@@ -1159,21 +1159,30 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     def write_stream(self, src: IO[bytes], *, offset: int = 0) -> int:
         """Drain a binary file-like ``src`` into this holder at ``offset``.
 
-        Mirrors :meth:`write_local_path` for IO-shaped sources
-        (:class:`io.BytesIO`, ``open(..., "rb")``, urllib3 responses,
-        :class:`yggdrasil.io.tabular.parquet_io.ParquetIO`). Reads the
-        full payload once and commits it via a single
-        :meth:`write_bytes`, so backends whose ``_write_mv`` implements
-        an atomic upload at ``offset == 0`` (Files API ``upload``, S3
-        ``PutObject``) push a single request rather than chunked
-        read-modify-rewrites.
+        Default: real chunked streaming — read :data:`_COPY_CHUNK`
+        bytes at a time from *src* and splice each chunk through
+        :meth:`write_bytes`, so multi-GB sources never materialise
+        as a single :class:`bytes` object in Python.
+
+        Backends with an atomic whole-object upload (Volumes
+        ``files.upload``, Workspace ``workspace.upload``, S3
+        ``PutObject``) override this to pass the live stream
+        straight to the backend in a single request instead of
+        N read-modify-rewrites — the chunked default is a strict
+        loss for those.
         """
         if offset < 0:
             raise ValueError("write_stream offset must be >= 0")
-        payload = src.read()
-        if not payload:
-            return 0
-        return self.write_bytes(payload, offset=offset)
+        cursor = offset
+        total = 0
+        while True:
+            chunk = src.read(_COPY_CHUNK)
+            if not chunk:
+                break
+            n = self.write_bytes(chunk, offset=cursor)
+            cursor += n
+            total += n
+        return total
 
     # ------------------------------------------------------------------
     # Byte transfer — upload / download to any byte sink

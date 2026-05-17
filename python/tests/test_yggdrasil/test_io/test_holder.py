@@ -307,14 +307,15 @@ class TestWriteStream:
         assert n == 5
         assert (tmp_path / "out.bin").read_bytes() == b"hello"
 
-    def test_atomic_single_write_for_remote_like_backend(self) -> None:
-        """Stream-write must hit ``_write_mv`` exactly once.
+    def test_default_streams_in_chunks(self) -> None:
+        """Default :meth:`Holder.write_stream` is real chunked streaming.
 
-        Remote backends (VolumePath / S3Path) implement ``_write_mv``
-        as an atomic upload + read-modify-rewrite for non-zero pos —
-        anything that chunks a stream into per-chunk
-        ``write_mv(...,pos=cursor)`` calls would devolve into N
-        downloads + N uploads. This test pins the contract.
+        Multi-MB sources never materialise as a single Python
+        ``bytes`` object — :data:`_COPY_CHUNK` (1 MiB) bytes go
+        in per ``_write_mv`` call. Remote backends that prefer
+        a single atomic PUT (Volumes, Workspace, DBFS) override
+        :meth:`write_stream` to pass the stream straight to
+        their backend uploader; this test pins the default.
         """
         import io as _stdio
         m = Memory()
@@ -331,7 +332,8 @@ class TestWriteStream:
         finally:
             type(m)._write_mv = original
 
-        assert calls == [4 * 1024 * 1024]
+        # 4 MiB source, 1 MiB chunk → 4 round trips.
+        assert calls == [1024 * 1024] * 4
 
     def test_empty_stream_is_noop(self) -> None:
         import io as _stdio
