@@ -496,14 +496,6 @@ class PyEnv:
         return get_ipython() is not None
 
     @classmethod
-    def can_access_databricks(cls):
-        return (
-            cls.in_databricks
-            or "DATABRICKS_HOST" in os.environ.keys()
-            or "DATABRICKS_CLUSTER_ID" in os.environ.keys()
-        )
-
-    @classmethod
     def in_aws_lambda(cls) -> bool:
         """``True`` when running inside the AWS Lambda runtime.
 
@@ -532,17 +524,18 @@ class PyEnv:
         **not** covered — there's no environment-side signal for it
         (callers needing that should hit IMDS).
         """
+        env = os.environ
+        # AWS_EXECUTION_ENV is set by Lambda, CodeBuild, and some
+        # CodePipeline / SageMaker images; ECS injects the metadata
+        # URI; the credentials-relative-URI is set on any compute
+        # surface using a task / instance role.
         return (
-            cls.in_aws_lambda()
-            or cls.in_aws_batch()
-            # AWS_EXECUTION_ENV is set by Lambda, CodeBuild, and some
-            # CodePipeline / SageMaker images; ECS injects the metadata
-            # URI; the credentials-relative-URI is set on any compute
-            # surface using a task / instance role.
-            or "AWS_EXECUTION_ENV" in os.environ
-            or "ECS_CONTAINER_METADATA_URI_V4" in os.environ
-            or "ECS_CONTAINER_METADATA_URI" in os.environ
-            or "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" in os.environ
+            "AWS_LAMBDA_FUNCTION_NAME" in env
+            or "AWS_BATCH_JOB_ID" in env
+            or "AWS_EXECUTION_ENV" in env
+            or "ECS_CONTAINER_METADATA_URI_V4" in env
+            or "ECS_CONTAINER_METADATA_URI" in env
+            or "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" in env
         )
 
     @classmethod
@@ -555,9 +548,8 @@ class PyEnv:
         caller wants to talk to a remote workspace; the SDK reads the same
         env vars to resolve auth and target compute.
         """
-        if cls.in_databricks():
-            return False
-        return "DATABRICKS_HOST" in os.environ
+        env = os.environ
+        return "DATABRICKS_RUNTIME_VERSION" not in env and "DATABRICKS_HOST" in env
 
     @classmethod
     def spark_session(
@@ -1280,6 +1272,11 @@ class PyEnv:
             if not pip_name:
                 raise ValueError("Provide at least one of module_name or pip_name.")
             module_name = pip_name.replace("-", "_")
+
+        if use_cache and not upgrade and module_name in self._checked_modules:
+            cached = sys.modules.get(module_name)
+            if cached is not None:
+                return cached
 
         if not upgrade:
             try:
