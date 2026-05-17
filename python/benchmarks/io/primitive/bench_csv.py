@@ -1,4 +1,4 @@
-"""Benchmark :class:`CsvIO` — string-encoded format.
+"""Benchmark :class:`CSVFile` — string-encoded format.
 
 CSV is the codec-bound case: read + write is dominated by the
 string encode/decode pass. Production shapes include flat
@@ -18,7 +18,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from yggdrasil.io.primitive.csv_io import CsvIO
+from yggdrasil.io.primitive.csv_file import CSVFile
 
 from _common import (  # type: ignore[import-not-found]
     bench_roundtrip,
@@ -33,20 +33,20 @@ def scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
     # CSV doesn't support nested types — skip the nested fixture so
     # this bench stays clean.
-    out.extend(bench_roundtrip("csv flat 1k", CsvIO, flat_table(1_000),
+    out.extend(bench_roundtrip("csv flat 1k", CSVFile, flat_table(1_000),
                                repeat=repeat, inner=100))
-    out.extend(bench_roundtrip("csv flat 50k", CsvIO, flat_table(50_000),
+    out.extend(bench_roundtrip("csv flat 50k", CSVFile, flat_table(50_000),
                                repeat=repeat, inner=20))
-    out.extend(bench_roundtrip("csv wide 32x10k", CsvIO, wide_table(10_000),
+    out.extend(bench_roundtrip("csv wide 32x10k", CSVFile, wide_table(10_000),
                                repeat=repeat, inner=20))
 
-    sink = CsvIO(b"")
+    sink = CSVFile(b"")
     sink.write_arrow_table(flat_table(50_000))
     sink.seek(0)
     payload = sink.read()
     out.append(time_one(
         "csv: collect_schema flat 50k",
-        lambda: CsvIO(payload).collect_schema(),
+        lambda: CSVFile(payload).collect_schema(),
         repeat=repeat, inner=500,
     ))
     return out

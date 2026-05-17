@@ -3,14 +3,14 @@
 The real arrow_insert flow is:
 
     pandas/polars/arrow source
-        -> ParquetIO.write_table(data, CastOptions(target=...))
+        -> ParquetFile.write_table(data, CastOptions(target=...))
             -> _write_pandas_frame / _write_polars_frame / _write_arrow_table
                 -> _write_arrow_batches  (cast each batch, write to parquet sink)
         -> staging.write_stream(buffer)   # network upload to Databricks Volume
         -> warehouse INSERT FROM staging
 
 The network upload is out of scope here — what we measure is the in-process
-part that hands a typed frame to ``ParquetIO`` with the table's target schema
+part that hands a typed frame to ``ParquetFile`` with the table's target schema
 bound on ``CastOptions``. That is where casts + per-batch dispatch live.
 
 Usage::
@@ -72,7 +72,7 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +197,7 @@ SHAPES: dict[str, Callable[[int], pa.Table]] = {
 
 
 # ---------------------------------------------------------------------------
-# Bench runner — drives ParquetIO.write_table with a bound target schema,
+# Bench runner — drives ParquetFile.write_table with a bound target schema,
 # matching what ``Table.arrow_insert`` does before the volume upload.
 # ---------------------------------------------------------------------------
 
@@ -228,22 +228,22 @@ def run_bench(rows: int, shape: str, repeat: int) -> list[dict]:
     polars_df = pl.from_arrow(table)
 
     def write_pandas() -> int:
-        with ParquetIO() as buf:
+        with ParquetFile() as buf:
             buf.write_table(pandas_df, options)
             return buf.size
 
     def write_polars() -> int:
-        with ParquetIO() as buf:
+        with ParquetFile() as buf:
             buf.write_table(polars_df, options)
             return buf.size
 
     def write_arrow_table() -> int:
-        with ParquetIO() as buf:
+        with ParquetFile() as buf:
             buf.write_table(table, options)
             return buf.size
 
     def write_arrow_batches() -> int:
-        with ParquetIO() as buf:
+        with ParquetFile() as buf:
             buf.write_table(table.to_batches(max_chunksize=10_000), options)
             return buf.size
 

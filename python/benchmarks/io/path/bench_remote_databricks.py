@@ -34,7 +34,7 @@ from yggdrasil.databricks.fs.dbfs_path import DBFSPath
 from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 from yggdrasil.io.path.remote_path import RemotePath
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ def scenarios(repeat: int) -> list[dict]:
     client, workspace = _stub_databricks_client(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
     p = DBFSPath("/dbfs/x.parquet", client=client)
-    p._invalidate_stat_cache()
+    p.invalidate_singleton(remove_global=False)
     workspace.dbfs.get_status.reset_mock()
     workspace.dbfs.read.reset_mock()
     p.exists()
@@ -255,7 +255,7 @@ def scenarios(repeat: int) -> list[dict]:
     client, workspace = _stub_databricks_client(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
     p = DBFSPath("/dbfs/x.parquet", client=client)
-    p._invalidate_stat_cache()
+    p.invalidate_singleton(remove_global=False)
     workspace.dbfs.get_status.reset_mock()
     workspace.dbfs.read.reset_mock()
     p.read_bytes()
@@ -275,7 +275,7 @@ def scenarios(repeat: int) -> list[dict]:
     client, workspace = _stub_databricks_client(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
     p = VolumePath("/Volumes/cat/sch/vol/x.parquet", client=client)
-    p._invalidate_stat_cache()
+    p.invalidate_singleton(remove_global=False)
     workspace.files.get_metadata.reset_mock()
     workspace.files.download.reset_mock()
     p.exists()
@@ -303,7 +303,7 @@ def scenarios(repeat: int) -> list[dict]:
     client, workspace = _stub_databricks_client(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
     p = VolumePath("/Volumes/cat/sch/vol/x.parquet", client=client)
-    p._invalidate_stat_cache()
+    p.invalidate_singleton(remove_global=False)
     workspace.files.get_metadata.reset_mock()
     workspace.files.download.reset_mock()
     p.read_bytes()
@@ -319,22 +319,22 @@ def scenarios(repeat: int) -> list[dict]:
     # -------------------------------------------------------------------
     # Tabular IO ↔ Path interaction — the headline scenario
     # -------------------------------------------------------------------
-    # ParquetIO(path=remote).read_arrow_table() is the canonical "give
+    # ParquetFile(path=remote).read_arrow_table() is the canonical "give
     # me a frame from this remote object". We want the operation to
     # bottom out in one download — the optimizer should fold the
     # size-probe and the read into a single round trip.
 
     client, workspace = _stub_databricks_client(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
-    pio = ParquetIO(holder=VolumePath(
+    pio = ParquetFile(holder=VolumePath(
         "/Volumes/cat/sch/vol/x.parquet", client=client,
     ))
-    pio._holder._invalidate_stat_cache()
+    pio.holder.invalidate_singleton(remove_global=False)
     workspace.files.get_metadata.reset_mock()
     workspace.files.download.reset_mock()
     pio.read_arrow_table()
     out.append({
-        "label": "ParquetIO(VolumePath).read_arrow_table — SDK calls",
+        "label": "ParquetFile(VolumePath).read_arrow_table — SDK calls",
         "best": 0.0, "median": 0.0, "mean": 0.0,
         "calls": (
             workspace.files.get_metadata.call_count
@@ -345,13 +345,13 @@ def scenarios(repeat: int) -> list[dict]:
     # Same for DBFS.
     client, workspace = _stub_databricks_client(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
-    pio = ParquetIO(holder=DBFSPath("/dbfs/x.parquet", client=client))
-    pio._holder._invalidate_stat_cache()
+    pio = ParquetFile(holder=DBFSPath("/dbfs/x.parquet", client=client))
+    pio.holder.invalidate_singleton(remove_global=False)
     workspace.dbfs.get_status.reset_mock()
     workspace.dbfs.read.reset_mock()
     pio.read_arrow_table()
     out.append({
-        "label": "ParquetIO(DBFSPath).read_arrow_table — SDK calls",
+        "label": "ParquetFile(DBFSPath).read_arrow_table — SDK calls",
         "best": 0.0, "median": 0.0, "mean": 0.0,
         "calls": (
             workspace.dbfs.get_status.call_count
@@ -362,15 +362,15 @@ def scenarios(repeat: int) -> list[dict]:
     # collect_schema — should hit the cheap footer read path.
     client, workspace = _stub_databricks_client(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
-    pio = ParquetIO(holder=VolumePath(
+    pio = ParquetFile(holder=VolumePath(
         "/Volumes/cat/sch/vol/x.parquet", client=client,
     ))
-    pio._holder._invalidate_stat_cache()
+    pio.holder.invalidate_singleton(remove_global=False)
     workspace.files.get_metadata.reset_mock()
     workspace.files.download.reset_mock()
     pio.collect_schema()
     out.append({
-        "label": "ParquetIO(VolumePath).collect_schema — SDK calls",
+        "label": "ParquetFile(VolumePath).collect_schema — SDK calls",
         "best": 0.0, "median": 0.0, "mean": 0.0,
         "calls": (
             workspace.files.get_metadata.call_count
@@ -380,7 +380,7 @@ def scenarios(repeat: int) -> list[dict]:
 
     # Timings for the same operations
     out.append(_time_one(
-        "ParquetIO(VolumePath).read_arrow_table",
+        "ParquetFile(VolumePath).read_arrow_table",
         lambda: _read_via_volume_path(client, parquet_payload),
         repeat=repeat, inner=200,
     ))
@@ -397,7 +397,7 @@ def _read_via_volume_path(client, payload):
         content_type="application/octet-stream",
         last_modified="Mon, 01 Jan 2024 00:00:00 GMT",
     )
-    return ParquetIO(holder=VolumePath(
+    return ParquetFile(holder=VolumePath(
         "/Volumes/cat/sch/vol/x.parquet", client=client,
     )).read_arrow_table()
 

@@ -1,4 +1,4 @@
-"""Benchmark the nested :class:`Tabular` leaves: FolderIO + ZipIO.
+"""Benchmark the nested :class:`Tabular` leaves: FolderIO + ZipFile.
 
 What this covers
 ----------------
@@ -12,7 +12,7 @@ surface, so the interesting paths are:
 * Per-framework variants (arrow / polars / pandas) — measures the
   bridge from the aggregated Arrow read through to the engine frame.
 
-ZipIO uses a self-built in-memory archive (no disk). FolderIO uses a
+ZipFile uses a self-built in-memory archive (no disk). FolderIO uses a
 temp directory of parquet files.
 
 Usage::
@@ -37,8 +37,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.io.nested.folder_io import FolderIO
-from yggdrasil.io.nested.zip_io import ZipIO
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.nested.zip_file import ZipFile
+from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
 # ---------------------------------------------------------------------------
@@ -130,22 +130,22 @@ def _zip_scenarios(repeat: int) -> list[dict]:
 
     out.append(_time_one(
         "zip: list_entries 8 files",
-        lambda: ZipIO(payload_8x1k).list_entries(),
+        lambda: ZipFile(payload_8x1k).list_entries(),
         repeat=repeat, inner=2_000,
     ))
     out.append(_time_one(
         "zip: collect_schema 8 files",
-        lambda: ZipIO(payload_8x1k).collect_schema(),
+        lambda: ZipFile(payload_8x1k).collect_schema(),
         repeat=repeat, inner=200,
     ))
     out.append(_time_one(
         "zip: read_arrow_table 8x1k",
-        lambda: ZipIO(payload_8x1k).read_arrow_table(),
+        lambda: ZipFile(payload_8x1k).read_arrow_table(),
         repeat=repeat, inner=100,
     ))
     out.append(_time_one(
         "zip: read_arrow_table 8x50k",
-        lambda: ZipIO(payload_8x50k).read_arrow_table(),
+        lambda: ZipFile(payload_8x50k).read_arrow_table(),
         repeat=repeat, inner=10,
     ))
 
@@ -153,12 +153,12 @@ def _zip_scenarios(repeat: int) -> list[dict]:
         import polars  # noqa: F401
         out.append(_time_one(
             "zip: read_polars_frame 8x1k",
-            lambda: ZipIO(payload_8x1k).read_polars_frame(),
+            lambda: ZipFile(payload_8x1k).read_polars_frame(),
             repeat=repeat, inner=100,
         ))
         out.append(_time_one(
             "zip: read_polars_frame 8x50k",
-            lambda: ZipIO(payload_8x50k).read_polars_frame(),
+            lambda: ZipFile(payload_8x50k).read_polars_frame(),
             repeat=repeat, inner=10,
         ))
     except ImportError:
@@ -168,12 +168,12 @@ def _zip_scenarios(repeat: int) -> list[dict]:
         import pandas  # noqa: F401
         out.append(_time_one(
             "zip: read_pandas_frame 8x1k",
-            lambda: ZipIO(payload_8x1k).read_pandas_frame(),
+            lambda: ZipFile(payload_8x1k).read_pandas_frame(),
             repeat=repeat, inner=100,
         ))
         out.append(_time_one(
             "zip: read_pandas_frame 8x50k",
-            lambda: ZipIO(payload_8x50k).read_pandas_frame(),
+            lambda: ZipFile(payload_8x50k).read_pandas_frame(),
             repeat=repeat, inner=10,
         ))
     except ImportError:

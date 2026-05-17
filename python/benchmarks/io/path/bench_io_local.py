@@ -30,9 +30,9 @@ import pyarrow as pa
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCIO
-from yggdrasil.io.primitive.csv_io import CsvIO
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.primitive.csv_file import CSVFile
+from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
 # Writes share the same target path across iterations, so use OVERWRITE
@@ -195,11 +195,11 @@ def _bench_format(
 def scenarios(repeat: int, tmp: Path) -> list[dict]:
     out: list[dict] = []
     table = _table(ROWS)
-    out.extend(_bench_format("parquet", ParquetIO, "data.parquet",
+    out.extend(_bench_format("parquet", ParquetFile, "data.parquet",
                              table, repeat=repeat, tmp=tmp, inner=5))
-    out.extend(_bench_format("arrow-ipc", ArrowIPCIO, "data.arrow",
+    out.extend(_bench_format("arrow-ipc", ArrowIPCFile, "data.arrow",
                              table, repeat=repeat, tmp=tmp, inner=5))
-    out.extend(_bench_format("csv", CsvIO, "data.csv",
+    out.extend(_bench_format("csv", CSVFile, "data.csv",
                              table, repeat=repeat, tmp=tmp, inner=3))
     return out
 

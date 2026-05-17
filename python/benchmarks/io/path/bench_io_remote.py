@@ -29,7 +29,7 @@ from typing import Callable
 import pyarrow as pa
 
 from yggdrasil.io.path.path import Path
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
 ROWS = 5_000
@@ -103,9 +103,9 @@ def scenarios(repeat: int, remote_url: str) -> list[dict]:
     target = base.joinpath("ygg-bench-remote.parquet")
 
     def write_arrow():
-        ParquetIO(path=target).write_arrow_table(table)
+        ParquetFile(path=target).write_arrow_table(table)
     def read_arrow():
-        ParquetIO(path=target).read_arrow_table()
+        ParquetFile(path=target).read_arrow_table()
 
     out.append(_time_one(
         f"remote ({base.url.scheme}): parquet write_arrow rows={ROWS}",
@@ -118,11 +118,11 @@ def scenarios(repeat: int, remote_url: str) -> list[dict]:
 
     try:
         import polars  # noqa: F401
-        pl_frame = ParquetIO(path=target).read_polars_frame()
+        pl_frame = ParquetFile(path=target).read_polars_frame()
         def write_polars():
-            ParquetIO(path=target).write_polars_frame(pl_frame)
+            ParquetFile(path=target).write_polars_frame(pl_frame)
         def read_polars():
-            ParquetIO(path=target).read_polars_frame()
+            ParquetFile(path=target).read_polars_frame()
         out.append(_time_one(
             f"remote ({base.url.scheme}): parquet write_polars rows={ROWS}",
             write_polars, repeat=repeat, inner=3,
@@ -141,11 +141,11 @@ def scenarios(repeat: int, remote_url: str) -> list[dict]:
 
     try:
         import pandas  # noqa: F401
-        pd_frame = ParquetIO(path=target).read_pandas_frame()
+        pd_frame = ParquetFile(path=target).read_pandas_frame()
         def write_pandas():
-            ParquetIO(path=target).write_pandas_frame(pd_frame)
+            ParquetFile(path=target).write_pandas_frame(pd_frame)
         def read_pandas():
-            ParquetIO(path=target).read_pandas_frame()
+            ParquetFile(path=target).read_pandas_frame()
         out.append(_time_one(
             f"remote ({base.url.scheme}): parquet write_pandas rows={ROWS}",
             write_pandas, repeat=repeat, inner=3,
