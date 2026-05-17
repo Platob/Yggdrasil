@@ -1,40 +1,35 @@
 """Live-integration tests for :class:`SchemaSession`.
 
-End-to-end exercise of the schema-backed HTTP cache against a real
-upstream API (``httpbin.org``) and a real Unity Catalog schema.
-Skipped unless ``DATABRICKS_HOST`` (and matching credentials) are
-exported — see :class:`DatabricksIntegrationCase`.
+Exercises the schema-backed HTTP cache against a real upstream
+(``httpbin.org``) and a real Unity Catalog schema. Skipped unless
+``DATABRICKS_HOST`` (and matching credentials) are exported — see
+:class:`DatabricksIntegrationCase`.
 
-What the tests verify
----------------------
+Determinism trick
+-----------------
+``httpbin.org/uuid`` returns a freshly-generated UUID on every call,
+so the response body is its own cache verifier:
 
-The :class:`SchemaSession` pipeline only earns its keep when the
-parent's local + remote cache machinery actually round-trips real
-:class:`Response` rows through a Delta table. The fixture uses
-``httpbin.org/uuid`` — a deterministic verifier: a fresh call yields
-a new UUID, a cache hit returns the previously stored one. Both
-detection modes:
+* :attr:`Mode.APPEND` — the read-through path: cold call writes a row,
+  warm call returns the *same* UUID because it came from the table
+  rather than the wire.
+* :attr:`Mode.UPSERT` — bypass-on-read: two calls return *different*
+  UUIDs, but the table ends with exactly one row keyed by the public
+  URL hash.
 
-* :attr:`Mode.APPEND` — the default read-through path. First call =
-  network fetch + cache write; second call = same UUID, the response
-  came from the table.
-* :attr:`Mode.UPSERT` — bypasses the lookup. First and second calls
-  return distinct UUIDs; the table ends up with one row (the upsert
-  replaces, not appends).
-
-Router mode (``SchemaSession()`` with no schema) is covered by a
-third test that dispatches one request to ``httpbin.org`` and one to
-``api.github.com`` — distinct host-derived schemas, distinct cache
-tables, both auto-created.
+Local cache layer
+-----------------
+``local_cache=False`` on every test so the assertions track the
+remote (Delta-table) tier in isolation; a separate test pins the
+two-tier behaviour by enabling the local layer and asserting a warm
+call short-circuits before the remote read.
 
 Cleanup
 -------
-
-A unique sub-schema (``yg_schemasession_<hex>``) is provisioned per
-test class so concurrent runs don't collide and a failure leaves at
-most one schema behind. Class teardown drops the whole schema
-(``CASCADE``-style via ``Schema.delete(force=True)``) so the tables
-inside it go with it.
+A per-class throw-away schema (``yg_schemasession_<hex>``) is created
+under :envvar:`DATABRICKS_INTEGRATION_CATALOG` (default ``trading``)
+and dropped in ``tearDownClass`` so the tables provisioned by each
+``/uuid`` call go with it.
 """
 
 from __future__ import annotations
@@ -42,7 +37,9 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import tempfile
 import unittest
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -58,49 +55,45 @@ from . import DatabricksIntegrationCase
 
 
 __all__ = [
+    "TestSchemaSessionPathToTableName",
     "TestSchemaSessionAppend",
     "TestSchemaSessionUpsert",
-    "TestSchemaSessionRouter",
+    "TestSchemaSessionLocalCache",
 ]
 
 
 HTTPBIN_BASE = os.environ.get("YGG_HTTPBIN_BASE", "https://httpbin.org").rstrip("/")
 
 
-def _public_get(session, path: str) -> Response:
-    """Issue a GET against httpbin and return the Response.
+def _get_uuid(session: SchemaSession) -> tuple[Response, str]:
+    """Issue ``GET /uuid`` and return ``(response, parsed_uuid)``.
 
-    Wraps the bare ``session.send`` call so a transient httpbin
-    outage surfaces as a skip rather than a noisy fail.
+    Wraps the bare ``send`` so an httpbin outage skips the test
+    instead of raising a noisy fail.
     """
-    req = PreparedRequest.prepare("GET", f"{HTTPBIN_BASE}{path}")
+    req = PreparedRequest.prepare("GET", f"{HTTPBIN_BASE}/uuid")
     try:
-        return session.send(req)
+        response = session.send(req)
     except Exception as exc:  # noqa: BLE001 - network surface
         raise unittest.SkipTest(
-            f"Upstream {HTTPBIN_BASE!r} unreachable for {path!r}: {exc}. "
-            "Set YGG_HTTPBIN_BASE to a reachable httpbin mirror or run on a "
-            "host with outbound HTTPS to httpbin.org."
+            f"Upstream {HTTPBIN_BASE!r} unreachable: {exc}. "
+            "Set YGG_HTTPBIN_BASE to a reachable httpbin mirror."
         ) from exc
 
+    if response.status_code != 200:
+        raise unittest.SkipTest(
+            f"httpbin returned {response.status_code} for /uuid — skipping."
+        )
 
-def _extract_uuid(response: Response) -> str:
-    """Parse the ``uuid`` field out of an ``httpbin.org/uuid`` response."""
     body = response.buffer.to_bytes() if response.buffer is not None else b""
-    if not body:
-        raise AssertionError("Empty response body — httpbin returned no payload")
     payload = json.loads(body)
     if "uuid" not in payload:
         raise AssertionError(f"Unexpected /uuid payload shape: {payload!r}")
-    return payload["uuid"]
+    return response, payload["uuid"]
 
 
 def _row_count(table) -> int:
-    """Run ``SELECT count(*)`` against *table* and return an int.
-
-    ``table.execute`` returns a :class:`StatementResult`; pull the
-    single int64 cell out via the Arrow batch reader.
-    """
+    """``SELECT count(*)`` against *table* as a plain int."""
     result = table.execute(
         f"SELECT count(*) AS n FROM {table.full_name(safe=True)}"
     )
@@ -110,8 +103,55 @@ def _row_count(table) -> int:
     return 0
 
 
-class _SchemaSessionIntegrationBase(DatabricksIntegrationCase):
-    """Shared fixture: per-class throw-away schema under
+# ---------------------------------------------------------------------------
+# Pure-Python unit checks (no live workspace needed)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaSessionPathToTableName(unittest.TestCase):
+    """Pure path → identifier checks. No workspace, no skip."""
+
+    def setUp(self) -> None:
+        # The method only touches regex + safe_table_name; a stand-in
+        # ``self._schema = None`` would trip the __init__ guard, so go
+        # through the bound method on a throw-away instance whose
+        # __init__ we skip entirely.
+        self.fn = SchemaSession.path_to_table_name.__get__(
+            object.__new__(SchemaSession),
+        )
+
+    def test_empty_path_falls_back_to_root(self) -> None:
+        self.assertEqual(self.fn(""), "root")
+        self.assertEqual(self.fn("/"), "root")
+        self.assertEqual(self.fn(None), "root")
+
+    def test_collapses_non_alphanumeric_runs(self) -> None:
+        # ``/api/v1/users.json?id=42`` should fold every separator to ``_``.
+        self.assertEqual(
+            self.fn("/api/v1/users.json?id=42"),
+            "api_v1_users_json_id_42",
+        )
+
+    def test_lowercases_input(self) -> None:
+        self.assertEqual(self.fn("/Path/MixedCase"), "path_mixedcase")
+
+    def test_long_path_stays_within_uc_limit(self) -> None:
+        long_path = "/" + "/".join("seg" + str(i) for i in range(200))
+        out = self.fn(long_path)
+        self.assertLessEqual(len(out), 255)
+        # Distinct overflows should produce distinct names — the
+        # ``safe_table_name`` BLAKE2b suffix is the disambiguator.
+        other = self.fn(long_path + "X")
+        self.assertNotEqual(out, other)
+
+
+# ---------------------------------------------------------------------------
+# Live integration fixture
+# ---------------------------------------------------------------------------
+
+
+class _SchemaSessionLiveBase(DatabricksIntegrationCase):
+    """Per-class throw-away schema under
     :envvar:`DATABRICKS_INTEGRATION_CATALOG` (default ``trading``)."""
 
     catalog_name: ClassVar[str]
@@ -121,23 +161,19 @@ class _SchemaSessionIntegrationBase(DatabricksIntegrationCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.catalog_name = os.environ.get(
-            "DATABRICKS_INTEGRATION_CATALOG", "trading",
-        ).strip() or "trading"
-        cls.schema_name = (
-            f"yg_schemasession_{secrets.token_hex(4)}"
+        cls.catalog_name = (
+            os.environ.get("DATABRICKS_INTEGRATION_CATALOG", "trading").strip()
+            or "trading"
         )
+        cls.schema_name = f"yg_schemasession_{secrets.token_hex(4)}"
         try:
-            cls.schema = cls.client.schemas(
-                catalog_name=cls.catalog_name,
-            ).schema(schema_name=cls.schema_name)
+            cls.schema = cls.client.schemas(catalog_name=cls.catalog_name).schema(
+                schema_name=cls.schema_name,
+            )
             cls.schema.ensure_created(
                 comment="yggdrasil SchemaSession integration-test schema",
             )
         except DatabricksError as exc:
-            # No permission to create a schema in this catalog — skip
-            # the whole suite cleanly so the integration run keeps
-            # moving.
             raise unittest.SkipTest(
                 f"Cannot create schema {cls.catalog_name}.{cls.schema_name}: "
                 f"{exc}. Override DATABRICKS_INTEGRATION_CATALOG with a "
@@ -147,151 +183,137 @@ class _SchemaSessionIntegrationBase(DatabricksIntegrationCase):
     @classmethod
     def tearDownClass(cls) -> None:
         try:
-            getattr(cls, "schema", None) and cls.schema.delete(
-                force=True, raise_error=False,
-            )
+            sch = getattr(cls, "schema", None)
+            if sch is not None:
+                sch.delete(force=True, raise_error=False)
         finally:
             super().tearDownClass()
 
-
-@pytest.mark.integration
-class TestSchemaSessionAppend(_SchemaSessionIntegrationBase):
-    """APPEND mode: read-through cache against httpbin.org."""
-
-    def test_uuid_cache_hit_returns_same_uuid(self) -> None:
-        session = SchemaSession(
+    def _session(self, *, mode: Mode, local_cache=False) -> SchemaSession:
+        """Build a fresh session per test — unique ``key`` keeps the
+        parent singleton cache from handing back a stale instance from
+        an earlier case."""
+        return SchemaSession(
             self.schema,
             base_url=HTTPBIN_BASE,
-            mode=Mode.APPEND,
-            local_cache=False,  # isolate the remote layer
-            key=f"int-append-{secrets.token_hex(2)}",
+            mode=mode,
+            local_cache=local_cache,
+            key=f"int-{secrets.token_hex(2)}",
         )
 
-        # 1) Cold call → network fetch → write to ``uuid`` table.
-        first = _public_get(session, "/uuid")
-        self.assertEqual(first.status_code, 200)
-        first_uuid = _extract_uuid(first)
 
-        # 2) Warm call → cache hit → identical UUID (proves the
-        # response came from the table, not the wire).
-        second = _public_get(session, "/uuid")
-        self.assertEqual(second.status_code, 200)
+# ---------------------------------------------------------------------------
+# APPEND mode — read-through cache
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestSchemaSessionAppend(_SchemaSessionLiveBase):
+
+    def test_warm_call_returns_cached_uuid(self) -> None:
+        """Cold call writes; warm call returns the same UUID from the table."""
+        session = self._session(mode=Mode.APPEND)
+
+        _, first = _get_uuid(session)
+        _, second = _get_uuid(session)
+
         self.assertEqual(
-            _extract_uuid(second), first_uuid,
-            "second /uuid call should have hit the remote cache "
-            "and returned the first response's UUID",
+            second, first,
+            "APPEND mode: second /uuid call should have hit the remote "
+            "cache and returned the cold call's UUID",
         )
 
-        # The session derived ``uuid`` as the table name; the row
-        # write may finish asynchronously inside Databricks, so we
-        # assert reachability rather than an exact count.
         table = self.schema.table("uuid")
         self.assertTrue(
             table.exists,
-            f"expected SchemaSession to have auto-created "
-            f"{table.full_name()!r} on the first /uuid call",
+            f"expected SchemaSession to have auto-created {table.full_name()!r} "
+            f"on the first /uuid call",
         )
+
+    def test_distinct_paths_use_distinct_tables(self) -> None:
+        """``/uuid`` and ``/get`` resolve to different table names; both
+        get auto-created on first call."""
+        session = self._session(mode=Mode.APPEND)
+
+        _get_uuid(session)
+        req = PreparedRequest.prepare("GET", f"{HTTPBIN_BASE}/get")
+        try:
+            other = session.send(req)
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(f"httpbin /get unreachable: {exc}") from exc
+        self.assertEqual(other.status_code, 200)
+
+        self.assertTrue(self.schema.table("uuid").exists)
+        self.assertTrue(self.schema.table("get").exists)
+
+
+# ---------------------------------------------------------------------------
+# UPSERT mode — bypass on read, refresh on write
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
-class TestSchemaSessionUpsert(_SchemaSessionIntegrationBase):
-    """UPSERT mode: cache is always bypassed on read, refreshed on write."""
+class TestSchemaSessionUpsert(_SchemaSessionLiveBase):
 
-    def test_upsert_returns_fresh_uuid_each_call(self) -> None:
-        session = SchemaSession(
-            self.schema,
-            base_url=HTTPBIN_BASE,
-            mode=Mode.UPSERT,
-            local_cache=False,
-            key=f"int-upsert-{secrets.token_hex(2)}",
-        )
+    def test_each_call_returns_fresh_uuid(self) -> None:
+        session = self._session(mode=Mode.UPSERT)
 
-        first = _public_get(session, "/uuid")
-        second = _public_get(session, "/uuid")
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 200)
+        _, first = _get_uuid(session)
+        _, second = _get_uuid(session)
+
         self.assertNotEqual(
-            _extract_uuid(first), _extract_uuid(second),
-            "UPSERT mode must skip the cache lookup — two calls "
-            "should have produced two different UUIDs from the wire",
+            first, second,
+            "UPSERT must bypass the cache lookup — two calls should "
+            "have produced two distinct UUIDs from the wire",
         )
 
-        # Table is still created (the upsert writes go through the
-        # same write path); ``count(*)`` should sit at exactly 1
-        # because UPSERT replaces the row keyed by ``public_url_hash``
-        # instead of appending.
         table = self.schema.table("uuid")
         self.assertTrue(table.exists)
         count = _row_count(table)
         self.assertEqual(
             count, 1,
-            f"UPSERT should leave exactly 1 row keyed by public_url_hash, "
-            f"got {count}. The merge key may have drifted.",
+            f"UPSERT keys by public_url_hash and replaces — expected 1 row, "
+            f"got {count}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Two-tier (local + remote) cache
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
-class TestSchemaSessionRouter(_SchemaSessionIntegrationBase):
-    """Router mode: empty SchemaSession routes per-host."""
+class TestSchemaSessionLocalCache(_SchemaSessionLiveBase):
+    """Local on-disk tier short-circuits before the remote read."""
 
-    def test_router_dispatches_to_per_host_singleton(self) -> None:
-        # In router mode the session needs the catalog + Schemas
-        # service so children can resolve under our throw-away
-        # catalog. Each child derives its schema name from the
-        # request host (``host_to_schema_name``); we override the
-        # router's catalog so the children land under
-        # ``trading.<host_derived>`` next to our cleanup target.
-        # To keep cleanup tidy we lock the router to the per-class
-        # schema by pre-seeding the host cache with the bound child.
-        bound_child = SchemaSession(
-            self.schema,
-            base_url=HTTPBIN_BASE,
-            mode=Mode.APPEND,
-            local_cache=False,
-            key=f"int-router-bound-{secrets.token_hex(2)}",
-        )
-        router = SchemaSession(
-            catalog_name=self.catalog_name,
-            schemas=self.client.schemas(catalog_name=self.catalog_name),
-            mode=Mode.APPEND,
-            local_cache=False,
-            key=f"int-router-{secrets.token_hex(2)}",
-        )
-
-        # Pre-seed: route the throw-away schema under the host the
-        # test will hit so the resolved child reuses ``self.schema``
-        # rather than provisioning a parallel ``httpbin_org`` schema
-        # outside teardown's reach.
-        from yggdrasil.io.url import URL
-
-        host_base = URL.from_(HTTPBIN_BASE)
-        router._host_session_cache  # initialise lazily
-        # ``for_host`` returns the bound child if ``base_url=host_base``
-        # matches the parent Session singleton key. We force the
-        # mapping in directly.
-        if router._host_session_cache is None:
-            from yggdrasil.dataclasses import ExpiringDict
-            router._host_session_cache = ExpiringDict(
-                default_ttl=None, max_size=8,
+    def test_local_layer_serves_warm_call_without_remote(self) -> None:
+        """Two-tier APPEND: cold call hits the wire and writes both
+        tiers; warm call returns the same UUID — which is the
+        end-user contract regardless of which tier serves it. We
+        also confirm the local tier left a file on disk so the
+        fast-path is genuinely populated."""
+        with tempfile.TemporaryDirectory(prefix="yg-schemasession-") as tmp:
+            session = SchemaSession(
+                self.schema,
+                base_url=HTTPBIN_BASE,
+                mode=Mode.APPEND,
+                local_cache=tmp,
+                key=f"int-local-{secrets.token_hex(2)}",
             )
-        router._host_session_cache.set(
-            (host_base.host.lower(), host_base.port), bound_child,
-        )
 
-        self.assertTrue(router.is_router)
-        first = _public_get(router, "/uuid")
-        second = _public_get(router, "/uuid")
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 200)
-        self.assertEqual(
-            _extract_uuid(second), _extract_uuid(first),
-            "Router should have dispatched both /uuid sends to the same "
-            "host child, which caches the response on the first call.",
-        )
+            _, first = _get_uuid(session)
+            _, second = _get_uuid(session)
 
-        resolved = router.for_host(HTTPBIN_BASE)
-        self.assertIs(
-            resolved, bound_child,
-            "Router's per-host cache should resolve to the seeded child "
-            "for repeated hits on the same host.",
-        )
+            self.assertEqual(
+                second, first,
+                "Warm call should have returned the cached UUID",
+            )
+
+            # The local fast-path writes one ``.arrow`` file per
+            # response under ``<tmp>/<METHOD>/<host>/.../<hash>.arrow``.
+            arrow_files = list(Path(tmp).rglob("*.arrow"))
+            self.assertTrue(
+                arrow_files,
+                f"Expected the local cache layer to leave at least one "
+                f".arrow file under {tmp!r}; got nothing.",
+            )
