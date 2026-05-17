@@ -1179,6 +1179,96 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         self._pos += n
         return n
 
+    def upload(
+        self, src: Any, *, size: int = -1, offset: int = 0,
+    ) -> "IO":
+        """Pull *src*'s bytes into this IO at the current cursor.
+
+        Cursor-anchored counterpart to :meth:`Holder.upload` —
+        ``io.upload(src)`` writes *src*'s bytes starting at the
+        IO's current position and advances the cursor by the
+        number of bytes written. *size* / *offset* slice the
+        **source** (same as :meth:`Holder.upload`): ``size=-1``
+        reads to EOF, ``size>=0`` caps the count, ``offset`` is
+        the position inside *src* to start reading from.
+
+        *src* accepts a :class:`Holder`, another :class:`IO`
+        cursor, or a ``str`` / :class:`os.PathLike` coerced via
+        ``Path.from_(src)``. Returns *self* so cursor-chained
+        writes work (``io.upload(src).write(b)``).
+        """
+        from yggdrasil.io.holder import (
+            Holder,
+            _coerce_transfer_endpoint,
+        )
+
+        source = _coerce_transfer_endpoint(src)
+        if isinstance(source, IO):
+            # IO source: ``offset`` seeks the source cursor;
+            # ``read`` advances it. The destination side is *this*
+            # IO's cursor, advanced by ``write_bytes``.
+            if offset:
+                source.seek(offset)
+            payload = source.read() if size < 0 else source.read(size)
+        elif isinstance(source, Holder):
+            payload = source.read_bytes(n=size, pos=offset)
+        else:  # pragma: no cover — coercion only returns Holder/IO
+            raise TypeError(
+                f"IO.upload: expected a Holder, IO, str, or "
+                f"os.PathLike source; got {type(source).__name__}."
+            )
+        self.write_bytes(payload)
+        return self
+
+    def download(
+        self, to: Any = None, *, size: int = -1, offset: int = 0,
+    ) -> "Holder | IO":
+        """Push bytes from this IO (cursor-relative) into *to*.
+
+        Cursor-anchored counterpart to :meth:`Holder.download`.
+        ``offset`` is **relative to the current cursor**:
+        ``offset=0`` reads from the cursor's current position,
+        ``offset=N`` skips N bytes forward first. ``size=-1``
+        reads to EOF, ``size>=0`` caps the count. The cursor
+        advances past the bytes that were actually read.
+
+        When *to* is :data:`None`, bytes land in
+        ``~/Downloads/<name>`` (browser-style; falls back to
+        ``"download"`` for cursorless / nameless holders).
+        Otherwise *to* accepts the same shapes as
+        :meth:`Holder.download` (:class:`Holder`, :class:`IO`,
+        ``str`` / :class:`os.PathLike`). Returns the resolved
+        target.
+        """
+        from yggdrasil.io.holder import (
+            _coerce_transfer_endpoint,
+            _default_download_target,
+            _join_dir_hint,
+        )
+
+        if offset:
+            self.seek(self._pos + offset)
+        payload = self.read() if size < 0 else self.read(size)
+
+        if to is None:
+            to = _default_download_target(self._transfer_filename())
+        target = _join_dir_hint(_coerce_transfer_endpoint(to), self)
+        target.write_bytes(payload)
+        return target
+
+    def _transfer_filename(self) -> str:
+        """Filename used when joining onto a directory-shaped target.
+
+        Delegates to the bound :class:`Holder` so an IO over a
+        :class:`LocalPath` carries the path's basename through
+        ``cp``-style directory targets. IO cursors over
+        :class:`Memory` fall back to ``"download"`` like the
+        holder side.
+        """
+        if self._holder is None:
+            return "download"
+        return self._holder._transfer_filename()
+
     def writelines(self, lines: Any) -> None:
         for line in lines:
             self.write(line)

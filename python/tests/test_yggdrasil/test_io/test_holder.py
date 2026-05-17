@@ -446,30 +446,83 @@ class TestHolderTransfer:
         with pytest.raises(TypeError, match="Holder, IO, str, or os.PathLike"):
             mem.upload(42)
 
-    def test_upload_slices_source_with_n_and_pos(self) -> None:
+    def test_upload_slices_source_with_size_and_offset(self) -> None:
         src = Memory()
         src.write_bytes(b"abcdef")
         dst = Memory()
-        dst.upload(src, n=3, pos=2)
+        dst.upload(src, size=3, offset=2)
         # 3 bytes starting at offset 2 → "cde".
         assert dst.read_bytes() == b"cde"
 
-    def test_download_slices_source_with_n_and_pos(self) -> None:
+    def test_download_slices_source_with_size_and_offset(self) -> None:
         src = Memory()
         src.write_bytes(b"abcdef")
         dst = Memory()
-        src.download(dst, n=2, pos=4)
+        src.download(dst, size=2, offset=4)
         assert dst.read_bytes() == b"ef"
 
-    def test_upload_from_io_honors_pos(self) -> None:
+    def test_upload_from_io_honors_offset(self) -> None:
         from yggdrasil.io.bytes_io import BytesIO
 
         with BytesIO() as bio:
             bio.write_bytes(b"abcdef")
-            # ``pos`` seeks the cursor; ``n`` caps the read.
+            # ``offset`` seeks the cursor; ``size`` caps the read.
             mem = Memory()
-            mem.upload(bio, n=2, pos=1)
+            mem.upload(bio, size=2, offset=1)
         assert mem.read_bytes() == b"bc"
+
+
+class TestIOTransfer:
+    """``IO.upload`` / ``IO.download`` are cursor-anchored mirrors of Holder's."""
+
+    def test_io_upload_writes_at_cursor_and_advances(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = Memory()
+        src.write_bytes(b"src-payload")
+
+        with BytesIO() as io:
+            io.write_bytes(b"PRE-")
+            cursor_before = io.tell()
+            io.upload(src)
+            # Cursor advanced by the written byte count.
+            assert io.tell() == cursor_before + src.size
+            io.seek(0)
+            assert io.read() == b"PRE-src-payload"
+
+    def test_io_upload_slices_source_by_size_and_offset(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = Memory()
+        src.write_bytes(b"abcdef")
+
+        with BytesIO() as io:
+            io.upload(src, size=3, offset=2)
+            io.seek(0)
+            assert io.read() == b"cde"
+
+    def test_io_download_reads_from_cursor(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as io:
+            io.write_bytes(b"abcdef")
+            io.seek(2)  # cursor at 'c'
+            dst = Memory()
+            io.download(dst, size=3)
+            assert dst.read_bytes() == b"cde"
+            # Cursor advanced past the read.
+            assert io.tell() == 5
+
+    def test_io_download_offset_is_cursor_relative(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as io:
+            io.write_bytes(b"abcdef")
+            io.seek(1)
+            dst = Memory()
+            # cursor=1 + offset=2 → read starts at index 3 → "de"
+            io.download(dst, size=2, offset=2)
+            assert dst.read_bytes() == b"de"
 
 
 class TestPathTransferOptimization:

@@ -1084,7 +1084,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # ------------------------------------------------------------------
 
     def upload(
-        self, src: Any, *, n: int = -1, pos: int = 0,
+        self, src: Any, *, size: int = -1, offset: int = 0,
     ) -> "Holder":
         """Upload *src*'s bytes into this holder.
 
@@ -1095,19 +1095,20 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         *src* accepts any of:
 
         - :class:`Holder` (incl. any :class:`Path` subclass) —
-          its bytes are pulled starting at *pos*.
-        - :class:`IO` cursor — *pos* (if non-zero) seeks before
-          ``read()``; otherwise the cursor's current position is
-          honoured.
+          its bytes are pulled starting at *offset*.
+        - :class:`IO` cursor — *offset* (if non-zero) seeks
+          before ``read()``; otherwise the cursor's current
+          position is honoured.
         - ``str`` / :class:`os.PathLike` — coerced via
           ``Path.from_(src)`` and treated as a holder.
 
-        *n* and *pos* slice the source: ``n=-1`` (default) reads
-        to EOF, ``n>=0`` caps the byte count, ``pos`` is the
-        starting offset. Slicing forces the whole-payload fast
-        path in :meth:`_transfer_to` to defer to a bytes copy
-        (the backend-specific shortcuts — ``shutil.copyfile``,
-        ``write_local_path`` — don't expose a window).
+        *size* and *offset* slice the source: ``size=-1`` (default)
+        reads to EOF, ``size>=0`` caps the byte count, ``offset``
+        is the starting offset. Slicing forces the whole-payload
+        fast path in :meth:`_transfer_to` to defer to a bytes
+        copy (the backend-specific shortcuts —
+        ``shutil.copyfile``, ``write_local_path`` — don't expose
+        a window).
 
         When *self* is a :class:`Path` whose URL ends in a
         trailing ``/`` (directory shape), the source's filename
@@ -1129,12 +1130,12 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         target = _join_dir_hint(self, source)
         if isinstance(source, Path) and source.is_dir():
             # Directory tree: only a :class:`Path` target can hold
-            # it. ``n`` / ``pos`` slicing is a file-only knob.
-            if n != -1 or pos != 0:
+            # it. ``size`` / ``offset`` slicing is a file-only knob.
+            if size != -1 or offset != 0:
                 raise IsADirectoryError(
                     f"Holder.upload: source {source.full_path()!r} is "
-                    f"a directory; n / pos slicing applies to file "
-                    f"uploads only."
+                    f"a directory; size / offset slicing applies to "
+                    f"file uploads only."
                 )
             if not isinstance(target, Path):
                 raise IsADirectoryError(
@@ -1149,19 +1150,19 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         if isinstance(source, IO):
             # IO cursors aren't :class:`Holder` — no ``_transfer_to``
             # to inherit. Pull from the cursor (after an optional
-            # ``seek``) and write into the target.
-            if pos:
-                source.seek(pos)
-            payload = source.read() if n < 0 else source.read(n)
+            # seek) and write into the target.
+            if offset:
+                source.seek(offset)
+            payload = source.read() if size < 0 else source.read(size)
             target.write_bytes(payload)
-        elif n < 0 and pos == 0:
+        elif size < 0 and offset == 0:
             source._transfer_to(target)
         else:
-            target.write_bytes(source.read_bytes(n=n, pos=pos))
+            target.write_bytes(source.read_bytes(n=size, pos=offset))
         return target
 
     def download(
-        self, to: Any = None, *, n: int = -1, pos: int = 0,
+        self, to: Any = None, *, size: int = -1, offset: int = 0,
     ) -> "Holder | IO":
         """Copy this holder's bytes to a local target.
 
@@ -1171,9 +1172,9 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         ``(1)`` / ``(2)`` / … suffixes appended on name conflict.
         Otherwise *to* accepts the same shapes as :meth:`upload`
         (:class:`Holder`, :class:`IO`, ``str`` / :class:`os.PathLike`).
-        *n* and *pos* slice this holder: ``n=-1`` (default) reads
-        to EOF, ``n>=0`` caps the byte count, ``pos`` is the
-        starting offset. Returns the resolved target.
+        *size* and *offset* slice this holder: ``size=-1`` (default)
+        reads to EOF, ``size>=0`` caps the byte count, ``offset``
+        is the starting offset. Returns the resolved target.
         """
         from yggdrasil.io.path.path import Path
 
@@ -1184,11 +1185,11 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             # Symmetric with :meth:`upload` — delegate to the
             # destination-side recurse: ``target.upload(self)``
             # knows how to ``mkdir`` and walk *self*'s children.
-            if n != -1 or pos != 0:
+            if size != -1 or offset != 0:
                 raise IsADirectoryError(
                     f"Holder.download: source {self.full_path()!r} is "
-                    f"a directory; n / pos slicing applies to file "
-                    f"downloads only."
+                    f"a directory; size / offset slicing applies to "
+                    f"file downloads only."
                 )
             if not isinstance(target, Path):
                 raise IsADirectoryError(
@@ -1197,10 +1198,10 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                     f"tree, got {type(target).__name__}."
                 )
             return target.upload(self)
-        if n < 0 and pos == 0:
+        if size < 0 and offset == 0:
             self._transfer_to(target)
         else:
-            target.write_bytes(self.read_bytes(n=n, pos=pos))
+            target.write_bytes(self.read_bytes(n=size, pos=offset))
         return target
 
 
