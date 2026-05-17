@@ -508,13 +508,13 @@ class S3Path(RemotePath):
     # Holder I/O — _read_mv / _write_mv / truncate / _clear
     # ==================================================================
 
-    def read_mv(self, n: int, pos: int) -> memoryview:
+    def read_mv(self, size: int = -1, offset: int = 0) -> memoryview:
         """Range read with a whole-file fast path that skips the size probe.
 
-        The base :meth:`Holder.read_mv` resolves a ``n < 0`` "read to
-        EOF" request by calling ``self.size`` first, which is one
-        ``HeadObject`` round trip every time the stat cache is cold.
-        For the dominant shape — ``read_bytes()`` /
+        The base :meth:`Holder.read_mv` resolves a ``size < 0``
+        "read to EOF" request by calling ``self.size`` first, which
+        is one ``HeadObject`` round trip every time the stat cache
+        is cold. For the dominant shape — ``read_bytes()`` /
         ``read_arrow_table()`` against a fresh path — that probe is
         wasted: the ``GetObject`` we're about to issue without a
         ``Range`` header returns the whole object *and* carries the
@@ -522,9 +522,9 @@ class S3Path(RemotePath):
         folds back into the cache. Partial / positional reads keep
         the base bounds check so out-of-range windows still raise.
         """
-        if n < 0 and pos == 0:
+        if size < 0 and offset == 0:
             return self._read_mv(-1, 0)
-        return super().read_mv(n, pos)
+        return super().read_mv(size, offset)
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         """Range-based ``GetObject`` → :class:`memoryview` over bytes.

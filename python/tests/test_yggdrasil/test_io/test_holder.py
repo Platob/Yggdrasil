@@ -340,11 +340,11 @@ class TestWriteStream:
         assert n == 0
         assert m.read_bytes() == b"keep"
 
-    def test_negative_pos_raises(self) -> None:
+    def test_negative_offset_raises(self) -> None:
         import io as _stdio
         m = Memory()
-        with pytest.raises(ValueError, match="pos must be >= 0"):
-            m.write_stream(_stdio.BytesIO(b"x"), pos=-1)
+        with pytest.raises(ValueError, match="offset must be >= 0"):
+            m.write_stream(_stdio.BytesIO(b"x"), offset=-1)
 
 
 class TestHolderTabular:

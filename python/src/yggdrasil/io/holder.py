@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import struct
 import time
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Union, Any, ClassVar, IO, Iterable, Iterator
@@ -412,13 +413,13 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             return False
 
     def _init_from_file_like(self, data: IO[bytes]) -> None:
-        pos = 0
+        offset = 0
         while True:
             chunk = data.read(_COPY_CHUNK)
             if not chunk:
                 break
-            self.write_bytes(chunk, pos=pos)
-            pos += len(chunk)
+            self.write_bytes(chunk, offset=offset)
+            offset += len(chunk)
 
     # ------------------------------------------------------------------
     # Constructors
@@ -451,23 +452,23 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # Abstract primitives
     # ------------------------------------------------------------------
 
-    def read_mv(self, n: int, pos: int) -> memoryview:
-        size = self.size
-        pos = _resolve_pos(pos, size)
-        if pos < 0 or pos > size:
+    def read_mv(self, size: int = -1, offset: int = 0) -> memoryview:
+        total = self.size
+        offset = _resolve_pos(offset, total)
+        if offset < 0 or offset > total:
             raise ValueError(
-                f"Position {pos} is out of bounds for "
-                f"{type(self).__name__} of size {size}"
+                f"Offset {offset} is out of bounds for "
+                f"{type(self).__name__} of size {total}"
             )
-        if n < 0:
-            n = size - pos
-        if n < 0 or pos + n > size:
+        if size < 0:
+            size = total - offset
+        if size < 0 or offset + size > total:
             raise ValueError(
-                f"Range [{pos}, {pos + n}) is out of bounds for "
-                f"{type(self).__name__} of size {size}"
+                f"Range [{offset}, {offset + size}) is out of bounds for "
+                f"{type(self).__name__} of size {total}"
             )
 
-        return self._read_mv(n, pos)
+        return self._read_mv(size, offset)
 
     @abstractmethod
     def _read_mv(self, n: int, pos: int) -> memoryview:
@@ -486,7 +487,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         """
 
     def write_mv(
-        self, data: memoryview, pos: int, *, update_stat: bool = True,
+        self, data: memoryview, offset: int = 0, *, update_stat: bool = True,
     ) -> int:
         """Splice ``data`` at ``pos``, pre-growing the holder as needed.
 
@@ -514,12 +515,12 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         re-statting via the path-side ``_stat`` for filesystem
         backends) once the loop finishes.
         """
-        size = self.size
-        pos = _resolve_pos(pos, size)
-        if pos < 0:
+        total = self.size
+        offset = _resolve_pos(offset, total)
+        if offset < 0:
             raise ValueError(
-                f"Position {pos} is out of bounds for "
-                f"{type(self).__name__} of size {size}"
+                f"Offset {offset} is out of bounds for "
+                f"{type(self).__name__} of size {total}"
             )
 
         n = len(data)
@@ -527,13 +528,13 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             return 0
 
         # Pre-grow the visible size so _write_mv just lays bytes down
-        # at a known-valid range. resize() is a no-op when pos+n <= size
-        # (in-place overwrite case), so the fast path stays fast.
-        end = pos + n
-        if end > size:
+        # at a known-valid range. resize() is a no-op when offset+n
+        # <= size (in-place overwrite case), so the fast path stays fast.
+        end = offset + n
+        if end > total:
             self.resize(end)
 
-        written = self._write_mv(data, pos)
+        written = self._write_mv(data, offset)
 
         if written > 0 and update_stat:
             self._touch_stat(size=max(end, self.size))
@@ -960,30 +961,35 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     # Bytes / text convenience surface
     # ------------------------------------------------------------------
 
-    def read_bytes(self, n: int = -1, pos: int = 0) -> bytes:
-        """Read ``n`` bytes at ``pos`` as :class:`bytes`."""
-        return bytes(self.read_mv(n, pos))
+    def read_bytes(self, size: int = -1, offset: int = 0) -> bytes:
+        """Read ``size`` bytes starting at ``offset`` as :class:`bytes`.
+
+        ``size=-1`` reads to EOF; ``offset`` accepts negative
+        indices via :func:`_resolve_pos` (``-1`` → ``size``,
+        ``-N`` → ``self.size - N``).
+        """
+        return bytes(self.read_mv(size, offset))
 
     def write_bytes(
         self,
         data: Union[bytes, bytearray, memoryview, str],
-        pos: int = 0,
+        offset: int = 0,
     ) -> int:
-        """Splice bytes-like ``data`` at ``pos``. Returns bytes written."""
+        """Splice bytes-like ``data`` at ``offset``. Returns bytes written."""
         if isinstance(data, str):
             data = data.encode("utf-8")
-        return self.write_mv(_as_byte_mv(data), pos)
+        return self.write_mv(_as_byte_mv(data), offset)
 
     def read_text(
         self,
         encoding: str = "utf-8",
         errors: str = "strict",
         *,
-        n: int = -1,
-        pos: int = 0,
+        size: int = -1,
+        offset: int = 0,
     ) -> str:
-        """Decode ``n`` bytes at ``pos`` as text."""
-        return self.read_bytes(n, pos).decode(encoding, errors=errors)
+        """Decode ``size`` bytes at ``offset`` as text."""
+        return self.read_bytes(size, offset).decode(encoding, errors=errors)
 
     def write_text(
         self,
@@ -991,12 +997,102 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         encoding: str = "utf-8",
         errors: str = "strict",
         *,
-        pos: int = 0,
+        offset: int = 0,
     ) -> int:
-        """Encode ``text`` and splice at ``pos``. Returns bytes written."""
+        """Encode ``text`` and splice at ``offset``. Returns bytes written."""
         return self.write_bytes(
-            text.encode(encoding, errors=errors), pos,
+            text.encode(encoding, errors=errors), offset,
         )
+
+    # ------------------------------------------------------------------
+    # Cursorless read/write primitives — IO subclasses add cursor
+    # ------------------------------------------------------------------
+
+    def readinto(self, buffer: Any, *, offset: int = 0) -> int:
+        """Fill *buffer* with bytes starting at ``offset``.
+
+        Returns the number of bytes written into *buffer* —
+        ``min(len(buffer), self.size - offset)``. Matches the
+        stdlib :meth:`io.RawIOBase.readinto` shape but stays
+        cursorless; subclasses with a cursor (``IO``) wrap this
+        and advance after the call.
+        """
+        mv = memoryview(buffer)
+        capacity = len(mv)
+        if capacity == 0:
+            return 0
+        chunk = self.read_bytes(capacity, offset)
+        n = len(chunk)
+        if n:
+            mv[:n] = chunk
+        return n
+
+    def readline(self, limit: int = -1, *, offset: int = 0) -> bytes:
+        """Read up to the next newline starting at ``offset``.
+
+        Returns the line including the trailing ``\\n`` (or short
+        when EOF lands first). ``limit >= 0`` caps the byte
+        count. Cursorless — :class:`IO` subclasses wrap this and
+        advance the cursor by the returned length.
+        """
+        total = self.size
+        if offset >= total:
+            return b""
+        chunk_len = total - offset
+        if limit is not None and limit >= 0:
+            chunk_len = min(limit, chunk_len)
+        if chunk_len <= 0:
+            return b""
+        chunk = self.read_bytes(chunk_len, offset)
+        nl = chunk.find(b"\n")
+        return chunk if nl == -1 else chunk[: nl + 1]
+
+    def readlines(self, hint: int = -1, *, offset: int = 0) -> list[bytes]:
+        """Read every line from ``offset`` to EOF (or until ``hint`` bytes)."""
+        lines: list[bytes] = []
+        cursor = offset
+        total = 0
+        while True:
+            line = self.readline(offset=cursor)
+            if not line:
+                break
+            lines.append(line)
+            total += len(line)
+            cursor += len(line)
+            if hint is not None and hint > 0 and total >= hint:
+                break
+        return lines
+
+    # ---- structured binary helpers — fixed-width little-endian ---------
+
+    def _read_struct(self, fmt: str, n: int, offset: int) -> Any:
+        return struct.unpack(fmt, self.read_bytes(n, offset))[0]
+
+    def _write_struct(self, fmt: str, value: Any, offset: int) -> int:
+        return self.write_bytes(struct.pack(fmt, value), offset)
+
+    def read_int8(self, *, offset: int = 0) -> int: return self._read_struct("<b", 1, offset)
+    def write_int8(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<b", int(v), offset)
+    def read_uint8(self, *, offset: int = 0) -> int: return self._read_struct("<B", 1, offset)
+    def write_uint8(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<B", int(v), offset)
+    def read_int16(self, *, offset: int = 0) -> int: return self._read_struct("<h", 2, offset)
+    def write_int16(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<h", int(v), offset)
+    def read_uint16(self, *, offset: int = 0) -> int: return self._read_struct("<H", 2, offset)
+    def write_uint16(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<H", int(v), offset)
+    def read_int32(self, *, offset: int = 0) -> int: return self._read_struct("<i", 4, offset)
+    def write_int32(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<i", int(v), offset)
+    def read_uint32(self, *, offset: int = 0) -> int: return self._read_struct("<I", 4, offset)
+    def write_uint32(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<I", int(v), offset)
+    def read_int64(self, *, offset: int = 0) -> int: return self._read_struct("<q", 8, offset)
+    def write_int64(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<q", int(v), offset)
+    def read_uint64(self, *, offset: int = 0) -> int: return self._read_struct("<Q", 8, offset)
+    def write_uint64(self, v: int, *, offset: int = 0) -> int: return self._write_struct("<Q", int(v), offset)
+    def read_f32(self, *, offset: int = 0) -> float: return self._read_struct("<f", 4, offset)
+    def write_f32(self, v: float, *, offset: int = 0) -> int: return self._write_struct("<f", float(v), offset)
+    def read_f64(self, *, offset: int = 0) -> float: return self._read_struct("<d", 8, offset)
+    def write_f64(self, v: float, *, offset: int = 0) -> int: return self._write_struct("<d", float(v), offset)
+    def read_bool(self, *, offset: int = 0) -> bool: return bool(self.read_uint8(offset=offset))
+    def write_bool(self, v: bool, *, offset: int = 0) -> int: return self.write_uint8(1 if v else 0, offset=offset)
 
     # ------------------------------------------------------------------
     # Local-path bridge
@@ -1060,24 +1156,24 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                     remaining -= written
         return total
 
-    def write_stream(self, src: IO[bytes], *, pos: int = 0) -> int:
-        """Drain a binary file-like ``src`` into this holder at ``pos``.
+    def write_stream(self, src: IO[bytes], *, offset: int = 0) -> int:
+        """Drain a binary file-like ``src`` into this holder at ``offset``.
 
         Mirrors :meth:`write_local_path` for IO-shaped sources
         (:class:`io.BytesIO`, ``open(..., "rb")``, urllib3 responses,
         :class:`yggdrasil.io.tabular.parquet_io.ParquetIO`). Reads the
         full payload once and commits it via a single
         :meth:`write_bytes`, so backends whose ``_write_mv`` implements
-        an atomic upload at ``pos == 0`` (Files API ``upload``, S3
+        an atomic upload at ``offset == 0`` (Files API ``upload``, S3
         ``PutObject``) push a single request rather than chunked
         read-modify-rewrites.
         """
-        if pos < 0:
-            raise ValueError("write_stream pos must be >= 0")
+        if offset < 0:
+            raise ValueError("write_stream offset must be >= 0")
         payload = src.read()
         if not payload:
             return 0
-        return self.write_bytes(payload, pos=pos)
+        return self.write_bytes(payload, offset=offset)
 
     # ------------------------------------------------------------------
     # Byte transfer — upload / download to any byte sink
@@ -1147,18 +1243,16 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             for child in source.iterdir():
                 (target / child.name).upload(child)
             return target
-        if isinstance(source, IO):
-            # IO cursors aren't :class:`Holder` — no ``_transfer_to``
-            # to inherit. Pull from the cursor (after an optional
-            # seek) and write into the target.
-            if offset:
-                source.seek(offset)
-            payload = source.read() if size < 0 else source.read(size)
-            target.write_bytes(payload)
-        elif size < 0 and offset == 0:
+        if not isinstance(source, IO) and size < 0 and offset == 0:
+            # Whole-payload :class:`Holder` source → defer to the
+            # backend-aware fast path (``shutil.copyfile``,
+            # ``write_local_path``, …). Sliced or IO sources fall
+            # through to the byte-pump below.
             source._transfer_to(target)
         else:
-            target.write_bytes(source.read_bytes(n=size, pos=offset))
+            target.write_bytes(
+                _read_slice_from_source(source, size=size, offset=offset),
+            )
         return target
 
     def download(
@@ -1201,7 +1295,9 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         if size < 0 and offset == 0:
             self._transfer_to(target)
         else:
-            target.write_bytes(self.read_bytes(n=size, pos=offset))
+            target.write_bytes(
+                _read_slice_from_source(self, size=size, offset=offset),
+            )
         return target
 
 
@@ -1240,6 +1336,29 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     def to_bytes(self) -> bytes:
         """Full payload as :class:`bytes` — alias for ``read_bytes()``."""
         return self.read_bytes()
+
+    def getvalue(self) -> bytes:
+        """Stdlib :class:`io.BytesIO` parity — alias for :meth:`to_bytes`."""
+        return self.to_bytes()
+
+    def decode(self, encoding: str = "utf-8", errors: str = "replace") -> str:
+        """Decode the whole payload as text. Cursorless — does not seek."""
+        return self.to_bytes().decode(encoding, errors=errors)
+
+    def to_base64(self, urlsafe: bool = True) -> str:
+        """Return the payload base64-encoded as an ASCII ``str``.
+
+        ``urlsafe=True`` (default) uses :func:`base64.urlsafe_b64encode`
+        — ``-`` / ``_`` in place of ``+`` / ``/`` so the result drops
+        cleanly into a URL or filename. ``urlsafe=False`` falls back
+        to the standard alphabet.
+        """
+        import base64
+
+        b = self.to_bytes()
+        if urlsafe:
+            return base64.urlsafe_b64encode(b).decode("ascii")
+        return base64.b64encode(b).decode("ascii")
 
     def xxh3_64(self):
         """Return an :class:`xxhash.xxh3_64` instance over the payload.
@@ -1318,6 +1437,31 @@ def _coerce_transfer_endpoint(value: Any) -> "Holder | IO":
         f"Holder.upload/download: expected a Holder, IO, str, or "
         f"os.PathLike endpoint; got {type(value).__name__}: {value!r}"
     )
+
+
+def _read_slice_from_source(
+    source: "Holder | IO", *, size: int, offset: int,
+) -> bytes:
+    """Pull ``[offset, offset+size)`` bytes from a coerced transfer source.
+
+    Hides the :class:`Holder` vs :class:`IO` split for the
+    upload/download read side:
+
+    - :class:`Holder` sources use ``read_bytes(size, offset)``
+      — cursorless positional read.
+    - :class:`IO` sources :meth:`~IO.seek` to ``offset`` (when
+      non-zero) and consume ``size`` bytes from the cursor, so
+      the caller-supplied stream position is the natural origin.
+
+    ``size < 0`` means "to EOF" in both cases.
+    """
+    from yggdrasil.io.base import IO
+
+    if isinstance(source, IO):
+        if offset:
+            source.seek(offset)
+        return source.read() if size < 0 else source.read(size)
+    return source.read_bytes(size=size, offset=offset)
 
 
 def _join_dir_hint(

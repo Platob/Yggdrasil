@@ -141,16 +141,16 @@ class TestSeekable:
     def test_reread_within_window(self) -> None:
         s = MemoryStream(b"abcdefghij", byte_size=64)
         # Force a pull.
-        assert s.read_bytes(n=5, pos=0) == b"abcde"
+        assert s.read_bytes(size=5, offset=0) == b"abcde"
         # Seek back inside the window — same bytes come back.
-        assert s.read_bytes(n=3, pos=2) == b"cde"
-        assert s.read_bytes(n=10, pos=0) == b"abcdefghij"
+        assert s.read_bytes(size=3, offset=2) == b"cde"
+        assert s.read_bytes(size=10, offset=0) == b"abcdefghij"
 
     def test_read_past_window_start_raises(self) -> None:
         s = MemoryStream(b"x" * 200, byte_size=64)
         s._pull_to_eof()  # window is now [136, 200)
         with pytest.raises(ValueError, match="behind the live window"):
-            s.read_bytes(n=10, pos=0)
+            s.read_bytes(size=10, offset=0)
 
     def test_read_within_window_after_slide(self) -> None:
         # Emit 200 bytes through a 64-byte window; bytes [136, 200)
@@ -160,8 +160,8 @@ class TestSeekable:
         s._pull_to_eof()
         assert s.window_start == 136
         # Position at window_start is the first valid offset.
-        assert s.read_bytes(n=10, pos=136) == payload[136:146]
-        assert s.read_bytes(n=64, pos=136) == payload[136:200]
+        assert s.read_bytes(size=10, offset=136) == payload[136:146]
+        assert s.read_bytes(size=64, offset=136) == payload[136:200]
 
     def test_seek_end_sentinel(self) -> None:
         s = MemoryStream(b"hello", byte_size=64)
@@ -174,38 +174,38 @@ class TestSeekable:
         # Drain so size is known.
         s.read_bytes()
         # pos=-2 -> size-2 = 4 -> "ef"
-        assert s.read_bytes(n=2, pos=-2) == b"ef"
+        assert s.read_bytes(size=2, offset=-2) == b"ef"
 
 
 class TestEOF:
     def test_read_to_eof_with_negative_n(self) -> None:
         s = MemoryStream(b"abcdef", byte_size=64)
-        assert s.read_bytes(n=-1, pos=0) == b"abcdef"
+        assert s.read_bytes(size=-1, offset=0) == b"abcdef"
         assert s.eof
 
     def test_read_more_than_available_caps_at_eof(self) -> None:
         s = MemoryStream(b"abc", byte_size=64)
         # Asking for 100 bytes returns only 3.
-        assert s.read_bytes(n=100, pos=0) == b"abc"
+        assert s.read_bytes(size=100, offset=0) == b"abc"
 
     def test_partial_pull_then_eof(self) -> None:
         # Source yields one chunk then signals EOF on the next call.
         chunks = iter([b"first", b""])
         s = MemoryStream(lambda n: next(chunks, b""), byte_size=64)
-        assert s.read_bytes(n=10, pos=0) == b"first"
+        assert s.read_bytes(size=10, offset=0) == b"first"
         assert s.eof
 
 
 class TestWrite:
     def test_append_at_end(self) -> None:
         s = MemoryStream(byte_size=64)
-        n = s.write_bytes(b"hello", pos=0)
+        n = s.write_bytes(b"hello", offset=0)
         assert n == 5
-        assert s.read_bytes(n=5, pos=0) == b"hello"
+        assert s.read_bytes(size=5, offset=0) == b"hello"
 
     def test_append_slides_window(self) -> None:
         s = MemoryStream(byte_size=8)
-        s.write_bytes(b"abcdefghij", pos=0)  # 10 bytes
+        s.write_bytes(b"abcdefghij", offset=0)  # 10 bytes
         assert s.size == 10
         assert s.window_start == 2
         assert bytes(s.memoryview()) == b"cdefghij"
@@ -213,19 +213,19 @@ class TestWrite:
     def test_overwrite_within_window(self) -> None:
         s = MemoryStream(b"abcdef", byte_size=64)
         s.read_bytes()
-        s.write_bytes(b"XY", pos=2)
-        assert s.read_bytes(n=6, pos=0) == b"abXYef"
+        s.write_bytes(b"XY", offset=2)
+        assert s.read_bytes(size=6, offset=0) == b"abXYef"
 
     def test_write_behind_window_raises(self) -> None:
         s = MemoryStream(byte_size=4)
-        s.write_bytes(b"abcdefgh", pos=0)  # window = [4, 8)
+        s.write_bytes(b"abcdefgh", offset=0)  # window = [4, 8)
         with pytest.raises(ValueError, match="behind the live window"):
-            s.write_bytes(b"!", pos=0)
+            s.write_bytes(b"!", offset=0)
 
     def test_write_past_end_raises(self) -> None:
         s = MemoryStream(byte_size=64)
         with pytest.raises(ValueError, match="past current end"):
-            s.write_bytes(b"x", pos=10)
+            s.write_bytes(b"x", offset=10)
 
 
 class TestTruncateClearReserve:
@@ -241,11 +241,11 @@ class TestTruncateClearReserve:
         s.read_bytes()
         s.truncate(6)
         assert s.size == 6
-        assert s.read_bytes(n=6, pos=0) == b"abc\x00\x00\x00"
+        assert s.read_bytes(size=6, offset=0) == b"abc\x00\x00\x00"
 
     def test_truncate_below_window_start_raises(self) -> None:
         s = MemoryStream(byte_size=4)
-        s.write_bytes(b"abcdefgh", pos=0)  # window_start = 4
+        s.write_bytes(b"abcdefgh", offset=0)  # window_start = 4
         with pytest.raises(ValueError, match="behind the live window start"):
             s.truncate(2)
 
@@ -256,7 +256,7 @@ class TestTruncateClearReserve:
 
     def test_clear_resets_window(self) -> None:
         s = MemoryStream(byte_size=4)
-        s.write_bytes(b"abcdef", pos=0)
+        s.write_bytes(b"abcdef", offset=0)
         s.clear()
         assert s.size == 0
         assert s.window_start == 0

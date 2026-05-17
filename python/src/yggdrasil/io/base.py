@@ -72,11 +72,9 @@ directly). Effects on top of a holder:
 
 from __future__ import annotations
 
-import base64
 import io as _stdlib_io
 import os
 import pathlib
-import struct
 import tempfile
 import time
 from collections.abc import Iterable
@@ -1080,17 +1078,22 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
     # ==================================================================
 
     def read(self, size: int = -1) -> bytes:
+        """Read up to *size* bytes from the cursor, advancing past them.
+
+        Stdlib :meth:`io.RawIOBase.read` semantic: ``size < 0`` /
+        ``None`` reads to EOF; otherwise reads up to ``size``
+        bytes, returning fewer at EOF. The holder's ``read_bytes``
+        would raise on an out-of-range window, so cap to remaining
+        before dispatching.
+        """
         remaining = max(0, self.size - self._pos)
         if size is None or size < 0:
             size = remaining
         else:
-            # Cap to remaining bytes — stdlib ``IOBase.read`` returns
-            # fewer than *size* when EOF is reached, so we do the same
-            # rather than asking the holder for an out-of-range slice.
             size = min(size, remaining)
         if size == 0:
             return b""
-        out = self._active().pread(size, self._pos)
+        out = self._active().read_bytes(size, offset=self._pos)
         self._pos += len(out)
         return out
 
@@ -1099,52 +1102,23 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         return self.read(-1)
 
     def readinto(self, b: Any) -> int:
-        mv = memoryview(b)
-        n = len(mv)
-        if n == 0:
-            return 0
-        chunk = self._active().pread(n, self._pos)
-        got = len(chunk)
-        if got:
-            mv[:got] = chunk
-            self._pos += got
+        """Fill *b* from the cursor, advance, return bytes written."""
+        got = self._active().readinto(b, offset=self._pos)
+        self._pos += got
         return got
 
     def readinto1(self, b: Any) -> int:
         return self.readinto(b)
 
     def readline(self, limit: int = -1) -> bytes:
-        size = self.size
-        if self._pos >= size:
-            return b""
-        if limit is None or limit < 0:
-            chunk_len = size - self._pos
-        else:
-            chunk_len = min(limit, size - self._pos)
-        if chunk_len <= 0:
-            return b""
-
-        chunk = self._active().pread(chunk_len, self._pos)
-        nl = chunk.find(b"\n")
-        if nl == -1:
-            self._pos += len(chunk)
-            return chunk
-
-        line = chunk[: nl + 1]
+        """Read up to the next newline from the cursor, advancing past it."""
+        line = self._active().readline(limit, offset=self._pos)
         self._pos += len(line)
         return line
 
     def readlines(self, hint: int = -1) -> list[bytes]:
-        lines: list[bytes] = []
-        total = 0
-        while True:
-            line = self.readline()
-            if not line:
-                break
-            lines.append(line)
-            total += len(line)
-            if hint is not None and hint > 0 and total >= hint:
-                break
+        lines = self._active().readlines(hint, offset=self._pos)
+        self._pos += sum(len(line) for line in lines)
         return lines
 
     def write(self, b: Any, *, update_stat: bool = True) -> int:
@@ -1172,10 +1146,11 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         return self.write_bytes(memoryview(b), update_stat=update_stat)
 
     def write_bytes(self, b: BytesLike, *, update_stat: bool = True) -> int:
+        """Splice *b* at the cursor, advance, return bytes written."""
         mv = _as_byte_mv(b)
         if len(mv) == 0:
             return 0
-        n = self._active().pwrite(mv, self._pos, update_stat=update_stat)
+        n = self._active().write_mv(mv, self._pos, update_stat=update_stat)
         self._pos += n
         return n
 
@@ -1198,26 +1173,14 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         writes work (``io.upload(src).write(b)``).
         """
         from yggdrasil.io.holder import (
-            Holder,
             _coerce_transfer_endpoint,
+            _read_slice_from_source,
         )
 
         source = _coerce_transfer_endpoint(src)
-        if isinstance(source, IO):
-            # IO source: ``offset`` seeks the source cursor;
-            # ``read`` advances it. The destination side is *this*
-            # IO's cursor, advanced by ``write_bytes``.
-            if offset:
-                source.seek(offset)
-            payload = source.read() if size < 0 else source.read(size)
-        elif isinstance(source, Holder):
-            payload = source.read_bytes(n=size, pos=offset)
-        else:  # pragma: no cover — coercion only returns Holder/IO
-            raise TypeError(
-                f"IO.upload: expected a Holder, IO, str, or "
-                f"os.PathLike source; got {type(source).__name__}."
-            )
-        self.write_bytes(payload)
+        self.write_bytes(
+            _read_slice_from_source(source, size=size, offset=offset),
+        )
         return self
 
     def download(
@@ -1244,11 +1207,15 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             _coerce_transfer_endpoint,
             _default_download_target,
             _join_dir_hint,
+            _read_slice_from_source,
         )
 
-        if offset:
-            self.seek(self._pos + offset)
-        payload = self.read() if size < 0 else self.read(size)
+        # ``offset`` on self is cursor-relative — the helper does the
+        # absolute seek + read pair, advancing the cursor past the
+        # bytes it consumed.
+        payload = _read_slice_from_source(
+            self, size=size, offset=self._pos + offset,
+        )
 
         if to is None:
             to = _default_download_target(self._transfer_filename())
@@ -1333,26 +1300,23 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
             pass
 
     # ==================================================================
-    # Convenience drains
+    # Convenience drains — cursorless pass-throughs to the holder
     # ==================================================================
 
     def to_bytes(self) -> bytes:
         """Whole-payload snapshot from the active holder. Cursor untouched."""
-        return self._active().read_bytes()
+        return self._active().to_bytes()
 
     def getvalue(self) -> bytes:
         """Stdlib-compatible alias for :meth:`to_bytes`."""
-        return self.to_bytes()
+        return self._active().getvalue()
 
     def decode(self, encoding: str = "utf-8", errors: str = "replace") -> str:
         """Decode the whole payload as text. Cursor untouched."""
-        return self.to_bytes().decode(encoding, errors=errors)
+        return self._active().decode(encoding, errors=errors)
 
     def to_base64(self, urlsafe: bool = True) -> str:
-        b = self.to_bytes()
-        if urlsafe:
-            return base64.urlsafe_b64encode(b).decode("ascii")
-        return base64.b64encode(b).decode("ascii")
+        return self._active().to_base64(urlsafe=urlsafe)
 
     # ==================================================================
     # Iteration
@@ -1368,41 +1332,53 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         return line
 
     # ==================================================================
-    # Structured binary I/O — fixed-width little-endian primitives
+    # Structured binary I/O — cursor-anchored wrappers over Holder
     # ==================================================================
+    #
+    # Every primitive defers to the cursorless equivalent on the
+    # bound holder. The holder reads / writes at ``self._pos`` and
+    # the IO advances the cursor by the fixed-width count.
 
-    def _read_exact(self, n: int) -> bytes:
-        data = self.read(n)
-        if len(data) != n:
-            raise EOFError(f"expected {n} bytes, got {len(data)}")
-        return data
+    def _read_struct(self, method: str, width: int) -> Any:
+        value = getattr(self._active(), method)(offset=self._pos)
+        self._pos += width
+        return value
 
-    def read_int8(self) -> int: return struct.unpack("<b", self._read_exact(1))[0]
-    def write_int8(self, v: int) -> int: return self.write_bytes(struct.pack("<b", int(v)))
-    def read_uint8(self) -> int: return struct.unpack("<B", self._read_exact(1))[0]
-    def write_uint8(self, v: int) -> int: return self.write_bytes(struct.pack("<B", int(v)))
-    def read_int16(self) -> int: return struct.unpack("<h", self._read_exact(2))[0]
-    def write_int16(self, v: int) -> int: return self.write_bytes(struct.pack("<h", int(v)))
-    def read_uint16(self) -> int: return struct.unpack("<H", self._read_exact(2))[0]
-    def write_uint16(self, v: int) -> int: return self.write_bytes(struct.pack("<H", int(v)))
-    def read_int32(self) -> int: return struct.unpack("<i", self._read_exact(4))[0]
-    def write_int32(self, v: int) -> int: return self.write_bytes(struct.pack("<i", int(v)))
-    def read_uint32(self) -> int: return struct.unpack("<I", self._read_exact(4))[0]
-    def write_uint32(self, v: int) -> int: return self.write_bytes(struct.pack("<I", int(v)))
-    def read_int64(self) -> int: return struct.unpack("<q", self._read_exact(8))[0]
-    def write_int64(self, v: int) -> int: return self.write_bytes(struct.pack("<q", int(v)))
-    def read_uint64(self) -> int: return struct.unpack("<Q", self._read_exact(8))[0]
-    def write_uint64(self, v: int) -> int: return self.write_bytes(struct.pack("<Q", int(v)))
-    def read_f32(self) -> float: return struct.unpack("<f", self._read_exact(4))[0]
-    def write_f32(self, v: float) -> int: return self.write_bytes(struct.pack("<f", float(v)))
-    def read_f64(self) -> float: return struct.unpack("<d", self._read_exact(8))[0]
-    def write_f64(self, v: float) -> int: return self.write_bytes(struct.pack("<d", float(v)))
+    def _write_struct(self, method: str, value: Any, width: int) -> int:
+        getattr(self._active(), method)(value, offset=self._pos)
+        self._pos += width
+        return width
+
+    def read_int8(self) -> int: return self._read_struct("read_int8", 1)
+    def write_int8(self, v: int) -> int: return self._write_struct("write_int8", v, 1)
+    def read_uint8(self) -> int: return self._read_struct("read_uint8", 1)
+    def write_uint8(self, v: int) -> int: return self._write_struct("write_uint8", v, 1)
+    def read_int16(self) -> int: return self._read_struct("read_int16", 2)
+    def write_int16(self, v: int) -> int: return self._write_struct("write_int16", v, 2)
+    def read_uint16(self) -> int: return self._read_struct("read_uint16", 2)
+    def write_uint16(self, v: int) -> int: return self._write_struct("write_uint16", v, 2)
+    def read_int32(self) -> int: return self._read_struct("read_int32", 4)
+    def write_int32(self, v: int) -> int: return self._write_struct("write_int32", v, 4)
+    def read_uint32(self) -> int: return self._read_struct("read_uint32", 4)
+    def write_uint32(self, v: int) -> int: return self._write_struct("write_uint32", v, 4)
+    def read_int64(self) -> int: return self._read_struct("read_int64", 8)
+    def write_int64(self, v: int) -> int: return self._write_struct("write_int64", v, 8)
+    def read_uint64(self) -> int: return self._read_struct("read_uint64", 8)
+    def write_uint64(self, v: int) -> int: return self._write_struct("write_uint64", v, 8)
+    def read_f32(self) -> float: return self._read_struct("read_f32", 4)
+    def write_f32(self, v: float) -> int: return self._write_struct("write_f32", v, 4)
+    def read_f64(self) -> float: return self._read_struct("read_f64", 8)
+    def write_f64(self, v: float) -> int: return self._write_struct("write_f64", v, 8)
     def read_bool(self) -> bool: return bool(self.read_uint8())
     def write_bool(self, v: bool) -> int: return self.write_uint8(1 if v else 0)
 
     def read_bytes_u32(self) -> bytes:
         """Length-prefixed (uint32 LE) bytes blob."""
-        return self._read_exact(self.read_uint32())
+        n = self.read_uint32()
+        data = self.read(n)
+        if len(data) != n:
+            raise EOFError(f"expected {n} bytes, got {len(data)}")
+        return data
 
     def write_bytes_u32(self, data: BytesLike) -> int:
         mv = memoryview(data)
