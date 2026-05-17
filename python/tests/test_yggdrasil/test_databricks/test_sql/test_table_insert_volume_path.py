@@ -10,7 +10,7 @@ single instance to verify the full insert plumbs the staging
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.table.table import Table
@@ -31,7 +31,20 @@ def _table(
     """Build a :class:`Table` with a mocked service so ``self.client``
     resolves without touching a real Databricks workspace."""
     service = MagicMock()
-    service.client.workspace_client.return_value = workspace or MagicMock()
+    ws = workspace or MagicMock()
+    service.client.workspace_client.return_value = ws
+    # ``Table.staging_volume`` builds a ``Volume`` from
+    # ``service.volumes`` whose client must reach the same workspace
+    # the table's client does — the minted VolumePath calls
+    # ``files.upload`` through *Volume.client.workspace_client*.
+    service.volumes.client.workspace_client.return_value = ws
+    # ``Table.staging_volume`` runs ``client.safe_tag_value`` on the
+    # table name to derive the ``stg_<table>`` volume — mirror the
+    # production behavior (strip/lower) so test assertions can match
+    # the rendered volume name.
+    service.client.safe_tag_value.side_effect = lambda v, repl="_": str(v).replace(
+        "/", repl,
+    )
     return Table(
         service=service,
         catalog_name=catalog_name,
@@ -52,7 +65,9 @@ class TestInsertVolumePath:
         path = tbl.insert_volume_path()
         assert isinstance(path, VolumePath)
         full = path.full_path()
-        assert full.startswith("/Volumes/cat/sch/tmp_tbl/.sql")
+        # ``staging_volume`` is ``stg_<table>`` under the table's
+        # catalog / schema; staging files land in ``.sql/tmp/``.
+        assert full.startswith("/Volumes/cat/sch/stg_tbl/.sql/tmp/")
         assert full.endswith(".parquet")
         # Default keeps the staged Parquet temporary so the holder
         # cleans up after itself.
@@ -70,13 +85,13 @@ class TestInsertVolumePath:
         other = _table("cat2", "sch2", "extra")
         path = tbl.insert_volume_path(other)
         full = path.full_path()
-        assert "/Volumes/cat2/sch2/tmp_extra/.sql" in full
+        assert "/Volumes/cat2/sch2/stg_extra/.sql/tmp/" in full
 
     def test_unique_per_call(self) -> None:
         tbl = _table()
         a = tbl.insert_volume_path().full_path()
         b = tbl.insert_volume_path().full_path()
-        # Filename carries epoch-ms + 8 bytes of randomness so two
+        # Filename carries epoch-ms + 8 hex chars of randomness so two
         # successive calls never collide.
         assert a != b
 
@@ -96,34 +111,13 @@ class TestInsertVolumePath:
 
 class TestInsertVolumePathIsMockable:
 
-    def test_delegates_to_volumepath_staging_path(self) -> None:
-        """``insert_volume_path`` is a thin wrapper — patching
-        :meth:`VolumePath.staging_path` should be enough to
-        observe (or replace) the path it produces."""
-        tbl = _table("cat", "sch", "tbl")
-        sentinel = MagicMock(spec=VolumePath)
-        with patch.object(
-            VolumePath, "staging_path", return_value=sentinel,
-        ) as staging:
-            out = tbl.insert_volume_path(temporary=False)
-        assert out is sentinel
-        kwargs = staging.call_args.kwargs
-        assert kwargs["catalog_name"] == "cat"
-        assert kwargs["schema_name"] == "sch"
-        assert kwargs["resource_name"] == "tbl"
-        assert kwargs["temporary"] is False
-        # ``self.client`` is forwarded so :meth:`VolumePath.staging_path`
-        # can resolve the workspace lazily through the aggregator —
-        # same shape it accepts in production.
-        assert kwargs["client"] is tbl.client
-
     def test_instance_override_swaps_staging_target(self) -> None:
         """Replacing the bound method on a single instance lets a
         test pin the staging path (and its workspace) without
-        monkey-patching the :class:`VolumePath` class."""
+        monkey-patching the underlying staging-volume plumbing."""
         tbl = _table()
         custom = VolumePath(
-            "/Volumes/test/test/tmp/.sql/test/test/tbl/part-fixed.parquet",
+            "/Volumes/test/test/stg_tbl/.sql/tmp/part-fixed.parquet",
             client=MagicMock(),
         )
         tbl.insert_volume_path = lambda *a, **kw: custom  # type: ignore[assignment]

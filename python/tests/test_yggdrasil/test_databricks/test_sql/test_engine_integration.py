@@ -508,7 +508,9 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         except ImportError:
             self.skipTest("pyspark is not installed in this environment")
 
-        from yggdrasil.databricks.fs import VolumePath
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.databricks.table.table import Table
 
         data = pa.table(
             {
@@ -516,13 +518,17 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
                 "label": pa.array(["m", "n"], type=pa.string()),
             }
         )
-        # Stage the volume up-front via the new factory shortcut so the
-        # caller can hand the engine a ready-to-read VolumePath.
-        path = VolumePath.staging_path(
+        # Stage the volume up-front through the table's staging path so
+        # the caller can hand the engine a ready-to-read VolumePath.
+        table = Table(
+            service=self.client.tables,
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
-            resource_name="engine_spark_volume",
-            tabular=data,
+            table_name="engine_spark_volume",
+        )
+        path = table.insert_volume_path(temporary=False)
+        path.as_media(media_type=MediaTypes.PARQUET).write_table(
+            data, mode=Mode.OVERWRITE,
         )
         try:
             result = self.engine.execute(
@@ -549,12 +555,14 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_volume_path_staging_path_writes_tabular_in_one_call(self) -> None:
-        """``VolumePath.staging_path(tabular=...)`` mints the path
-        *and* writes the supplied tabular as Parquet — replaces the
-        previous two-step ``staging_path(...)`` followed by
-        ``as_media(PARQUET).write_table(...)`` pattern."""
-        from yggdrasil.databricks.fs import VolumePath
+    def test_table_insert_volume_path_writes_parquet(self) -> None:
+        """``Table.insert_volume_path`` mints the staging path; writing
+        the Parquet through ``as_media(PARQUET).write_table`` is the
+        two-step pattern the warehouse insert path drives — verify the
+        warehouse can read the file back."""
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.databricks.table.table import Table
 
         data = pa.table(
             {
@@ -562,12 +570,15 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
                 "label": pa.array(["a", "b", "c"], type=pa.string()),
             }
         )
-        path = VolumePath.staging_path(
+        table = Table(
+            service=self.client.tables,
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
-            resource_name="staging_factory",
-            tabular=data,
-            client=self.client
+            table_name="staging_factory",
+        )
+        path = table.insert_volume_path(temporary=False)
+        path.as_media(media_type=MediaTypes.PARQUET).write_table(
+            data, mode=Mode.OVERWRITE,
         )
         try:
             # File exists with the written bytes (size > 0).

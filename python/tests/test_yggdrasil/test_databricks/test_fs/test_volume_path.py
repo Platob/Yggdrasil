@@ -389,57 +389,6 @@ class TestListing:
         workspace.files.get_directory_metadata.assert_not_called()
 
 
-class TestStagingPath:
-
-    def test_default_layout(self, workspace, client) -> None:
-        p = VolumePath.staging_path(
-            catalog_name="cat",
-            schema_name="sch",
-            resource_name="tbl",
-            client=client,
-        )
-        full = p.full_path()
-        assert full.startswith("/Volumes/cat/sch/tmp_tbl/.sql/")
-        assert full.endswith(".parquet")
-        assert p.temporary is True
-        assert p.workspace_client is workspace
-
-    def test_temporary_false(self, workspace, client) -> None:
-        p = VolumePath.staging_path(
-            catalog_name="cat",
-            schema_name="sch",
-            temporary=False,
-            client=client,
-        )
-        assert p.temporary is False
-        assert "/cat/sch/tmp_default/.sql/" in p.full_path()
-
-    def test_unique_per_call(self, workspace, client) -> None:
-        a = VolumePath.staging_path(
-            catalog_name="c", schema_name="s", client=client,
-        )
-        b = VolumePath.staging_path(
-            catalog_name="c", schema_name="s", client=client,
-        )
-        assert a.full_path() != b.full_path()
-
-    def test_client_aggregator(self, workspace, client) -> None:
-        p = VolumePath.staging_path(
-            catalog_name="c", schema_name="s", client=client,
-        )
-        assert p.workspace_client is workspace
-
-    def test_segments_are_sanitized(self, workspace, client) -> None:
-        p = VolumePath.staging_path(
-            catalog_name="`cat`",
-            schema_name="  sch  ",
-            resource_name="a/b",
-            client=client,
-        )
-        full = p.full_path()
-        assert "/cat/sch/tmp_a_b/.sql/" in full
-
-
 class TestVolumeAutoCreate:
     """``_call_ensuring_parents`` should walk the cheap path first
     (``create_directory`` on the parent) and only blind-create the

@@ -37,19 +37,17 @@ from __future__ import annotations
 import datetime as dt
 import io
 import logging
-import os
 import re
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 
 from databricks.sdk.errors import PermissionDenied
 
 from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
 from yggdrasil.data.enums import Mode, ModeLike, Scheme
-from yggdrasil.data.enums.media_type import MediaType, MediaTypes
+from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
@@ -74,15 +72,6 @@ __all__ = ["VolumePath", "VolumeCredentialsRefresher"]
 logger = logging.getLogger(__name__)
 
 
-# Filename produced by ``staging_path``:
-#     tmp-{start_epoch_s}-{end_epoch_s}-{seed}.parquet
-# ``end_epoch_s`` is the TTL the external sweepers honour, so the in-process
-# sweeper keys off the same field.
-_STAGING_LEAF_RE = re.compile(
-    r"^tmp-(?P<start>\d+)-(?P<end>\d+)-[0-9a-f]+\.parquet$",
-)
-
-
 class VolumePath(DatabricksPath):
     """Path under ``/Volumes/<cat>/<sch>/<vol>/...`` via the Files API.
 
@@ -100,13 +89,6 @@ class VolumePath(DatabricksPath):
     # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
     # import cycle.
-
-    # Process-wide "already swept" set, keyed by ``(catalog, schema, resource)``
-    # so concurrent ``staging_path`` calls collapse to one sweep per staging
-    # directory. Insert under the lock *before* launching the sweeper thread
-    # so duplicate triggers don't double-launch.
-    _STAGING_SWEPT: ClassVar["set[Tuple[str, str, str]]"] = set()
-    _STAGING_SWEPT_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
@@ -376,210 +358,6 @@ class VolumePath(DatabricksPath):
         passed through as the credential mode.
         """
         return self.volume.arrow_filesystem(mode=operation, region=region)
-
-    # ==================================================================
-    # SQL staging factory
-    # ==================================================================
-
-    @classmethod
-    def staging_path(
-        cls,
-        *,
-        catalog_name: str,
-        schema_name: str,
-        resource_name: Optional[str] = None,
-        temporary: bool = True,
-        client: Any = None,
-        max_lifetime: Optional[float] = None,
-        tabular: Any = None,
-    ) -> "VolumePath":
-        """Mint a fresh Parquet staging file under
-        ``/Volumes/<cat>/<sch>/tmp/.sql/<cat>/<sch>/<resource>/part-...``.
-
-        The leaf filename is unique per call (epoch-ms + 8 bytes of
-        randomness). Pass ``temporary=False`` to keep the file past
-        process exit; otherwise it is unlinked when the holder is
-        released.
-
-        Pass ``client`` — a :class:`DatabricksClient` aggregator — to
-        bind the freshly-minted path explicitly. When omitted, the
-        path lazy-resolves through :meth:`DatabricksClient.current`
-        on first use.
-
-        ``max_lifetime`` is accepted for backwards compatibility —
-        external sweepers honour it via the ``part-{epoch_ms}-...``
-        filename convention.
-
-        ``tabular`` — optional :class:`Tabular` (or anything
-        :meth:`Tabular.write_table` accepts: ``pa.Table`` / pandas /
-        polars / pyspark frames, list of dicts, ...).  When supplied,
-        the data is written to the freshly-minted path as Parquet
-        before returning, so a single call yields a populated staging
-        file ready to reference from SQL.  Cleanup matches the
-        ``temporary`` flag: a write failure unlinks the path when
-        ``temporary=True``.
-
-        Side effect: on first call per ``(cat, sch, resource)`` in
-        this process, a background sweep of the staging directory
-        deletes files whose embedded TTL (``end_epoch_s`` segment of
-        the leaf name) has already passed. The sweep is fire-and-
-        forget; staging never blocks on it and failures are logged
-        only.
-        """
-        cat = _staging_clean_part(catalog_name)
-        sch = _staging_clean_part(schema_name)
-        tbl = _staging_clean_part(resource_name or "default")
-
-        start_epoch_s = int(time.time())
-        end_epoch_s = start_epoch_s + int(max_lifetime or 3600)
-        seed = os.urandom(4).hex()
-        leaf = f"tmp-{start_epoch_s}-{end_epoch_s}-{seed}.parquet"
-        path = f"/{cat}/{sch}/tmp_{tbl}/.sql/{leaf}"
-
-        staged = cls(
-            url=URL(scheme=cls.scheme, path=path),
-            client=client,
-            temporary=temporary,
-        )
-
-        # Opportunistic, one-shot-per-process staging sweep. Runs in
-        # the background — the new staging path is returned immediately.
-        cls._maybe_sweep_staging(
-            catalog=cat,
-            schema=sch,
-            resource=tbl,
-            client=client,
-        )
-
-        if tabular is None:
-            return staged
-
-        try:
-            staged.as_media(media_type=MediaTypes.PARQUET).write_table(
-                tabular,
-                mode=Mode.OVERWRITE
-            )
-        except Exception:
-            if staged.temporary:
-                staged.clear()
-            raise
-        return staged
-
-    # ==================================================================
-    # Staging sweep — one-time per (cat, sch, resource) per process
-    # ==================================================================
-
-    @classmethod
-    def _maybe_sweep_staging(
-        cls,
-        *,
-        catalog: str,
-        schema: str,
-        resource: str,
-        client: Any,
-    ) -> None:
-        """Launch a one-shot background sweep of the staging directory.
-
-        Idempotent per process: the ``(catalog, schema, resource)`` key is
-        inserted into :attr:`_STAGING_SWEPT` under the lock *before* the
-        thread is launched, so concurrent ``staging_path`` calls on the
-        same directory don't double-launch. The thread is a daemon — it
-        never blocks process exit and never raises into the caller.
-        """
-        key = (catalog, schema, resource)
-
-        if key in cls._STAGING_SWEPT:
-            return
-
-        with cls._STAGING_SWEPT_LOCK:
-            if key in cls._STAGING_SWEPT:
-                return
-            cls._STAGING_SWEPT.add(key)
-
-        thread = threading.Thread(
-            target=cls._sweep_staging,
-            kwargs={
-                "catalog": catalog,
-                "schema": schema,
-                "resource": resource,
-                "client": client,
-            },
-            name=f"volume-staging-sweep-{catalog}.{schema}.{resource}",
-            daemon=True,
-        )
-        thread.start()
-
-    @classmethod
-    def _sweep_staging(
-        cls,
-        *,
-        catalog: str,
-        schema: str,
-        resource: str,
-        client: Any,
-    ) -> None:
-        """List the staging directory and delete files whose TTL has passed.
-
-        Best-effort: every failure mode (missing directory, listing
-        permission denied, individual delete failures) is swallowed
-        and logged. The sweep MUST NOT raise — it is invoked from a
-        daemon thread and any uncaught exception would just disappear
-        into the void anyway, but explicit handling keeps the log
-        trail readable.
-
-        Filenames are matched against :data:`_STAGING_LEAF_RE`; only
-        files whose embedded ``end_epoch_s`` is strictly in the past
-        are deleted. Anything else (foreign files, in-flight stagers
-        from other processes whose TTL hasn't elapsed, oddly-named
-        leftovers) is left alone.
-        """
-        staging_dir = cls(
-            url=URL(
-                scheme=cls.scheme,
-                path=f"/{catalog}/{schema}/tmp_{resource}/.sql",
-            ),
-            client=client,
-        )
-        now = int(time.time())
-        deleted = 0
-        scanned = 0
-        try:
-            for child in staging_dir._ls(recursive=False):
-                scanned += 1
-                leaf = (child.url.path or "").rsplit("/", 1)[-1]
-                match = _STAGING_LEAF_RE.match(leaf)
-                if not match:
-                    continue
-                try:
-                    end_epoch_s = int(match.group("end"))
-                except (TypeError, ValueError):
-                    continue
-                if end_epoch_s >= now:
-                    continue
-                try:
-                    child._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
-                    deleted += 1
-                except Exception:
-                    logger.debug(
-                        "Staging sweep failed to delete %r",
-                        child,
-                        exc_info=True,
-                    )
-        except Exception:
-            # Directory missing, permission denied, transient SDK
-            # error — all benign. Log at debug so production logs
-            # stay quiet but the trail exists for diagnosis.
-            logger.debug(
-                "Staging sweep aborted for /%s/%s/tmp_%s/.sql",
-                catalog, schema, resource,
-                exc_info=True,
-            )
-            return
-        if deleted or scanned:
-            logger.debug(
-                "Staging sweep /%s/%s/tmp_%s/.sql scanned=%d deleted=%d",
-                catalog, schema, resource, scanned, deleted,
-            )
 
     # ==================================================================
     # Listing
@@ -1072,10 +850,6 @@ def _looks_like_already_exists(exc: BaseException) -> bool:
         return True
     return "already exists" in str(exc).lower()
 
-
-def _staging_clean_part(value: str) -> str:
-    """Strip backticks/whitespace and forbid ``/`` in path segments."""
-    return str(value).strip().strip("`").replace("/", "_")
 
 # Late-bound: ``VolumePath._SERVICE_CLASS`` is ``Volumes`` once the
 # volume package finishes importing — avoids the

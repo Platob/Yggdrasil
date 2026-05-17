@@ -145,10 +145,12 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         ghost.invalidate_singleton()
         self.assertIs(ghost._stat_uncached().kind, IOKind.MISSING)
 
-    def test_staging_path_round_trip(self) -> None:
-        """:meth:`VolumePath.staging_path` is the SQL-engine helper —
-        check that the minted path actually round-trips against the
-        live Files API."""
+    def test_table_insert_volume_path_round_trip(self) -> None:
+        """:meth:`Table.insert_volume_path` is the SQL-engine staging
+        entry point — check that the minted path actually round-trips
+        against the live Files API."""
+        from yggdrasil.databricks.table.table import Table
+
         # Borrow the configured root's catalog / schema so the
         # staging helper writes somewhere we have access to.
         parts = self.base_root.lstrip("/").split("/")
@@ -156,17 +158,17 @@ class TestVolumePathIntegration(DatabricksIntegrationCase):
         if len(parts) < 4 or parts[0] != "Volumes":
             self.skipTest(
                 f"DATABRICKS_INTEGRATION_VOLUME_DIR={self.base_root!r} is not "
-                "a Unity Catalog volume path; skipping staging_path probe."
+                "a Unity Catalog volume path; skipping insert_volume_path probe."
             )
         catalog, schema = parts[1], parts[2]
 
-        staged = VolumePath.staging_path(
+        table = Table(
+            service=self.client.tables,
             catalog_name=catalog,
             schema_name=schema,
-            resource_name="integration",
-            client=self.client,
-            temporary=False,
+            table_name="integration",
         )
+        staged = table.insert_volume_path(temporary=False)
         try:
             staged.parent.mkdir(parents=True, exist_ok=True)
             staged.write_bytes(b"staged")
