@@ -144,6 +144,67 @@ def _resolve_subclass(
     return Memory
 
 
+def _resolve_format_target(
+    cls: type,
+    *,
+    media_type: Any,
+    path: Any,
+    data: Any,
+    holder: "Holder | None",
+) -> "type | None":
+    """Resolve the registered :class:`Tabular` class for the given inputs.
+
+    Resolution priority:
+
+    1. Explicit *media_type* kwarg.
+    2. *path* — extension via :meth:`URL.infer_media_type`.
+    3. *data* — same, when it's URL-shaped (``str`` / ``pathlib.PurePath``
+       / :class:`URL`); bytes-like and file-like inputs are skipped.
+    4. *holder*'s stamped ``media_type``.
+
+    Returns ``None`` when no media type can be resolved or no registered
+    leaf exists for the resolved type. Side-effect-imports
+    :mod:`yggdrasil.io.primitive` so every concrete leaf's
+    ``mime_type`` claim is in the registry by the time we look up.
+    """
+    # Side-effect import: ensures every leaf module has registered its
+    # mime_type by the time we hit the registry.
+    import yggdrasil.io.primitive  # noqa: F401
+    from yggdrasil.io.tabular.base import Tabular
+
+    mt = (
+        MediaType.from_(media_type, default=None)
+        if media_type is not None else None
+    )
+
+    if mt is None:
+        for src in (path, data):
+            if src is None or isinstance(src, (bytes, bytearray, memoryview)):
+                continue
+            if hasattr(src, "read") and not isinstance(src, str):
+                continue
+            try:
+                url_obj = URL.from_(src)
+            except Exception:
+                continue
+            mt = url_obj.infer_media_type(default=None)
+            if mt is not None:
+                break
+        if mt is None and holder is not None:
+            try:
+                # Read the holder's stamped media_type directly instead
+                # of through :meth:`stat()` — a remote-backed holder's
+                # ``stat()`` is a network probe, but ``media_type``
+                # resolves from the URL extension cache without one.
+                mt = getattr(holder, "media_type", None)
+            except Exception:
+                pass
+
+    if mt is None:
+        return None
+    return Tabular.class_for_media_type(mt, default=None)
+
+
 class Holder(Singleton, URLBased, Tabular[O], Disposable):
     """Position-addressable byte holder + :class:`Disposable` lifecycle
     + :class:`Tabular` view of its bytes.
@@ -250,23 +311,25 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
     ):
         """Create a new holder.
 
-        When called on the abstract :class:`Holder` itself, dispatches
-        to the concrete subclass implied by the inputs (scheme/url
-        registry → ``binary`` → ``path`` → ``data`` type → memory
-        default). When called on a concrete subclass directly, allocates
-        an instance of that subclass.
+        Two layered dispatches:
+
+        1. **Scheme dispatch** — when called on the abstract
+           :class:`Holder` itself, routes to the concrete storage
+           subclass implied by the inputs (scheme/url registry →
+           ``binary`` → ``path`` → ``data`` type → memory default).
+        2. **Format dispatch** — when called on an :class:`IO`
+           subclass, routes to the registered format leaf
+           (:class:`CsvIO`, :class:`ParquetIO`, …) implied by an
+           explicit ``media_type``, the ``path``'s extension, the
+           ``data``'s URL form, or the bound ``holder``'s stamped
+           media type. Storage leaves (:class:`Memory` /
+           :class:`LocalPath` / …) never satisfy the gate because the
+           registry maps onto IO leaves.
 
         Non-routing kwargs (``stat``, ``temporary``, ``media_type``,
-        ``auto_open``, …) ride through ``**kwargs`` so subclass
-        ``__new__`` and the eventual ``__init__`` see them.
+        ``holder``, ``auto_open``, …) ride through ``**kwargs`` so
+        subclass ``__new__`` and the eventual ``__init__`` see them.
         """
-        # Scheme/data dispatch fires only on the abstract :class:`Holder`
-        # itself. After the Holder ↔ IO merge, :class:`IO` is also a
-        # Holder subclass and has its own concrete subclasses
-        # (``BytesIO``, ``ParquetIO``, …); those go through
-        # :meth:`IO.__new__`'s format dispatch, not the scheme registry.
-        # Concrete storage leaves (Memory, LocalPath, …) have no
-        # subclasses of their own, so they fall through to allocation.
         if cls is Holder:
             target = _resolve_subclass(
                 scheme=scheme, url=url, binary=binary, path=path, data=data,
@@ -281,6 +344,46 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 path=path,
                 **kwargs,
             )
+
+        # Format dispatch — only meaningful for the IO hierarchy; the
+        # registry maps :class:`MediaType` onto registered IO leaves.
+        # Function-scope import: :mod:`yggdrasil.io.base` imports this
+        # module, so it isn't available at module load.
+        from yggdrasil.io.base import IO
+        if issubclass(cls, IO):
+            target = _resolve_format_target(
+                cls,
+                media_type=kwargs.get("media_type"),
+                path=path,
+                data=data,
+                holder=kwargs.get("holder"),
+            )
+            if target is not None and target is not cls and issubclass(target, IO):
+                instance = target.__new__(
+                    target,
+                    data=data,
+                    stat=stat,
+                    scheme=scheme,
+                    url=url,
+                    binary=binary,
+                    path=path,
+                    **kwargs,
+                )
+                # When target isn't a subclass of cls (sideways routes
+                # like ``BytesIO(path="x.parquet")`` → :class:`ParquetIO`,
+                # which inherits :class:`IO` directly), Python won't
+                # auto-invoke ``__init__`` on the returned instance —
+                # do it ourselves so the instance is fully set up.
+                if not isinstance(instance, cls):
+                    type(instance).__init__(
+                        instance,
+                        data=data,
+                        path=path,
+                        binary=binary,
+                        url=url,
+                        **kwargs,
+                    )
+                return instance
 
         # Forward construction args to :class:`Singleton.__new__` so the
         # default ``_singleton_key`` (or a subclass override) can read

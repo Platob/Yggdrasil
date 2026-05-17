@@ -137,71 +137,6 @@ def _as_byte_mv(data: BytesLike) -> memoryview:
     return mv
 
 
-def _resolve_format_target(
-    cls: type,
-    *,
-    media_type: Any,
-    path: Any,
-    data: Any,
-    holder: "Holder | None",
-) -> "type | None":
-    """Resolve the registered :class:`Tabular` class for the given inputs.
-
-    Resolution priority:
-
-    1. Explicit *media_type* kwarg.
-    2. *path* — extension via :meth:`URL.infer_media_type`.
-    3. *data* — same, when it's URL-shaped (``str`` / ``pathlib.PurePath``
-       / :class:`URL`); bytes-like and file-like inputs are skipped.
-    4. *holder*'s stamped ``stat().media_type``.
-
-    Returns ``None`` when no media type can be resolved or no registered
-    leaf exists for the resolved type. Side-effect-imports
-    :mod:`yggdrasil.io.primitive` so every concrete leaf's
-    ``mime_type`` claim is in the registry by the time we look up.
-    """
-    # Side-effect import: ensures every leaf module has registered its
-    # mime_type by the time we hit the registry.
-    import yggdrasil.io.primitive  # noqa: F401
-    from yggdrasil.data.enums.media_type import MediaType
-    from yggdrasil.io.tabular.base import Tabular
-
-    mt = (
-        MediaType.from_(media_type, default=None)
-        if media_type is not None else None
-    )
-
-    if mt is None:
-        from yggdrasil.io.url import URL
-        for src in (path, data):
-            if src is None or isinstance(src, (bytes, bytearray, memoryview)):
-                continue
-            if hasattr(src, "read") and not isinstance(src, str):
-                continue
-            try:
-                url = URL.from_(src)
-            except Exception:
-                continue
-            mt = url.infer_media_type(default=None)
-            if mt is not None:
-                break
-        if mt is None and holder is not None:
-            try:
-                # Read the holder's stamped media_type directly instead
-                # of through :meth:`stat()` — a remote-backed holder's
-                # ``stat()`` is a network probe, but ``media_type``
-                # resolves from the URL extension cache without one.
-                mt = getattr(holder, "media_type", None)
-            except Exception:
-                pass
-
-    if mt is None:
-        return None
-    return Tabular.class_for_media_type(mt, default=None)
-
-
-
-
 def _local_path_for_handle(obj: Any) -> Optional[str]:
     """Return the on-disk path for a local file handle, or ``None``.
 
@@ -302,29 +237,23 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         url: Any = None,
         **kwargs: Any,
     ):
-        """Allocate the instance, redirect by media type, and resolve a holder.
+        """Allocate the instance and resolve a holder.
 
-        Two-stage dispatch:
+        Format dispatch (``IO(path="x.csv")`` → :class:`CsvIO`,
+        ``BytesIO(media_type=parquet)`` → :class:`ParquetIO`, …) lives
+        on :meth:`Holder.__new__` — :func:`super().__new__` may return
+        a fully-initialised instance of a different leaf, in which case
+        we return it as-is without re-running the holder-resolution
+        path below.
 
-        1. **Format dispatch.** The inputs are inspected for a
-           :class:`MediaType` (explicit *media_type*, *path*'s
-           extension, *data*'s URL form when path-shaped, or the
-           bound *holder*'s stamped media). When the resolved type
-           has a registered :class:`Tabular` leaf and that leaf is
-           a different class than *cls*, ``__new__`` recurses into
-           the leaf so ``IO(path="x.csv")`` and
-           ``BytesIO(path="x.parquet")`` land on :class:`CsvIO` and
-           :class:`ParquetIO` respectively.
-        2. **Holder resolution.** When no holder is supplied, the
-           holder-shaped kwargs (``data`` / ``path`` / ``binary`` /
-           ``url``) are forwarded to :class:`Holder`, whose own
-           ``__new__`` scheme-dispatches to the right concrete
-           subclass (:class:`Memory`, :class:`LocalPath`, …).
-
-        Inputs :class:`Holder` doesn't recognize (file-like objects,
-        backend-specific shapes) are left for the subclass
-        ``__init__`` to drain — ``_holder`` stays ``None`` until the
-        subclass populates it.
+        When no holder is supplied, the holder-shaped kwargs
+        (``data`` / ``path`` / ``binary`` / ``url``) are forwarded to
+        :class:`Holder`, whose own ``__new__`` scheme-dispatches to the
+        right concrete storage subclass (:class:`Memory`,
+        :class:`LocalPath`, …). Inputs :class:`Holder` doesn't
+        recognise (file-like objects, backend-specific shapes) are
+        left for the subclass ``__init__`` to drain — ``_holder``
+        stays ``None`` until the subclass populates it.
         """
         # Validate up front so the dispatch redirect (which may skip
         # __init__ when target isn't a subclass of cls) doesn't lose
@@ -343,41 +272,24 @@ class IO(Holder, BinaryIO, Generic[T, O]):
                 "IO(path=...) for filesystem/URL paths."
             )
 
-        target = _resolve_format_target(
-            cls, media_type=media_type, path=path, data=data, holder=holder,
+        instance = super().__new__(
+            cls,
+            data=data,
+            path=path,
+            binary=binary,
+            url=url,
+            holder=holder,
+            media_type=media_type,
+            owns_holder=owns_holder,
+            mode=mode,
+            **kwargs,
         )
-        if target is not None and target is not cls and issubclass(target, IO):
-            instance = target.__new__(
-                target,
-                data=data,
-                holder=holder,
-                owns_holder=owns_holder,
-                mode=mode,
-                media_type=media_type,
-                path=path,
-                binary=binary,
-                url=url,
-                **kwargs,
-            )
-            # When target isn't a subclass of cls, Python won't
-            # auto-invoke __init__ on the returned instance — do it
-            # ourselves so the instance is fully set up.
-            if not isinstance(instance, cls):
-                type(instance).__init__(
-                    instance,
-                    data=data,
-                    holder=holder,
-                    owns_holder=owns_holder,
-                    mode=mode,
-                    media_type=media_type,
-                    path=path,
-                    binary=binary,
-                    url=url,
-                    **kwargs,
-                )
+        # Holder.__new__'s format dispatch may have routed to a
+        # different leaf; that path already wired up ``_holder`` /
+        # ``_owns_holder`` and ran ``__init__``, so return as-is.
+        if type(instance) is not cls:
             return instance
 
-        instance = super().__new__(cls)
         instance._holder = holder
         instance._owns_holder = bool(owns_holder)
         if holder is None:
