@@ -313,7 +313,9 @@ class WorkspacePath(DatabricksPath):
             data = data[:n]
         return memoryview(data)
 
-    def _write_stream(self, src: Any, *, offset: int, size: int = -1) -> int:
+    def _write_stream(
+        self, src: Any, *, offset: int, size: int = -1, **kwargs: Any,
+    ) -> int:
         """Override the base chunked stream — Workspace wants one PUT.
 
         The Workspace API has no positional / range write, so a
@@ -326,10 +328,11 @@ class WorkspacePath(DatabricksPath):
         ``size>=0`` (capped read) or non-zero ``offset`` fall
         back to the chunked base path because the API can't
         splice at a range and reads the full body without an
-        upper bound.
+        upper bound. ``batch_size`` only matters for that
+        fallback — the atomic upload doesn't chunk.
         """
         if offset != 0 or size >= 0:
-            return super()._write_stream(src, offset=offset, size=size)
+            return super()._write_stream(src, offset=offset, size=size, **kwargs)
         return self._upload(src)
 
     def _write_mv(self, data: memoryview, pos: int) -> int:

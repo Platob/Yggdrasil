@@ -478,6 +478,37 @@ class TestWriteHolder:
         dst.write_mv(memoryview(b"abcdefghij"), size=2)
         assert dst.read_bytes() == b"ab"
 
+    def test_batch_size_drives_chunked_reads(self) -> None:
+        """``write_stream(src, batch_size=N)`` reads N bytes per chunk."""
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as src:
+            src.write_bytes(b"x" * 32)
+            src.seek(0)
+
+            reads: list[int] = []
+            original = src.read
+
+            def spy_read(size=-1):
+                chunk = original(size)
+                reads.append(len(chunk))
+                return chunk
+
+            src.read = spy_read  # type: ignore[method-assign]
+
+            dst = Memory()
+            dst.write_stream(src, batch_size=8)
+
+        # 32-byte source consumed in 8-byte chunks → 4 reads of 8 +
+        # one trailing 0-byte EOF read.
+        assert [n for n in reads if n > 0] == [8, 8, 8, 8]
+
+    def test_batch_size_must_be_positive(self) -> None:
+        dst = Memory()
+        with pytest.raises(ValueError, match="batch_size must be > 0"):
+            import io as _stdio
+            dst.write_stream(_stdio.BytesIO(b"x"), batch_size=0)
+
 
 class TestHolderTransfer:
     """``Holder.upload`` / ``Holder.download`` accept Holder/IO/str/PathLike.

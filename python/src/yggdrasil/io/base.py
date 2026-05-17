@@ -1159,7 +1159,9 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         self._pos += n
         return n
 
-    def write_stream(self, src: Any, *, size: int = -1) -> int:
+    def write_stream(
+        self, src: Any, *, size: int = -1, batch_size: int | None = None,
+    ) -> int:
         """Drain a binary source into self at the cursor.
 
         Cursor-anchored wrapper around :meth:`Holder.write_stream` —
@@ -1167,22 +1169,34 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         real :class:`IO[bytes]` and dispatches to
         :meth:`Holder._write_stream`; this thin wrapper just
         advances the cursor by the bytes the holder reported
-        writing. ``size>=0`` caps the byte count drained from *src*.
+        writing. ``size>=0`` caps the byte count drained from *src*;
+        ``batch_size`` tunes the per-chunk read/write size on the
+        default streaming path (``None`` keeps the 1 MiB default).
         """
-        n = self._active().write_stream(src, offset=self._pos, size=size)
+        kwargs: dict[str, int] = {"offset": self._pos, "size": size}
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        n = self._active().write_stream(src, **kwargs)
         self._pos += n
         return n
 
-    def write_holder(self, src: Any, *, size: int = -1) -> int:
+    def write_holder(
+        self, src: Any, *, size: int = -1, batch_size: int | None = None,
+    ) -> int:
         """Splice another :class:`Holder`'s bytes into self at the cursor.
 
         Cursor-anchored wrapper around :meth:`Holder.write_holder` —
         small payloads land in one :meth:`Holder.write_mv` call,
         large ones stream through :meth:`Holder._write_stream`.
-        ``size>=0`` caps the byte count pulled from *src*. Cursor
-        advances by the byte count.
+        ``size>=0`` caps the byte count pulled from *src*;
+        ``batch_size`` is forwarded to the streaming path when
+        the holder exceeds the inline threshold. Cursor advances
+        by the byte count.
         """
-        n = self._active().write_holder(src, offset=self._pos, size=size)
+        kwargs: dict[str, int] = {"offset": self._pos, "size": size}
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        n = self._active().write_holder(src, **kwargs)
         self._pos += n
         return n
 

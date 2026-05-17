@@ -1200,7 +1200,12 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         return total
 
     def write_stream(
-        self, src: Any, *, offset: int = 0, size: int = -1,
+        self,
+        src: Any,
+        *,
+        offset: int = 0,
+        size: int = -1,
+        batch_size: int = _COPY_CHUNK,
     ) -> int:
         """Drain a binary source into this holder at ``offset``.
 
@@ -1214,22 +1219,37 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         ``size`` caps the byte count drained from *src* —
         ``size=-1`` (default) reads to EOF; ``size>=0`` stops at
         ``size`` bytes (no over-pull from the source).
+
+        ``batch_size`` is the read/write chunk size for the
+        default streaming path (:data:`_COPY_CHUNK`, 1 MiB).
+        Tune up for high-throughput remote sinks where the
+        per-call overhead dominates, or down to bound peak
+        memory on a slow consumer.
         """
         if offset < 0:
             raise ValueError("write_stream offset must be >= 0")
+        if batch_size <= 0:
+            raise ValueError("write_stream batch_size must be > 0")
         from yggdrasil.io.base import IO as _IO
         from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
         io_src = src if isinstance(src, _IO) else _YggBytesIO.from_(src)
-        return self._write_stream(io_src, offset=offset, size=size)
+        return self._write_stream(
+            io_src, offset=offset, size=size, batch_size=batch_size,
+        )
 
     def _write_stream(
-        self, src: "IO[bytes]", *, offset: int, size: int = -1,
+        self,
+        src: "IO[bytes]",
+        *,
+        offset: int,
+        size: int = -1,
+        batch_size: int = _COPY_CHUNK,
     ) -> int:
         """Splice ``src``'s bytes into this holder starting at ``offset``.
 
         Default implementation: real chunked streaming — read
-        :data:`_COPY_CHUNK` bytes at a time and splice each chunk
+        ``batch_size`` bytes at a time and splice each chunk
         through :meth:`write_bytes`, so multi-GB sources never
         materialise as a single :class:`bytes` object in Python.
         ``size>=0`` caps the byte count so the source stops
@@ -1252,9 +1272,9 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
             if remaining is not None:
                 if remaining <= 0:
                     break
-                chunk_size = min(_COPY_CHUNK, remaining)
+                chunk_size = min(batch_size, remaining)
             else:
-                chunk_size = _COPY_CHUNK
+                chunk_size = batch_size
             chunk = src.read(chunk_size)
             if not chunk:
                 break
@@ -1266,7 +1286,12 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         return total
 
     def write_holder(
-        self, src: "Holder", *, offset: int = 0, size: int = -1,
+        self,
+        src: "Holder",
+        *,
+        offset: int = 0,
+        size: int = -1,
+        batch_size: int = _COPY_CHUNK,
     ) -> int:
         """Splice another :class:`Holder`'s bytes into this one at ``offset``.
 
@@ -1274,6 +1299,9 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         to :meth:`_write_holder`. ``size`` caps the byte count
         pulled from *src* — ``size=-1`` (default) writes the
         whole source; ``size>=0`` writes the first ``size`` bytes.
+        ``batch_size`` is forwarded to the streaming path for
+        above-threshold payloads.
+
         Subclasses override the private hook to swap in a
         backend-aware fast path (Workspace / Volumes / S3 can
         hand the source straight to their atomic-upload SDK call
@@ -1287,10 +1315,17 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                 f"{type(src).__name__}. Pass through `write_bytes` for "
                 f"bytes-like / IO / stream inputs."
             )
-        return self._write_holder(src, offset=offset, size=size)
+        return self._write_holder(
+            src, offset=offset, size=size, batch_size=batch_size,
+        )
 
     def _write_holder(
-        self, src: "Holder", *, offset: int, size: int = -1,
+        self,
+        src: "Holder",
+        *,
+        offset: int,
+        size: int = -1,
+        batch_size: int = _COPY_CHUNK,
     ) -> int:
         """Splice *src*'s bytes into this holder starting at ``offset``.
 
@@ -1307,6 +1342,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         decision boundary (inline vs stream) uses
         ``min(src.size, size)`` so a 5 MiB source with
         ``size=1024`` still goes through the inline fast path.
+        ``batch_size`` controls the streaming chunk size when
+        the threshold path is taken.
 
         Override when a backend can splice a foreign holder
         without going through Python bytes (e.g. an S3
@@ -1320,7 +1357,9 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
         with _YggBytesIO(holder=src, mode="rb") as io_src:
-            return self._write_stream(io_src, offset=offset, size=effective)
+            return self._write_stream(
+                io_src, offset=offset, size=effective, batch_size=batch_size,
+            )
 
     # ------------------------------------------------------------------
     # Byte transfer — upload / download to any byte sink
