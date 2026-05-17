@@ -1016,6 +1016,45 @@ class TestStagedNotebookCallable(DatabricksTestCase):
         self.assertIn("_signature_fixture(name='bob', count=2)", source)
         self.assertNotIn("_yggdrasil_widget", source)
 
+    def test_notebook_source_compiles_for_representative_callables(self):
+        """Every staged notebook must round-trip through ``compile()``.
+
+        The Databricks notebook task host loads the staged ``.py`` via
+        ``exec(compile(f.read(), filename, 'exec'))`` (the traceback the
+        applier surfaced was rooted in that call). If the rendered
+        source has a ``SyntaxError`` — unbalanced cell, broken
+        ``__yggdrasil_task__`` JSON heredoc, stray ``@`` after the
+        captured-locals block, anything — the workspace run fails
+        before the first ``LOGGER`` line, which is exactly the silent
+        regression class this test guards.
+
+        Covers the three shapes the renderer emits:
+
+        1. Simple no-helper / no-widget callable.
+        2. Bound-args invocation (literal-only cell).
+        3. Captured-locals + widget invocation
+           (``AsyncInsertJob.apply_records`` — the path that hit
+           ``NameError: ClassVar`` in production).
+        """
+        from yggdrasil.databricks.table.async_job import AsyncInsertJob
+
+        cases: list[tuple[str, Any, tuple, dict]] = [
+            ("plain", _signature_fixture, (), {}),
+            ("bound_args", _signature_fixture, (), {"name": "bob", "count": 2}),
+            ("captured_locals", _capture_entry, (), {"suffix": "z"}),
+            ("widget_fallback", AsyncInsertJob.apply_records, (), {}),
+        ]
+        for label, func, args, kwargs in cases:
+            with self.subTest(case=label):
+                source = _render_callable_notebook(func, args, kwargs)
+                # ``compile`` is a stricter check than ``ast.parse``:
+                # it runs the same compile pipeline the Databricks host
+                # invokes, so anything ``ast.parse`` waves through but
+                # the bytecode compiler rejects (future-import
+                # placement, ``return`` outside a function, …) shows up
+                # here.
+                compile(source, f"<staged-notebook:{label}>", "exec")
+
     def test_stage_python_notebook_callable_returns_notebook_task(self):
         """End-to-end staging produces a Task w/ NotebookTask + env_key."""
         from unittest.mock import patch
