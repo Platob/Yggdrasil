@@ -437,3 +437,159 @@ class TestEnumEdgeCases:
 
         assert convert("RED", Color) is Color.RED
         assert convert("red", Color) is Color.RED
+
+
+# ---------------------------------------------------------------------------
+# Wildcard Any-source dispatch via _any_registry
+# ---------------------------------------------------------------------------
+
+
+class TestWildcardAnyDispatch:
+    """register_converter(Any, T) stores in _any_registry[T] and is reached
+    as step 3 of find_converter (after exact match and identity checks)."""
+
+    def test_any_source_converter_fires_for_any_type(self) -> None:
+        from typing import Any as TypingAny
+
+        class Tag:
+            def __init__(self, s: str) -> None:
+                self.s = s
+
+        @register_converter(TypingAny, Tag)
+        def anything_to_tag(v: TypingAny, opts: Any) -> Tag:
+            return Tag(str(v))
+
+        assert isinstance(convert(42, Tag), Tag)
+        assert isinstance(convert("hello", Tag), Tag)
+        assert isinstance(convert(3.14, Tag), Tag)
+
+    def test_exact_registration_beats_wildcard(self) -> None:
+        """A concrete (from_type, to_hint) registration takes priority over
+        the Any wildcard handler for the same target."""
+        from typing import Any as TypingAny
+
+        class Box:
+            def __init__(self, val: Any) -> None:
+                self.val = val
+
+        @register_converter(TypingAny, Box)
+        def any_to_box(v: TypingAny, opts: Any) -> Box:
+            return Box(("any", v))
+
+        @register_converter(int, Box)
+        def int_to_box(v: int, opts: Any) -> Box:
+            return Box(("int", v))
+
+        result = convert(99, Box)
+        assert result.val == ("int", 99)
+
+        result_str = convert("x", Box)
+        assert result_str.val == ("any", "x")
+
+
+# ---------------------------------------------------------------------------
+# Cache preservation — valid non-None hits survive new registrations
+# ---------------------------------------------------------------------------
+
+
+class TestCachePreservation:
+    """After the targeted-invalidation optimization, cached hits for unrelated
+    type pairs must not be evicted when a new converter is registered."""
+
+    def test_unrelated_hit_survives_new_registration(self) -> None:
+        from yggdrasil.data.cast.registry import _find_cache, find_converter
+
+        class _Src:
+            pass
+
+        class _Dst:
+            pass
+
+        class _Unrelated:
+            pass
+
+        # Populate cache for (_Src, _Dst) → None (no path).
+        find_converter(_Src, _Dst)
+        # Also populate (str, int) which has a real converter.
+        c_str_int = find_converter(str, int)
+        assert c_str_int is not None
+        assert (str, int) in _find_cache
+        cached_before = _find_cache[str, int]
+
+        # Register something completely unrelated.
+        @register_converter(_Unrelated, _Unrelated)
+        def noop(v: Any, opts: Any) -> Any:
+            return v
+
+        # The non-None hit for (str, int) must still be there.
+        assert (str, int) in _find_cache
+        assert _find_cache[str, int] is cached_before
+
+    def test_none_entries_are_evicted_on_new_registration(self) -> None:
+        from yggdrasil.data.cast.registry import _find_cache, find_converter
+
+        class _A2:
+            pass
+
+        class _B2:
+            pass
+
+        class _C2:
+            pass
+
+        # Cache a None entry for (_A2, _B2).
+        find_converter(_A2, _B2)
+        assert _find_cache.get((_A2, _B2)) is None
+
+        # Register something that doesn't directly connect _A2 → _B2.
+        @register_converter(_C2, _C2)
+        def noop2(v: Any, opts: Any) -> Any:
+            return v
+
+        # The None entry must be gone — it will be re-evaluated on demand.
+        assert (_A2, _B2) not in _find_cache
+
+    def test_exact_key_evicted_on_direct_registration(self) -> None:
+        """When a converter is registered for a pair that was cached
+        (e.g. as None), the cache entry for that exact pair is dropped
+        so the new converter is found on the next dispatch call."""
+        from yggdrasil.data.cast.registry import _find_cache, find_converter
+
+        class _P:
+            pass
+
+        class _Q:
+            pass
+
+        # Ensure no path exists yet; cache the None result.
+        assert find_converter(_P, _Q) is None
+        assert (_P, _Q) in _find_cache
+
+        @register_converter(_P, _Q)
+        def p_to_q(v: _P, opts: Any) -> _Q:
+            return _Q()
+
+        # Cache entry must be gone so the new converter is found.
+        assert (_P, _Q) not in _find_cache
+        assert find_converter(_P, _Q) is p_to_q
+
+
+# ---------------------------------------------------------------------------
+# identity function contract
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityFunction:
+
+    def test_identity_returns_value_unchanged(self) -> None:
+        from yggdrasil.data.cast.registry import identity
+
+        obj = object()
+        assert identity(obj) is obj
+
+    def test_identity_accepts_extra_args(self) -> None:
+        from yggdrasil.data.cast.registry import identity
+
+        # Converter signature is func(value, options); identity absorbs both.
+        assert identity(42, None) == 42
+        assert identity("x", object()) == "x"

@@ -116,6 +116,17 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
     If `from_hint` is `typing.Any` or `object`, the converter is stored in
     `_any_registry[to_hint]` and is eligible for *any* source value type.
 
+    Cache invalidation
+    ------------------
+    The dispatch cache (``_find_cache``) is updated surgically rather than
+    cleared wholesale: the exact ``(from_hint, to_hint)`` entry is evicted
+    (it may have been cached as ``None`` or as a slower composed path) and
+    all ``None`` entries are removed so previously-unresolvable pairs can
+    be retried via the new registration.  Cached non-``None`` hits for
+    unrelated type pairs survive untouched.  This keeps the warm cache
+    intact across dynamic module imports while still guaranteeing that the
+    new converter is discoverable immediately.
+
     Expected converter behavior:
       func(value, options) -> converted_value
     where `options` may be None.
@@ -129,9 +140,18 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
         else:
             _registry[(from_hint, to_hint)] = conv  # type: ignore[assignment]
 
-        # Any new registration may open new conversion paths, so stale cached
-        # results are no longer valid.
-        _find_cache.clear()
+        # Targeted cache invalidation: drop the exact key (it may have been
+        # cached as None or as a slower composed path) and all None entries
+        # (previously-unresolvable pairs that the new registration might now
+        # unlock as a composition mid-step).  Non-None hits for unrelated type
+        # pairs are still valid — adding a converter can only open paths, never
+        # close or change already-working ones.
+        cache = _find_cache
+        if cache:
+            cache.pop((from_hint, to_hint), None)
+            stale = [k for k, v in cache.items() if v is None]
+            for k in stale:
+                del cache[k]
 
         return func
 
@@ -195,18 +215,26 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
     """
     Find the best converter for (from_type -> to_hint).
 
-    Dispatch order:
-      1) exact (_registry[(from_type, to_hint)])
-      2) identity-ish (same type, or target Any/object)
-      3) wildcard Any->to_hint
-      4) namespace-triggered late imports (polars/pandas/pyspark) once
-      5) MRO cross-product lookup
-      6) scan-based fallback with issubclass checks for odd keys
-      7) one-hop composition: from -> mid -> to (single intermediate)
+    Dispatch order (cheapest first):
+      1) Cache hit — ``_find_cache[(from_type, to_hint)]`` (single dict lookup).
+      2) Exact match — ``_registry[(from_type, to_hint)]``.
+      3) Cheap identity — same type, or target is ``Any`` / ``object``.
+      4) Wildcard — ``_any_registry[to_hint]`` (``Any -> to_hint`` registrations).
+      5) Namespace-triggered late imports — if either namespace starts with
+         ``polars`` / ``pandas`` / ``pyspark`` / ``pyarrow``, the matching
+         engine cast module is imported as a side effect so it can register
+         its converters; the search then restarts from step 2 without
+         namespace checking to avoid re-importing on every miss.
+      6) MRO cross-product — all (from_mro × to_mro) pairs.
+      7) Scan-based fallback — linear scan with ``issubclass`` for unusual
+         registered keys that fall outside the MRO hierarchy.
+      8) One-hop composition — finds a chain ``from → mid → to`` through
+         the registry (single intermediate only, to bound search cost).
 
-    Results (including ``None`` for "no path") are cached in ``_find_cache`` on
-    the ``check_namespace=True`` path so repeated calls for the same type pair pay
-    only a single dict lookup on subsequent invocations.
+    Results (including ``None`` for "no path") are cached in ``_find_cache``
+    on the ``check_namespace=True`` entry path.  The cache is surgically
+    invalidated by :func:`register_converter` — only the exact registered
+    key and all ``None`` entries are evicted on a new registration.
     """
     cache_key = (from_type, to_hint)
 

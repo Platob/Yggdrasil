@@ -257,6 +257,41 @@ def _registry_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=200_000,
     ))
 
+    # Cache-preservation cost — measure how many warm hits survive a new
+    # registration (the targeted invalidation only drops None entries and the
+    # exact registered key, not the whole cache).  We register a private
+    # sentinel pair, then time a fully-warmed convert() call.  If the whole
+    # cache were cleared each time, the subsequent convert() would re-walk
+    # MRO/namespace for every warm pair; with targeted clearing the existing
+    # hits stay intact and the cost stays at a single dict lookup.
+    class _BenchSrc:
+        pass
+
+    class _BenchDst:
+        pass
+
+    @register_converter(_BenchSrc, _BenchDst)
+    def _bench_noop(v: _BenchSrc, opts: None) -> _BenchDst:
+        return _BenchDst()
+
+    # Warm the cache for the pairs we care about.
+    find_converter(str, int)
+    find_converter(int, str)
+    find_converter(str, float)
+
+    def _hit_after_registration():
+        @register_converter(_BenchSrc, _BenchDst)
+        def _inner(v: _BenchSrc, opts: None) -> _BenchDst:
+            return _BenchDst()
+        # Immediately re-warm and look up a cached pair.
+        return find_converter(str, int)
+
+    out.append(_time_one(
+        "registry: register + warm find_converter (targeted inval.)",
+        _hit_after_registration,
+        repeat=repeat, inner=5_000,
+    ))
+
     return out
 
 
