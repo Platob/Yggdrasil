@@ -55,7 +55,6 @@ from . import DatabricksIntegrationCase
 
 
 __all__ = [
-    "TestSchemaSessionPathToTableName",
     "TestSchemaSessionAppend",
     "TestSchemaSessionUpsert",
     "TestSchemaSessionLocalCache",
@@ -101,48 +100,6 @@ def _row_count(table) -> int:
         if batch.num_rows:
             return int(batch.column("n")[0].as_py())
     return 0
-
-
-# ---------------------------------------------------------------------------
-# Pure-Python unit checks (no live workspace needed)
-# ---------------------------------------------------------------------------
-
-
-class TestSchemaSessionPathToTableName(unittest.TestCase):
-    """Pure path → identifier checks. No workspace, no skip."""
-
-    def setUp(self) -> None:
-        # The method only touches regex + safe_table_name; a stand-in
-        # ``self._schema = None`` would trip the __init__ guard, so go
-        # through the bound method on a throw-away instance whose
-        # __init__ we skip entirely.
-        self.fn = SchemaSession.path_to_table_name.__get__(
-            object.__new__(SchemaSession),
-        )
-
-    def test_empty_path_falls_back_to_root(self) -> None:
-        self.assertEqual(self.fn(""), "root")
-        self.assertEqual(self.fn("/"), "root")
-        self.assertEqual(self.fn(None), "root")
-
-    def test_collapses_non_alphanumeric_runs(self) -> None:
-        # ``/api/v1/users.json?id=42`` should fold every separator to ``_``.
-        self.assertEqual(
-            self.fn("/api/v1/users.json?id=42"),
-            "api_v1_users_json_id_42",
-        )
-
-    def test_lowercases_input(self) -> None:
-        self.assertEqual(self.fn("/Path/MixedCase"), "path_mixedcase")
-
-    def test_long_path_stays_within_uc_limit(self) -> None:
-        long_path = "/" + "/".join("seg" + str(i) for i in range(200))
-        out = self.fn(long_path)
-        self.assertLessEqual(len(out), 255)
-        # Distinct overflows should produce distinct names — the
-        # ``safe_table_name`` BLAKE2b suffix is the disambiguator.
-        other = self.fn(long_path + "X")
-        self.assertNotEqual(out, other)
 
 
 # ---------------------------------------------------------------------------

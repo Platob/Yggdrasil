@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Mapping, Optional, Union
 
@@ -36,7 +35,7 @@ from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG, WaitingConfig
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.enums.mode import ModeLike
-from yggdrasil.databricks.sql.sql_utils import MAX_TABLE_NAME_LEN, safe_table_name
+from yggdrasil.databricks.table.table import Table
 from yggdrasil.io.http_.session import HTTPSession
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.send_config import CacheConfig
@@ -44,7 +43,6 @@ from yggdrasil.io.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schema import Schema
-    from yggdrasil.databricks.table.table import Table
     from yggdrasil.io.authorization.base import Authorization
     from yggdrasil.io.headers import Headers
 
@@ -53,9 +51,6 @@ __all__ = ["SchemaSession"]
 
 
 LOGGER = logging.getLogger(__name__)
-
-# Collapse anything outside ``[0-9A-Za-z]`` to ``_`` — compile once.
-_PATH_TO_IDENT_RE: re.Pattern[str] = re.compile(r"[^0-9A-Za-z]+")
 
 # Per-path Table handle cache TTL. One hour amortises the schema lookup
 # across a typical job while still surfacing upstream renames / drops
@@ -175,30 +170,16 @@ class SchemaSession(HTTPSession):
 
     # ── path → table mapping ───────────────────────────────────────────────
 
-    def path_to_table_name(self, path: str | None) -> str:
-        """Derive a Unity-Catalog-safe table name from a URL path.
-
-        Lowercase, collapse non-alphanumeric runs to ``_``, strip
-        surrounding underscores, substitute ``"root"`` for the empty
-        result so ``"/"`` still yields a legal identifier, then hand
-        off to :func:`safe_table_name` which enforces the 255-char UC
-        ceiling by splitting on ``_`` and BLAKE2b-hashing the
-        overflow tail.
-        """
-        cleaned = _PATH_TO_IDENT_RE.sub("_", (path or "").lower()).strip("_")
-        if not cleaned:
-            cleaned = "root"
-        name = safe_table_name(cleaned)
-        assert name is not None and len(name) <= MAX_TABLE_NAME_LEN, (
-            f"SchemaSession.path_to_table_name: derived name {name!r} "
-            f"({len(name) if name else 0} chars) exceeds Unity Catalog's "
-            f"{MAX_TABLE_NAME_LEN}-char limit — safe_table_name contract broken."
-        )
-        return name
-
     def table_for(self, request: PreparedRequest) -> "Table":
-        """Return (caching) the :class:`Table` that backs *request*'s URL path."""
-        name = self.path_to_table_name(request.url.path)
+        """Return (caching) the :class:`Table` that backs *request*'s URL path.
+
+        The URL path is fed through :meth:`Table.safe_name` — the
+        centralized "raw string → Unity-Catalog-safe identifier"
+        builder — so the cache table name is derived the same way
+        for every caller that touches the codebase, and the warning
+        for non-trivial sanitization fires once per fresh path.
+        """
+        name = Table.safe_name(request.url.path)
         return self._table_cache.get_or_set(name, lambda: self._schema.table(name))
 
     # ── cache config attachment ────────────────────────────────────────────
