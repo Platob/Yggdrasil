@@ -42,7 +42,7 @@ satisfy it without lying.
 Format registry
 ---------------
 
-The byte-backed format registry (ParquetIO, CsvIO, ArrowIPCIO, …)
+The byte-backed format registry (ParquetFile, CSVFile, ArrowIPCFile, …)
 lives on :class:`Holder` — each leaf declares
 :attr:`Holder.mime_type` at the class level and
 :meth:`Holder.__init_subclass__` auto-registers it in
@@ -201,8 +201,8 @@ class Tabular(ABC, Generic[O]):
     Concrete implementers add whatever substrate they need (a
     holder + cursor for byte-backed shapes, a session reference
     for catalog-backed shapes, etc.) and override the two batch
-    hooks. The byte-backed format registry (ParquetIO, CsvIO,
-    ArrowIPCIO, …) lives on :class:`Holder` — each leaf declares
+    hooks. The byte-backed format registry (ParquetFile, CSVFile,
+    ArrowIPCFile, …) lives on :class:`Holder` — each leaf declares
     :attr:`Holder.mime_type` at the class level and
     :meth:`Holder.__init_subclass__` auto-registers it. Look up via
     :meth:`Holder.class_for_media_type` / :meth:`Holder.for_holder`.

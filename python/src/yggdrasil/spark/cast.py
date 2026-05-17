@@ -225,7 +225,7 @@ def any_to_spark_dataframe(
     if isinstance(obj, pyspark_sql.DataFrame):
         return opts.cast_spark_tabular(obj)
 
-    # ``Tabular`` (Response, StatementResult, ParquetIO, …) owns its
+    # ``Tabular`` (Response, StatementResult, ParquetFile, …) owns its
     # own Spark fan-out — :meth:`Tabular.read_spark_frame` short-circuits
     # to a persisted Spark frame when one is on hand (see
     # ``StatementResult._read_spark_frame``) and otherwise runs the

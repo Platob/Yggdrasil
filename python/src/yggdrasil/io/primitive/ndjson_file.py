@@ -1,6 +1,6 @@
 """NDJSON (newline-delimited JSON) Tabular leaf.
 
-:class:`NDJsonIO` is the streamable counterpart to :class:`JsonIO`.
+:class:`NDJSONFile` is the streamable counterpart to :class:`JSONFile`.
 One JSON object per line, no array wrapper. APPEND is honest at
 the byte level (concatenate new lines onto the existing buffer);
 no read-modify-rewrite needed.
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
 
 
-__all__ = ["NDJsonIO", "NDJsonOptions"]
+__all__ = ["NDJSONFile", "NDJsonOptions"]
 
 
 #: Modes that may need to read existing bytes and merge with the
@@ -61,7 +61,7 @@ class NDJsonOptions(CastOptions):
         return pa_json.ParseOptions()
 
 
-class NDJsonIO(IO[bytes, NDJsonOptions]):
+class NDJSONFile(IO[bytes, NDJsonOptions]):
     """:class:`Tabular` leaf for newline-delimited JSON."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.NDJSON

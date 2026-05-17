@@ -325,7 +325,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         "_mode",
         # Cursor / wrapping. ``_parent`` is the underlying byte holder
         # this one delegates to (``LocalPath`` underneath a
-        # :class:`ParquetIO` cursor, :class:`Memory` underneath a
+        # :class:`ParquetFile` cursor, :class:`Memory` underneath a
         # :class:`BytesIO`, …). ``None`` on top-level storage leaves
         # (:class:`Memory`, :class:`LocalPath`, :class:`VolumePath`, …)
         # that own their bytes directly. ``_owns_parent`` decides
@@ -411,7 +411,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
            ``binary`` → ``path`` → ``data`` type → memory default).
         2. **Format dispatch** — when called on an :class:`IO`
            subclass, routes to the registered format leaf
-           (:class:`CsvIO`, :class:`ParquetIO`, …) implied by an
+           (:class:`CSVFile`, :class:`ParquetFile`, …) implied by an
            explicit ``media_type``, the ``path``'s extension, the
            ``data``'s URL form, or the bound ``holder``'s stamped
            media type. Storage leaves (:class:`Memory` /
@@ -476,7 +476,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
                     **kwargs,
                 )
                 # When target isn't a subclass of cls (sideways routes
-                # like ``BytesIO(path="x.parquet")`` → :class:`ParquetIO`,
+                # like ``BytesIO(path="x.parquet")`` → :class:`ParquetFile`,
                 # which inherits :class:`IO` directly), Python won't
                 # auto-invoke ``__init__`` on the returned instance —
                 # do it ourselves so the instance is fully set up.
@@ -707,7 +707,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         Looks up :attr:`MediaType.mime_type`'s name in
         :data:`_HOLDER_FORMAT_REGISTRY`. Codec is orthogonal — Parquet
         compressed with zstd or snappy still resolves to
-        :class:`ParquetIO`; the codec layer is the holder's concern.
+        :class:`ParquetFile`; the codec layer is the holder's concern.
 
         The returned class is a :class:`Tabular` subclass — typically a
         :class:`Holder` byte-backed leaf, occasionally a non-Holder
@@ -730,7 +730,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
 
         # Miss may just mean the leaf package hasn't been imported
         # yet — force the side-effect bootstrap once and retry. This
-        # is what catches nested leaves (ZipIO / FolderIO / DeltaIO)
+        # is what catches nested leaves (ZipFile / FolderIO / DeltaIO)
         # for callers that never touched ``yggdrasil.io.nested``.
         if not _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
             _bootstrap_holder_format_registry()
@@ -1183,8 +1183,8 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         Dispatches to the format-specific :class:`IO` leaf via the
         holder's stamped media type (or *media_type* override), so
         ``LocalPath("data.parquet").open()`` lands on
-        :class:`ParquetIO`, ``LocalPath("data.csv").open()`` on
-        :class:`CsvIO`, and an unknown / no-media holder falls back
+        :class:`ParquetFile`, ``LocalPath("data.csv").open()`` on
+        :class:`CSVFile`, and an unknown / no-media holder falls back
         to a plain :class:`IO`.
 
         Pattern::
@@ -1244,7 +1244,7 @@ class Holder(Singleton, URLBased, Tabular[O], Disposable):
         """Stream batches from a borrowed cursor on the dispatched leaf.
 
         Routes through :meth:`open` so the same format-leaf dispatch
-        (ParquetIO / XlsxIO / CsvIO / …) and ``acquire`` / ``release``
+        (ParquetFile / XLSXFile / CSVFile / …) and ``acquire`` / ``release``
         accounting that drives explicit ``with holder.open() as bio:``
         usage handles the contextual read too. Options are re-homed
         onto the leaf's options class so format-specific knobs (sheet

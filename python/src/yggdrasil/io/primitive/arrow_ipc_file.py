@@ -1,6 +1,6 @@
 """Arrow IPC file Tabular leaf over the new :class:`BytesIO` substrate.
 
-:class:`ArrowIPCIO` is a :class:`BytesIO` subclass with
+:class:`ArrowIPCFile` is a :class:`BytesIO` subclass with
 :attr:`mime_type` set to :data:`MimeTypes.ARROW_IPC`, which auto-
 registers it in the Tabular registry so :meth:`Tabular.for_holder`
 dispatches a holder with that media type to this class.
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     pass
 
 
-__all__ = ["ArrowIPCIO", "ArrowIPCOptions"]
+__all__ = ["ArrowIPCFile", "ArrowIPCOptions"]
 
 
 #: Modes that read existing bytes, merge with the incoming stream,
@@ -58,8 +58,8 @@ class ArrowIPCOptions(CastOptions):
 
     The most common knob to tweak is ``compression``. ``"auto"``
     (the default) defers the codec choice to write time: pick
-    :data:`ArrowIPCIO.AUTO_COMPRESSION_CODEC` when the input is at
-    least :data:`ArrowIPCIO.AUTO_COMPRESSION_THRESHOLD` bytes, else
+    :data:`ArrowIPCFile.AUTO_COMPRESSION_CODEC` when the input is at
+    least :data:`ArrowIPCFile.AUTO_COMPRESSION_THRESHOLD` bytes, else
     leave the file uncompressed (small payloads pay codec overhead
     they won't recoup). Pass an explicit ``"lz4"`` / ``"zstd"`` /
     ``None`` to bypass the heuristic.
@@ -77,9 +77,9 @@ class ArrowIPCOptions(CastOptions):
         if compression == "auto":
             if (
                 nbytes is not None
-                and nbytes >= ArrowIPCIO.AUTO_COMPRESSION_THRESHOLD
+                and nbytes >= ArrowIPCFile.AUTO_COMPRESSION_THRESHOLD
             ):
-                compression = ArrowIPCIO.AUTO_COMPRESSION_CODEC
+                compression = ArrowIPCFile.AUTO_COMPRESSION_CODEC
             else:
                 compression = None
         return ipc.IpcWriteOptions(
@@ -88,7 +88,7 @@ class ArrowIPCOptions(CastOptions):
         )
 
 
-class ArrowIPCIO(IO[bytes, ArrowIPCOptions]):
+class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
     """:class:`Tabular` leaf for the Arrow IPC **file** format.
 
     File-format reads parse the footer once on construction of the

@@ -12,7 +12,7 @@ from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG
 from yggdrasil.data.enums import MediaTypes
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.primitive import ArrowIPCIO
+from yggdrasil.io.primitive import ArrowIPCFile
 from yggdrasil.io.url import URL
 
 from ..authorization.base import Authorization
@@ -340,7 +340,7 @@ class HTTPSession(Session):
 
         new_holder = Memory()
         new_holder.media_type = MediaTypes.ARROW_IPC
-        with ArrowIPCIO(holder=new_holder, owns_holder=False, mode="wb") as new_buffer:
+        with ArrowIPCFile(holder=new_holder, owns_holder=False, mode="wb") as new_buffer:
             new_buffer.write_arrow_table(
                 final_df.to_arrow(compat_level=pl.CompatLevel.newest()),
                 compression="zstd",

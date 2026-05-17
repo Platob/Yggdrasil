@@ -1,6 +1,6 @@
-"""Behavior tests for :class:`yggdrasil.io.primitive.arrow_ipc_io.ArrowIPCIO`.
+"""Behavior tests for :class:`yggdrasil.io.primitive.arrow_ipc_file.ArrowIPCFile`.
 
-`ArrowIPCIO` is a :class:`BytesIO` leaf that auto-registers under
+`ArrowIPCFile` is a :class:`BytesIO` leaf that auto-registers under
 :data:`MimeTypes.ARROW_IPC`. Tests pin:
 
 * round-trip of Arrow tables / batches via the :class:`Tabular`
@@ -8,11 +8,11 @@
   pandas / polars / pylist views);
 * persistence to / from :class:`LocalPath` and back, both via
   ``with path.open() as bio: bio.write_arrow_table(...)`` and via
-  the ``ArrowIPCIO(holder=...)`` shape;
+  the ``ArrowIPCFile(holder=...)`` shape;
 * mode dispatch — OVERWRITE / APPEND / IGNORE / ERROR_IF_EXISTS /
   AUTO behave the way the docstring claims;
 * :meth:`Holder.for_holder` resolves a holder with the IPC media
-  type to :class:`ArrowIPCIO`.
+  type to :class:`ArrowIPCFile`.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.primitive.arrow_ipc_io import ArrowIPCIO, ArrowIPCOptions
+from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile, ArrowIPCOptions
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
 
@@ -40,52 +40,52 @@ def table() -> pa.Table:
 class TestRegistration:
 
     def test_mime_type_is_arrow_ipc(self) -> None:
-        assert ArrowIPCIO.mime_type is MimeTypes.ARROW_IPC
+        assert ArrowIPCFile.mime_type is MimeTypes.ARROW_IPC
 
-    def test_registry_resolves_to_arrow_ipc_io(self) -> None:
+    def test_registry_resolves_to_arrow_ipc_file(self) -> None:
         cls = Holder.class_for_media_type(MimeTypes.ARROW_IPC)
-        assert cls is ArrowIPCIO
+        assert cls is ArrowIPCFile
 
     def test_options_class(self) -> None:
-        assert ArrowIPCIO.options_class() is ArrowIPCOptions
+        assert ArrowIPCFile.options_class() is ArrowIPCOptions
 
 
 class TestRoundTripInMemory:
 
     def test_arrow_table_round_trip(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         loaded = io.read_arrow_table()
         assert loaded.equals(table)
 
     def test_arrow_batches_round_trip(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_batches(table.to_batches())
         out = list(io.read_arrow_batches())
         assert sum(b.num_rows for b in out) == table.num_rows
 
     def test_collect_schema(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         schema = io.collect_schema()
         assert set(schema.field_names()) == {"id", "name", "v"}
 
     def test_read_pandas_frame(self, table) -> None:
         pd = pytest.importorskip("pandas")
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         df = io.read_pandas_frame()
         pd.testing.assert_frame_equal(df, table.to_pandas())
 
     def test_read_polars_frame(self, table) -> None:
         pl = pytest.importorskip("polars")
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         df = io.read_polars_frame()
         assert df.equals(pl.from_arrow(table))
 
     def test_read_pylist(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         rows = io.read_pylist()
         assert rows == table.to_pylist()
@@ -94,16 +94,16 @@ class TestRoundTripInMemory:
 class TestEmptyBuffer:
 
     def test_read_yields_no_batches(self) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         assert list(io.read_arrow_batches()) == []
 
     def test_collect_schema_returns_empty(self) -> None:
         from yggdrasil.data.schema import Schema
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         assert io.collect_schema() == Schema.empty()
 
     def test_read_table_empty(self) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         assert io.read_arrow_table().num_rows == 0
 
 
@@ -111,23 +111,23 @@ class TestHolderBacked:
 
     def test_round_trip_via_local_path(self, tmp_path, table) -> None:
         target = LocalPath(str(tmp_path / "data.arrow"))
-        io = ArrowIPCIO(holder=target, owns_holder=False)
+        io = ArrowIPCFile(holder=target, owns_holder=False)
         io.write_arrow_table(table)
         assert target.size > 0
 
-        # Read back through a fresh ArrowIPCIO over the same holder.
-        reader = ArrowIPCIO(holder=target, owns_holder=False)
+        # Read back through a fresh ArrowIPCFile over the same holder.
+        reader = ArrowIPCFile(holder=target, owns_holder=False)
         loaded = reader.read_arrow_table()
         assert loaded.equals(table)
 
     def test_round_trip_via_memory_holder(self, table) -> None:
         mem = Memory()
-        io = ArrowIPCIO(holder=mem, owns_holder=False)
+        io = ArrowIPCFile(holder=mem, owns_holder=False)
         io.write_arrow_table(table)
         assert mem.size > 0
 
         # Fresh reader over the same memory.
-        reader = ArrowIPCIO(holder=mem, owns_holder=False)
+        reader = ArrowIPCFile(holder=mem, owns_holder=False)
         assert reader.read_arrow_table().equals(table)
 
     def test_idle_write_restores_cursor(self, table) -> None:
@@ -143,7 +143,7 @@ class TestHolderBacked:
         cursor actually moves); local-path holders take the OSFile
         direct-write fast path which never touches the cursor.
         """
-        idle = ArrowIPCIO(holder=Memory(), owns_holder=False)
+        idle = ArrowIPCFile(holder=Memory(), owns_holder=False)
         assert not idle._acquired
         assert idle.tell() == 0
         idle.write_arrow_table(table)
@@ -151,7 +151,7 @@ class TestHolderBacked:
         # Cursor is restored — the IO still looks fresh.
         assert idle.tell() == 0
 
-        with ArrowIPCIO(holder=Memory(), owns_holder=False) as opened:
+        with ArrowIPCFile(holder=Memory(), owns_holder=False) as opened:
             opened.write_arrow_table(table)
             # While opened the cursor follows the bytes — same as a
             # raw ``write_bytes`` would.
@@ -161,7 +161,7 @@ class TestHolderBacked:
 class TestModes:
 
     def test_overwrite_truncates(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         first_size = io.size
 
@@ -171,7 +171,7 @@ class TestModes:
         assert io.read_arrow_table().equals(smaller)
 
     def test_append_concatenates(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         more = pa.table({"id": [5, 6], "name": ["e", "f"], "v": [4.5, 5.5]})
         io.write_arrow_batches(more.to_batches(), options=ArrowIPCOptions(mode=Mode.APPEND))
@@ -181,7 +181,7 @@ class TestModes:
         assert loaded.column("id").to_pylist() == [1, 2, 3, 4, 5, 6]
 
     def test_ignore_skips_when_non_empty(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         before = io.size
         io.write_arrow_batches(
@@ -191,12 +191,12 @@ class TestModes:
         assert io.size == before
 
     def test_ignore_writes_when_empty(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_batches(table.to_batches(), options=ArrowIPCOptions(mode=Mode.IGNORE))
         assert io.read_arrow_table().equals(table)
 
     def test_error_if_exists_raises_when_non_empty(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         with pytest.raises(FileExistsError):
             io.write_arrow_batches(
@@ -204,7 +204,7 @@ class TestModes:
             )
 
     def test_error_if_exists_passes_when_empty(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_batches(
             table.to_batches(), options=ArrowIPCOptions(mode=Mode.ERROR_IF_EXISTS),
         )
@@ -215,7 +215,7 @@ class TestKeyedMerge:
     """``options.match_by`` drives key-aware APPEND / UPSERT."""
 
     def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         # Rows id=2, 3 collide with existing → dropped; id=5 is new.
         more = pa.table(
@@ -231,7 +231,7 @@ class TestKeyedMerge:
         assert loaded.column("name").to_pylist() == ["a", "b", "c", "d", "e"]
 
     def test_upsert_with_keys_replaces_existing(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         more = pa.table(
             {"id": [2, 3, 5], "name": ["X", "Y", "e"], "v": [-1.0, -2.0, 4.5]}
@@ -247,7 +247,7 @@ class TestKeyedMerge:
         assert loaded.column("v").to_pylist() == [0.5, 3.5, -1.0, -2.0, 4.5]
 
     def test_merge_behaves_like_upsert(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         more = pa.table({"id": [3], "name": ["Z"], "v": [9.0]})
         io.write_arrow_batches(
@@ -259,7 +259,7 @@ class TestKeyedMerge:
         assert loaded.column("name").to_pylist() == ["a", "b", "d", "Z"]
 
     def test_upsert_without_keys_falls_back_to_append(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         more = pa.table({"id": [2], "name": ["X"], "v": [-1.0]})
         io.write_arrow_batches(
@@ -272,7 +272,7 @@ class TestKeyedMerge:
         assert loaded.column("name").to_pylist() == ["a", "b", "c", "d", "X"]
 
     def test_upsert_with_keys_into_empty_writes_payload(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_batches(
             table.to_batches(),
             options=ArrowIPCOptions(mode=Mode.UPSERT, match_by=["id"]),
@@ -283,7 +283,7 @@ class TestKeyedMerge:
         base = pa.table(
             {"a": [1, 1, 2], "b": ["x", "y", "x"], "v": [10, 20, 30]}
         )
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(base)
         more = pa.table(
             # (1, "x") collides → dropped under APPEND; (2, "y") is new.
@@ -300,7 +300,7 @@ class TestKeyedMerge:
 
     def test_upsert_with_field_typed_match_by(self, table) -> None:
         from yggdrasil.data import Field
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(table)
         more = pa.table({"id": [3], "name": ["Z"], "v": [9.0]})
         # Field-typed match_by — the IO derives the key name list via
@@ -326,22 +326,22 @@ class TestExternalWriterPattern:
             with ipc.new_file(bio, table.schema) as writer:
                 writer.write_table(table)
 
-        # Read back through ArrowIPCIO over the same path.
-        reader = ArrowIPCIO(holder=target, owns_holder=False)
+        # Read back through ArrowIPCFile over the same path.
+        reader = ArrowIPCFile(holder=target, owns_holder=False)
         assert reader.read_arrow_table().equals(table)
 
 
 class TestCompressionOption:
 
     def test_lz4_round_trip(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(
             table, options=ArrowIPCOptions(compression="lz4"),
         )
         assert io.read_arrow_table().equals(table)
 
     def test_zstd_round_trip(self, table) -> None:
-        io = ArrowIPCIO()
+        io = ArrowIPCFile()
         io.write_arrow_table(
             table, options=ArrowIPCOptions(compression="zstd"),
         )
@@ -359,7 +359,7 @@ class TestTabularForHolder:
         target.media_type = MediaType.from_(MimeTypes.ARROW_IPC)
 
         leaf = Holder.for_holder(target)
-        assert isinstance(leaf, ArrowIPCIO)
+        assert isinstance(leaf, ArrowIPCFile)
 
 
 class TestOptionsCopyability:

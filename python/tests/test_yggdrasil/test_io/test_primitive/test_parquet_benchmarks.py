@@ -2,7 +2,7 @@
 
 What this file is
 -----------------
-A wall-clock harness over :class:`ParquetIO._write_arrow_batches`
+A wall-clock harness over :class:`ParquetFile._write_arrow_batches`
 (``python/src/yggdrasil/io/primitive/parquet_io.py``) and the raw
 ``pq.write_table`` baseline. The goal is to make the cost of each
 write-side knob visible per release, not to lock in a hard SLA.
@@ -50,7 +50,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.io.primitive.parquet_io import ParquetIO, ParquetOptions
+from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +149,12 @@ def _write_via_parquet_io(
     use_threads: bool = True,
     batches: "Iterable[pa.RecordBatch] | None" = None,
 ) -> bytes:
-    """Write ``table`` through the production :class:`ParquetIO` writer.
+    """Write ``table`` through the production :class:`ParquetFile` writer.
 
     Routes through ``_write_arrow_batches`` so the benchmarks track the
     same code path real callers hit — not just ``pq.write_table``.
     """
-    io_obj = ParquetIO()
+    io_obj = ParquetFile()
     opts = ParquetOptions(
         compression=compression,
         compression_level=compression_level,
@@ -180,7 +180,7 @@ def _write_via_pq_write_table(
     """Raw ``pq.write_table`` baseline — no ygg wrapper overhead.
 
     Difference vs :func:`_write_via_parquet_io` reflects what the
-    :class:`ParquetIO` layer is adding on top of pyarrow.
+    :class:`ParquetFile` layer is adding on top of pyarrow.
     """
     sink = pa.BufferOutputStream()
     pq.write_table(
@@ -419,7 +419,7 @@ class TestParquetWriteBenchmarks(ArrowTestCase):
             self.assertGreater(nbytes, 0)
         report.flush()
 
-    # -- ParquetIO wrapper vs raw pq.write_table ----------------------------
+    # -- ParquetFile wrapper vs raw pq.write_table ----------------------------
 
     def test_parquet_io_vs_pq_write_table(self) -> None:
         """How much overhead does the IO wrapper add over raw pyarrow?
@@ -429,10 +429,10 @@ class TestParquetWriteBenchmarks(ArrowTestCase):
         on the OVERWRITE path.
         """
         report = _BenchReport(
-            f"ParquetIO vs raw pq.write_table (mixed, n={self.n_rows})"
+            f"ParquetFile vs raw pq.write_table (mixed, n={self.n_rows})"
         )
         ms1, nb1 = _time_write(lambda: _write_via_parquet_io(self.mixed))
-        report.add("ParquetIO._write_arrow_batches", ms1, nb1)
+        report.add("ParquetFile._write_arrow_batches", ms1, nb1)
         ms2, nb2 = _time_write(lambda: _write_via_pq_write_table(self.mixed))
         report.add("pq.write_table              ", ms2, nb2)
         self.assertGreater(nb1, 0)

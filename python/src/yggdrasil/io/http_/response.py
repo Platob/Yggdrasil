@@ -53,8 +53,8 @@ class HTTPResponse(Response):
     ) -> "HTTPResponse":
         # Pre-infer media type from the response's Content-Type /
         # Content-Encoding so the holder carries it from the start;
-        # downstream callers reach the registered leaf (ParquetIO,
-        # JsonIO, ArrowIPCIO, …) via ``BytesIO(holder=self.buffer)``
+        # downstream callers reach the registered leaf (ParquetFile,
+        # JSONFile, ArrowIPCFile, …) via ``BytesIO(holder=self.buffer)``
         # without an extra format-detection hop.
         headers = dict(response.headers)
         pre_media = _media_type_from_headers(headers)

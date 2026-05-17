@@ -125,19 +125,19 @@ def update_last_checkpoint(
 
 def _write_v1(version: int, actions: List[dict], *, log_path: "Path") -> None:
     """V1 — single ``<version>.checkpoint.parquet`` next to the commits."""
-    from yggdrasil.io.primitive.parquet_io import ParquetIO, ParquetOptions
+    from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 
     ck_path = log_path / format_checkpoint_v1_name(version)
     table = _actions_to_arrow_table(actions)
 
-    leaf = ParquetIO(holder=ck_path, owns_holder=False)
+    leaf = ParquetFile(holder=ck_path, owns_holder=False)
     with leaf as opened:
         opened._write_arrow_table(table, ParquetOptions(mode=Mode.OVERWRITE))
 
 
 def _write_v2(version: int, actions: List[dict], *, log_path: "Path") -> None:
     """V2 — one sidecar parquet referenced from a manifest JSON."""
-    from yggdrasil.io.primitive.parquet_io import ParquetIO, ParquetOptions
+    from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 
     sidecar_uuid = uuid.uuid4().hex
     sidecar_dir = log_path / SIDECARS_DIR_NAME
@@ -146,7 +146,7 @@ def _write_v2(version: int, actions: List[dict], *, log_path: "Path") -> None:
     sidecar_path = sidecar_dir / sidecar_name
 
     table = _actions_to_arrow_table(actions)
-    leaf = ParquetIO(holder=sidecar_path, owns_holder=False)
+    leaf = ParquetFile(holder=sidecar_path, owns_holder=False)
     with leaf as opened:
         opened._write_arrow_table(table, ParquetOptions(mode=Mode.OVERWRITE))
 

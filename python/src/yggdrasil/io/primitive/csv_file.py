@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
 
 
-__all__ = ["CsvIO", "CsvOptions"]
+__all__ = ["CSVFile", "CsvOptions"]
 
 
 #: Modes that may need to read existing bytes and merge with the
@@ -189,7 +189,7 @@ class CsvOptions(CastOptions):
         )
 
 
-class CsvIO(IO[bytes, CsvOptions]):
+class CSVFile(IO[bytes, CsvOptions]):
     """:class:`Tabular` leaf for CSV files."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.CSV

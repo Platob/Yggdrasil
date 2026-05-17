@@ -1,22 +1,22 @@
 """Zip-archive Tabular leaf with lazy per-entry I/O.
 
-:class:`ZipIO` IS-A :class:`BytesIO` whose backing bytes are a zip
+:class:`ZipFile` IS-A :class:`BytesIO` whose backing bytes are a zip
 archive. It exposes two surfaces:
 
 1. **Byte surface** — inherited from :class:`BytesIO`. Read / write /
    seek the raw archive bytes (useful for "open zip, drive
    :mod:`zipfile` yourself" flows).
 2. **Children surface** — :meth:`iter_children` walks every entry as
-   a :class:`ZipEntryIO`. The entries are **lazy**: their bytes are
+   a :class:`ZipEntryFile`. The entries are **lazy**: their bytes are
    fetched from the parent archive on first read and cached after.
    Iterating doesn't decompress every entry up front.
 
 Lazy children
 -------------
 
-A :class:`ZipEntryIO` is a :class:`BytesIO` over a :class:`Memory`
+A :class:`ZipEntryFile` is a :class:`BytesIO` over a :class:`Memory`
 holder, but the holder's payload starts empty and is materialized
-on first access through :meth:`ZipEntryIO._materialize`. The first
+on first access through :meth:`ZipEntryFile._materialize`. The first
 ``read`` / ``size`` / ``seek_end`` / ``to_bytes`` / Tabular hook
 triggers exactly one ``zipfile.ZipFile(parent_view).read(name)``
 call; subsequent accesses hit the cached :class:`Memory` directly.
@@ -65,7 +65,7 @@ from yggdrasil.io.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 
 
-__all__ = ["ZipIO", "ZipOptions", "ZipEntryIO"]
+__all__ = ["ZipFile", "ZipOptions", "ZipEntryFile"]
 
 
 def _registered_tabular_extensions() -> "list[str]":
@@ -122,7 +122,7 @@ class ZipOptions(CastOptions):
     """:class:`CastOptions` extended with zip-archive knobs."""
 
     #: Name (and implied format) of the entry written by
-    #: :meth:`ZipIO._write_arrow_batches`. The extension picks the
+    #: :meth:`ZipFile._write_arrow_batches`. The extension picks the
     #: inner Tabular leaf.
     entry_name: str = "data.parquet"
     compression: int = zipfile.ZIP_DEFLATED
@@ -130,16 +130,16 @@ class ZipOptions(CastOptions):
 
 
 # ---------------------------------------------------------------------------
-# ZipEntryIO — lazy per-entry BytesIO
+# ZipEntryFile — lazy per-entry BytesIO
 # ---------------------------------------------------------------------------
 
 
-class ZipEntryIO(BytesIO):
+class ZipEntryFile(BytesIO):
     """:class:`BytesIO` over a single zip entry's uncompressed payload.
 
     The payload is fetched from the parent archive on first access
     and cached in the inner :class:`Memory` holder. Reading the
-    archive's directory (``ZipIO.list_entries`` / ``iter_children``)
+    archive's directory (``ZipFile.list_entries`` / ``iter_children``)
     is a fixed-cost walk; per-entry decompression only happens for
     the entries the caller actually touches.
 
@@ -161,14 +161,14 @@ class ZipEntryIO(BytesIO):
         self,
         *,
         entry_name: str,
-        zip_parent: "ZipIO",
+        zip_parent: "ZipFile",
         zip_info: "zipfile.ZipInfo | None" = None,
         **kwargs,
     ) -> None:
         # Empty Memory holder; bytes land here on materialize.
         super().__init__(holder=Memory(), owns_holder=True, **kwargs)
         self.entry_name: str = entry_name
-        self._zip_parent: "ZipIO" = zip_parent
+        self._zip_parent: "ZipFile" = zip_parent
         self._zip_info: "zipfile.ZipInfo | None" = zip_info
         # ``None`` until first directory probe; we keep the hint so
         # ``size`` can answer without decompressing.
@@ -237,7 +237,7 @@ class ZipEntryIO(BytesIO):
 
     def _resolve_leaf(self) -> "Tabular | None":
         # Triggers the side-effecting registrations on every primitive
-        # leaf — without this a caller that starts at zip_io directly
+        # leaf — without this a caller that starts at zip_file directly
         # would see an empty Tabular registry and fail to dispatch.
         import yggdrasil.io.primitive  # noqa: F401
 
@@ -251,7 +251,7 @@ class ZipEntryIO(BytesIO):
             cls = Holder.class_for_media_type(mt, default=None)
         except Exception:
             cls = None
-        if cls is None or cls is ZipEntryIO:
+        if cls is None or cls is ZipEntryFile:
             return None
         # Force materialization before we hand the holder to the
         # tabular leaf — it'll read bytes off it directly.
@@ -285,11 +285,11 @@ class ZipEntryIO(BytesIO):
 
 
 # ---------------------------------------------------------------------------
-# ZipIO
+# ZipFile
 # ---------------------------------------------------------------------------
 
 
-class ZipIO(BytesIO):
+class ZipFile(BytesIO):
     """:class:`Tabular` leaf for ``.zip`` archives."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.ZIP
@@ -302,8 +302,8 @@ class ZipIO(BytesIO):
     # Children surface — lazy iteration
     # ==================================================================
 
-    def iter_children(self) -> Iterator[ZipEntryIO]:
-        """Yield every archive entry as a lazy :class:`ZipEntryIO`.
+    def iter_children(self) -> Iterator[ZipEntryFile]:
+        """Yield every archive entry as a lazy :class:`ZipEntryFile`.
 
         Skips directories (entries whose name ends with ``/``).
         Per-entry payloads are NOT fetched here — the directory walk
@@ -320,7 +320,7 @@ class ZipIO(BytesIO):
             if info.is_dir():
                 continue
             yield self.adopt_child(
-                ZipEntryIO(
+                ZipEntryFile(
                     entry_name=info.filename,
                     zip_parent=self,
                     zip_info=info,
@@ -335,8 +335,8 @@ class ZipIO(BytesIO):
             with zipfile.ZipFile(v, "r") as zf:
                 return [info.filename for info in zf.infolist() if not info.is_dir()]
 
-    def child(self, entry_name: str) -> ZipEntryIO:
-        """Return a lazy :class:`ZipEntryIO` for *entry_name*.
+    def child(self, entry_name: str) -> ZipEntryFile:
+        """Return a lazy :class:`ZipEntryFile` for *entry_name*.
 
         Raises :class:`KeyError` when the entry doesn't exist.
         Doesn't pre-fetch bytes — the returned handle materializes
@@ -353,7 +353,7 @@ class ZipIO(BytesIO):
                         f"Available: {names!r}."
                     )
         return self.adopt_child(
-            ZipEntryIO(entry_name=entry_name, zip_parent=self, zip_info=info)
+            ZipEntryFile(entry_name=entry_name, zip_parent=self, zip_info=info)
         )
 
     # ==================================================================
@@ -398,7 +398,7 @@ class ZipIO(BytesIO):
         if not children:
             return
 
-        leaves: "list[tuple[ZipEntryIO, Tabular]]" = []
+        leaves: "list[tuple[ZipEntryFile, Tabular]]" = []
         unresolved: "list[str]" = []
         for child in children:
             leaf = child._resolve_leaf()

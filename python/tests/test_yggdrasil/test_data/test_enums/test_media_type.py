@@ -3,7 +3,7 @@
 `MediaType` is the format + codec wrapper layer above `MimeType`.
 The two-stage sniff (outer magic identifies a wrapper, inner peek
 into the decompressed head identifies the format) is what makes
-``Tabular.for_holder`` route a gzip-wrapped parquet to ParquetIO
+``Tabular.for_holder`` route a gzip-wrapped parquet to ParquetFile
 instead of OctetStreamIO. These tests pin the practical surface:
 
 * `from_` accepts MimeType / Codec / bytes / file-like / path-like.

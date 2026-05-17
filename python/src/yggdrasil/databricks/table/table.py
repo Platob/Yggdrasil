@@ -60,7 +60,7 @@ from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.io.path import Path
-from yggdrasil.io.primitive import ParquetIO
+from yggdrasil.io.primitive import ParquetFile
 from yggdrasil.io.tabular import Tabular, O
 from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
 from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
@@ -406,7 +406,7 @@ def _alias_columns(expr, alias: str):
 
 
 def _collect_prune_values_polars(
-    buffer: ParquetIO,
+    buffer: ParquetFile,
     prune_by: list[str],
 ) -> dict[str, tuple[Any, ...]]:
     df = buffer.scan_polars_frame().select(*prune_by).unique().collect()

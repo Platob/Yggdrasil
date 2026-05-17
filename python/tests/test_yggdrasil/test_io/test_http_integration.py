@@ -636,7 +636,7 @@ class TestFromUrllib3:
         import datetime as dt
         from yggdrasil.io.holder import Holder
         from yggdrasil.io.http_.response import HTTPResponse
-        from yggdrasil.io.primitive.json_io import JsonIO
+        from yggdrasil.io.primitive.json_file import JSONFile
 
         raw = self._make_raw(
             body=b'{"ok":true}',
@@ -650,10 +650,10 @@ class TestFromUrllib3:
             stream=False,
         )
         # The buffer is a Holder; opening it via response.open() routes
-        # through the JsonIO leaf for the stamped media type.
+        # through the JSONFile leaf for the stamped media type.
         assert isinstance(resp.buffer, Holder)
         with resp.open(mode="rb") as bio:
-            assert isinstance(bio, JsonIO)
+            assert isinstance(bio, JSONFile)
         assert raw.released is True
         assert resp.buffer.to_bytes() == b'{"ok":true}'
         assert resp.json() == {"ok": True}

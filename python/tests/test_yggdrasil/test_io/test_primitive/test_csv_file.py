@@ -1,4 +1,4 @@
-"""Behavior tests for :class:`yggdrasil.io.primitive.csv_io.CsvIO`."""
+"""Behavior tests for :class:`yggdrasil.io.primitive.csv_file.CSVFile`."""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.primitive.csv_io import CsvIO, CsvOptions
+from yggdrasil.io.primitive.csv_file import CSVFile, CsvOptions
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.tabular import Tabular
 
@@ -85,22 +85,22 @@ def deep_table() -> pa.Table:
 class TestRegistration:
 
     def test_mime_type_is_csv(self) -> None:
-        assert CsvIO.mime_type is MimeTypes.CSV
+        assert CSVFile.mime_type is MimeTypes.CSV
 
     def test_registry(self) -> None:
-        assert Holder.class_for_media_type(MimeTypes.CSV) is CsvIO
+        assert Holder.class_for_media_type(MimeTypes.CSV) is CSVFile
 
 
 class TestRoundTrip:
 
     def test_round_trip_arrow(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         loaded = io.read_arrow_table()
         assert loaded.equals(table)
 
     def test_csv_text_shape(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         # The pyarrow CSV writer quotes string columns by default.
         text = io.to_bytes().decode("utf-8")
@@ -109,19 +109,19 @@ class TestRoundTrip:
         assert lines[1] == '1,"a"'
 
     def test_collect_schema(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         assert set(io.collect_schema().field_names()) == {"id", "name"}
 
     def test_pandas_round_trip(self, table) -> None:
         pd = pytest.importorskip("pandas")
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         pd.testing.assert_frame_equal(io.read_pandas_frame(), table.to_pandas())
 
     def test_polars_round_trip(self, table) -> None:
         pl = pytest.importorskip("polars")
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         assert io.read_polars_frame().equals(pl.from_arrow(table))
 
@@ -129,11 +129,11 @@ class TestRoundTrip:
 class TestEmpty:
 
     def test_read_empty(self) -> None:
-        assert list(CsvIO().read_arrow_batches()) == []
+        assert list(CSVFile().read_arrow_batches()) == []
 
     def test_collect_schema_empty(self) -> None:
         from yggdrasil.data.schema import Schema
-        assert CsvIO().collect_schema() == Schema.empty()
+        assert CSVFile().collect_schema() == Schema.empty()
 
 
 class TestTargetSchemaCast:
@@ -152,7 +152,7 @@ class TestTargetSchemaCast:
         # CSV always carries text bytes; the reader infers types from
         # column values, so an explicit target lets the caller pin a
         # narrower or wider type.
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(pa.table({
             "id": ["1", "2", "3"], "v": ["1.5", "2.5", "3.5"],
         }))
@@ -162,7 +162,7 @@ class TestTargetSchemaCast:
 
     def test_write_casts_to_target_schema(self) -> None:
         # The casted values are what get persisted as text.
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(
             pa.table({"id": ["1", "2"], "v": ["1.5", "2.5"]}),
             target=self._target_field(),
@@ -175,14 +175,14 @@ class TestTargetSchemaCast:
 class TestModes:
 
     def test_overwrite_replaces(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         smaller = pa.table({"id": [9], "name": ["z"]})
         io.write_arrow_table(smaller, options=CsvOptions(mode=Mode.OVERWRITE))
         assert io.read_arrow_table().equals(smaller)
 
     def test_append_concatenates_without_extra_header(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         more = pa.table({"id": [4], "name": ["d"]})
         io.write_arrow_batches(more.to_batches(), options=CsvOptions(mode=Mode.APPEND))
@@ -194,13 +194,13 @@ class TestModes:
         assert loaded.num_rows == table.num_rows + more.num_rows
 
     def test_append_on_empty_writes_header(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_batches(table.to_batches(), options=CsvOptions(mode=Mode.APPEND))
         text = io.to_bytes().decode("utf-8")
         assert text.startswith('"id","name"')
 
     def test_ignore_skips_when_non_empty(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         before = io.size
         io.write_arrow_batches(
@@ -210,7 +210,7 @@ class TestModes:
         assert io.size == before
 
     def test_error_if_exists_raises(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         with pytest.raises(FileExistsError):
             io.write_arrow_batches(
@@ -222,7 +222,7 @@ class TestKeyedMerge:
     """``options.match_by`` drives key-aware APPEND / UPSERT."""
 
     def test_append_with_keys_drops_incoming_duplicates(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         more = pa.table({"id": [2, 4], "name": ["X", "d"]})
         io.write_arrow_batches(
@@ -234,7 +234,7 @@ class TestKeyedMerge:
         assert loaded.column("name").to_pylist() == ["a", "b", "c", "d"]
 
     def test_upsert_with_keys_replaces_existing(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table)
         more = pa.table({"id": [2, 4], "name": ["X", "d"]})
         io.write_arrow_batches(
@@ -249,7 +249,7 @@ class TestKeyedMerge:
 class TestDelimiter:
 
     def test_tsv_round_trip(self, table) -> None:
-        io = CsvIO()
+        io = CSVFile()
         io.write_arrow_table(table, options=CsvOptions(delimiter="\t"))
         assert "\t" in io.to_bytes().decode("utf-8")
         loaded = io.read_arrow_table(options=CsvOptions(delimiter="\t"))
@@ -260,13 +260,13 @@ class TestHolderBacked:
 
     def test_local_path_round_trip(self, tmp_path, table) -> None:
         target = LocalPath(str(tmp_path / "data.csv"))
-        io = CsvIO(holder=target, owns_holder=False)
+        io = CSVFile(holder=target, owns_holder=False)
         io.write_arrow_table(table)
         # Vanilla read.
         text = target.read_text()
         assert "id" in text and "name" in text
 
-        reader = CsvIO(holder=target, owns_holder=False)
+        reader = CSVFile(holder=target, owns_holder=False)
         assert reader.read_arrow_table().equals(table)
 
 
@@ -278,9 +278,9 @@ class TestExternalWriterPattern:
         with target.open("wb") as bio:
             table.to_pandas().to_csv(bio, index=False)
 
-        # Read back through CsvIO. pandas writes unquoted strings by
+        # Read back through CSVFile. pandas writes unquoted strings by
         # default, so the reader does the inference.
-        reader = CsvIO(holder=target, owns_holder=False)
+        reader = CSVFile(holder=target, owns_holder=False)
         loaded = reader.read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
         assert loaded.column("name").to_pylist() == ["a", "b", "c"]
@@ -292,7 +292,7 @@ class TestExternalWriterPattern:
         with target.open("wb") as bio:
             df.write_csv(bio)
 
-        reader = CsvIO(holder=target, owns_holder=False)
+        reader = CSVFile(holder=target, owns_holder=False)
         out = reader.read_polars_frame()
         assert out.equals(df)
 
@@ -302,7 +302,7 @@ class TestNestedAsJson:
 
     pyarrow's CSV writer rejects ``list`` / ``struct`` / ``map`` /
     ``dictionary`` types with ``ArrowInvalid: Unsupported Type``;
-    :class:`CsvIO` flattens those columns to JSON strings before they
+    :class:`CSVFile` flattens those columns to JSON strings before they
     reach the encoder. The cells must round-trip through stdlib
     :mod:`json` parsing without loss for downstream consumers.
     """
@@ -317,7 +317,7 @@ class TestNestedAsJson:
 
     def test_list_column_written_as_json(self) -> None:
         t = pa.table({"id": [1, 2, 3], "tags": [[1, 2], [3], None]})
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(t)
 
         rows = [
@@ -338,7 +338,7 @@ class TestNestedAsJson:
                 type=pa.struct([("x", pa.int64()), ("y", pa.float64())]),
             ),
         })
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(t)
         text = io.to_bytes().decode("utf-8")
 
@@ -355,7 +355,7 @@ class TestNestedAsJson:
                 pa.field("attrs", pa.map_(pa.string(), pa.int64())),
             ]),
         )
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(t)
 
         # Map cells survive as JSON. Arrow's ``Array.to_pylist`` hands
@@ -371,7 +371,7 @@ class TestNestedAsJson:
             "id": [1, 2, 3],
             "kind": pa.array(["alpha", "beta", "alpha"]).dictionary_encode(),
         })
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(t)
 
         # Dictionary-encoded columns surface to ``to_pylist`` as their
@@ -387,7 +387,7 @@ class TestNestedAsJson:
     def test_deep_nested_round_trip_via_json_parse(self, deep_table) -> None:
         """Every nested column survives the write as a JSON string
         whose ``json.loads`` reproduces the original Python value."""
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(deep_table)
         text = io.to_bytes().decode("utf-8")
 
@@ -415,7 +415,7 @@ class TestNestedAsJson:
         who have already flattened upstream get the writer's native
         ``Unsupported Type`` error so the contract is unambiguous."""
         t = pa.table({"id": [1], "tags": [[1, 2]]})
-        io = CsvIO()
+        io = CSVFile()
         with pytest.raises(pa.ArrowInvalid, match="Unsupported Type"):
             io.write_table(t, options=CsvOptions(nested_as_json=False))
 
@@ -423,7 +423,7 @@ class TestNestedAsJson:
         """Scalar-only writes don't pay any extra cost (no nested
         indices → encoder is a passthrough). Smoke-tests that the
         helper doesn't accidentally mangle plain columns."""
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(table)
         # ``read_arrow_table`` reads what was written; if scalar columns
         # were touched the round-trip would diverge.
@@ -445,7 +445,7 @@ class TestNestedAsJson:
         options = CsvOptions(target=target_field)
 
         source = pa.table({"id": [1, 2], "tags": ['[1, 2]', '[3]']})
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(source, options)
         text = io.to_bytes().decode("utf-8")
         line = text.splitlines()[1]
@@ -461,7 +461,7 @@ class TestNestedAsJson:
         b1 = pa.record_batch({"id": [1], "tags": [[1, 2]]})
         b2 = pa.record_batch({"id": [2], "tags": [[3, 4]]})
         b3 = pa.record_batch({"id": [3], "tags": [None]})
-        io = CsvIO()
+        io = CSVFile()
         io.write_table([b1, b2, b3])
 
         rows = io.to_bytes().decode("utf-8").strip().splitlines()
@@ -477,7 +477,7 @@ class TestNestedAsJson:
             "tags": [[1, 2], [3]],
         })
         # No target — pandas → arrow infers list<int64>.
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(df)
         text = io.to_bytes().decode("utf-8")
         assert '"[1,2]"' in text
@@ -489,7 +489,7 @@ class TestNestedAsJson:
             "id": [1, 2],
             "tags": [[1, 2], [3]],
         })
-        io = CsvIO()
+        io = CSVFile()
         io.write_table(df)
         text = io.to_bytes().decode("utf-8")
         assert '"[1,2]"' in text

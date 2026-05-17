@@ -40,7 +40,7 @@ Construction shapes
   return an owning IO.
 - **Format dispatch** — ``IO(media_type="csv")``,
   ``IO(path="x.parquet")``, … resolve to the registered Tabular leaf
-  (:class:`CsvIO`, :class:`ParquetIO`, …) automatically.
+  (:class:`CSVFile`, :class:`ParquetFile`, …) automatically.
 
 Lifecycle
 ---------
@@ -194,11 +194,11 @@ class IO(Holder, BinaryIO, Generic[T, O]):
     Two layered patterns survive the merge for backward compat:
 
     - **Self-storing IO** — the default. :class:`BytesIO` and the
-      format leaves (:class:`ParquetIO`, :class:`CsvIO`, …) carry
+      format leaves (:class:`ParquetFile`, :class:`CSVFile`, …) carry
       their own bytes via the inherited Holder primitives.
     - **Holder-wrapping IO** — opt-in via ``IO(holder=other_holder)``.
       The IO keeps a separate ``_holder`` pointer (e.g. a
-      :class:`LocalPath` underneath a :class:`ParquetIO` cursor) and
+      :class:`LocalPath` underneath a :class:`ParquetFile` cursor) and
       ``_active()`` redirects every byte op there. This is how
       ``LocalPath("data.parquet").open()`` produces a format-aware
       cursor against a path-backed buffer without copying bytes.
@@ -242,8 +242,8 @@ class IO(Holder, BinaryIO, Generic[T, O]):
     ):
         """Allocate the instance and resolve a holder.
 
-        Format dispatch (``IO(path="x.csv")`` → :class:`CsvIO`,
-        ``BytesIO(media_type=parquet)`` → :class:`ParquetIO`, …) lives
+        Format dispatch (``IO(path="x.csv")`` → :class:`CSVFile`,
+        ``BytesIO(media_type=parquet)`` → :class:`ParquetFile`, …) lives
         on :meth:`Holder.__new__` — :func:`super().__new__` may return
         a fully-initialised instance of a different leaf, in which case
         we return it as-is without re-running the holder-resolution
@@ -605,7 +605,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         Returns ``self._parent`` directly — the IO is a pure cursor
         over a single holder. Subclasses that need a side effect
         before every byte-level access (lazy materialization in
-        :class:`ZipEntryIO` / :class:`XlsxSheetIO`) override this
+        :class:`ZipEntryFile` / :class:`XLSXSheetFile`) override this
         hook to drive the side effect, then ``return super()._active()``.
         """
         return self._parent
@@ -806,8 +806,8 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         + one ``write`` (append).
 
         Built for the format-leaf write path: each leaf
-        (:class:`ParquetIO`, :class:`ArrowIPCIO`, :class:`CsvIO`,
-        :class:`NDJsonIO`, …) drives its encoder against an Arrow
+        (:class:`ParquetFile`, :class:`ArrowIPCFile`, :class:`CSVFile`,
+        :class:`NDJSONFile`, …) drives its encoder against an Arrow
         sink, then hands the resulting buffer to this method instead
         of streaming the encoder's per-row-group / per-batch / per-row
         writes through :meth:`write`. Skips the small-write cost on
@@ -907,13 +907,13 @@ class IO(Holder, BinaryIO, Generic[T, O]):
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
         """Default — opaque buffer can't honestly yield Arrow batches.
 
-        Format-specific subclasses (ParquetIO, CsvIO, ArrowIPCIO, …)
+        Format-specific subclasses (ParquetFile, CSVFile, ArrowIPCFile, …)
         override against the same holder. For dispatch by media type,
         construct via the format leaf directly.
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no tabular decoder. "
-            "Construct via the format leaf (ParquetIO, CsvIO, …) "
+            "Construct via the format leaf (ParquetFile, CSVFile, …) "
             "to read Arrow record batches from this byte buffer."
         )
 
@@ -928,7 +928,7 @@ class IO(Holder, BinaryIO, Generic[T, O]):
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no tabular encoder. "
-            "Construct via the format leaf (ParquetIO, CsvIO, …) "
+            "Construct via the format leaf (ParquetFile, CSVFile, …) "
             "to write Arrow record batches into this byte buffer."
         )
 

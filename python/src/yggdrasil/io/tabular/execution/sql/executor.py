@@ -18,7 +18,7 @@ Two backends, picked at runtime by what's installed:
   error so the user gets a single-line fix.
 
 Both backends materialize the result into a :class:`Tabular`
-holder (:class:`ArrowTabular` by default, :class:`ParquetIO`
+holder (:class:`ArrowTabular` by default, :class:`ParquetFile`
 folder when :attr:`SqlPreparedStatement.persist == "path"`) and
 return it alongside the row count. The :class:`SqlStatementResult`
 hangs the holder off ``_persisted_data`` so subsequent reads short-
@@ -201,7 +201,7 @@ class SqlExecutor(StatementExecutor, ABC):
         ``persist == "memory"`` → :class:`ArrowTabular` (zero copy
         — the holder just keeps a reference to the batches).
         ``persist == "path"`` → spill to a parquet file/folder under
-        ``statement.path`` and return the :class:`ParquetIO`
+        ``statement.path`` and return the :class:`ParquetFile`
         wrapping it. ``persist is None`` collapses to memory; the
         statement just won't keep the holder alive past the first
         read.

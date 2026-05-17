@@ -23,8 +23,8 @@ import pytest
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
-from yggdrasil.io.primitive.csv_io import CsvIO
-from yggdrasil.io.primitive.parquet_io import ParquetIO
+from yggdrasil.io.primitive.csv_file import CSVFile
+from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
 @pytest.fixture
@@ -51,15 +51,15 @@ class TestIterChildren:
 
     def test_yields_registered_tabular_leaves(self, tmp_path, table) -> None:
         # Drop a parquet and a csv into the folder.
-        ParquetIO(holder=__class__._lp(tmp_path / "a.parquet"), owns_holder=False).write_arrow_table(table)
-        CsvIO(holder=__class__._lp(tmp_path / "b.csv"), owns_holder=False).write_arrow_table(table)
+        ParquetFile(holder=__class__._lp(tmp_path / "a.parquet"), owns_holder=False).write_arrow_table(table)
+        CSVFile(holder=__class__._lp(tmp_path / "b.csv"), owns_holder=False).write_arrow_table(table)
         folder = FolderIO(path=str(tmp_path))
         kinds = sorted(type(c).__name__ for c in folder.iter_children())
-        assert kinds == ["CsvIO", "ParquetIO"]
+        assert kinds == ["CSVFile", "ParquetFile"]
 
     def test_skips_private_entries(self, tmp_path, table) -> None:
-        ParquetIO(holder=__class__._lp(tmp_path / ".hidden.parquet"), owns_holder=False).write_arrow_table(table)
-        ParquetIO(holder=__class__._lp(tmp_path / "real.parquet"), owns_holder=False).write_arrow_table(table)
+        ParquetFile(holder=__class__._lp(tmp_path / ".hidden.parquet"), owns_holder=False).write_arrow_table(table)
+        ParquetFile(holder=__class__._lp(tmp_path / "real.parquet"), owns_holder=False).write_arrow_table(table)
         folder = FolderIO(path=str(tmp_path))
         names = [c._parent.name for c in folder.iter_children()]
         assert "real.parquet" in names[0]
@@ -68,7 +68,7 @@ class TestIterChildren:
     def test_subdirectory_returns_subfolder(self, tmp_path, table) -> None:
         sub = tmp_path / "nested"
         sub.mkdir()
-        ParquetIO(holder=__class__._lp(sub / "x.parquet"), owns_holder=False).write_arrow_table(table)
+        ParquetFile(holder=__class__._lp(sub / "x.parquet"), owns_holder=False).write_arrow_table(table)
         folder = FolderIO(path=str(tmp_path))
         kids = list(folder.iter_children())
         assert any(isinstance(c, FolderIO) for c in kids)
@@ -162,13 +162,13 @@ class TestMakeChild:
         # Fresh path under tmp_path with the correct extension.
         assert os.fspath(child._parent).startswith(str(tmp_path))
         assert os.fspath(child._parent).endswith(".parquet")
-        # Class is the ParquetIO leaf — make_child wired the format.
-        assert isinstance(child, ParquetIO)
+        # Class is the ParquetFile leaf — make_child wired the format.
+        assert isinstance(child, ParquetFile)
 
     def test_csv_child(self, tmp_path) -> None:
         folder = FolderIO(path=str(tmp_path))
         child = folder.make_child(options=FolderOptions(child_media_type="csv"))
-        assert isinstance(child, CsvIO)
+        assert isinstance(child, CSVFile)
 
 
 class TestOptimize:
@@ -427,7 +427,7 @@ class TestTabularBaseOptimize:
         from yggdrasil.io.path.local_path import LocalPath
 
         target = LocalPath(str(tmp_path / "leaf.parquet"))
-        leaf = ParquetIO(holder=target, owns_holder=False)
+        leaf = ParquetFile(holder=target, owns_holder=False)
         leaf.write_arrow_table(table)
         # Default Tabular.optimize is a no-op for a non-aggregator
         # leaf — extra kwargs are accepted and ignored.
@@ -451,7 +451,7 @@ class TestPredicatePrune:
         static_values must not list the directory at all."""
         from yggdrasil.io.tabular.execution.expr import col
 
-        ParquetIO(
+        ParquetFile(
             holder=__class__._lp(tmp_path / "p.parquet"), owns_holder=False,
         ).write_arrow_table(table)
 
@@ -479,7 +479,7 @@ class TestPredicatePrune:
     ) -> None:
         from yggdrasil.io.tabular.execution.expr import col
 
-        ParquetIO(
+        ParquetFile(
             holder=__class__._lp(tmp_path / "p.parquet"), owns_holder=False,
         ).write_arrow_table(table)
         folder = FolderIO(path=str(tmp_path), static_values={"region": "us"})
@@ -494,7 +494,7 @@ class TestPredicatePrune:
         runs, leaving row-level filtering to downstream consumers."""
         from yggdrasil.io.tabular.execution.expr import col
 
-        ParquetIO(
+        ParquetFile(
             holder=__class__._lp(tmp_path / "p.parquet"), owns_holder=False,
         ).write_arrow_table(table)
         folder = FolderIO(path=str(tmp_path), static_values={"region": "us"})
@@ -519,10 +519,10 @@ class TestPredicatePrune:
         eu_dir = tmp_path / "eu"
         us_dir.mkdir()
         eu_dir.mkdir()
-        ParquetIO(
+        ParquetFile(
             holder=__class__._lp(us_dir / "p.parquet"), owns_holder=False,
         ).write_arrow_table(table)
-        ParquetIO(
+        ParquetFile(
             holder=__class__._lp(eu_dir / "p.parquet"), owns_holder=False,
         ).write_arrow_table(table)
 

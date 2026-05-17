@@ -70,7 +70,7 @@ class FolderOptions(CastOptions):
 
     #: Media type of newly minted child files. Drives both the
     #: filename extension and the :class:`Tabular` leaf class
-    #: (``ParquetIO`` / ``ArrowIPCIO`` / ``CsvIO`` / …) the folder
+    #: (``ParquetFile`` / ``ArrowIPCFile`` / ``CSVFile`` / …) the folder
     #: dispatches to. Defaults to Arrow IPC — matches the in-memory
     #: batch shape, no row-group footer to rewrite, cheapest format
     #: to land a stream of small batches into. Pass
@@ -236,8 +236,8 @@ class FolderIO(Holder[FolderOptions]):
         Sub-directories come back as a fresh :class:`FolderIO`. File
         entries route through :class:`MediaType.from_` (extension
         first, magic-byte fallback) to a registered :class:`Tabular`
-        leaf — :class:`ParquetIO` for ``.parquet``,
-        :class:`ArrowIPCIO` for ``.arrow``, etc. Files that don't
+        leaf — :class:`ParquetFile` for ``.parquet``,
+        :class:`ArrowIPCFile` for ``.arrow``, etc. Files that don't
         resolve fall back to a plain :class:`BytesIO`, which is
         useful for the children-surface walk but raises on the
         Tabular hooks (so they're transparently skipped by
