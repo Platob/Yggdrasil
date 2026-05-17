@@ -663,6 +663,55 @@ class TestIOTransfer:
             io.download(dst, size=2, offset=2)
             assert dst.read_bytes() == b"de"
 
+    def test_io_write_holder_advances_cursor(self) -> None:
+        """``IO.write_holder(src)`` splices at cursor and advances."""
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = Memory()
+        src.write_bytes(b"src-bytes")  # 9 bytes
+        with BytesIO() as io:
+            io.write_bytes(b"PRE-")
+            cursor_before = io.tell()
+            io.write_holder(src)
+            assert io.tell() == cursor_before + src.size
+            io.seek(0)
+            assert io.read() == b"PRE-src-bytes"
+
+    def test_io_write_holder_honors_size_cap(self) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        src = Memory()
+        src.write_bytes(b"abcdefghij")
+        with BytesIO() as io:
+            io.write_holder(src, size=4)
+            assert io.tell() == 4
+            io.seek(0)
+            assert io.read() == b"abcd"
+
+    def test_io_write_stream_honors_batch_size(self) -> None:
+        """``IO.write_stream(src, batch_size=N)`` threads through Holder."""
+        from yggdrasil.io.bytes_io import BytesIO
+
+        with BytesIO() as src:
+            src.write_bytes(b"x" * 16)
+            src.seek(0)
+
+            reads: list[int] = []
+            original = src.read
+
+            def spy_read(size=-1):
+                chunk = original(size)
+                reads.append(len(chunk))
+                return chunk
+
+            src.read = spy_read  # type: ignore[method-assign]
+
+            with BytesIO() as dst:
+                dst.write_stream(src, batch_size=4)
+
+        # 16 bytes / 4-byte batches → 4 reads of 4.
+        assert [n for n in reads if n > 0] == [4, 4, 4, 4]
+
 
 class TestPathTransferOptimization:
     """``Path._transfer_to`` overrides for local-aware fast paths."""

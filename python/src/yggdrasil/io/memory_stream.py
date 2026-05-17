@@ -292,46 +292,46 @@ class MemoryStream(Holder):
             media_type=self.media_type,
         )
 
-    def read_mv(self, n: int, pos: int) -> memoryview:
-        """Read ``n`` bytes at absolute ``pos``, pulling from source as
-        needed. ``n < 0`` reads to EOF.
+    def read_mv(self, size: int = -1, offset: int = 0) -> memoryview:
+        """Read ``size`` bytes at absolute ``offset``, pulling from source
+        as needed. ``size < 0`` reads to EOF.
 
-        Raises if ``pos`` is behind the live window — those bytes have
+        Raises if ``offset`` is behind the live window — those bytes have
         already slid out and are unrecoverable.
         """
-        # Resolve negative positions against the *current* size first
-        # so the SEEK_END idiom (``pos = -1, n = 0``) lands at
+        # Resolve negative offsets against the *current* size first
+        # so the SEEK_END idiom (``offset = -1, size = 0``) lands at
         # window_end without forcing a pull.
-        pos = _resolve_pos(pos, self.size)
-        if pos < 0:
+        offset = _resolve_pos(offset, self.size)
+        if offset < 0:
             raise ValueError(
-                f"Position {pos} is out of bounds for "
+                f"Offset {offset} is out of bounds for "
                 f"MemoryStream of size {self.size}"
             )
 
-        if n < 0:
+        if size < 0:
             self._pull_to_eof()
-            n = max(0, self.size - pos)
+            size = max(0, self.size - offset)
         else:
-            target = pos + n
+            target = offset + size
             if target > self.size:
                 self._pull_until(target)
             # EOF may have hit before reaching target — cap to what's
             # actually available.
-            n = min(n, max(0, self.size - pos))
+            size = min(size, max(0, self.size - offset))
 
-        if pos < self._window_start:
+        if offset < self._window_start:
             raise ValueError(
-                f"Position {pos} is behind the live window "
+                f"Offset {offset} is behind the live window "
                 f"[{self._window_start}, {self.window_end}); the window "
                 f"holds at most {self._byte_size} bytes and has slid past."
             )
-        if pos > self.size:
+        if offset > self.size:
             raise ValueError(
-                f"Position {pos} is past EOF (size {self.size})."
+                f"Offset {offset} is past EOF (size {self.size})."
             )
 
-        return self._read_mv(n, pos)
+        return self._read_mv(size, offset)
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         local = pos - self._window_start
@@ -340,12 +340,12 @@ class MemoryStream(Holder):
     def write_mv(
         self,
         data: memoryview,
-        pos: int = 0,
+        offset: int = 0,
         *,
         size: int = -1,
         update_stat: bool = True,
     ) -> int:
-        """Splice bytes at ``pos``. Appends past current end extend the
+        """Splice bytes at ``offset``. Appends past current end extend the
         stream and may slide the window; in-window writes overwrite.
 
         ``size>=0`` slices the input buffer to at most ``size``
@@ -355,19 +355,19 @@ class MemoryStream(Holder):
         if size >= 0 and len(data) > size:
             data = data[:size]
         total = self.size
-        pos = _resolve_pos(pos, total)
-        if pos < 0:
+        offset = _resolve_pos(offset, total)
+        if offset < 0:
             raise ValueError(
-                f"Position {pos} is out of bounds for MemoryStream"
+                f"Offset {offset} is out of bounds for MemoryStream"
             )
-        if pos < self._window_start:
+        if offset < self._window_start:
             raise ValueError(
-                f"Cannot write at position {pos}: behind the live window "
+                f"Cannot write at offset {offset}: behind the live window "
                 f"start {self._window_start}."
             )
-        if pos > total:
+        if offset > total:
             raise ValueError(
-                f"Cannot write at position {pos}: past current end {total} "
+                f"Cannot write at offset {offset}: past current end {total} "
                 f"(stream is append-or-overwrite, not sparse)."
             )
 
@@ -375,14 +375,14 @@ class MemoryStream(Holder):
         if n == 0:
             return 0
 
-        end = pos + n
+        end = offset + n
         local_end = end - self._window_start
         if local_end > len(self._buf):
             # Grow exactly to local_end; the splice below overwrites
             # the new tail, so no zero-padding survives.
             self._buf.extend(b"\x00" * (local_end - len(self._buf)))
 
-        written = self._write_mv(data, pos)
+        written = self._write_mv(data, offset)
         if written > 0 and update_stat:
             self._slide_window()
             self._touch_stat(size=self.size)
