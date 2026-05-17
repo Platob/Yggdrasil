@@ -1125,8 +1125,10 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         """Write *b* at the cursor, advancing it.
 
         Accepts bytes-like, ``str`` (UTF-8), ``io.BytesIO``, or any
-        file-like with ``.read``. The buffer-protocol fallback catches
-        things like :class:`pyarrow.Buffer` that aren't
+        file-like with ``.read``. File-like sources route through
+        :meth:`write_stream` so backends with an atomic whole-object
+        upload push a single request. The buffer-protocol fallback
+        catches things like :class:`pyarrow.Buffer` that aren't
         bytes/bytearray/memoryview but ARE memoryview-able.
         """
         if b is None:
@@ -1136,13 +1138,7 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         if isinstance(b, (bytes, bytearray, memoryview)):
             return self.write_bytes(b, update_stat=update_stat)
         if hasattr(b, "read"):
-            total = 0
-            while True:
-                chunk = b.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += self.write_bytes(chunk, update_stat=update_stat)
-            return total
+            return self.write_stream(b)
         return self.write_bytes(memoryview(b), update_stat=update_stat)
 
     def write_bytes(self, b: BytesLike, *, update_stat: bool = True) -> int:
@@ -1151,6 +1147,21 @@ class IO(Tabular[O], Disposable, Generic[T, O]):
         if len(mv) == 0:
             return 0
         n = self._active().write_mv(mv, self._pos, update_stat=update_stat)
+        self._pos += n
+        return n
+
+    def write_stream(self, src: Any) -> int:
+        """Drain a binary file-like *src* into self at the cursor.
+
+        Cursor-anchored wrapper around :meth:`Holder.write_stream` —
+        the holder reads *src* end-to-end and commits the payload
+        with a single :meth:`Holder.write_bytes`, so backends with
+        an atomic whole-object upload (``files.upload``,
+        ``workspace.upload``, S3 ``PutObject``) push one request
+        instead of chunked read-modify-rewrites. The cursor
+        advances by the number of bytes written.
+        """
+        n = self._active().write_stream(src, offset=self._pos)
         self._pos += n
         return n
 
