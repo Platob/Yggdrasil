@@ -690,22 +690,32 @@ class Volume(DatabricksResource, Singleton):
 
         Used by :meth:`read_info` when ``volumes.read`` returns
         ``NotFound``, and by :class:`VolumePath` when a write hits a
-        missing target. Routes the volume create through
-        :meth:`create` (which centralises the managed-volume default
-        and warms the ``VolumeInfo`` cache via ``_store_infos``);
-        ``AlreadyExists`` is swallowed so concurrent creators don't
-        fight. Returns ``True`` if at least one create landed.
+        missing target. Routes the volume create through the project's
+        :class:`Volumes` service (``self.service.create``, same
+        instance ``client.volumes`` exposes) so the managed-volume
+        default and the post-create ``_store_infos`` cache warm-up
+        live in one place; ``AlreadyExists`` is swallowed so
+        concurrent creators don't fight. Returns ``True`` if at least
+        one create landed.
         """
         ws = self.client.workspace_client()
         logger.debug("Ensuring volume %r exists", self)
 
+        def _create_volume() -> Any:
+            return self.service.create(
+                catalog_name=self.catalog_name,
+                schema_name=self.schema_name,
+                volume_name=self.volume_name,
+                if_not_exists=False,
+            )
+
         # 1) Try volume only — common case where catalog + schema exist.
         # ``if_not_exists=False`` so AlreadyExists surfaces here and we
         # can distinguish "already there" (return False) from "newly
-        # created" (return True); the ``self.create`` wrapper still
-        # owns the SDK call and the post-create cache warm-up.
+        # created" (return True); the service still owns the SDK call
+        # and the post-create cache warm-up.
         try:
-            self.create(if_not_exists=False)
+            _create_volume()
             return True
         except Exception as exc:
             if _looks_like_already_exists(exc):
@@ -732,7 +742,7 @@ class Volume(DatabricksResource, Singleton):
             else:
                 raise
 
-        _safe_create(lambda: self.create(if_not_exists=False))
+        _safe_create(_create_volume)
         return True
 
     # ── grants ────────────────────────────────────────────────────────────────

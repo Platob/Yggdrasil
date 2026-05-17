@@ -190,6 +190,42 @@ class Volumes(DatabricksService):
             volume_name=v,
         )
 
+    def create(
+        self,
+        location: str | None = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        volume_name: str | None = None,
+        comment: str | None = None,
+        storage_location: str | None = None,
+        volume_type=None,
+        if_not_exists: bool = True,
+    ) -> Volume:
+        """Create a volume by name and return the bound :class:`Volume`.
+
+        Service-level entry point matching :meth:`Warehouses.create` —
+        resolves the catalog / schema / volume parts (from *location*
+        or keyword overrides, falling back to the service defaults),
+        materialises the :class:`Volume` singleton, then delegates to
+        :meth:`Volume.create` so the managed-volume-type default and
+        the post-create ``_store_infos`` cache warm-up live in one
+        place. Callers reaching for "create a volume" from outside the
+        resource (recovery paths, scripts, tests) should prefer this
+        over a raw ``ws.volumes.create(...)`` call.
+        """
+        return self.volume(
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            volume_name=volume_name,
+        ).create(
+            comment=comment,
+            storage_location=storage_location,
+            volume_type=volume_type,
+            if_not_exists=if_not_exists,
+        )
+
     # ── remote fetch ──────────────────────────────────────────────────────────
 
     def find_remote(
