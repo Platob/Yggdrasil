@@ -413,6 +413,9 @@ class WorkspacePath(DatabricksPath):
                 mtime=time.time(),
                 media_type=self.media_type,
             ))
+            logger.info("Uploaded workspace file %r (size=%d)", self, size)
+        else:
+            logger.info("Uploaded workspace file %r (size=stream)", self)
         return size
 
     # ==================================================================

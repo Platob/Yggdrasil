@@ -943,15 +943,15 @@ class VolumePath(DatabricksPath):
 
         self._call_ensuring_parents(_do_upload)
         if size >= 0:
-            logger.info("Wrote %r (%d bytes)", self, size)
             self._seed_stat_cache(IOStats(
                 size=size,
                 kind=IOKind.FILE,
                 mtime=time.time(),
                 media_type=self.media_type,
             ))
+            logger.info("Uploaded volume file %r (size=%d)", self, size)
         else:
-            logger.info("Wrote %r (stream)", self)
+            logger.info("Uploaded volume file %r (size=stream)", self)
         return size
 
     def truncate(self, n: int) -> int:

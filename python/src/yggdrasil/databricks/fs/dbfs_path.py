@@ -347,6 +347,9 @@ class DBFSPath(DatabricksPath):
                 mtime=time.time(),
                 media_type=self.media_type,
             ))
+            logger.info("Uploaded DBFS file %r (size=%d)", self, size)
+        else:
+            logger.info("Uploaded DBFS file %r (size=stream)", self)
         return size
 
     def truncate(self, n: int) -> int:
