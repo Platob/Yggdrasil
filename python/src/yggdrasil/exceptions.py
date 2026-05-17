@@ -79,16 +79,35 @@ def _describe_field(field: "Field | None") -> str | None:
     """
     if field is None:
         return None
-    name = getattr(field, "name", None)
+    name = _safe_attr(field, "name")
+    # ``arrow_type`` is a cached property on Field — for a self-referential
+    # struct (a CastError target that recurses on itself), accessing it
+    # triggers ``StructType.to_arrow`` → ``Field.to_arrow_field`` → ``arrow_type``
+    # forever and the error formatter never returns. Guard the chain so the
+    # original CastError surfaces with a degraded but finite description.
     dtype: Any = (
-        getattr(field, "arrow_type", None)
-        or getattr(field, "type", None)
-        or getattr(field, "dtype", None)
+        _safe_attr(field, "arrow_type")
+        or _safe_attr(field, "type")
+        or _safe_attr(field, "dtype")
     )
     if name and dtype is not None:
         return f"{name}: {dtype}"
     if dtype is not None:
-        return str(dtype)
+        return _safe_str(dtype)
     if name:
         return str(name)
-    return repr(field)
+    return _safe_str(field, default=object.__repr__(field))
+
+
+def _safe_attr(obj: Any, name: str) -> Any:
+    try:
+        return getattr(obj, name, None)
+    except Exception:
+        return None
+
+
+def _safe_str(value: Any, default: str = "?") -> str:
+    try:
+        return str(value)
+    except Exception:
+        return default

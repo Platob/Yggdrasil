@@ -57,7 +57,17 @@ def stubbed_workspace_config(monkeypatch):
 @pytest.fixture
 def mocked_builder(monkeypatch):
     """Patch ``databricks.connect`` with controllable
-    ``DatabricksSession.builder`` and ``DatabricksEnv`` shapes."""
+    ``DatabricksSession.builder`` and ``DatabricksEnv`` shapes.
+
+    Also force ``SparkSession.getActiveSession()`` → ``None`` so the
+    early-return path in :meth:`DatabricksClient.spark` (which
+    bypasses the builder when a live session is already pinned on
+    the process) doesn't shortcut the mock. Real-world test
+    environments — notebook drivers, PyCharm's Spark Connect plugin,
+    leaked state from an earlier suite — routinely have an active
+    session, which would otherwise make ``serverless_client.spark()``
+    return the real session instead of the mocked one.
+    """
     session = MagicMock(name="SparkSession")
     builder = MagicMock(name="Builder")
     builder.sdkConfig.return_value = builder
@@ -83,6 +93,32 @@ def mocked_builder(monkeypatch):
         },
     )
     monkeypatch.setitem(sys.modules, "databricks.connect", fake_module)
+
+    # Neutralise any pre-existing live SparkSession in the process — both
+    # the classic and the Spark Connect classes expose
+    # ``getActiveSession()`` and ``DatabricksClient.spark`` probes the
+    # classic one before reaching the builder.
+    try:
+        from pyspark.sql import SparkSession as _SparkSession
+        monkeypatch.setattr(_SparkSession, "getActiveSession", staticmethod(lambda: None))
+    except Exception:
+        pass
+    try:
+        from pyspark.sql.connect.session import SparkSession as _ConnectSparkSession
+        monkeypatch.setattr(
+            _ConnectSparkSession, "getActiveSession", staticmethod(lambda: None),
+        )
+    except Exception:
+        pass
+    # Also clear yggdrasil's own cached session so the create-once helpers
+    # don't hand back a leaked Connect session from a previous test.
+    try:
+        from yggdrasil.environ import PyEnv
+        from yggdrasil.environ.environment import MISSING
+        monkeypatch.setattr(PyEnv, "_SPARK_SESSION", MISSING, raising=False)
+    except Exception:
+        pass
+
     return builder, session, FakeEnv, env_instances
 
 
@@ -110,6 +146,22 @@ class TestClassifyDependency:
         assert info.version is not None
 
     def test_editable_install_is_editable(self) -> None:
+        # Skip when the dev environment installed ``ygg`` non-editably
+        # (e.g. ``pip install .`` instead of ``pip install -e .``). The
+        # editable bit comes from PEP 610 ``direct_url.json`` — probe
+        # the same source the production classifier uses so the test
+        # only runs in environments that can actually satisfy its
+        # premise.
+        from importlib.metadata import distribution
+        from yggdrasil.databricks.registry import _detect_editable
+
+        if not _detect_editable(distribution("ygg")):
+            pytest.skip(
+                "ygg is installed non-editably in this environment; the "
+                "EDITABLE-classification path can only be exercised after "
+                "`pip install -e .`."
+            )
+
         info = classify_dependency("ygg")
         # The repo install IS editable; classification should
         # honour direct_url.json and stamp the hostname.

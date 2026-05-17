@@ -1566,7 +1566,7 @@ class DatabricksClient(Singleton, URLBased):
         Connect variant) configured against this client's workspace
         host and credentials. The bound :class:`DatabricksClient`
         is stashed on the session as ``session.ygg_client`` so
-        downstream helpers (UDFs, :class:`DynamicFrame` extensions,
+        downstream helpers (UDFs, :class:`Dataset` extensions,
         ad-hoc resource lookups) can reach the same auth without an
         extra ``DatabricksClient.current()`` call.
 
@@ -1688,7 +1688,7 @@ class DatabricksClient(Singleton, URLBased):
         """Stash ``self`` on *session* as ``ygg_client`` and return it.
 
         Downstream ``client.spark(...)`` consumers (UDFs,
-        :class:`DynamicFrame` extensions, ad-hoc resource lookups)
+        :class:`Dataset` extensions, ad-hoc resource lookups)
         pull the bound client off the session instead of
         re-resolving :meth:`DatabricksClient.current`.
         """

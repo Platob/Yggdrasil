@@ -329,13 +329,19 @@ class SQLWarehouse(
         """
         pool = self._external_link_pool_instance
         if pool is not None:
-            try:
-                pool.clear()
-            except Exception:
-                LOGGER.exception(
-                    "Failed to clear external-link pool for %r; continuing.",
-                    self,
-                )
+            # The pool slot can hold a bare ``object()`` placeholder during
+            # pickle / fixture round-trips (see
+            # ``test_warehouse_pickle.py``), so don't blindly call ``.clear``
+            # — that's a ``urllib3.PoolManager`` method, not a generic one.
+            clear = getattr(pool, "clear", None)
+            if callable(clear):
+                try:
+                    clear()
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to clear external-link pool for %r; continuing.",
+                        self,
+                    )
             self._external_link_pool_instance = None
         super()._release(committed=committed)
 

@@ -17,7 +17,7 @@ All Python commands run from `python/`.
 
 ```bash
 cd python
-uv venv .venv && source .venv/bin/activate   # .venv\Scripts\activate on Windows
+uv venv --seed .venv && source .venv/bin/activate   # .venv\Scripts\activate on Windows
 uv pip install -e .[dev]                     # core dev tooling
 
 # Optional extras are additive — install only what a task needs:

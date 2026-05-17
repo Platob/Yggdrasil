@@ -368,7 +368,7 @@ def dependencies_to_pip_specs(
                         module, source_path=dep.source_path,
                         version=dep.version,
                     )
-                    # ``PathPyPI.publish`` returns a :class:`Path`;
+                    # ``PyPIPath.publish`` returns a :class:`Path`;
                     # older shims may hand back a raw string. Accept
                     # either, project through ``full_path()`` when it
                     # exists so the requirement line carries the

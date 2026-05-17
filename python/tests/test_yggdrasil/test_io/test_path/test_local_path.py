@@ -370,9 +370,13 @@ class TestDownload:
         assert out.read_bytes() == b"payload"
 
     def test_download_default_uses_home_downloads(self, tmp_path, monkeypatch) -> None:
-        # Redirect $HOME so the test never touches the real user's
-        # Downloads folder.
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        # Redirect the user-home lookup so the test never touches the
+        # real Downloads folder. ``os.path.expanduser("~")`` consults
+        # ``HOME`` on POSIX and ``USERPROFILE`` on Windows — set both
+        # so this test is cross-platform.
+        fake_home = str(tmp_path / "home")
+        monkeypatch.setenv("HOME", fake_home)
+        monkeypatch.setenv("USERPROFILE", fake_home)
         src = LocalPath(str(tmp_path / "src.bin"))
         src.write_bytes(b"payload")
         out = src.download()
@@ -382,8 +386,12 @@ class TestDownload:
 
     def test_download_default_resolves_name_conflicts(self, tmp_path, monkeypatch) -> None:
         # Browser-style: second/third downloads of the same name get
-        # "(1)" / "(2)" inserted before the suffix.
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        # "(1)" / "(2)" inserted before the suffix. Same dual-env-var
+        # dance as the previous test so Windows + POSIX both see the
+        # redirected home.
+        fake_home = str(tmp_path / "home")
+        monkeypatch.setenv("HOME", fake_home)
+        monkeypatch.setenv("USERPROFILE", fake_home)
         src = LocalPath(str(tmp_path / "src.bin"))
         src.write_bytes(b"payload")
         first = src.download()

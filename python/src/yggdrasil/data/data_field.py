@@ -127,6 +127,56 @@ def _strip_internal_metadata(
     return out or None
 
 
+def _render_spark_column_sql(column: "Any") -> "str | None":
+    """Pull the SQL expression string off a ``pyspark.sql.Column``.
+
+    Three probes, in order:
+
+    1. ``column._jc.toString()`` — classic Spark's JVM Column. Spark
+       Connect's ``Column`` raises
+       ``PySparkAttributeError(JVM_ATTRIBUTE_NOT_SUPPORTED)`` on
+       ``_jc`` access, so this is wrapped in ``try/except``.
+    2. ``column._expr.__repr__()`` — Spark Connect's ``Column`` stores
+       the expression at ``_expr``; ``Column.__repr__`` itself is
+       just ``"Column<'%s'>" % self._expr.__repr__()``.
+    3. Parse ``repr(column)`` and strip the ``Column<'…'>`` wrapper
+       — last-resort for any future PySpark whose slot name changes.
+
+    Returns ``None`` when none of the probes yields a non-empty
+    string; the caller raises with a usable message.
+    """
+    try:
+        jc = column._jc
+    except Exception:
+        jc = None
+    if jc is not None:
+        try:
+            rendered = jc.toString()
+        except Exception:
+            rendered = None
+        if rendered:
+            return str(rendered)
+
+    expr = getattr(column, "_expr", None)
+    if expr is not None:
+        try:
+            rendered = expr.__repr__()
+        except Exception:
+            rendered = None
+        if rendered:
+            return str(rendered)
+
+    try:
+        repr_text = repr(column)
+    except Exception:
+        return None
+    # Strip ``Column<'<sql>'>`` to recover ``<sql>``. Match greedily on the
+    # inner ``'…'>`` close so nested quotes inside the SQL don't truncate.
+    if repr_text.startswith("Column<'") and repr_text.endswith("'>"):
+        return repr_text[len("Column<'"):-len("'>")]
+    return repr_text or None
+
+
 def _parse_spark_column_sql(sql: str) -> "tuple[str, DataType | None]":
     """Best-effort name + dtype extract from a Spark Column's SQL form.
 
@@ -2198,7 +2248,23 @@ class Field(BaseChildrenFields):
             return cls.from_str(obj)
 
         if isinstance(obj, Mapping):
-            return cls.from_dict(obj)
+            # ``from_dict`` expects a *schema* dict (``{"name": ..., "dtype": ...}``
+            # / ``{"type_text": ...}`` shape) — handing it an *instance* dict
+            # like ``{"id": 1, "name": "alice"}`` raises because no schema
+            # keys resolve. That's exactly what ``Schema.from_(row_dict)``
+            # call sites (e.g. ``Dataset.infer_schema``) hand us. Try
+            # the schema-dict route first, fall back to Arrow's struct
+            # inference from the row instance.
+            field_obj = cls.from_dict(obj, default=None)
+            if field_obj is not None:
+                return field_obj
+            try:
+                table = pa.Table.from_pylist([dict(obj)])
+            except Exception:
+                # Mixed / non-Arrow-compatible values — let the original
+                # schema-dict error fire so the caller sees the real reason.
+                return cls.from_dict(obj)
+            return cls.from_arrow(table.schema)
 
         if hasattr(obj, "value"):
             return cls.from_any(obj.value)
@@ -2737,14 +2803,13 @@ class Field(BaseChildrenFields):
         """Build a :class:`Field` from a ``pyspark.sql.Column``.
 
         ``Column`` objects don't expose a typed dtype on the public
-        Python surface — the only stable JVM access path that
-        survives across PySpark releases is the SQL-rendered
-        ``_jc.toString()`` (which is what ``Column.__repr__``
-        wraps). We parse that:
+        Python surface — we read the SQL-rendered expression instead
+        and parse that:
 
         * ``id`` — bare reference. Name is ``id``, dtype defers
-          to the fallback (``ObjectType``) since the JVM doesn't
-          expose the underlying schema on a free-standing column.
+          to the fallback (``ObjectType``) since neither the JVM
+          nor the Spark Connect proxy exposes the underlying
+          schema on a free-standing column.
         * ``CAST(<expr> AS <dtype>)`` / ``CAST(<expr> AS <dtype>)``
           — name follows the inner ``<expr>``'s leaf, dtype reads
           straight off ``<dtype>`` through
@@ -2760,6 +2825,18 @@ class Field(BaseChildrenFields):
           :meth:`SparkSession.createDataFrame` (which would be a
           live JVM round trip the caller didn't ask for).
 
+        Source of the SQL string, in order:
+
+        1. Classic Spark: ``column._jc.toString()`` — the JVM Column.
+        2. Spark Connect: ``column._expr.__repr__()`` — the proxy
+           doesn't have ``_jc`` (accessing it raises
+           ``PySparkAttributeError(JVM_ATTRIBUTE_NOT_SUPPORTED)``)
+           but ``_expr.__repr__`` is exactly what
+           ``Column.__repr__`` wraps as ``"Column<'<sql>'>"``.
+        3. ``repr(column)`` stripped of the ``Column<'…'>``
+           wrapper — last-resort for any future PySpark whose
+           internal slots renamed.
+
         Use :meth:`Field.from_spark_field` instead when the caller
         already has the resolved ``StructField`` (e.g. from
         ``df.schema.fields[i]``) — that path keeps the precise dtype
@@ -2767,23 +2844,13 @@ class Field(BaseChildrenFields):
         """
         from .types.primitive import ObjectType
 
-        jc = getattr(column, "_jc", None)
-        if jc is None:
-            raise TypeError(
-                f"Cannot build {cls.__name__} from pyspark Column without "
-                f"a backing JVM expression: {column!r}"
-            )
-
-        try:
-            rendered = jc.toString()
-        except Exception:
-            rendered = None
+        rendered = _render_spark_column_sql(column)
         if not rendered:
             raise TypeError(
                 f"Cannot read SQL representation from pyspark Column: {column!r}"
             )
 
-        name, dtype = _parse_spark_column_sql(str(rendered))
+        name, dtype = _parse_spark_column_sql(rendered)
         if dtype is None:
             dtype = ObjectType()
         if not name:

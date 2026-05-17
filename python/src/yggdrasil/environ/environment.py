@@ -588,8 +588,15 @@ class PyEnv:
         # ------------------------------------------------------------------
         # Cached session
         # ------------------------------------------------------------------
-        if cls._SPARK_SESSION is not MISSING:
+        # A cached non-None session is final. A cached ``None`` (left behind
+        # by an earlier ``create=False`` probe) should NOT block a later
+        # ``create=True`` call from actually bringing up a session — that
+        # bites every caller that probes the cache before asking for a real
+        # one (e.g. :func:`yggdrasil.spark.tests._get_test_spark`).
+        if cls._SPARK_SESSION is not MISSING and cls._SPARK_SESSION is not None:
             return cls._SPARK_SESSION
+        if cls._SPARK_SESSION is None and not create:
+            return None
 
         # ------------------------------------------------------------------
         # Ensure PySpark is importable

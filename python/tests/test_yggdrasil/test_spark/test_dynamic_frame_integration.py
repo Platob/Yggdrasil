@@ -1,4 +1,4 @@
-"""End-to-end integration tests for :class:`yggdrasil.spark.frame.DynamicFrame`.
+"""End-to-end integration tests for :class:`yggdrasil.spark.frame.Dataset`.
 
 Exercises the gnarly parts of the API against a real local
 ``SparkSession`` (skipped cleanly when PySpark isn't installed):
@@ -11,17 +11,17 @@ Exercises the gnarly parts of the API against a real local
   still land in the merged schema with widened nullability.
 * Dynamic → typed casts that preserve nested struct / list / map
   layouts through ``mapInArrow`` and survive a round trip back to
-  dynamic via :meth:`DynamicFrame.to_dynamic`.
-* :meth:`DynamicFrame.explode` over heterogeneous iterables, including
+  dynamic via :meth:`Dataset.to_dynamic`.
+* :meth:`Dataset.explode` over heterogeneous iterables, including
   empty iterables (which must drop without erroring on empty batches).
-* :meth:`DynamicFrame.apply` returning every tabular shape the cast
+* :meth:`Dataset.apply` returning every tabular shape the cast
   registry knows — dict, dataclass, ``pyarrow.RecordBatch``,
   ``polars.DataFrame`` — fanned out in a single transform.
-* :meth:`DynamicFrame.filter` that drops every row (empty output
+* :meth:`Dataset.filter` that drops every row (empty output
   partitions must not crash the typed-cast path) and predicate
   carriers that preserve ``installed_modules`` across a chain of
   transforms.
-* :meth:`DynamicFrame.parallelize` distributing a closure that
+* :meth:`Dataset.parallelize` distributing a closure that
   captures live state by reference (caught via ``yggdrasil.pickle``
   serialization).
 
@@ -51,7 +51,7 @@ from yggdrasil.data.types.primitive import (
     Int64Type,
     StringType,
 )
-from yggdrasil.spark.frame import DYNAMIC_SCHEMA, DynamicFrame, is_dynamic_schema
+from yggdrasil.spark.frame import DYNAMIC_SCHEMA, Dataset, is_dynamic_schema
 from yggdrasil.spark.tests import SparkTestCase
 
 
@@ -79,10 +79,10 @@ class _Row:
     score: float
 
 
-class _DynamicFrameTestBase(SparkTestCase, ArrowTestCase):
+class _DatasetTestBase(SparkTestCase, ArrowTestCase):
     """Shared SIGALRM-guarded setUp/tearDown for the integration tests.
 
-    Also stubs out :meth:`DynamicFrame._install_modules_on_executors`
+    Also stubs out :meth:`Dataset._install_modules_on_executors`
     so the per-transform ``_ensure_installed`` scan doesn't build /
     ship real ``yggdrasil`` / ``pyarrow`` / ``polars`` archives for
     every test that calls ``.map`` / ``.filter`` / ``.apply``. The
@@ -105,15 +105,15 @@ class _DynamicFrameTestBase(SparkTestCase, ArrowTestCase):
             signal.alarm(_TEST_TIMEOUT_SECONDS)
 
         # Stub: pretend every requested module installed cleanly.
-        self._orig_install = DynamicFrame._install_modules_on_executors
+        self._orig_install = Dataset._install_modules_on_executors
 
         def _stub(self_inner, modules):
             return set(modules)
 
-        DynamicFrame._install_modules_on_executors = _stub  # type: ignore[assignment]
+        Dataset._install_modules_on_executors = _stub  # type: ignore[assignment]
 
     def tearDown(self) -> None:
-        DynamicFrame._install_modules_on_executors = self._orig_install  # type: ignore[assignment]
+        Dataset._install_modules_on_executors = self._orig_install  # type: ignore[assignment]
         if _has_alarm():
             signal.alarm(0)
             signal.signal(signal.SIGALRM, self._prev_handler)
@@ -125,7 +125,7 @@ class _DynamicFrameTestBase(SparkTestCase, ArrowTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDynamicHeterogeneous(_DynamicFrameTestBase):
+class TestDynamicHeterogeneous(_DatasetTestBase):
 
     def test_mixed_python_types_round_trip(self) -> None:
         """Mixed shapes (scalars, dataclasses, dicts, nested) survive
@@ -148,7 +148,7 @@ class TestDynamicHeterogeneous(_DynamicFrameTestBase):
             (1, 2, 3),
             b"\x00\x01\x02\xff",
         ]
-        frame = DynamicFrame.from_iterable(items, spark_session=self.spark)
+        frame = Dataset.from_iterable(items, spark_session=self.spark)
 
         self.assertTrue(frame.is_dynamic)
         self.assertTrue(is_dynamic_schema(frame.df.schema))
@@ -166,8 +166,8 @@ class TestDynamicHeterogeneous(_DynamicFrameTestBase):
         single partition the order must equal the input order.
         """
         items = list(range(100))
-        frame = DynamicFrame.from_iterable(items, spark_session=self.spark)
-        frame = DynamicFrame(frame.df.coalesce(1))
+        frame = Dataset.from_iterable(items, spark_session=self.spark)
+        frame = Dataset(frame.df.coalesce(1))
         self.assertEqual(list(frame.to_local_iterator()), items)
 
     def test_filter_drops_all_rows_without_crashing(self) -> None:
@@ -175,7 +175,7 @@ class TestDynamicHeterogeneous(_DynamicFrameTestBase):
         downstream pipeline — must not raise on ``RecordBatch.from_pylist
         ([])`` or Arrow-typing emptiness checks.
         """
-        frame = DynamicFrame.from_iterable(range(50), spark_session=self.spark)
+        frame = Dataset.from_iterable(range(50), spark_session=self.spark)
         empty = frame.filter(lambda x: x > 1_000_000)
         self.assertEqual(empty.collect(), [])
         self.assertEqual(empty.count(), 0)
@@ -186,7 +186,7 @@ class TestDynamicHeterogeneous(_DynamicFrameTestBase):
 # ---------------------------------------------------------------------------
 
 
-class TestInferSchema(_DynamicFrameTestBase):
+class TestInferSchema(_DatasetTestBase):
 
     def test_full_scan_unions_sparse_fields(self) -> None:
         """Rows have *different* key sets — the merged schema must be
@@ -198,7 +198,7 @@ class TestInferSchema(_DynamicFrameTestBase):
             {"id": 2, "name": "b", "score": 0.5},
             {"id": 3, "score": 0.75, "tags": ["x", "y"]},
         ]
-        frame = DynamicFrame.from_iterable(items, spark_session=self.spark)
+        frame = Dataset.from_iterable(items, spark_session=self.spark)
         inferred = frame.infer_schema()
 
         names = {f.name for f in inferred.fields}
@@ -222,13 +222,13 @@ class TestInferSchema(_DynamicFrameTestBase):
             # absent from the inferred schema.
             {"id": 3, "name": "third", "late": 1.0},
         ]
-        frame = DynamicFrame.from_iterable(items, spark_session=self.spark)
-        frame = DynamicFrame(frame.df.coalesce(1))
+        frame = Dataset.from_iterable(items, spark_session=self.spark)
+        frame = Dataset(frame.df.coalesce(1))
         partial = frame.infer_schema(limit=2, inplace=False)
         self.assertEqual({f.name for f in partial.fields}, {"id", "name"})
 
     def test_empty_frame_raises(self) -> None:
-        frame = DynamicFrame.from_iterable([], spark_session=self.spark)
+        frame = Dataset.from_iterable([], spark_session=self.spark)
         with self.assertRaises(ValueError):
             frame.infer_schema()
 
@@ -238,7 +238,7 @@ class TestInferSchema(_DynamicFrameTestBase):
 # ---------------------------------------------------------------------------
 
 
-class TestTypedCast(_DynamicFrameTestBase):
+class TestTypedCast(_DatasetTestBase):
 
     def _nested_schema(self):
         return schema([
@@ -273,7 +273,7 @@ class TestTypedCast(_DynamicFrameTestBase):
                 "child": {"k": "beta", "v": -2.25},
             },
         ]
-        dyn = DynamicFrame.from_iterable(items, spark_session=self.spark)
+        dyn = Dataset.from_iterable(items, spark_session=self.spark)
         typed = dyn.cast(sch)
 
         self.assertFalse(typed.is_dynamic)
@@ -297,7 +297,7 @@ class TestTypedCast(_DynamicFrameTestBase):
             }
             for i in range(5)
         ]
-        typed = DynamicFrame.from_iterable(items, sch, spark_session=self.spark)
+        typed = Dataset.from_iterable(items, sch, spark_session=self.spark)
         dyn = typed.to_dynamic()
         self.assertTrue(dyn.is_dynamic)
 
@@ -322,7 +322,7 @@ class TestTypedCast(_DynamicFrameTestBase):
             [],
             [{"id": 4, "name": "d"}, {"id": 5, "name": "e"}],
         ]
-        dyn = DynamicFrame.from_iterable(items, spark_session=self.spark)
+        dyn = Dataset.from_iterable(items, spark_session=self.spark)
         exploded = dyn.explode(sch)
         rows = sorted(exploded.collect(), key=lambda r: r["id"])
         self.assertEqual([r["id"] for r in rows], [1, 2, 3, 4, 5])
@@ -331,7 +331,7 @@ class TestTypedCast(_DynamicFrameTestBase):
     def test_explode_typed_mode_rejected(self) -> None:
         """explode is dynamic-only — typed rows are dicts, not iterables."""
         sch = schema([field("id", Int32Type)])
-        typed = DynamicFrame.from_iterable(
+        typed = Dataset.from_iterable(
             [{"id": i} for i in range(3)], sch, spark_session=self.spark,
         )
         with self.assertRaises(TypeError):
@@ -343,7 +343,7 @@ class TestTypedCast(_DynamicFrameTestBase):
 # ---------------------------------------------------------------------------
 
 
-class TestApplyTabularShapes(_DynamicFrameTestBase):
+class TestApplyTabularShapes(_DatasetTestBase):
 
     def test_apply_returning_dataclass(self) -> None:
         sch = schema([
@@ -355,7 +355,7 @@ class TestApplyTabularShapes(_DynamicFrameTestBase):
         def make_row(i: int) -> _Row:
             return _Row(id=i, label=f"row-{i}", score=float(i) * 1.5)
 
-        out = DynamicFrame.parallelize(
+        out = Dataset.parallelize(
             make_row, range(8), schema=sch, spark_session=self.spark,
         )
         rows = sorted(out.collect(), key=lambda r: r["id"])
@@ -378,7 +378,7 @@ class TestApplyTabularShapes(_DynamicFrameTestBase):
                 schema=sch.to_arrow_schema(),
             )
 
-        dyn = DynamicFrame.from_iterable(range(5), spark_session=self.spark)
+        dyn = Dataset.from_iterable(range(5), spark_session=self.spark)
         out = dyn.apply(expand, sch)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["doubled"] for r in rows], [0, 2, 4, 6, 8])
@@ -398,7 +398,7 @@ class TestApplyTabularShapes(_DynamicFrameTestBase):
             import polars as pl
             return pl.DataFrame({"id": [seed], "squared": [seed * seed]})
 
-        dyn = DynamicFrame.from_iterable(range(4), spark_session=self.spark)
+        dyn = Dataset.from_iterable(range(4), spark_session=self.spark)
         out = dyn.apply(expand, sch)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["squared"] for r in rows], [0, 1, 4, 9])
@@ -409,7 +409,7 @@ class TestApplyTabularShapes(_DynamicFrameTestBase):
 # ---------------------------------------------------------------------------
 
 
-class TestTransformLineage(_DynamicFrameTestBase):
+class TestTransformLineage(_DatasetTestBase):
 
     def test_installed_modules_propagate_through_chain(self) -> None:
         """map → filter → cast keeps the discovered module set on every
@@ -417,7 +417,7 @@ class TestTransformLineage(_DynamicFrameTestBase):
         wheel for each transform.
         """
         seeded = {"ygg-test-module"}
-        frame = DynamicFrame.from_iterable(
+        frame = Dataset.from_iterable(
             range(10), spark_session=self.spark,
         )
         # Seed directly so we exercise the propagation without
@@ -433,7 +433,7 @@ class TestTransformLineage(_DynamicFrameTestBase):
             self.assertTrue(seeded.issubset(f.installed_modules))
 
     def test_filter_then_map_preserves_count(self) -> None:
-        frame = DynamicFrame.from_iterable(range(100), spark_session=self.spark)
+        frame = Dataset.from_iterable(range(100), spark_session=self.spark)
         out = frame.filter(lambda x: x % 3 == 0).map(lambda x: x * 10)
         rows = sorted(out.collect())
         self.assertEqual(rows, [i * 10 for i in range(100) if i % 3 == 0])
@@ -449,7 +449,7 @@ class TestTransformLineage(_DynamicFrameTestBase):
             return x * multiplier + offset
 
         sch = schema([field("y", Int64Type)])
-        out = DynamicFrame.parallelize(
+        out = Dataset.parallelize(
             lambda x: {"y": fn(x)}, range(5),
             schema=sch, spark_session=self.spark,
         )
@@ -462,7 +462,7 @@ class TestTransformLineage(_DynamicFrameTestBase):
 # ---------------------------------------------------------------------------
 
 
-class TestTypedConstruction(_DynamicFrameTestBase):
+class TestTypedConstruction(_DatasetTestBase):
 
     def test_from_iterable_typed_matches_spark_schema(self) -> None:
         sch = schema([
@@ -474,7 +474,7 @@ class TestTypedConstruction(_DynamicFrameTestBase):
             {"id": 1, "at": dt.date(2024, 1, 1), "name": "a"},
             {"id": 2, "at": dt.date(2024, 6, 1), "name": "b"},
         ]
-        frame = DynamicFrame.from_iterable(items, sch, spark_session=self.spark)
+        frame = Dataset.from_iterable(items, sch, spark_session=self.spark)
         self.assertFalse(frame.is_dynamic)
 
         spark_names = [f.name for f in frame.df.schema.fields]
@@ -496,7 +496,7 @@ class TestTypedConstruction(_DynamicFrameTestBase):
             field("v", Float64Type),
         ])
         items = [{"id": i, "v": float(i) / 2.0} for i in range(6)]
-        frame = DynamicFrame.from_iterable(items, sch, spark_session=self.spark)
+        frame = Dataset.from_iterable(items, sch, spark_session=self.spark)
         pdf = frame.toPolars()
         self.assertIsInstance(pdf, pl.DataFrame)
         self.assertEqual(pdf.columns, ["id", "v"])
@@ -508,7 +508,7 @@ class TestTypedConstruction(_DynamicFrameTestBase):
 # ---------------------------------------------------------------------------
 
 
-class TestDynamicSchemaShape(_DynamicFrameTestBase):
+class TestDynamicSchemaShape(_DatasetTestBase):
 
     def test_is_dynamic_schema_detects_pickle_column(self) -> None:
         self.assertTrue(is_dynamic_schema(DYNAMIC_SCHEMA))

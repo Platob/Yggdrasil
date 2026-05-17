@@ -39,7 +39,18 @@ class DatabricksResource(ABC):
         return None
 
     def __repr__(self) -> str:
-        url = self.explore_url
+        # ``explore_url`` reaches through ``self.service.client.base_url``,
+        # which can be ``None`` on a half-constructed / mid-tear-down
+        # instance (``__del__`` during interpreter shutdown,
+        # ``Session._INSTANCES.clear()`` racing a GC pass, a pickle-
+        # restored object whose service hasn't rebound yet). Bake a
+        # try/except so the repr survives — having a degraded
+        # ``ClassName(...)`` log line is strictly better than swallowing
+        # a downstream error because its message couldn't be formatted.
+        try:
+            url = self.explore_url
+        except Exception:
+            url = None
         if url is None:
             return super().__repr__()
         return f"{type(self).__name__}({url!r})"

@@ -468,7 +468,17 @@ class Curator(ABC):
                     names=["schema_pickle", "batch_ipc"],
                 )
 
-        cached = df.mapInArrow(_pass_one, schema=cache_schema).cache()
+        # Two passes over the data: first to infer the schema from each
+        # partition's batches, then to emit the typed result. ``.cache()``
+        # avoids re-running pass one. Databricks Connect serverless rejects
+        # ``PERSIST TABLE`` (``[NOT_SUPPORTED_WITH_SERVERLESS]``), so fall
+        # back to the un-cached frame — pass one then runs twice, but the
+        # alternative is a hard crash on serverless.
+        intermediate = df.mapInArrow(_pass_one, schema=cache_schema)
+        try:
+            cached = intermediate.cache()
+        except Exception:
+            cached = intermediate
 
         # ---- Driver-side schema merge --------------------------------
 

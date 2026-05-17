@@ -19,6 +19,7 @@ to that coverage rather than duplicating it.
 from __future__ import annotations
 
 import struct
+import unittest
 
 from yggdrasil.io.nested.delta.deletion_vector import (
     _MAGIC_SIMPLE,
@@ -28,6 +29,22 @@ from yggdrasil.io.nested.delta.deletion_vector import (
     write_uuid_deletion_vector,
 )
 from yggdrasil.io.nested.delta.tests import DeltaTestCase
+
+# ``DeltaIO.delete(predicate_string)`` lifts the predicate via
+# :func:`Expression.from_sql`, which depends on the optional ``sqlglot``
+# package. The DV / rewrite suites that pass SQL strings can only run
+# when that extra is installed — skip them cleanly when it isn't.
+try:
+    import sqlglot  # noqa: F401
+    _HAS_SQLGLOT = True
+except ImportError:
+    _HAS_SQLGLOT = False
+
+_requires_sqlglot = unittest.skipUnless(
+    _HAS_SQLGLOT,
+    "sqlglot is not installed; install it with `pip install sqlglot` "
+    "to exercise the SQL-predicate delete paths.",
+)
 
 # ---------------------------------------------------------------------------
 # Canonical import path
@@ -113,6 +130,7 @@ class TestDecodeUnknownEnvelope(DeltaTestCase):
 # ---------------------------------------------------------------------------
 
 
+@_requires_sqlglot
 class TestDeleteByRewrite(DeltaTestCase):
     def test_rewrite_drops_matched_rows(self) -> None:
         d = self.delta_io()
@@ -143,6 +161,7 @@ class TestDeleteByRewrite(DeltaTestCase):
 # ---------------------------------------------------------------------------
 
 
+@_requires_sqlglot
 class TestDeleteByDV(DeltaTestCase):
     def _opts(self):
         from yggdrasil.io.nested.delta import DeltaOptions

@@ -5,7 +5,7 @@
 ```bash
 git clone https://github.com/Platob/Yggdrasil.git
 cd Yggdrasil/python
-uv venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+uv venv --seed .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 uv pip install -e .[dev]
 ```
 

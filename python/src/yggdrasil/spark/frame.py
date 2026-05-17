@@ -28,12 +28,19 @@ from yggdrasil.spark.dependencies import (
 )
 
 __all__ = [
-    "DynamicFrame",
+    "Dataset",
     "is_dynamic_schema",
 ]
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.lazy_imports import polars_module
+
+# Per-session install cache. Spark Connect sessions don't always accept
+# attribute writes (``session.X = ...`` may be rejected by the proxy), so we
+# can't reliably stash this on the session itself. Keying by ``id(session)``
+# leaks at most one entry per session over the process lifetime — acceptable
+# for the long-lived client pattern these sessions are designed for.
+_PER_SESSION_INSTALLED_MODULES: "dict[int, set[str]]" = {}
 
 PICKLE_COLUMN_NAME = "_pickle"
 DYNAMIC_SCHEMA = schema_builder(
@@ -114,10 +121,172 @@ def _typed_rows(batches: Iterator[pa.RecordBatch]) -> Iterator[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# DynamicFrame
+# Executor module shipping
 # ---------------------------------------------------------------------------
 
-class DynamicFrame:
+# File extensions that mean "compiled native module" — the zip-import path
+# Python uses for ``addPyFile`` archives only handles pure-Python source.
+# A package shipping these has to land on disk somewhere on ``sys.path``,
+# not inside a zip, so we never auto-ship them.
+_NATIVE_EXTENSION_SUFFIXES = (".so", ".pyd", ".dylib")
+
+
+def _module_has_native_extensions(root: "Any") -> bool:
+    """``True`` iff *root* is a package directory containing ``.so`` / ``.pyd``.
+
+    A single-file ``.whl`` or ``.zip`` is taken at face value (we trust the
+    archive name); the check only rejects raw package directories whose
+    on-disk contents include compiled extensions.
+    """
+    try:
+        if not root.is_dir():
+            return False
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in _NATIVE_EXTENSION_SUFFIXES:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _install_modules_on_executors(
+    session: SparkSession,
+    modules: "set[str]",
+) -> set[str]:
+    """Ship each module to Spark executors via ``addArtifacts``.
+
+    Two backends, picked by feature detection:
+
+    - **Spark Connect / Databricks Connect** — ``session.addArtifacts(
+      path, pyfile=True)`` injects the archive into the
+      session's artifact directory for every executor. When a
+      :class:`DatabricksClient` is stashed on the session
+      (``session.ygg_client`` — set by
+      :meth:`DatabricksClient.spark`), the archive is *also*
+      published to the shared workspace registry at
+      ``/Workspace/.../.ygg/pypi/simple/`` so teammates on the
+      same workspace can reuse it without rebuilding.
+    - **Plain Spark** — falls back to
+      :meth:`SparkContext.addPyFile`.
+
+    Every module is materialized through
+    :func:`build_module_archive` so the artifact is a
+    deflated ``.zip`` whose top-level entry IS the package
+    directory — ``addArtifacts(pyfile=True)`` then loads it
+    straight onto the executor's ``sys.path``. Failures are
+    logged at INFO / WARNING and swallowed: best-effort
+    installs shouldn't crash an otherwise valid transform.
+    """
+    from yggdrasil.io.path._module_pack import (
+        build_module_archive,
+        resolve_module_root,
+    )
+
+    client = getattr(session, "ygg_client", None)
+    registry = None
+    if client is not None:
+        try:
+            from yggdrasil.databricks.registry import WorkspacePyPIRegistry
+            registry = WorkspacePyPIRegistry(client=client)
+        except Exception as exc:
+            LOGGER.info(
+                "Could not build WorkspacePyPIRegistry: %s", exc,
+            )
+            registry = None
+
+    add_art = getattr(session, "addArtifacts", None) or getattr(
+        session, "addArtifact", None,
+    )
+    # ``session.sparkContext`` raises ``JVM_ATTRIBUTE_NOT_SUPPORTED`` on
+    # Spark Connect — never just returns ``None`` — so guard the probe.
+    try:
+        sc = getattr(session, "sparkContext", None)
+    except Exception:
+        sc = None
+    add_py = getattr(sc, "addPyFile", None) if sc is not None else None
+
+    if not callable(add_art) and not callable(add_py):
+        LOGGER.info(
+            "SparkSession exposes neither addArtifacts nor "
+            "addPyFile — cannot install %s on executors.",
+            sorted(modules),
+        )
+        return set()
+
+    installed: set[str] = set()
+    for module_name in sorted(modules):
+        try:
+            root = resolve_module_root(module_name)
+        except Exception as exc:
+            LOGGER.info(
+                "Skipping %s — cannot resolve module root: %s",
+                module_name, exc,
+            )
+            continue
+
+        # Compiled extensions (``.so`` / ``.pyd``) inside a wheel-installed
+        # package can't be loaded from a zip — Python's zipimporter handles
+        # pure-Python source but not native ``.so`` modules. Trying to ship
+        # pyarrow / numpy / polars / pandas via ``addPyFile`` puts a broken
+        # copy ahead of the executor's real install in ``sys.path``. These
+        # are the packages the cluster always already has; skip them.
+        if _module_has_native_extensions(root):
+            LOGGER.info(
+                "Skipping %s — package contains compiled extensions that "
+                "won't load from a zip; assuming cluster has it pre-installed.",
+                module_name,
+            )
+            continue
+
+        archive_path = None
+        if registry is not None:
+            # Workspace-cache path: publish through the registry
+            # so the wheel / zip ends up at
+            # ``.ygg/pypi/simple/<pkg>/...`` for sharing. The
+            # registry returns a ``local:<path>`` spec and the
+            # remote :class:`WorkspacePath`; we use the local
+            # path for ``addArtifacts``.
+            try:
+                spec, _remote = registry.publish(module_name)
+                if spec.startswith("local:"):
+                    archive_path = spec[len("local:"):]
+            except Exception as exc:
+                LOGGER.info(
+                    "Registry publish failed for %s; falling back "
+                    "to in-place archive: %s", module_name, exc,
+                )
+
+        if archive_path is None:
+            try:
+                archive_path = str(
+                    build_module_archive(root, dest=None),
+                )
+            except Exception as exc:
+                LOGGER.info(
+                    "Skipping %s — cannot build archive: %s",
+                    module_name, exc,
+                )
+                continue
+
+        try:
+            if callable(add_art):
+                add_art(archive_path, pyfile=True)
+            else:
+                add_py(archive_path)
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to ship %s via Spark: %s", module_name, exc,
+            )
+            continue
+        installed.add(module_name)
+    return installed
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class Dataset:
     """Spark DataFrame wrapper with an optional yggdrasil Schema.
 
     Two modes:
@@ -133,7 +302,7 @@ class DynamicFrame:
 
     Any attribute not defined here is proxied to the underlying ``DataFrame``
     via ``__getattr__``; ``DataFrame`` results are re-wrapped as
-    ``DynamicFrame`` carrying the lifted Arrow schema.
+    ``Dataset`` carrying the lifted Arrow schema.
     """
 
     __slots__ = ('df', 'schema', 'installed_modules')
@@ -155,7 +324,7 @@ class DynamicFrame:
         # ``df.apply(f).map(g).filter(h)`` only round-trips each
         # module once per frame lineage. Tests and call sites that
         # know exactly which modules to ship can seed this directly
-        # (``DynamicFrame(df, installed_modules={"ygg", "polars"})``)
+        # (``Dataset(df, installed_modules={"ygg", "polars"})``)
         # to bypass the scan.
         self.installed_modules: set[str] = (
             set(installed_modules) if installed_modules else set()
@@ -215,12 +384,12 @@ class DynamicFrame:
         *,
         spark_session: SparkSession | None = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Build a frame from an in-memory iterable.
 
         ``schema=None`` pickles each element into a dynamic frame.
         ``schema=<Schema>`` casts the iterable on the driver and returns a
-        typed ``DynamicFrame`` whose underlying ``DataFrame`` matches
+        typed ``Dataset`` whose underlying ``DataFrame`` matches
         ``schema``.
         """
         if spark_session is None:
@@ -229,12 +398,20 @@ class DynamicFrame:
             )
 
         if schema is None:
+            # Materialize before handing to Spark — Spark Connect's
+            # ``createDataFrame`` indexes ``_data[0]`` to sniff the shape,
+            # which IndexErrors on an empty generator. A list also lets the
+            # Arrow path on Spark Connect take the fast LocalRelation route
+            # when ``len(data) == 0``. Local mode tolerates either shape.
+            cls._ensure_installed_on_session(spark_session)
+            rows = [(dumps(x),) for x in items]
             df = spark_session.createDataFrame(
-                ((dumps(x),) for x in items),
+                rows,
                 schema=DYNAMIC_SCHEMA.to_spark_schema(),
             )
             return cls(df=df, schema=None)
 
+        cls._ensure_installed_on_session(spark_session)
         schema = Schema.from_any(schema)
         table = any_to_arrow_table(
             items,
@@ -251,7 +428,7 @@ class DynamicFrame:
         *,
         spark_session: SparkSession | None = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Distribute ``function`` over ``inputs`` via ``mapInArrow``.
 
         ``schema=None`` returns a dynamic frame of pickled outputs.
@@ -262,6 +439,9 @@ class DynamicFrame:
                 create=True, install_spark=False, import_error=True,
             )
 
+        installed_modules = cls._ensure_installed_on_session(
+            spark_session, function,
+        )
         dumped = [(dumps(x),) for x in inputs]
         function_pickle = dumps(function)
         input_df = spark_session.createDataFrame(
@@ -281,7 +461,10 @@ class DynamicFrame:
             result_df = input_df.mapInArrow(
                 _runner, schema=DYNAMIC_SCHEMA.to_spark_schema()
             )
-            return cls(df=result_df, schema=None)
+            return cls(
+                df=result_df, schema=None,
+                installed_modules=installed_modules,
+            )
 
         schema = Schema.from_any(schema)
 
@@ -299,7 +482,10 @@ class DynamicFrame:
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = input_df.mapInArrow(_typed_runner, schema=schema.to_spark_schema())
-        return cls(df=result_df, schema=schema)
+        return cls(
+            df=result_df, schema=schema,
+            installed_modules=installed_modules,
+        )
 
     def infer_schema(
         self,
@@ -356,6 +542,10 @@ class DynamicFrame:
             return merged
 
         # ---- full-scan path: per-partition inference via mapInArrow -------
+        # The UDF imports ``yggdrasil.pickle`` on executors — make sure it's
+        # there. No user function to scan; the seed-with-yggdrasil default
+        # in :meth:`_ensure_installed_on_session` is exactly enough.
+        self._ensure_installed()
         is_dynamic_in = self.is_dynamic
 
         def _runner(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
@@ -410,169 +600,84 @@ class DynamicFrame:
 
     # ---- executor dependency wiring ----------------------------------------
 
-    def _ensure_installed(self, *functions: Callable[..., Any]) -> set[str]:
-        """Scan *functions* for module deps and ship them to executors.
+    @classmethod
+    def _ensure_installed_on_session(
+        cls,
+        session: SparkSession,
+        *functions: Callable[..., Any],
+    ) -> "set[str]":
+        """Auto-ship ygg (+ any function deps) to executors on first use.
 
-        The discovered modules are unioned into
-        :attr:`installed_modules` so subsequent calls in the same
-        frame lineage are no-ops. Returns the set of top-level
-        package names this call newly installed (empty when
-        nothing was missing).
+        UDFs registered via :meth:`mapInArrow` unpickle ``yggdrasil.pickle``
+        bytes inside the executor — which needs ``yggdrasil`` itself on the
+        worker. When the cluster has an *older* ygg pre-installed (a common
+        Databricks Connect setup), the local driver's pickle format may
+        disagree with what the executor knows how to read, surfacing as
+        ``UnpicklingError: invalid load key, 'Y'`` (stdlib pickle on YGG
+        magic bytes) or ``SerializationError: Invalid magic header``. Shipping
+        the driver's exact ``yggdrasil`` source via ``addArtifacts`` /
+        ``addPyFile`` overrides the stale install.
 
-        Resolution:
-
-        - Spark Connect session with a bound :class:`DatabricksClient`
-          (``session.ygg_client`` — set by
-          :meth:`DatabricksClient.spark`) — declare each new module
-          via :class:`DatabricksEnv.withDependencies` on a
-          :class:`WorkspacePyPIRegistry` so executors pick them up
-          on next session refresh. Editables / private libs get
-          shared through ``/Workspace/.../.ygg/pypi/simple/``.
-        - Plain Spark / non-Databricks session — fall back to
-          :meth:`SparkContext.addPyFile` with a freshly built
-          ``.zip`` of each module so the executors load it from
-          ``sys.path``. ``.whl`` files are also accepted by
-          ``addPyFile``.
-
-        Failures are logged at WARNING and swallowed — a missing
-        executor install is a load-time error in the UDF; we
-        don't want a best-effort scan to crash an otherwise valid
-        ``apply`` call.
+        Returns the set of modules now known-installed on *session* — useful
+        as the ``installed_modules`` seed for fresh :class:`Dataset`
+        instances so the next transform skips the re-scan.
         """
-        wanted: set[str] = set()
+        cache = _PER_SESSION_INSTALLED_MODULES.setdefault(id(session), set())
+        # Always seed with yggdrasil itself — every UDF path imports
+        # ``yggdrasil.pickle`` on the executor, regardless of the user
+        # function's globals.
+        wanted: set[str] = {"yggdrasil"}
         for fn in functions:
             if fn is None:
                 continue
             wanted.update(_function_top_modules(fn))
 
-        new_modules = wanted - self.installed_modules
+        new_modules = wanted - cache
         if not new_modules:
-            return set()
+            return set(cache)
 
         try:
-            installed = self._install_modules_on_executors(new_modules)
+            installed = _install_modules_on_executors(session, new_modules)
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning(
-                "DynamicFrame: failed to install %s on executors: %s",
+                "Dataset: failed to install %s on executors: %s",
                 sorted(new_modules), exc,
             )
-            return set()
+            return set(cache)
 
+        cache.update(installed)
+        return set(cache)
+
+    def _ensure_installed(self, *functions: Callable[..., Any]) -> set[str]:
+        """Per-frame wrapper around :meth:`_ensure_installed_on_session`.
+
+        Scans *functions* for module deps, ships any new ones to executors
+        (alongside ``yggdrasil`` itself if the session hasn't been seeded
+        yet), and folds the result into :attr:`installed_modules` so a chain
+        of transforms only round-trips each module once.
+
+        Resolution mirrors the docstring on
+        :meth:`_install_modules_on_executors`: Spark Connect /
+        Databricks Connect goes through ``addArtifacts(pyfile=True)``
+        (and optionally :class:`WorkspacePyPIRegistry` when the session is
+        bound via :meth:`DatabricksClient.spark`); plain Spark falls back to
+        :meth:`SparkContext.addPyFile`. Failures are logged at WARNING and
+        swallowed — a missing executor install surfaces as a UDF-time
+        ``ModuleNotFoundError`` we don't want a best-effort scan to mask.
+        """
+        installed = self._ensure_installed_on_session(
+            self.sparkSession, *functions,
+        )
+        new = installed - self.installed_modules
         self.installed_modules.update(installed)
-        return installed
+        return new
 
     def _install_modules_on_executors(
         self, modules: "set[str]",
     ) -> set[str]:
-        """Ship each module to Spark executors via ``addArtifacts``.
-
-        Two backends, picked by feature detection:
-
-        - **Spark Connect / Databricks Connect** — ``session.addArtifacts(
-          path, pyfile=True)`` injects the archive into the
-          session's artifact directory for every executor. When a
-          :class:`DatabricksClient` is stashed on the session
-          (``session.ygg_client`` — set by
-          :meth:`DatabricksClient.spark`), the archive is *also*
-          published to the shared workspace registry at
-          ``/Workspace/.../.ygg/pypi/simple/`` so teammates on the
-          same workspace can reuse it without rebuilding.
-        - **Plain Spark** — falls back to
-          :meth:`SparkContext.addPyFile`.
-
-        Every module is materialized through
-        :func:`build_module_archive` so the artifact is a
-        deflated ``.zip`` whose top-level entry IS the package
-        directory — ``addArtifacts(pyfile=True)`` then loads it
-        straight onto the executor's ``sys.path``. Failures are
-        logged at INFO / WARNING and swallowed: best-effort
-        installs shouldn't crash an otherwise valid transform.
-        """
-        from yggdrasil.io.path._module_pack import (
-            build_module_archive,
-            resolve_module_root,
-        )
-
-        session = self.sparkSession
-        client = getattr(session, "ygg_client", None)
-        registry = None
-        if client is not None:
-            try:
-                from yggdrasil.databricks.registry import WorkspacePyPIRegistry
-                registry = WorkspacePyPIRegistry(client=client)
-            except Exception as exc:
-                LOGGER.info(
-                    "Could not build WorkspacePyPIRegistry: %s", exc,
-                )
-                registry = None
-
-        add_art = getattr(session, "addArtifacts", None) or getattr(
-            session, "addArtifact", None,
-        )
-        sc = getattr(session, "sparkContext", None)
-        add_py = getattr(sc, "addPyFile", None) if sc is not None else None
-
-        if not callable(add_art) and not callable(add_py):
-            LOGGER.info(
-                "SparkSession exposes neither addArtifacts nor "
-                "addPyFile — cannot install %s on executors.",
-                sorted(modules),
-            )
-            return set()
-
-        installed: set[str] = set()
-        for module_name in sorted(modules):
-            try:
-                root = resolve_module_root(module_name)
-            except Exception as exc:
-                LOGGER.info(
-                    "Skipping %s — cannot resolve module root: %s",
-                    module_name, exc,
-                )
-                continue
-
-            archive_path = None
-            if registry is not None:
-                # Workspace-cache path: publish through the registry
-                # so the wheel / zip ends up at
-                # ``.ygg/pypi/simple/<pkg>/...`` for sharing. The
-                # registry returns a ``local:<path>`` spec and the
-                # remote :class:`WorkspacePath`; we use the local
-                # path for ``addArtifacts``.
-                try:
-                    spec, _remote = registry.publish(module_name)
-                    if spec.startswith("local:"):
-                        archive_path = spec[len("local:"):]
-                except Exception as exc:
-                    LOGGER.info(
-                        "Registry publish failed for %s; falling back "
-                        "to in-place archive: %s", module_name, exc,
-                    )
-
-            if archive_path is None:
-                try:
-                    archive_path = str(
-                        build_module_archive(root, dest=None),
-                    )
-                except Exception as exc:
-                    LOGGER.info(
-                        "Skipping %s — cannot build archive: %s",
-                        module_name, exc,
-                    )
-                    continue
-
-            try:
-                if callable(add_art):
-                    add_art(archive_path, pyfile=True)
-                else:
-                    add_py(archive_path)
-            except Exception as exc:
-                LOGGER.warning(
-                    "Failed to ship %s via Spark: %s", module_name, exc,
-                )
-                continue
-            installed.add(module_name)
-        return installed
+        """Per-frame shim around the module-level
+        :func:`_install_modules_on_executors`."""
+        return _install_modules_on_executors(self.sparkSession, modules)
 
     # ---- transforms --------------------------------------------------------
 
@@ -582,7 +687,7 @@ class DynamicFrame:
         schema: Schema | None = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """1:1 map over rows.
 
         Input rows are unpickled objects (dynamic mode) or row-dicts
@@ -643,7 +748,7 @@ class DynamicFrame:
         schema: Schema | None = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Map ``function`` over each row, optionally casting against ``schema``.
 
         Without a schema this is :meth:`map`. With a schema, ``function``
@@ -691,7 +796,7 @@ class DynamicFrame:
         schema: Schema | None = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Drop rows where ``predicate(row)`` is false.
 
         Predicate sees unpickled objects (dynamic mode) or row-dicts
@@ -774,7 +879,7 @@ class DynamicFrame:
         schema: Schema | None = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
+    ) -> "Dataset":
         """Explode rows of iterables into one row per element.
 
         Only meaningful in dynamic mode — typed rows are dicts, not
@@ -785,6 +890,10 @@ class DynamicFrame:
                 "explode() is only defined on dynamic-mode frames; "
                 "the inner objects must be iterable."
             )
+
+        # No user function to scan, but the UDF still imports
+        # ``yggdrasil.pickle`` on the executor — seed the install.
+        self._ensure_installed()
 
         if schema is None:
             def _runner(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
@@ -829,8 +938,9 @@ class DynamicFrame:
         schema: Schema,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "DynamicFrame":
-        """Materialise rows against ``schema`` as a typed ``DynamicFrame``."""
+    ) -> "Dataset":
+        """Materialise rows against ``schema`` as a typed ``Dataset``."""
+        self._ensure_installed()
         schema = Schema.from_any(schema)
         is_dynamic_in = self.is_dynamic
 
@@ -858,7 +968,7 @@ class DynamicFrame:
             installed_modules=self.installed_modules,
         )
 
-    def to_dynamic(self, *, byte_size: int = 128 * 1024 * 1024) -> "DynamicFrame":
+    def to_dynamic(self, *, byte_size: int = 128 * 1024 * 1024) -> "Dataset":
         """Drop typing: re-pickle row-dicts back into a dynamic frame.
 
         No-op when already dynamic. Useful before applying transforms
@@ -867,13 +977,18 @@ class DynamicFrame:
         if self.is_dynamic:
             return self
 
+        self._ensure_installed()
+
         def _runner(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
             yield from _emit_pickled(_typed_rows(batches), byte_size=byte_size)
 
         result_df = self.df.mapInArrow(
             _runner, schema=DYNAMIC_SCHEMA.to_spark_schema()
         )
-        return type(self)(df=result_df, schema=None)
+        return type(self)(
+            df=result_df, schema=None,
+            installed_modules=self.installed_modules,
+        )
 
     # ---- terminal ops ------------------------------------------------------
 
@@ -932,19 +1047,19 @@ class DynamicFrame:
 # ---------------------------------------------------------------------------
 
 def _wrap(value: Any) -> Any:
-    """Wrap ``DataFrame`` results as ``DynamicFrame``; pass others through."""
+    """Wrap ``DataFrame`` results as ``Dataset``; pass others through."""
     if isinstance(value, DataFrame):
-        return DynamicFrame(df=value, schema=Schema.from_any(value.schema))
+        return Dataset(df=value, schema=Schema.from_any(value.schema))
     return value
 
 
 class _ProxiedCallable:
     """Bound-method shim that wraps DataFrame return values.
 
-    Returned by :meth:`DynamicFrame.__getattr__` for callable attributes
+    Returned by :meth:`Dataset.__getattr__` for callable attributes
     on the underlying ``DataFrame``. Calling it forwards args/kwargs and
     runs the result through :func:`_wrap` so chained DataFrame ops stay
-    inside ``DynamicFrame``. Nested attribute access (e.g.
+    inside ``Dataset``. Nested attribute access (e.g.
     ``df.groupBy("x").agg(...)``) works because intermediate non-DF
     objects (``GroupedData``, ``Column``) pass through unchanged and
     their methods aren't proxied — only the final ``DataFrame`` they

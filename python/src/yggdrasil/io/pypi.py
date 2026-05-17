@@ -1,5 +1,5 @@
 """
-:class:`PathPyPI` — managed PEP 503 simple index at any :class:`Path` root.
+:class:`PyPIPath` — managed PEP 503 simple index at any :class:`Path` root.
 
 A drop-in "package artifactory" that publishes Python distributions
 under a yggdrasil :class:`~yggdrasil.io.path.path.Path` root —
@@ -9,13 +9,13 @@ by ``pip install --extra-index-url=<root>``.
 
 Two ingestion shapes:
 
-- :meth:`PathPyPI.publish` — build a real ``pip`` wheel for a local
+- :meth:`PyPIPath.publish` — build a real ``pip`` wheel for a local
   module (importable name or source path) and upload the versioned
   wheel under ``<root>/<normalized-project>/<wheel>.whl``. This is
   the pip-installable path: the wheel filename carries the version,
   the index page lists every uploaded wheel, and re-publishing the
   same source short-circuits when the target already exists.
-- :meth:`PathPyPI.publish_archive` — zip a module via
+- :meth:`PyPIPath.publish_archive` — zip a module via
   :meth:`Path.upload_module` and drop the archive under the same
   versioned layout. Used when the artefact ships as a raw zip
   (Spark ``addArtifacts(pyfile=True)``, ``sys.path`` extension)
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "PathPyPI",
+    "PyPIPath",
     "parse_wheel_filename",
     "normalize_pep503_name",
 ]
@@ -79,7 +79,7 @@ def parse_wheel_filename(name: str) -> tuple[Optional[str], Optional[str]]:
     return match.group("dist"), match.group("version")
 
 
-class PathPyPI:
+class PyPIPath:
     """A PEP 503 simple index hosted at *root* (any yggdrasil :class:`Path`).
 
     Parameters
@@ -96,13 +96,13 @@ class PathPyPI:
     --------
     Local index for testing::
 
-        pypi = PathPyPI("/tmp/my-index")
+        pypi = PyPIPath("/tmp/my-index")
         pypi.publish("my_local_pkg")
         # → /tmp/my-index/my-local-pkg/my_local_pkg-0.1.0-py3-none-any.whl
 
     Layered S3 index::
 
-        pypi = PathPyPI("s3://wheels.example.com/simple")
+        pypi = PyPIPath("s3://wheels.example.com/simple")
         pypi.publish("internal_lib")
     """
 
@@ -372,34 +372,99 @@ class PathPyPI:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _build_wheel(local_root: LocalPath) -> LocalPath:
-        """Build a wheel for *local_root*.
+        """Build a wheel for *local_root* in a temp dir; return the wheel path.
 
-        Tries ``python -m pip wheel --no-deps`` first (still the
-        common case), then falls back to ``uv build --wheel`` for
-        uv-managed venvs that don't ship pip. Neither is taken as
-        a hard dependency: as long as the active environment carries
-        one of them, the build goes through. The wheel lands in a
-        temp dir; the caller reads + uploads immediately, after which
-        the temp dir is reclaimed by the GC.
+        Backend resolution, in order:
+
+        1. ``pip wheel --no-deps`` — standard CPython. Always works when
+           the active interpreter ships pip (``ensurepip``-seeded venvs,
+           system Python, conda, ``python -m venv`` defaults).
+        2. ``python -m build --wheel`` — PEP 517 reference builder. Used
+           when pip is missing (``uv venv`` without ``--seed`` doesn't
+           install pip) but the ``build`` package is importable.
+        3. ``python -m ensurepip --upgrade`` + retry ``pip wheel`` —
+           last-resort bootstrap. Lets a freshly-cut uv venv recover
+           without the caller having to ``pip install build`` first.
+
+        Every backend writes to the same temp dir; the caller reads
+        + uploads, GC reclaims. Returns the *first* ``.whl`` produced
+        (a clean source tree yields exactly one).
         """
-        tmp = LocalPath(tempfile.mkdtemp(prefix="ygg-pypi-"))
-        errors: list[str] = []
+        import importlib.util
 
-        # Builder 1: ``python -m pip wheel`` against the active
-        # interpreter. Standard for any pip-bootstrapped venv.
-        pip_cmd = [
-            sys.executable, "-m", "pip", "wheel",
-            "--no-deps", "--quiet",
-            "--wheel-dir", str(tmp),
-            str(local_root),
-        ]
-        LOGGER.debug("Building wheel for %r via %s", local_root, " ".join(pip_cmd))
-        try:
-            subprocess.run(pip_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as exc:
-            errors.append(
-                f"pip wheel exited {exc.returncode}: "
-                f"{(exc.stderr or exc.stdout or '').strip()}"
+        tmp = LocalPath(tempfile.mkdtemp(prefix="ygg-pypi-"))
+
+        attempts: list[tuple[str, list[str]]] = []
+        if importlib.util.find_spec("pip") is not None:
+            attempts.append(("pip wheel", [
+                sys.executable, "-m", "pip", "wheel",
+                "--no-deps", "--quiet",
+                "--wheel-dir", str(tmp),
+                str(local_root),
+            ]))
+        if importlib.util.find_spec("build") is not None:
+            attempts.append(("python -m build", [
+                sys.executable, "-m", "build", "--wheel",
+                "--outdir", str(tmp),
+                str(local_root),
+            ]))
+
+        errors: list[str] = []
+        for name, cmd in attempts:
+            LOGGER.debug("Building wheel for %r via %s", local_root, name)
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                break
+            except subprocess.CalledProcessError as exc:
+                errors.append(
+                    f"{name} exited {exc.returncode}: "
+                    f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
+                )
+                continue
+            except FileNotFoundError as exc:
+                errors.append(f"{name}: binary not on PATH ({exc})")
+                continue
+        else:
+            # No backend was *callable*. Try the ensurepip bootstrap before
+            # giving up — that's the recovery path for uv-cut venvs.
+            LOGGER.debug(
+                "No wheel builder available for %r; trying python -m ensurepip",
+                local_root,
+            )
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "ensurepip", "--upgrade"],
+                    check=True, capture_output=True, text=True,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                stderr = getattr(exc, "stderr", "") or str(exc)
+                errors.append(f"ensurepip bootstrap: {stderr}")
+                raise RuntimeError(
+                    f"Failed to build wheel for {local_root!r}: no wheel "
+                    f"backend available. Tried: " + "; ".join(errors) + ". "
+                    f"Install one with `pip install build` or seed pip via "
+                    f"`python -m ensurepip --upgrade`."
+                ) from exc
+            cmd = [
+                sys.executable, "-m", "pip", "wheel",
+                "--no-deps", "--quiet",
+                "--wheel-dir", str(tmp),
+                str(local_root),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(
+                    f"Failed to build wheel for {local_root!r}: pip wheel "
+                    f"exited {exc.returncode} after ensurepip bootstrap.\n"
+                    f"stdout: {exc.stdout}\nstderr: {exc.stderr}"
+                ) from exc
+
+        wheels = sorted(tmp.glob("*.whl"))
+        if not wheels:
+            raise RuntimeError(
+                f"Wheel build produced no .whl files under {tmp!r} for "
+                f"{local_root!r}; check the package metadata."
             )
         except FileNotFoundError as exc:
             errors.append(f"pip wheel not invokable: {exc}")
@@ -443,7 +508,7 @@ def _artefact_version_matches(filename: str, version: str) -> bool:
     _, parsed = parse_wheel_filename(filename)
     if parsed is not None:
         return parsed == version
-    # ``{name}-{version}.zip`` shape from :meth:`PathPyPI.publish_archive`.
+    # ``{name}-{version}.zip`` shape from :meth:`PyPIPath.publish_archive`.
     stem = filename.rsplit(".", 1)[0]
     if stem.endswith(".tar"):
         stem = stem[:-4]

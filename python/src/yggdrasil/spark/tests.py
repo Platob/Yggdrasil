@@ -109,10 +109,11 @@ def _get_test_spark(
     """
     global _global_tmpdir
 
-    cached = PyEnv.spark_session()
-    if cached is not None:
-        return cached
-
+    # IMPORTANT: ``PyEnv.spark_session()`` (no args) sets the cached slot to
+    # ``None`` when there's no live session AND ``create`` was left False —
+    # which then short-circuits *every* subsequent call regardless of
+    # ``create=True``. Skip the bare probe and go straight to the
+    # create-or-cached call.
     if _global_tmpdir is None:
         _global_tmpdir = Path(tempfile.mkdtemp(prefix="ygg-spark-test-"))
 
@@ -131,7 +132,13 @@ def _get_test_spark(
     if session is None:
         raise RuntimeError("PyEnv.spark_session returned None for the test session")
 
-    session.sparkContext.setLogLevel("WARN")
+    # Spark Connect sessions (Databricks Connect) don't expose sparkContext —
+    # accessing it raises PySparkAttributeError(JVM_ATTRIBUTE_NOT_SUPPORTED).
+    # Swallow that path; log-level tweaking is a nicety, not a correctness gate.
+    try:
+        session.sparkContext.setLogLevel("WARN")
+    except Exception:
+        pass
     LOGGER.info(
         "Global test SparkSession ready — version %s, scratch=%s",
         session.version,
