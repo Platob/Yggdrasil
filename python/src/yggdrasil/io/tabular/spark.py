@@ -478,7 +478,12 @@ class Dataset(Tabular[CastOptions]):
         else:
             schema = _Schema.from_any(schema)
             df = schema.cast_spark_tabular(df)
-        return cls(frame=df, schema=schema)
+        instance = cls(frame=df, schema=schema)
+        logger.debug(
+            "Created Spark dataset %r from Spark frame (schema=%r)",
+            instance, schema,
+        )
+        return instance
 
     @classmethod
     def from_iterable(
@@ -513,11 +518,20 @@ class Dataset(Tabular[CastOptions]):
             # ``createDataFrame`` indexes ``_data[0]`` to sniff the
             # shape, which IndexErrors on an empty generator.
             rows = [(dumps(x),) for x in items]
+            logger.debug(
+                "Creating dynamic Spark dataset from iterable (rows=%d)",
+                len(rows),
+            )
             df = spark_session.createDataFrame(
                 rows,
                 schema=DYNAMIC_SCHEMA.to_spark_schema(),
             )
-            return cls(frame=df, schema=None)
+            instance = cls(frame=df, schema=None)
+            logger.info(
+                "Created dynamic Spark dataset %r (rows=%d)",
+                instance, len(rows),
+            )
+            return instance
 
         cls._ensure_installed_on_session(spark_session)
         schema = _Schema.from_any(schema)
@@ -525,9 +539,18 @@ class Dataset(Tabular[CastOptions]):
             items,
             options=CastOptions(target=schema, safe=False, byte_size=byte_size),
         )
-        return cls(
+        logger.debug(
+            "Creating typed Spark dataset from iterable (rows=%d, schema=%r)",
+            table.num_rows, schema,
+        )
+        instance = cls(
             frame=spark_session.createDataFrame(table), schema=schema,
         )
+        logger.info(
+            "Created typed Spark dataset %r (rows=%d)",
+            instance, table.num_rows,
+        )
+        return instance
 
     @classmethod
     def parallelize(
@@ -564,6 +587,11 @@ class Dataset(Tabular[CastOptions]):
         )
         dumped = [(dumps(x),) for x in inputs]
         function_pickle = dumps(function)
+        logger.debug(
+            "Creating Spark dataset via parallelize (inputs=%d, "
+            "function=%r, schema=%r)",
+            len(dumped), function, schema,
+        )
         input_df = spark_session.createDataFrame(
             dumped,
             schema=DYNAMIC_SCHEMA.to_spark_schema(),
@@ -750,6 +778,10 @@ class Dataset(Tabular[CastOptions]):
         if not new_modules:
             return set(cache)
 
+        logger.debug(
+            "Installing modules on Spark executors %r (modules=%r)",
+            session, sorted(new_modules),
+        )
         try:
             installed = _install_modules_on_executors(session, new_modules)
         except Exception as exc:  # pragma: no cover - defensive
@@ -760,6 +792,11 @@ class Dataset(Tabular[CastOptions]):
             return set(cache)
 
         cache.update(installed)
+        if installed:
+            logger.info(
+                "Installed modules on Spark executors %r (modules=%r)",
+                session, sorted(installed),
+            )
         return set(cache)
 
     def _ensure_installed(self, *functions: "Callable[..., Any]") -> "set[str]":
