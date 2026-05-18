@@ -130,7 +130,17 @@ class SparkTabular(Tabular[CastOptions]):
 
         self._frame: Optional["SparkDataFrame"] = held
         self._spark: Optional["SparkSession"] = spark
-        self._yggdrasil_schema: "Schema | None" = schema
+        # Schema lives on :attr:`Tabular._schema_cache` — the base
+        # class already owns the slot, the sentinel-vs-value protocol
+        # (``...`` = no schema declared, anything else = the declared
+        # / inferred yggdrasil Schema), and the
+        # :meth:`_persist_schema` / :meth:`_unpersist_schema` writers.
+        # The :attr:`schema` property below reads it back as
+        # ``None`` when the sentinel is set so the legacy ``Dataset``
+        # "schema is None means dynamic mode" contract survives the
+        # merge without a parallel slot.
+        if schema is not None:
+            self._persist_schema(schema)
         # Top-level package names this frame has already declared on
         # the cluster. Auto-populated when :meth:`apply` / :meth:`map`
         # / :meth:`filter` scan a user function's globals and feed
@@ -179,20 +189,25 @@ class SparkTabular(Tabular[CastOptions]):
     def schema(self) -> "Schema | None":
         """Yggdrasil :class:`Schema` describing the frame, when set.
 
-        ``None`` means *dynamic mode*: the underlying Spark frame has
-        the single-column ``_pickle`` schema and rows are arbitrary
-        pickled Python objects.
+        Reads through :attr:`Tabular._schema_cache` (the base-class
+        slot) and surfaces the ``...`` sentinel as ``None`` so the
+        legacy ``Dataset`` "``schema is None`` means dynamic mode"
+        contract still holds.
         """
-        return self._yggdrasil_schema
+        cached = self._schema_cache
+        return None if cached is ... else cached
 
     @schema.setter
     def schema(self, value: "Schema | None") -> None:
-        self._yggdrasil_schema = value
+        if value is None:
+            self._unpersist_schema()
+        else:
+            self._persist_schema(value)
 
     @property
     def is_dynamic(self) -> bool:
         """``True`` iff this holder is in dynamic (pickled-object) mode."""
-        return self._yggdrasil_schema is None
+        return self._schema_cache is ...
 
     @property
     def spark_schema(self):
@@ -240,7 +255,7 @@ class SparkTabular(Tabular[CastOptions]):
         attr = getattr(self._frame, name)
         if callable(attr):
             return _ProxiedCallable(attr, owner=self)
-        return _wrap(attr, schema=self._yggdrasil_schema, owner=self)
+        return _wrap(attr, schema=self.schema, owner=self)
 
     # ------------------------------------------------------------------
     # Tabular contract — cache & persist
@@ -618,7 +633,7 @@ class SparkTabular(Tabular[CastOptions]):
             raise ValueError("Cannot infer schema from an empty frame.")
 
         if not self.is_dynamic and not force:
-            return self._yggdrasil_schema
+            return self.schema
 
         # ---- sample path: drive the inference locally -----------------
         if limit is not None:
@@ -690,7 +705,7 @@ class SparkTabular(Tabular[CastOptions]):
             raise ValueError("Cannot infer schema from an empty frame.")
 
         if inplace:
-            self._yggdrasil_schema = merged
+            self._persist_schema(merged)
 
         return merged
 
@@ -936,7 +951,7 @@ class SparkTabular(Tabular[CastOptions]):
 
         out_schema = (
             _Schema.from_any(schema) if schema is not None
-            else self._yggdrasil_schema
+            else self.schema
         )
         if out_schema is None:
             raise AssertionError("unreachable")
@@ -1145,14 +1160,15 @@ class SparkTabular(Tabular[CastOptions]):
     ) -> pa.Table:
         from yggdrasil.arrow.cast import any_to_arrow_table
 
-        target = schema if schema is not None else self._yggdrasil_schema
+        bound = self.schema
+        target = schema if schema is not None else bound
         if self.is_dynamic and target is None:
             return any_to_arrow_table(
                 self.to_local_iterator(),
                 options=CastOptions(byte_size=byte_size, safe=False),
             )
         from yggdrasil.spark.cast import spark_dataframe_to_arrow
-        if target is not None and target is not self._yggdrasil_schema:
+        if target is not None and target is not bound:
             return spark_dataframe_to_arrow(
                 self.cast(target, byte_size=byte_size)._frame,
             )

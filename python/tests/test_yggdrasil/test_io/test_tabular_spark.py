@@ -134,6 +134,50 @@ class TestSparkTabularIsCached(unittest.TestCase):
         self.assertTrue(io.is_cached)
 
 
+class TestSparkTabularSchemaSlotReuse(unittest.TestCase):
+    """:attr:`schema` reads through :attr:`Tabular._schema_cache`."""
+
+    def test_default_is_dynamic(self) -> None:
+        # No declared schema → sentinel on the base slot → dynamic.
+        io = SparkTabular(_fake_frame())
+        self.assertIs(io._schema_cache, ...)
+        self.assertIsNone(io.schema)
+        self.assertTrue(io.is_dynamic)
+
+    def test_declared_schema_lands_on_base_cache(self) -> None:
+        # ``Schema``-typed construction populates the base slot — no
+        # private ``_yggdrasil_schema`` shadow attribute.
+        from yggdrasil.data import Field
+        from yggdrasil.data.schema import Schema
+
+        schema = Schema.from_fields([Field("x", "int64")])
+        io = SparkTabular(_fake_frame(), schema=schema)
+        self.assertIs(io._schema_cache, schema)
+        self.assertIs(io.schema, schema)
+        self.assertFalse(io.is_dynamic)
+
+    def test_setter_to_none_resets_sentinel(self) -> None:
+        from yggdrasil.data import Field
+        from yggdrasil.data.schema import Schema
+
+        io = SparkTabular(
+            _fake_frame(),
+            schema=Schema.from_fields([Field("x", "int64")]),
+        )
+        self.assertFalse(io.is_dynamic)
+        io.schema = None
+        # Setter routes through ``_unpersist_schema`` → sentinel.
+        self.assertIs(io._schema_cache, ...)
+        self.assertTrue(io.is_dynamic)
+        self.assertIsNone(io.schema)
+
+    def test_no_private_yggdrasil_schema_attribute(self) -> None:
+        # Belt and braces: the parallel slot is gone — there's a
+        # single cache, owned by the base ``Tabular``.
+        io = SparkTabular(_fake_frame())
+        self.assertFalse(hasattr(io, "_yggdrasil_schema"))
+
+
 class TestSparkTabularPersistCache(unittest.TestCase):
     """:meth:`persist` calls ``df.persist`` with skip-when-cached semantics."""
 
