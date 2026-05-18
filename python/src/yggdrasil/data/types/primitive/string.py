@@ -117,6 +117,20 @@ class StringType(PrimitiveType):
     def to_spark_name(self) -> str:
         return "STRING"
 
+    def as_spark(self) -> "StringType":
+        # Spark Connect's Arrow gRPC transport rejects ``large_string``
+        # and ``string_view`` with ``[UNSUPPORTED_ARROWTYPE]``; collapse
+        # the storage flavor to plain ``pa.string()`` so the table sent
+        # over the wire lands on the only variant Spark accepts.
+        if not (self.large or self.view):
+            return self
+        return StringType(
+            large=False,
+            view=False,
+            fixed_size=self.fixed_size,
+            byte_size=self.byte_size,
+        )
+
     # ==================================================================
     # Defaults / conversion
     # ==================================================================

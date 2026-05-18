@@ -378,11 +378,22 @@ class ArrayType(NestedType):
     def as_spark(self) -> "ArrayType":
         # Recurse via the field-level :meth:`Field.as_spark` so the
         # element's metadata + nullability survive alongside its
-        # Spark-flavored dtype.
+        # Spark-flavored dtype. Spark Connect's Arrow gRPC transport
+        # rejects ``large_list`` / ``list_view`` / ``large_list_view``
+        # with ``[UNSUPPORTED_ARROWTYPE]``; collapse the storage flavor
+        # to plain ``pa.list_(...)`` so the table sent over the wire
+        # lands on the only variant Spark accepts.
         spark_item = self.item_field.as_spark()
-        if spark_item is self.item_field:
+        same_item = spark_item is self.item_field
+        if same_item and not self.large and not self.view:
             return self
-        return ArrayType.from_item(spark_item)
+        return ArrayType.from_item(
+            spark_item,
+            list_size=self.list_size,
+            large=False,
+            view=False,
+            fixed_size=self.fixed_size,
+        )
 
     def as_polars(self) -> "ArrayType":
         polars_item = self.item_field.as_polars()

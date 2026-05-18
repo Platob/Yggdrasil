@@ -120,6 +120,19 @@ class BinaryType(PrimitiveType):
     def to_spark_name(self) -> str:
         return "BINARY"
 
+    def as_spark(self) -> "BinaryType":
+        # Spark Connect's Arrow gRPC transport rejects ``large_binary``
+        # and ``binary_view`` with ``[UNSUPPORTED_ARROWTYPE]``; collapse
+        # the storage flavor to plain ``pa.binary()`` so the table sent
+        # over the wire lands on the only variant Spark accepts.
+        if not (self.large or self.view):
+            return self
+        return BinaryType(
+            large=False,
+            view=False,
+            byte_size=self.byte_size,
+        )
+
     # ------------------------------------------------------------------
     # Defaults / conversion
     # ------------------------------------------------------------------
