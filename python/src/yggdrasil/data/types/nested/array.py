@@ -42,6 +42,16 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 
 
+# Regular ``ListArray`` carries int32 offsets — the largest representable
+# offset is ``2**31 - 1``. Down-casting a ``LargeListArray`` whose flat
+# values exceed this fits nowhere in a regular list, so we reject the
+# cast up front with a clear message instead of leaving pyarrow to raise
+# an opaque ArrowInvalid deep in the C++ layer. Exposed at module level
+# so tests can monkeypatch it to exercise the guard without allocating
+# a multi-gigabyte values array.
+_LIST_INT32_OFFSET_MAX: int = (1 << 31) - 1
+
+
 @dataclass(frozen=True, repr=False)
 class ArrayType(NestedType):
     item_field: "Field"
@@ -670,6 +680,24 @@ def cast_arrow_list_array(
             offsets=src_offsets,
             values=target_values,
             mask=array.is_null(),
+        )
+
+    # Down-cast from LargeList (int64 offsets) to regular List (int32
+    # offsets) only fits when the rebased offsets stay within the int32
+    # range. Without this guard, ``pa.ListArray.from_arrays`` either
+    # silently overflows the offsets buffer or raises an opaque
+    # ``ArrowInvalid`` deep in the C++ layer — neither tells the caller
+    # to widen the target to ``large_list``. Rebased offsets are
+    # monotonically increasing and start at 0, so the largest is the
+    # last entry — equal to ``len(target_values)`` by construction.
+    if len(target_values) > _LIST_INT32_OFFSET_MAX:
+        raise pa.ArrowInvalid(
+            f"Cannot down-cast {options.source} to {options.target}: "
+            f"flat values length {len(target_values)} exceeds the int32 "
+            f"offset capacity of regular list ({_LIST_INT32_OFFSET_MAX}). "
+            f"Set large=True on the target ArrayType (or use "
+            f"pa.large_list for the Arrow type) so the offsets keep their "
+            f"int64 width."
         )
 
     return pa.ListArray.from_arrays(

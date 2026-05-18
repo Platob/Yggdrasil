@@ -1567,6 +1567,13 @@ class Session(Singleton, ABC):
         )
 
         pool = self.job_pool
+        LOGGER.debug(
+            "Fetching %d send_many miss(es) through job pool "
+            "(max_in_flight=%d, ordered=%s)",
+            len(misses),
+            config.max_in_flight or pool.max_workers,
+            config.ordered,
+        )
         for result in pool.as_completed(
             (
                 Job.make(
@@ -2102,6 +2109,25 @@ class Session(Singleton, ABC):
 
         ttl = config.max_batch_ttl
 
+        LOGGER.debug(
+            "Starting send_many pipeline (mode=%s, batch_size=%d, "
+            "max_in_flight=%s, ttl=%s, ordered=%s, "
+            "local_cache=%s, remote_cache=%s)",
+            "spark" if is_spark else "python",
+            batch_size,
+            config.max_in_flight,
+            ttl,
+            config.ordered,
+            session_local_cfg.local_cache_enabled,
+            session_remote_cfg.remote_cache_enabled,
+        )
+
+        chunk_index = 0
+        total_local = 0
+        total_remote = 0
+        total_network = 0
+        total_failed = 0
+
         def _batched(
             it: Iterator[PreparedRequest],
             n: int,
@@ -2142,6 +2168,12 @@ class Session(Singleton, ABC):
         for chunk in chunks:
             if not chunk:
                 continue
+
+            chunk_index += 1
+            LOGGER.debug(
+                "Processing send_many chunk #%d (requests=%d, mode=%s)",
+                chunk_index, len(chunk), "spark" if is_spark else "python",
+            )
 
             # Snapshot per-request effective configs BEFORE stage 1 so
             # every downstream stage (split_local_cache, split_remote_cache,
@@ -2203,6 +2235,14 @@ class Session(Singleton, ABC):
                         key_to_remote_cfg,
                         session_remote_cfg,
                     )
+                local_count = sum(len(v) for v in local_hits_by_path.values())
+                total_local += local_count
+                LOGGER.debug(
+                    "Completed send_many chunk #%d (requests=%d, "
+                    "local_hits=%d, remote_hits=0, network=0, failed=0) "
+                    "— fully short-circuited on local cache",
+                    chunk_index, len(chunk), local_count,
+                )
                 yield ResponseBatch(
                     local_hits=local_hits,
                     remote_hits=remote_hits,
@@ -2259,6 +2299,22 @@ class Session(Singleton, ABC):
                 )
 
             if not after_remote:
+                local_count = sum(len(v) for v in local_hits_by_path.values())
+                if is_spark:
+                    remote_count = -1  # Spark frame — count not materialised
+                else:
+                    remote_count = sum(
+                        len(v) for v in remote_hits.values()  # type: ignore[union-attr]
+                    )
+                    total_remote += remote_count
+                total_local += local_count
+                LOGGER.debug(
+                    "Completed send_many chunk #%d (requests=%d, "
+                    "local_hits=%d, remote_hits=%s, network=0, failed=0) "
+                    "— short-circuited on remote cache",
+                    chunk_index, len(chunk), local_count,
+                    "<spark>" if remote_count < 0 else remote_count,
+                )
                 yield ResponseBatch(
                     local_hits=local_hits,
                     remote_hits=remote_hits,
@@ -2338,6 +2394,29 @@ class Session(Singleton, ABC):
                     stage4, thread_name_prefix="ygg-stage4",
                 )
 
+            local_count = sum(len(v) for v in local_hits_by_path.values())
+            total_local += local_count
+            if is_spark:
+                remote_count_log: "int | str" = "<spark>"
+                network_count_log: "int | str" = "<spark>"
+            else:
+                remote_count = sum(
+                    len(v) for v in remote_hits.values()  # type: ignore[union-attr]
+                )
+                total_remote += remote_count
+                remote_count_log = remote_count
+                net_count = len(new_hits) if isinstance(new_hits, list) else 0
+                total_network += net_count
+                network_count_log = net_count
+            failed_count = len(failed)
+            total_failed += failed_count
+            LOGGER.debug(
+                "Completed send_many chunk #%d (requests=%d, "
+                "local_hits=%d, remote_hits=%s, network=%s, failed=%d)",
+                chunk_index, len(chunk), local_count,
+                remote_count_log, network_count_log, failed_count,
+            )
+
             yield ResponseBatch(
                 local_hits=local_hits,
                 remote_hits=remote_hits,
@@ -2347,6 +2426,20 @@ class Session(Singleton, ABC):
 
             if not is_spark and config.raise_error and failed:
                 failed[-1].raise_for_status()
+
+        if is_spark:
+            LOGGER.debug(
+                "Finished send_many pipeline (chunks=%d, mode=spark) "
+                "— per-bucket counts deferred to Spark action",
+                chunk_index,
+            )
+        else:
+            LOGGER.debug(
+                "Finished send_many pipeline (chunks=%d, local_hits=%d, "
+                "remote_hits=%d, network=%d, failed=%d)",
+                chunk_index, total_local, total_remote,
+                total_network, total_failed,
+            )
 
     # ------------------------------------------------------------------ #
     # Spark stage 3 / 4 helpers                                           #
@@ -2557,6 +2650,11 @@ class Session(Singleton, ABC):
         except Exception:
             default_par = 8
         n_parts = max(1, min(len(misses), default_par * 8))
+        LOGGER.debug(
+            "Scattering %d send_many miss(es) across %d Spark partition(s) "
+            "via mapInArrow (default_parallelism=%d)",
+            len(misses), n_parts, default_par,
+        )
         request_df = spark.createDataFrame(request_table).repartition(n_parts)
 
         # Per-executor send config: keep both local and remote cache

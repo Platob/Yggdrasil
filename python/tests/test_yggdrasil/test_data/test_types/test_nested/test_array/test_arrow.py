@@ -175,6 +175,52 @@ class TestListRejections:
                 ),
             )
 
+    def test_large_list_down_cast_overflow_rejected(
+        self,
+        target_array_field: Field,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Down-casting a LargeList (int64 offsets) into a regular List
+        # (int32 offsets) silently overflows or raises an opaque
+        # ArrowInvalid in the C++ layer when the flat values exceed the
+        # int32 offset capacity. Monkeypatch the guard threshold so the
+        # check fires on a tiny synthetic input instead of forcing a
+        # 2GB allocation in CI.
+        from yggdrasil.data.types.nested import array as array_mod
+        from yggdrasil.data.types.nested.array import ArrayType
+        from yggdrasil.data.types.primitive import IntegerType
+
+        monkeypatch.setattr(array_mod, "_LIST_INT32_OFFSET_MAX", 3)
+
+        source_large = Field(
+            name="src",
+            dtype=ArrayType(
+                item_field=Field(
+                    name="item",
+                    dtype=IntegerType(byte_size=8, signed=True),
+                    nullable=True,
+                ),
+                large=True,
+            ),
+            nullable=True,
+        )
+
+        # 4 flat values across two rows — exceeds the patched threshold
+        # of 3, so the down-cast to regular list must reject.
+        array = pa.array(
+            [[1, 2], [3, 4]],
+            type=pa.large_list(pa.int64()),
+        )
+
+        with pytest.raises(pa.ArrowInvalid, match="exceeds the int32"):
+            cast_arrow_list_array(
+                array,
+                CastOptions(
+                    source=source_large,
+                    target=target_array_field,
+                ),
+            )
+
     def test_list_view_target_rejected(
         self,
         source_array_field: Field,

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import unittest
 
+from yggdrasil.data import Field
+from yggdrasil.data.types.nested import ArrayType, MapType, StructType
 from yggdrasil.data.types.primitive import (
     DecimalType,
     FloatingPointType,
@@ -131,3 +133,95 @@ class TestCrossTypeMerge(unittest.TestCase):
         str_type = StringType()
 
         self.assertIs(int_type.merge_with(str_type), int_type)
+
+
+class TestNestedVsPrimitiveMerge(unittest.TestCase):
+    """Nested types win over primitives no matter which side is self.
+
+    A list / struct / map row can't be represented by a scalar dtype
+    without dropping its inner shape, so the merge picks the nested
+    type as the only option that preserves both samples.
+    """
+
+    @staticmethod
+    def _list_of_int() -> ArrayType:
+        return ArrayType(
+            item_field=Field(
+                name="item",
+                dtype=IntegerType(byte_size=8, signed=True),
+                nullable=True,
+            ),
+        )
+
+    @staticmethod
+    def _struct_of_int() -> StructType:
+        return StructType(
+            fields=[
+                Field(
+                    name="x",
+                    dtype=IntegerType(byte_size=8, signed=True),
+                    nullable=True,
+                ),
+            ]
+        )
+
+    @staticmethod
+    def _map_of_str_int() -> MapType:
+        return MapType(
+            item_field=Field(
+                name="entries",
+                dtype=StructType(
+                    fields=[
+                        Field(name="key", dtype=StringType(), nullable=False),
+                        Field(
+                            name="value",
+                            dtype=IntegerType(byte_size=8, signed=True),
+                            nullable=True,
+                        ),
+                    ]
+                ),
+                nullable=False,
+            ),
+        )
+
+    def test_primitive_left_array_right_yields_array(self) -> None:
+        primitive = StringType()
+        array = self._list_of_int()
+
+        self.assertIs(primitive.merge_with(array), array)
+
+    def test_array_left_primitive_right_yields_array(self) -> None:
+        primitive = StringType()
+        array = self._list_of_int()
+
+        self.assertIs(array.merge_with(primitive), array)
+
+    def test_primitive_left_struct_right_yields_struct(self) -> None:
+        primitive = IntegerType(byte_size=8, signed=True)
+        struct = self._struct_of_int()
+
+        self.assertIs(primitive.merge_with(struct), struct)
+
+    def test_primitive_left_map_right_yields_map(self) -> None:
+        primitive = StringType()
+        map_t = self._map_of_str_int()
+
+        self.assertIs(primitive.merge_with(map_t), map_t)
+
+    def test_overwrite_mode_still_prefers_nested(self) -> None:
+        # OVERWRITE flips precedence between same-id primitives, but
+        # the cross-id ``_merge_with_different_id`` path treats nested
+        # as authoritative regardless of mode — a primitive can't
+        # carry the inner schema.
+        primitive = StringType()
+        array = self._list_of_int()
+
+        self.assertIs(primitive.merge_with(array, mode=Mode.OVERWRITE), array)
+
+    def test_downcast_does_not_drop_nested(self) -> None:
+        # Even when the caller asked for a downcast, falling back to a
+        # primitive would lose the nested rows entirely.
+        primitive = StringType()
+        array = self._list_of_int()
+
+        self.assertIs(array.merge_with(primitive, downcast=True), array)
