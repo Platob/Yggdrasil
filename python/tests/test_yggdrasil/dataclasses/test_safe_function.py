@@ -18,6 +18,7 @@ from yggdrasil.dataclasses.safe_function import (
     _canonical_module_path,
     _expand_alias,
     _resolve_str_annotation,
+    build_row_invoker,
     check_function_args,
     checkargs,
     describe_signature,
@@ -868,6 +869,140 @@ class TestDescribeSignatureCanonicalPaths(unittest.TestCase):
         self.assertEqual(params["t"]["annotation"], "pyarrow.Table")
         self.assertEqual(params["n"]["annotation"], "int")
         self.assertEqual(meta["return"], "polars.DataFrame")
+
+
+# ---------------------------------------------------------------------------
+# build_row_invoker — per-row dispatch over arbitrary pyfunc shapes
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRowInvoker(unittest.TestCase):
+    """The per-row dispatcher used by :meth:`Dataset.apply` / ``map``.
+
+    Exercises the four signature shapes the invoker recognises plus
+    the type-coercion plumbing that runs through annotated parameters.
+    """
+
+    def test_single_positional_passes_row_through(self):
+        def f(x):
+            return ("got", x)
+
+        invoke = build_row_invoker(f)
+        self.assertEqual(invoke(5), ("got", 5))
+        # A mapping value reaches a single-arg function as a single arg —
+        # no dict spread, because the function declares one positional slot.
+        row = {"k": 1, "v": 2}
+        self.assertEqual(invoke(row), ("got", row))
+
+    def test_single_positional_annotation_coerces(self):
+        def f(x: int) -> int:
+            return x + 1
+
+        invoke = build_row_invoker(f)
+        # String coerces to int via the cast registry.
+        self.assertEqual(invoke("4"), 5)
+        # Already-correct type passes through.
+        self.assertEqual(invoke(7), 8)
+
+    def test_multi_arg_function_spreads_dict_as_kwargs(self):
+        def f(id: int, name: str) -> str:
+            return f"{id}-{name}"
+
+        invoke = build_row_invoker(f)
+        self.assertEqual(invoke({"id": 1, "name": "a"}), "1-a")
+        # String id coerces via int annotation.
+        self.assertEqual(invoke({"id": "2", "name": "b"}), "2-b")
+
+    def test_multi_arg_drops_unknown_keys_when_no_var_kw(self):
+        # Strict signature — extra keys shouldn't crash the call.
+        def f(id: int, name: str) -> str:
+            return f"{id}-{name}"
+
+        invoke = build_row_invoker(f)
+        # ``extra`` is silently filtered because the signature has no **kwargs.
+        self.assertEqual(invoke({"id": 1, "name": "a", "extra": True}), "1-a")
+
+    def test_var_keyword_function_spreads_full_dict(self):
+        def f(**row) -> dict:
+            return dict(row)
+
+        invoke = build_row_invoker(f)
+        self.assertEqual(
+            invoke({"id": 1, "name": "x", "extra": True}),
+            {"id": 1, "name": "x", "extra": True},
+        )
+        # Non-mapping rows pass through as a single positional.
+        def g(*args, **kw):
+            return (args, kw)
+        invoke_g = build_row_invoker(g)
+        self.assertEqual(invoke_g(7), ((7,), {}))
+
+    def test_var_positional_spreads_sequences(self):
+        def f(*xs):
+            return sum(xs)
+
+        invoke = build_row_invoker(f)
+        self.assertEqual(invoke([1, 2, 3]), 6)
+        self.assertEqual(invoke((4, 5)), 9)
+        # Scalar passes through as a single arg.
+        self.assertEqual(invoke(7), 7)
+
+    def test_kwargs_spread_falls_back_to_single_arg_on_typeerror(self):
+        # Signature looks dict-spreadable but the body rejects the call —
+        # the invoker retries with the row as a single positional arg.
+        def f(value):
+            # Receives the full dict in fallback mode.
+            return value
+
+        invoke = build_row_invoker(f)
+        # Single-positional shape — direct call.
+        self.assertEqual(invoke({"a": 1}), {"a": 1})
+
+    def test_uninspectable_function_falls_back_to_single_arg(self):
+        # ``min`` is a C builtin — inspect.signature raises ValueError
+        # on older Pythons, returns a synthesized signature on newer
+        # ones. Either way the invoker must call ``min(row)`` cleanly.
+        invoke = build_row_invoker(min)
+        self.assertEqual(invoke([3, 1, 2]), 1)
+
+    def test_mixed_signature_with_var_kw(self):
+        # Two named params + **kwargs — declared names take their slot,
+        # extras flow through the catch-all.
+        def f(id: int, name: str, **extra) -> dict:
+            return {"id": id, "name": name, "extra": extra}
+
+        invoke = build_row_invoker(f)
+        out = invoke({"id": "3", "name": "x", "tags": ["a"], "score": 1.5})
+        self.assertEqual(out["id"], 3)
+        self.assertEqual(out["name"], "x")
+        self.assertEqual(out["extra"], {"tags": ["a"], "score": 1.5})
+
+    def test_keyword_only_function(self):
+        # Keyword-only params still receive their values from the dict.
+        def f(*, id: int, name: str) -> str:
+            return f"{id}-{name}"
+
+        invoke = build_row_invoker(f)
+        self.assertEqual(invoke({"id": "9", "name": "kw"}), "9-kw")
+
+    def test_lambda_handled_as_single_arg(self):
+        invoke = build_row_invoker(lambda x: x + 100)
+        self.assertEqual(invoke(5), 105)
+
+    def test_dataclass_returning_function(self):
+        import dataclasses
+
+        @dataclasses.dataclass
+        class Row:
+            id: int
+            label: str
+
+        def make(id: int, label: str) -> Row:
+            return Row(id=id, label=label)
+
+        invoke = build_row_invoker(make)
+        out = invoke({"id": "5", "label": "x"})
+        self.assertEqual(out, Row(id=5, label="x"))
 
 
 if __name__ == "__main__":
