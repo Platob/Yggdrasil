@@ -32,6 +32,7 @@ import pyarrow.compute as pc
 from yggdrasil.data.constants import DEFAULT_FIELD_NAME
 from yggdrasil.data.enums.mode import Mode
 from yggdrasil.data.types.id import DataTypeId
+from yggdrasil.exceptions import CastError
 from yggdrasil.data.types.parser import (
     DataTypeMetadata,
     ParsedDataType,
@@ -1787,32 +1788,64 @@ class DataType(BaseChildrenFields, ABC):
         # buffer for no semantic gain.
         if _arrow_types_compatible(array.type, target_type):
             return array
-        if options.need_cast(array, self):
+        if not options.need_cast(array, self):
+            return array
+        # Atomic CastError at the primitive leaf — any failure leaving
+        # ``pc.cast`` (or the polars fallback) wraps in CastError with
+        # the bound source/target. Callers that bypass the Field-level
+        # wrap (direct ``DataType.cast_arrow_array``, deeper struct
+        # rebinds) still get a diagnostic that names both ends instead
+        # of a bare ``ArrowInvalid: Unsupported cast …``.
+        try:
             try:
-                casted = pc.cast(
+                return pc.cast(
                     array,
                     target_type=target_type,
                     safe=options.safe,
                     memory_pool=options.arrow_memory_pool,
                 )
             except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-                # Polars fallback — for casts pyarrow rejects (e.g. string →
-                # decimal, nested-struct coercions). Round-trip through
-                # polars, then re-cast to pin down the exact target type.
+                # Polars fallback — for casts pyarrow rejects (e.g.
+                # string → decimal, nested-struct coercions). Round-trip
+                # through polars, then re-cast to pin down the exact
+                # target type.
                 pl = polars_module()
                 array = (
                     pl.from_arrow(array)
                     .cast(dtype=self.to_polars(), strict=options.safe)
                     .to_arrow()
                 )
-                casted = pc.cast(
+                return pc.cast(
                     array,
                     target_type=target_type,
                     safe=options.safe,
                     memory_pool=options.arrow_memory_pool,
                 )
-            return casted
-        return array
+        except CastError:
+            raise
+        except Exception as exc:
+            # Peek source off the array when options didn't carry one so
+            # the rendered message names both ends.
+            from yggdrasil.data.data_field import Field as _Field
+
+            source = options.source
+            if source is None:
+                try:
+                    source = _Field.from_arrow(array)
+                except Exception:
+                    source = None
+            target = options.target
+            if target is None:
+                try:
+                    target = _Field.from_arrow(target_type)
+                except Exception:
+                    target = None
+            raise CastError(
+                str(exc),
+                source=source,
+                target=target,
+                original=exc,
+            ) from exc
 
     def _cast_chunked_array(
         self,

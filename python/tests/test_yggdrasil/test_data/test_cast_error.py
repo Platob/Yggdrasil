@@ -282,6 +282,20 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
         self.assertEqual(ctx.exception.target.name, "amount")
         self.assertIsNotNone(ctx.exception.original)
 
+    def test_dtype_cast_arrow_array_direct_wraps(self) -> None:
+        # Calling :meth:`DataType.cast_arrow_array` straight on the
+        # dtype (no Field shell) still raises CastError — the wrap is
+        # atomic to the leaf, not gated on the Field-level wrapper.
+        pa = self.pa
+        tgt_field = Field.from_arrow(pa.field("amount", pa.int64()))
+        arr = pa.array(["nope"], type=pa.string())
+        with self.assertRaises(CastError) as ctx:
+            tgt_field.dtype.cast_arrow_array(arr, safe=True)
+        # Source is peeked off the array so the message names both ends.
+        self.assertIsNotNone(ctx.exception.source)
+        self.assertEqual(ctx.exception.source.arrow_type, pa.string())
+        self.assertNotIn("? -> ", str(ctx.exception))
+
     def test_cast_arrow_array_without_source_binds_from_array(self) -> None:
         # When the caller doesn't pass a source, the atomic wrap pulls
         # the source dtype off the array itself so the rendered message
