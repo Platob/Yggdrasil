@@ -110,7 +110,7 @@ class Header:
         payload:size bytes
     """
 
-    __slots__ = ("tag", "codec", "size", "meta_size", "start", "metadata")
+    __slots__ = ("tag", "codec", "size", "meta_size", "start", "metadata", "_encoded_meta")
 
     def __init__(
         self,
@@ -120,6 +120,7 @@ class Header:
         meta_size: int,
         start: int,
         metadata: Metadata = None,
+        _encoded_meta: bytes | None = None,
     ) -> None:
         self.tag = tag
         self.codec = codec
@@ -127,6 +128,7 @@ class Header:
         self.meta_size = meta_size
         self.start = start
         self.metadata = metadata
+        self._encoded_meta = _encoded_meta
 
     @property
     def header_start(self) -> int:
@@ -155,6 +157,7 @@ class Header:
             meta_size=len(encoded),
             start=start + HEADER_SIZE + len(encoded),
             metadata=dict(metadata) if metadata else None,
+            _encoded_meta=encoded,
         )
 
     @classmethod
@@ -200,6 +203,7 @@ class Header:
             meta_size=meta_size,
             start=pos + HEADER_SIZE + meta_size,
             metadata=metadata,
+            _encoded_meta=meta_blob,
         )
 
     def payload_view(self, buffer: BytesIO) -> BytesIO:
@@ -228,7 +232,9 @@ class Header:
                 f"Payload size mismatch: header.size={self.size}, actual={len(payload)}"
             )
 
-        metadata_blob = encode_metadata(self.metadata)
+        metadata_blob = self._encoded_meta
+        if metadata_blob is None:
+            metadata_blob = encode_metadata(self.metadata)
         if len(metadata_blob) != self.meta_size:
             raise ValueError(
                 f"Metadata size mismatch: header.meta_size={self.meta_size}, "

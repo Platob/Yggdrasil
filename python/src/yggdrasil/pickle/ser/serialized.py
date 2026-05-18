@@ -54,9 +54,9 @@ class Serialized(ABC, Generic[T]):
     head: Header
     data: BytesIO
 
-    _cached_obj: Optional[T] = field(
+    _cached_obj: Any = field(
         init=False,
-        default=None,
+        default=...,  # Ellipsis sentinel — None is a valid deserialized value
         repr=False,
         compare=False,
         hash=False,
@@ -122,7 +122,7 @@ class Serialized(ABC, Generic[T]):
 
     def as_cache_python(self) -> T:
         cached = self._cached_obj
-        if cached is None:
+        if cached is ...:
             cached = self._as_python_uncached()
             object.__setattr__(self, "_cached_obj", cached)
         return cached
@@ -391,24 +391,29 @@ class Serialized(ABC, Generic[T]):
         codec: int | None = None,
         compress_threshold: int = COMPRESS_THRESHOLD,
     ) -> "Serialized[object]":
-        # Skip the ``bytes(memoryview(data))`` rewrap when the input is
-        # already an immutable ``bytes`` — the codec primitives accept
-        # bytes directly. Keeps the hot small-payload path allocation-free.
+        # Accept bytes/bytearray/memoryview — all are valid bytes-like inputs
+        # for the codec primitives. Avoid converting memoryview → bytes early;
+        # the compressors accept the raw view directly, saving one allocation
+        # on the hot Arrow-IPC and large-payload paths.
+        raw: bytes | memoryview
         if isinstance(data, bytes):
             raw = data
+        elif isinstance(data, memoryview):
+            raw = data
         else:
-            raw = bytes(memoryview(data))
+            raw = memoryview(data)
 
+        raw_len = len(raw)
         if codec is None:
-            if len(raw) >= compress_threshold:
+            if raw_len >= compress_threshold:
                 codec = DEFAULT_CODEC
                 encoded = compress_bytes(raw, codec)
-                if len(encoded) >= len(raw):
+                if len(encoded) >= raw_len:
                     codec = CODEC_NONE
-                    encoded = raw
+                    encoded = bytes(raw) if not isinstance(raw, bytes) else raw
             else:
                 codec = CODEC_NONE
-                encoded = raw
+                encoded = bytes(raw) if not isinstance(raw, bytes) else raw
         else:
             encoded = compress_bytes(raw, codec)
 
@@ -418,8 +423,12 @@ class Serialized(ABC, Generic[T]):
             size=len(encoded),
             metadata=metadata,
         )
-        buf = head.write_to(encoded)
-        payload = head.payload_view(buf)
+        # Store just the compressed payload in its own BytesIO — no need to
+        # build a full [header | meta | payload] buffer here only to view the
+        # payload portion back out.  write_to() reconstructs the header on
+        # demand, and the payload memoryview it receives is always zero-copy
+        # from this holder's backing bytearray.
+        payload = BytesIO(encoded)
 
         if cls is Serialized:
             target = Tags.get_class(tag)
@@ -428,8 +437,6 @@ class Serialized(ABC, Generic[T]):
                     f"Tag {tag} resolved to invalid serializer class: {target!r}, "
                     "install more recent version with uv pip install ygg[data,databricks,pickle]>=0.6.21"
                 )
-        elif cls is Serialized:
-            raise TypeError(f"Tag {tag} resolved to invalid serializer class: {cls!r}")
         else:
             target = cls
 

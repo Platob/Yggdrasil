@@ -203,8 +203,13 @@ def loads(
                 f"Invalid base64-encoded string {label!r}"
             ) from e
 
-    # Read-only over a fresh in-memory buffer — closed state already
-    # routes ops directly through the Memory holder; the ``with`` block
-    # was seeding a redundant scratch copy of the entire payload.
-    return load(BytesIO(s), unpickle=unpickle)
+    # Create the buffer once here and read directly from it — avoids the
+    # extra BytesIO(BytesIO(s)) wrap that routing through load() would cause.
+    buffer = BytesIO(s)
+    mag = buffer.read(MAGIC_LENGTH)
+    if not is_valid_magic(mag):
+        raise SerializationError("Invalid magic header")
+
+    read = Serialized.read_from(buffer)
+    return read.as_python() if unpickle else read
 
