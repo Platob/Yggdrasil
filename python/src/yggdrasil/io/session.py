@@ -1517,13 +1517,16 @@ class Session(Singleton, ABC):
             # No request-key columns means the SQL can't disambiguate
             # rows per request; mirror the Python path's behaviour by
             # treating every input request as a hit when any row came
-            # back, otherwise everything is a miss.
+            # back, otherwise everything is a miss. Pin the snapshot
+            # (see the keyed branch below for the rationale) so the
+            # caller's later ``.count()`` doesn't re-read the cache
+            # table after stage 4 inserted the freshly-fetched misses.
             try:
                 any_row = hits_df.head(1)
             except Exception:
                 any_row = None
             if any_row:
-                return hits_df, []
+                return self._pin_spark_snapshot(hits_df), []
             return None, list(requests)
 
         # Request-side ``request_by`` keys (``public_url_hash``,
@@ -1542,7 +1545,44 @@ class Session(Singleton, ABC):
         for req, lookup in zip(requests, lookup_batch):
             if cfg.request_tuple(lookup) not in matched:
                 misses.append(req)
-        return hits_df, misses
+        if not matched:
+            # Cold-cache short-circuit: returning a still-bound
+            # SparkDataFrame for the empty match would let any later
+            # action — e.g. :attr:`ResponseBatch.counts` — re-execute
+            # the SELECT after stage 4 has inserted ``misses`` into the
+            # same cache table, double-counting those rows as remote
+            # hits. The bucket really is empty; let the consumer drop it.
+            return None, misses
+        # Pin the matched-row snapshot. The lazy ``hits_df`` reads the
+        # cache table, which stage 4 mutates in place — without an
+        # eagerly-materialised cache snapshot a later ``.count()`` would
+        # re-issue the SELECT and pick up the freshly-inserted miss rows.
+        return self._pin_spark_snapshot(hits_df), misses
+
+    @staticmethod
+    def _pin_spark_snapshot(df: "SparkDataFrame") -> "SparkDataFrame":
+        """Cache ``df`` and force one action so the snapshot is stable.
+
+        Spark's ``DataFrame.cache`` is lazy — the partitions only
+        materialise on the first action against the frame. When the
+        downstream caller's first action runs after a sibling write to
+        the same source table, the cached snapshot ends up containing
+        rows that landed *after* the logical read. Forcing a single
+        ``.count()`` here pins the partitions to the pre-mutation state.
+        ``.cache`` itself can fail on Spark Connect logical plans the
+        backend won't materialise — log and return the original frame
+        so a best-effort pin doesn't crash the caller.
+        """
+        try:
+            df = df.cache()
+            df.count()
+        except Exception:  # noqa: BLE001
+            LOGGER.warning(
+                "Failed to pin Spark snapshot for %r; downstream counts "
+                "may re-execute the plan",
+                df, exc_info=True,
+            )
+        return df
 
     def _fetch_misses(
         self,
@@ -2697,7 +2737,25 @@ class Session(Singleton, ABC):
                     byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
                 )
 
-        return request_df.mapInArrow(_send_partition, schema=response_spark_schema)
+        result_df = request_df.mapInArrow(
+            _send_partition, schema=response_spark_schema,
+        )
+        # Cache so stage 4's insert (the first action on this frame)
+        # both materialises and caches it. Without the cache, every
+        # later action — including :attr:`ResponseBatch.counts` — would
+        # re-execute the ``mapInArrow``, re-issuing per-partition
+        # network calls AND letting workers' ``send_many`` short-circuit
+        # on the very rows stage 4 has just persisted to the remote
+        # cache table (double-counting them as fresh hits).
+        try:
+            result_df = result_df.cache()
+        except Exception:  # noqa: BLE001
+            LOGGER.warning(
+                "Failed to cache stage-3 mapInArrow result; downstream "
+                "counts may re-execute the per-partition fetch",
+                exc_info=True,
+            )
+        return result_df
     
     def get(
         self,

@@ -308,3 +308,41 @@ class TestSparkPersistRemote:
 
         assert len(tab.inserts) == 1
         assert tab.inserts[0]["url_hashes"] == [req_ok.public_url_hash]
+
+
+class TestPinSparkSnapshot:
+    """Snapshot pinning for Spark-mode remote-cache lookups.
+
+    Stage 4 mutates the cache table that the stage 2 lookup frame reads
+    from. Without an eager snapshot, a later ``.count()`` on the lookup
+    frame re-runs the SELECT and double-counts rows freshly inserted by
+    stage 4 — the regression that surfaced as
+    ``ResponseBatch.counts == {'remote': N, 'new': N}`` for a cold
+    cache where ``remote`` should have been 0.
+    """
+
+    def test_pin_caches_and_freezes_count(self, spark) -> None:
+        df = spark.range(0, 5).toDF("v")
+        pinned = Session._pin_spark_snapshot(df)
+        assert getattr(pinned, "is_cached", False), (
+            "_pin_spark_snapshot must register the frame with Spark's "
+            "executor cache so subsequent actions don't re-execute"
+        )
+        # Count should match the snapshot at pin time.
+        assert pinned.count() == 5
+
+    def test_pin_survives_persist_failure(self, spark, monkeypatch) -> None:
+        # Spark Connect logical plans can reject ``cache`` — best-effort
+        # pin must fall through to the original frame rather than crash
+        # the caller.
+        from pyspark.sql import DataFrame as _SparkDataFrame
+
+        def _reject_cache(self):  # noqa: ANN001
+            raise Exception(
+                "[NOT_SUPPORTED_WITH_SERVERLESS] cache rejected"
+            )
+
+        monkeypatch.setattr(_SparkDataFrame, "cache", _reject_cache)
+        df = spark.range(0, 3).toDF("v")
+        pinned = Session._pin_spark_snapshot(df)
+        assert pinned.count() == 3
