@@ -78,10 +78,6 @@ def cast_arrow_struct_array(
     target_type: "StructType" = options.target.dtype
 
     children: list[pa.Array] = []
-    # Track the source-side child resolved for each target position so
-    # the assembly-boundary wrap below can name both ends. ``None`` =
-    # source had no matching field (target_child rebuilt from default).
-    source_children: list["Field | None"] = []
     target_fields = [f.to_arrow_field() for f in target_type.fields]
 
     for i, target_child in enumerate(target_type.children):
@@ -89,7 +85,6 @@ def cast_arrow_struct_array(
         # name-then-alias lookup against the source struct's
         # children.
         source_child = source_type.field(name=target_child.name, index=i, raise_error=False)
-        source_children.append(source_child)
 
         if source_child is None:
             children.append(
@@ -128,37 +123,8 @@ def cast_arrow_struct_array(
                 options=options.copy(source=source_child, target=target_child),
             )
         )
-    # ``pa.StructArray.from_arrays`` validates strict child-type equality
-    # against ``fields``. The per-child cast already targets the exact
-    # arrow type, but a subclass override of ``_cast_arrow_array`` could
-    # still return a non-matching layout — defensive rebind keeps the
-    # struct assembler from raising a bare ArrowInvalid. Atomic
-    # CastError wrap names the specific child whose final-type rebind
-    # failed — the surrounding ``Field.cast_arrow_array`` wrap would
-    # otherwise blame the parent.
-    rebound: list[pa.Array] = []
-    for child, field, target_child, source_child in zip(
-        children, target_fields, target_type.children, source_children,
-    ):
-        if child.type.equals(field.type):
-            rebound.append(child)
-            continue
-        try:
-            rebound.append(
-                pc.cast(
-                    child, target_type=field.type,
-                    safe=options.safe, memory_pool=options.arrow_memory_pool,
-                )
-            )
-        except Exception as exc:
-            raise CastError(
-                str(exc),
-                source=source_child,
-                target=target_child,
-                original=exc,
-            ) from exc
     return pa.StructArray.from_arrays(
-        rebound,
+        children,
         fields=target_fields,
         mask=array.is_null(),
         memory_pool=options.arrow_memory_pool,
