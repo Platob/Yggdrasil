@@ -57,3 +57,33 @@ class TestLocalPathRoundTrip:
         # JSON output is row-oriented.
         assert isinstance(data, list)
         assert len(data) == 2
+
+
+class TestStraddlingObjectFallback:
+    """A single JSON object terminated with ``\\n`` is misclassified as
+    NDJSON by the cheap sniff; if the object exceeds pyarrow's default
+    1 MiB block size the streaming reader raises ``ArrowInvalid:
+    straddling object …``. The reader must fall back to ``json.loads``
+    instead of propagating the error.
+    """
+
+    def test_large_single_object_with_trailing_newline(self) -> None:
+        big = "x" * (2 * 1024 * 1024)
+        payload = json.dumps({"id": 1, "blob": big}).encode("utf-8") + b"\n"
+
+        mem = Memory()
+        mem.write(payload)
+
+        got = JSONFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert got.column("id").to_pylist() == [1]
+        assert got.column("blob").to_pylist() == [big]
+
+    def test_pretty_printed_object_with_trailing_newline(self) -> None:
+        payload = json.dumps({"id": 7, "name": "a"}, indent=2).encode("utf-8") + b"\n"
+
+        mem = Memory()
+        mem.write(payload)
+
+        got = JSONFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert got.column("id").to_pylist() == [7]
+        assert got.column("name").to_pylist() == ["a"]

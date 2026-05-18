@@ -114,38 +114,64 @@ class JSONFile(IO[bytes, JsonOptions]):
             # the standard library JSON parser.
             head = v.read_at(1, 0)
             is_array = head.lstrip().startswith(b"[")
-            if is_array or not v.read_at(1, max(0, size - 1)).endswith(b"\n"):
-                v.seek(0)
-                data = v.read()
-                parsed = json.loads(data.decode(options.encoding))
-                if isinstance(parsed, list):
-                    if parsed:
-                        yield options.cast_arrow_tabular(
-                            pa.RecordBatch.from_pylist(parsed)
-                        )
-                    return
-                if isinstance(parsed, dict):
-                    yield options.cast_arrow_tabular(
-                        pa.RecordBatch.from_pylist([parsed])
-                    )
-                    return
-                raise ValueError(
-                    f"{type(self).__name__}: expected a JSON array of objects "
-                    f"or a single object; got {type(parsed).__name__}."
-                )
+            ends_with_newline = v.read_at(1, max(0, size - 1)).endswith(b"\n")
+            if is_array or not ends_with_newline:
+                yield from self._read_via_json_loads(v, options)
+                return
 
             # Newline-terminated → NDJSON-shaped. Stream via pyarrow.
+            # ``pa_json.open_json`` reads in fixed-size blocks (default
+            # 1 MiB) and raises ``ArrowInvalid: straddling object …``
+            # when a single record exceeds that block — which happens
+            # when a single pretty-printed JSON object/array was
+            # misclassified as NDJSON by the cheap sniff above. Fall
+            # back to the full-buffer ``json.loads`` path in that case.
             v.seek(0)
-            reader = pa_json.open_json(
-                v,
-                read_options=options.to_read_options(),
-                parse_options=options.to_parse_options(),
-            )
+            try:
+                reader = pa_json.open_json(
+                    v,
+                    read_options=options.to_read_options(),
+                    parse_options=options.to_parse_options(),
+                )
+            except pa.ArrowInvalid:
+                yield from self._read_via_json_loads(v, options)
+                return
             try:
                 for batch in reader:
                     yield options.cast_arrow_tabular(batch)
             finally:
                 reader.close()
+
+    def _read_via_json_loads(
+        self,
+        v,
+        options: JsonOptions,
+    ) -> Iterator[pa.RecordBatch]:
+        """Parse the full buffer with :func:`json.loads`.
+
+        Used both for the documented shapes (top-level array, single
+        object) and as a fallback when the streaming NDJSON reader
+        rejects the payload (typically a single pretty-printed JSON
+        object that straddled pyarrow's block boundary).
+        """
+        v.seek(0)
+        data = v.read()
+        parsed = json.loads(data.decode(options.encoding))
+        if isinstance(parsed, list):
+            if parsed:
+                yield options.cast_arrow_tabular(
+                    pa.RecordBatch.from_pylist(parsed)
+                )
+            return
+        if isinstance(parsed, dict):
+            yield options.cast_arrow_tabular(
+                pa.RecordBatch.from_pylist([parsed])
+            )
+            return
+        raise ValueError(
+            f"{type(self).__name__}: expected a JSON array of objects "
+            f"or a single object; got {type(parsed).__name__}."
+        )
 
     # ==================================================================
     # Write path
