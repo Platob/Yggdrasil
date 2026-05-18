@@ -35,7 +35,6 @@ from typing import TYPE_CHECKING, Iterator, Iterable
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from yggdrasil.data.types.base import _arrow_types_compatible
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.exceptions import CastError
 
@@ -79,10 +78,6 @@ def cast_arrow_struct_array(
     target_type: "StructType" = options.target.dtype
 
     children: list[pa.Array] = []
-    # Track the source-side child resolved for each target position so
-    # the assembly-boundary wrap below can name both ends. ``None`` =
-    # source had no matching field (target_child rebuilt from default).
-    source_children: list["Field | None"] = []
     target_fields = [f.to_arrow_field() for f in target_type.fields]
 
     for i, target_child in enumerate(target_type.children):
@@ -90,7 +85,6 @@ def cast_arrow_struct_array(
         # name-then-alias lookup against the source struct's
         # children.
         source_child = source_type.field(name=target_child.name, index=i, raise_error=False)
-        source_children.append(source_child)
 
         if source_child is None:
             children.append(
@@ -129,38 +123,8 @@ def cast_arrow_struct_array(
                 options=options.copy(source=source_child, target=target_child),
             )
         )
-    # ``pa.StructArray.from_arrays`` validates strict child-type equality
-    # against ``fields``. The per-child cast may legitimately return a
-    # view-layout buffer (``string_view`` vs ``string``) because
-    # ``_arrow_types_compatible`` short-circuits the scalar bypass — fine
-    # for top-level consumers, but the struct assembler refuses. Force a
-    # physical cast at the assembly boundary so the resulting struct
-    # honours the target's exact child types. Atomic CastError wrap names
-    # the specific child whose final-type rebind failed — the surrounding
-    # ``Field.cast_arrow_array`` wrap would otherwise blame the parent.
-    rebound: list[pa.Array] = []
-    for child, field, target_child, source_child in zip(
-        children, target_fields, target_type.children, source_children,
-    ):
-        if child.type.equals(field.type):
-            rebound.append(child)
-            continue
-        try:
-            rebound.append(
-                pc.cast(
-                    child, target_type=field.type,
-                    safe=options.safe, memory_pool=options.arrow_memory_pool,
-                )
-            )
-        except Exception as exc:
-            raise CastError(
-                str(exc),
-                source=source_child,
-                target=target_child,
-                original=exc,
-            ) from exc
     return pa.StructArray.from_arrays(
-        rebound,
+        children,
         fields=target_fields,
         mask=array.is_null(),
         memory_pool=options.arrow_memory_pool,
@@ -377,8 +341,8 @@ def cast_arrow_tabular(
         and all(
             data.schema.field(i).name == target_arrow_schema.field(i).name
             and data.schema.field(i).nullable == target_arrow_schema.field(i).nullable
-            and _arrow_types_compatible(
-                data.schema.field(i).type, target_arrow_schema.field(i).type,
+            and data.schema.field(i).type.equals(
+                target_arrow_schema.field(i).type,
             )
             for i in range(len(data.schema))
         )
@@ -413,12 +377,11 @@ def cast_arrow_tabular(
 
     # Atomic CastError at the assembly boundary — when a per-column
     # cast emits an array whose type doesn't match the target schema's
-    # field (a rare engine-rounding gap, e.g. ``string_view`` vs
-    # ``string`` slipping past ``_arrow_types_compatible``), pyarrow's
-    # ``from_arrays`` raises a bare ArrowInvalid that names neither the
-    # offending column nor the source/target field. Pinpoint the first
-    # column whose array type doesn't match so the reader knows which
-    # leaf to look at.
+    # field (a rare subclass-override gap), pyarrow's ``from_arrays``
+    # raises a bare ArrowInvalid that names neither the offending
+    # column nor the source/target field. Pinpoint the first column
+    # whose array type doesn't match so the reader knows which leaf to
+    # look at.
     try:
         if isinstance(data, pa.Table):
             return pa.Table.from_arrays(target_arrays, schema=target_arrow_schema)

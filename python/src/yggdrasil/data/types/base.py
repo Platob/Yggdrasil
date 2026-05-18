@@ -214,98 +214,6 @@ _FLOAT_TYPE_ID_TO_SIZE: dict[DataTypeId, int] = {
 }
 
 
-# ---------------------------------------------------------------------
-# Arrow view <-> flat compatibility.
-#
-# pyarrow ≥ 17 exposes the ``*_view`` layout variants (``string_view``,
-# ``binary_view``, ``list_view``, ``large_list_view``) — they carry the
-# same logical values as their flat counterparts but with a different
-# in-memory representation (per-cell offset+length tuples that can
-# reference shared variadic buffers). At the cast layer they're
-# interchangeable: feeding a ``string_view`` array to a consumer that
-# asked for ``string`` produces the same logical values, and forcing
-# ``pc.cast`` would copy every cell into a fresh flat buffer for no
-# semantic gain. The bypass treats each pair as compatible so the view
-# layout survives the cast.
-_VIEW_FLAT_PAIRS_PROBES: tuple[tuple[str, str], ...] = (
-    ("string_view", "string"),
-    ("binary_view", "binary"),
-    ("list_view", "list"),
-    ("large_list_view", "large_list"),
-)
-
-
-def _types_mod():
-    types_mod = getattr(pa, "types", None)
-    if types_mod is None:  # pragma: no cover — pyarrow ≥ 5 always has it
-        return None
-    return types_mod
-
-
-def _is_view_flat_pair(a: pa.DataType, b: pa.DataType) -> bool:
-    """``True`` when *a* and *b* are the view/flat variants of the same logical type.
-
-    Probes ``pa.types.is_<probe>`` for both directions. Older pyarrow
-    builds that lack a particular ``is_*`` helper degrade gracefully —
-    the pair is reported as not-compatible and the regular cast runs.
-    For list-shaped pairs the element types must also match recursively,
-    otherwise we'd let a ``list_view<int32>`` pass for a ``list<int64>``.
-    """
-    types = _types_mod()
-    if types is None:
-        return False
-    for view_name, flat_name in _VIEW_FLAT_PAIRS_PROBES:
-        is_view = getattr(types, f"is_{view_name}", None)
-        is_flat = getattr(types, f"is_{flat_name}", None)
-        if is_view is None or is_flat is None:
-            continue
-        try:
-            view_first = is_view(a) and is_flat(b)
-            flat_first = is_flat(a) and is_view(b)
-        except Exception:
-            continue
-        if not (view_first or flat_first):
-            continue
-        # Scalar view variants (``string_view`` / ``binary_view``) have
-        # no element type, so the kind match is the whole story. List
-        # variants carry one child each; require the child types match
-        # before declaring the pair interchangeable.
-        if view_name in {"list_view", "large_list_view"}:
-            a_value = getattr(a, "value_type", None)
-            b_value = getattr(b, "value_type", None)
-            if a_value is None or b_value is None:
-                return False
-            return _arrow_types_compatible(a_value, b_value)
-        return True
-    return False
-
-
-def _arrow_types_compatible(source_type: pa.DataType, target_type: pa.DataType) -> bool:
-    """Bypass-equality check for two pyarrow types.
-
-    Returns ``True`` when feeding an array of *source_type* to a
-    consumer that asked for *target_type* would produce the same
-    logical values without any per-cell work. Used by the cast bypass
-    to skip a ``pc.cast`` rebuild that would otherwise just copy
-    buffers around.
-
-    Currently covers:
-
-    * Exact ``pa.DataType.equals`` match — the common case.
-    * View / flat layout pairs (``string_view`` ↔ ``string``,
-      ``binary_view`` ↔ ``binary``, ``list_view<T>`` ↔ ``list<T>``,
-      ``large_list_view<T>`` ↔ ``large_list<T>``).
-
-    Returns ``False`` for everything else; the caller falls through to
-    the regular cast.
-    """
-    if source_type is target_type:
-        return True
-    if source_type.equals(target_type):
-        return True
-    return _is_view_flat_pair(source_type, target_type)
-
-
 #: Per-class singleton cache for default-arg construction. Lives at
 #: module scope (rather than as a ClassVar on :class:`DataType`) so
 #: ``DataType.__new__`` and overriding subclass ``__new__`` methods can
@@ -1792,13 +1700,11 @@ class DataType(BaseChildrenFields, ABC):
         # that lowers to the same pa.DataType — so Field-level
         # ``need_cast`` may flag a difference even when the underlying
         # engine types match. When they do, ``pc.cast`` would be a
-        # no-op rebuild; skip it. The compatibility check also keeps
-        # ``string_view`` / ``binary_view`` sources unmaterialized when
-        # the target is the flat ``string`` / ``binary`` counterpart —
-        # the view layout already carries the same logical values, and
-        # forcing the cast would copy every cell into a fresh offsets
-        # buffer for no semantic gain.
-        if _arrow_types_compatible(array.type, target_type):
+        # no-op rebuild; skip it. The check is strict ``equals`` —
+        # layout-variant sources (``string_view`` vs flat ``string``,
+        # ``list_view<T>`` vs ``list<T>``) fall through to the real cast
+        # so the result honours the target arrow type exactly.
+        if array.type.equals(target_type):
             return array
         if not options.need_cast(array, self):
             return array
@@ -1868,7 +1774,7 @@ class DataType(BaseChildrenFields, ABC):
         # rationale. ``ChunkedArray.type`` is uniform across chunks, so
         # a single comparison covers the whole stream.
         target_type = self.to_arrow()
-        if _arrow_types_compatible(array.type, target_type):
+        if array.type.equals(target_type):
             return array
         if not options.need_cast(array, self):
             return array

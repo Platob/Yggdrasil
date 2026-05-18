@@ -326,11 +326,12 @@ class TestEngineTypeBypassArrow(ArrowTestCase):
         self.assertIs(out, table)
 
 
-class TestArrowViewFlatBypass(ArrowTestCase):
+class TestArrowViewFlatStrictCast(ArrowTestCase):
     """Arrow view layouts (``string_view`` / ``binary_view`` / list views)
-    carry the same logical values as their flat counterparts. A cast
-    that would force the view into the flat layout is buffer-churn for
-    no semantic gain — the bypass keeps the view intact."""
+    are *not* treated as interchangeable with their flat counterparts at
+    the cast layer: when the target asks for the flat type, the cast
+    must materialize a flat-layout array so the result type strictly
+    equals the target arrow type."""
 
     def _string_view_array(self, values):
         pa = self.pa
@@ -342,17 +343,17 @@ class TestArrowViewFlatBypass(ArrowTestCase):
         except (TypeError, pa.ArrowNotImplementedError):
             return pa.array(values, type=pa.string()).cast(pa.string_view())
 
-    def test_string_view_target_string_returns_input(self) -> None:
+    def test_string_view_target_string_casts_to_flat(self) -> None:
         if not hasattr(self.pa, "string_view"):
             self.skipTest("pyarrow build has no string_view")
         arr = self._string_view_array(["a", "b", "c"])
 
         out = StringType().cast_arrow_array(arr)
 
-        self.assertIs(out, arr)
-        self.assertEqual(out.type, self.pa.string_view())
+        self.assertEqual(out.type, self.pa.string())
+        self.assertEqual(out.to_pylist(), ["a", "b", "c"])
 
-    def test_string_view_chunked_target_string_returns_input(self) -> None:
+    def test_string_view_chunked_target_string_casts_to_flat(self) -> None:
         if not hasattr(self.pa, "string_view"):
             self.skipTest("pyarrow build has no string_view")
         pa = self.pa
@@ -362,10 +363,10 @@ class TestArrowViewFlatBypass(ArrowTestCase):
 
         out = StringType().cast_arrow_array(arr)
 
-        self.assertIs(out, arr)
-        self.assertEqual(out.type, pa.string_view())
+        self.assertEqual(out.type, pa.string())
+        self.assertEqual(out.to_pylist(), ["a", "b", "c"])
 
-    def test_table_with_string_view_column_passes_through(self) -> None:
+    def test_table_with_string_view_column_casts_to_flat(self) -> None:
         if not hasattr(self.pa, "string_view"):
             self.skipTest("pyarrow build has no string_view")
         from yggdrasil.data.options import CastOptions
@@ -375,8 +376,9 @@ class TestArrowViewFlatBypass(ArrowTestCase):
         table = pa.table({"a": self._string_view_array(["x", "y"])})
 
         # Target uses the flat ``string`` type; source carries the
-        # ``string_view`` layout. Engine-level bypass should still
-        # return the table unchanged (view layout preserved).
+        # ``string_view`` layout. With the view bypass removed the cast
+        # must materialize the flat layout so the resulting schema
+        # strictly matches the target arrow type.
         flat_schema = pa.schema([pa.field("a", pa.string(), nullable=True)])
         target_field = Schema.from_arrow(flat_schema).to_field()
         opts = CastOptions(target=target_field).check_source(
@@ -385,8 +387,8 @@ class TestArrowViewFlatBypass(ArrowTestCase):
 
         out = opts.cast_arrow_tabular(table)
 
-        self.assertIs(out, table)
-        self.assertEqual(out.schema.field("a").type, pa.string_view())
+        self.assertEqual(out.schema.field("a").type, pa.string())
+        self.assertEqual(out.column("a").to_pylist(), ["x", "y"])
 
 
 class TestEngineTypeBypassPolars(PolarsTestCase):
