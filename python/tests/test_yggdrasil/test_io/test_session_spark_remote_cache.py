@@ -238,6 +238,54 @@ class TestSparkPersistRemote:
         assert tab.inserts[0]["mode"] == Mode.APPEND
         assert tab.inserts[0]["url_hashes"] == [req_append.public_url_hash]
 
+    def test_serverless_persist_rejection_does_not_crash(
+        self, spark, scratch, monkeypatch,
+    ) -> None:
+        # Databricks Connect serverless raises
+        # ``[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE ...`` when a
+        # caller invokes ``DataFrame.persist`` against the unsupported
+        # plan node. Stage 4 routes through
+        # :class:`yggdrasil.io.tabular.spark.Dataset`, whose ``persist``
+        # swallows the exception and continues with the un-cached
+        # frame — both inserts must still land.
+        tab_a = _SparkAwareFakeTabular("cache_a")
+        tab_b = _SparkAwareFakeTabular("cache_b")
+        cfg_a = _remote_cfg(tab_a)
+        cfg_b = _remote_cfg(tab_b)
+
+        req_a = make_request("https://example.com/a")
+        req_b = make_request("https://example.com/b")
+        df = _responses_to_spark(spark, scratch, [
+            make_response(request=req_a, body=b'{"k":"a"}'),
+            make_response(request=req_b, body=b'{"k":"b"}'),
+        ])
+
+        from pyspark.sql import DataFrame as _SparkDataFrame
+
+        def _reject_persist(self, *_a, **_kw):
+            raise Exception(
+                "[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE is not "
+                "supported on serverless compute. SQLSTATE: 0A000"
+            )
+
+        monkeypatch.setattr(_SparkDataFrame, "persist", _reject_persist)
+
+        key_to_remote_cfg = {
+            req_a.public_url_hash: cfg_a,
+            req_b.public_url_hash: cfg_b,
+        }
+        s = StubSession()
+        # Must not raise — the Dataset wrapper logs and falls through
+        # to the un-cached frame, both groups still get their insert.
+        s._spark_persist_remote(
+            df, key_to_remote_cfg, cfg_a, spark=spark,
+        )
+
+        assert len(tab_a.inserts) == 1
+        assert len(tab_b.inserts) == 1
+        assert tab_a.inserts[0]["url_hashes"] == [req_a.public_url_hash]
+        assert tab_b.inserts[0]["url_hashes"] == [req_b.public_url_hash]
+
     def test_failed_responses_filtered_out(self, spark, scratch) -> None:
         tab = _SparkAwareFakeTabular("cache_t")
         cfg = _remote_cfg(tab)

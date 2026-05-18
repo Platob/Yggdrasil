@@ -2332,10 +2332,20 @@ class Session(Singleton, ABC):
 
         # Persist only when more than one group will read ``ok_df`` —
         # otherwise the single insert action is the one and only
-        # evaluation and we save the storage round trip.
+        # evaluation and we save the storage round trip. Route the
+        # cache through :class:`yggdrasil.io.tabular.spark.Dataset`
+        # so backends that reject ``persist`` (Databricks Connect
+        # serverless raises ``[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST
+        # TABLE``) fall through to the un-cached frame instead of
+        # crashing stage 4 — pass two then runs twice, but the
+        # alternative is a hard failure on serverless compute.
         multi_group = len(groups) > 1
+        ok_dataset: "Dataset | None" = None
         if multi_group:
-            ok_df = ok_df.persist()
+            from yggdrasil.io.tabular.spark import Dataset
+
+            ok_dataset = Dataset(frame=ok_df).persist()
+            ok_df = ok_dataset.frame
 
         # When every key in the chunk's cfg map collapses onto one
         # group, the inserted frame IS the whole ``ok_df``. With any
@@ -2411,8 +2421,8 @@ class Session(Singleton, ABC):
                 thread_name_prefix="ygg-spark-remote-cache-insert",
             )
         finally:
-            if multi_group:
-                ok_df.unpersist()
+            if ok_dataset is not None:
+                ok_dataset.unpersist()
 
     def _spark_fetch_misses(
         self,
