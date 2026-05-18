@@ -1402,6 +1402,35 @@ class Session(Singleton, ABC):
         )
         return spark.createDataFrame(table)
 
+    @staticmethod
+    def _flatten_remote_hits(
+        remote_hits_by_table: (
+            "dict[str, list[Response]] | dict[str, SparkDataFrame]"
+        ),
+    ) -> "list[Response] | SparkDataFrame | None":
+        """Collapse a per-table remote-hits dict into one bucket.
+
+        Empty dict → ``None``. Python lists chain into a single list
+        (or ``None`` when every list is empty). Spark frames union via
+        ``unionByName(allowMissingColumns=True)`` so the response
+        schema is enforced across tables; a missing column would mean
+        a real schema drift, and silent column-fill is worse than a
+        loud failure.
+        """
+        if not remote_hits_by_table:
+            return None
+        values = list(remote_hits_by_table.values())
+        first = values[0]
+        if isinstance(first, list):
+            flat: list[Response] = [
+                r for v in remote_hits_by_table.values() for r in v  # type: ignore[union-attr]
+            ]
+            return flat or None
+        result = first
+        for part in values[1:]:
+            result = result.unionByName(part, allowMissingColumns=True)
+        return result
+
     def _split_remote_cache_spark(
         self,
         requests: list[PreparedRequest],
@@ -1517,13 +1546,16 @@ class Session(Singleton, ABC):
             # No request-key columns means the SQL can't disambiguate
             # rows per request; mirror the Python path's behaviour by
             # treating every input request as a hit when any row came
-            # back, otherwise everything is a miss.
+            # back, otherwise everything is a miss. Pin the snapshot
+            # (see the keyed branch below for the rationale) so the
+            # caller's later ``.count()`` doesn't re-read the cache
+            # table after stage 4 inserted the freshly-fetched misses.
             try:
                 any_row = hits_df.head(1)
             except Exception:
                 any_row = None
             if any_row:
-                return hits_df, []
+                return self._pin_spark_snapshot(hits_df), []
             return None, list(requests)
 
         # Request-side ``request_by`` keys (``public_url_hash``,
@@ -1542,7 +1574,44 @@ class Session(Singleton, ABC):
         for req, lookup in zip(requests, lookup_batch):
             if cfg.request_tuple(lookup) not in matched:
                 misses.append(req)
-        return hits_df, misses
+        if not matched:
+            # Cold-cache short-circuit: returning a still-bound
+            # SparkDataFrame for the empty match would let any later
+            # action — e.g. :attr:`ResponseBatch.counts` — re-execute
+            # the SELECT after stage 4 has inserted ``misses`` into the
+            # same cache table, double-counting those rows as remote
+            # hits. The bucket really is empty; let the consumer drop it.
+            return None, misses
+        # Pin the matched-row snapshot. The lazy ``hits_df`` reads the
+        # cache table, which stage 4 mutates in place — without an
+        # eagerly-materialised cache snapshot a later ``.count()`` would
+        # re-issue the SELECT and pick up the freshly-inserted miss rows.
+        return self._pin_spark_snapshot(hits_df), misses
+
+    @staticmethod
+    def _pin_spark_snapshot(df: "SparkDataFrame") -> "SparkDataFrame":
+        """Cache ``df`` and force one action so the snapshot is stable.
+
+        Spark's ``DataFrame.cache`` is lazy — the partitions only
+        materialise on the first action against the frame. When the
+        downstream caller's first action runs after a sibling write to
+        the same source table, the cached snapshot ends up containing
+        rows that landed *after* the logical read. Forcing a single
+        ``.count()`` here pins the partitions to the pre-mutation state.
+        ``.cache`` itself can fail on Spark Connect logical plans the
+        backend won't materialise — log and return the original frame
+        so a best-effort pin doesn't crash the caller.
+        """
+        try:
+            df = df.cache()
+            df.count()
+        except Exception:  # noqa: BLE001
+            LOGGER.warning(
+                "Failed to pin Spark snapshot for %r; downstream counts "
+                "may re-execute the plan",
+                df, exc_info=True,
+            )
+        return df
 
     def _fetch_misses(
         self,
@@ -2198,30 +2267,31 @@ class Session(Singleton, ABC):
             local_hits_by_path, after_local = self._split_local_cache(
                 chunk, session_local_cfg, key_to_local_cfg=key_to_local_cfg,
             )
-            # On the spark path, lift each path's responses to its own
-            # Spark frame so every bucket downstream is frame-resident
-            # — matches stage 2/3 and lets the caller union holders
-            # without a per-bucket type switch. Empty dict (no local
-            # hits) is left as-is; ResponseBatch installs a
-            # schema-bearing default placeholder, Spark or Arrow as
-            # appropriate.
-            local_hits: "dict[str, list[Response]] | dict[str, SparkDataFrame]"
-            if is_spark:
-                local_hits = {
-                    pkey: self._responses_to_spark(rs, spark)
-                    for pkey, rs in local_hits_by_path.items()
-                }
+            # Flatten across cache-folder paths into a single bucket
+            # for :class:`ResponseBatch`. On the spark path, lift the
+            # flat list to a Spark frame once so every bucket
+            # downstream is frame-resident — matches stage 2/3 and
+            # lets the caller union holders without a per-bucket type
+            # switch. ``local_hits_by_path`` stays a per-path dict
+            # internally because :meth:`_mirror_local_hits_to_remote`
+            # walks it before stage 3.
+            local_flat: list[Response] = [
+                r for hits in local_hits_by_path.values() for r in hits
+            ]
+            local_hits: "list[Response] | SparkDataFrame | None"
+            if not local_flat:
+                local_hits = None
+            elif is_spark:
+                local_hits = self._responses_to_spark(local_flat, spark)
             else:
-                local_hits = local_hits_by_path
-            # Remote hits are split per cache table — keyed by
-            # ``CacheConfig.table.full_name(safe=True)`` — so the
-            # downstream :class:`ResponseBatch` preserves which table
-            # answered which subset. An empty dict tells
-            # ``ResponseBatch`` to install a schema-bearing default.
-            remote_hits: "dict[str, list[Response]] | dict[str, SparkDataFrame]" = {}
-            # Default new_hits to None so ResponseBatch coerces it to a
-            # schema-bearing empty holder (Spark or Arrow depending on
-            # mode) — no special-case for "stage skipped".
+                local_hits = local_flat
+            # Remote hits: dict keyed by ``CacheConfig.table.full_name``
+            # internally so :meth:`_backfill_local_cache` knows which
+            # rows came from which table; collapsed into one bucket at
+            # the :class:`ResponseBatch` boundary.
+            remote_hits_by_table: (
+                "dict[str, list[Response]] | dict[str, SparkDataFrame]"
+            ) = {}
             new_hits: "list[Response] | SparkDataFrame | None" = None
 
             if not after_local:
@@ -2235,7 +2305,7 @@ class Session(Singleton, ABC):
                         key_to_remote_cfg,
                         session_remote_cfg,
                     )
-                local_count = sum(len(v) for v in local_hits_by_path.values())
+                local_count = len(local_flat)
                 total_local += local_count
                 LOGGER.debug(
                     "Completed send_many chunk #%d (requests=%d, "
@@ -2245,7 +2315,7 @@ class Session(Singleton, ABC):
                 )
                 yield ResponseBatch(
                     local_hits=local_hits,
-                    remote_hits=remote_hits,
+                    remote_hits=None,
                     new_hits=new_hits,
                     spark=spark,
                 )
@@ -2258,7 +2328,7 @@ class Session(Singleton, ABC):
             # never collects to the driver and downstream callers can
             # union it with stage 3's Spark output.
             if is_spark:
-                remote_hits, after_remote = self._split_remote_cache_spark(
+                remote_hits_by_table, after_remote = self._split_remote_cache_spark(
                     after_local,
                     session_remote_cfg,
                     spark=spark,
@@ -2270,7 +2340,7 @@ class Session(Singleton, ABC):
                 # frame-resident. Drivers that want a hot local cache
                 # should use the Python path explicitly.
             else:
-                remote_hits, after_remote = self._split_remote_cache(
+                remote_hits_by_table, after_remote = self._split_remote_cache(
                     after_local,
                     session_remote_cfg,
                     spark_session=spark,
@@ -2282,7 +2352,11 @@ class Session(Singleton, ABC):
                 # doesn't care which remote table sourced a row, only
                 # the response-to-request mapping by URL.
                 self._backfill_local_cache(
-                    [r for table_hits in remote_hits.values() for r in table_hits],
+                    [
+                        r
+                        for table_hits in remote_hits_by_table.values()
+                        for r in table_hits
+                    ],
                     key_to_local_cfg,
                     session_local_cfg,
                 )
@@ -2298,13 +2372,18 @@ class Session(Singleton, ABC):
                     session_remote_cfg,
                 )
 
+            # Collapse the per-table remote split into one bucket for
+            # :class:`ResponseBatch`. Python lists chain; Spark frames
+            # union via ``unionByName(allowMissingColumns=True)``.
+            remote_hits = self._flatten_remote_hits(remote_hits_by_table)
+
             if not after_remote:
-                local_count = sum(len(v) for v in local_hits_by_path.values())
+                local_count = len(local_flat)
                 if is_spark:
                     remote_count = -1  # Spark frame — count not materialised
                 else:
                     remote_count = sum(
-                        len(v) for v in remote_hits.values()  # type: ignore[union-attr]
+                        len(v) for v in remote_hits_by_table.values()  # type: ignore[union-attr]
                     )
                     total_remote += remote_count
                 total_local += local_count
@@ -2394,14 +2473,14 @@ class Session(Singleton, ABC):
                     stage4, thread_name_prefix="ygg-stage4",
                 )
 
-            local_count = sum(len(v) for v in local_hits_by_path.values())
+            local_count = len(local_flat)
             total_local += local_count
             if is_spark:
                 remote_count_log: "int | str" = "<spark>"
                 network_count_log: "int | str" = "<spark>"
             else:
                 remote_count = sum(
-                    len(v) for v in remote_hits.values()  # type: ignore[union-attr]
+                    len(v) for v in remote_hits_by_table.values()  # type: ignore[union-attr]
                 )
                 total_remote += remote_count
                 remote_count_log = remote_count
@@ -2697,7 +2776,25 @@ class Session(Singleton, ABC):
                     byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
                 )
 
-        return request_df.mapInArrow(_send_partition, schema=response_spark_schema)
+        result_df = request_df.mapInArrow(
+            _send_partition, schema=response_spark_schema,
+        )
+        # Cache so stage 4's insert (the first action on this frame)
+        # both materialises and caches it. Without the cache, every
+        # later action — including :attr:`ResponseBatch.counts` — would
+        # re-execute the ``mapInArrow``, re-issuing per-partition
+        # network calls AND letting workers' ``send_many`` short-circuit
+        # on the very rows stage 4 has just persisted to the remote
+        # cache table (double-counting them as fresh hits).
+        try:
+            result_df = result_df.cache()
+        except Exception:  # noqa: BLE001
+            LOGGER.warning(
+                "Failed to cache stage-3 mapInArrow result; downstream "
+                "counts may re-execute the per-partition fetch",
+                exc_info=True,
+            )
+        return result_df
     
     def get(
         self,
