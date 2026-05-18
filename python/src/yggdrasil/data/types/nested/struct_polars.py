@@ -215,7 +215,7 @@ def cast_polars_tabular(
         return data
 
     source_schema = options.source
-    target_schema = options.merged.to_struct()
+    target_schema = options.target.to_struct()
 
     # Engine-level fast bypass — when the source polars schema already
     # equals the target engine schema, the per-column rebuild produces

@@ -637,6 +637,11 @@ def cast_arrow_list_array(
 
     if source_arrow_type.value_type == target_arrow_type.value_type:
         target_values = src_values
+    elif len(src_values) == 0:
+        # Empty child — skip the per-item cast (which would fail on
+        # shapes the registry can't bridge, e.g. struct -> string) and
+        # synthesize an empty values array of the target type directly.
+        target_values = pa.array([], type=target_arrow_type.value_type)
     else:
         target_values = target_type.item_field.cast_arrow_array(
             src_values,
