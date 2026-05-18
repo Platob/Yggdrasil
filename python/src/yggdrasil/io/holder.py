@@ -122,6 +122,78 @@ def _resolve_pos(pos: int, size: int) -> int:
     return pos
 
 
+def _resolve_in_memory_tabular(data: Any) -> "type | None":
+    """Return the concrete in-memory :class:`Tabular` for *data*, or ``None``.
+
+    The byte-backed registry on :class:`IO` doesn't know how to wrap
+    pure-data shapes (a :class:`pa.Table`, a Spark DataFrame, a
+    polars / pandas frame, a ``list[dict]`` / ``dict[str, list]``):
+    they're already materialised, never went through a wire format,
+    and don't have a URL. This helper is what :meth:`IO.__new__`
+    consults before falling through to the scheme/format dispatch so
+    those shapes land on the right in-memory holder:
+
+    - :class:`pyarrow.Table` / :class:`pa.RecordBatch` /
+      :class:`pa.RecordBatchReader` → :class:`ArrowTabular`.
+    - Spark :class:`pyspark.sql.DataFrame` → :class:`SparkTabular`
+      (kept lazy on the executors — no driver collect).
+    - polars / pandas frame → :class:`ArrowTabular` (Arrow is the
+      narrow waist; the holder's ``_ingest`` knows the conversion).
+    - ``list[dict]`` rows / ``dict[str, list]`` columns →
+      :class:`ArrowTabular`.
+
+    Returns ``None`` when *data* isn't a shape we recognise — the
+    caller should fall through to its existing dispatch (a
+    :class:`Memory` byte-holder, a path-backed storage leaf, etc.).
+    Module-name sniffing keeps polars / pandas / pyspark out of the
+    import graph until we've already confirmed an instance from one
+    of those modules.
+    """
+    if data is None:
+        return None
+
+    # PyArrow shapes that :meth:`ArrowTabular._ingest` already handles
+    # directly. The two non-Table shapes (RecordBatch /
+    # RecordBatchReader) are intentional: callers building a stream
+    # with ``pa.ipc.open_stream`` and handing the reader to
+    # :class:`IO` get back an in-memory holder rather than a TypeError.
+    if isinstance(data, (pa.Table, pa.RecordBatch, pa.RecordBatchReader)):
+        from yggdrasil.io.tabular.arrow import ArrowTabular
+        return ArrowTabular
+
+    mod = (type(data).__module__ or "").split(".", 1)[0]
+
+    if mod == "pyspark":
+        # Spark DataFrame → keep lazy. Other pyspark types (Column,
+        # GroupedData, Window …) aren't tabular sources we know how
+        # to wrap; route DataFrames only.
+        if "DataFrame" in type(data).__name__:
+            from yggdrasil.io.tabular.spark import SparkTabular
+            return SparkTabular
+        return None
+
+    if mod in ("polars", "pandas"):
+        from yggdrasil.io.tabular.arrow import ArrowTabular
+        return ArrowTabular
+
+    # Pure-Python row-list / column-dict shapes. Match the same
+    # guards :meth:`ArrowTabular._ingest` uses so the dispatch and
+    # the ingest agree on what "I can handle this" means.
+    if isinstance(data, list) and data and all(
+        isinstance(r, dict) for r in data
+    ):
+        from yggdrasil.io.tabular.arrow import ArrowTabular
+        return ArrowTabular
+    if (
+        isinstance(data, dict) and data
+        and all(isinstance(v, (list, tuple)) for v in data.values())
+    ):
+        from yggdrasil.io.tabular.arrow import ArrowTabular
+        return ArrowTabular
+
+    return None
+
+
 def _resolve_subclass(
     *,
     scheme: str | None = None,
@@ -551,6 +623,35 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             )
 
         if cls is IO and holder is None:
+            # In-memory tabular dispatch — when *data* is already a
+            # materialised tabular shape (a :class:`pa.Table`, a Spark
+            # / polars / pandas frame, a ``list[dict]`` /
+            # ``dict[str, list]``, or an existing :class:`Tabular`),
+            # route to the right in-memory holder rather than forcing
+            # the input through the byte-backed scheme / format
+            # registries. Those registries dispatch on URLs and media
+            # types; a pure-data payload has neither.
+            #
+            # - Already a :class:`Tabular` (and not an :class:`IO`,
+            #   which keeps its existing cursor-over-IO semantics
+            #   below): return as-is. The caller already has the
+            #   holder they want; re-wrapping would lose state.
+            # - Otherwise consult :func:`_resolve_in_memory_tabular`
+            #   for the concrete holder class
+            #   (:class:`ArrowTabular` for arrow / polars / pandas /
+            #   row-list / column-dict shapes, :class:`SparkTabular`
+            #   for spark — kept lazy on the executors).
+            if isinstance(data, Tabular) and not isinstance(data, IO):
+                return data
+            in_memory_target = _resolve_in_memory_tabular(data)
+            if in_memory_target is not None:
+                # ArrowTabular / SparkTabular aren't subclasses of
+                # :class:`IO`, so ``isinstance(returned, cls)`` is
+                # False at the top of ``type.__call__`` — Python
+                # skips the post-``__new__`` ``IO.__init__`` re-entry
+                # automatically. No idempotency flag dance.
+                return in_memory_target(data, **kwargs)
+
             # Storage construction — pick the concrete storage subclass
             # for the given seed (scheme → URL registry, binary →
             # Memory, path → LocalPath / remote, …). When a parent

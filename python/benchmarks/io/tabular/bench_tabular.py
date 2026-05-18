@@ -149,14 +149,39 @@ def _ingest_scenarios(rows: int, repeat: int) -> list[dict]:
     rows_pylist = table.to_pylist()  # endpoint-only — diagnostic fixture
     pydict = {name: col.to_pylist() for name, col in zip(table.column_names, table.columns)}
 
+    # Fresh RecordBatchReader per call — readers consume on iteration.
+    def _make_reader() -> pa.RecordBatchReader:
+        return pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+
+    # Sibling source so the multi-input shape has two distinct tables
+    # to concat (matches the typical "drain N statement results into
+    # one holder" pattern).
+    sibling = _arrow_table(rows)
+    seed_io = ArrowTabular(table)  # reused as a Tabular source
+
     out.append(_time_one(
         f"ingest: ArrowTabular(table) rows={rows}",
         lambda: ArrowTabular(table),
         repeat=repeat, inner=2_000,
     ))
     out.append(_time_one(
+        f"ingest: ArrowTabular(table, table, table) rows={rows}",
+        lambda: ArrowTabular(table, sibling, table),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
         f"ingest: ArrowTabular(list[RecordBatch]) rows={rows}",
         lambda: ArrowTabular(batches),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        f"ingest: ArrowTabular(RecordBatchReader) rows={rows}",
+        lambda: ArrowTabular(_make_reader()),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        f"ingest: ArrowTabular(ArrowTabular) rows={rows}",
+        lambda: ArrowTabular(seed_io),
         repeat=repeat, inner=2_000,
     ))
     out.append(_time_one(
@@ -228,6 +253,21 @@ def _read_scenarios(rows: int, repeat: int) -> list[dict]:
         "read: collect_schema()",
         lambda: io_match.collect_schema(),
         repeat=repeat, inner=20_000,
+    ))
+
+    # Spilled-state read: holder backed by an mmap'd Arrow IPC file
+    # (the path the ArrowIPCFile spill writer produces). Confirms the
+    # zero-copy read-back path doesn't pay an extra concat / cast hop.
+    io_spilled = ArrowTabular(match_table, spill_bytes=1)
+    out.append(_time_one(
+        f"read: read_arrow_table spilled no-target rows={rows}",
+        lambda: io_spilled.read_arrow_table(opts_none),
+        repeat=repeat, inner=500,
+    ))
+    out.append(_time_one(
+        f"read: read_arrow_table spilled MATCH rows={rows}",
+        lambda: io_spilled.read_arrow_table(opts_match),
+        repeat=repeat, inner=500,
     ))
     return out
 
