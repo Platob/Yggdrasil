@@ -123,12 +123,38 @@ def cast_arrow_struct_array(
                 options=options.copy(source=source_child, target=target_child),
             )
         )
-    return pa.StructArray.from_arrays(
-        children,
-        fields=target_fields,
-        mask=array.is_null(),
-        memory_pool=options.arrow_memory_pool,
-    )
+    # ``pa.StructArray.from_arrays`` raises a bare ArrowInvalid when a
+    # child's type doesn't equal the declared field type. Wrap the
+    # assembler so the failing leaf surfaces with its source / target
+    # fields named — same shape as the tabular variant below.
+    try:
+        return pa.StructArray.from_arrays(
+            children,
+            fields=target_fields,
+            mask=array.is_null(),
+            memory_pool=options.arrow_memory_pool,
+        )
+    except CastError:
+        raise
+    except Exception as exc:
+        for child, target_arrow_field, target_child in zip(
+            children, target_fields, target_type.children,
+        ):
+            if child.type.equals(target_arrow_field.type):
+                continue
+            raise CastError(
+                f"cast_arrow_struct_array: child {target_child.name!r} "
+                f"produced arrow type {child.type!r}, which pyarrow could "
+                f"not coerce to the declared field type "
+                f"{target_arrow_field.type!r}. The per-child cast did not "
+                f"emit the target type.",
+                source=source_type.field(
+                    name=target_child.name, raise_error=False,
+                ),
+                target=target_child,
+                original=exc,
+            ) from exc
+        raise
 
 
 def cast_arrow_map_array(
@@ -350,6 +376,7 @@ def cast_arrow_tabular(
         return data
 
     target_arrays: list[pa.Array] = []
+    target_sources: list["Field | None"] = []
     num_rows = data.num_rows
 
     for i, target_field in enumerate(target_schema.children):
@@ -374,10 +401,48 @@ def cast_arrow_tabular(
             )
 
         target_arrays.append(casted)
+        target_sources.append(source_field)
 
-    if isinstance(data, pa.Table):
-        return pa.Table.from_arrays(target_arrays, schema=target_arrow_schema)
-    return pa.RecordBatch.from_arrays(target_arrays, schema=target_arrow_schema)
+    # ``pa.Table.from_arrays(schema=...)`` silently coerces a column
+    # whose type doesn't exactly equal the declared schema field — handy
+    # for benign mismatches like ``string`` vs ``large_string``, but
+    # when the per-column cast leaks a structurally-wrong array (e.g.
+    # a ``list<string>`` where the target is ``list<struct<…>>``)
+    # pyarrow raises a bare ``ArrowNotImplementedError: Unsupported
+    # cast from <inner> to <inner>`` with no column name. Wrap the
+    # assembler so the failing column surfaces with its source /
+    # target fields named.
+    try:
+        if isinstance(data, pa.Table):
+            return pa.Table.from_arrays(target_arrays, schema=target_arrow_schema)
+        return pa.RecordBatch.from_arrays(target_arrays, schema=target_arrow_schema)
+    except CastError:
+        raise
+    except Exception as exc:
+        for casted, target_child, source_child in zip(
+            target_arrays, target_schema.children, target_sources,
+        ):
+            expected_arrow_type = target_arrow_schema.field(target_child.name).type
+            if casted.type.equals(expected_arrow_type):
+                continue
+            raise CastError(
+                f"cast_arrow_tabular: column {target_child.name!r} produced "
+                f"arrow type {casted.type!r}, which pyarrow could not coerce "
+                f"to the declared schema type {expected_arrow_type!r}. The "
+                f"per-column cast did not emit the target type — usually "
+                f"means the source column shape doesn't match what the cast "
+                f"dispatcher expected (e.g. polars Object / Null inference "
+                f"diverged from the declared target, or a JSON-string column "
+                f"never reached the JSON decoder).",
+                source=source_child,
+                target=target_child,
+                original=exc,
+            ) from exc
+        # Every column type matched; the failure is somewhere else in
+        # the assembler (row count mismatch, schema-level constraint).
+        # Re-raise with the original schema so the caller still sees
+        # the underlying pyarrow message.
+        raise
 
 
 # ---------------------------------------------------------------------------
