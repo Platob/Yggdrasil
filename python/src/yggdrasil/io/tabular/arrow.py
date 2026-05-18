@@ -7,20 +7,31 @@ append, IGNORE → no-op when non-empty). Use this when you want a
 :class:`Tabular` over Arrow data you already have on the driver
 and don't want the IPC serialization round-trip.
 
-Auto-spill to local Arrow IPC
------------------------------
+Auto-spill via :class:`ArrowIPCFile`
+------------------------------------
 
 Same shape as :class:`yggdrasil.io.buffer.bytes_io.BytesIO`: when the
 in-memory footprint crosses ``spill_bytes`` (default 128 MiB), the
 holder consolidates everything (any previously-spilled table plus
-the in-memory tail) into a fresh Arrow IPC *file* under
-``tempfile.gettempdir()`` (file-format chosen for random access /
-``read_all`` semantics) and re-attaches the result via
-:func:`pyarrow.memory_map` — so reads after the spill are
-zero-copy from the OS page cache. The spill file uses the same
+the in-memory tail) and writes it through an
+:class:`yggdrasil.io.primitive.arrow_ipc_file.ArrowIPCFile` bound to
+a fresh :class:`yggdrasil.io.path.local_path.LocalPath` under
+``tempfile.gettempdir()``. Going through the format leaf means the
+spill picks up the unified IPC write options (legacy-format flag,
+compression knob) and the same OSFile streaming the bench-tested
+``ArrowIPCFile`` write path already uses. The result is then
+re-attached via :func:`pyarrow.memory_map` so reads after the
+spill are zero-copy from the OS page cache. The spill file uses the
 ``tmp-{start}-{end}-{seed}.arrow`` naming and TTL convention
 :func:`yggdrasil.io.buffer._concurrency.cleanup_stale_spill_files`
 expects, and is unlinked on :meth:`_release` when we own it.
+
+Spill compression defaults to ``None``: the spill is throwaway
+local cache, so the codec overhead would hurt re-read latency
+without buying anything we'd keep. Override per-instance via
+``spill_compression=`` (passed straight through to
+:class:`ArrowIPCOptions`) when on-disk size matters more than
+read-back speed.
 
 Flip the spill threshold off with ``spill_bytes=0`` (or ``None``).
 Pass an explicit ``spill_path=`` to use a caller-owned location
@@ -33,7 +44,9 @@ What we ingest
 :meth:`_ingest` accepts the shapes a real caller actually has on
 hand without forcing a manual conversion to Arrow:
 
-- :class:`pyarrow.Table` / :class:`pyarrow.RecordBatch`
+- :class:`pyarrow.Table` / :class:`pyarrow.RecordBatch` /
+  :class:`pyarrow.RecordBatchReader` / :class:`pyarrow.ChunkedArray`
+- another :class:`Tabular` (drained as an Arrow batch stream)
 - polars :class:`DataFrame` / :class:`LazyFrame` (LazyFrame
   collects on ingest — the holder is in-memory by design)
 - pandas :class:`DataFrame`
@@ -41,6 +54,8 @@ hand without forcing a manual conversion to Arrow:
   Spark 4+, ``toPandas`` otherwise)
 - ``list[dict]`` rows / ``dict[str, list]`` columns
 - any iterable yielding the above
+- multiple positional sources: ``ArrowTabular(t1, t2, t3)`` is
+  equivalent to ingesting each in order.
 
 That keeps the most common conversion glue on this side of the
 API instead of every caller writing the same five-line ``isinstance``
@@ -58,6 +73,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.tabular import Tabular
 from yggdrasil.data.enums import MimeType, Mode
+from yggdrasil.pickle.serde import ObjectSerde
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +89,8 @@ __all__ = ["ArrowTabular"]
 ArrowSource = Union[
     pa.RecordBatch,
     pa.Table,
+    pa.RecordBatchReader,
+    "Tabular",
     Iterable[Union[pa.RecordBatch, pa.Table]],
     Any,
     None,
@@ -85,6 +103,36 @@ ArrowSource = Union[
 # ``ArrowTabular.spill_bytes = N``.
 _DEFAULT_SPILL_BYTES = 128 * 1024 * 1024
 _DEFAULT_SPILL_TTL = 86400
+
+
+def _write_spill_ipc_file(
+    path: str, table: pa.Table, compression: "str | None",
+) -> None:
+    """Write *table* to *path* via :class:`ArrowIPCFile` over a local file.
+
+    Routes through the format leaf so the spill picks up the unified
+    IPC write path (OSFile streaming on local holders, the codec /
+    legacy-format options, the per-write metadata commit) instead of
+    re-implementing the same :func:`pa.ipc.new_file` sequence inline.
+    """
+    from yggdrasil.io.path.local_path import LocalPath
+    from yggdrasil.io.primitive.arrow_ipc_file import (
+        ArrowIPCFile,
+        ArrowIPCOptions,
+    )
+
+    holder = LocalPath(path)
+    sink = ArrowIPCFile(holder=holder, owns_holder=True)
+    try:
+        sink.write_arrow_table(
+            table,
+            ArrowIPCOptions(mode=Mode.OVERWRITE, compression=compression),
+        )
+    finally:
+        try:
+            sink.close()
+        except Exception:
+            pass
 
 
 def _deep_copy_table(table: pa.Table) -> pa.Table:
@@ -146,11 +194,12 @@ class ArrowTabular(Tabular[CastOptions]):
     def __init__(
         self,
         data: ArrowSource = None,
-        *,
+        *more: ArrowSource,
         schema: Optional[pa.Schema] = None,
         spill_bytes: Optional[int] = _DEFAULT_SPILL_BYTES,
         spill_ttl: int = _DEFAULT_SPILL_TTL,
         spill_path: "Any | None" = None,
+        spill_compression: "str | None" = None,
         **kwargs: Any,
     ) -> None:
         # ``**kwargs`` forwards :class:`Tabular`-shared init args
@@ -166,6 +215,7 @@ class ArrowTabular(Tabular[CastOptions]):
         # spill files using the same window.
         self._spill_bytes_threshold: int = int(spill_bytes or 0)
         self._spill_ttl: int = int(spill_ttl)
+        self._spill_compression: "str | None" = spill_compression
         self._in_memory_bytes: int = 0
 
         # mmap state. ``_spilled_table`` references buffers that live
@@ -174,6 +224,12 @@ class ArrowTabular(Tabular[CastOptions]):
         # referenced.
         self._spilled_table: "pa.Table | None" = None
         self._spill_mmap: "pa.MemoryMappedFile | None" = None
+
+        # Materialized :class:`pa.Table` view of ``_batches`` —
+        # populated lazily by :meth:`_read_arrow_table`, invalidated by
+        # every write / append / spill. Repeated table reads against an
+        # untouched holder skip the concat.
+        self._memory_table_cache: "pa.Table | None" = None
 
         # Caller-supplied spill path acts like the BytesIO "external"
         # branch — we honor it as the spill destination but don't
@@ -188,6 +244,9 @@ class ArrowTabular(Tabular[CastOptions]):
 
         if data is not None:
             self._ingest(data)
+        for src in more:
+            if src is not None:
+                self._ingest(src)
 
         # Tabular leaves are stateless w.r.t. Disposable — there is
         # no separate acquire phase to wait for, so just leave the
@@ -282,6 +341,7 @@ class ArrowTabular(Tabular[CastOptions]):
         """Drop in-memory + spilled state and unlink the owned spill file."""
         self._batches.clear()
         self._in_memory_bytes = 0
+        self._memory_table_cache = None
         self._drop_spill_table()
         self._unlink_owned_spill_path()
 
@@ -311,6 +371,7 @@ class ArrowTabular(Tabular[CastOptions]):
         super()._release()
         self._batches.clear()
         self._in_memory_bytes = 0
+        self._memory_table_cache = None
         self._drop_spill_table()
         self._unlink_owned_spill_path()
 
@@ -330,6 +391,67 @@ class ArrowTabular(Tabular[CastOptions]):
         for batch in self._batches:
             yield options.cast_arrow_tabular(batch)
 
+    def _read_arrow_table(self, options: CastOptions) -> pa.Table:
+        """Materialize a :class:`pa.Table` from spilled + in-memory state.
+
+        Overrides the base ``list(_read_arrow_batches) →
+        Table.from_batches`` loop with:
+
+        * One :func:`pa.concat_tables` over the combined sources
+          (skipped entirely when only one side has data).
+        * A single table-level :meth:`CastOptions.cast_arrow_tabular`
+          instead of one cast per batch.
+        * A cached :class:`pa.Table` over the in-memory tail; cache hits
+          when there's no spilled chunk and no target/cast options skip
+          the concat too.
+
+        Combined effect on the bench: ``read_arrow_table no-target``
+        collapses to a near-zero zero-copy reference return on the
+        common "ArrowTabular wraps one pa.Table" shape.
+        """
+        sources: list[pa.Table] = []
+        if self._spilled_table is not None:
+            sources.append(self._spilled_table)
+        memory_table = self._materialize_memory_table()
+        if memory_table is not None and memory_table.num_rows > 0:
+            sources.append(memory_table)
+
+        if not sources:
+            return super()._read_arrow_table(options)
+
+        if len(sources) == 1:
+            table = sources[0]
+        else:
+            table = pa.concat_tables(sources, promote_options="default")
+
+        target = getattr(options, "target", None)
+        if (
+            target is None
+            and not getattr(options, "row_size", None)
+            and not getattr(options, "byte_size", None)
+        ):
+            # No cast or rechunk requested — return the held table as-is
+            # (zero-copy reference). Callers that mutate the result are
+            # acting on the holder's buffers; pyarrow tables are
+            # immutable so this is safe.
+            return table
+        return options.cast_arrow_tabular(table)
+
+    def _materialize_memory_table(self) -> "pa.Table | None":
+        """Concatenate ``_batches`` into a :class:`pa.Table` (cached).
+
+        Returns ``None`` when nothing is held in memory. Callers that
+        only need the spilled side check ``_spilled_table`` directly.
+        """
+        if not self._batches:
+            return None
+        cached = self._memory_table_cache
+        if cached is not None:
+            return cached
+        table = pa.Table.from_batches(self._batches)
+        self._memory_table_cache = table
+        return table
+
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],
@@ -341,6 +463,7 @@ class ArrowTabular(Tabular[CastOptions]):
         if action is Mode.OVERWRITE:
             self._batches.clear()
             self._in_memory_bytes = 0
+            self._memory_table_cache = None
             self._drop_spill_table()
             self._unlink_owned_spill_path()
         elif action is not Mode.APPEND:
@@ -368,6 +491,9 @@ class ArrowTabular(Tabular[CastOptions]):
         # spend on the IPC file plus a small framing overhead. Close
         # enough for the threshold check.
         self._in_memory_bytes += batch.nbytes
+        # The cached :class:`pa.Table` is keyed by the current batch
+        # list; any append invalidates it.
+        self._memory_table_cache = None
 
     def _maybe_spill(self) -> None:
         """Spill consolidated state to IPC + mmap if threshold crossed.
@@ -390,7 +516,17 @@ class ArrowTabular(Tabular[CastOptions]):
             )
 
     def _consolidate_spill(self) -> None:
-        """Merge previously-spilled + in-memory batches → fresh IPC + mmap.
+        """Merge previously-spilled + in-memory batches → IPC file + mmap.
+
+        The write side routes through
+        :class:`yggdrasil.io.primitive.arrow_ipc_file.ArrowIPCFile` over
+        a :class:`LocalPath`, so the spill picks up the same OSFile
+        streaming, codec knob, and legacy-format toggle the format leaf
+        already manages. The read side opens a fresh
+        :func:`pyarrow.memory_map` over the same path so the table's
+        buffers can outlive any context the writer would close — the
+        instance retains both the mmap and the resulting table for the
+        lifetime of the spilled state.
 
         Two write modes:
 
@@ -449,9 +585,9 @@ class ArrowTabular(Tabular[CastOptions]):
             old_mmap = None
 
         try:
-            with pa.OSFile(str(target_path), "wb") as sink:
-                with pa.ipc.new_file(sink, merged.schema) as writer:
-                    writer.write_table(merged)
+            _write_spill_ipc_file(
+                str(target_path), merged, self._spill_compression,
+            )
         except Exception:
             # Best-effort cleanup of the half-written file before we
             # bubble up — old owned state stays intact when it was a
@@ -476,6 +612,7 @@ class ArrowTabular(Tabular[CastOptions]):
         self._spilled_table = new_table
         self._batches.clear()
         self._in_memory_bytes = 0
+        self._memory_table_cache = None
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "ArrowTabular spilled %d rows to %s",
@@ -570,23 +707,48 @@ class ArrowTabular(Tabular[CastOptions]):
     def _ingest(self, source: ArrowSource) -> None:
         if source is None:
             return
+
+        # Arrow-native shapes first — these are the hot paths and skip
+        # the module-name sniff entirely.
         if isinstance(source, pa.RecordBatch):
             self._append_batch(source)
             self._maybe_spill()
             return
         if isinstance(source, pa.Table):
-            for batch in source.to_batches():
-                self._append_batch(batch)
             if self._schema is None:
                 self._schema = source.schema
+            for batch in source.to_batches():
+                self._append_batch(batch)
+            self._maybe_spill()
+            return
+        if isinstance(source, pa.RecordBatchReader):
+            # ``read_all`` decodes the whole reader inside the C++
+            # runtime — no per-batch Python hop, and the resulting
+            # table shares chunking with the upstream batches.
+            self._ingest(source.read_all())
+            return
+        if isinstance(source, pa.ChunkedArray):
+            raise TypeError(
+                f"ArrowTabular can't ingest a bare pa.ChunkedArray "
+                f"({source.type!r}); wrap it in a pa.Table with a "
+                "column name first: pa.table({'col': chunked})."
+            )
+
+        # Another Tabular — drain it as an Arrow batch stream. Covers
+        # ParquetFile, ArrowIPCFile, LazyTabular, another ArrowTabular,
+        # etc. without each backend re-implementing a dispatch branch.
+        if isinstance(source, Tabular):
+            for batch in source.read_arrow_batches():
+                self._append_batch(batch)
             self._maybe_spill()
             return
 
-        # Module-name sniffing keeps optional engine deps out of
-        # the import graph — we only touch a frame's API once we've
-        # confirmed it's an instance of one we know how to drain.
-        module = (type(source).__module__ or "").split(".", 1)[0]
-        if module == "polars":
+        # Engine-frame namespaces — sniffed via the canonical
+        # :class:`ObjectSerde` helper so the dispatch table stays
+        # consistent with the rest of the IO layer.
+        namespace, _ = ObjectSerde.module_and_name(source)
+        root = namespace.split(".", 1)[0] if namespace else ""
+        if root == "polars":
             import polars as pl
 
             # LazyFrame collects here; the in-memory holder is the
@@ -597,10 +759,10 @@ class ArrowTabular(Tabular[CastOptions]):
                 source = source.collect()
             self._ingest(source.to_arrow())
             return
-        if module == "pandas":
+        if root == "pandas":
             self._ingest(pa.Table.from_pandas(source))
             return
-        if module == "pyspark":
+        if root == "pyspark":
             to_arrow = getattr(source, "toArrow", None)
             if to_arrow is not None:
                 self._ingest(to_arrow())
@@ -631,7 +793,8 @@ class ArrowTabular(Tabular[CastOptions]):
             raise TypeError(
                 f"ArrowTabular can't ingest "
                 f"{type(source).__module__}.{type(source).__name__}: "
-                f"{source!r}. Accepted: pyarrow Table/RecordBatch, polars "
+                f"{source!r}. Accepted: pyarrow Table / RecordBatch / "
+                "RecordBatchReader, another Tabular, polars "
                 "DataFrame/LazyFrame, pandas DataFrame, pyspark DataFrame, "
                 "list[dict], dict[str, list], or an iterable of any of "
                 "those."
