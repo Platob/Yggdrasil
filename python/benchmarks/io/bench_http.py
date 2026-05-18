@@ -374,11 +374,10 @@ def _session_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=20_000,
     ))
     out.append(_time_one(
-        "HTTPSession(base_url, headers, key) (singleton hit)",
+        "HTTPSession(base_url, headers) (singleton hit)",
         lambda: HTTPSession(
             base_url="https://api.example.com",
             headers={"X-Tenant": "acme"},
-            key="bench-prepare",
         ),
         repeat=repeat, inner=20_000,
     ))
@@ -408,11 +407,10 @@ def _session_scenarios(repeat: int) -> list[dict]:
     #     trace headers from the session;
     #   * session-level auth handler — every request re-resolves the
     #     handler's ``authorization`` and stamps the header.
-    session_plain = HTTPSession(base_url="https://api.example.com", key="bench-plain")
+    session_plain = HTTPSession(base_url="https://api.example.com/bench-plain")
     session_with_headers = HTTPSession(
         base_url="https://api.example.com",
         headers={"X-Tenant": "acme", "X-Trace-Id": "abc123"},
-        key="bench-prepare",
     )
 
     # Stand-in auth handler that returns a static token; the real MSAL /
@@ -427,10 +425,9 @@ def _session_scenarios(repeat: int) -> list[dict]:
             return f"Bearer {self.token}"
 
     session_with_auth = HTTPSession(
-        base_url="https://api.example.com",
+        base_url="https://api.example.com/bench-auth",
         headers={"X-Tenant": "acme"},
         auth=_StaticAuth(),  # type: ignore[arg-type]
-        key="bench-auth",
     )
 
     def _prepare_plain():
@@ -498,9 +495,8 @@ def _session_scenarios(repeat: int) -> list[dict]:
             return resp
 
     fake_session = _FakeHTTPSession(
-        base_url="https://api.example.com",
+        base_url="https://api.example.com/bench-fake",
         headers={"X-Tenant": "acme", "X-Trace-Id": "abc123"},
-        key="bench-fake",
     )
     # ``_send`` short-circuits on cache hits, but here both caches
     # default to disabled — every iteration walks the no-cache branch:
