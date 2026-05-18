@@ -248,6 +248,9 @@ class TestLocalCacheSend:
         out = s.send(req, local_cache=cache)
         assert len(s.calls) == 0
         assert out.json() == {"v": "cached"}
+        # Stamped by the local-cache load path.
+        assert out.local_cached is True
+        assert out.remote_cached is False
 
     def test_miss_writes_back(self, tmp_path) -> None:
         cache = _local_cfg(tmp_path)
@@ -259,11 +262,16 @@ class TestLocalCacheSend:
         assert len(s.calls) == 1
         assert out.json() == {"v": "fresh"}
         assert _wait_for_local(cache) >= 1
+        # Network fetch — neither cache layer answered.
+        assert out.local_cached is False
+        assert out.remote_cached is False
 
         # Second send hits the freshly written disk row, not the network.
         out2 = s.send(req, local_cache=cache)
         assert len(s.calls) == 1
         assert out2.json() == {"v": "fresh"}
+        assert out2.local_cached is True
+        assert out2.remote_cached is False
 
     def test_failure_response_not_persisted(self, tmp_path) -> None:
         cache = _local_cfg(tmp_path)
@@ -491,6 +499,9 @@ class TestRemoteCacheSend:
         out = s.send(req, remote_cache=cfg)
         assert len(s.calls) == 0
         assert out.json() == {"v": "cached"}
+        # Stamped by the remote-cache load path.
+        assert out.remote_cached is True
+        assert out.local_cached is False
 
     def test_miss_writes_back_via_insert(self) -> None:
         tab = _FakeRemoteTabular()

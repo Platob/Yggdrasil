@@ -629,6 +629,12 @@ class Session(Singleton, ABC):
                 "Found local %s %s under %s (fast path)",
                 request.method, request.url, root,
             )
+            # Stamp the origin so downstream consumers (and the next
+            # arrow projection) see "this came from the local cache".
+            # ``_state_token`` folds both cache flags in, so the
+            # projection cache invalidates without an explicit reset.
+            resp.local_cached = True
+            resp.remote_cached = False
             return resp
         return None
 
@@ -717,6 +723,8 @@ class Session(Singleton, ABC):
                     request.url,
                     cache_cfg.tabular,
                 )
+                response.remote_cached = True
+                response.local_cached = False
                 return response
 
         return None
@@ -1254,6 +1262,8 @@ class Session(Singleton, ABC):
         for req, lookup in zip(requests, lookup_batch):
             candidate = result_map.get(cfg.request_tuple(lookup))
             if candidate is not None and cfg.filter_response(candidate, request=req):
+                candidate.remote_cached = True
+                candidate.local_cached = False
                 hits.append(candidate)
             else:
                 misses.append(req)
@@ -1418,6 +1428,16 @@ class Session(Singleton, ABC):
                 raise
 
         hits_df = cache_result.read_spark_frame()
+        # Stamp the origin flags on the read side. Stored values may be
+        # stale (``mirror_local_to_remote`` pushes local hits into the
+        # remote table with ``local_cached=True``) — overwrite both so
+        # the downstream consumer always sees the layer that answered.
+        from pyspark.sql import functions as F
+        hits_df = (
+            hits_df
+            .withColumn("local_cached", F.lit(False))
+            .withColumn("remote_cached", F.lit(True))
+        )
 
         key_cols = list(cfg.request_by or [])
         if not key_cols:
