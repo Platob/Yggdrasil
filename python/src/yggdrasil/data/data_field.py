@@ -3463,9 +3463,15 @@ class Field(BaseChildrenFields):
         except CastError:
             raise
         except Exception as exc:
+            # Bind source from the actual array when options didn't
+            # carry one — otherwise the wrap renders ``cast ? -> <tgt>``
+            # and the reader has to guess what came in. ``check_source``
+            # swallows its own peek failures so this never masks the
+            # original exception.
+            sourced = scoped.check_source(array, copy=False)
             raise CastError(
                 str(exc),
-                source=scoped.source,
+                source=sourced.source,
                 target=self,
                 original=exc,
             ) from exc
@@ -3481,24 +3487,16 @@ class Field(BaseChildrenFields):
             return table
         options = get_cast_options_class().check(options=options, **more)
         scoped = options.with_target(self)
-        # Same wrap shape as :meth:`cast_arrow_array` — covers a
-        # tabular-level failure that doesn't originate inside one of
-        # the per-column casts (schema-mismatch, missing column, etc.).
-        # Per-column failures already raise CastError from the inner
-        # ``cast_arrow_array`` wrap above; we re-raise those unchanged.
-        try:
-            casted = self.to_struct().dtype.cast_arrow_tabular(
-                table, options=scoped,
-            )
-        except CastError:
-            raise
-        except Exception as exc:
-            raise CastError(
-                str(exc),
-                source=scoped.source,
-                target=self,
-                original=exc,
-            ) from exc
+        # Per-column failures raise CastError from the inner
+        # ``cast_arrow_array`` wrap — that's the atomic field-level
+        # context the caller wants. Don't re-wrap here: a tabular-level
+        # rewrap would discard the failing leaf's name in favour of the
+        # outer struct's, and any non-CastError that escapes the column
+        # walk (schema-mismatch, missing column, ``pa.Table.from_arrays``
+        # type mismatch) already carries its own diagnostic.
+        casted = self.to_struct().dtype.cast_arrow_tabular(
+            table, options=scoped,
+        )
         # Tabular finalize is identity — per-column finalize already
         # ran inside the struct walk. Kept for shape symmetry.
         return self.finalize_arrow(casted)
