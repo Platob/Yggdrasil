@@ -88,11 +88,34 @@ def _make_table_with_staging(
             side_effect=RuntimeError("no schema for unit test"),
         )
     else:
-        schema = MagicMock()
-        schema.field_names.return_value = field_names
-        tbl.collect_schema = MagicMock(return_value=schema)  # type: ignore[assignment]
+        tbl.collect_schema = MagicMock(  # type: ignore[assignment]
+            return_value=_make_schema(tuple(field_names)),
+        )
 
     return tbl, folder, parquet_path, meta_path
+
+
+def _target_url(dotted: str) -> str:
+    """Build the canonical Table-URL string for a ``cat.sch.tbl`` triple.
+
+    The URL form is ``dbfs+table:///<cat>/<sch>/<tbl>`` — matches what
+    :class:`Table` mints when no workspace host is wired up.
+    """
+    parts = dotted.split(".")
+    return "dbfs+table:///" + "/".join(parts)
+
+
+def _make_schema(field_names: tuple[str, ...] | None) -> Any:
+    """Build a minimal :class:`Schema` with the given column names.
+
+    Returns ``None`` when *field_names* is ``None`` — keeps the "no
+    explicit column list" test branch reachable.
+    """
+    if field_names is None:
+        return None
+    from yggdrasil.data.schema import Field, schema
+
+    return schema([Field(name=n, dtype="string") for n in field_names])
 
 
 def _make_record(
@@ -107,13 +130,13 @@ def _make_record(
     **overrides: Any,
 ) -> AsyncInsert:
     return AsyncInsert(
-        target_full_name=target,
+        target=_target_url(target),
+        schema=_make_schema(target_field_names),
         parquet_paths=parquets,
         metadata_paths=metas,
         operation_ids=ops,
         created_at=created_at,
         mode=mode,
-        target_field_names=target_field_names,
         **overrides,
     )
 
@@ -205,7 +228,7 @@ class TestAsyncInsertSerialization:
 
     def test_from_dict_ignores_unknown_keys(self):
         data = {
-            "target_full_name": "cat.sch.tbl",
+            "target": _target_url("cat.sch.tbl"),
             "unknown_field": "ignored",
         }
         rec = AsyncInsert.from_dict(data)
@@ -231,7 +254,7 @@ class TestAsyncInsertSerialization:
         meta = MagicMock()
         meta.full_path.return_value = "/Volumes/cat/sch/stg/logs/x.json"
         rec = AsyncInsert(
-            target_full_name="cat.sch.tbl",
+            target=_target_url("cat.sch.tbl"),
             parquet_paths=(parquet,),
             metadata_paths=(meta,),
         )
@@ -266,7 +289,7 @@ class TestAsyncInsertSerialization:
         meta = MagicMock()
         meta.full_path.return_value = "/Volumes/cat/sch/stg/logs/x.json"
         rec = AsyncInsert(
-            target_full_name="cat.sch.tbl",
+            target=_target_url("cat.sch.tbl"),
             parquet_paths=(parquet,),
             metadata_paths=(meta,),
         )
@@ -292,7 +315,7 @@ class TestAsyncInsertProperties:
         assert rec.operation_id == "a"
 
     def test_operation_id_empty_when_no_ids(self):
-        rec = AsyncInsert(target_full_name="x")
+        rec = AsyncInsert(target="dbfs+table:///x")
         assert rec.operation_id == ""
 
 
@@ -336,12 +359,12 @@ class TestToSQL:
         assert sql.endswith(" WHERE x > 0")
 
     def test_empty_when_no_parquets(self):
-        rec = AsyncInsert(target_full_name="cat.sch.tbl")
+        rec = AsyncInsert(target=_target_url("cat.sch.tbl"))
         assert rec.to_sql() == []
 
     def test_empty_when_no_target(self):
         rec = AsyncInsert(
-            target_full_name="",
+            target=None,
             parquet_paths=("/Volumes/a.parquet",),
         )
         assert rec.to_sql() == []
@@ -532,16 +555,15 @@ class TestToStatements:
         return path_patch, prep_patch
 
     def test_empty_record_returns_empty(self):
-        rec = AsyncInsert(target_full_name="cat.sch.t")  # no parquets
+        rec = AsyncInsert(target=_target_url("cat.sch.t"))  # no parquets
         assert rec.to_statements() == []
 
     def test_builds_one_statement_with_alias_substitutions(self):
         rec = _make_record(
+            target="main.sales.tbl",
             parquets=("/Volumes/a/p1.parquet", "/Volumes/a/p2.parquet"),
             metas=("/Volumes/a/p1.json", "/Volumes/a/p2.json"),
             ops=("op-1", "op-2"),
-            target_catalog_name="main",
-            target_schema_name="sales",
         )
 
         # Each DatabricksPath.from_ call returns a fresh MagicMock so we
@@ -549,21 +571,24 @@ class TestToStatements:
         # marked temporary.
         path_patch, prep_patch = self._patched_prepare()
         with path_patch, prep_patch as prepare:
-            prepare.return_value = MagicMock(name="prepared")
+            prepared = MagicMock(name="prepared")
+            prepared.external_volume_paths = None
+            prepare.return_value = prepared
             statements = rec.to_statements()
 
         assert len(statements) == 1
         prepare.assert_called_once()
 
-        # SQL uses {__p0__}/{__p1__} placeholders, not literal paths.
+        # SQL has the parquet paths inlined as ``parquet.`<path>``` — no
+        # ``{__p0__}`` placeholders survive into the prepared text.
         sql_arg = prepare.call_args.args[0]
-        assert "{__p0__}" in sql_arg
-        assert "{__p1__}" in sql_arg
-        # Literal paths should NOT leak into the SQL text.
-        assert "/Volumes/a/p1.parquet" not in sql_arg
-        # external_volume_paths carries one entry per parquet (under __pN__)
+        assert "{__p0__}" not in sql_arg
+        assert "{__p1__}" not in sql_arg
+        assert "parquet.`" in sql_arg
+        # external_volume_paths is bound on the prepared statement by
+        # ``_attach_cleanup_paths`` — one entry per parquet (under __pN__)
         # plus one per metadata file (under __mN__) — four total.
-        ext = prepare.call_args.kwargs["external_volume_paths"]
+        ext = prepared.external_volume_paths
         assert set(ext) == {"__p0__", "__p1__", "__m0__", "__m1__"}
         # Each resolved path was marked temporary so the statement
         # lifecycle unlinks it on success.
@@ -587,13 +612,15 @@ class TestToStatements:
             handle = MagicMock()
             handle.temporary = False
             from_.return_value = handle
-            prepare.return_value = MagicMock()
+            prepared = MagicMock()
+            prepared.external_volume_paths = None
+            prepare.return_value = prepared
             rec.to_statements(cleanup=False)
 
-        # Paths still attached for SQL substitution, but their
+        # Paths still attached for cleanup tracking, but their
         # ``temporary`` flag stays False so clear_temporary_resources
         # skips them.
-        ext = prepare.call_args.kwargs["external_volume_paths"]
+        ext = prepared.external_volume_paths
         for path in ext.values():
             assert path.temporary is False
 
@@ -601,7 +628,9 @@ class TestToStatements:
         rec = _make_record(mode="overwrite")
         path_patch, prep_patch = self._patched_prepare()
         with path_patch, prep_patch as prepare:
-            prepare.return_value = MagicMock()
+            prepared = MagicMock()
+            prepared.external_volume_paths = None
+            prepare.return_value = prepared
             rec.to_statements()
 
         sql_arg = prepare.call_args.args[0]
@@ -611,7 +640,9 @@ class TestToStatements:
         rec = _make_record()
         path_patch, prep_patch = self._patched_prepare()
         with path_patch, prep_patch as prepare:
-            prepare.return_value = MagicMock()
+            prepared = MagicMock()
+            prepared.external_volume_paths = None
+            prepare.return_value = prepared
             rec.to_statements(retry={"timeout": 30.0})
 
         assert prepare.call_args.kwargs["retry"] == {"timeout": 30.0}
@@ -651,7 +682,7 @@ class TestExecute:
         rec.wait.assert_called_once_with(wait=True, raise_error=True)
 
     def test_empty_op_does_nothing(self):
-        rec = AsyncInsert(target_full_name="cat.sch.tbl")
+        rec = AsyncInsert(target=_target_url("cat.sch.tbl"))
         engine = MagicMock()
         assert rec.execute(engine) is None
         engine.warehouse.assert_not_called()
@@ -740,7 +771,7 @@ class TestConcat:
         engine = MagicMock()
         sentinel_batch = MagicMock(name="batch")
         with patch(self._ASYNC_WRITE, return_value=sentinel_batch) as from_records:
-            result = AsyncInsert.concat([a, b], engine=engine, cleanup=True)
+            result = AsyncInsert.concat([a, b], executor=engine, cleanup=True)
 
         assert result is sentinel_batch
         from_records.assert_called_once()
@@ -757,16 +788,16 @@ class TestConcat:
         engine = MagicMock()
 
         with patch(self._ASYNC_WRITE, return_value=MagicMock()) as from_records:
-            AsyncInsert.concat([a], engine=engine, cleanup=False)
+            AsyncInsert.concat([a], executor=engine, cleanup=False)
             assert from_records.call_args.kwargs["cleanup"] is False
 
-            AsyncInsert.concat([a], engine=engine, cleanup=True)
+            AsyncInsert.concat([a], executor=engine, cleanup=True)
             assert from_records.call_args.kwargs["cleanup"] is True
 
     def test_concat_with_engine_empty_returns_none(self):
         engine = MagicMock()
         with patch(self._ASYNC_WRITE) as from_records:
-            assert AsyncInsert.concat([], engine=engine) is None
+            assert AsyncInsert.concat([], executor=engine) is None
         from_records.assert_not_called()
         engine.warehouse.assert_not_called()
 
@@ -777,7 +808,7 @@ class TestConcat:
 
         with patch(self._ASYNC_WRITE, return_value=MagicMock()) as from_records:
             AsyncInsert.concat(
-                [a], engine=engine, wait=False, raise_error=False,
+                [a], executor=engine, wait=False, raise_error=False,
             )
 
         _, kwargs = from_records.call_args
@@ -868,7 +899,7 @@ class TestAsyncWrite:
             AsyncInsert, "to_statements",
             return_value=[MagicMock(name="stmt")],
         ), patch(self._BATCH, return_value=batch):
-            out = AsyncWrite.from_source([rec], engine=engine)
+            out = AsyncWrite.from_source([rec], executor=engine)
 
         assert out is batch
         engine.warehouse.assert_called_once()
@@ -913,7 +944,7 @@ class TestCleanup:
 
     def test_skips_empty_path_entries(self):
         rec = AsyncInsert(
-            target_full_name="cat.sch.tbl",
+            target=_target_url("cat.sch.tbl"),
             parquet_paths=("",),  # empty entry
             metadata_paths=(),
         )

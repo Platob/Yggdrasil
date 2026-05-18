@@ -225,9 +225,14 @@ class WarehousePreparedStatement(PreparedStatement):
         external_data: Optional[
             Mapping[str, "ExternalStatementData | Tabular | str | tuple"]
         ] = None,
+        target: Any = None,
+        schema: Optional[Schema] = None,
         **kwargs: Any,
     ):
-        super().__init__(text, key=key, retry=retry, external_data=external_data)
+        super().__init__(
+            text, key=key, retry=retry, external_data=external_data,
+            target=target, schema=schema,
+        )
         self.warehouse_id = warehouse_id
         self.warehouse_name = warehouse_name
         self.catalog_name = catalog_name
@@ -1182,8 +1187,13 @@ class WarehouseStatementBatch(StatementBatch):
         *,
         parallel: int = 1,
         external_paths: Optional[dict[str, VolumePath]] = None,
+        target: Any = None,
+        schema: Optional[Schema] = None,
     ):
-        super().__init__(executor=executor, statements=None, parallel=parallel)
+        super().__init__(
+            executor=executor, statements=None, parallel=parallel,
+            target=target, schema=schema,
+        )
         self.external_volume_paths = dict(external_paths) if external_paths else {}
         if statements:
             self.extend(statements)

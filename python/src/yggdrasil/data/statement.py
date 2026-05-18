@@ -48,6 +48,7 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.io.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.data.executor import StatementExecutor
@@ -261,6 +262,8 @@ class PreparedStatement(Disposable):
     text: str = ""
     retry: Optional[WaitingConfig] = None
     external_data: Optional[dict[str, ExternalStatementData]] = None
+    target: Optional[URL] = None
+    schema: Optional[Schema] = None
 
     def __init__(
         self,
@@ -271,6 +274,8 @@ class PreparedStatement(Disposable):
         external_data: Optional[
             Mapping[str, "ExternalStatementData | Tabular | str | tuple"]
         ] = None,
+        target: "URL | str | None" = None,
+        schema: "Schema | None" = None,
     ):
         Disposable.__init__(self)
         # Most callers pass a non-empty ``str`` literal; the
@@ -286,6 +291,16 @@ class PreparedStatement(Disposable):
         # Avoid the function-call frame when nothing was passed —
         # 99% of statement constructions don't bind external data.
         self.external_data = _coerce_external_data(external_data) if external_data else None
+        # ``target`` is the URL identifying the resource this statement
+        # writes to / reads from (a ``dbfs+table://...`` for warehouse
+        # inserts, an HTTP endpoint for a request statement, etc.). Pure
+        # metadata; the executor decides what to do with it.
+        self.target = URL.from_(target) if target is not None and not isinstance(target, URL) else target
+        # ``schema`` is the *expected* schema for the statement's I/O —
+        # the target table's schema on writes, the declared output
+        # schema on reads. Distinct from :meth:`StatementResult.collect_schema`
+        # which is the schema actually materialized after execution.
+        self.schema = schema
 
     @property
     def retryable(self) -> bool:
@@ -363,6 +378,8 @@ class PreparedStatement(Disposable):
             coerced = cls(statement.text, key=statement.key)
             if statement.external_data:
                 coerced.external_data = dict(statement.external_data)
+            coerced.target = statement.target
+            coerced.schema = statement.schema
             return coerced
         raise TypeError(f"Cannot prepare {statement!r} as {cls.__name__}.")
 
@@ -737,12 +754,17 @@ class StatementBatch(StatementResult[PS], Generic[PS, SR]):
 
     executor: "StatementExecutor"
     results: "OrderedDict[str, SR]"
+    target: Optional[URL] = None
+    schema: Optional[Schema] = None
 
     def __init__(
         self,
         executor: "StatementExecutor",
         statements: Optional[Iterable["PS | str"]] = None,
         parallel: int = 1,
+        *,
+        target: "URL | str | None" = None,
+        schema: "Schema | None" = None,
         **kwargs: Any,
     ):
         # A batch has no single statement — set the StatementResult
@@ -755,6 +777,13 @@ class StatementBatch(StatementResult[PS], Generic[PS, SR]):
         self.iteration = 0
         self._cached_schema: Optional[Schema] = None
         self.results = OrderedDict()
+        # Optional unified-metadata slots — every child statement on a
+        # homogeneous batch points at the same target (e.g. an
+        # ``AsyncInsert`` whose Parquet payloads all write to one
+        # table) and shares the same expected schema. Generic batches
+        # leave them ``None``.
+        self.target = URL.from_(target) if target is not None and not isinstance(target, URL) else target
+        self.schema = schema
 
         if parallel is None:
             parallel = 1
