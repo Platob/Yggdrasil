@@ -271,10 +271,30 @@ def any_to_spark_dataframe(
         memory_pool=opts.arrow_memory_pool,
     ))
     arrow_table = pa.Table.from_batches(rechunked, schema=arrow_table.schema)
+
+    # Project the casted schema through :meth:`Schema.as_spark` so
+    # any LargeList / large_string / large_binary / list_view that
+    # pyarrow emitted while building the table drops to its plain
+    # Spark-compatible counterpart — Spark Connect's Arrow gRPC
+    # transport rejects the "large" / "view" variants with
+    # ``[UNSUPPORTED_ARROWTYPE]`` (SQLSTATE 0A000). The same field
+    # drives both the Spark schema arg and the Arrow-side cast
+    # below so the buffers on the wire match the dtype Spark is
+    # expecting. ``opts.merged`` is populated by
+    # :func:`any_to_arrow_table` (via ``_bind_source``) by the time
+    # we get here.
+    spark_field = opts.merged.as_spark()
+    spark_arrow_schema = spark_field.to_arrow_schema()
+    if not arrow_table.schema.equals(spark_arrow_schema, check_metadata=False):
+        # ``pa.Table.cast`` short-circuits per-column when the type
+        # already matches, so the common all-plain case pays only
+        # the schema-equality check above.
+        arrow_table = arrow_table.cast(spark_arrow_schema)
+
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "spark.createDataFrame from %d batches / %d rows",
             len(rechunked), arrow_table.num_rows,
         )
-    df = spark.createDataFrame(arrow_table, schema=opts.merged.to_spark_schema())
+    df = spark.createDataFrame(arrow_table, schema=spark_field.to_spark_schema())
     return opts.cast_spark(df)

@@ -125,6 +125,37 @@ class TestPrimitiveAsSpark(unittest.TestCase):
             with self.subTest(t=t):
                 self.assertIs(t.as_spark(), t)
 
+    def test_large_string_drops_to_plain_string(self) -> None:
+        # Spark Connect's Arrow transport rejects ``large_string`` —
+        # the downcast flips ``large`` off so ``to_arrow()`` yields
+        # ``pa.string()``.
+        import pyarrow as pa
+        spark = StringType(large=True).as_spark()
+        self.assertIsInstance(spark, StringType)
+        self.assertFalse(spark.large)
+        self.assertEqual(spark.to_arrow(), pa.string())
+
+    def test_string_view_drops_to_plain_string(self) -> None:
+        import pyarrow as pa
+        spark = StringType(view=True).as_spark()
+        self.assertIsInstance(spark, StringType)
+        self.assertFalse(spark.view)
+        self.assertEqual(spark.to_arrow(), pa.string())
+
+    def test_large_binary_drops_to_plain_binary(self) -> None:
+        import pyarrow as pa
+        spark = BinaryType(large=True).as_spark()
+        self.assertIsInstance(spark, BinaryType)
+        self.assertFalse(spark.large)
+        self.assertEqual(spark.to_arrow(), pa.binary())
+
+    def test_binary_view_drops_to_plain_binary(self) -> None:
+        import pyarrow as pa
+        spark = BinaryType(view=True).as_spark()
+        self.assertIsInstance(spark, BinaryType)
+        self.assertFalse(spark.view)
+        self.assertEqual(spark.to_arrow(), pa.binary())
+
 
 class TestNestedAsSpark(unittest.TestCase):
 
@@ -137,6 +168,47 @@ class TestNestedAsSpark(unittest.TestCase):
     def test_array_already_spark_returns_self(self) -> None:
         arr = ArrayType.from_item(Field("item", IntegerType(byte_size=4, signed=True)))
         self.assertIs(arr.as_spark(), arr)
+
+    def test_large_list_drops_to_plain_list(self) -> None:
+        # ``[UNSUPPORTED_ARROWTYPE] Unsupported arrow type LargeList``
+        # is the Spark Connect error this rewrite is meant to dodge.
+        import pyarrow as pa
+        arr = ArrayType.from_item(
+            Field("item", IntegerType(byte_size=4, signed=True)),
+            large=True,
+        )
+        spark = arr.as_spark()
+        self.assertIsInstance(spark, ArrayType)
+        self.assertFalse(spark.large)
+        self.assertEqual(spark.to_arrow(), pa.list_(pa.field("item", pa.int32())))
+
+    def test_list_view_drops_to_plain_list(self) -> None:
+        import pyarrow as pa
+        arr = ArrayType.from_item(
+            Field("item", IntegerType(byte_size=4, signed=True)),
+            view=True,
+        )
+        spark = arr.as_spark()
+        self.assertIsInstance(spark, ArrayType)
+        self.assertFalse(spark.view)
+        self.assertEqual(spark.to_arrow(), pa.list_(pa.field("item", pa.int32())))
+
+    def test_large_list_of_large_string_drops_both(self) -> None:
+        # Nested: Schema.as_spark should rewrite both the outer list
+        # flavor and the inner string flavor in one pass so the whole
+        # tree is wire-safe.
+        import pyarrow as pa
+        arr = ArrayType.from_item(
+            Field("item", StringType(large=True)),
+            large=True,
+        )
+        spark = arr.as_spark()
+        self.assertFalse(spark.large)
+        self.assertFalse(spark.item_field.dtype.large)
+        self.assertEqual(
+            spark.to_arrow(),
+            pa.list_(pa.field("item", pa.string())),
+        )
 
     def test_map_recurses_via_key_and_value_fields(self) -> None:
         map_type = MapType.from_key_value(
