@@ -365,6 +365,18 @@ class SparkTabular(Tabular[CastOptions]):
             return spark.createDataFrame([], schema=spark_schema)
         return options.cast_spark_tabular(self._frame)
 
+    def _read_spark_dataset(self, options: CastOptions) -> "SparkTabular":
+        # Source already speaks Spark — skip the
+        # :meth:`Tabular.from_spark_frame` rewrap when no target schema
+        # forces a recast. Returning ``self`` keeps the holder identity
+        # stable across ``to_spark_dataset()`` round trips, which the
+        # ``SparkTabular``-as-cache pattern relies on.
+        target = options.target
+        if target is None:
+            return self
+        frame = options.cast_spark_tabular(self._frame) if self._frame is not None else None
+        return type(self)(frame=frame, schema=target)
+
     def _write_spark_frame(
         self,
         frame: "SparkDataFrame",

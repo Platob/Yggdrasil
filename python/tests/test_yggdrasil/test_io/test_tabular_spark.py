@@ -302,3 +302,56 @@ class TestSparkTabularProxyForwarding(unittest.TestCase):
         io = SparkTabular()
         with self.assertRaises(AttributeError):
             io.something_random
+
+
+class TestSparkTabularToSparkDataset(unittest.TestCase):
+    """:meth:`to_spark_dataset` short-circuits when the source already
+    speaks Spark — no rewrap, no engine call."""
+
+    def test_no_target_returns_self(self) -> None:
+        # Identity preservation matters for the
+        # ``SparkTabular``-as-cache pattern: round-tripping through
+        # ``to_spark_dataset`` must not break ``is`` identity checks
+        # (used by remote-cache hit tracking and the persist /
+        # unpersist lifecycle).
+        io = SparkTabular(_fake_frame())
+        out = io.to_spark_dataset()
+        self.assertIs(out, io)
+
+    def test_target_rewraps_with_schema(self) -> None:
+        from yggdrasil.data import Field
+        from yggdrasil.data.schema import Schema
+
+        df = _fake_frame()
+        io = SparkTabular(df)
+        target = Schema.from_fields([Field("x", "int64")])
+
+        # Stub ``cast_spark_tabular`` so the test doesn't need a live
+        # SparkSession to drive the actual cast — we only need to
+        # verify the dispatch: target set → new instance, schema
+        # stamped, original holder left alone.
+        with mock.patch(
+            "yggdrasil.data.options.CastOptions.cast_spark_tabular",
+            return_value=df,
+        ):
+            out = io.to_spark_dataset(target=target)
+
+        self.assertIsNot(out, io)
+        self.assertIsInstance(out, SparkTabular)
+        self.assertIs(out.schema, target)
+        # The original holder is left untouched.
+        self.assertIsNone(io.schema)
+
+    def test_empty_with_target_yields_empty_typed_holder(self) -> None:
+        from yggdrasil.data import Field
+        from yggdrasil.data.schema import Schema
+
+        io = SparkTabular()
+        target = Schema.from_fields([Field("x", "int64")])
+
+        out = io.to_spark_dataset(target=target)
+
+        self.assertIsNot(out, io)
+        self.assertIsInstance(out, SparkTabular)
+        self.assertIs(out.schema, target)
+        self.assertIsNone(out.frame)
