@@ -3627,8 +3627,8 @@ class Table(DatabricksPath):
 
         prepared = _prepare_spark_batch(sql_texts)
 
-        logger.info(
-            "Spark insert into table %r (mode=%s, match_by=%s, prune_by=%s, "
+        logger.debug(
+            "Inserting via Spark into table %r (mode=%s, match_by=%s, prune_by=%s, "
             "statements=%d, retry=%s, anti_join=%s)",
             target_location, mode_enum, match_by, prune_by, len(prepared),
             retry_cfg is not None, anti_join_handled,
@@ -3646,6 +3646,12 @@ class Table(DatabricksPath):
                     raise_error=raise_error,
                     engine="spark",
                 )
+            logger.info(
+                "Inserted via Spark into table %r (mode=%s, match_by=%s, "
+                "prune_by=%s, statements=%d, anti_join=%s)",
+                target_location, mode_enum, match_by, prune_by, len(prepared),
+                anti_join_handled,
+            )
         finally:
             try:
                 session.catalog.dropTempView(view_name)
