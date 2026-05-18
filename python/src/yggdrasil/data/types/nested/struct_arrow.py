@@ -367,7 +367,7 @@ def cast_arrow_tabular(
         return data
 
     source_schema = options.source
-    target_schema = options.merged.to_struct()
+    target_schema = options.target.to_struct()
 
     target_arrow_schema = target_schema.to_arrow_schema()
     if data.schema.equals(target_arrow_schema, check_metadata=False):

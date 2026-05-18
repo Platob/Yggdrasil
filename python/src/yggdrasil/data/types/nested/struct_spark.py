@@ -174,7 +174,7 @@ def cast_spark_tabular(
         return data
 
     source_schema = options.source
-    target_schema = options.merged.to_struct()
+    target_schema = options.target.to_struct()
 
     # Engine-level fast bypass — Field/DataType detail (semantic
     # subclass, metadata) doesn't surface in the underlying Spark
