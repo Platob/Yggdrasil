@@ -7,6 +7,7 @@ import itertools
 import logging
 import os
 import pathlib
+import pickle
 import re
 import threading
 import time
@@ -2506,23 +2507,30 @@ class Session(Singleton, ABC):
 
         Requests cross the wire as an Arrow table with the canonical
         :data:`~yggdrasil.io.request.REQUEST_SCHEMA` — deterministic
-        columns, no pickled Python objects, no driver-side
-        :class:`Session` subclass dragged into the worker's pickle
-        graph. That's the path that survives Spark Connect / Databricks
-        Connect, where the cluster's interpreter has no idea what
-        ``tests.test_yggdrasil.…StubSession`` is and the cloudpickle
-        round-trip fails with ``ModuleNotFoundError``.
+        columns, no pickled Python objects in the row payload.
 
-        Each Spark partition becomes one :meth:`Session.send_many` call
-        on the executor — built against a vanilla :class:`HTTPSession`
-        the worker constructs locally — fanning out via that session's
-        thread pool. Both local and remote cache configs are forwarded:
-        workers consult the same caches as the driver, so a request the
-        driver fan-out missed but a peer worker has already cached can
-        still short-circuit before hitting the network.
+        The driver-side :class:`Session` itself is pickled once with
+        :func:`pickle.dumps` and that bytes blob travels with the
+        ``mapInArrow`` closure; each partition rehydrates the same
+        subclass via :func:`pickle.loads`, so user overrides (custom
+        auth, header injection, request hooks) execute on the worker.
+        ``Session.__getstate__`` / ``__setstate__`` strip the
+        threading.RLock and JobPoolExecutor before serialising and
+        re-init them on the way back in, and ``Singleton.__new__``
+        collapses the loads onto the executor's per-``(cls, config)``
+        cached instance so all partitions share one connection pool.
+        Spark Connect / Databricks Connect callers need the user's
+        subclass module on the cluster's ``sys.path`` for the
+        cloudpickle round-trip to resolve — that's the price of running
+        a driver-side subclass on the worker.
+
+        Each Spark partition becomes one :meth:`Session.send_many` call,
+        fanning out via the rehydrated session's thread pool. Both local
+        and remote cache configs are forwarded: workers consult the same
+        caches as the driver, so a request the driver fan-out missed but
+        a peer worker has already cached can still short-circuit before
+        hitting the network.
         """
-        from yggdrasil.io.http_.session import HTTPSession
-
         if not misses:
             return self._cached_empty_spark_frame(spark)
 
@@ -2563,15 +2571,18 @@ class Session(Singleton, ABC):
             raise_error=False,
         )
 
+        # Pickle once on the driver; the bytes ride along with the
+        # ``mapInArrow`` closure. ``Singleton.__new__`` collapses the
+        # per-partition ``pickle.loads`` onto the executor's cached
+        # ``(cls, config)`` instance, so all partitions on one executor
+        # share a single connection pool.
+        self_serialized = pickle.dumps(self)
         response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
 
         def _send_partition(
             batches: Iterator[pa.RecordBatch],
         ) -> Iterator[pa.RecordBatch]:
-            # Vanilla HTTPSession built per-partition. Singleton-cached
-            # by ``(cls, config)`` so all partitions on the same executor
-            # share one connection pool.
-            session = HTTPSession()
+            session = pickle.loads(self_serialized)
             for batch in batches:
                 partition_requests = list(PreparedRequest.from_arrow(batch))
                 if not partition_requests:
