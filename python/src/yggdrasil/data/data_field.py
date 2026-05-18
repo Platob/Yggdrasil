@@ -3463,9 +3463,15 @@ class Field(BaseChildrenFields):
         except CastError:
             raise
         except Exception as exc:
+            # Bind source from the actual array when options didn't
+            # carry one — otherwise the wrap renders ``cast ? -> <tgt>``
+            # and the reader has to guess what came in. ``check_source``
+            # swallows its own peek failures so this never masks the
+            # original exception.
+            sourced = scoped.check_source(array, copy=False)
             raise CastError(
                 str(exc),
-                source=scoped.source,
+                source=sourced.source,
                 target=self,
                 original=exc,
             ) from exc

@@ -281,3 +281,17 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
             )
         self.assertEqual(ctx.exception.target.name, "amount")
         self.assertIsNotNone(ctx.exception.original)
+
+    def test_cast_arrow_array_without_source_binds_from_array(self) -> None:
+        # When the caller doesn't pass a source, the atomic wrap pulls
+        # the source dtype off the array itself so the rendered message
+        # still names both ends instead of ``? -> int64``.
+        pa = self.pa
+        tgt_field = Field.from_arrow(pa.field("amount", pa.int64()))
+        arr = pa.array(["nope"], type=pa.string())
+        with self.assertRaises(CastError) as ctx:
+            tgt_field.cast_arrow_array(arr, safe=True)
+        err = ctx.exception
+        self.assertIsNotNone(err.source)
+        self.assertEqual(err.source.arrow_type, pa.string())
+        self.assertNotIn("? -> ", str(err))
