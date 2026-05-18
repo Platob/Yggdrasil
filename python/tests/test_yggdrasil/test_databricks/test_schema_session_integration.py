@@ -147,15 +147,15 @@ class _SchemaSessionLiveBase(DatabricksIntegrationCase):
             super().tearDownClass()
 
     def _session(self, *, mode: Mode, local_cache=False) -> SchemaSession:
-        """Build a fresh session per test — unique ``key`` keeps the
-        parent singleton cache from handing back a stale instance from
-        an earlier case."""
+        """Build a fresh session per test — unique ``base_url`` suffix
+        keeps the singleton cache from handing back a stale instance
+        from an earlier case (the cache now keys on every constructor
+        argument, so a per-test URL suffix is the simplest split)."""
         return SchemaSession(
             self.schema,
-            base_url=HTTPBIN_BASE,
+            base_url=f"{HTTPBIN_BASE}#int-{secrets.token_hex(2)}",
             mode=mode,
             local_cache=local_cache,
-            key=f"int-{secrets.token_hex(2)}",
         )
 
 
@@ -252,10 +252,9 @@ class TestSchemaSessionLocalCache(_SchemaSessionLiveBase):
         with tempfile.TemporaryDirectory(prefix="yg-schemasession-") as tmp:
             session = SchemaSession(
                 self.schema,
-                base_url=HTTPBIN_BASE,
+                base_url=f"{HTTPBIN_BASE}#int-local-{secrets.token_hex(2)}",
                 mode=Mode.APPEND,
                 local_cache=tmp,
-                key=f"int-local-{secrets.token_hex(2)}",
             )
 
             _, first = _get_uuid(session)

@@ -93,13 +93,11 @@ SCHEMA = _StubSchema()
 SESSION_APPEND = SchemaSession(
     SCHEMA,
     base_url="https://api.example.com",
-    key="bench-append",
     mode=Mode.APPEND,
 )
 SESSION_UPSERT = SchemaSession(
     SCHEMA,
     base_url="https://api.example.com",
-    key="bench-upsert",
     mode=Mode.UPSERT,
 )
 # Remote-only variant: local cache disabled so ``_attach_cache``
@@ -108,14 +106,12 @@ SESSION_UPSERT = SchemaSession(
 SESSION_REMOTE_ONLY = SchemaSession(
     SCHEMA,
     base_url="https://api.example.com",
-    key="bench-remote-only",
     mode=Mode.APPEND,
     local_cache=False,
 )
-# Plain HTTPSession baseline — same base_url with a different ``key``
-# so the singleton cache keeps it distinct from the SchemaSession
-# instances sharing the same URL.
-BASE_SESSION = HTTPSession(base_url="https://api.example.com", key="bench-base")
+# Plain HTTPSession baseline. Different class from SchemaSession, so
+# the singleton key naturally keeps it distinct even on the same URL.
+BASE_SESSION = HTTPSession(base_url="https://api.example.com")
 
 
 PATHS = [

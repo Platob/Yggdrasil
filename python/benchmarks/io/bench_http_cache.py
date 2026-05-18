@@ -113,7 +113,7 @@ CFG_REMOTE_PRIVATE = CacheConfig(
 
 # A session is the bridge between CacheConfig and the fast-path
 # helpers — singleton-cached so repeated construction is free.
-SESSION = HTTPSession(base_url="https://api.example.com", key="bench-cache")
+SESSION = HTTPSession(base_url="https://api.example.com/bench-cache")
 
 
 # Pre-store one response into the local cache so the

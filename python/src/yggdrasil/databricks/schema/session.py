@@ -29,7 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Union
 
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG, WaitingConfig
@@ -78,25 +78,6 @@ class SchemaSession(HTTPSession):
     Remaining keyword arguments forward to :class:`HTTPSession`.
     """
 
-    #: Namespace prefix on the parent's singleton key so a
-    #: ``SchemaSession`` never collides with a bare ``HTTPSession``
-    #: sharing the same ``(base_url, key)`` pair.
-    KEY_PREFIX: ClassVar[str] = "yggdrasil.schema_session:"
-
-    @classmethod
-    def _prefixed_key(cls, key: str) -> str:
-        return key if key.startswith(cls.KEY_PREFIX) else f"{cls.KEY_PREFIX}{key}"
-
-    def __new__(  # type: ignore[override]
-        cls,
-        schema: "Schema",
-        base_url: Optional[URL | str] = None,
-        *args: Any,
-        key: str = "",
-        **kwargs: Any,
-    ) -> "SchemaSession":
-        return super().__new__(cls, base_url, key=cls._prefixed_key(key))
-
     def __init__(
         self,
         schema: "Schema",
@@ -109,7 +90,6 @@ class SchemaSession(HTTPSession):
         pool_maxsize: int = 10,
         headers: "Headers | Mapping[str, str] | None" = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
-        key: str = "",
         auth: Optional["Authorization"] = None,
     ) -> None:
         if getattr(self, "_initialized", False):
@@ -119,53 +99,62 @@ class SchemaSession(HTTPSession):
                 "SchemaSession requires a bound Schema; got None. Pass "
                 "the Schema whose tables should back the response cache."
             )
-        key = self._prefixed_key(key)
         super().__init__(
             base_url=base_url,
             verify=verify,
             pool_maxsize=pool_maxsize,
             headers=headers,
             waiting=waiting,
-            key=key,
             auth=auth,
         )
-        self._schema = schema
-        self._mode = Mode.from_(mode, default=Mode.APPEND)
-        self._table_cache: ExpiringDict[str, "Table"] = ExpiringDict(
-            default_ttl=table_cache_ttl,
-            max_size=1024,
+        self.schema = schema
+        self.mode = Mode.from_(mode, default=Mode.APPEND)
+        self.local_cache = local_cache
+        self.table_cache_ttl = table_cache_ttl
+        # Derived from ``local_cache`` / ``table_cache_ttl``; not part
+        # of the identity key. Listed in ``_TRANSIENT_STATE_ATTRS`` so
+        # the singleton-key probe and ``__getstate__`` both skip them,
+        # then rebuilt lazily on access via the cached_property pair.
+        self._table_cache = ExpiringDict(
+            default_ttl=table_cache_ttl, max_size=1024,
         )
-        self._local_cache_template: Optional[CacheConfig] = self._build_local_template(
-            local_cache,
-        )
+        self._local_cache_template = self._build_local_template(local_cache)
 
-    # ``_table_cache`` pickles live entries via ``ExpiringDict.__getstate__``;
-    # ``_local_cache_template`` is a frozen dataclass — both round-trip cleanly.
-    _TRANSIENT_STATE_ATTRS = HTTPSession._TRANSIENT_STATE_ATTRS
+    _TRANSIENT_STATE_ATTRS = HTTPSession._TRANSIENT_STATE_ATTRS | {
+        "_table_cache", "_local_cache_template",
+    }
+
+    def __setstate__(self, state):
+        # Inherit the live-singleton short-circuit and the
+        # transient-attr defaulting from :class:`HTTPSession` /
+        # :class:`Session`, then rebuild the derived caches from the
+        # already-restored ``local_cache`` / ``table_cache_ttl`` so a
+        # cross-process clone has working caches without re-pickling
+        # the live :class:`ExpiringDict` state.
+        if getattr(self, "_initialized", False):
+            return
+        super().__setstate__(state)
+        self._table_cache = ExpiringDict(
+            default_ttl=self.table_cache_ttl, max_size=1024,
+        )
+        self._local_cache_template = self._build_local_template(self.local_cache)
 
     def __getnewargs_ex__(self):
-        return (
-            (self._schema, self.base_url),
-            {"key": self.key, "mode": self._mode.value},
-        )
+        # SchemaSession's ``__init__`` takes ``schema`` + ``base_url``
+        # positionally; every other argument is keyword-only. Reuse
+        # the parent's ``__dict__`` walk for the HTTPSession-side
+        # kwargs and just restate the positional pair.
+        _, parent_kwargs = super().__getnewargs_ex__()
+        parent_kwargs.pop("schema", None)
+        return (self.schema, self.base_url), parent_kwargs
 
     # ── identity / introspection ───────────────────────────────────────────
-
-    @property
-    def schema(self) -> "Schema":
-        """The bound :class:`Schema` whose tables back the cache."""
-        return self._schema
-
-    @property
-    def mode(self) -> Mode:
-        """Cache write disposition (:attr:`Mode.APPEND` by default)."""
-        return self._mode
 
     def __repr__(self) -> str:
         base = self.base_url.to_string() if self.base_url else None
         return (
-            f"SchemaSession(schema={self._schema.full_name()!r}, "
-            f"base_url={base!r}, mode={self._mode.value!r})"
+            f"SchemaSession(schema={self.schema.full_name()!r}, "
+            f"base_url={base!r}, mode={self.mode.value!r})"
         )
 
     # ── path → table mapping ───────────────────────────────────────────────
@@ -180,7 +169,7 @@ class SchemaSession(HTTPSession):
         for non-trivial sanitization fires once per fresh path.
         """
         name = Table.safe_name(request.url.path)
-        return self._table_cache.get_or_set(name, lambda: self._schema.table(name))
+        return self._table_cache.get_or_set(name, lambda: self.schema.table(name))
 
     # ── cache config attachment ────────────────────────────────────────────
 
@@ -193,11 +182,11 @@ class SchemaSession(HTTPSession):
             return None
         if local_cache is True:
             base = CacheConfig.default()
-            return base.merge(path=base.local_cache_path(session=self), mode=self._mode)
+            return base.merge(path=base.local_cache_path(session=self), mode=self.mode)
         cfg = CacheConfig.check_arg(local_cache)
         if not cfg.is_local:
             cfg = cfg.merge(path=cfg.local_cache_path(session=self))
-        return cfg if cfg.mode == self._mode else cfg.merge(mode=self._mode)
+        return cfg if cfg.mode == self.mode else cfg.merge(mode=self.mode)
 
     def _attach_cache(self, request: PreparedRequest) -> PreparedRequest:
         """Stamp the per-path remote :class:`CacheConfig` (and local template,
@@ -208,13 +197,13 @@ class SchemaSession(HTTPSession):
         the request asks for something different.
         """
         if request.remote_cache_config is None:
-            mode = request.mode if request.mode is not None else self._mode
+            mode = request.mode if request.mode is not None else self.mode
             request.remote_cache_config = CacheConfig(
                 tabular=self.table_for(request), mode=mode,
             )
         if request.local_cache_config is None and self._local_cache_template is not None:
             tmpl = self._local_cache_template
-            mode = request.mode if request.mode is not None else self._mode
+            mode = request.mode if request.mode is not None else self.mode
             request.local_cache_config = tmpl if tmpl.mode == mode else tmpl.merge(mode=mode)
         return request
 

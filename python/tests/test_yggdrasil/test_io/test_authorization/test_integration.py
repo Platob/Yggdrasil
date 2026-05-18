@@ -299,10 +299,9 @@ class TestSessionAuth:
         session.auth = None
         assert session.auth is None
 
-    def test_auth_setter_rejects_non_authorization(self) -> None:
-        session = StubSession()
+    def test_auth_constructor_rejects_non_authorization(self) -> None:
         with pytest.raises(TypeError, match="auth must be an Authorization"):
-            session.auth = "Bearer literal"  # type: ignore[assignment]
+            StubSession(auth="Bearer literal")  # type: ignore[arg-type]
 
     def test_pickle_round_trip_preserves_handler(self) -> None:
         # The session-wide handler must travel into Spark workers

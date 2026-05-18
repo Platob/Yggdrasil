@@ -112,14 +112,17 @@ class HTTPSession(Session):
         headers: Optional[dict[str, str]] = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
-        key: str = "",
         auth: Optional[Authorization] = None,
     ) -> None:
         if getattr(self, "_initialized", False):
             return
         # ``urllib3`` connection pools cap out at 8 hosts comfortably for
         # our typical workloads; clamp here so a caller passing the legacy
-        # default (10) does not blow past the urllib3 sweet spot.
+        # default (10) does not blow past the urllib3 sweet spot. The
+        # clamped value flows into ``self.pool_maxsize`` via
+        # ``Session.__init__`` and therefore into the singleton key, so
+        # ``HTTPSession(pool_maxsize=20)`` and ``HTTPSession()`` collapse
+        # to one instance the way they always did.
         pool_maxsize = min(8, int(pool_maxsize)) if pool_maxsize else 8
         super().__init__(
             base_url=base_url,
@@ -127,20 +130,15 @@ class HTTPSession(Session):
             pool_maxsize=pool_maxsize,
             headers=headers,
             waiting=waiting,
-            key=key,
             auth=auth,
         )
-        self._http_pool: Optional[urllib3.PoolManager] = self._build_http_pool()
+        # Connection pool is built lazily on first :attr:`http_pool`
+        # access. Keeping ``__init__`` side-effect-free lets the
+        # singleton-key probe (see :meth:`Session._singleton_key`) run
+        # the constructor without opening sockets.
+        self._http_pool: Optional[urllib3.PoolManager] = None
 
     _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_http_pool"}
-
-    def __setstate__(self, state):
-        # Singleton hit: ``Session.__setstate__`` returns early and the
-        # cached pool stays attached — skip the rebuild so we don't drop it.
-        if getattr(self, "_initialized", False):
-            return
-        super().__setstate__(state)
-        self._http_pool = self._build_http_pool()
 
 
     def _build_retry(self) -> urllib3.Retry:

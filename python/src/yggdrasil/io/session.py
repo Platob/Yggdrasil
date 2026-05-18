@@ -392,6 +392,36 @@ def _encode_request_data(
     return urlencode(data, doseq=True).encode("utf-8"), "application/x-www-form-urlencoded"
 
 
+def _hashable_identity_value(value: Any) -> Any:
+    """Coerce an ``__init__`` argument into a hashable form for the singleton key.
+
+    Most argument shapes (frozen :class:`WaitingConfig`,
+    :class:`Authorization`, :class:`URL`, primitives, ``None``) are
+    already hashable and pass through unchanged. A few common
+    constructor-input shapes that aren't get canonicalised here so
+    two callers that spell the same identity slightly differently
+    still collapse onto one singleton:
+
+    * a ``str`` that parses as a URL is fed through :meth:`URL.from_`
+      and stringified, so ``"https://x.com"`` and ``URL("https://x.com")``
+      key the same way;
+    * :class:`Headers` / generic :class:`Mapping` collapse to a tuple
+      of sorted items;
+    * sets become sorted tuples, lists become tuples.
+    """
+    if value is None:
+        return None
+    if isinstance(value, URL):
+        return value.to_string()
+    if isinstance(value, Mapping):
+        return tuple(sorted(value.items()))
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted(value))
+    if isinstance(value, list):
+        return tuple(value)
+    return value
+
+
 def _format_cookie_header(cookies: Any) -> str:
     """Serialize a ``requests``-style ``cookies=`` arg into one ``Cookie`` header value."""
     if hasattr(cookies, "to_header"):
@@ -405,20 +435,26 @@ def _format_cookie_header(cookies: Any) -> str:
 
 
 class Session(Singleton, ABC):
-    """HTTP session base — keyed by ``(class, base_url, key)``.
+    """HTTP session base — singleton-keyed by its post-init ``__dict__``.
 
     Inherits the standard :class:`Singleton` plumbing:
 
-    - same-key constructor calls collapse to one process-lifetime
+    - same-config constructor calls collapse to one process-lifetime
       instance (``_SINGLETON_TTL = None``), so connection pool,
       cookie jar, and per-host state survive across every call site
-      that re-spells the same URL;
-    - the ``key`` kwarg splits same-URL singletons when a caller
-      needs parallel sessions against one host (different
-      credentials / tenants); default ``""`` keeps the historical
-      "same URL → same instance" behavior;
-    - ``base_url=None`` callers always get a fresh instance —
-      there's no canonical identity to cache against.
+      that re-spells the same configuration;
+    - the singleton key is built by running ``__init__`` on a probe
+      and projecting the resulting ``self.__dict__`` minus the
+      attributes named in :attr:`_TRANSIENT_STATE_ATTRS` /
+      :attr:`_IDENTITY_BOOKKEEPING_ATTRS`. Every attribute the
+      subclass writes during init participates in identity, so a
+      subclass that adds new constructor knobs (catalog name, auth
+      handler, cache mode, …) gets them in the key automatically —
+      no parallel ``_singleton_key`` listing to keep in sync;
+    - the only way to *exclude* something from identity is to keep
+      it out of ``__init__``'s normalisation output, or to add the
+      attribute name to :attr:`_TRANSIENT_STATE_ATTRS` (which also
+      drops it from the pickle payload). There is no other knob.
 
     Pickling is handled by the :class:`Singleton` base
     (``__getstate__`` filters :attr:`_TRANSIENT_STATE_ATTRS`,
@@ -428,15 +464,20 @@ class Session(Singleton, ABC):
     sender's lock state.
     """
 
-    # Process-lifetime caching when a base_url is supplied. ``__new__``
-    # below opts out (``singleton_ttl=...``) when ``base_url`` is empty
-    # so anonymous Sessions don't share state through the singleton
-    # cache.
+    # Process-lifetime singleton cache — every constructor call lands
+    # in :attr:`_INSTANCES` keyed on the full argument tuple so two
+    # callers building the same session shape share the live pool /
+    # cookies / cache state.
     _SINGLETON_TTL: ClassVar[Any] = None
 
     # Instance attributes that don't survive pickling — excluded by
     # ``__getstate__`` and rebuilt by ``__setstate__``. Subclasses extend
     # this with their own non-picklable handles (e.g. connection pools).
+    # This is also the sole exclusion list for the singleton key: a
+    # subclass that wants a constructor arg out of the identity should
+    # not add it to ``__init__`` in the first place; a subclass that
+    # has a *derived* attribute it doesn't want shared across pickles
+    # adds the attribute name here.
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
         "_lock", "_job_pool",
     })
@@ -451,37 +492,43 @@ class Session(Singleton, ABC):
     _RESPONSE_CLASS: ClassVar[type] = Response
     _BATCH_CLASS: ClassVar[type] = ResponseBatch
 
-    @classmethod
-    def _singleton_key(
-        cls,
-        base_url: Optional[URL | str] = None,
-        *args: Any,
-        key: str = "",
-        **kwargs: Any,
-    ) -> Any:
-        # ``__new__`` already gates on ``base_url`` being truthy before
-        # the key is computed, so we don't need to defend against the
-        # empty case here.
-        key_url = base_url if isinstance(base_url, URL) else URL.from_(base_url)
-        return (cls, key_url.to_string(), key)
+    # Bookkeeping attributes that ``__init__`` / the Singleton plumbing
+    # write into ``__dict__`` but that aren't part of the user-facing
+    # identity. Excluded from ``__getnewargs_ex__`` alongside
+    # :attr:`_TRANSIENT_STATE_ATTRS`.
+    _IDENTITY_BOOKKEEPING_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_initialized", "_singleton_key_",
+    })
 
-    def __new__(
-        cls,
-        base_url: Optional[URL | str] = None,
-        *args: Any,
-        key: str = "",
-        **kwargs: Any,
-    ) -> "Session":
-        # Anonymous Sessions (``base_url=None``) bypass the singleton
-        # cache entirely — there's no canonical key, and two different
-        # no-base callers shouldn't share state. We can't route through
-        # :meth:`Singleton.__new__` here because the class-level
-        # ``_SINGLETON_TTL = None`` would override a per-call
-        # ``singleton_ttl=...`` and force a key build.
-        if not base_url:
-            kwargs.pop("singleton_ttl", None)
-            return object.__new__(cls)
-        return super().__new__(cls, base_url, *args, key=key, **kwargs)
+    @classmethod
+    def _identity_excluded_attrs(cls) -> frozenset[str]:
+        """Attribute names omitted from ``__getnewargs_ex__`` / pickle args."""
+        return cls._TRANSIENT_STATE_ATTRS | cls._IDENTITY_BOOKKEEPING_ATTRS
+
+    @classmethod
+    def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
+        # Run the subclass's ``__init__`` on a throwaway probe and
+        # project the post-init ``__dict__`` into the key, keeping
+        # only the attributes whose names appear in some ``__init__``
+        # along the MRO. Reusing the real init path means every
+        # normalisation the constructor applies (URL parsing, header
+        # coercion, pool-size clamping, schema lookup, …) lands in
+        # the key for free; the parameter-name filter keeps derived
+        # caches, lazy handles, and other non-identity state out by
+        # construction — exactly the same set ``__getnewargs_ex__``
+        # ships back, so the receiver re-derives the same key.
+        kwargs.pop("singleton_ttl", None)
+        probe = object.__new__(cls)
+        object.__setattr__(probe, "_initialized", False)
+        cls.__init__(probe, *args, **kwargs)
+        param_names = cls._init_param_names()
+        excluded = cls._identity_excluded_attrs()
+        items = tuple(
+            (k, _hashable_identity_value(v))
+            for k, v in sorted(probe.__dict__.items())
+            if k in param_names and k not in excluded
+        )
+        return (cls, items)
 
     def __init__(
         self,
@@ -491,7 +538,6 @@ class Session(Singleton, ABC):
         headers: "Headers | Mapping[str, str] | None" = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
-        key: str = "",
         auth: Optional[Authorization] = None,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor call
@@ -499,13 +545,17 @@ class Session(Singleton, ABC):
         # second pass so we don't drop the live connection pool / cookies.
         if getattr(self, "_initialized", False):
             return
+        if auth is not None and not isinstance(auth, Authorization):
+            raise TypeError(
+                f"auth must be an Authorization instance or None; got "
+                f"{type(auth).__name__}."
+            )
         self.base_url = URL.from_(base_url) if base_url else None
-        self.key = key
         self.verify = verify
         self.pool_maxsize = pool_maxsize if pool_maxsize and pool_maxsize > 0 else 8
         self.headers: Headers = Headers.from_(headers)
         self.waiting = waiting
-        self._auth: Authorization | None = auth
+        self.auth: Authorization | None = auth
         self._lock = threading.RLock()
         self._job_pool: Optional[JobPoolExecutor] = None
         self._initialized = True
@@ -519,12 +569,55 @@ class Session(Singleton, ABC):
             self._job_pool = None
 
     def __getnewargs_ex__(self):
-        # Route unpickling through ``__new__`` so a session reconstructed
-        # with the same ``(base_url, key)`` collapses to the in-process
-        # singleton instead of cloning the connection pool / cookie jar.
-        # Use the ``_ex__`` variant so ``key`` reaches ``__new__`` as a
-        # keyword (it's keyword-only on the constructor).
-        return ((self.base_url,), {"key": self.key})
+        # Pull every constructor knob the subclass stashes on ``self``
+        # back out of ``__dict__``, but only the attributes whose names
+        # actually appear in some ``__init__`` along the MRO — that's
+        # what the receiver's ``__new__`` knows how to feed back into
+        # the probe-driven :meth:`_singleton_key`. Transient handles,
+        # singleton bookkeeping, and subclass-private slots that don't
+        # match a constructor parameter (test queues, lazy caches the
+        # subclass stashes outside ``__init__``'s surface) stay out by
+        # construction; the rest of ``__dict__`` rides into
+        # :meth:`Singleton.__setstate__`'s payload instead.
+        param_names = self._init_param_names()
+        excluded = self._identity_excluded_attrs()
+        state = {
+            k: v for k, v in self.__dict__.items()
+            if k in param_names and k not in excluded and k != "base_url"
+        }
+        return (self.base_url,), state
+
+    @classmethod
+    def _init_param_names(cls) -> frozenset[str]:
+        """Union of named ``__init__`` parameters across the MRO.
+
+        ``*args`` / ``**kwargs`` capture parameters are excluded so a
+        subclass with a bare ``def __init__(self, *args, **kwargs)``
+        passthrough (the test stubs do this) still inherits the
+        parent's named knobs without leaking attribute slots back
+        through ``__getnewargs_ex__``.
+        """
+        import inspect
+
+        names: set[str] = set()
+        for klass in cls.__mro__:
+            init = klass.__dict__.get("__init__")
+            if init is None or init is object.__init__:
+                continue
+            try:
+                sig = inspect.signature(init)
+            except (TypeError, ValueError):
+                continue
+            for name, param in sig.parameters.items():
+                if name == "self":
+                    continue
+                if param.kind in (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
+                    continue
+                names.add(name)
+        return frozenset(names)
 
     def __setstate__(self, state):
         # Defer to :meth:`Singleton.__setstate__` for the live-singleton
@@ -546,27 +639,6 @@ class Session(Singleton, ABC):
                     self._job_pool = JobPoolExecutor(max_workers=self.pool_maxsize)
                     LOGGER.debug("Created job pool with max_workers=%s", self.pool_maxsize)
         return self._job_pool
-
-    @property
-    def auth(self) -> Optional[Authorization]:
-        """Session-wide :class:`Authorization` handler.
-
-        When set, :meth:`prepare_request_before_send` resolves it
-        lazily into each outbound request's ``Authorization`` header,
-        unless the request carries its own :attr:`PreparedRequest.auth`
-        (per-request wins). Travels into Spark workers via the standard
-        ``__getstate__`` / ``__setstate__`` round-trip.
-        """
-        return self._auth
-
-    @auth.setter
-    def auth(self, value: Optional[Authorization]) -> None:
-        if value is not None and not isinstance(value, Authorization):
-            raise TypeError(
-                f"auth must be an Authorization instance or None; got "
-                f"{type(value).__name__}."
-            )
-        self._auth = value
 
     @property
     def x_api_key(self) -> Optional[str]:
@@ -871,7 +943,7 @@ class Session(Singleton, ABC):
         # write the resolved header directly instead of mutating
         # ``request.auth`` so a request reused across sessions doesn't
         # carry a stale session-level binding.
-        handler = request.auth or self._auth
+        handler = request.auth or self.auth
         if handler is not None:
             if request.headers is None:
                 request.headers = Headers()

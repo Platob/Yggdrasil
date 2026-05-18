@@ -202,7 +202,7 @@ def _fmt(r: dict) -> str:
 def _wire_scenarios(base_url: str, repeat: int) -> list[dict]:
     """Bare ``HTTPSession.send`` over the localhost socket."""
     out: list[dict] = []
-    sess = HTTPSession(base_url=base_url, key="bench-live")
+    sess = HTTPSession(base_url=base_url)
 
     for sz in ("tiny", "kib1", "kib64"):
         path = f"/{sz}"
@@ -234,7 +234,7 @@ def _wire_scenarios(base_url: str, repeat: int) -> list[dict]:
 
 def _send_many_scenarios(base_url: str, repeat: int) -> list[dict]:
     out: list[dict] = []
-    sess = HTTPSession(base_url=base_url, key="bench-many")
+    sess = HTTPSession(base_url=base_url)
     batch_size = 32
 
     # ``send_many`` consumes an iterator. Rebuild it on every iter so
@@ -315,7 +315,7 @@ def _local_cache_scenarios(base_url: str, repeat: int) -> list[dict]:
     # Bare session for the baseline. Same singleton-cache key it had
     # in ``_wire_scenarios`` — singleton-by-key means the pool stays
     # hot across scenarios.
-    sess = HTTPSession(base_url=base_url, key="bench-live")
+    sess = HTTPSession(base_url=base_url)
     tmp = tempfile.mkdtemp(prefix="ygg-bench-live-cache-")
     try:
         from yggdrasil.io.send_config import CacheConfig
