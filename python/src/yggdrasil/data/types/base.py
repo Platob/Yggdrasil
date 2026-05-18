@@ -279,6 +279,22 @@ def _default_singleton(cls: type) -> "DataType":
     return inst
 
 
+def _rebuild_data_type(cls: type) -> "DataType":
+    """Allocate a fresh :class:`DataType` instance bypassing ``__new__``.
+
+    Pickle's ``NEWOBJ`` opcode calls ``cls.__new__(cls)`` with no args
+    — the same path :meth:`DataType.__new__` redirects to the per-class
+    singleton. For parameterized types (``StructType`` / ``ArrayType`` /
+    ``MapType`` / ``DecimalType`` / timestamp / time / duration / ...)
+    the singleton would then be mutated by the unpickled state, so two
+    pickled instances with different fields collapse onto the same
+    object (last write wins). Routing through :func:`object.__new__`
+    here keeps each unpickled instance independent — see
+    :meth:`DataType.__reduce__`.
+    """
+    return object.__new__(cls)
+
+
 def _cached_engine_method(method):
     """Wrap a ``to_arrow`` / ``to_polars`` / ``to_spark`` impl with caching.
 
@@ -336,6 +352,31 @@ class DataType(BaseChildrenFields, ABC):
         if not args and not kwargs:
             return _default_singleton(cls)
         return object.__new__(cls)
+
+    def __reduce__(self):
+        """Pickle through a singleton-bypassing factory.
+
+        ``__new__`` returns the shared per-class singleton when called
+        with no args, which is exactly the call shape pickle's
+        ``NEWOBJ`` uses. The follow-up state restore would then mutate
+        that singleton — fine for primitive leaves (``Int64Type``,
+        ``StringType``, ...) whose state is invariant per class, but
+        catastrophic for parameterized types where each pickled
+        instance has different fields. Without this override two
+        ``StructType`` values picked together collapse onto one
+        singleton (last ``__setstate__`` wins) and every reference
+        into the unpickled tree silently points at the same struct.
+
+        Routing through :func:`_rebuild_data_type` allocates each
+        unpickled instance fresh via :func:`object.__new__`. Only
+        dataclass-declared fields are carried in the state payload —
+        the lazy ``_to_arrow_cached`` / ``_to_polars_cached`` /
+        ``_to_spark_cached`` slots set via ``object.__setattr__`` are
+        skipped so engine projections rebuild from the restored fields
+        on first access.
+        """
+        state = {f.name: getattr(self, f.name) for f in fields(self)}
+        return (_rebuild_data_type, (type(self),), state)
 
     def __str__(self):
         return self.pretty_format()
