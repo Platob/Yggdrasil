@@ -568,12 +568,9 @@ class PyEnv:
 
         Resolution order:
         1. Return the cached session if already resolved.
-        2. Check for an active SparkSession in the current process.
-        3. When *create* is True, pick the build path:
-           - ``connect=True`` (or ``None`` + :meth:`should_use_databricks_connect`)
-             → :meth:`_bootstrap_connect_session` (``databricks.connect``).
-           - Otherwise → :meth:`_bootstrap_session` (local PySpark with the
-             ``yggdrasil.spark.setup`` helpers when *local_setup* is True).
+        2. Decide Connect vs local based on *connect* / :meth:`should_use_databricks_connect`.
+        3. Probe for an active session of the chosen flavor.
+        4. When *create* is True, bootstrap a session of that flavor.
 
         For richer Databricks Connect wiring (wheel publishing, ``DatabricksEnv``,
         ``addArtifacts``), use :meth:`DatabricksClient.spark` — it delegates the
@@ -590,98 +587,189 @@ class PyEnv:
         # ------------------------------------------------------------------
         # A cached non-None session is final. A cached ``None`` (left behind
         # by an earlier ``create=False`` probe) should NOT block a later
-        # ``create=True`` call from actually bringing up a session — that
-        # bites every caller that probes the cache before asking for a real
-        # one (e.g. :func:`yggdrasil.spark.tests._get_test_spark`).
+        # ``create=True`` call from actually bringing up a session.
         if cls._SPARK_SESSION is not MISSING and cls._SPARK_SESSION is not None:
             return cls._SPARK_SESSION
         if cls._SPARK_SESSION is None and not create:
             return None
 
         # ------------------------------------------------------------------
-        # Ensure PySpark is importable
+        # Decide flavor up front — Connect vs pure/local — so probe and
+        # bootstrap stay on the same track.
         # ------------------------------------------------------------------
+        use_connect = connect if connect is not None else cls.should_use_databricks_connect()
+
+        if use_connect:
+            session = cls._resolve_connect_session(
+                create=create,
+                import_error=import_error,
+                install_spark=install_spark,
+                install_java=install_java,
+                local_setup=local_setup,
+                extra_config=extra_config,
+                fallback_local=connect is None,
+            )
+        else:
+            session = cls._resolve_local_session(
+                create=create,
+                import_error=import_error,
+                install_spark=install_spark,
+                install_java=install_java,
+                local_setup=local_setup,
+                extra_config=extra_config,
+            )
+
+        cls._SPARK_SESSION = session
+        return cls._SPARK_SESSION
+
+    # ---------------------------------------------------------------------
+    # Per-flavor resolvers
+    # ---------------------------------------------------------------------
+
+    @classmethod
+    def _resolve_local_session(
+        cls,
+        *,
+        create: bool,
+        import_error: bool,
+        install_spark: bool,
+        install_java: bool,
+        local_setup: bool,
+        extra_config: dict[str, str] | None,
+    ) -> "SparkSession | None":
+        """Probe + (optionally) bootstrap a pure / local PySpark SparkSession."""
         SparkSession = cls._import_spark_session(
             import_error=import_error, install_spark=install_spark
         )
         if SparkSession is None:
-            cls._SPARK_SESSION = None
             return None
 
-        # ------------------------------------------------------------------
-        # Resolve a session: active → bootstrap → bare builder → None
-        # ------------------------------------------------------------------
         try:
             active = SparkSession.getActiveSession()
         except Exception:
             active = None
 
         if active is not None:
-            cls._SPARK_SESSION = active
-        elif create:
-            use_connect = connect if connect is not None else cls.should_use_databricks_connect()
-            if use_connect:
-                cls._SPARK_SESSION = cls._bootstrap_connect_session(
-                    import_error=connect is True or import_error,
-                    fallback_local=connect is None,
-                    SparkSession=SparkSession,
-                    local_setup=local_setup,
-                    extra_config=extra_config,
-                    install_java=install_java,
-                )
-            else:
-                cls._SPARK_SESSION = cls._bootstrap_session(
-                    SparkSession,
-                    local_setup=local_setup,
-                    extra_config=extra_config,
-                    install_java=install_java,
-                )
-        else:
-            cls._SPARK_SESSION = None
+            return active
 
-        return cls._SPARK_SESSION
+        if not create:
+            return None
+
+        return cls._bootstrap_session(
+            SparkSession,
+            local_setup=local_setup,
+            extra_config=extra_config,
+            install_java=install_java,
+        )
+
+    @classmethod
+    def _resolve_connect_session(
+        cls,
+        *,
+        create: bool,
+        import_error: bool,
+        install_spark: bool,
+        install_java: bool,
+        local_setup: bool,
+        extra_config: dict[str, str] | None,
+        fallback_local: bool,
+    ) -> "SparkSession | None":
+        """Probe + (optionally) bootstrap a Databricks Connect SparkSession.
+
+        *fallback_local* — when True (i.e. caller passed ``connect=None`` and
+        we auto-detected Connect), missing ``databricks-connect`` silently
+        falls back to a pure local session. When False (caller forced
+        ``connect=True``), missing Connect raises (subject to *import_error*).
+        """
+        SparkConnectSession = cls._import_spark_connect_session(
+            import_error=import_error, install_spark=install_spark
+        )
+
+        # Probe for an already-active Connect session before doing any work.
+        if SparkConnectSession is not None:
+            try:
+                active = SparkConnectSession.getActiveSession()
+            except Exception:
+                active = None
+            if active is not None:
+                return active
+
+        if not create:
+            return None
+
+        # Need a classic SparkSession reference for the local-fallback path.
+        SparkSession = cls._import_spark_session(
+            import_error=import_error, install_spark=install_spark
+        )
+        if SparkSession is None and not fallback_local:
+            return None
+
+        return cls._bootstrap_connect_session(
+            import_error=import_error,
+            fallback_local=fallback_local,
+            SparkSession=SparkSession,
+            local_setup=local_setup,
+            extra_config=extra_config,
+            install_java=install_java,
+        )
 
     @classmethod
     def _spark_session_from_obj(
         cls, obj: Any, *, import_error: bool
     ) -> "SparkSession | None":
-        """Resolve `obj` argument forms: Ellipsis, bool, or a SparkSession."""
+        """Resolve `obj` argument forms: Ellipsis, bool, or a SparkSession.
+
+        * ``...``      — auto-resolve: create on Databricks, probe-only elsewhere.
+        * ``True``     — equivalent to ``create=True``.
+        * ``False``    — equivalent to ``create=False`` (probe cache / active only).
+        * a session   — adopt it (classic or Connect), populating the cache if empty.
+        """
         if obj is ...:
-            if cls.in_databricks():
-                return cls.spark_session(create=True, import_error=False)
-            return None
+            return cls.spark_session(
+                create=cls.in_databricks(),
+                import_error=import_error,
+            )
 
         if isinstance(obj, bool):
-            if obj:
-                return cls.spark_session(create=True, import_error=False)
-            return None
+            return cls.spark_session(create=obj, import_error=import_error)
 
+        # Accept either a classic SparkSession or a Connect SparkSession instance.
+        # Both are imported permissively — we're type-checking an object the caller
+        # already has, so a missing module just means "not that flavor".
         SparkSession = cls._import_spark_session(
-            import_error=import_error, install_spark=False
+            import_error=False, install_spark=False
         )
-        if SparkSession is not None and isinstance(obj, SparkSession):
-            if cls._SPARK_SESSION is MISSING:
+        SparkConnectSession = cls._import_spark_connect_session(
+            import_error=False, install_spark=False
+        )
+
+        session_types = tuple(t for t in (SparkSession, SparkConnectSession) if t is not None)
+
+        if not session_types:
+            if import_error:
+                raise ImportError(
+                    "Neither pyspark.sql.SparkSession nor pyspark.sql.connect.session.SparkSession "
+                    "is importable; cannot validate the provided session object."
+                )
+            raise TypeError(
+                f"Cannot validate {obj!r}: no SparkSession class available to type-check against."
+            )
+
+        if isinstance(obj, session_types):
+            if cls._SPARK_SESSION is MISSING or cls._SPARK_SESSION is None:
                 cls._SPARK_SESSION = obj
             return obj
 
-        raise TypeError(f"Invalid argument for spark_session: {obj!r}")
+        raise TypeError(
+            f"Invalid argument for spark_session: expected SparkSession "
+            f"(classic or Connect), bool, or Ellipsis; got {type(obj).__name__}"
+        )
 
     @classmethod
     def _import_spark_session(
         cls, *, import_error: bool, install_spark: bool
     ) -> "type[SparkSession] | None":
         """Import pyspark.sql.SparkSession, optionally pip-installing first."""
-        try:
-            from pyspark.sql.connect.session import SparkSession
-            return SparkSession
-        except ImportError:
-            if not install_spark:
-                if import_error:
-                    raise
-                return None
-        except Exception:
-            return None
-
         try:
             from pyspark.sql import SparkSession
             return SparkSession
@@ -697,6 +785,32 @@ class PyEnv:
         runtime_import_module(module_name="pyspark", pip_name="pyspark", install=True)
         try:
             from pyspark.sql import SparkSession
+            return SparkSession
+        except Exception:
+            if import_error:
+                raise
+            return None
+
+    @classmethod
+    def _import_spark_connect_session(
+        cls, *, import_error: bool, install_spark: bool
+    ) -> "type[SparkSession] | None":
+        try:
+            from pyspark.sql.connect.session import SparkSession
+            return SparkSession
+        except ImportError:
+            if not install_spark:
+                if import_error:
+                    raise
+                return None
+        except Exception:
+            return None
+
+        runtime_import_module(
+            module_name="databricks.connect", pip_name="databricks-connect", install=True
+        )
+        try:
+            from pyspark.sql.connect.session import SparkSession
             return SparkSession
         except Exception:
             if import_error:

@@ -1561,7 +1561,7 @@ class DatabricksClient(Singleton, URLBased):
         Each *dependency* is classified once via
         :func:`classify_dependency`:
 
-        - Public PyPI specs (``"ygg[data,databricks]==0.7.84"``,
+        - Public PyPI specs (``"ygg[data,databricks]==0.7.85"``,
           ``"numpy>=1.0"``, …) ride straight to the cluster via
           :meth:`DatabricksEnv.withDependencies`. ``ygg`` is
           always declared via :meth:`default_ygg_spec` — pinned
@@ -1575,7 +1575,7 @@ class DatabricksClient(Singleton, URLBased):
         - Editable installs (``pip install -e .``) get their
           local working copy built into a wheel whose version
           carries the local hostname
-          (``0.7.84+host.<host>``). The wheel lives at
+          (``0.7.85+host.<host>``). The wheel lives at
           ``/Workspace/Users/<me>/.ygg/pypi/simple/<pkg>/<wheel>``
           (overridable via *registry*) and is re-uploaded on every
           load so the registry slot tracks the developer's

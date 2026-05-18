@@ -3441,7 +3441,7 @@ class Table(DatabricksPath):
         logger.debug(
             "Arrow insert into table %r (mode=%s, match_by=%s, prune_by=%s, "
             "statements=%d, retry=%s)",
-            target_location, mode_enum, match_by, prune_by, len(prepared),
+            target_location, mode_enum.name, match_by, prune_by, len(prepared),
             retry_active,
         )
 
