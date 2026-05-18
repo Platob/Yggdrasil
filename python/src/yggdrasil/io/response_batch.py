@@ -12,7 +12,7 @@ folder path, remote hits keyed by remote-cache table full name. The
 new-hits bucket stays single-holder — network fetches don't carry a
 meaningful per-config split before they're persisted. All holders are
 the same type — Python (:class:`ArrowTabular`) and Spark
-(:class:`SparkTabular`) share one contract — and empty buckets keep
+(:class:`Dataset`) share one contract — and empty buckets keep
 their :data:`RESPONSE_SCHEMA` so a batch with no responses still answers
 schema questions correctly. Iteration walks each holder's Arrow batches
 and rebuilds :class:`Response` objects via
@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Union
 
 from .tabular.base import Tabular
-from yggdrasil.io.tabular import ArrowTabular, SparkTabular
+from yggdrasil.io.tabular import ArrowTabular, Dataset
 from .response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 
 if TYPE_CHECKING:
@@ -99,15 +99,15 @@ def empty_arrow_holder() -> ArrowTabular:
     return ArrowTabular(schema=RESPONSE_ARROW_SCHEMA)
 
 
-def empty_spark_holder(spark: "SparkSession") -> SparkTabular:
-    """Empty :class:`SparkTabular` keyed to the Spark response schema.
+def empty_spark_holder(spark: "SparkSession") -> Dataset:
+    """Empty :class:`Dataset` keyed to the Spark response schema.
 
     The held frame is built with ``spark.createDataFrame([], schema=...)``
     so the holder advertises :data:`RESPONSE_SCHEMA` (Spark form) without
     materialising any rows.
     """
     df = spark.createDataFrame([], schema=RESPONSE_SCHEMA.to_spark_schema())
-    return SparkTabular(df, spark=spark)
+    return Dataset(df, spark=spark)
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +133,8 @@ def responses_to_tabular(responses: list[Response]) -> ArrowTabular:
     )
 
 
-def spark_to_tabular(df: "SparkDataFrame") -> SparkTabular:
-    """Wrap a Spark DataFrame in a :class:`SparkTabular` (no collect).
+def spark_to_tabular(df: "SparkDataFrame") -> Dataset:
+    """Wrap a Spark DataFrame in a :class:`Dataset` (no collect).
 
     The DataFrame lives on the holder's mutable ``frame`` slot, so
     :meth:`Tabular.read_spark_frame` returns it untouched. A
@@ -143,7 +143,7 @@ def spark_to_tabular(df: "SparkDataFrame") -> SparkTabular:
     on the :class:`ResponseBatch` is disallowed precisely so callers
     don't trip over that collect by accident.
     """
-    return SparkTabular(df)
+    return Dataset(df)
 
 
 def _coerce_bucket(
@@ -362,11 +362,11 @@ class ResponseBatch:
 
     @staticmethod
     def _is_spark_holder(holder: Tabular) -> bool:
-        return isinstance(holder, SparkTabular) and holder.frame is not None
+        return isinstance(holder, Dataset) and holder.frame is not None
 
     @staticmethod
     def _holder_count(holder: Tabular) -> int:
-        if isinstance(holder, SparkTabular):
+        if isinstance(holder, Dataset):
             return holder.frame.count() if holder.frame is not None else 0
         if isinstance(holder, ArrowTabular):
             return holder.num_rows
@@ -394,7 +394,7 @@ class ResponseBatch:
         ``local`` and ``remote`` are totals summed across every
         contributing key — use :attr:`local_counts` and
         :attr:`remote_counts` for the per-key breakdowns. For
-        :class:`SparkTabular` this triggers ``df.count()``; for
+        :class:`Dataset` this triggers ``df.count()``; for
         :class:`ArrowTabular` it sums ``num_rows`` across the
         in-memory batches — fine for debugging or small assertions,
         not for hot paths.
@@ -468,7 +468,7 @@ class ResponseBatch:
         # makes the batch truthy regardless of contents — use
         # :attr:`counts` when you need the precise size.
         for holder in self._holders():
-            if isinstance(holder, SparkTabular):
+            if isinstance(holder, Dataset):
                 if holder.frame is not None:
                     return True
             elif isinstance(holder, ArrowTabular):
@@ -533,8 +533,8 @@ class ResponseBatch:
         from yggdrasil.data.enums import Mode
 
         mine: Tabular = getattr(self, attr)
-        if isinstance(theirs, SparkTabular) and theirs.frame is not None:
-            if isinstance(mine, SparkTabular) and mine.frame is not None:
+        if isinstance(theirs, Dataset) and theirs.frame is not None:
+            if isinstance(mine, Dataset) and mine.frame is not None:
                 mine.frame = mine.frame.unionByName(
                     theirs.frame, allowMissingColumns=True,
                 )
@@ -563,8 +563,8 @@ class ResponseBatch:
             if existing is None:
                 mine[key] = their_holder
                 continue
-            if isinstance(their_holder, SparkTabular) and their_holder.frame is not None:
-                if isinstance(existing, SparkTabular) and existing.frame is not None:
+            if isinstance(their_holder, Dataset) and their_holder.frame is not None:
+                if isinstance(existing, Dataset) and existing.frame is not None:
                     existing.frame = existing.frame.unionByName(
                         their_holder.frame, allowMissingColumns=True,
                     )
@@ -612,7 +612,7 @@ class ResponseBatch:
 
         frames: list["SparkDataFrame"] = []
         for holder in self._holders():
-            if isinstance(holder, SparkTabular) and holder.frame is not None:
+            if isinstance(holder, Dataset) and holder.frame is not None:
                 frames.append(holder.frame)
             else:
                 frames.append(holder.read_spark_frame())

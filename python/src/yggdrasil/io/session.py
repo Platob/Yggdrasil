@@ -629,6 +629,12 @@ class Session(Singleton, ABC):
                 "Found local %s %s under %s (fast path)",
                 request.method, request.url, root,
             )
+            # Stamp the origin so downstream consumers (and the next
+            # arrow projection) see "this came from the local cache".
+            # ``_state_token`` folds both cache flags in, so the
+            # projection cache invalidates without an explicit reset.
+            resp.local_cached = True
+            resp.remote_cached = False
             return resp
         return None
 
@@ -717,6 +723,8 @@ class Session(Singleton, ABC):
                     request.url,
                     cache_cfg.tabular,
                 )
+                response.remote_cached = True
+                response.local_cached = False
                 return response
 
         return None
@@ -996,7 +1004,7 @@ class Session(Singleton, ABC):
         """Stream responses one at a time, in both Python and Spark modes.
 
         Spark-backed buckets are drained via the holder's
-        :meth:`Tabular.read_records`, which for :class:`SparkTabular`
+        :meth:`Tabular.read_records`, which for :class:`Dataset`
         uses ``df.toLocalIterator()`` — rows stream from the executors
         one at a time, so the driver memory footprint stays bounded
         even for large network-fetch batches. Callers that want a
@@ -1254,6 +1262,8 @@ class Session(Singleton, ABC):
         for req, lookup in zip(requests, lookup_batch):
             candidate = result_map.get(cfg.request_tuple(lookup))
             if candidate is not None and cfg.filter_response(candidate, request=req):
+                candidate.remote_cached = True
+                candidate.local_cached = False
                 hits.append(candidate)
             else:
                 misses.append(req)
@@ -1418,6 +1428,16 @@ class Session(Singleton, ABC):
                 raise
 
         hits_df = cache_result.read_spark_frame()
+        # Stamp the origin flags on the read side. Stored values may be
+        # stale (``mirror_local_to_remote`` pushes local hits into the
+        # remote table with ``local_cached=True``) — overwrite both so
+        # the downstream consumer always sees the layer that answered.
+        from pyspark.sql import functions as F
+        hits_df = (
+            hits_df
+            .withColumn("local_cached", F.lit(False))
+            .withColumn("remote_cached", F.lit(True))
+        )
 
         key_cols = list(cfg.request_by or [])
         if not key_cols:
@@ -1774,7 +1794,7 @@ class Session(Singleton, ABC):
 
         Works in both Python and Spark modes. Spark-backed buckets are
         drained via the holder's :meth:`Tabular.read_records`, which
-        for :class:`SparkTabular` uses ``df.toLocalIterator()`` — rows
+        for :class:`Dataset` uses ``df.toLocalIterator()`` — rows
         stream from the executors one at a time, so the driver memory
         footprint stays bounded even for large network-fetch batches.
         :class:`ResponseBatch.__iter__` rejects Spark mode (it would
@@ -2195,13 +2215,17 @@ class Session(Singleton, ABC):
             if is_spark:
                 # `cfg.tabular.insert` accepts the Spark DataFrame
                 # directly, so we hand off the lazy DF without
-                # materialising on the driver.
-                if (
-                    new_hits is not None
-                    and session_remote_cfg.remote_cache_enabled
-                ):
+                # materialising on the driver. Per-request overrides
+                # ride through ``key_to_remote_cfg`` — mirrors the
+                # non-Spark ``_persist_remote`` so a chunk targeting
+                # multiple remote tables fans out instead of collapsing
+                # onto the session-level cfg.
+                if new_hits is not None:
                     self._spark_persist_remote(
-                        new_hits, session_remote_cfg, spark=spark,
+                        new_hits,
+                        key_to_remote_cfg,
+                        session_remote_cfg,
+                        spark=spark,
                     )
             else:
                 # Remote and local writebacks touch independent
@@ -2255,81 +2279,140 @@ class Session(Singleton, ABC):
     # Spark stage 3 / 4 helpers                                           #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
     def _spark_persist_remote(
+        self,
         new_responses_df: "SparkDataFrame",
-        cfg: CacheConfig,
+        key_to_remote_cfg: Mapping[int, CacheConfig],
+        session_remote_cfg: CacheConfig,
         *,
         spark: "SparkSession",
     ) -> None:
-        """Stage 4 on Spark: bulk-insert successful responses into the remote cache.
+        """Stage 4 on Spark: per-request bulk-insert into the remote cache.
 
-        Honours the session-level remote config only — per-request overrides
-        collapse onto it on the spark path, mirroring stage 3 where workers
-        see only the session-level local cache config. ``cfg.tabular.insert``
-        accepts the Spark DataFrame directly via ``spark_insert_into``, so
-        no driver-side collect is needed.
+        Mirrors :meth:`_persist_remote`: each ``public_url_hash`` resolves
+        to its effective :class:`CacheConfig` via ``key_to_remote_cfg``
+        (falling back to ``session_remote_cfg``), groups bucket by
+        :meth:`_remote_write_group_key`, and each group's insert runs
+        concurrently. The Spark frame is persisted once when more than
+        one group fires so the network fetch behind it doesn't re-execute
+        per group; single-group inserts keep the legacy zero-persist
+        plan.
 
         Before inserting, APPEND-mode writes are de-duplicated against the
         existing remote rows via a ``left_anti`` join on the response
-        ``hash`` column — the remote table stores anonymized requests
-        (cf. ``_persist_remote``), so a row whose hash already lives in
-        the cache is suppressed rather than re-inserted. UPSERT mode
-        keeps its read-free fast path and relies on ``match_by`` to
-        collapse duplicates server-side.
+        ``(partition_key, public_hash)`` keys — the remote table stores
+        anonymized requests (cf. ``_persist_remote``), so a row whose
+        hash already lives in the cache is suppressed rather than
+        re-inserted. UPSERT mode keeps its read-free fast path and
+        relies on ``match_by`` to collapse duplicates server-side.
         """
         from pyspark.sql import functions as F
+
+        # Bucket request hashes by their effective remote-cache config's
+        # write group. Disabled configs drop out here so the persist
+        # path never fires for them.
+        groups: dict[tuple, tuple[CacheConfig, list[int]]] = {}
+        for cfg_key, eff in key_to_remote_cfg.items():
+            if eff is None:
+                eff = session_remote_cfg
+            if not eff.remote_cache_enabled:
+                continue
+            gkey = self._remote_write_group_key(eff)
+            if gkey not in groups:
+                groups[gkey] = (eff, [])
+            groups[gkey][1].append(cfg_key)
+
+        if not groups:
+            return
 
         ok_df = new_responses_df.where(
             (F.col("status_code") >= 200)
             & (F.col("status_code") < 300)
         )
 
-        if cfg.mode != Mode.UPSERT:
-            table_name = cfg.tabular.full_name(safe=True)
-            try:
-                wanted_partitions = [
-                    row["partition_key"]
-                    for row in ok_df.select("partition_key").distinct().collect()
-                ]
-            except Exception:
-                wanted_partitions = []
-            try:
-                if wanted_partitions:
-                    literals = ", ".join(str(int(v)) for v in wanted_partitions)
-                    existing_df = spark.sql(
-                        "SELECT DISTINCT partition_key, public_hash "
-                        f"FROM {table_name} WHERE partition_key IN ({literals})"
-                    )
-                else:
-                    existing_df = spark.sql(
-                        "SELECT DISTINCT partition_key, public_hash "
-                        f"FROM {table_name}"
-                    )
-            except Exception as exc:
-                if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
-                    raise
-                existing_df = None
+        # Persist only when more than one group will read ``ok_df`` —
+        # otherwise the single insert action is the one and only
+        # evaluation and we save the storage round trip.
+        multi_group = len(groups) > 1
+        if multi_group:
+            ok_df = ok_df.persist()
 
-            if existing_df is not None:
-                ok_df = ok_df.join(
-                    existing_df,
-                    on=["partition_key", "public_hash"],
-                    how="left_anti",
+        # When every key in the chunk's cfg map collapses onto one
+        # group, the inserted frame IS the whole ``ok_df``. With any
+        # disabled / split-out keys present we have to filter by
+        # ``request_public_url_hash`` so dropped requests don't leak
+        # into the surviving group's insert.
+        covers_chunk = (
+            len(groups) == 1
+            and sum(len(hs) for _, (_, hs) in groups.items())
+            == len(key_to_remote_cfg)
+        )
+
+        def _insert_one(cfg: CacheConfig, hashes: list[int]) -> None:
+            if covers_chunk:
+                df = ok_df
+            else:
+                df = ok_df.where(
+                    F.col("request_public_url_hash").isin(hashes)
                 )
 
-        LOGGER.debug(
-            "%s ok response(s) into remote cache %s (spark insert)",
-            "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
-            cfg.tabular,
-        )
-        cfg.tabular.insert(
-            ok_df,
-            mode=cfg.mode,
-            match_by=cfg.sql_match_by or None,
-            wait=cfg.wait,
-            spark_session=spark,
-        )
+            if cfg.mode != Mode.UPSERT:
+                table_name = cfg.tabular.full_name(safe=True)
+                try:
+                    wanted_partitions = [
+                        row["partition_key"]
+                        for row in df.select("partition_key").distinct().collect()
+                    ]
+                except Exception:
+                    wanted_partitions = []
+                try:
+                    if wanted_partitions:
+                        literals = ", ".join(str(int(v)) for v in wanted_partitions)
+                        existing_df = spark.sql(
+                            "SELECT DISTINCT partition_key, public_hash "
+                            f"FROM {table_name} WHERE partition_key IN ({literals})"
+                        )
+                    else:
+                        existing_df = spark.sql(
+                            "SELECT DISTINCT partition_key, public_hash "
+                            f"FROM {table_name}"
+                        )
+                except Exception as exc:
+                    if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
+                        raise
+                    existing_df = None
+
+                if existing_df is not None:
+                    df = df.join(
+                        existing_df,
+                        on=["partition_key", "public_hash"],
+                        how="left_anti",
+                    )
+
+            LOGGER.debug(
+                "%s ok response(s) into remote cache %s (spark insert)",
+                "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
+                cfg.tabular,
+            )
+            cfg.tabular.insert(
+                df,
+                mode=cfg.mode,
+                match_by=cfg.sql_match_by or None,
+                wait=cfg.wait,
+                spark_session=spark,
+            )
+
+        try:
+            self._run_concurrently(
+                [
+                    lambda c=cfg, hs=hashes: _insert_one(c, hs)
+                    for (_gkey, (cfg, hashes)) in groups.items()
+                ],
+                thread_name_prefix="ygg-spark-remote-cache-insert",
+            )
+        finally:
+            if multi_group:
+                ok_df.unpersist()
 
     def _spark_fetch_misses(
         self,

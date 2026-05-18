@@ -1,6 +1,6 @@
 """In-memory :class:`Tabular` holding a (mutable) Spark DataFrame.
 
-:class:`SparkTabular` is the canonical Spark surface. Two interleaved
+:class:`Dataset` is the canonical Spark surface. Two interleaved
 roles, both satisfied by one class:
 
 * :class:`Tabular` contract — :meth:`_read_arrow_batches` /
@@ -52,10 +52,11 @@ Two modes, distinguished by :attr:`schema`:
 Backwards-compat aliases
 ------------------------
 
-``yggdrasil.spark.frame.Dataset`` is exported as an alias for
-:class:`SparkTabular`. ``self.df`` is a property over the
-underlying ``frame`` slot so call sites using either spelling
-keep working.
+:class:`Dataset` (this module) and ``yggdrasil.spark.frame.Dataset``
+are kept as aliases for :class:`Dataset` so external imports of the
+legacy spellings keep resolving to the same class. ``self.df`` is a
+property over the underlying ``frame`` slot so call sites using either
+``frame=`` / ``df=`` spelling keep working.
 """
 
 from __future__ import annotations
@@ -83,13 +84,13 @@ if TYPE_CHECKING:
     from yggdrasil.data.schema import Schema
 
 
-__all__ = ["SparkTabular"]
+__all__ = ["Dataset", "SparkTabular"]
 
 
 logger = logging.getLogger(__name__)
 
 
-class SparkTabular(Tabular[CastOptions]):
+class Dataset(Tabular[CastOptions]):
     """:class:`Tabular` + Spark-DataFrame surface in one class.
 
     The frame is the holder's only state; reads of
@@ -116,8 +117,8 @@ class SparkTabular(Tabular[CastOptions]):
     ) -> None:
         """Wrap a Spark DataFrame, optionally with a yggdrasil schema.
 
-        Two accepted spellings: ``SparkTabular(frame=df)`` (the
-        Tabular-style argument name) and ``SparkTabular(df=df)`` (the
+        Two accepted spellings: ``Dataset(frame=df)`` (the
+        Tabular-style argument name) and ``Dataset(df=df)`` (the
         legacy ``Dataset`` spelling). Passing both raises.
         """
         super().__init__()
@@ -241,7 +242,7 @@ class SparkTabular(Tabular[CastOptions]):
     # DataFrame proxy — fall through to the underlying frame for any
     # attribute we don't define ourselves. Wraps DataFrame results so
     # chained ``.select(...).groupBy(...).agg(...)`` stays inside
-    # :class:`SparkTabular`.
+    # :class:`Dataset`.
     # ------------------------------------------------------------------
 
     def __getattr__(self, name: str) -> Any:
@@ -284,7 +285,7 @@ class SparkTabular(Tabular[CastOptions]):
         *,
         data: Any = None,
         storage_level: "StorageLevel | str | None" = None,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Cache the underlying frame on Spark executors.
 
         ``data=`` replaces the held frame first (legacy stash path
@@ -365,6 +366,18 @@ class SparkTabular(Tabular[CastOptions]):
             return spark.createDataFrame([], schema=spark_schema)
         return options.cast_spark_tabular(self._frame)
 
+    def _read_spark_dataset(self, options: CastOptions) -> "Dataset":
+        # Source already speaks Spark — skip the
+        # :meth:`Tabular.from_spark_frame` rewrap when no target schema
+        # forces a recast. Returning ``self`` keeps the holder identity
+        # stable across ``to_spark_dataset()`` round trips, which the
+        # ``Dataset``-as-cache pattern relies on.
+        target = options.target
+        if target is None:
+            return self
+        frame = options.cast_spark_tabular(self._frame) if self._frame is not None else None
+        return type(self)(frame=frame, schema=target)
+
     def _write_spark_frame(
         self,
         frame: "SparkDataFrame",
@@ -404,7 +417,7 @@ class SparkTabular(Tabular[CastOptions]):
         arrow_table = spark_dataframe_to_arrow(self._frame)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "SparkTabular collected %d rows from Spark frame",
+                "Dataset collected %d rows from Spark frame",
                 arrow_table.num_rows,
             )
         for batch in arrow_table.to_batches(max_chunksize=options.row_size):
@@ -450,7 +463,7 @@ class SparkTabular(Tabular[CastOptions]):
         cls,
         df: "SparkDataFrame",
         schema: "Schema | None" = None,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Wrap a Spark frame, optionally re-casting it against ``schema``.
 
         ``schema=None`` infers a yggdrasil :class:`Schema` from the
@@ -475,7 +488,7 @@ class SparkTabular(Tabular[CastOptions]):
         *,
         spark_session: Optional["SparkSession"] = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Build a frame from an in-memory iterable.
 
         ``schema=None`` pickles each element into a dynamic frame.
@@ -525,7 +538,7 @@ class SparkTabular(Tabular[CastOptions]):
         *,
         spark_session: Optional["SparkSession"] = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Distribute ``function`` over ``inputs`` via ``mapInArrow``.
 
         ``schema=None`` returns a dynamic frame of pickled outputs.
@@ -768,7 +781,7 @@ class SparkTabular(Tabular[CastOptions]):
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """1:1 map over rows.
 
         Input rows are unpickled objects (dynamic mode) or row-dicts
@@ -841,7 +854,7 @@ class SparkTabular(Tabular[CastOptions]):
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Map ``function`` over each row, optionally casting against ``schema``.
 
         Without a schema this is :meth:`map`. With a schema,
@@ -896,7 +909,7 @@ class SparkTabular(Tabular[CastOptions]):
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Drop rows where ``predicate(row)`` is false.
 
         Predicate sees unpickled objects (dynamic mode) or row-dicts
@@ -991,7 +1004,7 @@ class SparkTabular(Tabular[CastOptions]):
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Explode rows of iterables into one row per element.
 
         Only meaningful in dynamic mode — typed rows are dicts, not
@@ -1058,7 +1071,7 @@ class SparkTabular(Tabular[CastOptions]):
         schema: "Schema",
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Materialise rows against ``schema`` as a typed frame."""
         from yggdrasil.data.schema import Schema as _Schema
         from yggdrasil.pickle.ser import loads
@@ -1095,7 +1108,7 @@ class SparkTabular(Tabular[CastOptions]):
 
     def to_dynamic(
         self, *, byte_size: int = 128 * 1024 * 1024,
-    ) -> "SparkTabular":
+    ) -> "Dataset":
         """Drop typing: re-pickle row-dicts back into a dynamic frame.
 
         No-op when already dynamic.
@@ -1267,8 +1280,8 @@ class SparkTabular(Tabular[CastOptions]):
 
 
 # ---------------------------------------------------------------------------
-# Proxy plumbing — keeps ``SparkTabular.<spark-df-method>(...)`` chains
-# returning :class:`SparkTabular`, so the user-visible type doesn't
+# Proxy plumbing — keeps ``Dataset.<spark-df-method>(...)`` chains
+# returning :class:`Dataset`, so the user-visible type doesn't
 # disappear behind a single ``.select`` call.
 # ---------------------------------------------------------------------------
 
@@ -1277,9 +1290,9 @@ def _wrap(
     value: Any,
     *,
     schema: "Schema | None" = None,
-    owner: "SparkTabular | None" = None,
+    owner: "Dataset | None" = None,
 ) -> Any:
-    """Wrap ``DataFrame`` results as :class:`SparkTabular`; pass others through."""
+    """Wrap ``DataFrame`` results as :class:`Dataset`; pass others through."""
     try:
         from pyspark.sql import DataFrame as _SparkDataFrame
     except ImportError:
@@ -1296,7 +1309,7 @@ def _wrap(
             from yggdrasil.data.schema import Schema as _Schema
             out_schema = _Schema.from_any(value.schema)
         installed = owner.installed_modules if owner is not None else None
-        return SparkTabular(
+        return Dataset(
             frame=value, schema=out_schema, installed_modules=installed,
         )
     return value
@@ -1305,10 +1318,10 @@ def _wrap(
 class _ProxiedCallable:
     """Bound-method shim that wraps DataFrame return values.
 
-    Returned by :meth:`SparkTabular.__getattr__` for callable attributes
+    Returned by :meth:`Dataset.__getattr__` for callable attributes
     on the underlying ``DataFrame``. Calling it forwards args/kwargs
     and runs the result through :func:`_wrap` so chained DataFrame ops
-    stay inside :class:`SparkTabular`.
+    stay inside :class:`Dataset`.
     """
 
     __slots__ = ("_callable", "_owner")
@@ -1317,7 +1330,7 @@ class _ProxiedCallable:
         self,
         fn: "Callable[..., Any]",
         *,
-        owner: "SparkTabular | None" = None,
+        owner: "Dataset | None" = None,
     ) -> None:
         self._callable = fn
         self._owner = owner
@@ -1331,3 +1344,12 @@ class _ProxiedCallable:
 
     def __repr__(self) -> str:
         return f"_ProxiedCallable({self._callable!r})"
+
+
+# Pre-rename spelling. External callers that did
+# ``from yggdrasil.io.tabular.spark import SparkTabular`` (or
+# ``from yggdrasil.io.tabular import SparkTabular``) keep resolving
+# to the same class — the alias is the same object, not a subclass,
+# so ``isinstance(x, SparkTabular)`` and ``isinstance(x, Dataset)``
+# are interchangeable.
+SparkTabular = Dataset

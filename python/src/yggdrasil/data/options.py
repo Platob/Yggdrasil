@@ -307,7 +307,7 @@ class CastOptions:
     # When True, mutating tabular operations (table inserts, MERGE-style
     # writes, …) hand back the rows they actually wrote as a
     # :class:`Tabular` — typically a :class:`ArrowTabular` or a
-    # :class:`SparkTabular` depending on the engine that ran the write.
+    # :class:`Dataset` depending on the engine that ran the write.
     # Default ``False`` keeps the historical "fire-and-forget" return
     # contract; flip it on when downstream code wants to chain on the
     # newly-appended payload (logging, follow-up tasks, downstream
