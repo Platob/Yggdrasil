@@ -591,6 +591,18 @@ class DataType(BaseChildrenFields, ABC):
             elif other.type_id.is_any_or_null:
                 return self
 
+        # Nested vs. primitive — prefer the nested side regardless of
+        # which one is ``self``. A list / struct / map row can't
+        # round-trip through a scalar dtype without losing its inner
+        # shape, so the nested type is the only one that preserves the
+        # union of both samples. Mirrors how the JSON-source cast paths
+        # (``data/types/primitive/json.py``) already treat nested
+        # sources as authoritative.
+        self_nested = self.type_id.is_nested
+        other_nested = other.type_id.is_nested
+        if self_nested != other_nested:
+            return self if self_nested else other
+
         if downcast == upcast:
             return self
 
