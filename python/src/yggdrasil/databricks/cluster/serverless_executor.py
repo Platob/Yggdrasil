@@ -92,8 +92,17 @@ class ServerlessClusterStatementExecutor(SparkStatementExecutor):
         # ``client.spark()`` honours the serverless_compute_id field
         # already baked onto the client, so the session lands on the
         # right serverless pool with no extra wiring.
+        LOGGER.debug(
+            "Resolving Spark Connect session for serverless executor %r "
+            "(cluster=%r)",
+            self, self.cluster,
+        )
         session = self.cluster.client.spark()
         self.spark_session = session
+        LOGGER.info(
+            "Resolved Spark Connect session for serverless executor %r",
+            self,
+        )
         return session
 
     def has_session(self) -> bool:
