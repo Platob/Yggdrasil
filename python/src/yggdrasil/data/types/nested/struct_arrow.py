@@ -375,30 +375,9 @@ def cast_arrow_tabular(
 
         target_arrays.append(casted)
 
-    # Atomic CastError at the assembly boundary — when a per-column
-    # cast emits an array whose type doesn't match the target schema's
-    # field (a rare subclass-override gap), pyarrow's ``from_arrays``
-    # raises a bare ArrowInvalid that names neither the offending
-    # column nor the source/target field. Pinpoint the first column
-    # whose array type doesn't match so the reader knows which leaf to
-    # look at.
-    try:
-        if isinstance(data, pa.Table):
-            return pa.Table.from_arrays(target_arrays, schema=target_arrow_schema)
-        return pa.RecordBatch.from_arrays(target_arrays, schema=target_arrow_schema)
-    except Exception as exc:
-        for column_array, target_field in zip(target_arrays, target_schema.children):
-            expected = target_field.to_arrow_field().type
-            if not column_array.type.equals(expected):
-                raise CastError(
-                    str(exc),
-                    source=source_schema.field(
-                        name=target_field.name, raise_error=False,
-                    ),
-                    target=target_field,
-                    original=exc,
-                ) from exc
-        raise
+    if isinstance(data, pa.Table):
+        return pa.Table.from_arrays(target_arrays, schema=target_arrow_schema)
+    return pa.RecordBatch.from_arrays(target_arrays, schema=target_arrow_schema)
 
 
 # ---------------------------------------------------------------------------

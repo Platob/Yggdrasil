@@ -672,6 +672,17 @@ class PyEnv:
     ) -> "type[SparkSession] | None":
         """Import pyspark.sql.SparkSession, optionally pip-installing first."""
         try:
+            from pyspark.sql.connect.session import SparkSession
+            return SparkSession
+        except ImportError:
+            if not install_spark:
+                if import_error:
+                    raise
+                return None
+        except Exception:
+            return None
+
+        try:
             from pyspark.sql import SparkSession
             return SparkSession
         except ImportError:

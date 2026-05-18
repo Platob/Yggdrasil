@@ -379,9 +379,9 @@ class TestServerlessBranch:
         # on top.
         _builder, _session, _env_cls, env_instances = mocked_builder
         _registry_cls, calls = fake_registry
-        serverless_client.spark("ygg==0.7.74")
+        serverless_client.spark("ygg==0.7.84")
         names = [d for d, _ in calls]
-        assert names == ["ygg==0.7.74"]
+        assert names == ["ygg==0.7.84"]
 
 
 class TestClassicBranch:

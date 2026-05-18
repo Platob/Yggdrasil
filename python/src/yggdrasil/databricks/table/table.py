@@ -3515,9 +3515,6 @@ class Table(DatabricksPath):
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
-        # TODO: Fix async databricks notebook.
-        wait = True if PyEnv.in_databricks() else wait
-
         target = self.create(
             data,
             mode=schema_mode,

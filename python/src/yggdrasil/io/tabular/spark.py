@@ -279,6 +279,20 @@ class Dataset(Tabular[CastOptions]):
             return False
         return bool(getattr(frame, "is_cached", False))
 
+    def cache(self):
+        """Cache the underlying frame on Spark executors."""
+        try:
+            self._frame = self._frame.cache()
+        except Exception:
+            # Spark Connect can reject ``cache`` on a logical-plan node
+            # it can't materialize (e.g. an unbound stream). Don't let
+            # a best-effort cache cripple the caller.
+            logger.warning(
+                "Caching %r failed; continuing without executor cache",
+                self, exc_info=True,
+            )
+        return self
+
     def persist(
         self,
         engine: str = "auto",
@@ -318,13 +332,7 @@ class Dataset(Tabular[CastOptions]):
         try:
             frame.persist(level) if level is not None else frame.persist()
         except Exception:
-            # Spark Connect can reject ``persist`` on a logical-plan
-            # node it can't materialize (e.g. an unbound stream).
-            # Don't let a best-effort cache cripple the caller.
-            logger.warning(
-                "Persisting %r failed; continuing without executor cache",
-                self, exc_info=True,
-            )
+            return self.cache()
         else:
             logger.debug(
                 "Persisted %r (storage_level=%r)", self, level,

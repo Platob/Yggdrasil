@@ -2510,7 +2510,7 @@ class Session(Singleton, ABC):
         if multi_group:
             from yggdrasil.io.tabular.spark import Dataset
 
-            ok_dataset = Dataset(frame=ok_df).persist()
+            ok_dataset = Dataset(frame=ok_df).cache()
             ok_df = ok_dataset.frame
 
         # When every key in the chunk's cfg map collapses onto one

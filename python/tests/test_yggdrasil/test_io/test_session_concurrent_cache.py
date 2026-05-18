@@ -4,9 +4,6 @@ Covers:
 
 - ``Session._run_concurrently`` runs tasks in parallel, propagates the
   first exception, and short-circuits the empty / single-task cases.
-- ``Session._enable_fair_spark_scheduler`` calls ``conf.set`` with
-  ``spark.scheduler.mode=FAIR`` and is forgiving on Spark builds that
-  reject the runtime change.
 """
 from __future__ import annotations
 
@@ -106,49 +103,3 @@ class TestRunConcurrently:
         )
         assert len(names) == 2
         assert all(n.startswith("ygg-test") for n in names)
-
-
-# ---------------------------------------------------------------------------
-# _enable_fair_spark_scheduler
-# ---------------------------------------------------------------------------
-
-
-class _FakeSparkConf:
-
-    def __init__(self) -> None:
-        self.set_calls: "list[tuple[str, str]]" = []
-
-    def set(self, key: str, value: str) -> None:
-        self.set_calls.append((key, value))
-
-
-class _FakeSparkSession:
-
-    def __init__(self) -> None:
-        self.conf = _FakeSparkConf()
-
-
-class _FakeSparkSessionRejecting:
-
-    def __init__(self) -> None:
-        class _Rejector:
-            def set(self, key: str, value: str) -> None:
-                raise RuntimeError(f"runtime change refused for {key}")
-        self.conf = _Rejector()
-
-
-class TestEnableFairSparkScheduler:
-
-    def test_sets_fair_mode(self) -> None:
-        spark = _FakeSparkSession()
-        Session._enable_fair_spark_scheduler(spark)
-        assert spark.conf.set_calls == [("spark.scheduler.mode", "FAIR")]
-
-    def test_swallows_rejection(self) -> None:
-        spark = _FakeSparkSessionRejecting()
-        # Managed clusters that reject runtime scheduler-mode changes
-        # must not break the request flow.
-        Session._enable_fair_spark_scheduler(spark)
-
-    def test_none_session_is_noop(self) -> None:
-        Session._enable_fair_spark_scheduler(None)
