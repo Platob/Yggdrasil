@@ -84,12 +84,22 @@ class DatabricksSparkStatementExecutor(SparkStatementExecutor):
         except Exception:
             active = None
         if active is not None:
+            logger.debug(
+                "Reusing active Spark Connect session for executor %r", self,
+            )
             self.spark_session = active
             return active
 
         if not create:
             return None
 
+        logger.debug(
+            "Resolving Spark Connect session for executor %r (client=%r)",
+            self, self.client,
+        )
         session = self.client.spark()
         self.spark_session = session
+        logger.info(
+            "Resolved Spark Connect session for executor %r", self,
+        )
         return session

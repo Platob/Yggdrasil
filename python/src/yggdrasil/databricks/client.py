@@ -1639,6 +1639,9 @@ class DatabricksClient(Singleton, URLBased):
         except Exception:
             active = None
         if active is not None:
+            LOGGER.debug(
+                "Reusing active Spark Connect session for %r", self,
+            )
             return self._bind_spark_session(active)
 
         from databricks.connect import DatabricksSession  # noqa
@@ -1647,9 +1650,19 @@ class DatabricksClient(Singleton, URLBased):
         if not any(_is_ygg_dep(d) for d in deps):
             deps.insert(0, f"ygg[data,databricks]=={ygg_version}")
 
+        mode = "serverless" if self.is_serverless_compute else "classic"
+        LOGGER.debug(
+            "Resolving Spark Connect dependencies for %r (mode=%s, deps=%r)",
+            self, mode, deps,
+        )
         registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
         specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)
 
+        LOGGER.debug(
+            "Creating Spark Connect session %r (mode=%s, cluster_id=%r, "
+            "serverless_compute_id=%r, install_specs=%d)",
+            self, mode, self.cluster_id, self.serverless_compute_id, len(specs),
+        )
         builder = DatabricksSession.builder.sdkConfig(self.workspace_config)
 
         if self.is_serverless_compute:
@@ -1668,8 +1681,17 @@ class DatabricksClient(Singleton, URLBased):
                 if spec.startswith("local:")
             ]
             if local_paths:
+                LOGGER.debug(
+                    "Attaching wheel artifacts to Spark Connect session %r "
+                    "(count=%d, paths=%r)",
+                    self, len(local_paths), local_paths,
+                )
                 session.addArtifacts(*local_paths, pyfile=True)
 
+        LOGGER.info(
+            "Created Spark Connect session %r (mode=%s, install_specs=%d)",
+            self, mode, len(specs),
+        )
         return self._bind_spark_session(session)
 
     def _bind_spark_session(self, session: "Any") -> "Any":
