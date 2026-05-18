@@ -279,13 +279,13 @@ def _install_modules_on_executors(
 
 
 # ---------------------------------------------------------------------------
-# Dataset (alias of SparkTabular)
+# Dataset re-export
 # ---------------------------------------------------------------------------
 #
 # Historically :class:`Dataset` lived here as a standalone Spark-DataFrame
 # wrapper while :class:`yggdrasil.io.tabular.SparkTabular` carried the
-# :class:`Tabular` contract. They've been merged into one class — the
-# :class:`SparkTabular` re-export below — so:
+# :class:`Tabular` contract. They've been merged into one class,
+# :class:`yggdrasil.io.tabular.spark.Dataset`, so:
 #
 # * the Tabular surface (read_arrow_batches / write_arrow_batches /
 #   read_spark_frame / write_spark_frame) and
@@ -293,29 +293,30 @@ def _install_modules_on_executors(
 #   executor module shipping, schema inference, the
 #   :meth:`__getattr__` DataFrame proxy)
 #
-# live on one type. Existing call sites that import `Dataset` from
-# `yggdrasil.spark.frame` or `SparkTabular` from `yggdrasil.io.tabular`
-# keep working unchanged — they're the same class. The module-level
-# helpers above (`is_dynamic_schema`, `_emit_pickled`, `_typed_cast`,
-# `_dynamic_rows`, `_typed_rows`, `_install_modules_on_executors`,
-# `DYNAMIC_SCHEMA`, `PICKLE_COLUMN_NAME`) stay here — :class:`SparkTabular`
-# imports them where needed.
+# live on one type. Existing call sites that import :class:`Dataset` from
+# ``yggdrasil.spark.frame`` or :class:`SparkTabular` from
+# ``yggdrasil.io.tabular`` keep working unchanged — both names resolve
+# to the same class. The module-level helpers above
+# (``is_dynamic_schema``, ``_emit_pickled``, ``_typed_cast``,
+# ``_dynamic_rows``, ``_typed_rows``, ``_install_modules_on_executors``,
+# ``DYNAMIC_SCHEMA``, ``PICKLE_COLUMN_NAME``) stay here —
+# :class:`Dataset` imports them where needed.
 
 def __getattr__(name: str) -> Any:
     """Lazy ``Dataset`` accessor — defers the import to break the cycle.
 
-    Importing :class:`SparkTabular` at module top-level would form a
-    cycle: ``yggdrasil.io.tabular.spark`` (where SparkTabular now
-    lives) imports :class:`yggdrasil.io.tabular.Tabular`, whose
-    package ``__init__`` re-imports SparkTabular — and our module is
-    only half-loaded at that point. Resolving the attribute on first
-    access (PEP 562) breaks the cycle without forcing every caller to
-    spell out the new import path.
+    Importing :class:`Dataset` at module top-level would form a cycle:
+    ``yggdrasil.io.tabular.spark`` (where :class:`Dataset` lives) imports
+    :class:`yggdrasil.io.tabular.Tabular`, whose package ``__init__``
+    re-imports :class:`Dataset` — and our module is only half-loaded at
+    that point. Resolving the attribute on first access (PEP 562) breaks
+    the cycle without forcing every caller to spell out the new import
+    path. ``SparkTabular`` lands on the same class for back-compat.
     """
-    if name == "Dataset":
-        from yggdrasil.io.tabular.spark import SparkTabular as _SparkTabular
+    if name in ("Dataset", "SparkTabular"):
+        from yggdrasil.io.tabular.spark import Dataset as _Dataset
 
         # Cache on the module so subsequent lookups skip the resolver.
-        globals()["Dataset"] = _SparkTabular
-        return _SparkTabular
+        globals()[name] = _Dataset
+        return _Dataset
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

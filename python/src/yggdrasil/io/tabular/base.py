@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
     from yggdrasil.io.holder import Holder
-    from yggdrasil.io.tabular.spark import SparkTabular
+    from yggdrasil.io.tabular.spark import Dataset
 
 
 __all__ = ["Tabular", "TabularStaticValues", "is_tabular_source"]
@@ -1267,14 +1267,14 @@ class Tabular(ABC, Generic[O]):
 
     def read_spark_dataset(
         self, options: "O | None" = None, **kwargs: Any,
-    ) -> "SparkTabular":
-        """Read into a :class:`SparkTabular` holder.
+    ) -> "Dataset":
+        """Read into a :class:`Dataset` holder.
 
         Mirrors :meth:`read_arrow_dataset` for the Spark engine: the
         return type is a yggdrasil holder rather than the bare engine
         frame, so callers keep the Tabular surface (chained transforms,
         ``persist`` / ``insert`` / ``schema``, …) without an extra wrap
-        at the call site. :class:`SparkTabular` overrides
+        at the call site. :class:`Dataset` overrides
         :meth:`_read_spark_dataset` to return itself in place — no
         materialise round trip when the source already speaks Spark.
         """
@@ -1282,10 +1282,10 @@ class Tabular(ABC, Generic[O]):
             self.check_options(options, overrides=locals())
         )
 
-    def _read_spark_dataset(self, options: O) -> "SparkTabular":
-        from yggdrasil.io.tabular.spark import SparkTabular
+    def _read_spark_dataset(self, options: O) -> "Dataset":
+        from yggdrasil.io.tabular.spark import Dataset
 
-        return SparkTabular.from_spark_frame(
+        return Dataset.from_spark_frame(
             self._read_spark_frame(options),
             schema=options.target,
         )

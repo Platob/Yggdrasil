@@ -996,7 +996,7 @@ class Session(Singleton, ABC):
         """Stream responses one at a time, in both Python and Spark modes.
 
         Spark-backed buckets are drained via the holder's
-        :meth:`Tabular.read_records`, which for :class:`SparkTabular`
+        :meth:`Tabular.read_records`, which for :class:`Dataset`
         uses ``df.toLocalIterator()`` — rows stream from the executors
         one at a time, so the driver memory footprint stays bounded
         even for large network-fetch batches. Callers that want a
@@ -1774,7 +1774,7 @@ class Session(Singleton, ABC):
 
         Works in both Python and Spark modes. Spark-backed buckets are
         drained via the holder's :meth:`Tabular.read_records`, which
-        for :class:`SparkTabular` uses ``df.toLocalIterator()`` — rows
+        for :class:`Dataset` uses ``df.toLocalIterator()`` — rows
         stream from the executors one at a time, so the driver memory
         footprint stays bounded even for large network-fetch batches.
         :class:`ResponseBatch.__iter__` rejects Spark mode (it would

@@ -3207,7 +3207,7 @@ class Table(DatabricksPath):
         ``return_data=True`` the backend that ran the write hands back
         its source payload as a :class:`Tabular` —
         :class:`ArrowTabular` from :meth:`arrow_insert`,
-        :class:`SparkTabular` from :meth:`spark_insert`, the input
+        :class:`Dataset` from :meth:`spark_insert`, the input
         :class:`StatementResult` from :meth:`sql_insert` — for
         downstream chaining without re-querying the target.
         """
@@ -3492,7 +3492,7 @@ class Table(DatabricksPath):
         the policy explicit instead of relying on auto-promote.
 
         Returns the submitted :class:`StatementBatch` by default. With
-        ``return_data=True``, returns a :class:`SparkTabular` wrapping
+        ``return_data=True``, returns a :class:`Dataset` wrapping
         the materialised source DataFrame — handy for chaining
         downstream transforms without re-querying the target.
         """
@@ -3656,7 +3656,7 @@ class Table(DatabricksPath):
                 logger.debug("Failed to drop temp view %r; continuing.", view_name, exc_info=True)
             if prune_by and not return_data:
                 # Keep the cached source alive when the caller asked
-                # for it back — :class:`SparkTabular` is the consumer
+                # for it back — :class:`Dataset` is the consumer
                 # and unpersisting here would force a re-execution
                 # downstream.
                 try:
@@ -3665,8 +3665,8 @@ class Table(DatabricksPath):
                     logger.debug("Failed to unpersist cached source; continuing.", exc_info=True)
 
         if return_data:
-            from yggdrasil.io.tabular.spark import SparkTabular
-            return SparkTabular(data_df)
+            from yggdrasil.io.tabular.spark import Dataset
+            return Dataset(data_df)
         return primary_batch
 
     # =========================================================================

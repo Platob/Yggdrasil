@@ -135,7 +135,7 @@ def _resolve_in_memory_tabular(data: Any) -> "type | None":
 
     - :class:`pyarrow.Table` / :class:`pa.RecordBatch` /
       :class:`pa.RecordBatchReader` → :class:`ArrowTabular`.
-    - Spark :class:`pyspark.sql.DataFrame` → :class:`SparkTabular`
+    - Spark :class:`pyspark.sql.DataFrame` → :class:`Dataset`
       (kept lazy on the executors — no driver collect).
     - polars / pandas frame → :class:`ArrowTabular` (Arrow is the
       narrow waist; the holder's ``_ingest`` knows the conversion).
@@ -168,8 +168,8 @@ def _resolve_in_memory_tabular(data: Any) -> "type | None":
         # GroupedData, Window …) aren't tabular sources we know how
         # to wrap; route DataFrames only.
         if "DataFrame" in type(data).__name__:
-            from yggdrasil.io.tabular.spark import SparkTabular
-            return SparkTabular
+            from yggdrasil.io.tabular.spark import Dataset
+            return Dataset
         return None
 
     if mod in ("polars", "pandas"):
@@ -639,13 +639,13 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             # - Otherwise consult :func:`_resolve_in_memory_tabular`
             #   for the concrete holder class
             #   (:class:`ArrowTabular` for arrow / polars / pandas /
-            #   row-list / column-dict shapes, :class:`SparkTabular`
+            #   row-list / column-dict shapes, :class:`Dataset`
             #   for spark — kept lazy on the executors).
             if isinstance(data, Tabular) and not isinstance(data, IO):
                 return data
             in_memory_target = _resolve_in_memory_tabular(data)
             if in_memory_target is not None:
-                # ArrowTabular / SparkTabular aren't subclasses of
+                # ArrowTabular / Dataset aren't subclasses of
                 # :class:`IO`, so ``isinstance(returned, cls)`` is
                 # False at the top of ``type.__call__`` — Python
                 # skips the post-``__new__`` ``IO.__init__`` re-entry
