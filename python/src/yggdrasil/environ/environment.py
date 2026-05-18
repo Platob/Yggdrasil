@@ -748,11 +748,19 @@ class PyEnv:
 
         Uses the ``DATABRICKS_*`` env vars the SDK already reads to resolve
         host / auth / target compute. When ``databricks-connect`` isn't
-        installed and *fallback_local* is True, fall back to a local
-        session; otherwise raise (or swallow per *import_error*).
+        already importable, route through
+        :meth:`PyEnv.runtime_import_module` to install it on demand;
+        when the auto-install is impossible / declined and
+        *fallback_local* is True, fall back to a local session;
+        otherwise raise (or swallow per *import_error*).
         """
         try:
-            from databricks.connect import DatabricksSession
+            cls.runtime_import_module(
+                module_name="databricks.connect",
+                pip_name="databricks-connect",
+                install=True,
+                warn=False,
+            )
         except ImportError:
             if not fallback_local:
                 if import_error:
