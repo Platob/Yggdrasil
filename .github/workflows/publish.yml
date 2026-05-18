@@ -34,7 +34,7 @@
 # otherwise the token-based fallback is used automatically.
 # ============================================================================
 
-name: 🚀 Publish ygg
+name: Publish ygg
 
 on:
   push:

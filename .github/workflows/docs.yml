@@ -10,7 +10,7 @@
 # - Artifact is available as `docs-site` for inspection on every run.
 # ============================================================================
 
-name: 📚 Docs (MkDocs → GitHub Pages)
+name: Docs (MkDocs to GitHub Pages)
 
 on:
   push:
