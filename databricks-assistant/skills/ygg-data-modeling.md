@@ -65,6 +65,52 @@ Any table prefixed `raw_` carries these guarantees:
   id when present, `(natural_id, ingested_at)` otherwise. A re-run of
   the same window must not duplicate.
 
+### Hard table split — prefer many narrow raw_ tables over one wide one
+
+When you can split a source into multiple `raw_<entity>` tables
+along a stable dimension (per-symbol, per-tenant, per-shard,
+per-day), **do**. Hard splits:
+
+- **Remove `MERGE` contention.** Each split writes to its own
+  Delta table; concurrent ingestion jobs never fight for the same
+  commit lock.
+- **Parallelise cleanly.** One Job task per split (or one Spark
+  task in `dbc.jobs.run_now(notebook_params={"shard": s})` per
+  shard) — fan-out is the schedule, not a write coordinator.
+- **Survive bad rows locally.** A poison batch corrupts one split,
+  not the whole entity.
+- **Re-shard freely.** Reorganising splits is a `CREATE TABLE AS
+  SELECT ... UNION ALL ...` — no historical merge to unwind.
+
+Splits land in the same `<source>` schema with a stable naming
+convention:
+
+```
+main.cme.raw_ohlcv_cl       ← per-symbol shard
+main.cme.raw_ohlcv_ng
+main.cme.raw_ohlcv_bz
+
+main.tenant_data.raw_orders_tenant_a    ← per-tenant shard
+main.tenant_data.raw_orders_tenant_b
+
+main.vendor.raw_events_2026_05          ← per-month shard for
+main.vendor.raw_events_2026_06           the high-volume case
+```
+
+Curated layer joins back together via `UNION ALL` (or
+`CREATE MATERIALIZED VIEW`) — analysts query the union, never the
+raw shards directly.
+
+Decision: **prefer a split** when concurrent writers exist, when
+`MERGE` is contending (Delta concurrency conflict exceptions in
+the job log), or when one entity dominates volume by > 10×. A
+single `raw_<entity>` is fine for low-cardinality / low-volume
+sources — don't over-shard a 10k-row/day feed.
+
+The curated and `dash_*` layers stay **un-sharded** — the
+union/aggregate runs once at curate time and consumers see one
+table.
+
 ### Geographic shared dims
 
 When the source has a place reference (country, region, exchange,

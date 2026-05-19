@@ -363,3 +363,210 @@ class TestMainEntry(DatabricksTestCase):
             ])
         self.assertEqual(rc, 0)
         self.assertEqual(client.genie.defaults.agent_auto_save_format, "csv")
+
+
+# ---------------------------------------------------------------------------
+# --deploy-skills — upload local skills to a workspace path
+# ---------------------------------------------------------------------------
+class TestDeploySkills(CLIBase):
+    """``GenieCLI.deploy_skills`` walks a local dir and writes each .md.
+
+    Network is mocked: the test patches ``WorkspacePath.from_`` to
+    return a stub whose ``write_bytes`` / ``mkdir`` calls land on a
+    recorded list, so we never touch a real workspace.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        from pathlib import Path
+
+        # Build a throwaway skills dir mirroring the real layout.
+        self.skills_root = Path(tempfile.mkdtemp(prefix="ygg-skills-src-"))
+        self.addCleanup(self._rmtree, str(self.skills_root))
+        (self.skills_root / "user_instructions.md").write_text("# user\n")
+        (self.skills_root / ".assistant_workspace_instructions.md").write_text("# workspace\n")
+        skills_subdir = self.skills_root / "skills"
+        skills_subdir.mkdir()
+        (skills_subdir / "ygg-install.md").write_text("# install\n")
+        (skills_subdir / "ygg-pitfalls.md").write_text("# pitfalls\n")
+
+    def test_parser_exposes_deploy_flags(self):
+        parser = GenieCLI.build_parser()
+        dests = {a.dest for a in parser._actions}
+        for n in ("deploy_skills", "skills_dir", "deploy_target", "deploy_overwrite"):
+            self.assertIn(n, dests)
+
+    def test_resolve_skills_dir_prefers_argument(self):
+        # Manually wire the args namespace as the parser would.
+        import argparse
+
+        self.cli.args = argparse.Namespace(skills_dir=str(self.skills_root))
+        resolved = self.cli._resolve_skills_dir()
+        self.assertEqual(resolved, self.skills_root)
+
+    def test_resolve_skills_dir_falls_back_to_env(self):
+        import argparse
+        import os
+
+        self.cli.args = argparse.Namespace(skills_dir=None)
+        prior = os.environ.get("YGG_SKILLS_DIR")
+        os.environ["YGG_SKILLS_DIR"] = str(self.skills_root)
+        try:
+            resolved = self.cli._resolve_skills_dir()
+        finally:
+            if prior is None:
+                os.environ.pop("YGG_SKILLS_DIR", None)
+            else:
+                os.environ["YGG_SKILLS_DIR"] = prior
+        self.assertEqual(resolved, self.skills_root)
+
+    def test_deploy_skills_missing_dir_returns_2(self):
+        import argparse
+
+        self.cli.args = argparse.Namespace(
+            skills_dir="/path/does/not/exist",
+            deploy_target=None,
+            deploy_overwrite=True,
+        )
+        rc = self.cli.deploy_skills()
+        self.assertEqual(rc, 2)
+        self.assertIn("skills source not found", self._out())
+
+    def test_deploy_skills_uploads_every_md(self):
+        import argparse
+        from unittest.mock import MagicMock as _MM, patch as _patch
+
+        self.cli.args = argparse.Namespace(
+            skills_dir=str(self.skills_root),
+            deploy_target="/Workspace/Users/me/.ygg/da",
+            deploy_overwrite=True,
+        )
+
+        # Patch WorkspacePath.from_ to return a stub that records writes.
+        recorded: list[tuple[str, bytes]] = []
+
+        class _StubWP:
+            def __init__(self, dest):
+                self.dest = dest
+                self.parent = _MM()
+
+            def with_client(self, _client):
+                return self
+
+            def write_bytes(self, data, overwrite=False):
+                recorded.append((self.dest, data))
+
+        with _patch(
+            "yggdrasil.databricks.fs.workspace_path.WorkspacePath.from_",
+            side_effect=lambda dest: _StubWP(dest),
+        ):
+            rc = self.cli.deploy_skills()
+
+        self.assertEqual(rc, 0)
+        dests = sorted(d for d, _ in recorded)
+        self.assertIn("/Workspace/Users/me/.ygg/da/.assistant_workspace_instructions.md", dests)
+        self.assertIn("/Workspace/Users/me/.ygg/da/user_instructions.md", dests)
+        self.assertIn("/Workspace/Users/me/.ygg/da/skills/ygg-install.md", dests)
+        self.assertIn("/Workspace/Users/me/.ygg/da/skills/ygg-pitfalls.md", dests)
+        # Body bytes round-trip the source content.
+        body_by_dest = dict(recorded)
+        self.assertEqual(
+            body_by_dest["/Workspace/Users/me/.ygg/da/skills/ygg-install.md"],
+            b"# install\n",
+        )
+
+    def test_deploy_skills_continues_on_per_file_failure(self):
+        import argparse
+        from unittest.mock import MagicMock as _MM, patch as _patch
+
+        self.cli.args = argparse.Namespace(
+            skills_dir=str(self.skills_root),
+            deploy_target="/Workspace/Shared/.ygg/da",
+            deploy_overwrite=True,
+        )
+
+        recorded: list[str] = []
+
+        class _StubWP:
+            def __init__(self, dest):
+                self.dest = dest
+                self.parent = _MM()
+
+            def with_client(self, _client):
+                return self
+
+            def write_bytes(self, data, overwrite=False):
+                # Make one of the writes fail; the rest still go through.
+                if "ygg-install" in self.dest:
+                    raise RuntimeError("upstream 5xx")
+                recorded.append(self.dest)
+
+        with _patch(
+            "yggdrasil.databricks.fs.workspace_path.WorkspacePath.from_",
+            side_effect=lambda dest: _StubWP(dest),
+        ):
+            rc = self.cli.deploy_skills()
+
+        # Some files uploaded → 0 (the failure is logged, not fatal).
+        self.assertEqual(rc, 0)
+        # Failure was reported …
+        out = self._out()
+        self.assertIn("upstream 5xx", out)
+        self.assertIn("ygg-install.md", out)
+        # … but the other three still landed.
+        self.assertEqual(len(recorded), 3)
+
+    def test_deploy_skills_empty_dir_returns_1(self):
+        import argparse
+        import tempfile
+        from pathlib import Path
+
+        empty = Path(tempfile.mkdtemp(prefix="ygg-skills-empty-"))
+        self.addCleanup(self._rmtree, str(empty))
+
+        self.cli.args = argparse.Namespace(
+            skills_dir=str(empty),
+            deploy_target="/Workspace/x",
+            deploy_overwrite=True,
+        )
+        rc = self.cli.deploy_skills()
+        self.assertEqual(rc, 1)
+        self.assertIn("no .md files found", self._out())
+
+    def test_main_deploy_skills_runs_deploy_path(self):
+        # End-to-end through main(argv): parser builds, defaults merge,
+        # deploy_skills runs, no REPL.
+        import io
+        from unittest.mock import MagicMock as _MM, patch as _patch
+
+        client = self.client
+        recorded: list[str] = []
+
+        class _StubWP:
+            def __init__(self, dest):
+                self.dest = dest
+                self.parent = _MM()
+
+            def with_client(self, _client):
+                return self
+
+            def write_bytes(self, data, overwrite=False):
+                recorded.append(self.dest)
+
+        buf = io.StringIO()
+        with _patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             _patch(
+                "yggdrasil.databricks.fs.workspace_path.WorkspacePath.from_",
+                side_effect=lambda dest: _StubWP(dest),
+             ), \
+             _patch("sys.stdout", buf):
+            rc = main([
+                "--host", "x.databricks.com",
+                "--deploy-skills",
+                "--skills-dir", str(self.skills_root),
+                "--deploy-target", "/Workspace/Users/test/.ygg/da",
+                "--no-color",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(recorded), 4)

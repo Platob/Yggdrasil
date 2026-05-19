@@ -208,6 +208,27 @@ class GenieCLI(DatabricksCLI):
             help="Disable ANSI colors.",
         )
 
+        deploy_grp = parser.add_argument_group("Workspace skill deployment")
+        deploy_grp.add_argument(
+            "--deploy-skills", dest="deploy_skills", default=False,
+            action="store_true",
+            help="Upload assistant skills + instructions to the workspace, then exit.",
+        )
+        deploy_grp.add_argument(
+            "--skills-dir", dest="skills_dir", default=None,
+            help="Source directory for skills (default: $YGG_SKILLS_DIR, "
+                 "else ./databricks-assistant).",
+        )
+        deploy_grp.add_argument(
+            "--deploy-target", dest="deploy_target", default=None,
+            help="Workspace target path (default: /Workspace/Users/<me>/.ygg/databricks-assistant).",
+        )
+        deploy_grp.add_argument(
+            "--deploy-overwrite", dest="deploy_overwrite", default=True,
+            action=argparse.BooleanOptionalAction,
+            help="Overwrite existing files at the target (default on).",
+        )
+
     # ------------------------------------------------------------------ #
     # Defaults wiring
     # ------------------------------------------------------------------ #
@@ -291,16 +312,133 @@ class GenieCLI(DatabricksCLI):
     def run(self) -> int:
         """Apply CLI defaults to the Genie service, then drop into the REPL.
 
-        When ``--question/-q`` was supplied, fall back to a single-shot
-        ask + exit (no REPL prompt).
+        When ``--deploy-skills`` is on, upload the local skills /
+        instructions to the workspace and exit. When ``--question/-q``
+        was supplied, fall back to a single-shot ask + exit (no REPL
+        prompt). Otherwise drop into the REPL.
         """
         # Merge CLI flags into the Genie service's defaults once on entry.
         self.genie.defaults = self.defaults_from_args(self.args, self.genie.defaults)
+
+        if getattr(self.args, "deploy_skills", False):
+            return self.deploy_skills()
 
         question = getattr(self.args, "question", None)
         if question is not None:
             return self.ask_once(question)
         return self.run_repl()
+
+    # ------------------------------------------------------------------ #
+    # Workspace skill deployment
+    # ------------------------------------------------------------------ #
+    def deploy_skills(self) -> int:
+        """Upload ``databricks-assistant/`` to the workspace.
+
+        Reads from ``--skills-dir`` (or ``$YGG_SKILLS_DIR``, then
+        ``./databricks-assistant``) and uploads every ``*.md`` to
+        ``--deploy-target`` (default
+        ``/Workspace/Users/<me>/.ygg/databricks-assistant``). Sub-paths
+        ``skills/<file>.md`` and the two top-level instruction files
+        (``.assistant_workspace_instructions.md`` /
+        ``user_instructions.md``) are preserved relative to the source
+        root.
+
+        Returns 0 on success, non-zero when the source directory is
+        missing or no files were uploaded.
+        """
+        import os
+        from pathlib import Path
+
+        source = self._resolve_skills_dir()
+        if source is None or not source.is_dir():
+            self.error(
+                f"  skills source not found: {source}. "
+                "Pass --skills-dir or set YGG_SKILLS_DIR."
+            )
+            return 2
+
+        target_root = (
+            getattr(self.args, "deploy_target", None)
+            or os.environ.get("YGG_SKILLS_TARGET")
+            or self._default_deploy_target()
+        )
+        overwrite = bool(getattr(self.args, "deploy_overwrite", True))
+
+        # Collect (source_file, relative_path) pairs so the workspace
+        # layout mirrors the local tree (skills/ subfolder preserved).
+        candidates: list[tuple[Path, str]] = []
+        for path in sorted(source.rglob("*.md")):
+            rel = path.relative_to(source)
+            candidates.append((path, str(rel).replace(os.sep, "/")))
+
+        if not candidates:
+            self.warn(f"  no .md files found under {source}")
+            return 1
+
+        self.info(f"  deploying {len(candidates)} file(s) from {source}")
+        self.info(f"  target: {target_root}")
+
+        uploaded = 0
+        for src, rel in candidates:
+            dest = f"{target_root.rstrip('/')}/{rel}"
+            try:
+                self._upload_one(src, dest, overwrite=overwrite)
+            except Exception as exc:
+                self.error(f"  ✗ {rel}: {type(exc).__name__}: {exc}")
+                continue
+            self.success(f"  ✓ {rel}")
+            uploaded += 1
+
+        if uploaded == 0:
+            self.error("  no files uploaded")
+            return 1
+        self.success(f"  done — {uploaded}/{len(candidates)} uploaded.")
+        return 0
+
+    def _resolve_skills_dir(self):
+        """Pick the source dir for ``--deploy-skills``."""
+        import os
+        from pathlib import Path
+
+        arg = getattr(self.args, "skills_dir", None)
+        if arg:
+            return Path(arg).expanduser()
+        env = os.environ.get("YGG_SKILLS_DIR")
+        if env:
+            return Path(env).expanduser()
+        return Path.cwd() / "databricks-assistant"
+
+    def _default_deploy_target(self) -> str:
+        """Default workspace target: ``/Workspace/Users/<me>/.ygg/databricks-assistant``.
+
+        Falls back to ``/Workspace/Shared/.ygg/databricks-assistant``
+        when the current identity can't be resolved (service principal
+        or notebook context unavailable).
+        """
+        try:
+            current_user = self.client.workspace_client().current_user.me()
+            user_name = getattr(current_user, "user_name", None)
+            if user_name:
+                return f"/Workspace/Users/{user_name}/.ygg/databricks-assistant"
+        except Exception:
+            LOGGER.debug("Could not resolve current user; falling back to /Workspace/Shared",
+                         exc_info=True)
+        return "/Workspace/Shared/.ygg/databricks-assistant"
+
+    def _upload_one(self, src, dest: str, *, overwrite: bool) -> None:
+        """Upload one file to the workspace path.
+
+        Uses :class:`WorkspacePath` so retry / cache-invalidation /
+        parent-creation behave like every other lifecycle op in the
+        codebase. ``overwrite=True`` is the default — re-deploying
+        replaces the existing file; ``False`` raises if it already
+        exists.
+        """
+        from yggdrasil.databricks import WorkspacePath
+
+        wp = WorkspacePath.from_(dest).with_client(self.client)
+        wp.parent.mkdir(parents=True, exist_ok=True)
+        wp.write_bytes(src.read_bytes(), overwrite=overwrite)
 
     def run_repl(self) -> int:
         """REPL loop until the user quits. Returns a process exit code."""

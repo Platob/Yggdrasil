@@ -190,10 +190,77 @@ Two ways to parametrise a callable task:
 Mix-and-match by capturing job parameters via task `notebook_params` /
 `python_params` in your `JobTask` config.
 
-## Cluster vs serverless
+## Cluster vs serverless — pick by workload
 
-The default `JobTask.from_callable` task runs on **serverless** via
-`DEFAULT_ENVIRONMENT_KEY`. To pin classic compute:
+Default `JobTask.from_callable` runs on **serverless**. That's the
+right answer for **internal pipelines** (curated rebuilds, `dash_*`
+refreshes, dim joins, anything that talks only to Unity Catalog
+warehouses + Delta tables) — fast cold start, auto-scale, `ygg` is
+already provisioned via the AST-walked dependency resolution.
+
+It's the **wrong** answer for **ingestion pipelines that hit the
+public internet** (HTTP APIs, S3, vendor SFTP, third-party
+webhooks). Databricks serverless compute has no outbound internet
+access by default — egress is gated by the workspace network policy
+and most workspaces ship without one configured. Use a **custom
+all-purpose cluster** for ingestion, with `ygg[data,databricks,http]`
+preinstalled.
+
+| Task | Compute | Why |
+| --- | --- | --- |
+| Ingestion (HTTP API, S3 / GCS / Azure, FTP, webhooks) | **All-purpose cluster** with outbound internet | Serverless has no public-internet egress on most workspaces. |
+| Curated rebuild (raw_ → curated) | **Serverless** (`environment_key=DEFAULT_ENVIRONMENT_KEY`) | Internal to UC; fast cold start; ygg provisioned via AST deps. |
+| `dash_*` display rebuilds | **Serverless** | Same as curated — internal joins / windows. |
+| ML training (small data) | **Serverless** | UC-only; MLflow tracking is internal. |
+| ML training (heavy / GPU) | **Job cluster** (single-use, sized for the workload) | Serverless GPU is restricted; one-shot job cluster avoids leaving paid GPUs idle. |
+
+### Provisioning an ingestion cluster with ygg pre-installed
+
+```python
+INGESTION_CLUSTER_SPEC = {
+    "spark_version": "16.4.x-scala2.12",
+    "node_type_id": "Standard_DS3_v2",
+    "num_workers": 0,                                # single-node ingestion
+    "data_security_mode": "SINGLE_USER",
+    "spark_conf": {
+        "spark.databricks.cluster.profile": "singleNode",
+        "spark.master": "local[*, 4]",
+    },
+    # NETWORK ACCESS — required for ingestion (default workspaces lock
+    # serverless egress; classic clusters honour the workspace's NAT /
+    # public-IP policy).
+    "custom_tags": {"egress": "internet"},
+    # Pre-install ygg so the staged Python task starts from the right
+    # baseline. PyPi index libraries land before the script runs.
+    "library_specifications": [
+        {"pypi": {"package": "ygg[data,databricks,http]"}},
+    ],
+}
+
+cluster = dbc.clusters.create(name="ygg-ingest-default", **INGESTION_CLUSTER_SPEC)
+cluster.wait_for_state("RUNNING")
+```
+
+Then pin the ingestion task to it:
+
+```python
+job.pytask(
+    ingest_orders_since,
+    "2026-05-19T00:00:00Z",
+    task_key="ingest",
+    existing_cluster_id=cluster.cluster_id,
+).create()
+```
+
+Curated / display / ML tasks on the **same job** keep the
+serverless default — the cluster pin is per-task. A multi-task DAG
+ends up with one classic ingestion task and N serverless downstream
+tasks, all in one Job.
+
+## Pinning compute explicitly (when you need to override)
+
+To pin a serverless task to a specific environment (Python version,
+pinned wheels), or to pin classic compute on a per-task basis:
 
 ```python
 job.pytask(
@@ -210,9 +277,11 @@ job.pytask(
 job.pytask(ingest, task_key="ingest", existing_cluster_id="0123-…").create()
 ```
 
-For a heavy ingestion the serverless default usually beats a tiny
-single-node cluster on cold-start. Pin classic compute only when you
-need a specific Spark version, JVM lib, or init script.
+For internal pipelines the serverless default beats a tiny
+single-node cluster on cold-start. Pin classic compute when you
+need: a specific Spark version, a JVM lib, an init script, **or
+internet egress for ingestion** (see the workload table above —
+serverless has no public outbound on most workspaces).
 
 ## Triggering + waiting (already covered)
 

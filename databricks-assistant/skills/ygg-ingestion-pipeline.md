@@ -70,6 +70,19 @@ Use the parse-then-write shape for paginated lists, streaming
 deltas, or any source where the curated layer needs predicate-pushed
 column access.
 
+## Compute choice — ingestion ≠ internal pipeline
+
+Ingestion tasks talk to the public internet (HTTP APIs, S3, vendor
+SFTP), and **Databricks serverless compute has no outbound internet
+egress on most workspaces**. Pin ingestion tasks to a **custom
+all-purpose cluster** with `ygg[data,databricks,http]` preinstalled.
+Curated + `dash_*` + ML tasks downstream stay on **serverless** —
+they only touch Unity Catalog. The cluster pin is per-task; one Job
+DAG ends up with one classic ingestion task and N serverless tasks
+fanning out from it. See
+[`ygg-databricks-job-workflows`](ygg-databricks-job-workflows.md)
+§ "Cluster vs serverless".
+
 ## Worked example — REST API → Delta table, hourly
 
 ```python
