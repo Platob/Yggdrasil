@@ -811,3 +811,78 @@ class TestCombinedCacheIntegration:
         # Remote got the network-miss writeback for ``c`` (``b`` was
         # already there and the miss-then-writeback path covers ``c``).
         assert any(call["rows"] >= 1 for call in tab.inserts)
+
+
+# ===========================================================================
+# cache_only — bypass the network fallback
+# ===========================================================================
+
+
+class TestCacheOnly:
+
+    def test_send_local_hit_returns_cached_response(self, tmp_path) -> None:
+        # Local cache has the row → cache_only should still return it
+        # without any network activity.
+        cache = _local_cfg(tmp_path)
+        req = make_request("https://example.com/x")
+        _seed_local(cache, make_response(request=req, body=b'{"v":"cached"}'))
+
+        s = StubSession()
+        out = s.send(req, local_cache=cache, cache_only=True)
+
+        assert out.json() == {"v": "cached"}
+        assert len(s.calls) == 0
+
+    def test_send_remote_hit_returns_cached_response(self) -> None:
+        # Remote cache holds the row → cache_only returns it without
+        # crossing the wire.
+        tab = _FakeRemoteTabular()
+        remote = _remote_cfg(tab)
+        req = make_request("https://example.com/x")
+        _seed_remote(tab, make_response(request=req, body=b'{"v":"from-remote"}'))
+
+        s = StubSession()
+        out = s.send(req, remote_cache=remote, cache_only=True)
+
+        assert out.json() == {"v": "from-remote"}
+        assert len(s.calls) == 0
+
+    def test_send_full_miss_raises_lookup_error(self, tmp_path) -> None:
+        # Both caches empty → cache_only must raise instead of firing
+        # the network request.
+        cache = _local_cfg(tmp_path)
+        tab = _FakeRemoteTabular()
+        remote = _remote_cfg(tab)
+        req = make_request("https://example.com/x")
+
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"v":"network"}'))
+
+        with pytest.raises(LookupError, match="cache_only=True"):
+            s.send(
+                req,
+                local_cache=cache,
+                remote_cache=remote,
+                cache_only=True,
+            )
+        assert len(s.calls) == 0, "cache_only must not cross the wire"
+
+    def test_send_many_drops_misses_and_keeps_hits(self, tmp_path) -> None:
+        # Local hit + full miss → cache_only yields the hit and drops
+        # the miss from the stream without any network call.
+        cache = _local_cfg(tmp_path)
+        a = make_request("https://example.com/a")
+        b = make_request("https://example.com/b")
+        _seed_local(cache, make_response(request=a, body=b'{"k":"a"}'))
+
+        s = StubSession()
+        s.queue(make_response(request=b, body=b'{"k":"b"}'))
+
+        out = list(s.send_many(
+            iter([a, b]),
+            local_cache=cache,
+            cache_only=True,
+        ))
+
+        assert [r.json()["k"] for r in out] == ["a"]
+        assert len(s.calls) == 0
