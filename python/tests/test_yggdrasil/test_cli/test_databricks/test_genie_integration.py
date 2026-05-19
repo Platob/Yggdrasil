@@ -1,11 +1,17 @@
 """Live-integration tests for ``ygg-genie`` (the :class:`GenieCLI`).
 
-Skipped unless ``DATABRICKS_HOST`` (plus matching credentials) and
-``DATABRICKS_GENIE_SPACE_ID`` are exported. Exercises the same agent
-flows that :mod:`test_databricks.test_genie.test_integration` covers,
-but routed through the CLI's parse → defaults-merge → REPL plumbing
-so the wiring between argparse, the agent, and on-disk artifacts
-is verified end-to-end against a real workspace.
+Skipped unless ``DATABRICKS_HOST`` (plus matching credentials) is
+exported. Exercises the same agent flows that
+:mod:`test_databricks.test_genie.test_integration` covers, but routed
+through the CLI's parse → defaults-merge → REPL plumbing so the
+wiring between argparse, the agent, and on-disk artifacts is
+verified end-to-end against a real workspace.
+
+Like the agent-side integration tests, this module relies on
+``auto_pick_space`` instead of gating on ``DATABRICKS_GENIE_SPACE_ID``;
+the whole class skips when the workspace has zero Genie spaces.
+``DATABRICKS_GENIE_SPACE_ID`` stays available as an optional override
+for reproducibility.
 """
 from __future__ import annotations
 
@@ -30,17 +36,21 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 
 class GenieCLIIntegrationCase(DatabricksIntegrationCase):
-    """Common setup: tmp output dir, configured space id, no-color CLI."""
+    """Common setup: tmp output dir, no-color CLI, optional pinned space."""
 
     def setUp(self) -> None:
         super().setUp()
-        space_id = _env("DATABRICKS_GENIE_SPACE_ID")
-        if not space_id:
-            raise unittest.SkipTest(
-                "DATABRICKS_GENIE_SPACE_ID not set — skipping ygg-genie "
-                "integration tests."
-            )
-        self.space_id = space_id
+        # Optional override — honored if set, otherwise auto-pick.
+        self.space_id = _env("DATABRICKS_GENIE_SPACE_ID")
+        if self.space_id is None:
+            first = next(iter(self.client.genie.list_spaces()), None)
+            if first is None:
+                raise unittest.SkipTest(
+                    "Workspace has no Genie spaces — nothing to test "
+                    "against. Create at least one space or set "
+                    "DATABRICKS_GENIE_SPACE_ID."
+                )
+
         self.tmpdir = Path(tempfile.mkdtemp(prefix="ygg-genie-cli-int-"))
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         # Reset the cached agent so each test starts with a clean history.
@@ -74,7 +84,7 @@ class TestGenieCLIOneShot(GenieCLIIntegrationCase):
 
         self.client.genie.defaults = replace(
             self.client.genie.defaults,
-            space_id=self.space_id,
+            space_id=self.space_id,  # None when no env override → auto-pick
             agent_output_dir=str(self.tmpdir),
         )
         rc = self.cli.ask_once(question)
@@ -95,16 +105,21 @@ class TestGenieCLIMain(GenieCLIIntegrationCase):
         from unittest.mock import patch
 
         question = _env("DATABRICKS_GENIE_QUESTION_TEXT", _DEFAULT_TEXT_QUESTION)
+        # --space-id is optional — pinned via env when set, otherwise the
+        # CLI's --auto-pick-space default (on) resolves a space.
+        argv = [
+            "--output-dir", str(self.tmpdir),
+            "--auto-save",
+            "--auto-save-format", "json",
+            "--no-color",
+            "-q", question,
+        ]
+        if self.space_id is not None:
+            argv = ["--space-id", self.space_id, *argv]
+
         buf = io.StringIO()
         with patch("sys.stdout", buf):
-            rc = main([
-                "--space-id", self.space_id,
-                "--output-dir", str(self.tmpdir),
-                "--auto-save",
-                "--auto-save-format", "json",
-                "--no-color",
-                "-q", question,
-            ])
+            rc = main(argv)
         self.assertEqual(rc, 0)
         # The CLI should have rendered an answer header to stdout.
         self.assertIn("status:", buf.getvalue())

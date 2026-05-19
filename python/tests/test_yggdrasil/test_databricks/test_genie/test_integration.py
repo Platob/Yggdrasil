@@ -1,31 +1,36 @@
 """Live-integration tests for :class:`GenieAgent`.
 
 Skipped unless ``DATABRICKS_HOST`` (plus matching credentials) is
-exported — see :class:`DatabricksIntegrationCase`. Most tests also
-require ``DATABRICKS_GENIE_SPACE_ID`` so they have a known space to
-ask against; tests that can run against an auto-picked space stay
-enabled when that's missing.
+exported — see :class:`DatabricksIntegrationCase`. Tests rely on
+:attr:`GenieDefaults.auto_pick_space` (on by default) so they run
+against whichever Genie space the workspace returns first; no env
+gate is required beyond what the SDK itself needs. The whole class
+skips when the workspace has zero Genie spaces.
+
+Assertions deliberately target API mechanics (a completed
+:class:`GenieAnswer`, a readable file on disk, a stable
+``conversation_id`` across turns) rather than specific Genie reply
+text — that way the same prompts work against any auto-picked space
+without becoming brittle.
 
 Environment knobs
 -----------------
 ``DATABRICKS_HOST`` / ``DATABRICKS_TOKEN`` / ``DATABRICKS_CONFIG_PROFILE``
     Standard SDK credentials read by :class:`DatabricksClient`.
 ``DATABRICKS_GENIE_SPACE_ID``
-    Space id used by every test that needs a deterministic target. Most
-    tests skip when this is unset rather than silently auto-picking, so
-    a developer running locally with a tagged workspace gets the same
-    coverage as CI.
+    Optional override. When set, pins every test to that space id;
+    otherwise auto-pick runs.
 ``DATABRICKS_GENIE_WAREHOUSE_ID``
     Optional warehouse override for query materialisation. Falls back
     to the workspace default warehouse.
 ``DATABRICKS_GENIE_QUESTION_TEXT``
     Optional natural-language question used by the text-only ask. The
-    default ("Hello, what data do you have access to?") is a reliable
-    no-SQL prompt against any space.
+    default ("Hello, what data do you have access to?") is a generic
+    prompt every Genie space should respond to.
 ``DATABRICKS_GENIE_QUESTION_SQL``
     Optional natural-language question used by the SQL-producing ask.
-    Defaults to a generic count question — override per-space if your
-    Genie definition prefers a different prompt shape.
+    Defaults to a generic count question; tests that need a SQL
+    attachment self-skip when Genie returns text only.
 
 Cleanup
 -------
@@ -66,9 +71,10 @@ class GenieIntegrationCase(DatabricksIntegrationCase):
 
     Subclasses inherit the live :class:`DatabricksClient` (``cls.client``)
     from :class:`DatabricksIntegrationCase` and access the agent via
-    :attr:`agent`. ``DATABRICKS_GENIE_SPACE_ID`` is required for most
-    tests; the few that don't need a deterministic space override
-    :meth:`setUp` to drop the skip.
+    :attr:`agent`. No env-var gate beyond what the SDK requires —
+    ``auto_pick_space`` resolves a target on the first ask. When the
+    workspace has zero Genie spaces, the whole case skips (there's
+    literally nothing to test against).
     """
 
     SPACE_ID_ENV: ClassVar[str] = "DATABRICKS_GENIE_SPACE_ID"
@@ -76,21 +82,31 @@ class GenieIntegrationCase(DatabricksIntegrationCase):
 
     def setUp(self) -> None:
         super().setUp()
-        space_id = _env(self.SPACE_ID_ENV)
-        if not space_id:
-            raise unittest.SkipTest(
-                f"{self.SPACE_ID_ENV} not set — skipping. Export a known "
-                "Genie space id to run agent integration tests."
-            )
 
+        # Honor an explicit env override for reproducibility, but never
+        # require it — ``auto_pick_space`` (default True) handles the
+        # unset case by walking ``list_spaces``.
+        space_id = _env(self.SPACE_ID_ENV)
         warehouse_id = _env(self.WAREHOUSE_ID_ENV)
+
+        if space_id is None:
+            # Probe once so the whole case skips cleanly on workspaces
+            # with no Genie spaces, instead of failing every test with
+            # "Could not auto-pick a Genie space".
+            first = next(iter(self.client.genie.list_spaces()), None)
+            if first is None:
+                raise unittest.SkipTest(
+                    "Workspace has no Genie spaces — nothing to test "
+                    "against. Create at least one space or set "
+                    f"{self.SPACE_ID_ENV} to a known id."
+                )
 
         self.tmpdir = Path(tempfile.mkdtemp(prefix="ygg-genie-int-"))
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
 
         self.client.genie.defaults = replace(
             self.client.genie.defaults,
-            space_id=space_id,
+            space_id=space_id,  # None lets auto_pick_space resolve on first ask
             warehouse_id=warehouse_id,
             agent_output_dir=str(self.tmpdir),
             # Auto-save off here — every test explicitly opts in so the
@@ -111,15 +127,19 @@ class GenieIntegrationCase(DatabricksIntegrationCase):
 class TestGenieIntegrationSpace(GenieIntegrationCase):
     """Space lookup + metadata — cheap, no chat traffic."""
 
-    def test_ensure_space_returns_configured_space(self):
+    def test_ensure_space_returns_a_space(self):
         space = self.client.genie.ensure_space()
         self.assertIsInstance(space, GenieSpace)
-        self.assertEqual(space.space_id, _env(self.SPACE_ID_ENV))
+        self.assertTrue(space.space_id)
+        # When the user pinned ``DATABRICKS_GENIE_SPACE_ID``, ensure_space
+        # honors it; otherwise auto-pick returned something real.
+        pinned = _env(self.SPACE_ID_ENV)
+        if pinned is not None:
+            self.assertEqual(space.space_id, pinned)
 
-    def test_list_spaces_includes_configured(self):
-        configured = _env(self.SPACE_ID_ENV)
-        ids = {s.space_id for s in self.client.genie.list_spaces()}
-        self.assertIn(configured, ids)
+    def test_list_spaces_is_non_empty(self):
+        spaces = list(self.client.genie.list_spaces())
+        self.assertGreater(len(spaces), 0)
 
     def test_space_details_load(self):
         space = self.client.genie.space()
