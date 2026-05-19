@@ -44,6 +44,7 @@ most for routing.
 | [`ygg-databricks-genie`](skills/ygg-databricks-genie.md) | `dbc.genie.ask`, `GenieSpace`, `GenieConversation` |
 | [`ygg-databricks-vector-search`](skills/ygg-databricks-vector-search.md) | `dbc.ai.vector_search.endpoint/index/query`, `Schema → schema_json`, time-series-aware retrieval, typed Arrow results |
 | [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) | End-to-end recipe: HTTP / API / S3 → discover → cast → Unity Catalog → schedule |
+| [`ygg-resilient-ingestion`](skills/ygg-resilient-ingestion.md) | `ErrorNotifyingHTTPSession`, SMTP / Slack notifiers, quarantine + dead-letter tables, idempotent MERGE, "minimum strict failing" pattern |
 | [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) | Sample an unknown endpoint, infer + tighten a `Schema`, validate against fresh data |
 | [`ygg-data-modeling`](skills/ygg-data-modeling.md) | Schema-per-source, `raw_<entity>` + provenance, PK / FK / partition via `Field` metadata, cross-source joins via shared ISO dims |
 | [`ygg-curated-views`](skills/ygg-curated-views.md) | UTC timestamps, decimal money, ISO currency / country / language / timezone, lat/lon + `geo_point()` + GeoJSON, naming, table vs view |
@@ -74,10 +75,13 @@ can be answered end-to-end without further questions:
 3. [`ygg-databricks-tables`](skills/ygg-databricks-tables.md) —
    reconcile catalog / schema / table, `ensure_created(schema=...)`.
 4. [`ygg-http`](skills/ygg-http.md) +
-   [`ygg-cast`](skills/ygg-cast.md) — pull pages with
-   `HTTPSession` (or `SchemaSession` when responses *are* the
-   bronze cache), cast through the schema, write via
-   `Table.insert / merge / async_insert`.
+   [`ygg-cast`](skills/ygg-cast.md) +
+   [`ygg-resilient-ingestion`](skills/ygg-resilient-ingestion.md) —
+   pull pages with `HTTPSession` (or `SchemaSession` when responses
+   *are* the bronze cache, or `ErrorNotifyingHTTPSession` when the
+   upstream is flaky and the schedule must keep running), cast
+   through the schema, route bad rows to a quarantine table, write
+   via `Table.insert / merge / async_insert`.
 5. [`ygg-databricks-job-workflows`](skills/ygg-databricks-job-workflows.md)
    — stage the callable via `Job.pytask`, attach a
    `CronSchedule` / `FileArrivalTriggerConfiguration`.

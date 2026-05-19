@@ -37,7 +37,13 @@ the dedicated skill for the call-site details.
    are the cache — see the decision tree below), cast through the
    schema, write via `Table.insert` / `async_insert` / `merge`. See
    [`ygg-http`](ygg-http.md) +
-   [`ygg-statement-result`](ygg-statement-result.md).
+   [`ygg-statement-result`](ygg-statement-result.md). For any
+   ingestion that must keep running when the upstream is flaky —
+   alert on persistent failures, quarantine poison rows, re-fetch
+   the missed window on the next run — wrap the session in
+   `ErrorNotifyingHTTPSession` and follow
+   [`ygg-resilient-ingestion`](ygg-resilient-ingestion.md). That's
+   the "minimum strict failing" path the default schedule wants.
 6. **Stage the callable as a Databricks Job task** with a schedule.
    See [`ygg-databricks-job-workflows`](ygg-databricks-job-workflows.md).
 7. **Build the curated layer.** Standardise UTC timestamps, decimal
