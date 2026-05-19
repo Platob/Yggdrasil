@@ -51,7 +51,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         VectorSearchIndexesAPI,
     )
 
+    from yggdrasil.data import Schema
+
     from .service import VectorSearch
+
+
+SchemaLike = Union["Schema", "pa.Schema", Mapping[str, str], str]
+RowsLike = Union[
+    "pa.Table",
+    "pl.DataFrame",
+    "pd.DataFrame",
+    Sequence[Mapping[str, Any]],
+]
 
 
 __all__ = [
@@ -164,6 +175,93 @@ def _coerce_pipeline_type(value: Any) -> "Any":
     if value is None:
         return PipelineType.TRIGGERED
     return PipelineType(str(value).upper())
+
+
+def _schema_to_json(schema: "SchemaLike") -> str:
+    """Build the ``schema_json`` payload Direct-Access indexes expect.
+
+    Accepts the shape the rest of the project speaks:
+
+    - :class:`yggdrasil.data.Schema` — each field is serialised as
+      ``"<name>": "<databricks_sql_type>"`` via
+      :meth:`DataType.to_spark_name` so the index row schema stays in
+      sync with the curated table / Arrow definition that produced it.
+    - :class:`pyarrow.Schema` — round-tripped through
+      :meth:`Schema.from_arrow_schema` so the same projection rule
+      applies.
+    - ``Mapping[str, str]`` — taken verbatim (caller already speaks the
+      Databricks shape, e.g. ``{"id": "string", "vec": "array<float>"}``).
+    - ``str`` — assumed to already be a JSON document and returned
+      unchanged for callers handing in a hand-rolled payload.
+
+    The Databricks Vector Search API documents the shape as
+    a flat ``{"col": "<sql_type>"}`` object — all-lower-case type
+    tokens — so :meth:`DataType.to_spark_name` is lower-cased on the
+    way out.
+    """
+    from yggdrasil.pickle import json as ygg_json
+
+    if isinstance(schema, str):
+        return schema
+
+    if isinstance(schema, Mapping):
+        pairs = {str(k): str(v) for k, v in schema.items()}
+        return ygg_json.dumps(pairs, to_bytes=False)
+
+    # Lazy: pyarrow.Schema duck-typed via ``.names`` + ``.types``;
+    # yggdrasil ``Schema`` / ``StructField`` has ``.fields`` of
+    # :class:`Field` objects.
+    fields = getattr(schema, "fields", None)
+    if fields is not None and all(
+        hasattr(f, "name") and hasattr(f, "dtype") for f in fields
+    ):
+        pairs = {f.name: f.dtype.to_spark_name().lower() for f in fields}
+        return ygg_json.dumps(pairs, to_bytes=False)
+
+    # pyarrow.Schema fallback — go through the yggdrasil round-trip
+    # so the type-text projection follows the same rule.
+    try:
+        from yggdrasil.data import Schema as YggSchema
+
+        ygg_schema = YggSchema.from_arrow_schema(schema)
+        pairs = {f.name: f.dtype.to_spark_name().lower() for f in ygg_schema.fields}
+        return ygg_json.dumps(pairs, to_bytes=False)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise TypeError(
+            f"schema must be a yggdrasil Schema, pyarrow.Schema, mapping, "
+            f"or JSON string; got {type(schema).__name__}"
+        ) from exc
+
+
+def _rows_to_pylist(rows: "RowsLike") -> list[dict[str, Any]]:
+    """Coerce a frame / row sequence into ``list[dict]`` for the JSON wire.
+
+    Vector Search's ``upsert_data_vector_index`` takes a JSON-encoded
+    list of rows — a genuine row endpoint (see ``CLAUDE.md``: "yield
+    Python rows to a downstream sink"). Going Arrow → Python rows once
+    at the boundary is the cheapest path that still lets callers pass
+    the data shape they already have.
+    """
+    if rows is None:
+        return []
+
+    # ``pa.Table`` first — the zero-copy path callers reach for when
+    # they already hold an Arrow frame. ``to_pylist`` is the documented
+    # exit kernel for row endpoints; one C-bridge pass per call.
+    if hasattr(rows, "to_pylist") and hasattr(rows, "num_rows"):
+        return rows.to_pylist()
+
+    # ``pl.DataFrame`` — go through Arrow so dtype intent (timestamp
+    # precision, decimal scale) survives the trip.
+    if hasattr(rows, "to_arrow") and not isinstance(rows, (list, tuple)):
+        return rows.to_arrow().to_pylist()
+
+    # ``pd.DataFrame`` — same shape via ``to_dict("records")``.
+    if hasattr(rows, "to_dict") and hasattr(rows, "columns"):
+        return rows.to_dict(orient="records")
+
+    # ``Sequence[Mapping]`` — already there.
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +793,8 @@ class VectorSearchIndex(DatabricksResource):
         self,
         *,
         primary_key: str,
-        schema_json: str,
+        schema: "Optional[SchemaLike]" = None,
+        schema_json: Optional[str] = None,
         embedding_source_columns: Optional[Sequence[Union[str, "EmbeddingSourceColumn"]]] = None,
         embedding_vector_columns: Optional[Sequence[Union[Mapping[str, Any], "EmbeddingVectorColumn"]]] = None,
         embedding_model_endpoint_name: Optional[str] = None,
@@ -705,11 +804,22 @@ class VectorSearchIndex(DatabricksResource):
     ) -> "VectorSearchIndex":
         """Create a ``DIRECT_ACCESS`` index that the caller upserts into.
 
-        ``schema_json`` is a JSON string describing the row schema (see
-        the Databricks Vector Search docs for the shape — typically
-        ``{"<col>": "<type>", ...}``). Provide either
-        ``embedding_source_columns`` (managed embeddings) or
-        ``embedding_vector_columns`` (self-managed) the same way as
+        ``schema`` is the row schema in any of the shapes
+        :func:`_schema_to_json` accepts:
+
+        - :class:`yggdrasil.data.Schema` — the canonical surface; field
+          names, types, and nullability stay in lockstep with the
+          curated table backing the index.
+        - :class:`pyarrow.Schema` — the Arrow-native shortcut.
+        - ``Mapping[str, str]`` — the Databricks-native flat
+          ``{"<col>": "<sql_type>"}`` shape.
+
+        ``schema_json`` is the legacy raw JSON string, kept for callers
+        already speaking the wire format. Pass exactly one of
+        ``schema`` / ``schema_json``.
+
+        Provide either ``embedding_source_columns`` (managed embeddings)
+        or ``embedding_vector_columns`` (self-managed) the same way as
         :meth:`create_delta_sync`.
         """
         from databricks.sdk.errors import AlreadyExists, DatabricksError
@@ -727,6 +837,20 @@ class VectorSearchIndex(DatabricksResource):
                 f"default set. Pass endpoint_name=... or set "
                 f"VectorSearch.defaults.endpoint_name."
             )
+
+        if schema is not None and schema_json is not None:
+            raise ValueError(
+                f"Cannot create {self!r}: pass schema= OR schema_json=, "
+                f"not both."
+            )
+        if schema is None and schema_json is None:
+            raise ValueError(
+                f"Cannot create {self!r}: pass schema= (Schema / "
+                f"pa.Schema / mapping) or schema_json= (raw JSON)."
+            )
+        resolved_schema_json = (
+            schema_json if schema_json is not None else _schema_to_json(schema)
+        )
 
         source_cols: Optional[list[EmbeddingSourceColumn]] = None
         if embedding_source_columns:
@@ -775,7 +899,7 @@ class VectorSearchIndex(DatabricksResource):
             )
 
         spec = DirectAccessVectorIndexSpec(
-            schema_json=schema_json,
+            schema_json=resolved_schema_json,
             embedding_source_columns=source_cols,
             embedding_vector_columns=vector_cols,
         )
@@ -861,27 +985,45 @@ class VectorSearchIndex(DatabricksResource):
     # ------------------------------------------------------------------ #
     # Direct-access data plane
     # ------------------------------------------------------------------ #
-    def upsert(self, rows: Sequence[Mapping[str, Any]]) -> Any:
+    def upsert(self, rows: "RowsLike") -> Any:
         """Upsert rows into a ``DIRECT_ACCESS`` index.
 
-        ``rows`` is a sequence of dicts (one per row) matching the
-        ``schema_json`` passed at create time. The vector column is
-        either pre-computed (self-managed embeddings) or filled in by
-        the managed embedding endpoint.
+        ``rows`` accepts every shape the rest of the project speaks:
+
+        - :class:`pyarrow.Table` — preferred when the data comes from
+          the cast registry / Delta / curated tables. Conversion to
+          the wire's row-dict shape happens in one ``to_pylist`` hop
+          at the boundary (vector-search upserts are a genuine row
+          endpoint — see ``CLAUDE.md``).
+        - :class:`polars.DataFrame` — routed through Arrow so dtype
+          intent survives.
+        - :class:`pandas.DataFrame` — ``to_dict(orient='records')``.
+        - ``Sequence[Mapping]`` — already row-shaped, used as-is.
+
+        The vector column is either pre-computed (self-managed
+        embeddings) or filled in server-side by the managed
+        embedding endpoint.
         """
         from yggdrasil.pickle import json as ygg_json
 
-        if not rows:
+        payload_rows = _rows_to_pylist(rows)
+        if not payload_rows:
             LOGGER.debug("Skipping upsert into %r: empty rows", self)
             return None
 
-        payload = ygg_json.dumps(list(rows), to_bytes=False)
-        LOGGER.debug("Upserting %d rows into vector-search index %r", len(rows), self)
+        payload = ygg_json.dumps(payload_rows, to_bytes=False)
+        LOGGER.debug(
+            "Upserting %d rows into vector-search index %r",
+            len(payload_rows), self,
+        )
         response = self.api.upsert_data_vector_index(
             index_name=self.index_name,
             inputs_json=payload,
         )
-        LOGGER.info("Upserted %d rows into vector-search index %r", len(rows), self)
+        LOGGER.info(
+            "Upserted %d rows into vector-search index %r",
+            len(payload_rows), self,
+        )
         return response
 
     def delete_rows(self, primary_keys: Sequence[str]) -> Any:
@@ -930,6 +1072,7 @@ class VectorSearchIndex(DatabricksResource):
         columns_to_rerank: Optional[Sequence[str]] = None,
         reranker: "Optional[RerankerConfig]" = None,
         score_threshold: Optional[float] = None,
+        target_schema: "Optional[Schema]" = None,
     ) -> "VectorSearchQueryResult":
         """Run a similarity / hybrid / full-text query against this index.
 
@@ -959,6 +1102,14 @@ class VectorSearchIndex(DatabricksResource):
         score_threshold
             Optional minimum score; rows below the threshold are
             dropped server-side.
+        target_schema
+            Optional :class:`yggdrasil.data.Schema` pinned on the
+            returned :class:`VectorSearchQueryResult`. When set, the
+            result's :meth:`VectorSearchQueryResult.to_arrow_table`
+            casts each result column through the yggdrasil cast
+            registry to honour the caller's dtype / nullability /
+            timezone intent (matches the ``CastOptions(target_field=...)``
+            pattern used by :class:`StatementResult` and Genie).
         """
         from yggdrasil.pickle import json as ygg_json
 
@@ -995,7 +1146,11 @@ class VectorSearchIndex(DatabricksResource):
             reranker=reranker,
             score_threshold=score_threshold,
         )
-        return VectorSearchQueryResult(index=self, response=response)
+        return VectorSearchQueryResult(
+            index=self,
+            response=response,
+            target_schema=target_schema,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1068,9 +1223,12 @@ class VectorSearchQueryResult:
         self,
         index: VectorSearchIndex,
         response: "QueryVectorIndexResponse",
+        *,
+        target_schema: "Optional[Schema]" = None,
     ):
         self.index = index
         self.response = response
+        self.target_schema = target_schema
 
     def __repr__(self) -> str:
         return (
@@ -1128,7 +1286,11 @@ class VectorSearchQueryResult:
             endpoint_name=endpoint_name,
             page_token=token,
         )
-        return VectorSearchQueryResult(index=self.index, response=response)
+        return VectorSearchQueryResult(
+            index=self.index,
+            response=response,
+            target_schema=self.target_schema,
+        )
 
     def iter_pages(self) -> Iterator["VectorSearchQueryResult"]:
         """Yield ``self`` then every subsequent page."""
@@ -1140,12 +1302,23 @@ class VectorSearchQueryResult:
     # ------------------------------------------------------------------ #
     # Materialisation
     # ------------------------------------------------------------------ #
-    def to_arrow_table(self) -> "pa.Table":
+    def to_arrow_table(
+        self,
+        *,
+        target_schema: "Optional[Schema]" = None,
+    ) -> "pa.Table":
         """Materialise the result as a :class:`pyarrow.Table`.
 
         Each column is cast to the Arrow type resolved from its
         ``type_text``; unknown / complex types stay as strings so the
         original byte payload is preserved.
+
+        When ``target_schema`` is set (either inline or via the
+        :attr:`target_schema` carried from :meth:`VectorSearchIndex.query`),
+        the assembled Arrow table is run through the yggdrasil cast
+        registry so the caller's dtype / nullability / timezone
+        intent is honoured — the same path :class:`StatementResult`
+        and :class:`GenieAnswer` already use.
         """
         import pyarrow as pa
         import pyarrow.compute as pc
@@ -1153,7 +1326,8 @@ class VectorSearchQueryResult:
         columns = self.columns
         rows = self.data_array
         if not columns:
-            return pa.table({})
+            empty = pa.table({})
+            return self._apply_target_schema(empty, target_schema)
 
         # Transpose rows → columns at the C boundary. Cells arrive as
         # JSON-string scalars (``List[List[str]]`` is the wire shape);
@@ -1185,17 +1359,49 @@ class VectorSearchQueryResult:
                     arr = string_arr
             arrays.append(arr)
             names.append(col.name or "")
-        return pa.table(arrays, names=names)
+        table = pa.table(arrays, names=names)
+        return self._apply_target_schema(table, target_schema)
 
-    def to_polars(self) -> "pl.DataFrame":
+    def _apply_target_schema(
+        self,
+        table: "pa.Table",
+        override: "Optional[Schema]",
+    ) -> "pa.Table":
+        """Route ``table`` through the yggdrasil cast registry when a target is set.
+
+        Resolves the target in priority order: the per-call
+        ``override`` argument, then :attr:`target_schema` carried
+        from :meth:`VectorSearchIndex.query`. Returns ``table``
+        unchanged when neither is set.
+
+        The cast goes through ``Schema.cast_arrow`` — the same
+        registered path :class:`StatementResult` /
+        :class:`GenieAnswer` use, so timezone intent, decimal scale,
+        nullability, and field order all stay honored without a
+        hand-rolled per-column cast loop.
+        """
+        target = override if override is not None else self.target_schema
+        if target is None:
+            return table
+        return target.cast_arrow(table)
+
+    def to_polars(
+        self,
+        *,
+        target_schema: "Optional[Schema]" = None,
+    ) -> "pl.DataFrame":
         """Materialise the result as a :class:`polars.DataFrame`."""
         from yggdrasil.polars.lib import polars as pl
 
-        return pl.from_arrow(self.to_arrow_table())
+        return pl.from_arrow(self.to_arrow_table(target_schema=target_schema))
 
-    def to_pandas(self) -> "pd.DataFrame":
+    def to_pandas(
+        self,
+        *,
+        target_schema: "Optional[Schema]" = None,
+    ) -> "pd.DataFrame":
         """Materialise the result as a :class:`pandas.DataFrame`."""
-        return self.to_arrow_table().to_pandas()
+        return self.to_arrow_table(target_schema=target_schema).to_pandas()
 
     def to_dicts(self) -> list[dict[str, Any]]:
         """Return the rows as a list of dicts keyed by column name.

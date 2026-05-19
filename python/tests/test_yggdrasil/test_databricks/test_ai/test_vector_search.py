@@ -501,6 +501,67 @@ class TestVectorSearchIndexCreate(VectorSearchTestCase):
                 schema_json="{}",
             )
 
+    def test_create_direct_access_accepts_ygg_schema(self):
+        """Schema → schema_json projection: each Field's DataType.to_spark_name lowered."""
+        from yggdrasil.data import DataType, Field, Schema
+        from yggdrasil.pickle import json as ygg_json
+
+        info = _build_vector_index(index_type=VectorIndexType.DIRECT_ACCESS)
+        self.indexes_api.create_index.return_value = info
+
+        schema = Schema.from_fields([
+            Field("id", DataType.from_("string"), nullable=False),
+            Field("text", DataType.from_("string")),
+            Field("vec", DataType.from_("list<float>")),
+        ])
+        self.vs.index("main.rag.docs").create_direct_access(
+            primary_key="id",
+            schema=schema,
+            embedding_vector_columns=[{"name": "vec", "embedding_dimension": 768}],
+        )
+        call = self.indexes_api.create_index.call_args
+        spec: DirectAccessVectorIndexSpec = call.kwargs["direct_access_index_spec"]
+        parsed = ygg_json.loads(spec.schema_json)
+        self.assertEqual(parsed, {
+            "id": "string",
+            "text": "string",
+            "vec": "array<float>",
+        })
+
+    def test_create_direct_access_accepts_mapping(self):
+        from yggdrasil.pickle import json as ygg_json
+
+        info = _build_vector_index(index_type=VectorIndexType.DIRECT_ACCESS)
+        self.indexes_api.create_index.return_value = info
+
+        self.vs.index("main.rag.docs").create_direct_access(
+            primary_key="id",
+            schema={"id": "string", "vec": "array<float>"},
+            embedding_vector_columns=[{"name": "vec", "embedding_dimension": 768}],
+        )
+        call = self.indexes_api.create_index.call_args
+        spec: DirectAccessVectorIndexSpec = call.kwargs["direct_access_index_spec"]
+        self.assertEqual(
+            ygg_json.loads(spec.schema_json),
+            {"id": "string", "vec": "array<float>"},
+        )
+
+    def test_create_direct_access_rejects_both_schema_shapes(self):
+        with self.assertRaises(ValueError):
+            self.vs.index("main.rag.docs").create_direct_access(
+                primary_key="id",
+                schema={"id": "string"},
+                schema_json='{"id": "string"}',
+                embedding_vector_columns=[{"name": "vec", "embedding_dimension": 768}],
+            )
+
+    def test_create_direct_access_rejects_no_schema(self):
+        with self.assertRaises(ValueError):
+            self.vs.index("main.rag.docs").create_direct_access(
+                primary_key="id",
+                embedding_vector_columns=[{"name": "vec", "embedding_dimension": 768}],
+            )
+
 
 # ---------------------------------------------------------------------------
 # Index runtime
@@ -569,6 +630,62 @@ class TestVectorSearchIndexRuntime(VectorSearchTestCase):
 
     def test_upsert_skips_when_empty(self):
         self.assertIsNone(self._idx().upsert([]))
+        self.indexes_api.upsert_data_vector_index.assert_not_called()
+
+    def test_upsert_accepts_arrow_table(self):
+        """Arrow Table → list[dict] at the row-endpoint boundary."""
+        import pyarrow as pa
+        from yggdrasil.pickle import json as ygg_json
+
+        table = pa.table({
+            "id": pa.array(["a", "b"], type=pa.string()),
+            "text": pa.array(["alpha", "beta"], type=pa.string()),
+        })
+        self._idx().upsert(table)
+        call = self.indexes_api.upsert_data_vector_index.call_args
+        parsed = ygg_json.loads(call.kwargs["inputs_json"])
+        self.assertEqual(parsed, [
+            {"id": "a", "text": "alpha"},
+            {"id": "b", "text": "beta"},
+        ])
+
+    def test_upsert_accepts_polars_dataframe(self):
+        try:
+            import polars as pl
+        except ImportError:  # pragma: no cover - optional dep
+            self.skipTest("polars not installed")
+        from yggdrasil.pickle import json as ygg_json
+
+        df = pl.DataFrame({"id": ["a", "b"], "text": ["alpha", "beta"]})
+        self._idx().upsert(df)
+        call = self.indexes_api.upsert_data_vector_index.call_args
+        parsed = ygg_json.loads(call.kwargs["inputs_json"])
+        self.assertEqual(parsed, [
+            {"id": "a", "text": "alpha"},
+            {"id": "b", "text": "beta"},
+        ])
+
+    def test_upsert_accepts_pandas_dataframe(self):
+        try:
+            import pandas as pd
+        except ImportError:  # pragma: no cover - optional dep
+            self.skipTest("pandas not installed")
+        from yggdrasil.pickle import json as ygg_json
+
+        df = pd.DataFrame({"id": ["a", "b"], "text": ["alpha", "beta"]})
+        self._idx().upsert(df)
+        call = self.indexes_api.upsert_data_vector_index.call_args
+        parsed = ygg_json.loads(call.kwargs["inputs_json"])
+        self.assertEqual(parsed, [
+            {"id": "a", "text": "alpha"},
+            {"id": "b", "text": "beta"},
+        ])
+
+    def test_upsert_skips_when_empty_arrow_table(self):
+        import pyarrow as pa
+
+        empty = pa.table({"id": pa.array([], type=pa.string())})
+        self.assertIsNone(self._idx().upsert(empty))
         self.indexes_api.upsert_data_vector_index.assert_not_called()
 
     def test_delete_rows_passes_primary_keys(self):
@@ -684,6 +801,27 @@ class TestVectorSearchQuery(VectorSearchTestCase):
         call = self.indexes_api.query_index.call_args
         self.assertEqual(call.kwargs["filters_json"], '{"category": "news"}')
 
+    def test_query_target_schema_threaded_through_result(self):
+        """`target_schema` on query() lands on the returned QueryResult."""
+        from yggdrasil.data import DataType, Field, Schema
+
+        self._set_query_response(_build_query_response(
+            column_specs=[("id", "string"), ("score", "double")],
+            rows=[["a", "0.9"]],
+        ))
+        target = Schema.from_fields([
+            Field("id", DataType.from_("string"), nullable=False),
+            Field("score", DataType.from_("float64"), nullable=False),
+        ])
+        result = self.vs.index("main.rag.docs").query(
+            columns=["id"],
+            query_text="x",
+            target_schema=target,
+        )
+        self.assertIs(result.target_schema, target)
+        # Pagination preserves the target.
+        self.assertIsNone(result.next_page())  # no next page → None, but no crash
+
 
 # ---------------------------------------------------------------------------
 # Query result materialisation
@@ -755,6 +893,49 @@ class TestVectorSearchQueryResult(VectorSearchTestCase):
         table = result.to_arrow_table()
         self.assertEqual(table.num_rows, 0)
         self.assertEqual(table.column_names, ["id", "score"])
+
+    def test_to_arrow_table_applies_target_schema(self):
+        """Target Schema casts every column through the ygg registry."""
+        import pyarrow as pa
+
+        from yggdrasil.data import DataType, Field, Schema
+
+        result = self._make_result(
+            column_specs=[("id", "string"), ("score", "double")],
+            rows=[["a", "0.9"], ["b", "0.8"]],
+        )
+        # Promote ``score`` from float64 to decimal(10, 4) — the cast
+        # registry handles the conversion.
+        target = Schema.from_fields([
+            Field("id", DataType.from_("string"), nullable=False),
+            Field("score", DataType.from_("decimal(10, 4)"), nullable=False),
+        ])
+        table = result.to_arrow_table(target_schema=target)
+        self.assertEqual(table.schema.field("id").type, pa.string())
+        self.assertEqual(table.schema.field("score").type, pa.decimal128(10, 4))
+
+    def test_to_arrow_table_uses_carried_target_schema(self):
+        """The target_schema carried from query() applies to to_arrow_table()."""
+        import pyarrow as pa
+
+        from yggdrasil.data import DataType, Field, Schema
+
+        target = Schema.from_fields([
+            Field("id", DataType.from_("string"), nullable=False),
+            Field("score", DataType.from_("float32"), nullable=False),
+        ])
+        self.vs.defaults = replace(self.vs.defaults, endpoint_name="rag-endpoint")
+        result = VectorSearchQueryResult(
+            index=self.vs.index("main.rag.docs"),
+            response=_build_query_response(
+                column_specs=[("id", "string"), ("score", "double")],
+                rows=[["a", "0.9"]],
+            ),
+            target_schema=target,
+        )
+        table = result.to_arrow_table()
+        # Carried target lowers ``score`` to float32.
+        self.assertEqual(table.schema.field("score").type, pa.float32())
 
     def test_to_polars(self):
         result = self._make_result(
