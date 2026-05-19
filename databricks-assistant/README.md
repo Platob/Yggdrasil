@@ -30,6 +30,26 @@ The Assistant picks skills by matching the task against each skill's
 "When to use" section, so the filename and that section are what matter
 most for routing.
 
+## Skills inventory
+
+| Skill | Covers |
+| --- | --- |
+| [`ygg-install`](skills/ygg-install.md) | `%pip install "ygg[data,databricks]"`, version pinning, env vars |
+| [`ygg-databricks-client`](skills/ygg-databricks-client.md) | `DatabricksClient`, auth, services, resource singletons |
+| [`ygg-databricks-sql`](skills/ygg-databricks-sql.md) | `dbc.sql.execute(...)`, parameter binding, warehouse vs cluster routing |
+| [`ygg-databricks-tables`](skills/ygg-databricks-tables.md) | `Table.create / insert / async_insert / merge / delete_where` |
+| [`ygg-databricks-files`](skills/ygg-databricks-files.md) | `DatabricksPath`, DBFS / Volume / Workspace IO |
+| [`ygg-databricks-jobs`](skills/ygg-databricks-jobs.md) | Jobs, secrets, clusters, warehouses, `WaitingConfig` |
+| [`ygg-databricks-genie`](skills/ygg-databricks-genie.md) | `dbc.genie.ask`, `GenieSpace`, `GenieConversation` |
+| [`ygg-cast`](skills/ygg-cast.md) | `convert(value, target)`, `CastOptions`, registry extension |
+| [`ygg-schema-fields`](skills/ygg-schema-fields.md) | `DataField` / `Schema` / `DataType`, schema intent |
+| [`ygg-statement-result`](skills/ygg-statement-result.md) | `StatementResult` / `Tabular` / `DataTable` consumption, streaming |
+| [`ygg-enums`](skills/ygg-enums.md) | `ByteUnit`, `Currency`, `MimeType`, `TimeZone`, … |
+| [`ygg-json-pickle`](skills/ygg-json-pickle.md) | `yggdrasil.pickle.json`, `serde`, singleton-by-config pickling |
+| [`ygg-http`](skills/ygg-http.md) | `HTTPSession`, `HTTPRequest`, `HTTPResponse`, `URL`, retries / caching |
+| [`ygg-logging`](skills/ygg-logging.md) | `<Verb> <ResourceNoun> %r (...)`, `%r` lazy logging, anti-patterns |
+| [`ygg-pitfalls`](skills/ygg-pitfalls.md) | Post-generation checklist — row loops, bare imports, pre-checks, etc. |
+
 ## Keeping these files in sync with the library
 
 Skills reference public surface (`yggdrasil.data.cast.convert`,
