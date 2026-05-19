@@ -110,7 +110,7 @@ class Header:
         payload:size bytes
     """
 
-    __slots__ = ("tag", "codec", "size", "meta_size", "start", "metadata")
+    __slots__ = ("tag", "codec", "size", "meta_size", "start", "metadata", "_meta_blob")
 
     def __init__(
         self,
@@ -127,6 +127,7 @@ class Header:
         self.meta_size = meta_size
         self.start = start
         self.metadata = metadata
+        self._meta_blob: bytes | None = None
 
     @property
     def header_start(self) -> int:
@@ -148,7 +149,7 @@ class Header:
     ) -> "Header":
         """Build a header from semantic fields."""
         encoded = encode_metadata(metadata)
-        return cls(
+        h = cls(
             tag=tag,
             codec=codec,
             size=size,
@@ -156,6 +157,8 @@ class Header:
             start=start + HEADER_SIZE + len(encoded),
             metadata=dict(metadata) if metadata else None,
         )
+        h._meta_blob = encoded
+        return h
 
     @classmethod
     def read_from(
@@ -193,7 +196,7 @@ class Header:
                 )
 
         metadata = decode_metadata(meta_blob)
-        return cls(
+        h = cls(
             tag=tag,
             codec=codec,
             size=size,
@@ -201,6 +204,8 @@ class Header:
             start=pos + HEADER_SIZE + meta_size,
             metadata=metadata,
         )
+        h._meta_blob = meta_blob
+        return h
 
     def payload_view(self, buffer: BytesIO) -> BytesIO:
         """Return a zero-copy view of the payload bytes."""
@@ -228,12 +233,11 @@ class Header:
                 f"Payload size mismatch: header.size={self.size}, actual={len(payload)}"
             )
 
-        metadata_blob = encode_metadata(self.metadata)
-        if len(metadata_blob) != self.meta_size:
-            raise ValueError(
-                f"Metadata size mismatch: header.meta_size={self.meta_size}, "
-                f"actual={len(metadata_blob)}"
-            )
+        # Reuse the pre-encoded blob cached at build/read time; fall back to
+        # re-encoding only for Headers constructed directly via __init__.
+        metadata_blob = self._meta_blob
+        if metadata_blob is None:
+            metadata_blob = encode_metadata(self.metadata)
 
         # Single struct.pack for the fixed 12-byte header.
         fixed = _HEADER_STRUCT.pack(self.tag, self.codec, self.size, self.meta_size)

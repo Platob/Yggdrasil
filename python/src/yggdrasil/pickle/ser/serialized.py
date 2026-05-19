@@ -418,8 +418,12 @@ class Serialized(ABC, Generic[T]):
             size=len(encoded),
             metadata=metadata,
         )
-        buf = head.write_to(encoded)
-        payload = head.payload_view(buf)
+        # Wrap the encoded payload directly — no intermediate wire-format
+        # buffer needed. The old path called head.write_to(encoded) to create
+        # [header+meta+payload] and then payload_view() to copy just [payload]
+        # back out, costing two BytesIO allocations and two copies of the
+        # payload. BytesIO(encoded) is one allocation and one copy.
+        payload = BytesIO(encoded)
 
         if cls is Serialized:
             target = Tags.get_class(tag)
@@ -428,8 +432,6 @@ class Serialized(ABC, Generic[T]):
                     f"Tag {tag} resolved to invalid serializer class: {target!r}, "
                     "install more recent version with uv pip install ygg[data,databricks,pickle]>=0.6.21"
                 )
-        elif cls is Serialized:
-            raise TypeError(f"Tag {tag} resolved to invalid serializer class: {cls!r}")
         else:
             target = cls
 
