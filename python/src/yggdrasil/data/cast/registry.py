@@ -28,7 +28,16 @@ Key ideas
   3) Any-wildcard target handler
   4) MRO cross-product lookup
   5) scan-based fallback (issubclass checks for "odd" keys)
-  6) one-hop composition: from -> mid -> to (single intermediate only)
+
+  Note: an earlier version of the registry auto-composed a
+  ``from -> mid -> to`` converter by chaining two registered hops
+  through any intermediate type. That path produced silent
+  surprises — picked an unintended intermediate when multiple
+  candidates matched, masked missing direct converters, and made
+  every cast's correctness depend on the order of unrelated
+  registrations. The composition step is gone; callers wanting a
+  two-hop cast register the direct ``from -> to`` converter
+  explicitly.
 
 The public API is `register_converter()` + `convert()`.
 
@@ -202,7 +211,13 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
       4) namespace-triggered late imports (polars/pandas/pyspark) once
       5) MRO cross-product lookup
       6) scan-based fallback with issubclass checks for odd keys
-      7) one-hop composition: from -> mid -> to (single intermediate)
+
+    Composition (auto-chaining ``from -> mid -> to`` through any
+    registered intermediate) used to live as a step 7; it was
+    removed because the intermediate picked depended on the order
+    of unrelated registrations, masked missing direct converters,
+    and produced silent surprises. Callers needing a two-hop cast
+    register the direct converter explicitly.
 
     Results (including ``None`` for "no path") are cached in ``_find_cache`` on
     the ``check_namespace=True`` path so repeated calls for the same type pair pay
@@ -274,29 +289,6 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
         except TypeError:
             continue
 
-    # 7) one-level composition: from -> mid -> to
-    # This is intentionally limited: deterministic and avoids path-search explosions.
-    for (rf, mid), c1 in _registry.items():
-        try:
-            if not type_matches(from_type, rf):
-                continue
-        except TypeError:
-            continue
-
-        for (rmid, rt), c2 in _registry.items():
-            try:
-                if not type_matches(mid, rmid):
-                    continue
-                if not type_matches(to_hint, rt):
-                    continue
-            except TypeError:
-                continue
-
-            def composed(v: Any, o: Optional["CastOptions"], _c1=c1, _c2=c2) -> Any:
-                return _c2(_c1(v, o), o)
-
-            return composed
-
     return None
 
 
@@ -331,7 +323,7 @@ def convert(
          str)``) bail out here, before any function call.
       3) ``Optional[T]`` unwrap for generic-alias targets.
       4) ``None`` → ``None`` if optional, else ``default_scalar(target)``.
-      5) Registry lookup (exact / wildcard / namespace / MRO / one-hop composition).
+      5) Registry lookup (exact / wildcard / namespace / MRO / scan-fallback).
       6) ``Enum`` member resolution and ``dataclass`` from-mapping coercion.
       7) Container generics — ``list`` / ``set`` / ``tuple`` / ``dict`` / ``Mapping``.
       8) ``TypeError`` — no path found.

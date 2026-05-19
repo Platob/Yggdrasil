@@ -10,8 +10,10 @@ The contract under test:
   scalar for ``T``.
 * **MRO fallback** — a registration on a base class catches subclass
   values.
-* **One-hop composition** — ``X → Y`` plus ``Y → int`` chains
-  automatically.
+* **No auto-composition** — the registry refuses to chain ``X → Y``
+  plus ``Y → int`` into ``X → int`` on the fly. Callers register
+  the direct converter explicitly so the intermediate type is
+  intentional, not an artifact of registration order.
 * **Native type support** — Enums (by name + value), dataclasses
   (with future-annotations resolution + private-field skipping),
   list / tuple / set / Mapping with element coercion.
@@ -100,7 +102,7 @@ class TestIntToStr:
 
 
 # ---------------------------------------------------------------------------
-# Dispatch — MRO fallback + one-hop composition
+# Dispatch — MRO fallback, no auto-composition
 # ---------------------------------------------------------------------------
 
 
@@ -120,7 +122,16 @@ class TestDispatch:
 
         assert convert(B(9), int) == 9
 
-    def test_one_hop_composition(self) -> None:
+    def test_no_auto_composition(self) -> None:
+        """Two registered hops do NOT auto-chain into a direct cast.
+
+        The registry used to compose ``X → Y → int`` into a synthetic
+        ``X → int`` converter at lookup time; that path was removed
+        because the chosen intermediate depended on the order of
+        unrelated registrations and silently masked missing direct
+        converters. ``convert(X(42), int)`` now raises ``TypeError``
+        unless a direct ``X → int`` converter is registered.
+        """
         class X:
             def __init__(self, n: int) -> None:
                 self.n = n
@@ -136,6 +147,14 @@ class TestDispatch:
         @register_converter(Y, int)
         def y_to_int(v: Y, opts: Any) -> int:
             return int(v.s)
+
+        with pytest.raises(TypeError):
+            convert(X(42), int)
+
+        # The direct registration restores the cast.
+        @register_converter(X, int)
+        def x_to_int(v: X, opts: Any) -> int:
+            return v.n
 
         assert convert(X(42), int) == 42
 
