@@ -83,6 +83,9 @@ class BooleanType(PrimitiveType):
     # Exporters
     # ------------------------------------------------------------------
 
+    def _default_pyhint(self) -> Any:
+        return bool
+
     def to_arrow(self) -> pa.DataType:
         return pa.bool_()
 

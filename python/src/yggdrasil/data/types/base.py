@@ -222,6 +222,54 @@ _FLOAT_TYPE_ID_TO_SIZE: dict[DataTypeId, int] = {
 _DATA_TYPE_DEFAULT_SINGLETONS: dict[type, "DataType"] = {}
 
 
+#: Sentinel for the ``_pyhint_cache`` slot. ``None`` is a real value
+#: (``NullType.to_pyhint()`` returns ``type(None)`` / the literal None
+#: hint), so distinguish "no cached hint" from "cached hint is None"
+#: with a private object identity rather than ``...`` (Ellipsis is
+#: itself a typing-system value users sometimes pass).
+_PYHINT_UNSET: Any = object()
+
+
+def _stamp_pyhint_cache(result: "DataType", hint: Any) -> None:
+    """First-write-wins cache stamp for the parsed Python hint.
+
+    Called from :meth:`DataType.from_pytype` to preserve the original
+    *hint* on *result* so :meth:`DataType.to_pyhint` can hand it back
+    verbatim — keeping user-defined dataclasses / enum classes /
+    ``np.int64``-style aliases that the canonical reconstruction
+    would collapse.
+
+    Skip / overwrite policy:
+
+    * ``None`` / ``type(None)`` / a bare :class:`DataType` instance /
+      a :class:`ParsedDataType` aren't useful as hints (the default
+      reconstruction already returns the same shape), so we don't
+      stamp them.
+    * When the slot is already set, leave it alone — the first
+      caller of :meth:`from_pytype` against a singleton wins. Without
+      this rule, ``from_pytype(np.int64)`` running after
+      ``from_pytype(int)`` would corrupt the shared
+      ``IntegerType()`` singleton's cache for every prior caller.
+    * The ``object.__setattr__`` call works on the frozen dataclass
+      because the slot is intentionally NOT declared as a
+      ``dataclasses.field`` — it lives outside ``__eq__`` / ``__hash__``
+      / pickle state, same pattern as the engine-projection caches
+      (``_to_arrow_cached`` etc.).
+    """
+    if hint is None or hint is _NONE_TYPE:
+        return
+    if isinstance(hint, (DataType, ParsedDataType)):
+        return
+    if getattr(result, "_pyhint_cache", _PYHINT_UNSET) is not _PYHINT_UNSET:
+        return
+    try:
+        object.__setattr__(result, "_pyhint_cache", hint)
+    except (AttributeError, TypeError):
+        # Slot rejection (custom subclass with __slots__ that excluded
+        # the cache name) — degrade silently to "no cache".
+        pass
+
+
 #: Memoized ``pa.DataType -> DataType`` dispatch results. Populated on
 #: first :meth:`DataType.from_arrow_type` miss; reused on every
 #: subsequent peek of the same ``pa.DataType``. Cast pipelines build
@@ -636,6 +684,59 @@ class DataType(BaseChildrenFields, ABC):
             "name": self.type_id.name,
         }
 
+    # ------------------------------------------------------------------
+    # Python type hint round-trip
+    #
+    # :meth:`from_pytype` parses a Python annotation (``int``, ``str``,
+    # ``list[int]``, ``Optional[int]``, a dataclass, an Enum, …) into a
+    # :class:`DataType`. :meth:`to_pyhint` is the inverse — emit the
+    # Python type hint a caller would type to land on this dtype.
+    #
+    # Two-tier resolution:
+    #
+    # 1. **Cached hint** — :meth:`from_pytype` stamps the original
+    #    parsed hint on the resulting DataType via
+    #    ``object.__setattr__(self, "_pyhint_cache", hint)`` whenever
+    #    the hint carries information the default reconstruction would
+    #    lose (a user-defined dataclass, an ``Enum`` subclass, an
+    #    ``np.int64`` alias, a typing-generic with concrete child
+    #    args). Subsequent :meth:`to_pyhint` calls return the cached
+    #    value verbatim. The cache lives outside the dataclass
+    #    ``fields`` so equality / hash / pickle stay clean.
+    # 2. **Default reconstruction** — when no cache is set,
+    #    :meth:`_default_pyhint` (subclass hook) generates a canonical
+    #    Python hint from the dtype's own state. ``IntegerType()``
+    #    returns ``int``, ``StringType()`` returns ``str``,
+    #    ``ArrayType(item_field=Field("item", IntegerType()))`` returns
+    #    ``list[int]``, etc.
+    # ------------------------------------------------------------------
+
+    def to_pyhint(self) -> Any:
+        """Return the Python type hint that maps back to this DataType.
+
+        Cached when :meth:`from_pytype` stamped an explicit hint on
+        the instance (preserves user-defined dataclasses, enum
+        classes, ``numpy.int64`` and other narrow aliases the
+        canonical reconstruction would collapse). Otherwise falls
+        back to :meth:`_default_pyhint`, the subclass hook that
+        builds a canonical hint from the dtype's own state.
+        """
+        cache = getattr(self, "_pyhint_cache", _PYHINT_UNSET)
+        if cache is not _PYHINT_UNSET:
+            return cache
+        return self._default_pyhint()
+
+    def _default_pyhint(self) -> Any:
+        """Subclass hook: canonical Python hint for this dtype.
+
+        Override per concrete type (``IntegerType`` → ``int``,
+        ``StringType`` → ``str``, ``ArrayType`` → ``list[T]`` with
+        the child type recursed, …). The base default returns
+        :class:`typing.Any` so an unimplemented subclass still
+        round-trips through ``Any`` rather than raising.
+        """
+        return Any
+
     def to_json(self, to_bytes: bool = False) -> AnyStr:
         dumped = json.dumps(self.to_dict())
         if to_bytes:
@@ -1035,6 +1136,23 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_pytype(cls, hint: Any) -> "DataType":
+        """Parse a Python annotation into a :class:`DataType`.
+
+        Stamps the resulting instance's ``_pyhint_cache`` with the
+        original *hint* when the canonical reconstruction
+        (:meth:`_default_pyhint`) wouldn't round-trip — so
+        ``from_pytype(MyDataclass).to_pyhint()`` returns
+        ``MyDataclass`` itself rather than a generic struct hint,
+        ``from_pytype(MyEnum).to_pyhint()`` returns the enum class,
+        and ``from_pytype(np.int64).to_pyhint()`` returns
+        ``np.int64`` rather than the canonical ``int``.
+        """
+        result = cls._from_pytype_impl(hint)
+        _stamp_pyhint_cache(result, hint)
+        return result
+
+    @classmethod
+    def _from_pytype_impl(cls, hint: Any) -> "DataType":
         if isinstance(hint, DataType):
             return hint
 

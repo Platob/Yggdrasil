@@ -186,6 +186,13 @@ class FloatingPointType(NumericType):
     def _size(self) -> int:
         return self.byte_size or 8
 
+    def _default_pyhint(self) -> Any:
+        # ``float`` is the canonical Python hint regardless of byte
+        # width (Python doesn't expose float8 / float16 / float32 as
+        # distinct annotations). ``np.float32`` aliases survive
+        # via the ``_pyhint_cache`` stamp on first parse.
+        return float
+
     def to_arrow(self) -> pa.DataType:
         if self._size == 2:
             return pa.float16() if hasattr(pa, "float16") else pa.float32()

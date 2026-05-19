@@ -321,6 +321,14 @@ class IntegerType(NumericType):
         base["signed"] = self.signed
         return base
 
+    def _default_pyhint(self) -> Any:
+        # All integer widths / signedness collapse to ``int`` in Python.
+        # Callers that need the original ``np.int64`` / ``np.uint8`` /
+        # custom ``IntEnum`` alias rely on the ``_pyhint_cache`` stamp
+        # ``from_pytype`` sets — this fallback is the safe round-trip
+        # when no hint was preserved.
+        return int
+
     # ------------------------------------------------------------------
     # Exporters
     # ------------------------------------------------------------------

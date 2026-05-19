@@ -100,6 +100,9 @@ class BinaryType(PrimitiveType):
     # Exporters
     # ------------------------------------------------------------------
 
+    def _default_pyhint(self) -> Any:
+        return bytes
+
     def to_arrow(self) -> pa.DataType:
         if self.byte_size is not None:
             return pa.binary(self.byte_size)

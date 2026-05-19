@@ -82,6 +82,12 @@ class NullType(PrimitiveType):
     # Exporters
     # ------------------------------------------------------------------
 
+    def _default_pyhint(self) -> Any:
+        # ``type(None)`` is the Python annotation for "only None is
+        # allowed". Inside a Union (``Optional[T]`` / ``T | None``)
+        # this is what marks the column nullable per the project rule.
+        return type(None)
+
     def to_arrow(self) -> pa.DataType:
         return pa.null()
 

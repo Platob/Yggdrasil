@@ -99,6 +99,12 @@ class StringType(PrimitiveType):
     # Exporters
     # ==================================================================
 
+    def _default_pyhint(self) -> Any:
+        # All string flavours (utf8 / large_utf8 / view) round-trip
+        # as ``str`` in Python. Fixed-width / Unicode-narrower subtypes
+        # rely on their ``_pyhint_cache`` stamp to preserve.
+        return str
+
     def to_arrow(self) -> pa.DataType:
         if self.large:
             return pa.large_string()
