@@ -32,6 +32,7 @@ from yggdrasil.data.cast.datetime import (
     int_to_date,
     int_to_datetime,
     normalize_datetime_string,
+    str_to_timedelta,
     truncate_datetime_value,
 )
 
@@ -243,3 +244,45 @@ class TestTruncate:
         assert out == dt.datetime(
             2024, 5, 1, 0, 0, tzinfo=dt.timezone.utc
         )
+
+
+# ---------------------------------------------------------------------------
+# Timedelta parsing
+# ---------------------------------------------------------------------------
+
+
+class TestStrToTimedelta:
+
+    @pytest.mark.parametrize(
+        "td",
+        [
+            dt.timedelta(days=1),
+            dt.timedelta(days=2),
+            dt.timedelta(days=-1),
+            dt.timedelta(seconds=30),
+            dt.timedelta(days=1, hours=1, minutes=2, seconds=3),
+            dt.timedelta(days=1, microseconds=500_000),
+            dt.timedelta(seconds=-30),
+            dt.timedelta(days=1, hours=10, minutes=20, seconds=30, microseconds=123_456),
+        ],
+    )
+    def test_python_str_roundtrip(self, td: dt.timedelta) -> None:
+        assert str_to_timedelta(str(td)) == td
+
+    def test_compact_days_shorthand(self) -> None:
+        assert str_to_timedelta("1d 0:00:00") == dt.timedelta(days=1)
+        assert str_to_timedelta("-2d 1:00") == dt.timedelta(days=-2, hours=1)
+
+    def test_unit_form(self) -> None:
+        assert str_to_timedelta("15m") == dt.timedelta(minutes=15)
+        assert str_to_timedelta("2.5h") == dt.timedelta(hours=2, minutes=30)
+
+    def test_iso_duration(self) -> None:
+        assert str_to_timedelta("PT15M") == dt.timedelta(minutes=15)
+
+    def test_float_fallback(self) -> None:
+        assert str_to_timedelta("3.5") == dt.timedelta(seconds=3, microseconds=500_000)
+
+    def test_invalid_raises(self) -> None:
+        with pytest.raises(ValueError, match="Cannot parse timedelta"):
+            str_to_timedelta("not a duration")

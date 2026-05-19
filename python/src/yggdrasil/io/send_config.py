@@ -58,6 +58,7 @@ _SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
         "stream",
         "remote_cache",
         "local_cache",
+        "cache_only",
         "spark_session",
     }
 )
@@ -1005,6 +1006,13 @@ class SendConfig(_ConfigBase):
     wait: WaitingConfig = field(default=DEFAULT_WAITING_CONFIG)
     remote_cache: CacheConfig = field(default=DEFAULT_CACHE_CONFIG)
     local_cache: CacheConfig = field(default=DEFAULT_CACHE_CONFIG)
+    # When True, ``Session._send`` consults the local + remote caches as
+    # usual but skips the network fallback — a full miss raises
+    # :class:`LookupError` instead of crossing the wire. ``send_many``
+    # silently drops misses from the stream. Lets callers replay a known
+    # warm cache offline (or after an outage) without an unintended
+    # upstream fetch.
+    cache_only: bool = False
     spark_session: Optional["SparkSession"] = field(
         default=None,
         hash=False,
@@ -1024,6 +1032,7 @@ class SendConfig(_ConfigBase):
             "wait": self.wait,
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
+            "cache_only": self.cache_only,
             "spark_session": None,
         }
 
@@ -1033,6 +1042,7 @@ class SendConfig(_ConfigBase):
         object.__setattr__(self, "wait", state["wait"])
         object.__setattr__(self, "remote_cache", state["remote_cache"])
         object.__setattr__(self, "local_cache", state["local_cache"])
+        object.__setattr__(self, "cache_only", state.get("cache_only", False))
         object.__setattr__(self, "spark_session", None)
 
     @classmethod
@@ -1064,6 +1074,7 @@ class SendManyConfig(_ConfigBase):
     stream: bool = True
     remote_cache: CacheConfig = field(default_factory=CacheConfig)
     local_cache: CacheConfig = field(default_factory=CacheConfig)
+    cache_only: bool = False
     spark_session: Optional["SparkSession"] = field(
         default=None,
         hash=False,
@@ -1090,6 +1101,7 @@ class SendManyConfig(_ConfigBase):
             "stream": self.stream,
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
+            "cache_only": self.cache_only,
             "normalize": self.normalize,
             "batch_size": self.batch_size,
             "ordered": self.ordered,
@@ -1105,6 +1117,7 @@ class SendManyConfig(_ConfigBase):
         object.__setattr__(self, "stream", state["stream"])
         object.__setattr__(self, "remote_cache", state["remote_cache"])
         object.__setattr__(self, "local_cache", state["local_cache"])
+        object.__setattr__(self, "cache_only", state.get("cache_only", False))
         object.__setattr__(self, "normalize", state["normalize"])
         object.__setattr__(self, "batch_size", state["batch_size"])
         object.__setattr__(self, "ordered", state["ordered"])
@@ -1134,6 +1147,7 @@ class SendManyConfig(_ConfigBase):
                 "stream": arg.stream,
                 "remote_cache": arg.remote_cache,
                 "local_cache": arg.local_cache,
+                "cache_only": arg.cache_only,
                 "spark_session": arg.spark_session,
             }
             # Overrides win, but a None override means "no opinion" — fall back
@@ -1162,5 +1176,6 @@ class SendManyConfig(_ConfigBase):
             stream=self.stream,
             remote_cache=self.remote_cache if with_remote_cache else CacheConfig(),
             local_cache=self.local_cache if with_local_cache else CacheConfig(),
+            cache_only=self.cache_only,
             spark_session=self.spark_session if with_spark else None,
         )

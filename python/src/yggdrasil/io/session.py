@@ -872,6 +872,7 @@ class Session(Singleton, ABC):
         stream: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        cache_only: bool = False,
         spark_session: Optional["SparkSession"] = None,
         start: bool = True,
         **options,
@@ -895,6 +896,7 @@ class Session(Singleton, ABC):
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            cache_only=cache_only,
             spark_session=spark_session,
             **options,
         )
@@ -1021,6 +1023,18 @@ class Session(Singleton, ABC):
                 return remote_response
 
         # --- 3. No cache hit — perform actual request ---
+        # ``cache_only`` callers opted out of the network fallback. The
+        # cache lookups above already ran; reaching here means both
+        # missed, so raise instead of crossing the wire.
+        if config.cache_only:
+            raise LookupError(
+                f"cache_only=True but no cached response for {request.method} "
+                f"{request.url} (local_cache_enabled="
+                f"{effective_local_cfg.local_cache_enabled}, "
+                f"remote_cache_enabled="
+                f"{effective_remote_cfg.remote_cache_enabled})."
+            )
+
         request = self.prepare_request_before_send(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
         response = self._local_send(request, config=config)
@@ -1067,6 +1081,7 @@ class Session(Singleton, ABC):
         stream: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        cache_only: bool = False,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
@@ -1100,6 +1115,7 @@ class Session(Singleton, ABC):
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            cache_only=cache_only,
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
@@ -1965,6 +1981,7 @@ class Session(Singleton, ABC):
         stream: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        cache_only: bool = False,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
@@ -1994,6 +2011,7 @@ class Session(Singleton, ABC):
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            cache_only=cache_only,
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
@@ -2014,6 +2032,7 @@ class Session(Singleton, ABC):
         stream: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        cache_only: bool = False,
         **options,
     ) -> "SparkDataFrame":
         """Send one request via Spark and return a lazy ``DataFrame[Response]``.
@@ -2034,6 +2053,7 @@ class Session(Singleton, ABC):
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            cache_only=cache_only,
             **options,
         )
 
@@ -2049,6 +2069,7 @@ class Session(Singleton, ABC):
         stream: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        cache_only: bool = False,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
@@ -2083,6 +2104,7 @@ class Session(Singleton, ABC):
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            cache_only=cache_only,
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
@@ -2403,7 +2425,24 @@ class Session(Singleton, ABC):
                 continue
 
             # --- Stage 3: fetch misses ---
+            # ``cache_only`` skips the network fan-out entirely: drop
+            # the remaining misses from the stream and emit just what
+            # the caches answered. No writeback either — there are no
+            # new hits to persist.
             failed: list[Response] = []
+            if config.cache_only:
+                LOGGER.debug(
+                    "send_many chunk #%d: cache_only=True, dropping "
+                    "%d miss(es) without fetching",
+                    chunk_index, len(after_remote),
+                )
+                yield ResponseBatch(
+                    local_hits=local_hits,
+                    remote_hits=remote_hits,
+                    new_hits=new_hits,
+                    spark=spark,
+                )
+                continue
             if is_spark:
                 # Network results stay in Spark — never collected to
                 # the driver. raise_error doesn't short-circuit a
