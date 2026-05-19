@@ -74,6 +74,16 @@ retry loop around `session.send(...)`. For local response caching
 pass a `CacheConfig` (see `yggdrasil/io/session.py`); for remote /
 shared caching, the same `Session` supports a Mongo-backed cache.
 
+For failures that **outlast** the retry budget (vendor down for an
+hour, auth token revoked, persistent 5xx on one record), wrap the
+session in `ErrorNotifyingHTTPSession` — it fires a notifier
+callback on persistent failure and returns a synthetic
+`status_code=0` response instead of raising, so a flaky upstream
+doesn't take the ingestion pipeline down. See
+[`ygg-resilient-ingestion`](ygg-resilient-ingestion.md) for the
+full pattern (notifier shapes, quarantine tables, dead-letter,
+idempotent re-runs).
+
 ## URLs are values, not strings
 
 ```python
