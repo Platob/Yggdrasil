@@ -44,6 +44,8 @@ most for routing.
 | [`ygg-databricks-genie`](skills/ygg-databricks-genie.md) | `dbc.genie.ask`, `GenieSpace`, `GenieConversation` |
 | [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) | End-to-end recipe: HTTP / API / S3 → discover → cast → Unity Catalog → schedule |
 | [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) | Sample an unknown endpoint, infer + tighten a `Schema`, validate against fresh data |
+| [`ygg-data-modeling`](skills/ygg-data-modeling.md) | Schema-per-source, `raw_<entity>` + provenance, PK / FK / partition via `Field` metadata, cross-source joins via shared ISO dims |
+| [`ygg-curated-views`](skills/ygg-curated-views.md) | UTC timestamps, decimal money, ISO currency / country / language / timezone, naming, table vs view |
 | [`ygg-cast`](skills/ygg-cast.md) | `convert(value, target)`, `CastOptions`, registry extension |
 | [`ygg-schema-fields`](skills/ygg-schema-fields.md) | `DataField` / `Schema` / `DataType`, schema intent |
 | [`ygg-statement-result`](skills/ygg-statement-result.md) | `StatementResult` / `Tabular` / `DataTable` consumption, streaming |
@@ -62,21 +64,27 @@ can be answered end-to-end without further questions:
 
 1. [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) — probe
    the source, infer a `Schema`, tighten it, commit the literal.
-2. [`ygg-schema-fields`](skills/ygg-schema-fields.md) +
-   [`ygg-databricks-tables`](skills/ygg-databricks-tables.md) —
-   reconcile the catalog/schema/table, `ensure_created`.
-3. [`ygg-http`](skills/ygg-http.md) +
+2. [`ygg-data-modeling`](skills/ygg-data-modeling.md) — pick the
+   layout (one schema per source, `raw_<entity>` + provenance,
+   PK / FK / partition via `Field` metadata).
+3. [`ygg-databricks-tables`](skills/ygg-databricks-tables.md) —
+   reconcile catalog / schema / table, `ensure_created(schema=...)`.
+4. [`ygg-http`](skills/ygg-http.md) +
    [`ygg-cast`](skills/ygg-cast.md) — pull pages with
-   `HTTPSession`, cast through the schema, write via
+   `HTTPSession` (or `SchemaSession` when responses *are* the
+   bronze cache), cast through the schema, write via
    `Table.insert / merge / async_insert`.
-4. [`ygg-databricks-job-workflows`](skills/ygg-databricks-job-workflows.md)
+5. [`ygg-databricks-job-workflows`](skills/ygg-databricks-job-workflows.md)
    — stage the callable via `Job.pytask`, attach a
    `CronSchedule` / `FileArrivalTriggerConfiguration`.
-5. [`ygg-benchmarks`](skills/ygg-benchmarks.md) — add a bench for the
+6. [`ygg-curated-views`](skills/ygg-curated-views.md) — standardise
+   UTC timestamps, decimal money, ISO codes; expose the curated
+   layer that BI / ML read.
+7. [`ygg-benchmarks`](skills/ygg-benchmarks.md) — add a bench for the
    hot transform path before merging.
 
 [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) is the
-master recipe that chains the five.
+master recipe that chains the seven.
 
 ## Keeping these files in sync with the library
 

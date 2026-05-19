@@ -14,7 +14,7 @@ This skill orchestrates the others — it does **not** re-explain HTTP,
 schema, table, or job mechanics. Each section ends with a pointer to
 the dedicated skill for the call-site details.
 
-## The six steps that always happen
+## The seven steps that always happen
 
 1. **Read the source contract.** Documentation, OpenAPI spec, sample
    payload, or — when nothing is provided — call the endpoint and
@@ -23,21 +23,46 @@ the dedicated skill for the call-site details.
    `Field.from_pandas` / `Field.from_arrow` / Polars inference, then
    *fix* the inferred schema (nullability, decimal precision, timezone
    intent). See [`ygg-schema-discovery`](ygg-schema-discovery.md).
-3. **Reconcile the target.** Build a `Schema` from the discovered
-   shape, ensure the catalog / schema / volume / table exist via the
-   resource singletons. See
-   [`ygg-databricks-tables`](ygg-databricks-tables.md) +
-   [`ygg-schema-fields`](ygg-schema-fields.md).
-4. **Write the fetch-and-load callable** — a single Python function
-   that pulls a page / range from the source, casts to the target
-   schema, and writes via `Table.insert` / `async_insert` / `merge`.
-   See [`ygg-http`](ygg-http.md) +
+3. **Pick the schema layout.** One Unity Catalog schema per data
+   source, `raw_<entity>` for landings + provenance columns, curated
+   tables / views downstream. See
+   [`ygg-data-modeling`](ygg-data-modeling.md).
+4. **Reconcile the target.** Catalog / schema / table singletons,
+   `ensure_created(schema=...)`, PK / FK / partition / cluster all
+   ride on `Field` metadata. See
+   [`ygg-data-modeling`](ygg-data-modeling.md) +
+   [`ygg-databricks-tables`](ygg-databricks-tables.md).
+5. **Write the fetch-and-load callable.** Pull pages via
+   `HTTPSession` (or `SchemaSession` when the responses themselves
+   are the cache — see the decision tree below), cast through the
+   schema, write via `Table.insert` / `async_insert` / `merge`. See
+   [`ygg-http`](ygg-http.md) +
    [`ygg-statement-result`](ygg-statement-result.md).
-5. **Stage the callable as a Databricks Job task** with a schedule.
+6. **Stage the callable as a Databricks Job task** with a schedule.
    See [`ygg-databricks-job-workflows`](ygg-databricks-job-workflows.md).
-6. **Benchmark the hot path during development** so the pipeline
-   doesn't ship a row-loop trap. See
-   [`ygg-benchmarks`](ygg-benchmarks.md).
+7. **Build the curated layer.** Standardise UTC timestamps, decimal
+   money, ISO codes, naming. See
+   [`ygg-curated-views`](ygg-curated-views.md). Benchmark the hot
+   transform before merging — see [`ygg-benchmarks`](ygg-benchmarks.md).
+
+## HTTP source — should the responses *be* the raw table?
+
+Two shapes for the raw landing when the source is HTTP:
+
+| Shape | When | How |
+| --- | --- | --- |
+| **Response cache = raw table.** Persist every `Response` row as-is, schema = `RESPONSE_SCHEMA`. | API is per-id `GET`s, slow-changing, idempotent. Replay = re-render from cached rows. | `SchemaSession(schema=…, local_cache=…, mode=…)` — see [`ygg-http`](ygg-http.md#choose-local-vs-remote-cache-via-schemasession). The Delta table behind the session *is* `raw_<entity>_responses`. |
+| **Parse-then-write.** Pull payload, normalise into Arrow, write `raw_<entity>` with provenance columns. | API returns lists / pages / aggregates. Curated layer needs columnar access to fields. | Plain `HTTPSession` + `Table.insert / merge`; provenance columns (`_ingested_at`, `_payload_hash`, `_source`) on the schema. See [`ygg-data-modeling`](ygg-data-modeling.md#standard-raw_-provenance-columns). |
+
+Use the response-cache shape (`SchemaSession`) when the source spec
+says *"every call is cheap, results are stable per id"* — replay
+becomes free, and the local-vs-remote cache decision tree in
+[`ygg-http`](ygg-http.md) picks the right tier for the workload
+(single-process notebook → `local_cache=True`; Spark / `send_many`
+job → `local_cache=False`, remote-only is the synchronization point).
+Use the parse-then-write shape for paginated lists, streaming
+deltas, or any source where the curated layer needs predicate-pushed
+column access.
 
 ## Worked example — REST API → Delta table, hourly
 
@@ -58,28 +83,61 @@ ORDERS_PATH = "/v1/orders"
 
 
 # ---- 2. discovered schema (see ygg-schema-discovery for sampling) ------
-ORDERS_SCHEMA = Schema.from_fields([
-    DataField("order_id",   DataType.string(),               nullable=False),
-    DataField("customer_id", DataType.string(),              nullable=False),
-    DataField("amount",     DataType.decimal(18, 2),          nullable=False),
-    DataField("currency",   DataType.string(),                nullable=False),
-    DataField("paid_at",    DataType.timestamp("UTC"),        nullable=False),
-    DataField("status",     DataType.string(),                nullable=False),
+# Two layers — raw (vendor-shaped, immutable) + curated (standardised).
+# See ygg-data-modeling for the raw_ + provenance convention.
+
+import datetime as dt
+
+RAW_ORDERS_SCHEMA = Schema.from_fields([
+    # Source-shaped columns — names + types match the vendor payload.
+    DataField("order_id",     DataType.string(),  nullable=False,
+              tags={"primary_key": True}),
+    DataField("customer_id",  DataType.string(),  nullable=False,
+              tags={"foreign_key": True},
+              metadata={"references": "main.vendor_orders.raw_customers(customer_id)"}),
+    DataField("created",      DataType.string(),  nullable=False,
+              comment="Vendor ISO-8601 string, +offset varies."),
+    DataField("amount",       DataType.float64(), nullable=False,
+              comment="Source ships float — curated layer demotes to decimal(18, 2)."),
+    DataField("ccy",          DataType.string(),  nullable=False),
+    DataField("country",      DataType.string(),  nullable=True),
+    DataField("status",       DataType.string(),  nullable=False),
+    # Provenance — never from the source. See ygg-data-modeling.
+    DataField("_ingested_at", DataType.timestamp("UTC"), nullable=False,
+              tags={"primary_key": True, "partition_by": True}),
+    DataField("_source",      DataType.string(),  nullable=False,
+              comment="Logical source — matches the schema name."),
+    DataField("_source_url",  DataType.string(),  nullable=True),
+    DataField("_payload_hash", DataType.string(), nullable=False,
+              comment="xxhash64 of the source row — dedup key."),
+    DataField("_batch_id",    DataType.string(),  nullable=False),
 ])
 
 
-# ---- 3. reconcile target ----------------------------------------------
-tbl = dbc.table("main.sales.orders")
-tbl.ensure_created(schema=ORDERS_SCHEMA, comment="vendor orders v1")
+# ---- 3. one schema per source -----------------------------------------
+dbc.catalog("main").ensure_created()
+dbc.schema("main.vendor_orders").ensure_created(
+    comment="Vendor orders source — raw_ landings + curated views.",
+)
 
 
-# ---- 4. fetch-and-load callable ---------------------------------------
+# ---- 4. reconcile target (PK / FK / partition all from Field tags) ----
+raw_tbl = dbc.table("main.vendor_orders.raw_orders")
+raw_tbl.ensure_created(
+    schema=RAW_ORDERS_SCHEMA,
+    comment="Bronze landing for vendor orders. Immutable, source-shaped.",
+)
+
+
+# ---- 5. fetch-and-load callable ---------------------------------------
 def ingest_orders_since(since_iso: str) -> int:
-    """Pull every order updated since *since_iso*, write to Delta.
+    """Pull every order updated since *since_iso*, write to raw_orders.
 
     Returns the row count written so the caller can log / alert on
     empty windows.
     """
+    import uuid
+
     session = HTTPSession.from_url(
         ORDERS_API,
         headers={"Authorization": f"Bearer {dbc.secrets.get('vendor', 'api_token')}"},
@@ -98,22 +156,36 @@ def ingest_orders_since(since_iso: str) -> int:
     if not rows:
         return 0
 
-    # Cast Python dicts → Arrow with the target schema in one pass —
+    # Stamp provenance columns on every row before the cast.
+    from yggdrasil.xxhash import xxh64
+    from yggdrasil.pickle import json as ygg_json
+    now = dt.datetime.now(dt.timezone.utc)
+    batch_id = str(uuid.uuid4())
+    for r in rows:
+        r["_ingested_at"] = now
+        r["_source"] = "vendor_orders"
+        r["_source_url"] = f"{ORDERS_API}{ORDERS_PATH}"
+        r["_payload_hash"] = xxh64(ygg_json.dumps(r, to_bytes=True)).hexdigest()
+        r["_batch_id"] = batch_id
+
+    # Cast Python dicts → Arrow with the raw schema in one pass —
     # no row loops, the cast registry does the work.
     from pyarrow import Table as ArrowTable
-    arrow = ArrowTable.from_pylist(rows, schema=ORDERS_SCHEMA.to_arrow())
+    arrow = ArrowTable.from_pylist(rows, schema=RAW_ORDERS_SCHEMA.to_arrow())
 
-    # MERGE on (order_id) so a re-run is idempotent.
-    tbl.merge(
+    # MERGE on (order_id, _ingested_at) so a re-run with the same
+    # window doesn't duplicate — but a fresh fetch lands a new row.
+    raw_tbl.merge(
         arrow,
-        keys=["order_id"],
-        update_columns=["customer_id", "amount", "currency",
-                        "paid_at", "status"],
+        keys=["order_id", "_ingested_at"],
+        update_columns=["customer_id", "created", "amount", "ccy",
+                        "country", "status", "_source_url",
+                        "_payload_hash", "_batch_id"],
     )
     return arrow.num_rows
 
 
-# ---- 5. stage + schedule (hourly) -------------------------------------
+# ---- 6. stage + schedule (hourly) -------------------------------------
 from databricks.sdk.service.jobs import CronSchedule
 
 job = dbc.jobs.create_or_update(
@@ -132,7 +204,12 @@ job.pytask(
     task_key="ingest_orders",
 ).create()
 
-# ---- 6. benchmark the hot path before merging (see ygg-benchmarks) ----
+# ---- 7. curated view on top (see ygg-curated-views) -------------------
+# main.vendor_orders.orders — standardised UTC timestamps + decimal money
+# + ISO currency / country codes — feeds BI / ML. Built once at curate
+# time, or rebuilt on every ingestion run.
+#
+# Benchmark the hot transform path before merging — see ygg-benchmarks.
 ```
 
 That whole file is the pipeline. Everything else — auth, retries,

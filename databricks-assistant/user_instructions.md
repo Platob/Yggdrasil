@@ -50,17 +50,31 @@ asking permission at each step:
    `Field.from_arrow_schema` / `Field.from_polars_schema`, tighten
    for nullability / decimal / timezone) → commit the `Schema(...)`
    literal to source.
-2. **Reconcile target** via `dbc.catalog(...).ensure_created()` →
+2. **Pick the layout** — one schema per source
+   (`main.<source>.raw_<entity>`), provenance columns on every
+   raw table (`_ingested_at`, `_source`, `_payload_hash`,
+   `_batch_id`), PK / FK / partition flags via `Field` metadata
+   (`tags={"primary_key": True}` etc.). See
+   [`ygg-data-modeling`](skills/ygg-data-modeling.md).
+3. **Reconcile target** via `dbc.catalog(...).ensure_created()` →
    `dbc.schema(...).ensure_created()` → `dbc.table(...).ensure_created(schema=...)`.
-3. **Write the fetch-and-load callable** using `HTTPSession` for
-   HTTP, `DatabricksPath`/`Path` for S3/Volume, and `Table.insert`
-   / `merge` / `async_insert` for the write (pick from the size
-   table in [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md)).
-4. **Schedule** via `dbc.jobs.create_or_update(name=..., schedule=CronSchedule(...))`
+4. **Write the fetch-and-load callable**. HTTP sources: pick
+   `SchemaSession` when the response cache *is* the raw table
+   (per-id GETs, idempotent), plain `HTTPSession` when it's
+   parse-then-write (paginated lists, deltas) — the decision tree
+   lives in [`ygg-http`](skills/ygg-http.md). S3 / object stores:
+   use `DatabricksPath` / `Path`. Local vs remote cache also
+   covered there.
+5. **Schedule** via `dbc.jobs.create_or_update(name=..., schedule=CronSchedule(...))`
    + `job.pytask(callable, ..., task_key=...).create()` — auto-deps
    resolve via the AST walker, splat `dbc.jobs.userinfo_defaults()`
    for git source / notifications / tags.
-5. **Benchmark** the hot transform path before merging — see
+6. **Build the curated layer** — standardise UTC timestamps
+   (`<col>_utc`), decimal money, ISO codes (`currency_iso`,
+   `country_iso`, `region_iso`, `language_iso`, `timezone_iana`)
+   so cross-source joins go through the shared `main.iso.*`
+   dimensions. See [`ygg-curated-views`](skills/ygg-curated-views.md).
+7. **Benchmark** the hot transform path before merging — see
    [`ygg-benchmarks`](skills/ygg-benchmarks.md). Quote before /
    after numbers in the commit body.
 
