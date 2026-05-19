@@ -662,30 +662,50 @@ def build_row_invoker(func: Callable[..., Any]) -> Callable[[Any], Any]:
 # ---------------------------------------------------------------------------
 
 def _resolve_tabular_target(ann: Any) -> Optional[type]:
-    """Return *ann* iff it's a recognised whole-batch tabular type.
+    """Return *ann* iff a ``pa.RecordBatch → ann`` converter is registered.
 
-    ``pyarrow.RecordBatch`` / ``pyarrow.Table`` are always probed (Arrow
-    is yggdrasil's only hard runtime dep); ``polars.DataFrame`` /
-    ``polars.LazyFrame`` / ``pandas.DataFrame`` resolve only when the
-    optional engine is installed. Unknown annotations return ``None`` so
-    the caller falls back to per-row dispatch.
+    Delegates the "is this a tabular shape?" decision to the
+    :mod:`yggdrasil.data.cast` registry — when ``find_converter(
+    pa.RecordBatch, ann)`` returns a hit, the whole-batch path is
+    viable; when it doesn't, the caller falls back to per-row
+    dispatch. That way new tabular targets (a third-party
+    ``DataFrame``-style type registered with ``@register_converter``)
+    auto-extend without touching this helper.
+
+    Routes the engine-side converter modules
+    (``yggdrasil.polars.cast`` / ``yggdrasil.pandas.cast``) via
+    :meth:`ObjectSerde.module_and_name` — the same namespace
+    helper the rest of the codebase uses for engine dispatch —
+    because their ``@register_converter`` calls only fire on import,
+    and a Spark executor unpickling a function with a
+    ``pl.DataFrame`` annotation may not have loaded the yggdrasil
+    polars cast registrations yet.
     """
     if not isinstance(ann, type):
         return None
     import pyarrow as _pa
-    if ann is _pa.RecordBatch or ann is _pa.Table:
-        return ann
-    try:
-        import polars as _pl
-    except ImportError:
-        _pl = None
-    if _pl is not None and (ann is _pl.DataFrame or ann is _pl.LazyFrame):
-        return ann
-    try:
-        import pandas as _pd
-    except ImportError:
-        _pd = None
-    if _pd is not None and ann is _pd.DataFrame:
+    if ann is _pa.RecordBatch:
+        return ann  # identity — no registry lookup needed
+    # Ensure the engine-side converter registrations exist for the
+    # annotation's module before asking the registry. Same engine
+    # dispatch shape used by ``yggdrasil.io.tabular.base`` /
+    # ``yggdrasil.io.tabular.arrow`` etc.
+    from yggdrasil.pickle.serde import ObjectSerde
+
+    namespace, _ = ObjectSerde.module_and_name(ann)
+    top = namespace.split(".", 1)[0] if namespace else ""
+    if top == "polars":
+        try:
+            import yggdrasil.polars.cast  # noqa: F401
+        except ImportError:
+            pass
+    elif top == "pandas":
+        try:
+            import yggdrasil.pandas.cast  # noqa: F401
+        except ImportError:
+            pass
+    from yggdrasil.data.cast.registry import find_converter
+    if find_converter(_pa.RecordBatch, ann) is not None:
         return ann
     return None
 
