@@ -18,9 +18,15 @@ to the curated tables those rules build.
 ## The curated contract
 
 ```
-main.<source>.raw_<entity>        ← source-shaped, immutable
-└── main.<source>.<entity>         ← curated, standardised, stable
+main.<source>.raw_<entity>        ← bronze   — source-shaped, immutable
+└── main.<source>.<entity>         ← silver   — curated, standardised, stable
+    └── main.<source>.dash_<view>   ← gold     — business-display, dashboard-shaped
 ```
+
+The display layer (`dash_*`) is consumer-facing — wide, pivoted,
+pre-aggregated, geometry inlined. Built on top of curated; built
+**after** curated in the same ingestion Job DAG. See
+[`ygg-display-views`](ygg-display-views.md).
 
 A curated table / view:
 
@@ -188,33 +194,60 @@ Rules:
   [-180, 180]`. Don't store as `decimal` — frontends and geo
   libraries expect `float64` / WGS84.
 
+Two equivalent shapes — pick whichever reads better at the call site:
+
+**Flat columns** — simplest when the row has one location:
+
 ```python
 from yggdrasil.data import Field, DataType
-from yggdrasil.data.types.nested import StructType, ArrayType
 
-# Single-point shape — every entity carries a renderable centre.
-Field("lat", DataType.float64(), nullable=True,
-      comment="WGS84 latitude in degrees, range [-90, 90]. "
-              "Resolved at curate time from country_iso / eic_code / city_name.")
-Field("lon", DataType.float64(), nullable=True,
-      comment="WGS84 longitude in degrees, range [-180, 180].")
+Field("lat", DataType.from_("float64"), nullable=True,
+      metadata={b"comment": b"WGS84 latitude [-90, 90]. "
+                            b"Resolved at curate time from country_iso / eic_code / city_name."})
+Field("lon", DataType.from_("float64"), nullable=True,
+      metadata={b"comment": b"WGS84 longitude [-180, 180]."})
+```
 
-# Zone shape — a polygon a frontend can shade. GeoJSON string keeps
-# the column engine-agnostic; downstream renderers parse it natively.
-Field("boundary_geojson", DataType.string(), nullable=True,
-      comment="GeoJSON Feature/FeatureCollection. Used by frontend "
-              "map plugins (kepler.gl, pydeck, folium) to render the zone.")
+**`geo_point()` struct** — preferred when the row has multiple
+locations (`origin` / `destination`) or a downstream sink speaks
+the `{"lat": …, "lon": …}` shape natively:
 
-# Time-series of points — e.g. AIS / GPS / wind-route track.
+```python
+from yggdrasil.data import geo_point
+
+geo_point("origin",      comment="Pickup point, WGS84.")
+geo_point("destination", comment="Drop-off point, WGS84.")
+```
+
+`geo_point("name")` returns a `Field` whose dtype is the canonical
+`GEO_POINT_TYPE` (a `StructType` of two non-nullable `float64`
+children). `nullable=True` by default — `nullable=False` on the
+parent struct prevents NULL rows, while the child non-nullable
+contract prevents partial coordinates (one of the two NULL). The
+type is a singleton (same instance for every `geo_point()` call) so
+the cast registry hits its exact-match fast path on every read.
+`is_geo_point_type(dtype)` matches the shape if you need to detect
+it downstream (e.g. when emitting a GeoJSON encoder).
+
+**Zone polygons** — shade the area on a frontend map:
+
+```python
+Field("boundary_geojson", DataType.from_("string"), nullable=True,
+      metadata={b"comment": b"GeoJSON Feature/FeatureCollection. "
+                            b"Used by map plugins (kepler.gl, pydeck, folium)."})
+```
+
+**Tracks / time-series of points** — vessel routes, wind patterns,
+sensor sweeps:
+
+```python
+# Each point in the list is independently renderable.
 Field("points",
-      DataType.array(DataType.struct([
-          Field("lat", DataType.float64(), nullable=False),
-          Field("lon", DataType.float64(), nullable=False),
-          Field("observation_utc", DataType.timestamp("UTC"), nullable=False),
-      ])),
+      DataType.from_(
+          "list<struct<lat: float64, lon: float64, observation_utc: timestamp(UTC)>>"
+      ),
       nullable=True,
-      comment="Ordered track of WGS84 points. Each plugin row "
-              "is independently renderable.")
+      metadata={b"comment": b"Ordered WGS84 track."})
 ```
 
 Resolve coords from the curated dim:

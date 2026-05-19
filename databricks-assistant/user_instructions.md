@@ -71,10 +71,19 @@ asking permission at each step:
    for git source / notifications / tags.
 6. **Build the curated layer** — standardise UTC timestamps
    (`<col>_utc`), decimal money, ISO codes (`currency_iso`,
-   `country_iso`, `region_iso`, `language_iso`, `timezone_iana`)
-   so cross-source joins go through the shared `main.iso.*`
-   dimensions. See [`ygg-curated-views`](skills/ygg-curated-views.md).
-7. **Benchmark** the hot transform path before merging — see
+   `country_iso`, `region_iso`, `language_iso`, `timezone_iana`),
+   `geo_point()` / lat-lon for renderable rows, so cross-source
+   joins go through the shared `main.iso.*` dimensions. See
+   [`ygg-curated-views`](skills/ygg-curated-views.md).
+7. **Build the business-display layer** — wide / pivoted /
+   pre-rolled `main.<source>.dash_<view>` tables (`dash_*`) over
+   curated. Time-series get pre-aggregated buckets
+   (`dash_ohlcv_5m`, `dash_ohlcv_1h`); geo gets inline
+   `geo_point` / `boundary_geojson`; KPIs go in a stable
+   `(kpi, value, unit, computed_at_utc)` table. Refresh runs as
+   a downstream task on the same Job DAG (`depends_on=["curate"]`).
+   See [`ygg-display-views`](skills/ygg-display-views.md).
+8. **Benchmark** the hot transform path before merging — see
    [`ygg-benchmarks`](skills/ygg-benchmarks.md). Quote before /
    after numbers in the commit body.
 

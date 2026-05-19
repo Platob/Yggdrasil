@@ -14,7 +14,7 @@ This skill orchestrates the others — it does **not** re-explain HTTP,
 schema, table, or job mechanics. Each section ends with a pointer to
 the dedicated skill for the call-site details.
 
-## The seven steps that always happen
+## The eight steps that always happen
 
 1. **Read the source contract.** Documentation, OpenAPI spec, sample
    payload, or — when nothing is provided — call the endpoint and
@@ -42,7 +42,13 @@ the dedicated skill for the call-site details.
    See [`ygg-databricks-job-workflows`](ygg-databricks-job-workflows.md).
 7. **Build the curated layer.** Standardise UTC timestamps, decimal
    money, ISO codes, naming. See
-   [`ygg-curated-views`](ygg-curated-views.md). Benchmark the hot
+   [`ygg-curated-views`](ygg-curated-views.md).
+8. **Build the business-display layer.** Wide / pivoted / pre-rolled
+   `dash_*` tables and views over curated — what BI tools and
+   dashboards actually query (no analyst-facing joins, geometry
+   inlined for map widgets, time buckets pre-aggregated). Refreshed
+   as a downstream task on the same Job DAG. See
+   [`ygg-display-views`](ygg-display-views.md). Benchmark the hot
    transform before merging — see [`ygg-benchmarks`](ygg-benchmarks.md).
 
 ## HTTP source — should the responses *be* the raw table?

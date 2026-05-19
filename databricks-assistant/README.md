@@ -45,7 +45,8 @@ most for routing.
 | [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) | End-to-end recipe: HTTP / API / S3 → discover → cast → Unity Catalog → schedule |
 | [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) | Sample an unknown endpoint, infer + tighten a `Schema`, validate against fresh data |
 | [`ygg-data-modeling`](skills/ygg-data-modeling.md) | Schema-per-source, `raw_<entity>` + provenance, PK / FK / partition via `Field` metadata, cross-source joins via shared ISO dims |
-| [`ygg-curated-views`](skills/ygg-curated-views.md) | UTC timestamps, decimal money, ISO currency / country / language / timezone, naming, table vs view |
+| [`ygg-curated-views`](skills/ygg-curated-views.md) | UTC timestamps, decimal money, ISO currency / country / language / timezone, lat/lon + `geo_point()` + GeoJSON, naming, table vs view |
+| [`ygg-display-views`](skills/ygg-display-views.md) | Business-display `dash_*` layer — wide / pivoted / time-series rollups, KPI tables, geo-display, materialisation picker, multi-task refresh DAG |
 | [`ygg-trading-commodity`](skills/ygg-trading-commodity.md) | Trading / commodity / energy market data: MIC codes, ENTSO-E EIC, OHLCV bars, contracts, FX, idempotency for corrections / settlements |
 | [`ygg-mlops`](skills/ygg-mlops.md) | MLflow on Databricks + UC registry, `ml_<task>_features` / `_predictions` / `_runs` tables, autoML candidate discovery, drift detection |
 | [`ygg-cast`](skills/ygg-cast.md) | `convert(value, target)`, `CastOptions`, registry extension |
@@ -80,13 +81,17 @@ can be answered end-to-end without further questions:
    — stage the callable via `Job.pytask`, attach a
    `CronSchedule` / `FileArrivalTriggerConfiguration`.
 6. [`ygg-curated-views`](skills/ygg-curated-views.md) — standardise
-   UTC timestamps, decimal money, ISO codes; expose the curated
-   layer that BI / ML read.
-7. [`ygg-benchmarks`](skills/ygg-benchmarks.md) — add a bench for the
+   UTC timestamps, decimal money, ISO codes, `geo_point` + GeoJSON
+   for renderable rows; expose the curated layer that BI / ML read.
+7. [`ygg-display-views`](skills/ygg-display-views.md) — wide /
+   pivoted / pre-rolled `dash_*` tables and views for dashboard
+   query patterns. Refreshed as a downstream task on the same
+   Job DAG.
+8. [`ygg-benchmarks`](skills/ygg-benchmarks.md) — add a bench for the
    hot transform path before merging.
 
 [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) is the
-master recipe that chains the seven.
+master recipe that chains the eight.
 
 ## Keeping these files in sync with the library
 
