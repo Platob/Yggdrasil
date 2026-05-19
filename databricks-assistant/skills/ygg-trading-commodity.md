@@ -135,6 +135,47 @@ RAW_DAYAHEAD_SCHEMA = Schema.from_fields([
 ])
 ```
 
+## Geographic columns on every location-bearing curated table
+
+Exchanges, bidding zones, delivery hubs, weather stations — anything
+geo gets `lat` + `lon` (and `boundary_geojson` when there's a real
+polygon) in the curated layer so map plugins / BI maps can render
+the row without a second lookup. The shared dims carry the geometry:
+
+```python
+# main.iso.exchange — one row per ISO 10383 MIC
+Field("mic_iso",          DataType.string(),  nullable=False,
+      tags={"primary_key": True}),
+Field("name",             DataType.string(),  nullable=False),
+Field("country_iso",      DataType.string(),  nullable=False,
+      tags={"foreign_key": True},
+      metadata={"references": "main.iso.country(iso_alpha2)"}),
+Field("city",             DataType.string(),  nullable=True),
+Field("lat",              DataType.float64(), nullable=True,
+      comment="HQ city lat (WGS84). Single-point — exchange boundary not meaningful."),
+Field("lon",              DataType.float64(), nullable=True),
+Field("timezone_iana",    DataType.string(),  nullable=False),
+
+# main.iso.bidding_zone — one row per ENTSO-E EIC
+Field("eic_code",         DataType.string(),  nullable=False,
+      tags={"primary_key": True}),
+Field("name",             DataType.string(),  nullable=False),
+Field("country_iso",      DataType.string(),  nullable=True,
+      comment="ISO 3166-1 alpha-2 — NULL when the zone spans countries."),
+Field("lat",              DataType.float64(), nullable=True,
+      comment="Centroid lat of the bidding zone polygon."),
+Field("lon",              DataType.float64(), nullable=True),
+Field("boundary_geojson", DataType.string(),  nullable=True,
+      comment="GeoJSON Feature for the zone polygon — rendered by frontend map plugins."),
+Field("timezone_iana",    DataType.string(),  nullable=False),
+```
+
+`yggdrasil.data.enums.geozone.GeoZoneCatalog` already carries
+`lat` / `lon` / `eic` / `country_iso` for every loaded zone — resolve
+at curate time, never at query time. See
+[`ygg-curated-views`](ygg-curated-views.md#3b-geographic-data--always-carry-latlon--optional-polygon)
+for the full convention.
+
 ## Curated joins on shared dims
 
 Cross-source queries route through `main.iso.*` rather than vendor-

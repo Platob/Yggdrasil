@@ -162,6 +162,94 @@ Field(
 Column naming convention: `<concept>_<standard>` so the column name
 itself signals which catalog to join (`country_iso` → `main.iso.country`).
 
+### 3b. Geographic data → always carry lat/lon (+ optional polygon)
+
+Anything with a place attached gets **renderable** coordinates in
+the curated layer — a frontend, BI plugin, or notebook map widget
+(folium, kepler.gl, pydeck, Databricks SQL geo visual) should be
+able to plot rows without a second lookup.
+
+Rules:
+
+- **Add `lat` and `lon` to every curated table that ships a location
+  reference**, even when the source only ships an opaque code
+  (`country_iso`, `city_name`, `eic_code`, `mic_iso`). Resolve at
+  curate time via `yggdrasil.data.enums.geozone.GeoZoneCatalog`
+  (every `GeoZone` carries `lat` + `lon`).
+- **For zone / region / polygon shapes, add `boundary_geojson`** —
+  a string column holding a GeoJSON `Feature` or `FeatureCollection`
+  so plugins can draw the polygon. Stored as `string` (Delta has no
+  native geometry type; downstream Spark/Polars/plotly accept GeoJSON).
+- **For a list of points** (route, time-series of positions),
+  emit `points` as a `list<struct<lat: float64, lon: float64,
+  observation_utc: timestamp("UTC")>>` so each cell is itself
+  renderable.
+- **Coordinate types:** `lat: float64 [-90, 90]`, `lon: float64
+  [-180, 180]`. Don't store as `decimal` — frontends and geo
+  libraries expect `float64` / WGS84.
+
+```python
+from yggdrasil.data import Field, DataType
+from yggdrasil.data.types.nested import StructType, ArrayType
+
+# Single-point shape — every entity carries a renderable centre.
+Field("lat", DataType.float64(), nullable=True,
+      comment="WGS84 latitude in degrees, range [-90, 90]. "
+              "Resolved at curate time from country_iso / eic_code / city_name.")
+Field("lon", DataType.float64(), nullable=True,
+      comment="WGS84 longitude in degrees, range [-180, 180].")
+
+# Zone shape — a polygon a frontend can shade. GeoJSON string keeps
+# the column engine-agnostic; downstream renderers parse it natively.
+Field("boundary_geojson", DataType.string(), nullable=True,
+      comment="GeoJSON Feature/FeatureCollection. Used by frontend "
+              "map plugins (kepler.gl, pydeck, folium) to render the zone.")
+
+# Time-series of points — e.g. AIS / GPS / wind-route track.
+Field("points",
+      DataType.array(DataType.struct([
+          Field("lat", DataType.float64(), nullable=False),
+          Field("lon", DataType.float64(), nullable=False),
+          Field("observation_utc", DataType.timestamp("UTC"), nullable=False),
+      ])),
+      nullable=True,
+      comment="Ordered track of WGS84 points. Each plugin row "
+              "is independently renderable.")
+```
+
+Resolve coords from the curated dim:
+
+```python
+# At curate time, look up lat/lon from the shared geozone catalog.
+from yggdrasil.data.enums.geozone.catalog import GeoZoneCatalog
+
+cat = GeoZoneCatalog.default()
+def lookup_coords(country_iso: str) -> tuple[float | None, float | None]:
+    z = cat.parse(country_iso)
+    return (z.lat, z.lon) if z else (None, None)
+```
+
+For `main.iso.country` / `main.iso.region` / `main.iso.exchange`
+shared dims, **always include `lat` + `lon` + `boundary_geojson`**
+so any curated table that FK-joins them inherits the geo columns
+without re-resolving:
+
+```sql
+SELECT o.*, c.lat AS country_lat, c.lon AS country_lon, c.boundary_geojson
+FROM main.vendor_orders.orders o
+JOIN main.iso.country c USING (country_iso)
+```
+
+Polygon sources:
+
+- ENTSO-E bidding zones — `entsoe-py` / ENTSO-E transparency ships
+  the EIC boundaries as GeoJSON.
+- Countries — Natural Earth (public domain) at `1:50m` is the
+  default; load once, write to `main.iso.country`.
+- ISO 3166-2 subdivisions — same Natural Earth source.
+- MIC exchanges — single point (exchange HQ city's lat/lon) is
+  enough; boundary not meaningful.
+
 ### 4. Strings → trimmed, normalised, enum-validated
 
 The raw layer keeps the source's exact bytes. The curated layer:

@@ -65,6 +65,16 @@ Any table prefixed `raw_` carries these guarantees:
   id when present, `(natural_id, ingested_at)` otherwise. A re-run of
   the same window must not duplicate.
 
+### Geographic shared dims
+
+When the source has a place reference (country, region, exchange,
+bidding zone, station), the **shared `main.iso.*` dim is the only
+right join target**, and that dim ships `lat` + `lon` (+
+`boundary_geojson` for polygons) so the curated row is *renderable*
+without a second lookup. See
+[`ygg-curated-views`](ygg-curated-views.md#3b-geographic-data--always-carry-latlon--optional-polygon)
+for the full geo-display convention.
+
 ### Standard `raw_` provenance columns
 
 Add these to every `raw_<entity>` schema, after the source-shaped
