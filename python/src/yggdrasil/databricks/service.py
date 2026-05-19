@@ -15,6 +15,7 @@ from yggdrasil.io.url import URL
 from .client import DatabricksClient
 
 if TYPE_CHECKING:
+    from .ai import DatabricksAI
     from .catalog.catalogs import Catalogs
     from .compute.service import Compute
     from .genie import Genie
@@ -172,6 +173,11 @@ class DatabricksService(ABC):
     def genie(self) -> "Genie":
         """Genie service (shorthand for ``client.genie``)."""
         return self.client.genie
+
+    @property
+    def ai(self) -> "DatabricksAI":
+        """Databricks AI umbrella service (shorthand for ``client.ai``)."""
+        return self.client.ai
 
     @property
     def jobs(self) -> "Jobs":
