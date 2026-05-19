@@ -42,6 +42,7 @@ most for routing.
 | [`ygg-databricks-jobs`](skills/ygg-databricks-jobs.md) | Run / wait on jobs, secrets, clusters, warehouses, `WaitingConfig` |
 | [`ygg-databricks-job-workflows`](skills/ygg-databricks-job-workflows.md) | `dbc.jobs.create_or_update`, `JobTask.from_callable`, cron / file-arrival schedules, multi-task DAGs |
 | [`ygg-databricks-genie`](skills/ygg-databricks-genie.md) | `dbc.genie.ask`, `GenieSpace`, `GenieConversation` |
+| [`ygg-databricks-vector-search`](skills/ygg-databricks-vector-search.md) | `dbc.ai.vector_search.endpoint/index/query`, `Schema → schema_json`, time-series-aware retrieval, typed Arrow results |
 | [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) | End-to-end recipe: HTTP / API / S3 → discover → cast → Unity Catalog → schedule |
 | [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) | Sample an unknown endpoint, infer + tighten a `Schema`, validate against fresh data |
 | [`ygg-data-modeling`](skills/ygg-data-modeling.md) | Schema-per-source, `raw_<entity>` + provenance, PK / FK / partition via `Field` metadata, cross-source joins via shared ISO dims |

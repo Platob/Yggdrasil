@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .workspaces import Workspaces, Workspace
     from .path import DatabricksPath
     from .genie import Genie
+    from .ai import DatabricksAI
     from .tags.service import EntityTags
 
 __all__ = [
@@ -1527,6 +1528,25 @@ class DatabricksClient(Singleton, URLBased):
         from .genie import Genie
         cached = Genie(client=self)
         self.__dict__["_genie"] = cached
+        return cached
+
+    @property
+    def ai(self) -> "DatabricksAI":
+        """Databricks AI umbrella service (vector search today, serving/registry next).
+
+        Reach the concrete services through it::
+
+            client.ai.vector_search.endpoint("rag").ensure_created()
+            client.ai.vector_search.index("main.rag.docs").query(
+                query_text="…", columns=["id", "text"],
+            )
+        """
+        cached = self.__dict__.get("_ai")
+        if cached is not None:
+            return cached
+        from .ai import DatabricksAI
+        cached = DatabricksAI(client=self)
+        self.__dict__["_ai"] = cached
         return cached
 
     @property
