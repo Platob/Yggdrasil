@@ -231,6 +231,21 @@ class GenieDefaults:
     managed_space_instructions
         Free-text instructions baked into the auto-created space's
         ``serialized_space``.
+    agent_output_dir
+        Root directory the :class:`GenieAgent` writes artifacts under.
+        When ``None`` (the default), :attr:`GenieAgent.output_dir` resolves
+        to ``$XDG_CACHE_HOME/yggdrasil/genie`` (falling back to
+        ``~/.cache/yggdrasil/genie``).
+    agent_auto_save
+        When ``True``, :meth:`GenieAgent.run` saves the SQL result of every
+        answer that carries a query attachment.
+    agent_auto_save_format
+        File format used by auto-save. One of ``"parquet"``, ``"csv"``,
+        ``"arrow"``, ``"json"``, ``"text"``. Parquet is the default.
+    agent_max_steps
+        Soft step budget honored by :meth:`GenieAgent.chat`. The agent
+        stops accepting new questions once this many turns have completed
+        on a single :meth:`chat` call.
     """
 
     space_id: Optional[str] = None
@@ -246,6 +261,10 @@ class GenieDefaults:
     managed_space_tables: tuple[str, ...] = ()
     managed_space_parent_path: Optional[str] = None
     managed_space_instructions: tuple[str, ...] = ()
+    agent_output_dir: Optional[str] = None
+    agent_auto_save: bool = False
+    agent_auto_save_format: str = "parquet"
+    agent_max_steps: int = 8
 
     @property
     def timeout(self) -> dt.timedelta:

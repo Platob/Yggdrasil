@@ -52,6 +52,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from databricks.sdk.service.dashboards import GenieAPI, GenieMessage
     from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
+    from .agent import GenieAgent
+
 
 __all__ = ["Genie"]
 
@@ -86,6 +88,7 @@ class Genie(DatabricksService):
     ):
         super().__init__(client=client)
         self.defaults: GenieDefaults = defaults if defaults is not None else GenieDefaults()
+        self._agent: "Optional[GenieAgent]" = None
 
     # ------------------------------------------------------------------ #
     # SDK boundary
@@ -93,6 +96,26 @@ class Genie(DatabricksService):
     @property
     def api(self) -> "GenieAPI":
         return self.client.workspace_client().genie
+
+    # ------------------------------------------------------------------ #
+    # Local agent
+    # ------------------------------------------------------------------ #
+    @property
+    def agent(self) -> "GenieAgent":
+        """Lazily-built :class:`GenieAgent` for local orchestration.
+
+        One instance per :class:`Genie` service — its history and
+        registered tools persist across calls within a single process.
+        Construct directly with ``GenieAgent(genie_service)`` if you
+        need a separate session.
+        """
+        cached = self._agent
+        if cached is None:
+            from .agent import GenieAgent
+
+            cached = GenieAgent(service=self)
+            self._agent = cached
+        return cached
 
     # ------------------------------------------------------------------ #
     # The one-shot ask
