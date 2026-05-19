@@ -24,7 +24,7 @@ primitives) for the final hand-tuning.
    Parquet and emit a typed schema.
 3. **Lift into a `Schema`.** Use `Field.from_arrow_schema(...)` /
    `Field.from_polars_schema(...)` / `Field.from_pandas(...)` to get a
-   yggdrasil `Schema` with `DataField` / `DataType` carriers.
+   yggdrasil `Schema` with `Field` / `DataType` carriers.
 4. **Tighten by hand.** Inferred types are *suggestions*. Fix:
    - nullability (the engine sees `null` once → `nullable=True`; real
      contract says required → flip to `False`),
@@ -82,20 +82,20 @@ schema = Field.from_polars_schema(df.schema)
 schema = Field.from_pandas(pandas_df)
 ```
 
-`Field.from_*` returns a single root `DataField` whose `dtype` is a
+`Field.from_*` returns a single root `Field` whose `dtype` is a
 nested `StructType` — call `.fields` (or treat it as a `Schema`) to
 get the column list.
 
 ## Tighten the inferred schema
 
 ```python
-from yggdrasil.data import DataField, DataType, Schema
+from yggdrasil.data import Field, DataType, Schema
 
 tightened = Schema.from_fields([
-    DataField("order_id",   DataType.string(),         nullable=False),  # required
-    DataField("amount",     DataType.decimal(18, 2),    nullable=False),  # was float64
-    DataField("paid_at",    DataType.timestamp("UTC"),  nullable=False),  # was timestamp[us]
-    DataField("note",       DataType.string(),         nullable=True),   # really optional
+    Field("order_id",   DataType.string(),         nullable=False),  # required
+    Field("amount",     DataType.decimal(18, 2),    nullable=False),  # was float64
+    Field("paid_at",    DataType.timestamp("UTC"),  nullable=False),  # was timestamp[us]
+    Field("note",       DataType.string(),         nullable=True),   # really optional
 ])
 ```
 

@@ -12,7 +12,7 @@ I primarily work in Python notebooks on Databricks against
   case.
 - **Imports:** `from yggdrasil.databricks import DatabricksClient`,
   `from yggdrasil.data.cast import convert`,
-  `from yggdrasil.data import DataField, Schema, DataType`. Use the
+  `from yggdrasil.data import Field, Schema, DataType`. Use the
   `lib.py` guards (`from yggdrasil.polars.lib import polars`) for
   optional engines.
 - **Casting:** Prefer `convert(value, target)` and
@@ -82,6 +82,37 @@ If something is genuinely ambiguous (idempotency strategy, whether
 to overwrite vs append, secret-scope name), ask once with the
 options. Otherwise pick a defensible default and document it in a
 short comment, don't stall.
+
+## Plan, think, bench, smoke-test — then ship
+
+Default to acting autonomously, but **prove the work is done before
+saying done**:
+
+1. **Plan in writing** before any non-trivial change. 3-7 bullets that
+   name the files / functions / schemas affected and the order of
+   operations. If you're chaining skills (ingestion + modeling +
+   curated + scheduling + MLOps), list them.
+2. **Think longer on edge cases.** Schema drift, idempotency, retry
+   exhaustion (429 → `ErrorNotifyingHTTPSession`), partial-batch
+   failures, FK target existence, decimal precision loss, timezone
+   intent, pagination cursors, cron-schedule timezone, model drift.
+   I'd rather you list them and dismiss most than ship the one you
+   missed.
+3. **Benchmark every hot-path change** via `python/benchmarks/`.
+   Quote `best` + `median` before/after in the commit body. See
+   [`ygg-benchmarks`](skills/ygg-benchmarks.md). "Felt faster"
+   doesn't ship — numbers do.
+4. **Smoke-test for real.** Unit tests for logic, one-batch live
+   run for ingestion, throwaway-table reconciliation for DDL, a
+   single training round for ML pipelines. Don't say "complete"
+   without proof the code actually executed.
+5. **Only when the above is done**, summarise what changed and
+   confirm next steps.
+
+Skip the "Should I…?" preambles. The only stopping question is when
+two defensible options materially affect the user (idempotency
+shape, overwrite semantics, schema versioning). Everything else:
+pick, document why in a one-line comment, move on.
 
 ## Tone in responses
 

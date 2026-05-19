@@ -71,22 +71,22 @@ Add these to every `raw_<entity>` schema, after the source-shaped
 columns:
 
 ```python
-from yggdrasil.data import DataField, DataType, Schema
+from yggdrasil.data import Field, DataType, Schema
 
 PROVENANCE = [
-    DataField("_ingested_at",
+    Field("_ingested_at",
               DataType.timestamp("UTC"),  nullable=False,
               comment="When the row landed in this table (UTC)."),
-    DataField("_source",
+    Field("_source",
               DataType.string(),          nullable=False,
               comment="Logical source name — matches the schema."),
-    DataField("_source_url",
+    Field("_source_url",
               DataType.string(),          nullable=True,
               comment="Endpoint / file URL the row came from."),
-    DataField("_payload_hash",
+    Field("_payload_hash",
               DataType.string(),          nullable=False,
               comment="Hash of the source row (xxhash64) — dedup key."),
-    DataField("_batch_id",
+    Field("_batch_id",
               DataType.string(),          nullable=False,
               comment="Run / job id that produced the row."),
 ]
@@ -104,15 +104,15 @@ layer reads when emitting `CREATE TABLE`. Set them once on the
 `Schema`; the rest is automatic.
 
 ```python
-from yggdrasil.data import DataField, DataType, Schema
+from yggdrasil.data import Field, DataType, Schema
 
 ORDERS_SCHEMA = Schema.from_fields([
-    DataField(
+    Field(
         "order_id", DataType.string(), nullable=False,
         comment="Vendor order id, ULID format.",
         tags={"primary_key": True},
     ),
-    DataField(
+    Field(
         "customer_id", DataType.string(), nullable=False,
         comment="FK → main.vendor_orders.raw_customers.customer_id",
         tags={"foreign_key": True},
@@ -120,12 +120,12 @@ ORDERS_SCHEMA = Schema.from_fields([
             "references": "main.vendor_orders.raw_customers(customer_id)",
         },
     ),
-    DataField("amount",        DataType.decimal(18, 2),    nullable=False),
-    DataField(
+    Field("amount",        DataType.decimal(18, 2),    nullable=False),
+    Field(
         "paid_at", DataType.timestamp("UTC"), nullable=False,
         tags={"partition_by": True},      # daily partition by date(paid_at)
     ),
-    DataField(
+    Field(
         "currency_iso", DataType.string(), nullable=False,
         comment="ISO 4217 — see yggdrasil.data.enums.Currency.",
         tags={"cluster_by": True},
@@ -148,7 +148,7 @@ Helpers when you'd rather not use a literal `tags={}` dict:
 
 ```python
 field = (
-    DataField("order_id", DataType.string(), nullable=False)
+    Field("order_id", DataType.string(), nullable=False)
     .with_primary_key()
     .with_partition_by(False)     # explicit off, in case a parent set it
 )
@@ -156,7 +156,7 @@ field = (
 
 `Field.with_primary_key()` / `with_foreign_key()` /
 `with_partition_by()` / `with_cluster_by()` all return a new
-`DataField` with the tag flag set (or replace in place when
+`Field` with the tag flag set (or replace in place when
 `inplace=True`).
 
 ## Composite primary keys + auto-naming
@@ -169,11 +169,11 @@ RELY` clause; no need to name it by hand.
 
 ```python
 RAW_ORDERS_SCHEMA = Schema.from_fields([
-    DataField("order_id",     DataType.string(), nullable=False,
+    Field("order_id",     DataType.string(), nullable=False,
               tags={"primary_key": True}),
-    DataField("_ingested_at", DataType.timestamp("UTC"), nullable=False,
+    Field("_ingested_at", DataType.timestamp("UTC"), nullable=False,
               tags={"primary_key": True, "partition_by": True}),
-    DataField("_payload_hash", DataType.string(), nullable=False),
+    Field("_payload_hash", DataType.string(), nullable=False),
     # ... source-shaped columns ...
 ])
 ```

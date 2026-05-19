@@ -70,7 +70,7 @@ column access.
 from datetime import datetime, timedelta, timezone
 
 from yggdrasil.databricks import DatabricksClient
-from yggdrasil.data import DataField, DataType, Schema
+from yggdrasil.data import Field, DataType, Schema
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.io.http_ import HTTPSession, HTTPRequest
 
@@ -90,27 +90,27 @@ import datetime as dt
 
 RAW_ORDERS_SCHEMA = Schema.from_fields([
     # Source-shaped columns — names + types match the vendor payload.
-    DataField("order_id",     DataType.string(),  nullable=False,
+    Field("order_id",     DataType.string(),  nullable=False,
               tags={"primary_key": True}),
-    DataField("customer_id",  DataType.string(),  nullable=False,
+    Field("customer_id",  DataType.string(),  nullable=False,
               tags={"foreign_key": True},
               metadata={"references": "main.vendor_orders.raw_customers(customer_id)"}),
-    DataField("created",      DataType.string(),  nullable=False,
+    Field("created",      DataType.string(),  nullable=False,
               comment="Vendor ISO-8601 string, +offset varies."),
-    DataField("amount",       DataType.float64(), nullable=False,
+    Field("amount",       DataType.float64(), nullable=False,
               comment="Source ships float — curated layer demotes to decimal(18, 2)."),
-    DataField("ccy",          DataType.string(),  nullable=False),
-    DataField("country",      DataType.string(),  nullable=True),
-    DataField("status",       DataType.string(),  nullable=False),
+    Field("ccy",          DataType.string(),  nullable=False),
+    Field("country",      DataType.string(),  nullable=True),
+    Field("status",       DataType.string(),  nullable=False),
     # Provenance — never from the source. See ygg-data-modeling.
-    DataField("_ingested_at", DataType.timestamp("UTC"), nullable=False,
+    Field("_ingested_at", DataType.timestamp("UTC"), nullable=False,
               tags={"primary_key": True, "partition_by": True}),
-    DataField("_source",      DataType.string(),  nullable=False,
+    Field("_source",      DataType.string(),  nullable=False,
               comment="Logical source — matches the schema name."),
-    DataField("_source_url",  DataType.string(),  nullable=True),
-    DataField("_payload_hash", DataType.string(), nullable=False,
+    Field("_source_url",  DataType.string(),  nullable=True),
+    Field("_payload_hash", DataType.string(), nullable=False,
               comment="xxhash64 of the source row — dedup key."),
-    DataField("_batch_id",    DataType.string(),  nullable=False),
+    Field("_batch_id",    DataType.string(),  nullable=False),
 ])
 
 

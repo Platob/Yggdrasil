@@ -1,4 +1,4 @@
-# Skill: describe columns and schemas with `DataField` / `Schema` / `DataType`
+# Skill: describe columns and schemas with `Field` / `Schema` / `DataType`
 
 ## When to use
 
@@ -11,10 +11,10 @@ precision/scale, timezone) is preserved across Arrow / Polars / pandas
 ## Primary surface
 
 ```python
-from yggdrasil.data import DataField, Field, Schema, DataType, DataTypeId
+from yggdrasil.data import Field, Schema, DataType, DataTypeId
 ```
 
-- `DataField` / `Field` — a column descriptor with name, type,
+- `Field` / `Field` — a column descriptor with name, type,
   nullability, metadata, tags, nested structure, engine-side dtype
   intent.
 - `Schema` — ordered collection of fields.
@@ -80,4 +80,4 @@ out = cast_arrow_tabular(raw_table, CastOptions(target_field=schema.to_arrow()))
   a `DataType` can emit all of them.
 - Don't drop metadata / nullability by rebuilding a `pa.schema(...)`
   from name + dtype tuples — round-trip via `Schema` instead.
-- Don't write parallel per-engine field classes; extend `DataField`.
+- Don't write parallel per-engine field classes; extend `Field`.

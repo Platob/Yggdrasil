@@ -45,7 +45,7 @@ the table when there's expensive joins / deduplication.
 ### 1. Timestamps → UTC
 
 ```python
-DataField(
+Field(
     "paid_at_utc",
     DataType.timestamp("UTC"),
     nullable=False,
@@ -81,18 +81,18 @@ Rules:
 ### 2. Numbers → decimal for money, int for counts
 
 ```python
-DataField(
+Field(
     "amount",
     DataType.decimal(18, 2),       # money — never float64
     nullable=False,
     comment="Order total, in `currency_iso` units.",
 )
-DataField(
+Field(
     "item_count",
     DataType.int32(),              # countable → integer, narrowest fit
     nullable=False,
 )
-DataField(
+Field(
     "fx_rate",
     DataType.decimal(18, 8),       # rate — high scale, fixed precision
     nullable=False,
@@ -125,32 +125,32 @@ GeoZoneCatalog.default().parse("Germany").country_iso  # → "DE"
 In the schema:
 
 ```python
-DataField(
+Field(
     "currency_iso",                          # column name carries the standard
     DataType.string(),
     nullable=False,
     comment="ISO 4217 — see yggdrasil.data.enums.Currency.",
     tags={"cluster_by": True},               # most queries filter on it
 )
-DataField(
+Field(
     "country_iso",
     DataType.string(),
     nullable=True,
     comment="ISO 3166-1 alpha-2 — see yggdrasil.data.enums.geozone.",
 )
-DataField(
+Field(
     "region_iso",
     DataType.string(),
     nullable=True,
     comment="ISO 3166-2 subdivision code (e.g. 'FR-75').",
 )
-DataField(
+Field(
     "language_iso",
     DataType.string(),
     nullable=True,
     comment="ISO 639-1 two-letter code.",
 )
-DataField(
+Field(
     "timezone_iana",
     DataType.string(),
     nullable=True,
@@ -179,7 +179,7 @@ Build a CHECK constraint via a constraint `Field` (see
 small and known:
 
 ```python
-DataField(
+Field(
     "status",
     DataType.string(),
     nullable=False,
@@ -206,7 +206,7 @@ column where some rows are `""` and others are `NULL` for "missing".
 ### 6. Identifiers → typed + commented
 
 ```python
-DataField(
+Field(
     "order_id",
     DataType.string(),
     nullable=False,
@@ -224,13 +224,13 @@ Raw landing (vendor shape):
 
 ```python
 RAW_ORDERS_SCHEMA = Schema.from_fields([
-    DataField("order_id",   DataType.string(), nullable=False,
+    Field("order_id",   DataType.string(), nullable=False,
               tags={"primary_key": True}),
-    DataField("created",    DataType.string(),  nullable=False,
+    Field("created",    DataType.string(),  nullable=False,
               comment="Source `created` field — ISO-8601 string, +offset varies."),
-    DataField("amount",     DataType.float64(), nullable=False),
-    DataField("ccy",        DataType.string(),  nullable=False),
-    DataField("country",    DataType.string(),  nullable=True),
+    Field("amount",     DataType.float64(), nullable=False),
+    Field("ccy",        DataType.string(),  nullable=False),
+    Field("country",    DataType.string(),  nullable=True),
     # ... + provenance columns ...
 ])
 
@@ -243,27 +243,27 @@ Curated standardisation:
 
 ```python
 ORDERS_SCHEMA = Schema.from_fields([
-    DataField(
+    Field(
         "order_id", DataType.string(), nullable=False,
         comment="Vendor order id. ULID format.",
         tags={"primary_key": True},
     ),
-    DataField(
+    Field(
         "created_at_utc", DataType.timestamp("UTC"), nullable=False,
         comment="Order creation time, normalised to UTC.",
         tags={"partition_by": True},
     ),
-    DataField(
+    Field(
         "amount", DataType.decimal(18, 2), nullable=False,
         comment="Order total in `currency_iso`.",
     ),
-    DataField(
+    Field(
         "currency_iso", DataType.string(), nullable=False,
         comment="ISO 4217. Joinable on main.iso.currency(iso_alpha3).",
         metadata={"references": "main.iso.currency(iso_alpha3)"},
         tags={"foreign_key": True, "cluster_by": True},
     ),
-    DataField(
+    Field(
         "country_iso", DataType.string(), nullable=True,
         comment="ISO 3166-1 alpha-2 (NULL when vendor didn't ship one).",
         metadata={"references": "main.iso.country(iso_alpha2)"},
