@@ -47,7 +47,7 @@ from yggdrasil.databricks.schema.schema import Schema
 from yggdrasil.databricks.volume.volume import Volume
 from yggdrasil.pandas.tests import PandasTestCase
 
-from . import DatabricksIntegrationCase
+from tests.test_yggdrasil.test_databricks import DatabricksIntegrationCase
 
 
 __all__ = [

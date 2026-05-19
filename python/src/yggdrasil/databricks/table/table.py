@@ -36,7 +36,6 @@ from databricks.sdk.service.catalog import (
     TableOperation,
     TableType, EntityTagAssignment,
 )
-
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
@@ -46,7 +45,7 @@ from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.column.column import Column
-from yggdrasil.dataclasses import Singleton
+from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.databricks.sql.sql_utils import (
     MAX_TABLE_NAME_LEN,
     quote_ident,
@@ -54,17 +53,17 @@ from yggdrasil.databricks.sql.sql_utils import (
     safe_table_name,
     sql_literal, escape_sql_string,
 )
+from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.environ import PyEnv
 from yggdrasil.io import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ParquetFile
 from yggdrasil.io.tabular import Tabular, O
 from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
 from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
+
 from ..fs import VolumePath
 from ..volume import Volume
 
@@ -85,7 +84,6 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.table.async_job import AsyncApplierTaskType
     from yggdrasil.databricks.table.async_write import AsyncInsert
     from yggdrasil.data.statement import StatementBatch
-
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
 
@@ -1154,6 +1152,7 @@ class Table(DatabricksPath):
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
         self._staging_volume: Volume | None = None
+        self._async_job: "DatabricksJob | None" = None
         self._initialized = True
 
     # ------------------------------------
@@ -2009,7 +2008,7 @@ class Table(DatabricksPath):
                 )
                 self.invalidate_singleton(remove_global=True)
                 return result
-            self.delete(wait=True, missing_ok=True, delete_staging=False)
+            self.delete(wait=True, missing_ok=True, delete_staging=False, delete_job=False)
 
         if self.exists:
             if mode == Mode.ERROR_IF_EXISTS:
@@ -2747,6 +2746,7 @@ class Table(DatabricksPath):
         wait: WaitingConfigArg = True,
         missing_ok: bool = False,
         delete_staging: bool = True,
+        delete_job: bool = True
     ) -> "Table":
         # ``delete_staging=False`` keeps the staging volume around for
         # internal drop-and-recreate flows (OVERWRITE) where the very
@@ -2755,8 +2755,8 @@ class Table(DatabricksPath):
         # upload and surface as PATH_NOT_FOUND on the warehouse INSERT.
         uc = self.client.workspace_client().tables
         logger.debug(
-            "Deleting table %r (wait=%s, delete_staging=%s)",
-            self, bool(wait), delete_staging,
+            "Deleting table %r (wait=%s, delete_staging=%s, delete_job=%s)",
+            self, bool(wait), delete_staging, delete_job
         )
 
         if wait:
@@ -2765,11 +2765,14 @@ class Table(DatabricksPath):
 
                 if delete_staging and self._staging_volume:
                     self._staging_volume.delete(wait=False)
+
+                if delete_job and self._async_job:
+                    self._async_job.delete(wait=False)
             except DatabricksError:
                 if not missing_ok:
                     raise
         else:
-            Job.make(self.delete, delete_staging=delete_staging).fire_and_forget()
+            Job.make(self.delete, delete_staging=delete_staging, delete_job=delete_job).fire_and_forget()
 
         self.invalidate_singleton(remove_global=True)
         logger.info("Deleted table %r", self)
@@ -3054,7 +3057,7 @@ class Table(DatabricksPath):
 
         One Databricks Job per ``(catalog, schema, table)`` triple,
         watching this table's own
-        ``stg_<table>/.sql/async/insert/data/`` folder via a
+        ``<table>/.sql/async/insert/data/`` folder via a
         file-arrival trigger. ``**overrides`` flow into
         :meth:`AsyncInsertJob.settings` for per-deploy knobs
         (``schedule=``, ``file_arrival_trigger=``, ``parameters=``,
@@ -3093,6 +3096,9 @@ class Table(DatabricksPath):
         invocation can't see the job's ``{{job.parameters.*}}``
         bindings).
         """
+        if self._async_job is not None:
+            return self._async_job
+
         from .async_job import AsyncInsertJob
 
         jobs = self.client.jobs
@@ -3109,7 +3115,8 @@ class Table(DatabricksPath):
             self, applier=applier, task_type=task_type, **overrides,
         )
         name = settings.pop("name")
-        return jobs.create_or_update(name=name, **settings)
+        self._async_job = jobs.create_or_update(name=name, **settings)
+        return self._async_job
 
     def async_insert(
         self,
@@ -3124,7 +3131,7 @@ class Table(DatabricksPath):
 
         Rows are cast to the target schema and dropped (alongside a
         JSON metadata file describing the operation) under the
-        table's ``stg_<table>/.sql/async/insert`` staging folder for a
+        table's ``<table>/.sql/async/insert`` staging folder for a
         downstream applier to pick up; the SQL insert is *not*
         executed. The constructed :class:`AsyncInsert` is itself a
         :class:`WarehouseStatementBatch`, so binding an executor and
@@ -3136,7 +3143,7 @@ class Table(DatabricksPath):
         ``require_job`` (default ``True``) ensures the per-table
         applier Job exists before any staging round trip — without one,
         staged payloads sit in the table's
-        ``stg_<table>/.sql/async/insert/`` folder forever with no
+        ``<table>/.sql/async/insert/`` folder forever with no
         consumer. The check rides through :meth:`Table.async_job`,
         whose :meth:`Jobs.find` lookup caches the ``name → job_id``
         mapping for 60 s; the steady-state cost is sub-millisecond.
@@ -3268,7 +3275,7 @@ class Table(DatabricksPath):
                 service=self.service.volumes,
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
-                volume_name="stg_" + self.client.safe_tag_value(self.table_name, repl="_").lower()
+                volume_name=self.client.safe_tag_value(self.table_name, repl="_").lower()
             )
         return self._staging_volume
 
@@ -3782,7 +3789,7 @@ class Table(DatabricksPath):
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
         if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, missing_ok=True, delete_staging=False)
+            self.delete(wait=True, missing_ok=True, delete_staging=False, delete_job=False)
 
         if not self.exists:
             raise ValueError(

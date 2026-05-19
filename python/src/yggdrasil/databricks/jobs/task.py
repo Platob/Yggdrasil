@@ -33,6 +33,7 @@ from databricks.sdk.service.jobs import (
     Task,
 )
 
+from yggdrasil.version import __version__ as yggdrasil_version
 from yggdrasil.dataclasses.safe_function import (
     describe_signature,
     format_signature,
@@ -94,7 +95,7 @@ DEFAULT_ENVIRONMENT_CLIENT = "5"
 #: bundle the dataframe engines (pandas/polars/numpy) and the
 #: Databricks SDK so staged tasks can move frames and call the
 #: workspace without a follow-up install step.
-DEFAULT_ENVIRONMENT_DEPENDENCIES: List[str] = ["ygg[data,databricks]"]
+DEFAULT_ENVIRONMENT_DEPENDENCIES: List[str] = [f"ygg[data,databricks]=={yggdrasil_version}"]
 
 
 class JobTask:

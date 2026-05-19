@@ -361,7 +361,7 @@ class WarehousePreparedStatement(PreparedStatement):
 
         Mints the staging path through :meth:`Table.insert_volume_path`
         on a transient :class:`Table` keyed by ``(catalog, schema,
-        resource_name or alias)`` — same per-table ``stg_<table>``
+        resource_name or alias)`` — same per-table ``<table>``
         volume layout the warehouse insert path uses — then writes the
         Parquet payload, unlinking the path on write failure when
         ``temporary=True``.

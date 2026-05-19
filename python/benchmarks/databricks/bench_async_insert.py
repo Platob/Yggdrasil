@@ -51,11 +51,11 @@ def _make_record(
     return AsyncInsert(
         target_full_name=target,
         parquet_paths=tuple(
-            f"/Volumes/main/sales/stg_orders/.sql/async/insert/{op_id}-{i}.parquet"
+            f"/Volumes/main/sales/orders/.sql/async/insert/{op_id}-{i}.parquet"
             for i in range(parquets)
         ),
         metadata_paths=tuple(
-            f"/Volumes/main/sales/stg_orders/.sql/async/insert/{op_id}-{i}.json"
+            f"/Volumes/main/sales/orders/.sql/async/insert/{op_id}-{i}.json"
             for i in range(parquets)
         ),
         operation_ids=tuple(f"{op_id}-{i}" for i in range(parquets)),

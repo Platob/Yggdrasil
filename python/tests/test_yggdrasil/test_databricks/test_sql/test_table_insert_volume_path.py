@@ -39,7 +39,7 @@ def _table(
     # ``files.upload`` through *Volume.client.workspace_client*.
     service.volumes.client.workspace_client.return_value = ws
     # ``Table.staging_volume`` runs ``client.safe_tag_value`` on the
-    # table name to derive the ``stg_<table>`` volume — mirror the
+    # table name to derive the ``<table>`` volume — mirror the
     # production behavior (strip/lower) so test assertions can match
     # the rendered volume name.
     service.client.safe_tag_value.side_effect = lambda v, repl="_": str(v).replace(
@@ -65,9 +65,9 @@ class TestInsertVolumePath:
         path = tbl.insert_volume_path()
         assert isinstance(path, VolumePath)
         full = path.full_path()
-        # ``staging_volume`` is ``stg_<table>`` under the table's
+        # ``staging_volume`` is ``<table>`` under the table's
         # catalog / schema; staging files land in ``.sql/tmp/``.
-        assert full.startswith("/Volumes/cat/sch/stg_tbl/.sql/tmp/")
+        assert full.startswith("/Volumes/cat/sch/tbl/.sql/tmp/")
         assert full.endswith(".parquet")
         # Default keeps the staged Parquet temporary so the holder
         # cleans up after itself.
@@ -85,7 +85,7 @@ class TestInsertVolumePath:
         other = _table("cat2", "sch2", "extra")
         path = tbl.insert_volume_path(other)
         full = path.full_path()
-        assert "/Volumes/cat2/sch2/stg_extra/.sql/tmp/" in full
+        assert "/Volumes/cat2/sch2/extra/.sql/tmp/" in full
 
     def test_unique_per_call(self) -> None:
         tbl = _table()
@@ -117,7 +117,7 @@ class TestInsertVolumePathIsMockable:
         monkey-patching the underlying staging-volume plumbing."""
         tbl = _table()
         custom = VolumePath(
-            "/Volumes/test/test/stg_tbl/.sql/tmp/part-fixed.parquet",
+            "/Volumes/test/test/tbl/.sql/tmp/part-fixed.parquet",
             client=MagicMock(),
         )
         tbl.insert_volume_path = lambda *a, **kw: custom  # type: ignore[assignment]

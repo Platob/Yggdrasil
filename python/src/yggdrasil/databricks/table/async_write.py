@@ -3,7 +3,7 @@
 When :meth:`Table.insert` is called with ``lazy=True``, the caller is
 not waiting on a warehouse round trip — the rows are cast to the
 target schema, written as Parquet under the table's
-``stg_<table>/.sql/async/insert`` staging folder, and a sibling JSON
+``<table>/.sql/async/insert`` staging folder, and a sibling JSON
 file carries an :class:`AsyncInsert` record so a downstream applier
 (typically a job-driven loop) can replay the operation against the
 target table when it's convenient. The :class:`AsyncInsert` itself is

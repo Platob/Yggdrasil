@@ -1,7 +1,7 @@
 """Per-table applier-job settings for staged async inserts.
 
 A staged async insert lands a Parquet payload plus a JSON metadata
-file under the target table's ``stg_<table>/.sql/async/insert/``
+file under the target table's ``<table>/.sql/async/insert/``
 folder; a downstream Databricks Job drains them back into the
 target. :meth:`AsyncInsertJob.settings` returns the full
 :class:`JobSettings`-shaped kwargs dict for the per-table applier
@@ -34,6 +34,9 @@ from typing import (
     Optional,
 )
 
+from yggdrasil.databricks.client import DatabricksClient
+from yggdrasil.databricks.fs import VolumePath
+
 #: Applier-task flavours :meth:`AsyncInsertJob.settings` will stage —
 #: ``"notebook"`` (default) renders cells so each step's logs surface
 #: under its own cell in the Databricks UI; ``"spark"`` renders a flat
@@ -52,9 +55,6 @@ from databricks.sdk.service.jobs import (
 )
 
 if TYPE_CHECKING:
-    from yggdrasil.databricks.client import DatabricksClient
-    from yggdrasil.databricks.fs import VolumePath
-
     from .async_write import AsyncInsert
     from .table import Table
 
@@ -312,7 +312,7 @@ class AsyncInsertJob:
         """Read the staged :class:`AsyncInsert` records under *path*.
 
         *path* defaults to *table*'s own
-        ``stg_<table>/.sql/async/insert`` folder. With ``merge=True``
+        ``<table>/.sql/async/insert`` folder. With ``merge=True``
         (default) returns one merged record per target — every
         overlapping append folds into a single ``INSERT INTO`` and a
         trailing overwrite drops everything before it (see

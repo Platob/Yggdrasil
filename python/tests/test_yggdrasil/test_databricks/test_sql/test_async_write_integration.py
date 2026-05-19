@@ -262,7 +262,7 @@ class TestAsyncWriteJobIntegration(_AsyncWriteIntegrationBase):
         assert isinstance(trigger.file_arrival, FileArrivalTriggerConfiguration)
         # Trigger points at the table's own async staging data folder.
         assert (
-            f"/Volumes/{self.catalog_name}/{self.schema_name}/stg_"
+            f"/Volumes/{self.catalog_name}/{self.schema_name}/"
             in trigger.file_arrival.url
         )
         assert trigger.file_arrival.url.endswith("/.sql/async/insert/logs/")

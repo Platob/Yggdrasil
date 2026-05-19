@@ -690,7 +690,7 @@ Example footer:
 Flow source: my_pipelines.daily_etl.daily_etl
   https://github.com/acme/data-platform/blob/abc123…/pipelines/daily_etl.py#L42
   git: abc123def012 (main)
-  yggdrasil=0.7.76
+  yggdrasil=0.7.89
 ```
 
 Need to add custom tags? `metadata.collect_source_metadata(func, extra={"team": "data"})` plumbs through to the deploy-time tag bag (used internally by the workflow layer — pass the same shape via the `@flow(tags={...})` kwarg).

@@ -27,6 +27,7 @@ from databricks.sdk.service.jobs import (
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.url import URL
+from yggdrasil.concurrent import Job as ConcurrentJob
 
 from ..client import DatabricksClient, DatabricksResource
 
@@ -231,7 +232,7 @@ class Job(Singleton, DatabricksResource):
         LOGGER.info("Updated job %r", self)
         return self
 
-    def delete(self) -> None:
+    def delete(self, wait: WaitingConfigArg = True) -> None:
         """Delete the job if it exists. Also drops the named-job cache entry."""
         if self.job_id is None:
             return
@@ -239,10 +240,14 @@ class Job(Singleton, DatabricksResource):
         from .service import _NAME_ID_CACHE
 
         LOGGER.debug("Deleting job %r", self)
-        try:
-            self.service._jobs_api().delete(job_id=self.job_id)
-        except ResourceDoesNotExist:
-            LOGGER.debug("Job %r already deleted — skipping delete", self)
+
+        if wait:
+            try:
+                self.service._jobs_api().delete(job_id=self.job_id)
+            except ResourceDoesNotExist:
+                LOGGER.debug("Job %r already deleted — skipping delete", self)
+        else:
+            ConcurrentJob.make(self.delete, wait=True).fire_and_forget()
 
         host = self.client.base_url.to_string()
         host_cache = _NAME_ID_CACHE.get(host)
