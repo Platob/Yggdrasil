@@ -20,6 +20,7 @@ from databricks.sdk.service.dashboards import (
 )
 
 from yggdrasil.databricks.genie import (
+    DEFAULT_MANAGED_SPACE_TITLE,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_WAIT,
     Genie,
@@ -27,6 +28,7 @@ from yggdrasil.databricks.genie import (
     GenieConversation,
     GenieDefaults,
     GenieSpace,
+    build_serialized_space,
 )
 from yggdrasil.databricks.tests import DatabricksTestCase
 from yggdrasil.dataclasses import WaitingConfig
@@ -411,3 +413,173 @@ class TestGenieFeedback(GenieTestCase):
             rating=GenieFeedbackRating.POSITIVE,
             comment="nice",
         )
+
+
+class TestGenieManagedDefaults(GenieTestCase):
+    """New ``GenieDefaults`` fields covering auto-create + cleanup."""
+
+    def test_managed_defaults_have_sensible_off_state(self):
+        d = self.genie.defaults
+        self.assertFalse(d.auto_create_space)
+        self.assertFalse(d.cleanup_dead_spaces)
+        self.assertEqual(d.managed_space_title, DEFAULT_MANAGED_SPACE_TITLE)
+        self.assertEqual(d.managed_space_tables, ())
+        self.assertIsNone(d.managed_space_description)
+        self.assertIsNone(d.managed_space_parent_path)
+
+    def test_build_serialized_space_minimal(self):
+        from yggdrasil.pickle import json as ygg_json
+
+        payload = build_serialized_space(tables=("main.sales.orders",))
+        body = ygg_json.loads(payload)
+        self.assertEqual(body["version"], 1)
+        self.assertEqual(
+            body["data_sources"]["tables"],
+            [{"identifier": "main.sales.orders"}],
+        )
+        self.assertNotIn("instructions", body)
+
+    def test_build_serialized_space_with_instructions(self):
+        from yggdrasil.pickle import json as ygg_json
+
+        payload = build_serialized_space(
+            tables=("main.sales.orders",),
+            text_instructions=("Be brief.", "Quote dollar amounts."),
+        )
+        body = ygg_json.loads(payload)
+        texts = body["instructions"]["text_instructions"]
+        self.assertEqual(len(texts), 2)
+        self.assertEqual(texts[0]["content"], ["Be brief."])
+        # Each instruction gets a fresh 32-char hex id (uuid4 hex).
+        self.assertEqual(len(texts[0]["id"]), 32)
+        self.assertNotEqual(texts[0]["id"], texts[1]["id"])
+
+
+class TestGenieEnsureSpace(GenieTestCase):
+    """``Genie.ensure_space`` resolve / auto-create flow."""
+
+    def test_returns_existing_when_space_id_set(self):
+        self.genie.defaults = replace(self.genie.defaults, space_id="space-X")
+        space = self.genie.ensure_space()
+        self.assertEqual(space.space_id, "space-X")
+        # Did not list or create.
+        self.genie_api.list_spaces.assert_not_called()
+        self.genie_api.create_space.assert_not_called()
+
+    def test_picks_matching_managed_title_over_first(self):
+        spaces_page = MagicMock()
+        spaces_page.spaces = [
+            MagicMock(space_id="other-id", title="Other"),
+            MagicMock(space_id="managed-id", title=DEFAULT_MANAGED_SPACE_TITLE),
+        ]
+        self.genie_api.list_spaces.return_value = spaces_page
+
+        space = self.genie.ensure_space()
+        self.assertEqual(space.space_id, "managed-id")
+        # Caches resolved id back on defaults so the next ask() is cheap.
+        self.assertEqual(self.genie.defaults.space_id, "managed-id")
+        self.genie_api.create_space.assert_not_called()
+
+    def test_auto_create_requires_tables(self):
+        self.genie.defaults = replace(
+            self.genie.defaults,
+            auto_create_space=True,
+            warehouse_id="wh-1",
+        )
+        self.genie_api.list_spaces.return_value = MagicMock(spaces=[])
+        with self.assertRaises(ValueError) as ctx:
+            self.genie.ensure_space()
+        self.assertIn("managed_space_tables", str(ctx.exception))
+
+    def test_auto_create_calls_create_space(self):
+        self.genie.defaults = replace(
+            self.genie.defaults,
+            auto_create_space=True,
+            warehouse_id="wh-1",
+            managed_space_tables=("main.sales.orders",),
+            managed_space_description="auto",
+        )
+        self.genie_api.list_spaces.return_value = MagicMock(spaces=[])
+        created = MagicMock(space_id="new-id", title=DEFAULT_MANAGED_SPACE_TITLE)
+        self.genie_api.create_space.return_value = created
+
+        space = self.genie.ensure_space()
+        self.assertEqual(space.space_id, "new-id")
+        self.assertEqual(self.genie.defaults.space_id, "new-id")
+
+        call = self.genie_api.create_space.call_args
+        self.assertEqual(call.kwargs["warehouse_id"], "wh-1")
+        self.assertEqual(call.kwargs["title"], DEFAULT_MANAGED_SPACE_TITLE)
+        self.assertEqual(call.kwargs["description"], "auto")
+        # serialized_space carries our minimal payload.
+        self.assertIn("main.sales.orders", call.kwargs["serialized_space"])
+
+    def test_missing_space_without_auto_create_raises(self):
+        self.genie.defaults = replace(
+            self.genie.defaults,
+            space_id=None,
+            auto_create_space=False,
+        )
+        self.genie_api.list_spaces.return_value = MagicMock(spaces=[])
+        with self.assertRaises(ValueError) as ctx:
+            self.genie.ensure_space()
+        self.assertIn("auto_create_space", str(ctx.exception))
+
+
+class TestGenieCleanupDeadSpaces(GenieTestCase):
+    """Duplicate managed-title spaces get trashed."""
+
+    def test_no_op_when_no_duplicates(self):
+        spaces_page = MagicMock()
+        spaces_page.spaces = [
+            MagicMock(space_id="only", title=DEFAULT_MANAGED_SPACE_TITLE),
+        ]
+        self.genie_api.list_spaces.return_value = spaces_page
+        self.assertEqual(self.genie.cleanup_dead_spaces(), [])
+        self.genie_api.trash_space.assert_not_called()
+
+    def test_trashes_duplicates_keeping_default(self):
+        self.genie.defaults = replace(self.genie.defaults, space_id="keeper")
+        spaces_page = MagicMock()
+        spaces_page.spaces = [
+            MagicMock(space_id="dup-A", title=DEFAULT_MANAGED_SPACE_TITLE),
+            MagicMock(space_id="keeper", title=DEFAULT_MANAGED_SPACE_TITLE),
+            MagicMock(space_id="dup-B", title=DEFAULT_MANAGED_SPACE_TITLE),
+            MagicMock(space_id="other", title="Not Managed"),
+        ]
+        self.genie_api.list_spaces.return_value = spaces_page
+
+        trashed = self.genie.cleanup_dead_spaces()
+        self.assertEqual(sorted(trashed), ["dup-A", "dup-B"])
+        trashed_calls = {
+            call.kwargs["space_id"]
+            for call in self.genie_api.trash_space.call_args_list
+        }
+        self.assertEqual(trashed_calls, {"dup-A", "dup-B"})
+
+    def test_trashes_duplicates_keeping_first_when_no_default(self):
+        # No defaults.space_id — survivor is the first listed entry.
+        spaces_page = MagicMock()
+        spaces_page.spaces = [
+            MagicMock(space_id="first", title=DEFAULT_MANAGED_SPACE_TITLE),
+            MagicMock(space_id="second", title=DEFAULT_MANAGED_SPACE_TITLE),
+        ]
+        self.genie_api.list_spaces.return_value = spaces_page
+        trashed = self.genie.cleanup_dead_spaces()
+        self.assertEqual(trashed, ["second"])
+
+    def test_cleanup_runs_from_ensure_space_when_flag_on(self):
+        self.genie.defaults = replace(
+            self.genie.defaults,
+            space_id="keeper",
+            cleanup_dead_spaces=True,
+        )
+        spaces_page = MagicMock()
+        spaces_page.spaces = [
+            MagicMock(space_id="keeper", title=DEFAULT_MANAGED_SPACE_TITLE),
+            MagicMock(space_id="dup", title=DEFAULT_MANAGED_SPACE_TITLE),
+        ]
+        self.genie_api.list_spaces.return_value = spaces_page
+
+        self.genie.ensure_space()
+        self.genie_api.trash_space.assert_called_once_with(space_id="dup")

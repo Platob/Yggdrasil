@@ -52,11 +52,14 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_POLL_INTERVAL_SECONDS",
     "DEFAULT_WAIT",
+    "DEFAULT_MANAGED_SPACE_TITLE",
+    "DEFAULT_SERIALIZED_SPACE_VERSION",
     "GenieDefaults",
     "GenieAnswer",
     "GenieConversation",
     "GenieSpace",
     "GENIE_TERMINAL_STATUSES",
+    "build_serialized_space",
 ]
 
 
@@ -85,6 +88,66 @@ DEFAULT_WAIT: WaitingConfig = WaitingConfig(
 GENIE_TERMINAL_STATUSES: frozenset[str] = frozenset(
     {"COMPLETED", "FAILED", "CANCELLED", "QUERY_RESULT_EXPIRED"}
 )
+
+#: Title used when :class:`Genie` auto-creates a default space. Also acts as
+#: the marker that :meth:`Genie.cleanup_dead_spaces` uses to identify
+#: yggdrasil-managed spaces — anything outside this title is left alone.
+DEFAULT_MANAGED_SPACE_TITLE: str = "Yggdrasil Genie"
+
+#: ``serialized_space.version`` baked by :func:`build_serialized_space`.
+#: The Genie API has accepted ``1`` and ``2``; the v1 shape is the smaller,
+#: more permissive payload and what every minimal example in the docs uses.
+DEFAULT_SERIALIZED_SPACE_VERSION: int = 1
+
+
+def build_serialized_space(
+    *,
+    tables: "tuple[str, ...] | list[str]" = (),
+    text_instructions: "tuple[str, ...] | list[str]" = (),
+    version: int = DEFAULT_SERIALIZED_SPACE_VERSION,
+) -> str:
+    """Build a minimal ``serialized_space`` JSON payload for ``create_space``.
+
+    Genie's ``create_space`` requires a JSON-encoded definition of the space's
+    data sources and instructions. This helper produces the smallest payload
+    the Genie API will accept so callers configuring
+    :attr:`GenieDefaults.managed_space_tables` don't have to hand-roll the
+    schema.
+
+    Parameters
+    ----------
+    tables
+        Fully qualified ``catalog.schema.table`` identifiers to expose in
+        the space. At least one is required by Genie itself; the helper
+        forwards whatever is passed and lets the API raise on an empty list.
+    text_instructions
+        Free-text guidance the LLM should follow inside the space. Optional.
+    version
+        Schema version. Defaults to :data:`DEFAULT_SERIALIZED_SPACE_VERSION`.
+
+    Returns
+    -------
+    str
+        A JSON string ready to pass to :meth:`Genie.create_space`.
+    """
+    from uuid import uuid4
+
+    from yggdrasil.pickle import json as ygg_json
+
+    body: dict[str, Any] = {
+        "version": version,
+        "data_sources": {
+            "tables": [{"identifier": ident} for ident in tables],
+        },
+    }
+    if text_instructions:
+        body["instructions"] = {
+            "text_instructions": [
+                {"id": uuid4().hex, "content": [text]}
+                for text in text_instructions
+            ],
+        }
+    return ygg_json.dumps(body, to_bytes=False)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +202,50 @@ class GenieDefaults:
         When :attr:`space_id` is unset, :meth:`Genie.default_space` may pick
         a space from :meth:`Genie.list_spaces` (filtered by :attr:`space_name`
         if set). Turn off to require an explicit id.
+    auto_create_space
+        When :attr:`space_id` is unset *and* :meth:`Genie._pick_space_id`
+        could not resolve one (no matching space exists),
+        :meth:`Genie.ensure_space` will create a fresh space using
+        :attr:`managed_space_title`, :attr:`managed_space_tables`, and
+        :attr:`warehouse_id`. Off by default — opt-in because space creation
+        has workspace-visible side effects.
+    cleanup_dead_spaces
+        When ``True``, :meth:`Genie.cleanup_dead_spaces` (called
+        automatically from :meth:`Genie.ensure_space` when the flag is on)
+        trashes duplicate managed-title spaces, keeping only the active one
+        identified by :attr:`space_id`. "Dead" means: same title as
+        :attr:`managed_space_title`, not the active id. Off by default.
+    managed_space_title
+        Title applied when auto-creating a Genie space, also used as the
+        marker for :meth:`Genie.cleanup_dead_spaces`. Defaults to
+        :data:`DEFAULT_MANAGED_SPACE_TITLE`.
+    managed_space_description
+        Description applied to auto-created spaces. ``None`` skips the
+        field.
+    managed_space_tables
+        Fully-qualified ``catalog.schema.table`` identifiers exposed in the
+        auto-created space's data sources. Genie requires at least one.
+    managed_space_parent_path
+        Workspace folder path the auto-created space is filed under.
+        ``None`` lets Genie pick its default location.
+    managed_space_instructions
+        Free-text instructions baked into the auto-created space's
+        ``serialized_space``.
+    agent_output_dir
+        Root directory the :class:`GenieAgent` writes artifacts under.
+        When ``None`` (the default), :attr:`GenieAgent.output_dir` resolves
+        to ``$XDG_CACHE_HOME/yggdrasil/genie`` (falling back to
+        ``~/.cache/yggdrasil/genie``).
+    agent_auto_save
+        When ``True``, :meth:`GenieAgent.run` saves the SQL result of every
+        answer that carries a query attachment.
+    agent_auto_save_format
+        File format used by auto-save. One of ``"parquet"``, ``"csv"``,
+        ``"arrow"``, ``"json"``, ``"text"``. Parquet is the default.
+    agent_max_steps
+        Soft step budget honored by :meth:`GenieAgent.chat`. The agent
+        stops accepting new questions once this many turns have completed
+        on a single :meth:`chat` call.
     """
 
     space_id: Optional[str] = None
@@ -147,6 +254,17 @@ class GenieDefaults:
     wait: WaitingConfig = DEFAULT_WAIT
     auto_execute_query: bool = True
     auto_pick_space: bool = True
+    auto_create_space: bool = False
+    cleanup_dead_spaces: bool = False
+    managed_space_title: str = DEFAULT_MANAGED_SPACE_TITLE
+    managed_space_description: Optional[str] = None
+    managed_space_tables: tuple[str, ...] = ()
+    managed_space_parent_path: Optional[str] = None
+    managed_space_instructions: tuple[str, ...] = ()
+    agent_output_dir: Optional[str] = None
+    agent_auto_save: bool = False
+    agent_auto_save_format: str = "parquet"
+    agent_max_steps: int = 8
 
     @property
     def timeout(self) -> dt.timedelta:
