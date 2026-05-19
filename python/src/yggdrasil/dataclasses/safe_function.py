@@ -242,22 +242,30 @@ def _resolved_annotations(func: Callable[..., Any]) -> dict[str, Any]:
 
     # Fast path — inspect.get_annotations with eval_str.
     try:
-        return dict(inspect.get_annotations(func, eval_str=True))
+        resolved: dict[str, Any] = dict(
+            inspect.get_annotations(func, eval_str=True),
+        )
     except Exception as exc:
         LOGGER.debug(
             "_resolved_annotations: get_annotations(eval_str=True) failed "
             "for %r — falling back to per-annotation resolution (%s)",
             getattr(func, "__qualname__", func), exc,
         )
+        resolved = dict(raw)
 
-    # Per-annotation fallback — partial wins still help.
+    # Per-annotation fallback for entries still left as strings.
+    # ``inspect.get_annotations(eval_str=True)`` silently keeps an
+    # annotation as a string when its eval against the function's
+    # globals + builtins fails (no exception is raised) — common for
+    # short aliases like ``pa.RecordBatch`` / ``pl.DataFrame`` /
+    # ``pd.DataFrame`` whose import name lives in ``yggdrasil``'s
+    # alias-prefix table but not in the caller's module globals.
+    # Route each leftover string through :func:`_resolve_str_annotation`
+    # so the alias expansion + dotted import path can finish the job.
     func_globals = getattr(func, "__globals__", None)
-    resolved: dict[str, Any] = {}
-    for name, ann in raw.items():
+    for name, ann in list(resolved.items()):
         if isinstance(ann, str):
             resolved[name] = _resolve_str_annotation(ann, func_globals=func_globals)
-        else:
-            resolved[name] = ann
     return resolved
 
 
@@ -653,36 +661,72 @@ def build_row_invoker(func: Callable[..., Any]) -> Callable[[Any], Any]:
 # a single column by name + type hint
 # ---------------------------------------------------------------------------
 
+def _resolve_tabular_target(ann: Any) -> Optional[type]:
+    """Return *ann* iff it's a recognised whole-batch tabular type.
+
+    ``pyarrow.RecordBatch`` / ``pyarrow.Table`` are always probed (Arrow
+    is yggdrasil's only hard runtime dep); ``polars.DataFrame`` /
+    ``polars.LazyFrame`` / ``pandas.DataFrame`` resolve only when the
+    optional engine is installed. Unknown annotations return ``None`` so
+    the caller falls back to per-row dispatch.
+    """
+    if not isinstance(ann, type):
+        return None
+    import pyarrow as _pa
+    if ann is _pa.RecordBatch or ann is _pa.Table:
+        return ann
+    try:
+        import polars as _pl
+    except ImportError:
+        _pl = None
+    if _pl is not None and (ann is _pl.DataFrame or ann is _pl.LazyFrame):
+        return ann
+    try:
+        import pandas as _pd
+    except ImportError:
+        _pd = None
+    if _pd is not None and ann is _pd.DataFrame:
+        return ann
+    return None
+
+
 def build_batch_invoker(
     func: Callable[..., Any],
 ) -> Callable[["pa.RecordBatch"], list[Any]]:
     """Return a per-batch dispatcher ``invoker(batch) -> list[Any]``.
 
-    When *func* has a single positional annotated parameter whose name
-    matches a column in the incoming :class:`pyarrow.RecordBatch`, the
-    whole column is cast to the target Arrow type via
-    :func:`pyarrow.compute.cast` (vectorised, one C++ kernel call) and
-    then iterated through *func* — skipping the per-row dict
-    reconstruction that ``batch.to_pylist()`` would otherwise do.
+    Three dispatch shapes, picked from *func*'s signature once:
 
-    Falls back to per-row dispatch via :func:`build_row_invoker` for
-    any other shape (multi-arg, ``**kwargs``, no column name match,
-    annotation that doesn't map to an Arrow type, …). The fallback
-    materialises ``batch.to_pylist()`` once and calls the row invoker
-    over the resulting dicts — exactly what the caller would have
-    done by hand, kept inside this helper so apply pipelines have a
-    single dispatch point.
+    1. **Whole-batch tabular** — when *func* has a single positional
+       annotated parameter whose type is a recognised tabular shape
+       (``pa.RecordBatch`` / ``pa.Table`` / ``pl.DataFrame`` /
+       ``pl.LazyFrame`` / ``pd.DataFrame``), the entire incoming
+       :class:`pyarrow.RecordBatch` is converted to that type via the
+       :func:`yggdrasil.data.cast.convert` registry and handed to *func*
+       in one call. The result is returned as a one-element list so the
+       downstream chunker (e.g. ``_typed_cast``) can fold it back
+       into Arrow batches alongside results from other partitions.
+    2. **Column-by-name + primitive target** — when *func* has a single
+       positional annotated parameter whose name matches a column in
+       the incoming batch and whose annotation maps to a primitive
+       Arrow type, the column is cast via :func:`pyarrow.compute.cast`
+       (vectorised, one C++ kernel call) and *func* runs per cell —
+       skipping the per-row dict reconstruction
+       ``batch.to_pylist()`` would otherwise do.
+    3. **Per-row fallback** — for every other shape (multi-arg,
+       ``**kwargs``, no column name match, annotation that doesn't map
+       to either category) the batch is materialised through
+       ``batch.to_pylist()`` and dispatched via
+       :func:`build_row_invoker` per row.
 
-    The fast path mirrors the dict-key extraction
-    :func:`build_row_invoker` already does on dynamic-mode rows,
-    moved up one level to operate over a whole Arrow column at a
-    time. Per-row :func:`yggdrasil.data.cast.convert` calls collapse
-    into one ``pa.compute.cast`` plus an isinstance fast-skip when
-    the column already carries the right type.
+    Per-row :func:`yggdrasil.data.cast.convert` calls collapse into one
+    ``pa.compute.cast`` (column path) or one ``convert(batch, target)``
+    (whole-batch path) when either fast path applies.
     """
     plan = _SignaturePlan(func)
     row_invoker = build_row_invoker(func)
 
+    tabular_target: Optional[type] = None
     arrow_target = None
     only_name: Optional[str] = None
     only_ann: Any = None
@@ -693,7 +737,8 @@ def build_batch_invoker(
         only_param = plan.positional_params[0]
         only_name = only_param.name
         only_ann = plan.resolved.get(only_name, only_param.annotation)
-        if isinstance(only_ann, type):
+        tabular_target = _resolve_tabular_target(only_ann)
+        if tabular_target is None and isinstance(only_ann, type):
             # Map ``int`` / ``float`` / ``str`` / ``bool`` / ``bytes`` /
             # ``datetime`` / ``date`` / ``Decimal`` … to the Arrow type
             # the cast registry would target. Generic aliases / unions /
@@ -705,6 +750,27 @@ def build_batch_invoker(
             except Exception:
                 arrow_target = None
 
+    # ---- Whole-batch tabular path -----------------------------------------
+    if tabular_target is not None:
+        from yggdrasil.data.cast import convert
+
+        def _batch_tabular_invoker(batch: "pa.RecordBatch") -> list[Any]:
+            # Convert the whole batch to the target tabular shape and let
+            # ``func`` see it as one frame. The downstream chunker treats
+            # the returned object as a single "row group" — when ``func``
+            # produces another tabular result, ``any_to_arrow_table`` /
+            # ``_typed_cast`` folds it straight back into Arrow.
+            try:
+                converted = convert(batch, tabular_target)
+            except (TypeError, ValueError):
+                # Conversion to the requested tabular type failed — fall
+                # back to per-row dispatch so the function still runs
+                # against something rather than crashing the whole batch.
+                return [row_invoker(r) for r in batch.to_pylist()]
+            return [func(converted)]
+        return _batch_tabular_invoker
+
+    # ---- Column-by-name + primitive target path --------------------------
     if only_name is None or arrow_target is None:
         # No vectorisable shape — straight per-row dispatch over the
         # batch's row dicts. Skipping the early-empty check here is

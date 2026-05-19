@@ -949,11 +949,20 @@ class Dataset(Tabular[CastOptions]):
           inputs reach the function as the annotated Python type.
 
         Typed-mode batches additionally route through
-        :func:`yggdrasil.dataclasses.build_batch_invoker`, which
-        vectorises the column cast via :func:`pyarrow.compute.cast`
-        when ``function`` is single-positional + annotated + the arg
-        name matches a column — one C++ kernel call instead of N
-        Python ``convert(value, ann)`` per batch.
+        :func:`yggdrasil.dataclasses.build_batch_invoker`, which picks
+        the cheapest dispatch shape per batch:
+
+        * **whole-batch tabular** — ``function`` annotated
+          ``def f(batch: pa.RecordBatch)`` / ``pa.Table`` /
+          ``pl.DataFrame`` / ``pl.LazyFrame`` / ``pd.DataFrame``
+          receives the whole batch converted to that type in one
+          call (zero per-row Python overhead),
+        * **column-by-name vectorised cast** — single-positional
+          annotated + arg name matches a column → the column is
+          cast via :func:`pyarrow.compute.cast` (one C++ kernel
+          call) and ``function`` runs per cell,
+        * **per-row fallback** — every other shape walks
+          ``batch.to_pylist()`` rows through the row invoker.
 
         Without a schema this is :meth:`map`. With a schema,
         ``function`` may return any tabular shape (dict, dataclass,

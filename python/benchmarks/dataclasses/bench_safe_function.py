@@ -245,6 +245,45 @@ def scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=500,
     ))
 
+    # ---- whole-batch tabular path — one call per batch -------------------
+    # ``def f(batch: pa.RecordBatch)`` is the cheapest possible apply
+    # shape: the user function sees the whole batch, the invoker doesn't
+    # walk row dicts. ``def f(df: pl.DataFrame)`` adds a single
+    # Arrow→Polars zero-copy conversion before the call.
+    def _whole_arrow_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
+        return batch
+
+    invoke_arrow = build_batch_invoker(_whole_arrow_batch)
+    out.append(_time_one(
+        "batch_invoker: whole pa.RecordBatch (identity), 2k rows",
+        lambda: invoke_arrow(int_batch_2k),
+        repeat=repeat, inner=20_000,
+    ))
+
+    def _whole_arrow_table(table: pa.Table) -> pa.Table:
+        return table
+
+    invoke_table = build_batch_invoker(_whole_arrow_table)
+    out.append(_time_one(
+        "batch_invoker: whole pa.Table (identity), 2k rows",
+        lambda: invoke_table(int_batch_2k),
+        repeat=repeat, inner=20_000,
+    ))
+
+    try:
+        import polars as pl
+        def _whole_polars(df: pl.DataFrame) -> pl.DataFrame:
+            return df
+
+        invoke_polars = build_batch_invoker(_whole_polars)
+        out.append(_time_one(
+            "batch_invoker: whole pl.DataFrame (zero-copy from Arrow), 2k rows",
+            lambda: invoke_polars(int_batch_2k),
+            repeat=repeat, inner=10_000,
+        ))
+    except ImportError:
+        pass
+
     return out
 
 

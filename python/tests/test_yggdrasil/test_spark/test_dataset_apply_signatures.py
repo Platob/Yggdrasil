@@ -22,6 +22,16 @@ from __future__ import annotations
 import os
 import unittest
 
+import pyarrow as pa  # noqa: F401  -- referenced by string-form annotations below
+
+# Polars is optional; module-level alias keeps the
+# ``def f(df: "pl.DataFrame")`` annotations resolvable when present,
+# and the test that uses it skips cleanly when ``pl`` is None.
+try:
+    import polars as pl  # noqa: F401  -- referenced by string-form annotations below
+except ImportError:  # pragma: no cover - optional dep
+    pl = None  # type: ignore[assignment]
+
 from yggdrasil.data import field, schema
 from yggdrasil.data.types.primitive import (
     Float64Type,
@@ -134,6 +144,34 @@ def _vectorized_cast(id: int) -> dict:
     return {"id": id, "label": f"v{id}", "score": float(id)}
 
 
+def _whole_batch_record_batch(batch: "pa.RecordBatch") -> "pa.RecordBatch":
+    # The ``pa.`` prefix resolves via the alias-prefix expansion in
+    # ``yggdrasil.dataclasses.safe_function._FAST_ALIAS_PREFIXES`` even
+    # when this function's globals don't carry ``pa`` directly — so the
+    # annotation reaches ``build_batch_invoker`` as ``pyarrow.RecordBatch``
+    # and the whole-batch path activates.
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    assert isinstance(batch, pa.RecordBatch)
+    new_id = pc.multiply(batch.column("id"), 100)
+    return pa.RecordBatch.from_pydict({
+        "id": new_id,
+        "label": batch.column("name"),
+        "score": pc.cast(batch.column("id"), pa.float64()),
+    })
+
+
+def _whole_batch_polars(df: "pl.DataFrame") -> "pl.DataFrame":
+    # ``pl.`` resolves via the same alias-prefix expansion.
+    import polars as pl
+    assert isinstance(df, pl.DataFrame)
+    return df.with_columns([
+        (pl.col("id") * 1000).alias("id"),
+        pl.col("name").alias("label"),
+        pl.col("id").cast(pl.Float64).alias("score"),
+    ]).select(["id", "label", "score"])
+
+
 # ---------------------------------------------------------------------------
 # TestCase — self-managed local SparkSession + Dataset module-install stub.
 # ---------------------------------------------------------------------------
@@ -236,6 +274,40 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
         out = typed.apply(_single_by_name, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["label"] for r in rows], [f"id-{i}" for i in range(5)])
+
+    def test_apply_whole_batch_record_batch(self) -> None:
+        # ``def f(batch: pa.RecordBatch)`` → batch invoker hands the
+        # whole RecordBatch in one call, function vectorises with
+        # pyarrow.compute, returns a RecordBatch.
+        from yggdrasil.data import field, schema as schema_builder
+        in_schema = schema_builder([
+            field("id", Int64Type, nullable=False),
+            field("name", StringType),
+        ])
+        rows_in = [{"id": i, "name": f"r{i}"} for i in range(6)]
+        typed = Dataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
+        out = typed.apply(_whole_batch_record_batch, _OUT_SCHEMA)
+        rows = sorted(out.collect(), key=lambda r: r["id"])
+        self.assertEqual([r["id"] for r in rows], [i * 100 for i in range(6)])
+        self.assertEqual([r["label"] for r in rows], [f"r{i}" for i in range(6)])
+
+    def test_apply_whole_batch_polars_dataframe(self) -> None:
+        try:
+            import polars as pl  # noqa: F401
+        except ImportError:
+            self.skipTest("polars not installed")
+
+        from yggdrasil.data import field, schema as schema_builder
+        in_schema = schema_builder([
+            field("id", Int64Type, nullable=False),
+            field("name", StringType),
+        ])
+        rows_in = [{"id": i, "name": f"p{i}"} for i in range(4)]
+        typed = Dataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
+        out = typed.apply(_whole_batch_polars, _OUT_SCHEMA)
+        rows = sorted(out.collect(), key=lambda r: r["id"])
+        self.assertEqual([r["id"] for r in rows], [i * 1000 for i in range(4)])
+        self.assertEqual([r["label"] for r in rows], [f"p{i}" for i in range(4)])
 
     def test_single_arg_vectorized_column_cast(self) -> None:
         # The input frame's ``id`` column carries strings; the

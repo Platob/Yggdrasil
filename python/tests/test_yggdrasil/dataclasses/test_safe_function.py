@@ -1142,6 +1142,86 @@ class TestBuildBatchInvoker(unittest.TestCase):
         self.assertEqual(invoke(batch), [2.0, 4.0, 6.0])
         self.assertEqual(calls, [1.0, 2.0, 3.0])
 
+    def test_whole_batch_pa_record_batch(self):
+        import pyarrow as pa
+        # ``def f(batch: pa.RecordBatch)`` → hand the whole batch in one
+        # call, not per row. The invoker returns ``[result]`` so the
+        # downstream chunker treats it as one row group.
+        seen = []
+        def f(batch: pa.RecordBatch) -> pa.RecordBatch:
+            seen.append(batch)
+            return batch
+
+        batch = pa.RecordBatch.from_pydict({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+        invoke = build_batch_invoker(f)
+        result = invoke(batch)
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], batch)
+        self.assertEqual(len(seen), 1)  # called once for the whole batch
+
+    def test_whole_batch_pa_table(self):
+        import pyarrow as pa
+        # ``def f(table: pa.Table)`` → batch gets converted to a Table.
+        def f(table: pa.Table) -> pa.Table:
+            return table
+
+        batch = pa.RecordBatch.from_pydict({"id": [1, 2, 3]})
+        invoke = build_batch_invoker(f)
+        result = invoke(batch)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], pa.Table)
+        self.assertEqual(result[0].num_rows, 3)
+
+    def test_whole_batch_polars_dataframe(self):
+        try:
+            import polars as pl
+        except ImportError:
+            self.skipTest("polars not installed")
+        import pyarrow as pa
+
+        def f(df: pl.DataFrame) -> pl.DataFrame:
+            return df
+
+        batch = pa.RecordBatch.from_pydict({"id": [1, 2], "name": ["a", "b"]})
+        invoke = build_batch_invoker(f)
+        result = invoke(batch)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], pl.DataFrame)
+        self.assertEqual(result[0].height, 2)
+
+    def test_whole_batch_pandas_dataframe(self):
+        try:
+            import pandas as pd
+        except ImportError:
+            self.skipTest("pandas not installed")
+        import pyarrow as pa
+
+        def f(df: pd.DataFrame) -> pd.DataFrame:
+            return df
+
+        batch = pa.RecordBatch.from_pydict({"id": [1, 2], "name": ["a", "b"]})
+        invoke = build_batch_invoker(f)
+        result = invoke(batch)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], pd.DataFrame)
+        self.assertEqual(len(result[0]), 2)
+
+    def test_whole_batch_takes_priority_over_column_by_name(self):
+        import pyarrow as pa
+        # The batch happens to have a column named ``batch`` — but
+        # ``def f(batch: pa.RecordBatch)`` should still receive the
+        # whole RecordBatch, not the value of the ``batch`` column.
+        def f(batch: pa.RecordBatch) -> pa.RecordBatch:
+            return batch
+
+        b = pa.RecordBatch.from_pydict({"batch": [1, 2], "other": ["x", "y"]})
+        invoke = build_batch_invoker(f)
+        result = invoke(b)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].num_rows, 2)
+        # The whole RecordBatch flowed through, not just the ``batch`` column.
+        self.assertEqual(result[0].column_names, ["batch", "other"])
+
 
 if __name__ == "__main__":
     unittest.main()
