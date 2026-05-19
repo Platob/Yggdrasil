@@ -80,8 +80,22 @@ column access.
 
 Ingestion tasks talk to the public internet (HTTP APIs, S3, vendor
 SFTP), and **Databricks serverless compute has no outbound internet
-egress on most workspaces**. Pin ingestion tasks to a **custom
-all-purpose cluster** with `ygg[data,databricks,http]` preinstalled.
+egress on most workspaces**. Pin ingestion tasks to a **multi-node
+all-purpose cluster** with `ygg[data,databricks,http]` preinstalled
+— the default shape is `num_workers >= 2` (or an autoscaling pool
+with a small floor) so outbound requests spread across N worker
+IPs behind the workspace NAT. Per-IP rate limits then hit N× later,
+and a single noisy worker doesn't poison the whole feed. Single-node
+is the right shape only for very-low-volume sources or for APIs
+with per-account (not per-IP) limits.
+
+To actually realise the IP spread, drive the fetch in parallel
+(one task per shard / symbol / date partition, or `foreachPartition`
+/ `mapInPandas` against a Spark frame of requests, or
+`yggdrasil.concurrent` helpers, or one `JobTask` per shard). A
+multi-node cluster sitting behind a single-threaded loop wastes the
+worker IPs.
+
 Curated + `dash_*` + ML tasks downstream stay on **serverless** —
 they only touch Unity Catalog. The cluster pin is per-task; one Job
 DAG ends up with one classic ingestion task and N serverless tasks

@@ -54,7 +54,8 @@ most for routing.
 | [`ygg-trading-analyst-power`](skills/ygg-trading-analyst-power.md) | Power desk — ENTSO-E day-ahead / intraday, cross-zone spreads, spark / dark / clean spreads, residual load, NTC-bounded mean reversion |
 | [`ygg-trading-analyst-gas`](skills/ygg-trading-analyst-gas.md) | Gas desk — TTF / NBP / HH / JKM, HDD/CDD, storage z-score, LNG arbitrage with freight + regas constraints, inter-hub spreads, fuel-switching feedback |
 | [`ygg-trading-analyst-oil`](skills/ygg-trading-analyst-oil.md) | Oil desk — Brent / WTI / Dubai, crack spreads (3-2-1, gasoil), curve shape, grade differentials, tanker arb, hurricane risk, ENEX-event regime breaks |
-| [`ygg-modelist`](skills/ygg-modelist.md) | Modelist profile — multi-candidate forecast training, per-run KPI matrix (`ml_<task>_run_metrics`), champion/challenger promotion, AI/BI dashboards + Databricks Apps frontend |
+| [`ygg-modelist`](skills/ygg-modelist.md) | Modelist profile — many simulation runs, walk-forward back-tests, model KPIs + trading-decision KPIs, SHAP / partial dependence, rendered notebook artifact per run, AI/BI dashboards + Databricks Apps frontend |
+| [`ygg-modelist-weather`](skills/ygg-modelist-weather.md) | Weather modelist — per-zone temperature / HDD-CDD, wind power (hub-height + power curve), photovoltaic (POA + temp derate + PR), basin precipitation / runoff; NWP ensemble post-processing |
 | [`ygg-mlops`](skills/ygg-mlops.md) | MLflow on Databricks + UC registry, `ml_<task>_features` / `_predictions` / `_runs` tables, autoML candidate discovery, drift detection |
 | [`ygg-cast`](skills/ygg-cast.md) | `convert(value, target)`, `CastOptions`, registry extension |
 | [`ygg-schema-fields`](skills/ygg-schema-fields.md) | `Field` / `Schema` / `DataType`, schema intent |
@@ -109,11 +110,19 @@ For commodity-trading users the data engineering chain feeds two
 downstream roles, each with its own skills:
 
 1. **Modelist** (the quant who builds the forecast).
-   [`ygg-modelist`](skills/ygg-modelist.md) — turns the curated
-   tables into multi-candidate models, persists a per-run KPI
-   matrix (`ml_<task>_run_metrics`), runs champion / challenger
-   promotion, and exposes the leaderboard + calibration tiles
-   through an AI/BI Dashboard or a Databricks App.
+   [`ygg-modelist`](skills/ygg-modelist.md) — turns curated
+   tables into many simulation candidates per cycle (nested MLflow
+   runs, walk-forward back-tests), persists a per-run KPI matrix
+   that includes **trading-decision KPIs** (`directional_acc`,
+   `pnl_proxy_per_unit`, `hit_rate_p80_band`), renders a
+   high-quality explanation notebook per run (SHAP + partial
+   dependence + calibration + residual diagnostics), runs
+   champion / challenger promotion behind a primary + guard
+   metric, and exposes the leaderboard through an AI/BI Dashboard
+   or a Databricks App. A specialised sibling
+   [`ygg-modelist-weather`](skills/ygg-modelist-weather.md) owns
+   the per-zone weather features (temperature, photovoltaic,
+   wind power, precipitation) every energy desk depends on.
 2. **Analyst** (the trader-facing decision producer).
    [`ygg-energy-trading-analyst`](skills/ygg-energy-trading-analyst.md)
    is the shared layer — `analyst_<task>_signals`,
