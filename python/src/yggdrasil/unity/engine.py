@@ -1,23 +1,52 @@
 """Top-level facade for a Unity-Catalog-style backend.
 
 A :class:`UnityEngine` owns the set of catalogs the caller can navigate
-through. Catalog → Schema → Table/View navigation hangs off the engine
-(``engine["main"]["default"]["sales"]``); ``__iter__`` walks every
-catalog and ``__contains__`` is a cheap existence probe.
+through (``engine["main"]["default"]["sales"]``) and doubles as a
+:class:`StatementExecutor` for the statement-shaped surface
+(:class:`UnityStatement` → :class:`UnityStatementResult`,
+:class:`UnityExecutionPlan` for ordered batches).
 
-The class is abstract — backends supply :meth:`catalog` /
-:meth:`catalogs` / :meth:`_default_catalog_name`. Everything else
-(``__getitem__`` etc.) is wired here.
+Inheritance shape
+-----------------
+``UnityEngine`` is a :class:`StatementExecutor` — which is itself a
+:class:`Session`. That gives every concrete backend three things for
+free:
+
+1. **Singleton-by-config** via the inherited
+   :class:`yggdrasil.dataclasses.singleton.Singleton` plumbing — two
+   callers constructing an ``FSEngine(base=same_path)`` share one
+   live instance, so the in-memory metadata caches and any per-host
+   pools survive across call sites.
+2. **Pickle-friendliness** — the singleton key restores in-process
+   identity on unpickle; transient handles named in
+   :attr:`_TRANSIENT_STATE_ATTRS` rebuild on first use.
+3. **prepare / send / execute** statement-shaped surface so the same
+   verbs that drive :class:`yggdrasil.spark.executor.SparkStatementExecutor`,
+   ``WarehouseStatementExecutor``, etc. drive a Unity catalog too —
+   ``engine.execute(CreateCatalog("main"))``, ``engine.execute_many([...])``,
+   ``UnityExecutionPlan(...).execute(engine)``.
+
+Backends supply :meth:`catalog` / :meth:`catalogs` / :meth:`create_catalog`;
+the statement-layer dispatch is polymorphic
+(:meth:`UnityStatement.apply` calls back into those methods), so a
+backend that implements the resource trio gets the statement surface
+without writing any per-statement dispatch.
 """
 
 from __future__ import annotations
 
 import logging
-from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Iterator
+from abc import abstractmethod
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator
+
+from yggdrasil.data.executor import StatementExecutor
+from yggdrasil.data.statement import StatementBatch
+from yggdrasil.unity.result import UnityStatementResult
+from yggdrasil.unity.statement import UnityStatement
 
 if TYPE_CHECKING:
     from yggdrasil.unity.catalog import UnityCatalog
+    from yggdrasil.unity.plan import UnityExecutionPlan
 
 
 __all__ = ["UnityEngine"]
@@ -26,22 +55,27 @@ __all__ = ["UnityEngine"]
 logger = logging.getLogger(__name__)
 
 
-class UnityEngine(ABC):
-    """Root of a Unity-Catalog-style backend.
+class UnityEngine(StatementExecutor[UnityStatement, UnityStatementResult, StatementBatch]):
+    """Root of a Unity-Catalog-style backend; doubles as a :class:`StatementExecutor`."""
 
-    Subclasses bind to whatever lives below (a filesystem :class:`Path`,
-    a SQL connection, a remote service) and return :class:`UnityCatalog`
-    instances through :meth:`catalog`.
-    """
+    # Pin the statement-layer types so the inherited ``prepare`` / ``send``
+    # pipeline produces concrete :class:`UnityStatement` /
+    # :class:`UnityStatementResult` instances without per-call coercion.
+    _PREPARED_CLASS: ClassVar[type[UnityStatement]] = UnityStatement
+    _RESPONSE_CLASS: ClassVar[type[UnityStatementResult]] = UnityStatementResult
 
-    # ── catalog navigation ──────────────────────────────────────────────
+    # Process-lifetime singleton caching — two callers building the
+    # same engine config collapse onto one instance.
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    # ── catalog navigation (concrete backend hooks) ─────────────────────
 
     @abstractmethod
     def catalog(self, name: str) -> "UnityCatalog":
         """Return a :class:`UnityCatalog` bound to *name*.
 
-        Does NOT verify existence — the returned handle's :attr:`exists`
-        property is the canonical probe.
+        Does NOT verify existence — the returned handle's
+        :attr:`UnityResource.exists` property is the canonical probe.
         """
 
     @abstractmethod
@@ -54,11 +88,48 @@ class UnityEngine(ABC):
         name: str,
         *,
         if_not_exists: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> "UnityCatalog":
         """Create *name* in the backend and return its handle."""
 
-    # ── default surface (wired off the abstract hooks) ──────────────────
+    # ── statement-layer hooks ───────────────────────────────────────────
+
+    def _submit_statement(
+        self,
+        statement: UnityStatement,
+        start: bool = True,
+    ) -> UnityStatementResult:
+        """Build a :class:`UnityStatementResult` and optionally run it.
+
+        Unity execution is synchronous: when *start* is ``True`` the
+        result comes back terminal (errors captured on the result
+        instead of raised, so the inherited ``execute`` /
+        ``raise_for_status`` flow stays uniform). When *start* is
+        ``False`` the result is returned idle so the caller can drive
+        :meth:`UnityStatementResult.start` themselves.
+        """
+        result = self._RESPONSE_CLASS(statement=statement, executor=self)
+        if start:
+            result.start(raise_error=False)
+        return result
+
+    # ── plan execution ──────────────────────────────────────────────────
+
+    def execute_plan(
+        self,
+        plan: "UnityExecutionPlan",
+        *,
+        raise_error: bool = True,
+    ) -> "list[UnityStatementResult]":
+        """Run every statement in *plan*, in order.
+
+        Thin sugar over :meth:`UnityExecutionPlan.execute`; kept on the
+        engine so the discoverability of ``engine.execute_plan(plan)``
+        mirrors ``engine.execute(stmt)`` / ``engine.execute_many([...])``.
+        """
+        return plan.execute(self, raise_error=raise_error)
+
+    # ── default navigation surface ──────────────────────────────────────
 
     def __getitem__(self, name: str) -> "UnityCatalog":
         catalog = self.catalog(name)

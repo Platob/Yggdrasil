@@ -5,6 +5,17 @@ remote path, anything that satisfies the :class:`Path` contract) and
 treats it as the root of a Unity-Catalog-style namespace. Catalogs are
 direct children; their metadata lives under ``<catalog>/_yggdrasil/``.
 
+Singleton + pickle
+------------------
+:class:`FSEngine` inherits the :class:`Session` / :class:`Singleton`
+plumbing through :class:`UnityEngine`: two callers asking for
+``FSEngine(base=path)`` with the same base collapse to one live
+instance, so the in-memory metadata caches (cached ``info`` payloads
+on every navigated :class:`UnityResource`) are shared. The singleton
+key is the bound :class:`Path` itself — paths hash on their normalized
+URL, so a ``LocalPath('/tmp/wh')`` and a ``LocalPath('/tmp/wh/')``
+collapse correctly.
+
 The engine is intentionally lightweight: navigation methods return
 fresh handles, listings walk :meth:`Path.iterdir` and filter by
 metadata presence. There is no in-memory catalog index — the on-disk
@@ -14,7 +25,7 @@ layout IS the index.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterator, Mapping
+from typing import Any, ClassVar, Iterator, Mapping
 
 from yggdrasil.io.path import Path
 from yggdrasil.unity.engine import UnityEngine
@@ -37,8 +48,33 @@ class FSEngine(UnityEngine):
     invisible.
     """
 
-    def __init__(self, base: "Path | str | Any") -> None:
+    #: Singleton-by-base — every ``FSEngine`` lives for the process
+    #: lifetime keyed on its bound :class:`Path`.
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(cls, base: Any = None, **kwargs: Any) -> Any:
+        # Project bare-string / os.PathLike inputs through ``Path.from_``
+        # so callers building the same engine via different surface
+        # spellings (a string vs. a ``LocalPath`` vs. a path obtained via
+        # ``base / "warehouse"``) collapse onto the same singleton.
+        if base is not None and not isinstance(base, Path):
+            base = Path.from_(base)
+        del kwargs  # Other constructor kwargs are not identity-bearing.
+        return (cls, base)
+
+    def __init__(self, base: "Path | str | Any" = None) -> None:
+        if getattr(self, "_initialized", False):
+            return
+        if base is None:
+            raise TypeError(
+                "FSEngine() requires base=<Path|str|os.PathLike>. "
+                "Pass the directory the unity catalog lives under, e.g. "
+                "FSEngine(base=LocalPath('/tmp/warehouse'))."
+            )
+        super().__init__()  # → StatementExecutor.__init__ → Disposable.__init__
         self.base: Path = base if isinstance(base, Path) else Path.from_(base)
+        self._initialized = True
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(base={self.base!r})"
@@ -68,8 +104,8 @@ class FSEngine(UnityEngine):
         self,
         name: str,
         *,
-        comment: str | None = None,
-        owner: str | None = None,
+        comment: "str | None" = None,
+        owner: "str | None" = None,
         properties: "Mapping[str, str] | None" = None,
         if_not_exists: bool = True,
     ) -> FSCatalog:
