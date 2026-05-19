@@ -1,4 +1,4 @@
-"""Filesystem-backed :class:`UnityCatalog`."""
+"""Filesystem-backed :class:`ExecutionCatalog`."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Iterator, Mapping
 
 from yggdrasil.io.path import Path
-from yggdrasil.unity.catalog import UnityCatalog
+from yggdrasil.unity.catalog import ExecutionCatalog
 from yggdrasil.unity.fs import registry
 from yggdrasil.unity.fs.schema import FSSchema
 from yggdrasil.unity.info import CatalogInfo
@@ -21,7 +21,7 @@ __all__ = ["FSCatalog"]
 logger = logging.getLogger(__name__)
 
 
-class FSCatalog(UnityCatalog):
+class FSCatalog(ExecutionCatalog):
     """Catalog backed by a directory under :attr:`FSEngine.base`."""
 
     def __init__(self, *, engine: "FSEngine", name: str) -> None:

@@ -1,6 +1,6 @@
 """Info dataclasses — the metadata carried by every :mod:`yggdrasil.unity` resource.
 
-Each :class:`UnityResource` exposes an ``info`` property returning one of
+Each :class:`ExecutionResource` exposes an ``info`` property returning one of
 the frozen dataclasses below. ``from_dict`` / ``to_dict`` keep the on-disk
 JSON shape canonical so any backend (filesystem, S3, a SQL catalog) can
 round-trip the same payload without dragging in a backend-specific type.

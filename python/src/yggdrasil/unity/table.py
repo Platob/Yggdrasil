@@ -1,8 +1,8 @@
-"""Abstract Unity table — :class:`UnityResource` mixed with :class:`Tabular`.
+"""Abstract Unity table — :class:`ExecutionResource` mixed with :class:`Tabular`.
 
 A table is both a *resource* (it has metadata, a lifecycle, an
 existence probe) and a *Tabular* (it yields and consumes Arrow record
-batches). :class:`UnityTable` composes both so caller code reads:
+batches). :class:`ExecutionTable` composes both so caller code reads:
 
 ::
 
@@ -25,20 +25,20 @@ from typing import TYPE_CHECKING, Any
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.unity.base import UnityResource
+from yggdrasil.unity.base import ExecutionResource
 from yggdrasil.unity.info import TableInfo
 
 if TYPE_CHECKING:
-    from yggdrasil.unity.schema import UnitySchema
+    from yggdrasil.unity.schema import ExecutionSchema
 
 
-__all__ = ["UnityTable"]
+__all__ = ["ExecutionTable"]
 
 
 logger = logging.getLogger(__name__)
 
 
-class UnityTable(UnityResource, Tabular[CastOptions]):
+class ExecutionTable(ExecutionResource, Tabular[CastOptions]):
     """Abstract managed table — resource lifecycle + :class:`Tabular` IO."""
 
     def __init__(self) -> None:
@@ -48,8 +48,8 @@ class UnityTable(UnityResource, Tabular[CastOptions]):
 
     @property
     @abstractmethod
-    def schema_handle(self) -> "UnitySchema":
-        """The :class:`UnitySchema` owning this table.
+    def schema_handle(self) -> "ExecutionSchema":
+        """The :class:`ExecutionSchema` owning this table.
 
         Named ``schema_handle`` so it doesn't clash with the
         :class:`Schema` payload exposed below or with
@@ -105,7 +105,7 @@ class UnityTable(UnityResource, Tabular[CastOptions]):
         *,
         if_not_exists: bool = True,
         **kwargs: Any,
-    ) -> "UnityTable":
+    ) -> "ExecutionTable":
         """Create the table. *schema* accepts anything
         :class:`Schema.from_` handles; backends persist it into the
         :class:`TableInfo`."""

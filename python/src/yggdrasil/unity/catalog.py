@@ -1,7 +1,7 @@
 """Abstract catalog — middle level of the ``catalog.schema.table`` tree.
 
-A :class:`UnityCatalog` owns a set of :class:`UnitySchema`. Navigation
-mirrors :class:`UnityEngine`: ``catalog["default"]`` returns a schema,
+A :class:`ExecutionCatalog` owns a set of :class:`ExecutionSchema`. Navigation
+mirrors :class:`ExecutionEngine`: ``catalog["default"]`` returns a schema,
 ``in catalog`` is a cheap existence probe, ``for s in catalog`` walks
 every schema. The base wires those off two backend hooks.
 """
@@ -12,19 +12,19 @@ import logging
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Iterator
 
-from yggdrasil.unity.base import UnityResource
+from yggdrasil.unity.base import ExecutionResource
 
 if TYPE_CHECKING:
-    from yggdrasil.unity.schema import UnitySchema
+    from yggdrasil.unity.schema import ExecutionSchema
 
 
-__all__ = ["UnityCatalog"]
+__all__ = ["ExecutionCatalog"]
 
 
 logger = logging.getLogger(__name__)
 
 
-class UnityCatalog(UnityResource):
+class ExecutionCatalog(ExecutionResource):
     """Abstract catalog — child schemas plus the inherited lifecycle."""
 
     @property
@@ -34,15 +34,15 @@ class UnityCatalog(UnityResource):
     # ── schema navigation ───────────────────────────────────────────────
 
     @abstractmethod
-    def schema(self, name: str) -> "UnitySchema":
-        """Return a :class:`UnitySchema` bound to *name*.
+    def schema(self, name: str) -> "ExecutionSchema":
+        """Return a :class:`ExecutionSchema` bound to *name*.
 
         Existence is not verified — probe via :attr:`exists` on the
         returned handle.
         """
 
     @abstractmethod
-    def schemas(self) -> Iterator["UnitySchema"]:
+    def schemas(self) -> Iterator["ExecutionSchema"]:
         """Iterate over every schema in this catalog."""
 
     @abstractmethod
@@ -52,12 +52,12 @@ class UnityCatalog(UnityResource):
         *,
         if_not_exists: bool = True,
         **kwargs,
-    ) -> "UnitySchema":
+    ) -> "ExecutionSchema":
         """Create *name* under this catalog and return its handle."""
 
     # ── default surface ─────────────────────────────────────────────────
 
-    def __getitem__(self, name: str) -> "UnitySchema":
+    def __getitem__(self, name: str) -> "ExecutionSchema":
         schema = self.schema(name)
         if not schema.exists:
             available = sorted(s.name for s in self.schemas())
@@ -73,5 +73,5 @@ class UnityCatalog(UnityResource):
             return False
         return self.schema(name).exists
 
-    def __iter__(self) -> Iterator["UnitySchema"]:
+    def __iter__(self) -> Iterator["ExecutionSchema"]:
         return self.schemas()

@@ -1,4 +1,4 @@
-"""Filesystem-backed :class:`UnityTable`.
+"""Filesystem-backed :class:`ExecutionTable`.
 
 The table's identity, schema, and partition intent live in
 ``<schema>/<table>/_yggdrasil/table.json``; row data lives under
@@ -24,7 +24,7 @@ from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
 from yggdrasil.io.path import Path
 from yggdrasil.unity.fs import registry
 from yggdrasil.unity.info import TableInfo
-from yggdrasil.unity.table import UnityTable
+from yggdrasil.unity.table import ExecutionTable
 
 if TYPE_CHECKING:
     from yggdrasil.unity.fs.engine import FSEngine
@@ -75,11 +75,11 @@ def _coerce_media_type(value: Any) -> MediaType:
     return coerced
 
 
-class FSTable(UnityTable):
+class FSTable(ExecutionTable):
     """Managed table backed by a :class:`FolderIO` over ``<table>/data/``."""
 
     def __init__(self, *, schema: "FSSchema", name: str) -> None:
-        UnityTable.__init__(self)
+        ExecutionTable.__init__(self)
         self._schema_handle = schema
         self._name = name
 

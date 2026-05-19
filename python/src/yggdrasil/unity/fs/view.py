@@ -1,4 +1,4 @@
-"""Filesystem-backed :class:`UnityView`.
+"""Filesystem-backed :class:`ExecutionView`.
 
 A view's metadata records a dotted ``catalog.schema.name`` source plus
 an optional SQL projection. ``_resolve_source`` walks the engine to
@@ -18,7 +18,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.unity.fs import registry
 from yggdrasil.unity.info import ViewInfo
-from yggdrasil.unity.view import UnityView
+from yggdrasil.unity.view import ExecutionView
 
 if TYPE_CHECKING:
     from yggdrasil.io.path import Path
@@ -38,18 +38,18 @@ _UNSET = ...
 def _resolve_source_full_name(source: Any) -> str:
     """Project *source* into a dotted ``catalog.schema.name`` string.
 
-    Accepts a live :class:`UnityResource` (uses its ``full_name``) or a
+    Accepts a live :class:`ExecutionResource` (uses its ``full_name``) or a
     plain string with exactly three dotted parts.
     """
-    from yggdrasil.unity.base import UnityResource
+    from yggdrasil.unity.base import ExecutionResource
 
-    if isinstance(source, UnityResource):
+    if isinstance(source, ExecutionResource):
         full = source.full_name
     elif isinstance(source, str):
         full = source
     else:
         raise TypeError(
-            f"source must be a UnityResource or a dotted "
+            f"source must be a ExecutionResource or a dotted "
             f"'catalog.schema.name' string; got {type(source).__name__}: "
             f"{source!r}."
         )
@@ -62,11 +62,11 @@ def _resolve_source_full_name(source: Any) -> str:
     return full
 
 
-class FSView(UnityView):
+class FSView(ExecutionView):
     """View backed by a JSON sidecar pointing at a target table."""
 
     def __init__(self, *, schema: "FSSchema", name: str) -> None:
-        UnityView.__init__(self)
+        ExecutionView.__init__(self)
         self._schema_handle = schema
         self._name = name
 
@@ -117,7 +117,7 @@ class FSView(UnityView):
         if source is _UNSET:
             raise ValueError(
                 f"View {self.full_name!r} requires a source= argument on "
-                "create. Pass a UnityResource or a dotted 'catalog.schema.name'."
+                "create. Pass a ExecutionResource or a dotted 'catalog.schema.name'."
             )
         if not self._schema_handle.exists:
             raise FileNotFoundError(

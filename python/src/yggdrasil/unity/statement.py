@@ -1,14 +1,14 @@
-"""Statement vocabulary for :class:`UnityEngine` execution plans.
+"""Statement vocabulary for :class:`ExecutionEngine` execution plans.
 
-Every Unity-level operation (create / drop a resource, insert rows,
+Every catalog-level operation (create / drop a resource, insert rows,
 read rows back, list a level of the namespace) is modelled as a
 :class:`PreparedStatement` subclass. The engine submits one through
-:meth:`UnityEngine.send` / :meth:`UnityEngine.execute` and gets a
-:class:`UnityStatementResult` whose ``output`` carries the operation's
-return value (a :class:`UnityResource`, a row count, a :class:`Tabular`).
+:meth:`ExecutionEngine.send` / :meth:`ExecutionEngine.execute` and gets a
+:class:`ExecutionStatementResult` whose ``output`` carries the operation's
+return value (a :class:`ExecutionResource`, a row count, a :class:`Tabular`).
 
 The statements are intentionally polymorphic — each one knows how to
-apply itself to a :class:`UnityEngine` through the :meth:`apply` hook,
+apply itself to a :class:`ExecutionEngine` through the :meth:`apply` hook,
 so the engine doesn't have to fan out on ``isinstance``. New backends
 plug in by overriding the engine's high-level resource methods
 (``create_catalog`` / ``schema.table`` / …); the statement layer flows
@@ -19,20 +19,21 @@ from __future__ import annotations
 
 import logging
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Mapping
 
 from yggdrasil.data.statement import PreparedStatement
+from yggdrasil.unity.plan_type import PlanCategory, PlanTypeId
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
     from yggdrasil.io.tabular.base import Tabular
-    from yggdrasil.unity.base import UnityResource
-    from yggdrasil.unity.engine import UnityEngine
+    from yggdrasil.unity.base import ExecutionResource
+    from yggdrasil.unity.engine import ExecutionEngine
 
 
 __all__ = [
-    "UnityStatement",
+    "ExecutionStatement",
     "CreateCatalog",
     "CreateSchema",
     "CreateTable",
@@ -73,14 +74,14 @@ def _render_options(options: "Mapping[str, Any] | None") -> str:
 
 def _resolve_resource_full_name(value: Any) -> str:
     """Turn *value* into a dotted ``catalog.schema.name`` identifier."""
-    from yggdrasil.unity.base import UnityResource
+    from yggdrasil.unity.base import ExecutionResource
 
-    if isinstance(value, UnityResource):
+    if isinstance(value, ExecutionResource):
         return value.full_name
     if isinstance(value, str):
         return value
     raise TypeError(
-        f"Expected a UnityResource or dotted identifier; got "
+        f"Expected an ExecutionResource or dotted identifier; got "
         f"{type(value).__name__}: {value!r}."
     )
 
@@ -88,38 +89,62 @@ def _resolve_resource_full_name(value: Any) -> str:
 # ── base ────────────────────────────────────────────────────────────────
 
 
-class UnityStatement(PreparedStatement):
-    """Base class for every :class:`UnityEngine` statement.
+class ExecutionStatement(PreparedStatement):
+    """Base class for every :class:`ExecutionEngine` statement.
 
-    Subclasses store the operation's structured payload as attributes
-    and implement :meth:`apply`, which the engine invokes through
-    :meth:`UnityStatementResult.start`. The :attr:`text` slot is a
-    SQL-ish projection of the payload, used by the standard logging /
-    repr path inherited from :class:`PreparedStatement`.
+    Subclasses store the operation's structured payload as attributes,
+    declare a :attr:`plan_type_id` ClassVar (used by
+    :class:`ExecutionPlan` and its specialised sub-plans for
+    classification and validation), and implement :meth:`apply` —
+    invoked by :meth:`ExecutionStatementResult.start`. The :attr:`text`
+    slot is a SQL-ish projection of the payload, used by the standard
+    logging / repr path inherited from :class:`PreparedStatement`.
     """
+
+    #: Stable :class:`PlanTypeId` for this concrete statement shape.
+    #: The abstract base intentionally leaves it unset — every
+    #: instantiable subclass pins it.
+    plan_type_id: ClassVar[PlanTypeId]
 
     def __init__(self, *, key: "str | None" = None) -> None:
         super().__init__(text=self._render_text(), key=key)
+
+    @property
+    def category(self) -> PlanCategory:
+        """Coarse classification derived from :attr:`plan_type_id`."""
+        return self.plan_type_id.category
+
+    @property
+    def is_mutation(self) -> bool:
+        """``True`` when this statement changes backend state (DDL / DML)."""
+        return self.plan_type_id.is_mutation
+
+    @property
+    def is_query(self) -> bool:
+        """``True`` when this statement is read-only (DQL / META)."""
+        return self.plan_type_id.is_query
 
     @abstractmethod
     def _render_text(self) -> str:
         """Return the SQL-ish text representation of this statement."""
 
     @abstractmethod
-    def apply(self, engine: "UnityEngine") -> Any:
+    def apply(self, engine: "ExecutionEngine") -> Any:
         """Run the operation against *engine* and return its output.
 
         The output is whatever the operation produces — a
-        :class:`UnityResource` for create/drop, an integer row count
+        :class:`ExecutionResource` for create/drop, an integer row count
         for inserts, a :class:`Tabular` for selects/shows. The engine
-        wraps the return value into a :class:`UnityStatementResult`.
+        wraps the return value into a :class:`ExecutionStatementResult`.
         """
 
 
 # ── create ──────────────────────────────────────────────────────────────
 
 
-class CreateCatalog(UnityStatement):
+class CreateCatalog(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.CREATE_CATALOG
+
     def __init__(
         self,
         name: str,
@@ -141,7 +166,7 @@ class CreateCatalog(UnityStatement):
         ine = " IF NOT EXISTS" if self.if_not_exists else ""
         return f"CREATE CATALOG{ine} {self.name}{_render_options(self.properties)}"
 
-    def apply(self, engine: "UnityEngine") -> "UnityResource":
+    def apply(self, engine: "ExecutionEngine") -> "ExecutionResource":
         return engine.create_catalog(
             self.name,
             comment=self.comment,
@@ -151,7 +176,9 @@ class CreateCatalog(UnityStatement):
         )
 
 
-class CreateSchema(UnityStatement):
+class CreateSchema(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.CREATE_SCHEMA
+
     def __init__(
         self,
         catalog_name: str,
@@ -178,7 +205,7 @@ class CreateSchema(UnityStatement):
             f"{_render_options(self.properties)}"
         )
 
-    def apply(self, engine: "UnityEngine") -> "UnityResource":
+    def apply(self, engine: "ExecutionEngine") -> "ExecutionResource":
         catalog = engine.catalog(self.catalog_name)
         if not catalog.exists:
             raise FileNotFoundError(
@@ -193,7 +220,9 @@ class CreateSchema(UnityStatement):
         )
 
 
-class CreateTable(UnityStatement):
+class CreateTable(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.CREATE_TABLE
+
     def __init__(
         self,
         catalog_name: str,
@@ -233,7 +262,7 @@ class CreateTable(UnityStatement):
             f"{fmt}{part}{_render_options(self.properties)}"
         )
 
-    def apply(self, engine: "UnityEngine") -> "UnityResource":
+    def apply(self, engine: "ExecutionEngine") -> "ExecutionResource":
         catalog = engine.catalog(self.catalog_name)
         if not catalog.exists:
             raise FileNotFoundError(
@@ -257,7 +286,9 @@ class CreateTable(UnityStatement):
         return schema_handle.create_table(self.name, **kwargs)
 
 
-class CreateView(UnityStatement):
+class CreateView(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.CREATE_VIEW
+
     def __init__(
         self,
         catalog_name: str,
@@ -291,7 +322,7 @@ class CreateView(UnityStatement):
             f"AS {body}"
         )
 
-    def apply(self, engine: "UnityEngine") -> "UnityResource":
+    def apply(self, engine: "ExecutionEngine") -> "ExecutionResource":
         catalog = engine.catalog(self.catalog_name)
         if not catalog.exists:
             raise FileNotFoundError(
@@ -316,7 +347,9 @@ class CreateView(UnityStatement):
 # ── drop ────────────────────────────────────────────────────────────────
 
 
-class DropCatalog(UnityStatement):
+class DropCatalog(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.DROP_CATALOG
+
     def __init__(
         self,
         name: str,
@@ -335,13 +368,15 @@ class DropCatalog(UnityStatement):
         cascade = " CASCADE" if self.recursive else ""
         return f"DROP CATALOG{ie} {self.name}{cascade}"
 
-    def apply(self, engine: "UnityEngine") -> "UnityResource":
+    def apply(self, engine: "ExecutionEngine") -> "ExecutionResource":
         catalog = engine.catalog(self.name)
         catalog.delete(recursive=self.recursive, missing_ok=self.missing_ok)
         return catalog
 
 
-class DropSchema(UnityStatement):
+class DropSchema(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.DROP_SCHEMA
+
     def __init__(
         self,
         catalog_name: str,
@@ -362,14 +397,16 @@ class DropSchema(UnityStatement):
         cascade = " CASCADE" if self.recursive else ""
         return f"DROP SCHEMA{ie} {self.catalog_name}.{self.name}{cascade}"
 
-    def apply(self, engine: "UnityEngine") -> "UnityResource":
+    def apply(self, engine: "ExecutionEngine") -> "ExecutionResource":
         catalog = engine.catalog(self.catalog_name)
         schema_handle = catalog.schema(self.name)
         schema_handle.delete(recursive=self.recursive, missing_ok=self.missing_ok)
         return schema_handle
 
 
-class DropTable(UnityStatement):
+class DropTable(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.DROP_TABLE
+
     def __init__(
         self,
         catalog_name: str,
@@ -391,7 +428,7 @@ class DropTable(UnityStatement):
         ie = " IF EXISTS" if self.missing_ok else ""
         return f"DROP TABLE{ie} {self.catalog_name}.{self.schema_name}.{self.name}"
 
-    def apply(self, engine: "UnityEngine") -> "UnityResource":
+    def apply(self, engine: "ExecutionEngine") -> "ExecutionResource":
         table = (
             engine.catalog(self.catalog_name)
             .schema(self.schema_name)
@@ -401,7 +438,9 @@ class DropTable(UnityStatement):
         return table
 
 
-class DropView(UnityStatement):
+class DropView(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.DROP_VIEW
+
     def __init__(
         self,
         catalog_name: str,
@@ -421,7 +460,7 @@ class DropView(UnityStatement):
         ie = " IF EXISTS" if self.missing_ok else ""
         return f"DROP VIEW{ie} {self.catalog_name}.{self.schema_name}.{self.name}"
 
-    def apply(self, engine: "UnityEngine") -> "UnityResource":
+    def apply(self, engine: "ExecutionEngine") -> "ExecutionResource":
         view = (
             engine.catalog(self.catalog_name)
             .schema(self.schema_name)
@@ -434,14 +473,16 @@ class DropView(UnityStatement):
 # ── data movement ───────────────────────────────────────────────────────
 
 
-class Insert(UnityStatement):
+class Insert(ExecutionStatement):
     """Write Arrow record batches into a table.
 
-    *data* is anything the table's :meth:`UnityTable.write_table` /
-    :meth:`UnityTable.write_arrow_batches` surface accepts — a
+    *data* is anything the table's :meth:`ExecutionTable.write_table` /
+    :meth:`ExecutionTable.write_arrow_batches` surface accepts — a
     :class:`pa.Table`, a list of :class:`pa.RecordBatch`, an iterable
     of batches, or another :class:`Tabular`.
     """
+
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.INSERT
 
     def __init__(
         self,
@@ -462,14 +503,19 @@ class Insert(UnityStatement):
         self.match_by = list(match_by) if match_by else None
         super().__init__(key=key)
 
+    @property
+    def target_full_name(self) -> str:
+        """Dotted ``catalog.schema.table`` identifier of the insert target."""
+        return f"{self.catalog_name}.{self.schema_name}.{self.table_name}"
+
     def _render_text(self) -> str:
         m = f" /* mode={self.mode!r} */" if self.mode is not ... else ""
         return (
-            f"INSERT INTO {self.catalog_name}.{self.schema_name}.{self.table_name}"
+            f"INSERT INTO {self.target_full_name}"
             f"{m}"
         )
 
-    def apply(self, engine: "UnityEngine") -> int:
+    def apply(self, engine: "ExecutionEngine") -> int:
         from yggdrasil.data.options import CastOptions
 
         table = (
@@ -500,13 +546,15 @@ class Insert(UnityStatement):
         return total[0]
 
 
-class Select(UnityStatement):
+class Select(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.SELECT
+
     """Read rows from a table or view as a :class:`Tabular`.
 
-    ``apply`` returns the live :class:`UnityTable` / :class:`UnityView`
+    ``apply`` returns the live :class:`ExecutionTable` / :class:`ExecutionView`
     handle — every downstream read method (``read_arrow_table``,
     ``read_polars_frame``, ``read_pandas_frame``, …) flows through the
-    :class:`UnityStatementResult` because it forwards Tabular hooks to
+    :class:`ExecutionStatementResult` because it forwards Tabular hooks to
     its output.
     """
 
@@ -525,12 +573,17 @@ class Select(UnityStatement):
         self.options = options
         super().__init__(key=key)
 
+    @property
+    def target_full_name(self) -> str:
+        """Dotted ``catalog.schema.name`` identifier of the read target."""
+        return f"{self.catalog_name}.{self.schema_name}.{self.name}"
+
     def _render_text(self) -> str:
         return (
-            f"SELECT * FROM {self.catalog_name}.{self.schema_name}.{self.name}"
+            f"SELECT * FROM {self.target_full_name}"
         )
 
-    def apply(self, engine: "UnityEngine") -> "Tabular":
+    def apply(self, engine: "ExecutionEngine") -> "Tabular":
         schema_handle = engine.catalog(self.catalog_name).schema(self.schema_name)
         # Tables before views — same precedence as ``schema[name]``.
         table = schema_handle.table(self.name)
@@ -548,15 +601,19 @@ class Select(UnityStatement):
 # ── show / list ─────────────────────────────────────────────────────────
 
 
-class ShowCatalogs(UnityStatement):
+class ShowCatalogs(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.SHOW_CATALOGS
+
     def _render_text(self) -> str:
         return "SHOW CATALOGS"
 
-    def apply(self, engine: "UnityEngine") -> "list[str]":
+    def apply(self, engine: "ExecutionEngine") -> "list[str]":
         return sorted(c.name for c in engine.catalogs())
 
 
-class ShowSchemas(UnityStatement):
+class ShowSchemas(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.SHOW_SCHEMAS
+
     def __init__(
         self,
         catalog_name: str,
@@ -569,7 +626,7 @@ class ShowSchemas(UnityStatement):
     def _render_text(self) -> str:
         return f"SHOW SCHEMAS IN {self.catalog_name}"
 
-    def apply(self, engine: "UnityEngine") -> "list[str]":
+    def apply(self, engine: "ExecutionEngine") -> "list[str]":
         catalog = engine.catalog(self.catalog_name)
         if not catalog.exists:
             raise FileNotFoundError(
@@ -578,7 +635,9 @@ class ShowSchemas(UnityStatement):
         return sorted(s.name for s in catalog.schemas())
 
 
-class ShowTables(UnityStatement):
+class ShowTables(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.SHOW_TABLES
+
     def __init__(
         self,
         catalog_name: str,
@@ -593,7 +652,7 @@ class ShowTables(UnityStatement):
     def _render_text(self) -> str:
         return f"SHOW TABLES IN {self.catalog_name}.{self.schema_name}"
 
-    def apply(self, engine: "UnityEngine") -> "list[str]":
+    def apply(self, engine: "ExecutionEngine") -> "list[str]":
         schema_handle = engine.catalog(self.catalog_name).schema(self.schema_name)
         if not schema_handle.exists:
             raise FileNotFoundError(
@@ -602,7 +661,9 @@ class ShowTables(UnityStatement):
         return sorted(t.name for t in schema_handle.tables())
 
 
-class ShowViews(UnityStatement):
+class ShowViews(ExecutionStatement):
+    plan_type_id: ClassVar[PlanTypeId] = PlanTypeId.SHOW_VIEWS
+
     def __init__(
         self,
         catalog_name: str,
@@ -617,7 +678,7 @@ class ShowViews(UnityStatement):
     def _render_text(self) -> str:
         return f"SHOW VIEWS IN {self.catalog_name}.{self.schema_name}"
 
-    def apply(self, engine: "UnityEngine") -> "list[str]":
+    def apply(self, engine: "ExecutionEngine") -> "list[str]":
         schema_handle = engine.catalog(self.catalog_name).schema(self.schema_name)
         if not schema_handle.exists:
             raise FileNotFoundError(

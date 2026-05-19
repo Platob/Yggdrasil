@@ -17,20 +17,20 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.unity.base import UnityResource
+from yggdrasil.unity.base import ExecutionResource
 from yggdrasil.unity.info import ViewInfo
 
 if TYPE_CHECKING:
-    from yggdrasil.unity.schema import UnitySchema
+    from yggdrasil.unity.schema import ExecutionSchema
 
 
-__all__ = ["UnityView"]
+__all__ = ["ExecutionView"]
 
 
 logger = logging.getLogger(__name__)
 
 
-class UnityView(UnityResource, Tabular[CastOptions]):
+class ExecutionView(ExecutionResource, Tabular[CastOptions]):
     """Abstract view — resolves to another :class:`Tabular` on read."""
 
     def __init__(self) -> None:
@@ -40,8 +40,8 @@ class UnityView(UnityResource, Tabular[CastOptions]):
 
     @property
     @abstractmethod
-    def schema_handle(self) -> "UnitySchema":
-        """The :class:`UnitySchema` owning this view."""
+    def schema_handle(self) -> "ExecutionSchema":
+        """The :class:`ExecutionSchema` owning this view."""
 
     @property
     def catalog_name(self) -> str:

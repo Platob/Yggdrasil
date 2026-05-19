@@ -13,27 +13,27 @@ import logging
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Iterator
 
-from yggdrasil.unity.base import UnityResource
+from yggdrasil.unity.base import ExecutionResource
 
 if TYPE_CHECKING:
-    from yggdrasil.unity.catalog import UnityCatalog
-    from yggdrasil.unity.table import UnityTable
-    from yggdrasil.unity.view import UnityView
+    from yggdrasil.unity.catalog import ExecutionCatalog
+    from yggdrasil.unity.table import ExecutionTable
+    from yggdrasil.unity.view import ExecutionView
 
 
-__all__ = ["UnitySchema"]
+__all__ = ["ExecutionSchema"]
 
 
 logger = logging.getLogger(__name__)
 
 
-class UnitySchema(UnityResource):
+class ExecutionSchema(ExecutionResource):
     """Abstract schema — child tables and views plus the inherited lifecycle."""
 
     @property
     @abstractmethod
-    def catalog(self) -> "UnityCatalog":
-        """The :class:`UnityCatalog` owning this schema."""
+    def catalog(self) -> "ExecutionCatalog":
+        """The :class:`ExecutionCatalog` owning this schema."""
 
     @property
     def catalog_name(self) -> str:
@@ -46,19 +46,19 @@ class UnitySchema(UnityResource):
     # ── table / view navigation ─────────────────────────────────────────
 
     @abstractmethod
-    def table(self, name: str) -> "UnityTable":
-        """Return a :class:`UnityTable` bound to *name* (no existence check)."""
+    def table(self, name: str) -> "ExecutionTable":
+        """Return a :class:`ExecutionTable` bound to *name* (no existence check)."""
 
     @abstractmethod
-    def tables(self) -> Iterator["UnityTable"]:
+    def tables(self) -> Iterator["ExecutionTable"]:
         """Iterate over every table in this schema."""
 
     @abstractmethod
-    def view(self, name: str) -> "UnityView":
-        """Return a :class:`UnityView` bound to *name* (no existence check)."""
+    def view(self, name: str) -> "ExecutionView":
+        """Return a :class:`ExecutionView` bound to *name* (no existence check)."""
 
     @abstractmethod
-    def views(self) -> Iterator["UnityView"]:
+    def views(self) -> Iterator["ExecutionView"]:
         """Iterate over every view in this schema."""
 
     @abstractmethod
@@ -69,7 +69,7 @@ class UnitySchema(UnityResource):
         *,
         if_not_exists: bool = True,
         **kwargs,
-    ) -> "UnityTable":
+    ) -> "ExecutionTable":
         """Create a managed table under this schema and return its handle.
 
         ``schema`` is anything :meth:`yggdrasil.data.Schema.from_` accepts —
@@ -81,23 +81,23 @@ class UnitySchema(UnityResource):
     def create_view(
         self,
         name: str,
-        source: "str | UnityTable | UnityView",
+        source: "str | ExecutionTable | ExecutionView",
         *,
         definition: str | None = None,
         if_not_exists: bool = True,
         **kwargs,
-    ) -> "UnityView":
+    ) -> "ExecutionView":
         """Create a view under this schema.
 
         ``source`` accepts a dotted ``catalog.schema.name`` string or a
-        live :class:`UnityTable` / :class:`UnityView` (its ``full_name``
+        live :class:`ExecutionTable` / :class:`ExecutionView` (its ``full_name``
         is recorded). ``definition`` is an optional SQL projection
         applied at read time.
         """
 
     # ── default surface ─────────────────────────────────────────────────
 
-    def __getitem__(self, name: str) -> "UnityResource":
+    def __getitem__(self, name: str) -> "ExecutionResource":
         """Table by name first, view as a fallback.
 
         Tables and views share a namespace; matching tables first keeps
@@ -122,6 +122,6 @@ class UnitySchema(UnityResource):
             return False
         return self.table(name).exists or self.view(name).exists
 
-    def __iter__(self) -> Iterator["UnityResource"]:
+    def __iter__(self) -> Iterator["ExecutionResource"]:
         yield from self.tables()
         yield from self.views()

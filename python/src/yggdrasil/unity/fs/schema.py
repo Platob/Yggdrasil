@@ -1,4 +1,4 @@
-"""Filesystem-backed :class:`UnitySchema`."""
+"""Filesystem-backed :class:`ExecutionSchema`."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from yggdrasil.unity.fs import registry
 from yggdrasil.unity.fs.table import FSTable
 from yggdrasil.unity.fs.view import FSView
 from yggdrasil.unity.info import SchemaInfo
-from yggdrasil.unity.schema import UnitySchema
+from yggdrasil.unity.schema import ExecutionSchema
 
 if TYPE_CHECKING:
     from yggdrasil.unity.fs.catalog import FSCatalog
@@ -23,7 +23,7 @@ __all__ = ["FSSchema"]
 logger = logging.getLogger(__name__)
 
 
-class FSSchema(UnitySchema):
+class FSSchema(ExecutionSchema):
     """Schema backed by a directory under :attr:`FSCatalog.path`."""
 
     def __init__(self, *, catalog: "FSCatalog", name: str) -> None:

@@ -1,8 +1,8 @@
 """Abstract base class for every :mod:`yggdrasil.unity` resource.
 
-A :class:`UnityResource` is the common contract every catalog / schema
+A :class:`ExecutionResource` is the common contract every catalog / schema
 / table / view satisfies: identity (``name`` / ``full_name``), bound
-:class:`UnityEngine`, cached :attr:`info` payload, ``create`` /
+:class:`ExecutionEngine`, cached :attr:`info` payload, ``create`` /
 ``delete`` / ``exists`` / ``ensure_created`` lifecycle. Backends
 implement the abstract hooks; navigation (Catalog → Schema →
 Table/View) is wired by the leaf subclasses.
@@ -21,21 +21,21 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
-    from yggdrasil.unity.engine import UnityEngine
+    from yggdrasil.unity.engine import ExecutionEngine
 
 
-__all__ = ["UnityResource"]
+__all__ = ["ExecutionResource"]
 
 
 logger = logging.getLogger(__name__)
 
 
-class UnityResource(ABC):
+class ExecutionResource(ABC):
     """Common surface for Unity-Catalog-style resources.
 
     Subclasses provide:
 
-    * :attr:`engine`     — the bound :class:`UnityEngine`.
+    * :attr:`engine`     — the bound :class:`ExecutionEngine`.
     * :attr:`name`       — short identifier (e.g. ``"sales"``).
     * :attr:`full_name`  — dotted qualified name.
     * :meth:`_read_info` — backend hook returning the info dataclass.
@@ -59,8 +59,8 @@ class UnityResource(ABC):
 
     @property
     @abstractmethod
-    def engine(self) -> "UnityEngine":
-        """The :class:`UnityEngine` this resource is bound to."""
+    def engine(self) -> "ExecutionEngine":
+        """The :class:`ExecutionEngine` this resource is bound to."""
 
     @property
     @abstractmethod
@@ -125,7 +125,7 @@ class UnityResource(ABC):
     # ── lifecycle ────────────────────────────────────────────────────────
 
     @abstractmethod
-    def create(self, *, if_not_exists: bool = True, **kwargs: Any) -> "UnityResource":
+    def create(self, *, if_not_exists: bool = True, **kwargs: Any) -> "ExecutionResource":
         """Create this resource in the backend.
 
         ``if_not_exists=True`` (default) is a silent no-op when the
@@ -134,14 +134,14 @@ class UnityResource(ABC):
         """
 
     @abstractmethod
-    def delete(self, *, missing_ok: bool = True, **kwargs: Any) -> "UnityResource":
+    def delete(self, *, missing_ok: bool = True, **kwargs: Any) -> "ExecutionResource":
         """Delete this resource from the backend.
 
         ``missing_ok=True`` (default) swallows ``NotFound`` so callers
         can call ``delete`` defensively; ``False`` re-raises.
         """
 
-    def ensure_created(self, **kwargs: Any) -> "UnityResource":
+    def ensure_created(self, **kwargs: Any) -> "ExecutionResource":
         """Create the resource if it does not already exist."""
         if not self.exists:
             self.create(if_not_exists=True, **kwargs)
@@ -158,7 +158,7 @@ class UnityResource(ABC):
     def __eq__(self, other: object) -> bool:
         if other is self:
             return True
-        if not isinstance(other, UnityResource):
+        if not isinstance(other, ExecutionResource):
             return NotImplemented
         return (
             type(self) is type(other)

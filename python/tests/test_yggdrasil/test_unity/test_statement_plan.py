@@ -1,4 +1,4 @@
-"""Tests for the unity statement layer and :class:`UnityExecutionPlan`."""
+"""Tests for the unity statement layer and :class:`ExecutionPlan`."""
 from __future__ import annotations
 
 from yggdrasil.arrow.tests import ArrowTestCase
@@ -23,10 +23,10 @@ from yggdrasil.unity import (
     ShowSchemas,
     ShowTables,
     ShowViews,
-    UnityCatalog,
-    UnityExecutionPlan,
-    UnityStatement,
-    UnityStatementResult,
+    ExecutionCatalog,
+    ExecutionPlan,
+    ExecutionStatement,
+    ExecutionStatementResult,
 )
 from yggdrasil.unity.fs import FSEngine, FSTable
 
@@ -62,10 +62,10 @@ class TestEngineInheritsSession(ArrowTestCase):
             FSEngine()
 
 
-class TestUnityStatementBasics(ArrowTestCase):
+class TestExecutionStatementBasics(ArrowTestCase):
     def test_statement_extends_prepared_statement(self) -> None:
-        self.assertTrue(issubclass(CreateCatalog, UnityStatement))
-        self.assertTrue(issubclass(UnityStatement, PreparedStatement))
+        self.assertTrue(issubclass(CreateCatalog, ExecutionStatement))
+        self.assertTrue(issubclass(ExecutionStatement, PreparedStatement))
 
     def test_statement_render_text_create_catalog(self) -> None:
         stmt = CreateCatalog("main")
@@ -93,10 +93,10 @@ class TestExecuteIndividualStatements(ArrowTestCase):
 
     def test_execute_create_catalog(self) -> None:
         result = self.engine.execute(CreateCatalog("main"))
-        self.assertIsInstance(result, UnityStatementResult)
+        self.assertIsInstance(result, ExecutionStatementResult)
         self.assertTrue(result.done)
         self.assertEqual(result.state, State.SUCCEEDED)
-        self.assertIsInstance(result.output, UnityCatalog)
+        self.assertIsInstance(result.output, ExecutionCatalog)
         self.assertEqual(result.output.full_name, "main")
         self.assertTrue(self.engine["main"].exists)
 
@@ -190,20 +190,20 @@ class TestExecuteIndividualStatements(ArrowTestCase):
         self.assertTrue(self.engine["main"].exists)
 
 
-class TestUnityExecutionPlan(ArrowTestCase):
+class TestExecutionPlan(ArrowTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.engine = FSEngine(base=LocalPath(str(self.tmp_path / "wh")))
 
     def test_plan_is_immutable(self) -> None:
-        base = UnityExecutionPlan()
+        base = ExecutionPlan()
         next_plan = base.then_create_catalog("main")
         self.assertEqual(len(base), 0)
         self.assertEqual(len(next_plan), 1)
 
     def test_plan_iter_and_len(self) -> None:
         plan = (
-            UnityExecutionPlan()
+            ExecutionPlan()
             .then_create_catalog("main")
             .then_create_schema("main", "default")
         )
@@ -213,17 +213,17 @@ class TestUnityExecutionPlan(ArrowTestCase):
 
     def test_plan_then_rejects_non_unity_statement(self) -> None:
         with self.assertRaises(TypeError):
-            UnityExecutionPlan().then(PreparedStatement(text="SELECT 1"))
+            ExecutionPlan().then(PreparedStatement(text="SELECT 1"))
 
     def test_plan_concatenation(self) -> None:
-        a = UnityExecutionPlan().then_create_catalog("main")
-        b = UnityExecutionPlan().then_create_schema("main", "default")
+        a = ExecutionPlan().then_create_catalog("main")
+        b = ExecutionPlan().then_create_schema("main", "default")
         combined = a + b
         self.assertEqual(len(combined), 2)
 
     def test_plan_execute_via_engine_method(self) -> None:
         plan = (
-            UnityExecutionPlan()
+            ExecutionPlan()
             .then_create_catalog("main")
             .then_create_schema("main", "default")
             .then_create_table(
@@ -244,14 +244,14 @@ class TestUnityExecutionPlan(ArrowTestCase):
         )
 
     def test_plan_execute_via_plan_method(self) -> None:
-        plan = UnityExecutionPlan().then_create_catalog("main")
+        plan = ExecutionPlan().then_create_catalog("main")
         results = plan.execute(self.engine)
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].done)
 
     def test_plan_repr_includes_text(self) -> None:
         plan = (
-            UnityExecutionPlan()
+            ExecutionPlan()
             .then_create_catalog("main")
             .then_create_schema("main", "default")
         )
@@ -262,13 +262,13 @@ class TestUnityExecutionPlan(ArrowTestCase):
     def test_plan_drop_cascade(self) -> None:
         # Build up, then a teardown plan reuses the same surface.
         (
-            UnityExecutionPlan()
+            ExecutionPlan()
             .then_create_catalog("main")
             .then_create_schema("main", "default")
             .then_create_table("main", "default", "t", schema=_sales_schema())
             .execute(self.engine)
         )
-        teardown = UnityExecutionPlan().then_drop_catalog(
+        teardown = ExecutionPlan().then_drop_catalog(
             "main", recursive=True,
         )
         teardown.execute(self.engine)
@@ -276,7 +276,7 @@ class TestUnityExecutionPlan(ArrowTestCase):
 
     def test_plan_select_then_read(self) -> None:
         (
-            UnityExecutionPlan()
+            ExecutionPlan()
             .then_create_catalog("main")
             .then_create_schema("main", "default")
             .then_create_table("main", "default", "sales", schema=_sales_schema())
@@ -287,7 +287,7 @@ class TestUnityExecutionPlan(ArrowTestCase):
             .execute(self.engine)
         )
         results = (
-            UnityExecutionPlan()
+            ExecutionPlan()
             .then_select("main", "default", "sales")
             .execute(self.engine)
         )
@@ -295,7 +295,7 @@ class TestUnityExecutionPlan(ArrowTestCase):
 
     def test_plan_raise_error_false_continues(self) -> None:
         plan = (
-            UnityExecutionPlan()
+            ExecutionPlan()
             .then_create_catalog("main")
             .then_insert(  # Fails — table doesn't exist
                 "main", "default", "missing",

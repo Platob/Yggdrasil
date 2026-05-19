@@ -1,8 +1,8 @@
-"""Synchronous :class:`StatementResult` for :class:`UnityEngine`.
+"""Synchronous :class:`StatementResult` for :class:`ExecutionEngine`.
 
 Unity operations are local (no remote queue, no streaming wire
-protocol): :meth:`UnityStatementResult.start` runs the statement's
-:meth:`UnityStatement.apply` and stashes the return value on
+protocol): :meth:`ExecutionStatementResult.start` runs the statement's
+:meth:`ExecutionStatement.apply` and stashes the return value on
 :attr:`output`. The result is terminal once :meth:`start` returns —
 :attr:`done` flips to ``True`` and :meth:`refresh_status` is a no-op.
 
@@ -23,36 +23,36 @@ import pyarrow as pa
 from yggdrasil.data.enums.state import State
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import StatementResult
-from yggdrasil.unity.statement import UnityStatement
+from yggdrasil.unity.statement import ExecutionStatement
 
 if TYPE_CHECKING:
     from yggdrasil.io.tabular.base import Tabular
-    from yggdrasil.unity.engine import UnityEngine
+    from yggdrasil.unity.engine import ExecutionEngine
 
 
-__all__ = ["UnityStatementResult"]
+__all__ = ["ExecutionStatementResult"]
 
 
 logger = logging.getLogger(__name__)
 
 
-class UnityStatementResult(StatementResult[UnityStatement]):
-    """Local-sync result wrapping the return value of a :class:`UnityStatement`."""
+class ExecutionStatementResult(StatementResult[ExecutionStatement]):
+    """Local-sync result wrapping the return value of a :class:`ExecutionStatement`."""
 
-    _PREPARED_CLASS: ClassVar[type[UnityStatement]] = UnityStatement
+    _PREPARED_CLASS: ClassVar[type[ExecutionStatement]] = ExecutionStatement
 
     def __init__(
         self,
-        statement: UnityStatement,
+        statement: ExecutionStatement,
         *,
-        executor: "Optional[UnityEngine]" = None,
+        executor: "Optional[ExecutionEngine]" = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(statement=statement, executor=executor, **kwargs)
         self._started: bool = False
         self._failure: BaseException | None = None
         #: Whatever the statement's :meth:`apply` returned. Backends
-        #: stash either a :class:`UnityResource`, an ``int`` row count,
+        #: stash either a :class:`ExecutionResource`, an ``int`` row count,
         #: a :class:`Tabular`, or a ``list[str]`` here.
         self.output: Any = None
 
@@ -80,8 +80,8 @@ class UnityStatementResult(StatementResult[UnityStatement]):
         wait: Any = True,
         raise_error: bool = True,
         **kwargs: Any,
-    ) -> "UnityStatementResult":
-        """Run :meth:`UnityStatement.apply` against the bound executor."""
+    ) -> "ExecutionStatementResult":
+        """Run :meth:`ExecutionStatement.apply` against the bound executor."""
         del wait, kwargs  # Unity execution is fully synchronous.
         if self._started and not reset:
             return self
@@ -93,7 +93,7 @@ class UnityStatementResult(StatementResult[UnityStatement]):
         if engine is None:
             raise RuntimeError(
                 f"Cannot start {self!r}: no executor bound. Construct the "
-                "result via UnityEngine.send() / UnityEngine.execute() so "
+                "result via ExecutionEngine.send() / ExecutionEngine.execute() so "
                 "the executor back-reference is set."
             )
 
@@ -119,7 +119,7 @@ class UnityStatementResult(StatementResult[UnityStatement]):
         wait: Any = None,
         raise_error: bool = False,
         **kwargs: Any,
-    ) -> "UnityStatementResult":
+    ) -> "ExecutionStatementResult":
         """No-op — synchronous results either ran already or never started."""
         del wait, raise_error, kwargs
         return self
