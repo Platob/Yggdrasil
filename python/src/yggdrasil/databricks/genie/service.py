@@ -34,7 +34,10 @@ from typing import TYPE_CHECKING, Iterator, Optional
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 
+from dataclasses import replace as _dc_replace
+
 from .resources import (
+    DEFAULT_MANAGED_SPACE_TITLE,
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_WAIT,
@@ -42,6 +45,7 @@ from .resources import (
     GenieConversation,
     GenieDefaults,
     GenieSpace,
+    build_serialized_space,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -239,6 +243,130 @@ class Genie(DatabricksService):
         self.api.trash_space(space_id=space_id)
 
     # ------------------------------------------------------------------ #
+    # Ensure / cleanup — the "easiest interaction" path
+    # ------------------------------------------------------------------ #
+    def ensure_space(self) -> GenieSpace:
+        """Resolve, or create, the default :class:`GenieSpace`.
+
+        Resolution order:
+
+        1. :attr:`GenieDefaults.space_id`, when set, returns immediately.
+        2. :meth:`_pick_space_id` walks :meth:`list_spaces` (filtered by
+           :attr:`GenieDefaults.space_name` when set; otherwise matched by
+           :attr:`GenieDefaults.managed_space_title` first, then the first
+           listed space).
+        3. When neither step resolves an id and
+           :attr:`GenieDefaults.auto_create_space` is ``True``, a fresh
+           space is created via :meth:`create_space` using the
+           ``managed_space_*`` fields on the defaults.
+
+        On a successful resolve / create, the discovered ``space_id`` is
+        cached back onto :attr:`defaults` so subsequent :meth:`ask` calls
+        skip the listing round trip. When
+        :attr:`GenieDefaults.cleanup_dead_spaces` is also ``True``,
+        duplicates are trashed before the resolved id is returned.
+        """
+        if self.defaults.space_id:
+            space = GenieSpace(service=self, space_id=self.defaults.space_id)
+            if self.defaults.cleanup_dead_spaces:
+                self.cleanup_dead_spaces()
+            return space
+
+        picked = self._pick_space_id()
+        if picked is None:
+            if not self.defaults.auto_create_space:
+                raise ValueError(
+                    "Could not resolve a Genie space. Either pass space_id=..., "
+                    "set Genie.defaults.space_id, or enable "
+                    "Genie.defaults.auto_create_space=True (and configure "
+                    "managed_space_tables / warehouse_id) to create one."
+                )
+            picked = self._create_managed_space().space_id
+
+        # Cache the resolved id on the frozen defaults so the next ask()
+        # bypasses list_spaces entirely.
+        self.defaults = _dc_replace(self.defaults, space_id=picked)
+
+        if self.defaults.cleanup_dead_spaces:
+            self.cleanup_dead_spaces()
+        return GenieSpace(service=self, space_id=picked)
+
+    def cleanup_dead_spaces(self) -> list[str]:
+        """Trash duplicate managed-title Genie spaces.
+
+        Finds every space whose ``title`` matches
+        :attr:`GenieDefaults.managed_space_title`, keeps the one whose id
+        matches :attr:`GenieDefaults.space_id` (or, when that's unset, the
+        first one listed), and trashes the rest. Returns the list of
+        trashed ``space_id`` values so callers can log / report what was
+        removed.
+
+        Idempotent: running again after a clean workspace returns ``[]``.
+        """
+        title = self.defaults.managed_space_title
+        if not title:
+            return []
+
+        keepers = self.defaults.space_id
+        matches: list[tuple[str, Optional[str]]] = []
+        for space in self.list_spaces():
+            entry_title = (
+                getattr(space._details, "title", None)
+                if space._details is not None
+                else None
+            )
+            if entry_title == title:
+                matches.append((space.space_id, entry_title))
+
+        if len(matches) <= 1:
+            return []
+
+        # Pick the survivor: the configured default if present, else the
+        # first listed (Genie's list ordering is stable per call).
+        if keepers and any(sid == keepers for sid, _ in matches):
+            survivor = keepers
+        else:
+            survivor = matches[0][0]
+
+        trashed: list[str] = []
+        for sid, _ in matches:
+            if sid == survivor:
+                continue
+            LOGGER.info(
+                "Trashing dead Genie space %r (duplicate of survivor %r, title=%r)",
+                sid, survivor, title,
+            )
+            self.api.trash_space(space_id=sid)
+            trashed.append(sid)
+        return trashed
+
+    def _create_managed_space(self) -> GenieSpace:
+        """Create a Genie space using the ``managed_space_*`` defaults."""
+        if not self.defaults.managed_space_tables:
+            raise ValueError(
+                "Cannot auto-create a Genie space without "
+                "Genie.defaults.managed_space_tables — Genie requires at "
+                "least one fully-qualified `catalog.schema.table` to expose."
+            )
+        serialized = build_serialized_space(
+            tables=self.defaults.managed_space_tables,
+            text_instructions=self.defaults.managed_space_instructions,
+        )
+        LOGGER.info(
+            "Creating Genie space %r (tables=%r, warehouse_id=%r)",
+            self.defaults.managed_space_title,
+            tuple(self.defaults.managed_space_tables),
+            self.defaults.warehouse_id,
+        )
+        return self.create_space(
+            warehouse_id=self.defaults.warehouse_id,
+            serialized_space=serialized,
+            title=self.defaults.managed_space_title or DEFAULT_MANAGED_SPACE_TITLE,
+            description=self.defaults.managed_space_description,
+            parent_path=self.defaults.managed_space_parent_path,
+        )
+
+    # ------------------------------------------------------------------ #
     # Conversation passthroughs
     # ------------------------------------------------------------------ #
     def conversation(self, *, space_id: str, conversation_id: str) -> GenieConversation:
@@ -282,20 +410,48 @@ class Genie(DatabricksService):
                 "Pass space_id=... or set Genie.defaults.space_id."
             )
         picked = self._pick_space_id()
-        if not picked:
-            raise ValueError(
-                "Could not auto-pick a Genie space. Either set "
-                "Genie.defaults.space_id, pass space_id=..., or "
-                "create a Genie space in this workspace."
-            )
-        return picked
+        if picked:
+            # Cache so the next ask() skips the list round trip.
+            self.defaults = _dc_replace(self.defaults, space_id=picked)
+            return picked
+
+        if self.defaults.auto_create_space:
+            created = self._create_managed_space()
+            self.defaults = _dc_replace(self.defaults, space_id=created.space_id)
+            return created.space_id
+
+        raise ValueError(
+            "Could not auto-pick a Genie space. Either set "
+            "Genie.defaults.space_id, pass space_id=..., enable "
+            "Genie.defaults.auto_create_space=True (with "
+            "managed_space_tables + warehouse_id), or create a Genie "
+            "space in this workspace."
+        )
 
     def _pick_space_id(self) -> Optional[str]:
+        # Resolution priority:
+        # 1. Exact match on ``defaults.space_name`` (explicit caller intent).
+        # 2. Exact match on ``defaults.managed_space_title`` (re-pick the
+        #    space we previously auto-created, even after the process
+        #    restarts and lost its in-memory ``defaults.space_id``).
+        # 3. First listed space — only when neither bias is set, so we
+        #    never silently switch a configured workspace.
         wanted_title = self.defaults.space_name
+        managed_title = self.defaults.managed_space_title
+        first_id: Optional[str] = None
+        managed_id: Optional[str] = None
+
         for space in self.list_spaces():
-            if wanted_title is None:
-                return space.space_id
             title = getattr(space._details, "title", None) if space._details else None
-            if title == wanted_title:
-                return space.space_id
-        return None
+            if wanted_title is not None:
+                if title == wanted_title:
+                    return space.space_id
+                continue
+            if first_id is None:
+                first_id = space.space_id
+            if managed_id is None and managed_title and title == managed_title:
+                managed_id = space.space_id
+
+        if wanted_title is not None:
+            return None
+        return managed_id or first_id
