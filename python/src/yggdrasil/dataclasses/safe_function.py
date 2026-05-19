@@ -661,55 +661,6 @@ def build_row_invoker(func: Callable[..., Any]) -> Callable[[Any], Any]:
 # a single column by name + type hint
 # ---------------------------------------------------------------------------
 
-def _resolve_tabular_target(ann: Any) -> Optional[type]:
-    """Return *ann* iff a ``pa.RecordBatch → ann`` converter is registered.
-
-    Delegates the "is this a tabular shape?" decision to the
-    :mod:`yggdrasil.data.cast` registry — when ``find_converter(
-    pa.RecordBatch, ann)`` returns a hit, the whole-batch path is
-    viable; when it doesn't, the caller falls back to per-row
-    dispatch. That way new tabular targets (a third-party
-    ``DataFrame``-style type registered with ``@register_converter``)
-    auto-extend without touching this helper.
-
-    Routes the engine-side converter modules
-    (``yggdrasil.polars.cast`` / ``yggdrasil.pandas.cast``) via
-    :meth:`ObjectSerde.module_and_name` — the same namespace
-    helper the rest of the codebase uses for engine dispatch —
-    because their ``@register_converter`` calls only fire on import,
-    and a Spark executor unpickling a function with a
-    ``pl.DataFrame`` annotation may not have loaded the yggdrasil
-    polars cast registrations yet.
-    """
-    if not isinstance(ann, type):
-        return None
-    import pyarrow as _pa
-    if ann is _pa.RecordBatch:
-        return ann  # identity — no registry lookup needed
-    # Ensure the engine-side converter registrations exist for the
-    # annotation's module before asking the registry. Same engine
-    # dispatch shape used by ``yggdrasil.io.tabular.base`` /
-    # ``yggdrasil.io.tabular.arrow`` etc.
-    from yggdrasil.pickle.serde import ObjectSerde
-
-    namespace, _ = ObjectSerde.module_and_name(ann)
-    top = namespace.split(".", 1)[0] if namespace else ""
-    if top == "polars":
-        try:
-            import yggdrasil.polars.cast  # noqa: F401
-        except ImportError:
-            pass
-    elif top == "pandas":
-        try:
-            import yggdrasil.pandas.cast  # noqa: F401
-        except ImportError:
-            pass
-    from yggdrasil.data.cast.registry import find_converter
-    if find_converter(_pa.RecordBatch, ann) is not None:
-        return ann
-    return None
-
-
 def build_batch_invoker(
     func: Callable[..., Any],
 ) -> Callable[["pa.RecordBatch"], list[Any]]:
@@ -757,18 +708,46 @@ def build_batch_invoker(
         only_param = plan.positional_params[0]
         only_name = only_param.name
         only_ann = plan.resolved.get(only_name, only_param.annotation)
-        tabular_target = _resolve_tabular_target(only_ann)
-        if tabular_target is None and isinstance(only_ann, type):
-            # Map ``int`` / ``float`` / ``str`` / ``bool`` / ``bytes`` /
-            # ``datetime`` / ``date`` / ``Decimal`` … to the Arrow type
-            # the cast registry would target. Generic aliases / unions /
-            # PEP-563-unresolved strings stay ``None`` and the path falls
-            # back to per-row dispatch.
-            try:
-                from yggdrasil.data.types.base import DataType
-                arrow_target = DataType.from_pytype(only_ann).to_arrow()
-            except Exception:
-                arrow_target = None
+        if isinstance(only_ann, type):
+            # Whole-batch tabular: ``find_converter`` answers "is there a
+            # ``pa.RecordBatch → only_ann`` converter?" — when yes, the
+            # registry knows how to hand the function a Table / DataFrame /
+            # LazyFrame / RecordBatch of *only_ann*'s shape. Engine cast
+            # registrations only fire on import, so trigger the matching
+            # ``yggdrasil.X.cast`` module via the namespace helper before
+            # probing. Same routing shape used elsewhere in the codebase.
+            import pyarrow as _pa
+            from yggdrasil.data.cast.registry import find_converter
+            from yggdrasil.pickle.serde import ObjectSerde
+
+            namespace, _ = ObjectSerde.module_and_name(only_ann)
+            top = namespace.split(".", 1)[0] if namespace else ""
+            if top == "polars":
+                try:
+                    import yggdrasil.polars.cast  # noqa: F401
+                except ImportError:
+                    pass
+            elif top == "pandas":
+                try:
+                    import yggdrasil.pandas.cast  # noqa: F401
+                except ImportError:
+                    pass
+            if (only_ann is _pa.RecordBatch
+                    or find_converter(_pa.RecordBatch, only_ann) is not None):
+                tabular_target = only_ann
+
+            if tabular_target is None:
+                # Column-by-name primitive cast: ``int`` / ``float`` /
+                # ``str`` / ``bool`` / ``bytes`` / ``datetime`` /
+                # ``Decimal`` … map to Arrow types via ``DataType.from_pytype``,
+                # and the named column is cast in one ``pa.compute.cast``
+                # kernel call before per-cell dispatch. Generic aliases /
+                # unions stay ``None`` here and fall back to per-row.
+                try:
+                    from yggdrasil.data.types.base import DataType
+                    arrow_target = DataType.from_pytype(only_ann).to_arrow()
+                except Exception:
+                    arrow_target = None
 
     # ---- Whole-batch tabular path -----------------------------------------
     if tabular_target is not None:
