@@ -8,11 +8,14 @@ Source: [`python/src/yggdrasil/data/cast/registry.py`](https://github.com/Platob
 
 Register converters with `@register_converter(from_hint, to_hint)`; dispatch them via `convert(value, target)`. Dispatch order:
 
-1. **Exact match** — registered `(from, to)` pair.
-2. **Identity** — value already matches the target type.
-3. **`Any` wildcards** — fall back to converters registered with `Any`.
-4. **MRO fallback** — walk the source type's MRO to find a registered ancestor.
-5. **One-hop composition** — `from → mid → to` if a single intermediate exists.
+1. **Exact match** — registered `(from, to)` pair (cache hit, ~170 ns).
+2. **Identity** — value already matches the target type (or target is `Any` / `object`).
+3. **`Any` wildcards** — fall back to converters registered with `Any → to_hint`.
+4. **Namespace late-import** — when `from_type` or `to_hint` lives in a `polars` / `pandas` / `pyspark` / `pyarrow` namespace, import the matching `yggdrasil.<engine>.cast` module to trigger its registrations, then retry.
+5. **MRO fallback** — walk the source type's MRO to find a registered ancestor.
+6. **`issubclass` scan** — final pass against every registered pair for odd typing-protocol keys.
+
+No auto-composition: the registry refuses to chain `X → Y` plus `Y → int` into a synthetic `X → int` cast. Register the direct `X → int` converter explicitly so the intermediate is intentional rather than an artifact of registration order.
 
 Engine modules register their converters **on import**:
 

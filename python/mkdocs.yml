@@ -154,6 +154,7 @@ nav:
   - Getting Started: getting-started.md
   - Guides:
       - Architecture: guides/architecture.md
+      - Data Model: guides/data-model.md
       - Casting: guides/casting.md
       - IO & HTTP: guides/io-http.md
       - Databricks: guides/databricks.md
