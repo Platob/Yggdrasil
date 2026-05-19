@@ -208,7 +208,7 @@ preinstalled.
 
 | Task | Compute | Why |
 | --- | --- | --- |
-| Ingestion (HTTP API, S3 / GCS / Azure, FTP, webhooks) | **All-purpose cluster** with outbound internet | Serverless has no public-internet egress on most workspaces. |
+| Ingestion (HTTP API, S3 / GCS / Azure, FTP, webhooks) | **Multi-node all-purpose cluster** with outbound internet | Serverless has no public-internet egress on most workspaces; multi-node spreads outbound IPs across workers so per-IP API rate limits hit N× later. Use single-node only for low-volume / per-account-quota sources. |
 | Curated rebuild (raw_ → curated) | **Serverless** (`environment_key=DEFAULT_ENVIRONMENT_KEY`) | Internal to UC; fast cold start; ygg provisioned via AST deps. |
 | `dash_*` display rebuilds | **Serverless** | Same as curated — internal joins / windows. |
 | ML training (small data) | **Serverless** | UC-only; MLflow tracking is internal. |
@@ -216,16 +216,25 @@ preinstalled.
 
 ### Provisioning an ingestion cluster with ygg pre-installed
 
+**Default to multi-node, not single-node, for external API
+ingestion.** Each worker has its own outbound IP behind the
+workspace NAT; spreading the requests across N workers means an
+API's per-IP rate limit hits N× before it throttles you, and a
+single noisy neighbour doesn't poison the whole feed. Single-node
+ingestion is the right shape only for low-volume sources or for
+APIs with per-account (not per-IP) limits.
+
 ```python
 INGESTION_CLUSTER_SPEC = {
     "spark_version": "16.4.x-scala2.12",
     "node_type_id": "Standard_DS3_v2",
-    "num_workers": 0,                                # single-node ingestion
+    "num_workers": 4,                                # multi-node by default;
+                                                     # spreads requests across
+                                                     # 4 worker IPs to reduce
+                                                     # per-IP rate-limit risk.
+    "autoscale": {"min_workers": 2, "max_workers": 8},  # let it grow under
+                                                        # heavy fan-out.
     "data_security_mode": "SINGLE_USER",
-    "spark_conf": {
-        "spark.databricks.cluster.profile": "singleNode",
-        "spark.master": "local[*, 4]",
-    },
     # NETWORK ACCESS — required for ingestion (default workspaces lock
     # serverless egress; classic clusters honour the workspace's NAT /
     # public-IP policy).
@@ -240,6 +249,26 @@ INGESTION_CLUSTER_SPEC = {
 cluster = dbc.clusters.create(name="ygg-ingest-default", **INGESTION_CLUSTER_SPEC)
 cluster.wait_for_state("RUNNING")
 ```
+
+When you genuinely need single-node (very-low-volume source,
+per-account quota, debug runs), set `num_workers=0` plus the
+`singleNode` Spark conf:
+
+```python
+SINGLE_NODE_OVERRIDES = {
+    "num_workers": 0,
+    "spark_conf": {
+        "spark.databricks.cluster.profile": "singleNode",
+        "spark.master": "local[*, 4]",
+    },
+}
+```
+
+To take real advantage of the worker IPs, drive the fetch in
+parallel (one task per shard / symbol / date / region) — Spark
+`mapInPandas`, `foreachPartition`, `yggdrasil.concurrent` helpers,
+or one `JobTask` per shard. A multi-node cluster sitting behind a
+single-threaded ingestion script wastes the worker IPs.
 
 Then pin the ingestion task to it:
 
