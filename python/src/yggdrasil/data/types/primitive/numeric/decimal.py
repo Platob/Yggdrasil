@@ -148,6 +148,10 @@ class DecimalType(NumericType):
     # Exporters
     # ------------------------------------------------------------------
 
+    def _default_pyhint(self) -> Any:
+        from decimal import Decimal
+        return Decimal
+
     def to_arrow(self) -> pa.DataType:
         if self.precision <= 38:
             return pa.decimal128(self.precision, self.scale)

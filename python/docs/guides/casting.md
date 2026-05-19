@@ -141,6 +141,6 @@ def normalize_options(options=None, *, target_field=None) -> CastOptions:
 
 ## When the cast doesn't fire
 
-1. Confirm the engine cast module is imported (`yggdrasil.polars.cast`, etc.). Engines register on import.
+1. Confirm the engine cast module is imported (`yggdrasil.polars.cast`, etc.). Engines register on import — `find_converter` also auto-triggers these imports when the source or target lives in the `polars` / `pandas` / `pyspark` / `pyarrow` namespace, so missing converters past that probe are real misses.
 2. Check `CastOptions.target_field` — `cast_arrow_tabular` and friends need the target schema.
-3. Inspect the dispatch order in [Architecture](architecture.md#the-cast-registry). Most "missing converter" cases are an MRO miss; register a converter or add an `Any`-wildcard fallback.
+3. Inspect the dispatch order in [Architecture](architecture.md#the-cast-registry). Most "missing converter" cases are an MRO miss; register a converter or add an `Any`-wildcard fallback. The registry **does not** auto-compose two registered hops (`X → Y → int`) into a synthetic direct cast — that path was deliberately removed because the chosen intermediate depended on the order of unrelated registrations. Register the direct `X → int` if you need one.

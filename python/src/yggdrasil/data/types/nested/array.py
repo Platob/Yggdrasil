@@ -309,6 +309,14 @@ class ArrayType(NestedType):
             return default
 
 
+    def _default_pyhint(self) -> Any:
+        # Recurse into the item field so nested annotations round-trip
+        # (``ArrayType(ArrayType(IntegerType()))`` → ``list[list[int]]``).
+        # The item field's own dtype carries its own ``_pyhint_cache``
+        # if the original parse stamped one, so user dataclasses /
+        # enums inside a list / list-of-list survive untouched.
+        return list[self.item_field.dtype.to_pyhint()]
+
     def to_arrow(self) -> pa.DataType:
         value_field = self.item_field.to_arrow_field()
 

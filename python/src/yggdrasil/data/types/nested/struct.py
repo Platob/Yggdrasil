@@ -221,6 +221,17 @@ class StructType(NestedType):
                 raise
             return default
 
+    def _default_pyhint(self) -> Any:
+        # No general Python annotation for "fixed-shape struct with
+        # heterogeneous field types" — ``TypedDict`` requires a class
+        # synthesis the registry can't undo round-trip. ``dict[str,
+        # Any]`` is the safe fallback. Callers who built the StructType
+        # from a real dataclass keep the original class on the
+        # ``_pyhint_cache`` slot stamped by ``from_pytype``, so
+        # ``from_pytype(MyClass).to_pyhint()`` returns ``MyClass``
+        # untouched.
+        return dict[str, Any]
+
     def to_arrow(self) -> pa.DataType:
         return pa.struct([f.to_arrow_field() for f in self.fields])
 

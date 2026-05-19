@@ -262,6 +262,16 @@ class MapType(NestedType):
                 raise ValueError(f"Could not parse {cls.__name__} from dict: {value!r}") from e
             return default
 
+    def _default_pyhint(self) -> Any:
+        # Recurse into key / value fields so the nested annotation
+        # round-trips (``MapType(StringType(), IntegerType())`` →
+        # ``dict[str, int]``). Each child field forwards to its own
+        # dtype's ``to_pyhint`` so cached hints survive.
+        return dict[
+            self.key_field.dtype.to_pyhint(),
+            self.value_field.dtype.to_pyhint(),
+        ]
+
     def to_arrow(self) -> pa.DataType:
         return pa.map_(
             self.key_field.to_arrow_field(),

@@ -28,7 +28,16 @@ Key ideas
   3) Any-wildcard target handler
   4) MRO cross-product lookup
   5) scan-based fallback (issubclass checks for "odd" keys)
-  6) one-hop composition: from -> mid -> to (single intermediate only)
+
+  Note: an earlier version of the registry auto-composed a
+  ``from -> mid -> to`` converter by chaining two registered hops
+  through any intermediate type. That path produced silent
+  surprises — picked an unintended intermediate when multiple
+  candidates matched, masked missing direct converters, and made
+  every cast's correctness depend on the order of unrelated
+  registrations. The composition step is gone; callers wanting a
+  two-hop cast register the direct ``from -> to`` converter
+  explicitly.
 
 The public API is `register_converter()` + `convert()`.
 
@@ -49,8 +58,6 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import inspect
-import types
 from collections.abc import Iterable, Mapping
 from typing import (
     TYPE_CHECKING,
@@ -144,21 +151,14 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
 
 
 def unwrap_optional(hint: Any) -> tuple[bool, Any]:
-    """
-    Return (is_optional, base_hint) for Optional[T] / T | None.
+    """Forward to :meth:`DataType.unwrap_optional`.
 
-    Examples:
-      int | None -> (True, int)
-      int | None -> (True, int)
-      int -> (False, int)
+    Kept as a module-level alias for back-compat. New code reaches for
+    ``DataType.unwrap_optional`` directly — the canonical resolver
+    lives there as part of the centralized Python type-hint API.
     """
-    origin = get_origin(hint)
-    if origin in {Union, types.UnionType}:
-        args = get_args(hint)
-        non_none = [a for a in args if a is not type(None)]  # noqa: E721
-        if len(non_none) == 1:
-            return True, non_none[0]
-    return False, hint
+    from yggdrasil.data.types.base import DataType
+    return DataType.unwrap_optional(hint)
 
 
 def iter_mro(tp: Any) -> Iterable[Any]:
@@ -202,7 +202,13 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
       4) namespace-triggered late imports (polars/pandas/pyspark) once
       5) MRO cross-product lookup
       6) scan-based fallback with issubclass checks for odd keys
-      7) one-hop composition: from -> mid -> to (single intermediate)
+
+    Composition (auto-chaining ``from -> mid -> to`` through any
+    registered intermediate) used to live as a step 7; it was
+    removed because the intermediate picked depended on the order
+    of unrelated registrations, masked missing direct converters,
+    and produced silent surprises. Callers needing a two-hop cast
+    register the direct converter explicitly.
 
     Results (including ``None`` for "no path") are cached in ``_find_cache`` on
     the ``check_namespace=True`` path so repeated calls for the same type pair pay
@@ -223,8 +229,10 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
             _find_cache[cache_key] = conv
         return conv
 
-    # 2) cheap identities
-    if from_type == to_hint or to_hint in (object, Any):
+    # 2) cheap identities — chained ``is`` against the singletons
+    # ``object`` / ``Any`` avoids the ``in (object, Any)`` tuple
+    # allocation every cold call previously paid.
+    if from_type == to_hint or to_hint is object or to_hint is Any:
         if check_namespace:
             _find_cache[cache_key] = identity
         return identity
@@ -272,41 +280,13 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
         except TypeError:
             continue
 
-    # 7) one-level composition: from -> mid -> to
-    # This is intentionally limited: deterministic and avoids path-search explosions.
-    for (rf, mid), c1 in _registry.items():
-        try:
-            if not type_matches(from_type, rf):
-                continue
-        except TypeError:
-            continue
-
-        for (rmid, rt), c2 in _registry.items():
-            try:
-                if not type_matches(mid, rmid):
-                    continue
-                if not type_matches(to_hint, rt):
-                    continue
-            except TypeError:
-                continue
-
-            def composed(v: Any, o: Optional["CastOptions"], _c1=c1, _c2=c2) -> Any:
-                return _c2(_c1(v, o), o)
-
-            return composed
-
     return None
 
 
 def is_runtime_value(x: Any) -> bool:
-    """
-    True for runtime values (42, [], MyClass()), False for type hints.
-
-    Used by some downstream logic that wants to distinguish "value" vs "hint".
-    """
-    if inspect.isclass(x):
-        return False
-    return get_origin(x) is None
+    """Forward to :meth:`DataType.is_runtime_value`."""
+    from yggdrasil.data.types.base import DataType
+    return DataType.is_runtime_value(x)
 
 
 # ----------------------------
@@ -323,40 +303,74 @@ def convert(
     Convert `value` to `target_hint` using registered converters + built-ins.
 
     Dispatch order (cheapest first):
-      1) ``Optional[T]`` unwrap.
-      2) ``None`` → ``None`` if optional, else ``default_scalar(target)``.
-      3) ``Any`` / ``object`` target → identity passthrough.
-      4) ``isinstance(value, target_hint)`` → identity passthrough.
-      5) Registry lookup (exact / wildcard / namespace / MRO / one-hop composition).
+      1) ``Any`` / ``object`` target → identity passthrough.
+      2) Plain-type identity: ``isinstance(value, target_hint)`` →
+         identity. Most calls (``convert(42, int)``, ``convert('x',
+         str)``) bail out here, before any function call.
+      3) ``Optional[T]`` unwrap for generic-alias targets.
+      4) ``None`` → ``None`` if optional, else ``default_scalar(target)``.
+      5) Registry lookup (exact / wildcard / namespace / MRO / scan-fallback).
       6) ``Enum`` member resolution and ``dataclass`` from-mapping coercion.
       7) Container generics — ``list`` / ``set`` / ``tuple`` / ``dict`` / ``Mapping``.
       8) ``TypeError`` — no path found.
 
-    Options are normalized through ``CastOptions.check`` only when the caller
-    actually supplied one — the no-options call site (the common one) skips the
-    allocation entirely.
+    Options are normalized through ``CastOptions.check`` only when the
+    caller actually supplied one (the no-options call site, which is the
+    overwhelmingly common one, skips the allocation and the import).
     """
-    from yggdrasil.arrow.python_defaults import default_scalar
-    from yggdrasil.data.options import CastOptions
-
-    is_optional, target_hint = unwrap_optional(target_hint)
-
-    if value is None:
-        return None if is_optional else default_scalar(target_hint)  # type: ignore[return-value]
-
+    # Cheapest exits first — identity checks against module-level
+    # singletons, no function calls, no tuple allocations. Reordered
+    # ahead of ``unwrap_optional`` (which calls ``get_origin`` + tuple
+    # allocation) so the Any / object / matching-type hot paths bail
+    # before any heavy work.
     if target_hint is Any or target_hint is object:
         return value  # type: ignore[return-value]
 
+    # Plain-type identity short-circuit. ``isinstance(target_hint,
+    # type)`` is a single C-level check; when it's True the target
+    # isn't an ``Optional[T]`` or a generic alias, so ``unwrap_optional``
+    # can't change the answer — skip it entirely. ``isinstance(value,
+    # target_hint)`` then handles the "value already matches" case
+    # (``convert(42, int)``, ``convert('x', str)``, …) which is the
+    # dominant shape in per-row coercion. Saves ~250 ns per call.
     target_is_type = isinstance(target_hint, type)
+    if target_is_type and value is not None:
+        try:
+            if isinstance(value, target_hint):
+                return value  # type: ignore[return-value]
+        except TypeError:
+            # Generic aliases / parameterised metaclasses can raise on
+            # the isinstance check; the outer guard already rules them
+            # out for the standard case, so this is strictly defensive.
+            pass
+
+    # Slow path. ``unwrap_optional`` runs only when we actually need
+    # it: a non-plain-type target (generic alias / Union / Optional)
+    # OR a None value (where the Optional flag controls whether we
+    # return None or a default scalar).
+    if not target_is_type or value is None:
+        is_optional, target_hint = unwrap_optional(target_hint)
+        target_is_type = isinstance(target_hint, type)
+        if target_hint is Any or target_hint is object:
+            return value  # type: ignore[return-value]
+    else:
+        is_optional = False
+
+    if value is None:
+        if is_optional:
+            return None  # type: ignore[return-value]
+        from yggdrasil.arrow.python_defaults import default_scalar
+        return default_scalar(target_hint)  # type: ignore[return-value]
+
     if target_is_type:
         try:
             if isinstance(value, target_hint):
                 return value  # type: ignore[return-value]
         except TypeError:
-            # Generic aliases / parameterized types raise here; ignore and dispatch.
             pass
 
     if options is not None or kwargs:
+        from yggdrasil.data.options import CastOptions
         options = CastOptions.check(options, **kwargs)
 
     conv = find_converter(type(value), target_hint)

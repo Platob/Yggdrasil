@@ -115,6 +115,12 @@ class ObjectType(DataType):
     # Exporters
     # ------------------------------------------------------------------
 
+    def _default_pyhint(self) -> Any:
+        # Variant column — ``object`` is the closest Python annotation
+        # for "anything goes". Original parsed hints (user classes,
+        # ``Any``) live on the ``_pyhint_cache`` stamp.
+        return object
+
     def to_arrow(self) -> pa.DataType:
         return pa.large_binary()
 

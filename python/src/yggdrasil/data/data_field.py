@@ -5,19 +5,14 @@ import itertools
 import json
 import os
 import pathlib
-import types
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
-    Annotated,
     ClassVar,
     Optional,
-    Union,
-    get_args,
-    get_origin,
     Iterator,
     Generator,
     AnyStr,
@@ -286,41 +281,26 @@ def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
     return isinstance(obj, type) and issubclass(obj, class_or_tuple)
 
 
+# The canonical Python type-hint resolution helpers live on
+# :class:`DataType` — :meth:`DataType.strip_annotated`,
+# :meth:`DataType.unwrap_newtype`, :meth:`DataType.normalize_hint`,
+# :meth:`DataType.unwrap_nullable_hint`. The module-level wrappers
+# below stay as thin forwarders so existing in-module callers
+# (``Field.from_pytype`` and friends) don't have to spell out the
+# class prefix on every line, but new code should reach for the
+# ``DataType`` classmethods directly.
+
+
 def _strip_annotated(hint: object) -> object:
-    while get_origin(hint) is Annotated:
-        args = get_args(hint)
-        hint = args[0] if args else Any
-    return hint
+    return DataType.strip_annotated(hint)
 
 
 def _unwrap_newtype(hint: object) -> object:
-    while hasattr(hint, "__supertype__"):
-        hint = hint.__supertype__
-    return hint
+    return DataType.unwrap_newtype(hint)
 
 
 def _unwrap_nullable_hint(hint: Any) -> tuple[Any, bool]:
-    if isinstance(hint, str):
-        parsed = ParsedDataType.parse(hint)
-        if parsed.type_id == DataTypeId.NULL:
-            return _NONE_TYPE, True
-        return hint, bool(parsed.nullable)
-
-    hint = _unwrap_newtype(_strip_annotated(hint))
-    origin = get_origin(hint)
-    args = get_args(hint)
-
-    if origin in (Union, types.UnionType):
-        non_null_args = tuple(arg for arg in args if arg is not _NONE_TYPE)
-        has_null = len(non_null_args) != len(args)
-
-        if not non_null_args:
-            return _NONE_TYPE, True
-
-        if len(non_null_args) == 1:
-            return _unwrap_newtype(_strip_annotated(non_null_args[0])), has_null
-
-        return hint, has_null
+    return DataType.unwrap_nullable_hint(hint)
 
     return hint, False
 

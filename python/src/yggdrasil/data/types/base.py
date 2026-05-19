@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime as dt
 import decimal
 import enum
+import importlib
+import inspect
 import json
 import logging
 import types
@@ -15,6 +17,7 @@ from typing import (
     TYPE_CHECKING,
     Annotated,
     Any,
+    Callable,
     ClassVar,
     Iterable,
     Iterator,
@@ -131,6 +134,13 @@ def _safe_issubclass(obj: object, class_or_tuple: object) -> bool:
         return False
 
 
+# Module-level forwarding shims. The canonical implementations live as
+# classmethods on :class:`DataType` — these wrappers exist so the
+# in-file ``from_pytype`` body (defined before the class) can still
+# reach the helpers without ``DataType`` being in scope at parse time.
+# External callers should use ``DataType.strip_annotated`` /
+# ``DataType.unwrap_newtype`` (or :meth:`DataType.normalize_hint`).
+
 def _strip_annotated(hint: object) -> object:
     while get_origin(hint) is Annotated:
         args = get_args(hint)
@@ -220,6 +230,54 @@ _FLOAT_TYPE_ID_TO_SIZE: dict[DataTypeId, int] = {
 #: both reach it without going through the descriptor machinery during
 #: ``__new__`` (descriptor protocol there has bitten subclasses before).
 _DATA_TYPE_DEFAULT_SINGLETONS: dict[type, "DataType"] = {}
+
+
+#: Sentinel for the ``_pyhint_cache`` slot. ``None`` is a real value
+#: (``NullType.to_pyhint()`` returns ``type(None)`` / the literal None
+#: hint), so distinguish "no cached hint" from "cached hint is None"
+#: with a private object identity rather than ``...`` (Ellipsis is
+#: itself a typing-system value users sometimes pass).
+_PYHINT_UNSET: Any = object()
+
+
+def _stamp_pyhint_cache(result: "DataType", hint: Any) -> None:
+    """First-write-wins cache stamp for the parsed Python hint.
+
+    Called from :meth:`DataType.from_pytype` to preserve the original
+    *hint* on *result* so :meth:`DataType.to_pyhint` can hand it back
+    verbatim — keeping user-defined dataclasses / enum classes /
+    ``np.int64``-style aliases that the canonical reconstruction
+    would collapse.
+
+    Skip / overwrite policy:
+
+    * ``None`` / ``type(None)`` / a bare :class:`DataType` instance /
+      a :class:`ParsedDataType` aren't useful as hints (the default
+      reconstruction already returns the same shape), so we don't
+      stamp them.
+    * When the slot is already set, leave it alone — the first
+      caller of :meth:`from_pytype` against a singleton wins. Without
+      this rule, ``from_pytype(np.int64)`` running after
+      ``from_pytype(int)`` would corrupt the shared
+      ``IntegerType()`` singleton's cache for every prior caller.
+    * The ``object.__setattr__`` call works on the frozen dataclass
+      because the slot is intentionally NOT declared as a
+      ``dataclasses.field`` — it lives outside ``__eq__`` / ``__hash__``
+      / pickle state, same pattern as the engine-projection caches
+      (``_to_arrow_cached`` etc.).
+    """
+    if hint is None or hint is _NONE_TYPE:
+        return
+    if isinstance(hint, (DataType, ParsedDataType)):
+        return
+    if getattr(result, "_pyhint_cache", _PYHINT_UNSET) is not _PYHINT_UNSET:
+        return
+    try:
+        object.__setattr__(result, "_pyhint_cache", hint)
+    except (AttributeError, TypeError):
+        # Slot rejection (custom subclass with __slots__ that excluded
+        # the cache name) — degrade silently to "no cache".
+        pass
 
 
 #: Memoized ``pa.DataType -> DataType`` dispatch results. Populated on
@@ -636,6 +694,300 @@ class DataType(BaseChildrenFields, ABC):
             "name": self.type_id.name,
         }
 
+    # ------------------------------------------------------------------
+    # Python type hint round-trip
+    #
+    # :meth:`from_pytype` parses a Python annotation (``int``, ``str``,
+    # ``list[int]``, ``Optional[int]``, a dataclass, an Enum, …) into a
+    # :class:`DataType`. :meth:`to_pyhint` is the inverse — emit the
+    # Python type hint a caller would type to land on this dtype.
+    #
+    # Two-tier resolution:
+    #
+    # 1. **Cached hint** — :meth:`from_pytype` stamps the original
+    #    parsed hint on the resulting DataType via
+    #    ``object.__setattr__(self, "_pyhint_cache", hint)`` whenever
+    #    the hint carries information the default reconstruction would
+    #    lose (a user-defined dataclass, an ``Enum`` subclass, an
+    #    ``np.int64`` alias, a typing-generic with concrete child
+    #    args). Subsequent :meth:`to_pyhint` calls return the cached
+    #    value verbatim. The cache lives outside the dataclass
+    #    ``fields`` so equality / hash / pickle stay clean.
+    # 2. **Default reconstruction** — when no cache is set,
+    #    :meth:`_default_pyhint` (subclass hook) generates a canonical
+    #    Python hint from the dtype's own state. ``IntegerType()``
+    #    returns ``int``, ``StringType()`` returns ``str``,
+    #    ``ArrayType(item_field=Field("item", IntegerType()))`` returns
+    #    ``list[int]``, etc.
+    # ------------------------------------------------------------------
+
+    def to_pyhint(self) -> Any:
+        """Return the Python type hint that maps back to this DataType.
+
+        Cached when :meth:`from_pytype` stamped an explicit hint on
+        the instance (preserves user-defined dataclasses, enum
+        classes, ``numpy.int64`` and other narrow aliases the
+        canonical reconstruction would collapse). Otherwise falls
+        back to :meth:`_default_pyhint`, the subclass hook that
+        builds a canonical hint from the dtype's own state.
+        """
+        cache = getattr(self, "_pyhint_cache", _PYHINT_UNSET)
+        if cache is not _PYHINT_UNSET:
+            return cache
+        return self._default_pyhint()
+
+    def _default_pyhint(self) -> Any:
+        """Subclass hook: canonical Python hint for this dtype.
+
+        Override per concrete type (``IntegerType`` → ``int``,
+        ``StringType`` → ``str``, ``ArrayType`` → ``list[T]`` with
+        the child type recursed, …). The base default returns
+        :class:`typing.Any` so an unimplemented subclass still
+        round-trips through ``Any`` rather than raising.
+        """
+        return Any
+
+    # ==================================================================
+    # Python type-hint resolution — canonical helpers
+    #
+    # :class:`DataType` (with :class:`yggdrasil.data.Field`) is the
+    # single source of truth for Python typing across the codebase.
+    # Every typing-resolution call site — :mod:`yggdrasil.dataclasses
+    # .safe_function`, :mod:`yggdrasil.data.cast.registry`,
+    # :mod:`yggdrasil.data.data_field`, :mod:`yggdrasil.arrow
+    # .python_defaults` — routes through the classmethods below
+    # instead of forking its own copy of ``get_origin`` / ``get_args``
+    # / Annotated-stripping / NewType-unwrapping / Optional-peeling
+    # logic. The result: one place to fix when typing semantics
+    # change (PEP 604, PEP 695, Annotated edge cases, …) and one
+    # place callers learn about ``pa.`` / ``pl.`` / ``pd.`` alias
+    # conventions.
+    # ==================================================================
+
+    #: Short-alias prefix expansion table. Editable so a third-party
+    #: engine module can register its own namespace (``ddf.`` for dask,
+    #: ``cudf.``, …) and have :meth:`resolve_str_annotation` /
+    #: :meth:`expand_alias` pick it up. Order doesn't matter — the
+    #: first matching prefix wins per :meth:`expand_alias`'s loop.
+    PYHINT_ALIASES: ClassVar[dict[str, str]] = {
+        "pa.": "pyarrow.",
+        "pl.": "polars.",
+        "pd.": "pandas.",
+        "np.": "numpy.",
+        "ps.": "pyspark.",
+        "ddf.": "dask.dataframe.",
+    }
+
+    @classmethod
+    def expand_alias(cls, name: str) -> str:
+        """Expand a known short-alias prefix.
+
+        ``pa.Table`` → ``pyarrow.Table``, ``pl.DataFrame`` →
+        ``polars.DataFrame``, etc. Returns *name* unchanged when no
+        registered prefix matches. The table lives at
+        :attr:`PYHINT_ALIASES`.
+        """
+        for short, full in cls.PYHINT_ALIASES.items():
+            if name.startswith(short):
+                return full + name[len(short):]
+        return name
+
+    @staticmethod
+    def strip_annotated(hint: Any) -> Any:
+        """Strip ``Annotated[T, ...]`` down to T (recursive)."""
+        while get_origin(hint) is Annotated:
+            args = get_args(hint)
+            hint = args[0] if args else Any
+        return hint
+
+    @staticmethod
+    def unwrap_newtype(hint: Any) -> Any:
+        """Unwrap a chain of ``NewType`` aliases to the base type."""
+        while hasattr(hint, "__supertype__"):
+            hint = hint.__supertype__
+        return hint
+
+    @classmethod
+    def normalize_hint(cls, hint: Any) -> Any:
+        """``strip_annotated`` then ``unwrap_newtype`` — common preamble.
+
+        Every ``from_pytype`` / ``unwrap_*`` flow needs the hint stripped
+        of ``Annotated`` metadata and the ``NewType`` chain unwrapped
+        before the real dispatch. Bundled into one classmethod so the
+        ordering ("strip Annotated before NewType, recursive on both")
+        lives in one place.
+        """
+        return cls.unwrap_newtype(cls.strip_annotated(hint))
+
+    @classmethod
+    def unwrap_optional(cls, hint: Any) -> tuple[bool, Any]:
+        """Return ``(is_optional, inner)`` for ``Optional[T]`` / ``T | None``.
+
+        Only collapses a Union whose non-``None`` arms reduce to exactly
+        one type — ``Optional[int]`` → ``(True, int)``,
+        ``int | None`` → ``(True, int)``. Multi-type unions return
+        ``(False, hint)`` so callers can decide how to handle them
+        (the cast registry generally falls through to ``StringType``).
+        """
+        origin = get_origin(hint)
+        if origin in {Union, types.UnionType}:
+            args = get_args(hint)
+            non_none = [a for a in args if a is not type(None)]
+            if len(non_none) == 1:
+                return True, non_none[0]
+        return False, hint
+
+    @classmethod
+    def unwrap_nullable_hint(cls, hint: Any) -> tuple[Any, bool]:
+        """Field-flavoured Optional unwrap: ``(inner, has_null)``.
+
+        Differences from :meth:`unwrap_optional`:
+
+        * String hints route through :class:`ParsedDataType.parse` so
+          the field name / nullability tag baked into the DSL form
+          (e.g. ``"int64?"``) survives.
+        * Multi-type unions stay intact — the caller wants
+          ``(Union[A, B], True)``, not ``(Union[A, B], False)`` — so
+          :class:`yggdrasil.data.Field` can stamp ``nullable=True``
+          without losing the multi-arm shape.
+        """
+        if isinstance(hint, str):
+            parsed = ParsedDataType.parse(hint)
+            if parsed.type_id == DataTypeId.NULL:
+                return type(None), True
+            return hint, bool(parsed.nullable)
+
+        hint = cls.normalize_hint(hint)
+        origin = get_origin(hint)
+        args = get_args(hint)
+
+        if origin in (Union, types.UnionType):
+            non_null_args = tuple(arg for arg in args if arg is not type(None))
+            has_null = len(non_null_args) != len(args)
+
+            if not non_null_args:
+                return type(None), True
+
+            if len(non_null_args) == 1:
+                return cls.normalize_hint(non_null_args[0]), has_null
+
+            return hint, has_null
+
+        return hint, False
+
+    @staticmethod
+    def is_runtime_value(x: Any) -> bool:
+        """``True`` for runtime values (``42``, ``[]``, ``MyClass()``).
+
+        ``False`` for type hints — distinguishes ``convert(42, int)``
+        (runtime value with target hint) from ``convert(int, str)``
+        (two hints, no value). Used to gate dispatch decisions in
+        downstream tooling.
+        """
+        if inspect.isclass(x):
+            return False
+        return get_origin(x) is None
+
+    @classmethod
+    def resolve_str_annotation(
+        cls, s: str, func_globals: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """Resolve a string annotation to a real type.
+
+        Tries, in order:
+
+        1. ``eval`` in *func_globals* + builtins — picks up local imports
+           and aliases declared in the function's own module.
+        2. ``eval`` against ``typing`` for generic shapes (``Optional[int]``,
+           ``list[int]``) when *func_globals* doesn't have them in scope.
+        3. Alias-prefix expansion via :meth:`expand_alias` + dotted
+           ``importlib.import_module`` lookup so ``pa.Table`` /
+           ``pl.DataFrame`` resolve without the function's globals
+           having ever imported the alias.
+
+        Returns *s* verbatim when every path fails — callers treat that
+        as "unresolved, skip coercion / leave as-is".
+        """
+        candidate = s.strip()
+
+        if func_globals is not None:
+            try:
+                return eval(candidate, func_globals, None)
+            except Exception:
+                pass
+
+        # Generic typing shapes (``Optional[int]``, ``list[int]``, …) live in
+        # the ``typing`` namespace; let them resolve without dragging the
+        # module into every caller's globals.
+        try:
+            import typing as _typing
+            return eval(candidate, dict(_typing.__dict__), None)
+        except Exception:
+            pass
+
+        expanded = cls.expand_alias(candidate)
+        if "." in expanded:
+            mod_path, _, attr = expanded.rpartition(".")
+            mod: Any = None
+            try:
+                mod = importlib.import_module(mod_path)
+            except ImportError:
+                # Module not on the path — try yggdrasil's runtime
+                # auto-install before giving up. Respects whatever install
+                # policy the active :class:`PyEnv` has configured.
+                try:
+                    from yggdrasil.environ import PyEnv
+                    mod = PyEnv.runtime_import_module(mod_path, warn=False)
+                except Exception:
+                    mod = None
+            except Exception:
+                mod = None
+            if mod is not None:
+                obj = getattr(mod, attr, None)
+                if obj is not None:
+                    return obj
+
+        return s
+
+    @classmethod
+    def resolve_function_annotations(
+        cls, func: "Callable[..., Any]",
+    ) -> dict[str, Any]:
+        """Resolve every annotation on *func* to a real type.
+
+        Two-pass best effort so a single unresolvable annotation doesn't
+        blow up the rest:
+
+        1. :func:`inspect.get_annotations` with ``eval_str=True`` —
+           evaluates every annotation in the function's globals + builtins
+           in one shot.
+        2. Per-annotation :meth:`resolve_str_annotation` fallback for
+           entries the fast path left as strings (it silently returns
+           the literal when its eval misses).
+
+        Anything still a string after both passes is left untouched —
+        callers treat it as "couldn't resolve, skip coercion" rather
+        than raising.
+        """
+        raw = dict(getattr(func, "__annotations__", {}) or {})
+        if not raw:
+            return raw
+
+        try:
+            resolved: dict[str, Any] = dict(
+                inspect.get_annotations(func, eval_str=True),
+            )
+        except Exception:
+            resolved = dict(raw)
+
+        func_globals = getattr(func, "__globals__", None)
+        for name, ann in list(resolved.items()):
+            if isinstance(ann, str):
+                resolved[name] = cls.resolve_str_annotation(
+                    ann, func_globals=func_globals,
+                )
+        return resolved
+
     def to_json(self, to_bytes: bool = False) -> AnyStr:
         dumped = json.dumps(self.to_dict())
         if to_bytes:
@@ -1035,6 +1387,23 @@ class DataType(BaseChildrenFields, ABC):
 
     @classmethod
     def from_pytype(cls, hint: Any) -> "DataType":
+        """Parse a Python annotation into a :class:`DataType`.
+
+        Stamps the resulting instance's ``_pyhint_cache`` with the
+        original *hint* when the canonical reconstruction
+        (:meth:`_default_pyhint`) wouldn't round-trip — so
+        ``from_pytype(MyDataclass).to_pyhint()`` returns
+        ``MyDataclass`` itself rather than a generic struct hint,
+        ``from_pytype(MyEnum).to_pyhint()`` returns the enum class,
+        and ``from_pytype(np.int64).to_pyhint()`` returns
+        ``np.int64`` rather than the canonical ``int``.
+        """
+        result = cls._from_pytype_impl(hint)
+        _stamp_pyhint_cache(result, hint)
+        return result
+
+    @classmethod
+    def _from_pytype_impl(cls, hint: Any) -> "DataType":
         if isinstance(hint, DataType):
             return hint
 

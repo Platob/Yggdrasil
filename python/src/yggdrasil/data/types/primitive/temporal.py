@@ -852,6 +852,10 @@ class DateType(TemporalType):
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.DATE)
 
+    def _default_pyhint(self) -> Any:
+        import datetime as _dt
+        return _dt.date
+
     def to_arrow(self) -> "pa.DataType":
         return pa.date64() if self.unit == "ms" else pa.date32()
 
@@ -950,6 +954,10 @@ class TimeType(TemporalType):
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.TIME)
+
+    def _default_pyhint(self) -> Any:
+        import datetime as _dt
+        return _dt.time
 
     def to_arrow(self) -> "pa.DataType":
         if self.unit in {"s", "ms"}:
@@ -1084,6 +1092,10 @@ class TimestampType(TemporalType):
         ``is_utc()`` and ``utc_offset()``.
         """
         return None if self.tz.is_naive() else self.tz.iana
+
+    def _default_pyhint(self) -> Any:
+        import datetime as _dt
+        return _dt.datetime
 
     def to_arrow(self) -> "pa.DataType":
         return pa.timestamp(unit=self.unit, tz=self.tz_iana)
@@ -1234,6 +1246,10 @@ class DurationType(TemporalType):
     @classmethod
     def handles_dict(cls, value: dict[str, Any]) -> bool:
         return cls._matches_dict(value, DataTypeId.DURATION)
+
+    def _default_pyhint(self) -> Any:
+        import datetime as _dt
+        return _dt.timedelta
 
     def to_arrow(self) -> "pa.DataType":
         return pa.duration(self.unit)
