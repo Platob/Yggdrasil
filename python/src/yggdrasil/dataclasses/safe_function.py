@@ -57,89 +57,44 @@ LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Fast alias prefixes — recognize ``pa.Table`` / ``pl.DataFrame`` /
-# ``pd.DataFrame`` / ``np.ndarray`` shapes when the function's own globals
-# don't have the short alias imported. Best-effort: if the dotted import
-# fails the annotation stays a string and coercion is skipped at the
-# call site.
+# Backwards-compatibility shims for module-level callers.
+#
+# The canonical implementations of these helpers live as classmethods on
+# :class:`yggdrasil.data.types.base.DataType` — the single source of
+# truth for Python type-hint resolution. The wrappers below keep the
+# module-level names working for any external caller that already
+# imported them, but new code should reach for ``DataType.expand_alias``
+# / ``DataType.resolve_str_annotation`` / ``DataType.resolve_function_annotations``
+# directly.
 # ---------------------------------------------------------------------------
-
-_FAST_ALIAS_PREFIXES: dict[str, str] = {
-    "pa.": "pyarrow.",
-    "pl.": "polars.",
-    "pd.": "pandas.",
-    "np.": "numpy.",
-    "ps.": "pyspark.",
-    "ddf.": "dask.dataframe.",
-}
 
 
 def _expand_alias(name: str) -> str:
-    """Expand a known short alias prefix (``pa.Table`` → ``pyarrow.Table``)."""
-    for short, full in _FAST_ALIAS_PREFIXES.items():
-        if name.startswith(short):
-            return full + name[len(short):]
-    return name
+    """Forward to :meth:`DataType.expand_alias`."""
+    from yggdrasil.data.types.base import DataType
+    return DataType.expand_alias(name)
 
 
 def _resolve_str_annotation(s: str, func_globals: Optional[dict[str, Any]] = None) -> Any:
-    """Best-effort: parse a string annotation into a real type.
+    """Forward to :meth:`DataType.resolve_str_annotation`."""
+    from yggdrasil.data.types.base import DataType
+    return DataType.resolve_str_annotation(s, func_globals=func_globals)
 
-    Tries, in order:
 
-    1. ``eval`` in *func_globals* + builtins — picks up local imports
-       and aliases declared in the function's own module.
-    2. ``eval`` against ``typing`` for generic shapes like
-       ``Optional[int]`` / ``list[int]`` when *func_globals* doesn't
-       have them in scope.
-    3. Fast alias prefix expansion (``pa.`` → ``pyarrow.``, …) +
-       dotted ``importlib.import_module`` lookup so short forms work
-       even when the function's globals never imported the short
-       alias.
+def _fast_alias_prefixes() -> dict[str, str]:
+    """Return the canonical alias-prefix table (``DataType.PYHINT_ALIASES``)."""
+    from yggdrasil.data.types.base import DataType
+    return DataType.PYHINT_ALIASES
 
-    Returns the original string when every path fails — callers
-    treat that as "unresolved, skip coercion".
-    """
-    candidate = s.strip()
 
-    if func_globals is not None:
-        try:
-            return eval(candidate, func_globals, None)
-        except Exception:
-            pass
-
-    # Generic typing shapes (``Optional[int]``, ``list[int]``, …) live in
-    # the ``typing`` namespace; let them resolve without dragging the
-    # module into every caller's globals.
-    try:
-        import typing as _typing
-        return eval(candidate, dict(_typing.__dict__), None)
-    except Exception:
-        pass
-
-    expanded = _expand_alias(candidate)
-    if "." in expanded:
-        mod_path, _, attr = expanded.rpartition(".")
-        mod: Any = None
-        try:
-            mod = importlib.import_module(mod_path)
-        except ImportError:
-            # Module not on the path — try yggdrasil's runtime
-            # auto-install before giving up. Respects whatever install
-            # policy the active :class:`PyEnv` has configured.
-            try:
-                from yggdrasil.environ import PyEnv
-                mod = PyEnv.runtime_import_module(mod_path, warn=False)
-            except Exception:
-                mod = None
-        except Exception:
-            mod = None
-        if mod is not None:
-            obj = getattr(mod, attr, None)
-            if obj is not None:
-                return obj
-
-    return s
+# Re-export under the old module-level name so ``_FAST_ALIAS_PREFIXES``
+# imports keep working. New code references ``DataType.PYHINT_ALIASES``
+# directly.
+def __getattr__(name: str) -> Any:
+    if name == "_FAST_ALIAS_PREFIXES":
+        from yggdrasil.data.types.base import DataType
+        return DataType.PYHINT_ALIASES
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -217,56 +172,17 @@ def _default_to_str(default: Any) -> tuple[bool, Optional[str]]:
 
 
 def _resolved_annotations(func: Callable[..., Any]) -> dict[str, Any]:
-    """Resolve string annotations on *func* into real types when possible.
+    """Forward to :meth:`DataType.resolve_function_annotations`.
 
-    Two-pass best effort so a single unresolvable annotation doesn't
-    blow up the rest:
-
-    1. :func:`inspect.get_annotations` with ``eval_str=True`` —
-       evaluates every annotation in the function's globals + builtins
-       in one shot. Fast path when the function's own module imports
-       all the referenced types.
-    2. Per-annotation :func:`_resolve_str_annotation` fallback — tries
-       func globals, then ``typing``, then fast alias-prefix expansion
-       (``pa.Table`` → ``pyarrow.Table``) + dotted module import.
-
-    Anything still left as a string after both passes is returned
-    as-is. The caller (:func:`check_function_args`) treats string
-    annotations as "couldn't resolve, skip coercion" rather than
-    raising — the goal is to coerce what we can and let the rest
-    flow through.
+    Kept as a module-level wrapper for back-compat with existing
+    imports inside :mod:`yggdrasil.dataclasses.safe_function`.
+    The canonical resolution logic — two-pass best effort with
+    ``inspect.get_annotations(eval_str=True)`` followed by per-string
+    fallback through ``DataType.resolve_str_annotation`` — lives on
+    :class:`DataType`.
     """
-    raw = dict(getattr(func, "__annotations__", {}) or {})
-    if not raw:
-        return raw
-
-    # Fast path — inspect.get_annotations with eval_str.
-    try:
-        resolved: dict[str, Any] = dict(
-            inspect.get_annotations(func, eval_str=True),
-        )
-    except Exception as exc:
-        LOGGER.debug(
-            "_resolved_annotations: get_annotations(eval_str=True) failed "
-            "for %r — falling back to per-annotation resolution (%s)",
-            getattr(func, "__qualname__", func), exc,
-        )
-        resolved = dict(raw)
-
-    # Per-annotation fallback for entries still left as strings.
-    # ``inspect.get_annotations(eval_str=True)`` silently keeps an
-    # annotation as a string when its eval against the function's
-    # globals + builtins fails (no exception is raised) — common for
-    # short aliases like ``pa.RecordBatch`` / ``pl.DataFrame`` /
-    # ``pd.DataFrame`` whose import name lives in ``yggdrasil``'s
-    # alias-prefix table but not in the caller's module globals.
-    # Route each leftover string through :func:`_resolve_str_annotation`
-    # so the alias expansion + dotted import path can finish the job.
-    func_globals = getattr(func, "__globals__", None)
-    for name, ann in list(resolved.items()):
-        if isinstance(ann, str):
-            resolved[name] = _resolve_str_annotation(ann, func_globals=func_globals)
-    return resolved
+    from yggdrasil.data.types.base import DataType
+    return DataType.resolve_function_annotations(func)
 
 
 def describe_signature(func: Callable[..., Any]) -> dict[str, Any]:

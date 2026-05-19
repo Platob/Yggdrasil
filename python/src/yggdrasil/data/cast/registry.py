@@ -58,8 +58,6 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import inspect
-import types
 from collections.abc import Iterable, Mapping
 from typing import (
     TYPE_CHECKING,
@@ -153,21 +151,14 @@ def register_converter(from_hint: Any, to_hint: Any) -> Callable[[F], F]:
 
 
 def unwrap_optional(hint: Any) -> tuple[bool, Any]:
-    """
-    Return (is_optional, base_hint) for Optional[T] / T | None.
+    """Forward to :meth:`DataType.unwrap_optional`.
 
-    Examples:
-      int | None -> (True, int)
-      int | None -> (True, int)
-      int -> (False, int)
+    Kept as a module-level alias for back-compat. New code reaches for
+    ``DataType.unwrap_optional`` directly — the canonical resolver
+    lives there as part of the centralized Python type-hint API.
     """
-    origin = get_origin(hint)
-    if origin in {Union, types.UnionType}:
-        args = get_args(hint)
-        non_none = [a for a in args if a is not type(None)]  # noqa: E721
-        if len(non_none) == 1:
-            return True, non_none[0]
-    return False, hint
+    from yggdrasil.data.types.base import DataType
+    return DataType.unwrap_optional(hint)
 
 
 def iter_mro(tp: Any) -> Iterable[Any]:
@@ -293,14 +284,9 @@ def find_converter(from_type: Any, to_hint: Any, check_namespace: bool = True) -
 
 
 def is_runtime_value(x: Any) -> bool:
-    """
-    True for runtime values (42, [], MyClass()), False for type hints.
-
-    Used by some downstream logic that wants to distinguish "value" vs "hint".
-    """
-    if inspect.isclass(x):
-        return False
-    return get_origin(x) is None
+    """Forward to :meth:`DataType.is_runtime_value`."""
+    from yggdrasil.data.types.base import DataType
+    return DataType.is_runtime_value(x)
 
 
 # ----------------------------
