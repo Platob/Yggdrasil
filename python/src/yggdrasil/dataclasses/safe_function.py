@@ -709,40 +709,25 @@ def build_batch_invoker(
         only_name = only_param.name
         only_ann = plan.resolved.get(only_name, only_param.annotation)
         if isinstance(only_ann, type):
-            # Whole-batch tabular: ``find_converter`` answers "is there a
-            # ``pa.RecordBatch → only_ann`` converter?" — when yes, the
-            # registry knows how to hand the function a Table / DataFrame /
-            # LazyFrame / RecordBatch of *only_ann*'s shape. Engine cast
-            # registrations only fire on import, so trigger the matching
-            # ``yggdrasil.X.cast`` module via the namespace helper before
-            # probing. Same routing shape used elsewhere in the codebase.
+            # Whole-batch tabular: ask the registry "is there a
+            # ``pa.RecordBatch → only_ann`` converter?". ``find_converter``
+            # already does the namespace-triggered late import dance for
+            # ``polars`` / ``pandas`` / ``pyspark`` / ``pyarrow`` targets
+            # (registry.py step 4) — no need to import the engine cast
+            # modules ourselves.
             import pyarrow as _pa
             from yggdrasil.data.cast.registry import find_converter
-            from yggdrasil.pickle.serde import ObjectSerde
 
-            namespace, _ = ObjectSerde.module_and_name(only_ann)
-            top = namespace.split(".", 1)[0] if namespace else ""
-            if top == "polars":
-                try:
-                    import yggdrasil.polars.cast  # noqa: F401
-                except ImportError:
-                    pass
-            elif top == "pandas":
-                try:
-                    import yggdrasil.pandas.cast  # noqa: F401
-                except ImportError:
-                    pass
-            if (only_ann is _pa.RecordBatch
-                    or find_converter(_pa.RecordBatch, only_ann) is not None):
+            if find_converter(_pa.RecordBatch, only_ann) is not None:
                 tabular_target = only_ann
-
-            if tabular_target is None:
+            else:
                 # Column-by-name primitive cast: ``int`` / ``float`` /
                 # ``str`` / ``bool`` / ``bytes`` / ``datetime`` /
-                # ``Decimal`` … map to Arrow types via ``DataType.from_pytype``,
-                # and the named column is cast in one ``pa.compute.cast``
-                # kernel call before per-cell dispatch. Generic aliases /
-                # unions stay ``None`` here and fall back to per-row.
+                # ``Decimal`` … map to Arrow types via
+                # ``DataType.from_pytype``, and the named column is cast
+                # in one ``pa.compute.cast`` kernel call before per-cell
+                # dispatch. Generic aliases / unions stay ``None`` here
+                # and fall back to per-row.
                 try:
                     from yggdrasil.data.types.base import DataType
                     arrow_target = DataType.from_pytype(only_ann).to_arrow()
