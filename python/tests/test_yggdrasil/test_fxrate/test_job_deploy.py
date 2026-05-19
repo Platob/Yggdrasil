@@ -299,6 +299,112 @@ class TestDeploySchedule(DatabricksTestCase):
                 client=self.client,
             )
 
+    def test_auto_create_cluster_resolves_id_and_pins_task(self) -> None:
+        # When auto_create_cluster=True the deploy path calls
+        # ``client.compute.clusters.all_purpose_cluster(...)`` and
+        # pins the returned cluster_id onto the staged task.
+        captured_tasks: list = []
+
+        def _capture_task_create(self_task):
+            captured_tasks.append(self_task)
+            return self_task
+
+        fake_cluster = MagicMock(cluster_id="9999-cluster", cluster_name="fx-auto")
+
+        with self._patch_create() as create_or_update, \
+                patch("yggdrasil.databricks.jobs.task.JobTask.create", _capture_task_create), \
+                patch.object(
+                    self.client.compute.clusters, "all_purpose_cluster",
+                    return_value=fake_cluster,
+                ) as cluster_call:
+            create_or_update.return_value = MagicMock(job_id=1, job_name="ygg-fxrate-ingestion")
+            deploy_scheduled_fxrate_job(
+                target_table="main.fx.raw_fxrate",
+                pairs=[("EUR", "USD")],
+                schedule="0 0 6 * * ?",
+                auto_create_cluster=True,
+                cluster_name="fx-auto",
+                cluster_node_type_id="m5d.large",
+                cluster_extra_libraries=["pyarrow-hotfix"],
+                cluster_spec={"num_workers": 0, "autotermination_minutes": 20},
+                client=self.client,
+            )
+
+        cluster_call.assert_called_once()
+        kwargs = cluster_call.call_args.kwargs
+        assert kwargs["name"] == "fx-auto"
+        # extra_libraries forwards as the ``libraries`` arg.
+        assert kwargs["libraries"] == ["pyarrow-hotfix"]
+        # node_type_id + cluster_spec merge into the **cluster_spec
+        # passthrough — caller wins on collision.
+        assert kwargs["node_type_id"] == "m5d.large"
+        assert kwargs["num_workers"] == 0
+        assert kwargs["autotermination_minutes"] == 20
+
+        # The staged task now pins the auto-resolved cluster_id.
+        assert captured_tasks
+        details = captured_tasks[0]._details
+        assert details.existing_cluster_id == "9999-cluster"
+        assert details.environment_key is None
+
+    def test_auto_create_cluster_no_cluster_name(self) -> None:
+        # ``cluster_name=None`` lets ``all_purpose_cluster`` pick the
+        # default (per-user) name. We just verify the call goes
+        # through and pins the result.
+        captured_tasks: list = []
+        fake_cluster = MagicMock(cluster_id="0001-default-cluster")
+
+        with self._patch_create() as create_or_update, \
+                patch("yggdrasil.databricks.jobs.task.JobTask.create",
+                      lambda self_task: captured_tasks.append(self_task) or self_task), \
+                patch.object(
+                    self.client.compute.clusters, "all_purpose_cluster",
+                    return_value=fake_cluster,
+                ):
+            create_or_update.return_value = MagicMock(job_id=1, job_name="ygg-fxrate-ingestion")
+            deploy_scheduled_fxrate_job(
+                target_table="main.fx.raw_fxrate",
+                pairs=[("EUR", "USD")],
+                schedule="0 0 6 * * ?",
+                auto_create_cluster=True,
+                client=self.client,
+            )
+
+        assert captured_tasks
+        assert captured_tasks[0]._details.existing_cluster_id == "0001-default-cluster"
+
+    def test_auto_create_cluster_conflicts_with_explicit_pin(self) -> None:
+        with pytest.raises(ValueError, match="at most one compute pin"):
+            deploy_scheduled_fxrate_job(
+                target_table="main.fx.raw_fxrate",
+                pairs=[("EUR", "USD")],
+                schedule="0 0 6 * * ?",
+                auto_create_cluster=True,
+                existing_cluster_id="0123-456789-abc",
+                client=self.client,
+            )
+
+    def test_auto_create_cluster_raises_when_id_missing(self) -> None:
+        # Defensive: ``all_purpose_cluster`` should always return a
+        # Cluster with a real cluster_id, but if it doesn't (mock
+        # leak, workspace race condition) we must fail loud rather
+        # than emit a Task spec with ``existing_cluster_id=None``.
+        fake_cluster = MagicMock(cluster_id=None, cluster_name="fx-broken")
+        with self._patch_create(), \
+                patch.object(
+                    self.client.compute.clusters, "all_purpose_cluster",
+                    return_value=fake_cluster,
+                ):
+            with pytest.raises(RuntimeError, match="no cluster_id"):
+                deploy_scheduled_fxrate_job(
+                    target_table="main.fx.raw_fxrate",
+                    pairs=[("EUR", "USD")],
+                    schedule="0 0 6 * * ?",
+                    auto_create_cluster=True,
+                    cluster_name="fx-broken",
+                    client=self.client,
+                )
+
     def test_idempotent_redeploy_updates_in_place(self) -> None:
         # Simulate a pre-existing job on the workspace; the deploy
         # path should route through ``update`` (find returned a hit)

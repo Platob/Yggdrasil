@@ -261,6 +261,11 @@ def deploy_scheduled_fxrate_job(
     job_cluster_key: Optional[str] = None,
     new_cluster: Optional[Mapping[str, Any]] = None,
     environment_key: Optional[str] = None,
+    auto_create_cluster: bool = False,
+    cluster_name: Optional[str] = None,
+    cluster_node_type_id: Optional[str] = None,
+    cluster_extra_libraries: Optional[Iterable[str]] = None,
+    cluster_spec: Optional[Mapping[str, Any]] = None,
     tags: Optional[Mapping[str, str]] = None,
     client: Optional["DatabricksClient"] = None,
 ) -> "Job":
@@ -298,14 +303,41 @@ def deploy_scheduled_fxrate_job(
             Change them by re-deploying.
         existing_cluster_id / job_cluster_key / new_cluster /
         environment_key:
-            Compute pin (mutually exclusive — pass at most one).
+            Explicit compute pin (mutually exclusive — pass at most
+            one, and not together with *auto_create_cluster*).
             Per CLAUDE.md "Pick compute by workload type" the FX
             fetch needs outbound internet, so an all-purpose cluster
             (``existing_cluster_id``) is usually the right choice on
             workspaces whose serverless tier lacks internet egress.
-            Leave all four ``None`` to let
-            :meth:`JobTask.from_callable` pick the default
-            (``DEFAULT_ENVIRONMENT_KEY`` serverless env).
+            Leave all four ``None`` and *auto_create_cluster* false
+            to let the staged task fall back to the serverless
+            ``DEFAULT_ENVIRONMENT_KEY`` env.
+        auto_create_cluster: When ``True`` resolve (or create) an
+            all-purpose cluster via
+            :meth:`Clusters.all_purpose_cluster`, pre-installed with
+            the latest matching ``ygg[http,data,databricks]`` minor
+            release, and pin the resulting cluster id on the staged
+            task. Idempotent: the helper reuses an existing
+            workspace cluster matching *cluster_name* if one is
+            already there.
+        cluster_name: When *auto_create_cluster* is on, the cluster
+            name to resolve / create. Defaults to a per-user
+            ``"All Purpose-<user>"`` name (the
+            :meth:`Clusters.all_purpose_cluster` default).
+        cluster_node_type_id: Worker / driver instance type for the
+            auto-created cluster (e.g. ``"Standard_D4ds_v5"`` on
+            Azure, ``"m5d.large"`` on AWS). When ``None`` the
+            workspace's default node type is picked by the SDK.
+        cluster_extra_libraries: Additional PyPI specs to install on
+            the auto-created cluster alongside the default
+            ``ygg[http,data,databricks]==<latest-minor>``
+            preinstall. Useful for vendor SDKs needed by a custom
+            FxRate backend.
+        cluster_spec: Free-form passthrough to
+            :meth:`Clusters.all_purpose_cluster`'s ``**cluster_spec``
+            (``num_workers``, ``autoscale``, ``custom_tags``,
+            ``policy_id``, …). Caller wins on key collisions with
+            the deploy-function defaults.
         tags: Optional Databricks job tags — useful for cost
             attribution / ownership in the Databricks UI.
         client: Workspace :class:`DatabricksClient`. Defaults to
@@ -320,20 +352,23 @@ def deploy_scheduled_fxrate_job(
 
     # Mutually-exclusive compute pins — guard at the boundary so the
     # error fires here, not deep in the Databricks SDK with a less
-    # actionable trace.
+    # actionable trace. ``auto_create_cluster`` lands as its own
+    # pin (it produces an ``existing_cluster_id`` after the helper
+    # call), so it counts toward the "at most one" budget.
     compute_pins = [
-        ("existing_cluster_id", existing_cluster_id),
-        ("job_cluster_key", job_cluster_key),
-        ("new_cluster", new_cluster),
-        ("environment_key", environment_key),
+        ("existing_cluster_id", existing_cluster_id is not None),
+        ("job_cluster_key", job_cluster_key is not None),
+        ("new_cluster", new_cluster is not None),
+        ("environment_key", environment_key is not None),
+        ("auto_create_cluster", bool(auto_create_cluster)),
     ]
-    set_pins = [k for k, v in compute_pins if v is not None]
-    if len(set_pins) > 1:
+    set_pin_names = [k for k, v in compute_pins if v]
+    if len(set_pin_names) > 1:
         raise ValueError(
             f"deploy_scheduled_fxrate_job: pass at most one compute pin; "
-            f"got {set_pins!r}. Pick existing_cluster_id (recommended for "
-            f"internet-bound ingestion), job_cluster_key, new_cluster, or "
-            f"environment_key."
+            f"got {set_pin_names!r}. Pick auto_create_cluster=True "
+            f"(easiest), existing_cluster_id, job_cluster_key, "
+            f"new_cluster, or environment_key."
         )
 
     if client is None:
@@ -346,6 +381,18 @@ def deploy_scheduled_fxrate_job(
     pairs_json = _pairs_to_json(pairs)
     pair_count = len(json.loads(pairs_json))
 
+    # Resolve auto-create early so a cluster-side failure surfaces
+    # before we touch the Jobs API (saves the user a half-deployed
+    # job sitting paused in the workspace).
+    if auto_create_cluster:
+        existing_cluster_id = _resolve_or_create_cluster(
+            client=client,
+            cluster_name=cluster_name,
+            node_type_id=cluster_node_type_id,
+            extra_libraries=cluster_extra_libraries,
+            cluster_spec=cluster_spec,
+        )
+
     description = (
         f"Scheduled FX ingestion into {target_table!r} on "
         f"{cron.quartz_cron_expression!r} ({cron.timezone_id}). "
@@ -353,8 +400,10 @@ def deploy_scheduled_fxrate_job(
     )
 
     LOGGER.debug(
-        "Deploying FX ingestion Job %r target=%r pairs=%d schedule=%r",
+        "Deploying FX ingestion Job %r target=%r pairs=%d schedule=%r "
+        "compute=%r",
         name, target_table, pair_count, cron.quartz_cron_expression,
+        set_pin_names[0] if set_pin_names else "serverless-default",
     )
 
     # Phase 1: upsert the bare Job shell with the schedule, tags, and
@@ -387,8 +436,13 @@ def deploy_scheduled_fxrate_job(
     # Phase 3: patch the compute pin onto the staged Task spec. The
     # default :meth:`JobTask.from_callable` stamps
     # ``environment_key=DEFAULT_ENVIRONMENT_KEY`` for serverless; an
-    # explicit pin overrides whichever knob the caller chose.
-    if set_pins:
+    # explicit pin (or the auto-resolved cluster_id) overrides it.
+    using_cluster_pin = (
+        existing_cluster_id is not None
+        or job_cluster_key is not None
+        or new_cluster is not None
+    )
+    if using_cluster_pin or environment_key is not None:
         patches: dict[str, Any] = {
             "existing_cluster_id": existing_cluster_id,
             "job_cluster_key": job_cluster_key,
@@ -397,13 +451,8 @@ def deploy_scheduled_fxrate_job(
         }
         # Cluster-bound pins exclude the serverless ``environment_key``
         # default — strip it so the spec stays internally consistent.
-        if any(
-            patches[k] is not None
-            for k in ("existing_cluster_id", "job_cluster_key", "new_cluster")
-        ):
-            patches.setdefault("environment_key", None)
-            if environment_key is None:
-                patches["environment_key"] = None
+        if using_cluster_pin:
+            patches["environment_key"] = None
         details = task._details
         if details is None:
             raise RuntimeError(
@@ -421,3 +470,52 @@ def deploy_scheduled_fxrate_job(
         name, getattr(job, "job_id", None), cron.quartz_cron_expression,
     )
     return job
+
+
+def _resolve_or_create_cluster(
+    *,
+    client: "DatabricksClient",
+    cluster_name: Optional[str],
+    node_type_id: Optional[str],
+    extra_libraries: Optional[Iterable[str]],
+    cluster_spec: Optional[Mapping[str, Any]],
+) -> str:
+    """Get-or-create an FX-ingestion cluster, return its ``cluster_id``.
+
+    Routes through :meth:`Clusters.all_purpose_cluster` which already
+    handles the idempotent shape (returns the existing cluster
+    matching *cluster_name*, creates a fresh one otherwise) and
+    pre-installs ``ygg[http,data,databricks]`` pinned to the latest
+    minor matching the local ygg install. All-purpose compute is
+    what the CLAUDE.md "Pick compute by workload type" rule calls
+    for on internet-bound ingestion.
+    """
+    libraries: list[str] = list(extra_libraries or ())
+
+    spec: dict[str, Any] = {}
+    if node_type_id is not None:
+        spec["node_type_id"] = node_type_id
+    if cluster_spec:
+        # Caller wins on collision so they can override the defaults
+        # the helper picks (autotermination, num_workers, …).
+        spec.update(dict(cluster_spec))
+
+    LOGGER.debug(
+        "Resolving FX ingestion cluster name=%r node_type=%r extra_libs=%r",
+        cluster_name, node_type_id, libraries,
+    )
+    cluster = client.compute.clusters.all_purpose_cluster(
+        name=cluster_name,
+        libraries=libraries or None,
+        **spec,
+    )
+    if cluster.cluster_id is None:
+        raise RuntimeError(
+            f"all_purpose_cluster returned a Cluster with no cluster_id "
+            f"(name={cluster_name!r}). Likely a workspace-side error."
+        )
+    LOGGER.info(
+        "Resolved FX ingestion cluster %r -> cluster_id=%s",
+        cluster_name or cluster.cluster_name, cluster.cluster_id,
+    )
+    return cluster.cluster_id
