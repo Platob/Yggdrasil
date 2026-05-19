@@ -18,6 +18,7 @@ from yggdrasil.dataclasses.safe_function import (
     _canonical_module_path,
     _expand_alias,
     _resolve_str_annotation,
+    build_batch_invoker,
     build_row_invoker,
     check_function_args,
     checkargs,
@@ -1003,6 +1004,143 @@ class TestBuildRowInvoker(unittest.TestCase):
         invoke = build_row_invoker(make)
         out = invoke({"id": "5", "label": "x"})
         self.assertEqual(out, Row(id=5, label="x"))
+
+    def test_single_arg_extracts_column_by_name(self):
+        # Dict row + single annotated arg whose name matches a key →
+        # extract that column's value rather than passing the whole dict.
+        def f(id: int) -> int:
+            return id * 10
+
+        invoke = build_row_invoker(f)
+        self.assertEqual(invoke({"id": 3, "name": "x"}), 30)
+        # String value coerces via the annotation.
+        self.assertEqual(invoke({"id": "4", "name": "x"}), 40)
+        # Scalar row stays a scalar — already an int, passes through.
+        self.assertEqual(invoke(7), 70)
+
+    def test_single_arg_dict_annotation_skips_extraction(self):
+        # ``def f(row: dict)`` should receive the whole mapping, even when
+        # the arg name happens to be a key in the row — the isinstance
+        # fast-skip wins before the dict-key extraction fires.
+        def f(row: dict) -> dict:
+            return row
+
+        invoke = build_row_invoker(f)
+        row = {"row": 1, "name": "x"}
+        self.assertEqual(invoke(row), row)
+
+    def test_single_arg_no_match_falls_through(self):
+        def f(id: int) -> int:
+            return id + 1
+
+        invoke = build_row_invoker(f)
+        # No matching key + dict-shaped row → convert(dict, int) fails →
+        # row passes through unchanged → f(dict) raises TypeError naturally.
+        with self.assertRaises(TypeError):
+            invoke({"other": 1})
+
+
+# ---------------------------------------------------------------------------
+# build_batch_invoker — vectorised column cast for typed Arrow batches
+# ---------------------------------------------------------------------------
+
+
+class TestBuildBatchInvoker(unittest.TestCase):
+    """Per-batch dispatcher for typed-mode Arrow record batches.
+
+    Single-positional + annotated + arg-name-matches-column functions
+    cast the whole column via :func:`pyarrow.compute.cast` and skip
+    the per-row dict reconstruction. Other shapes fall back to
+    :func:`build_row_invoker` over ``batch.to_pylist()`` rows.
+    """
+
+    def _batch(self, columns: dict) -> "pa.RecordBatch":
+        import pyarrow as pa
+        return pa.RecordBatch.from_pydict(columns)
+
+    def test_vectorized_cast_when_name_matches_column(self):
+        import pyarrow as pa
+        # ``id`` column is int64 already → straight-through; ``f`` just sees
+        # the int values, not row dicts.
+        def f(id: int) -> int:
+            assert isinstance(id, int)
+            return id * 2
+
+        batch = pa.RecordBatch.from_pydict({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+        invoke = build_batch_invoker(f)
+        self.assertEqual(invoke(batch), [2, 4, 6])
+
+    def test_vectorized_cast_converts_string_column_to_int(self):
+        import pyarrow as pa
+        def f(id: int) -> int:
+            assert isinstance(id, int)
+            return id + 100
+
+        # ``id`` arrives as strings — pa.compute.cast handles the
+        # vectorised string→int conversion before func ever runs.
+        batch = pa.RecordBatch.from_pydict({"id": ["1", "2", "3"]})
+        invoke = build_batch_invoker(f)
+        self.assertEqual(invoke(batch), [101, 102, 103])
+
+    def test_missing_column_falls_back_to_row_invoker(self):
+        import pyarrow as pa
+        # Arg name ``id`` doesn't appear in the batch — must fall back to
+        # the row invoker (which sees row dicts).
+        def f(id: int) -> int:
+            return id * 10
+
+        batch = pa.RecordBatch.from_pydict({"x": [1, 2], "y": ["a", "b"]})
+        invoke = build_batch_invoker(f)
+        # Row invoker walks dicts; no ``id`` key → row passes through →
+        # ``int(dict)`` fails → dict reaches f → TypeError.
+        with self.assertRaises(TypeError):
+            invoke(batch)
+
+    def test_multi_arg_falls_back_to_per_row(self):
+        import pyarrow as pa
+        def f(id: int, name: str) -> str:
+            return f"{id}-{name}"
+
+        batch = pa.RecordBatch.from_pydict({"id": [1, 2], "name": ["a", "b"]})
+        invoke = build_batch_invoker(f)
+        self.assertEqual(invoke(batch), ["1-a", "2-b"])
+
+    def test_null_cells_pass_through_unchanged(self):
+        import pyarrow as pa
+        # Null cells must reach the function as ``None`` (not as the
+        # annotation's default-zero) so callers can decide what to do.
+        def f(id: int):
+            return -1 if id is None else id + 1
+
+        batch = pa.RecordBatch.from_pydict({"id": [1, None, 3]})
+        invoke = build_batch_invoker(f)
+        self.assertEqual(invoke(batch), [2, -1, 4])
+
+    def test_empty_batch_yields_empty_list(self):
+        import pyarrow as pa
+        def f(id: int) -> int:
+            return id
+
+        batch = pa.RecordBatch.from_pydict({"id": pa.array([], type=pa.int64())})
+        invoke = build_batch_invoker(f)
+        self.assertEqual(invoke(batch), [])
+
+    def test_already_correct_arrow_type_skips_cast(self):
+        import pyarrow as pa
+        # When ``col.type`` already matches the arrow target, the
+        # pa.compute.cast call is skipped — the column flows straight
+        # through to_pylist.
+        calls = []
+        def f(value: float) -> float:
+            calls.append(value)
+            return value * 2.0
+
+        batch = pa.RecordBatch.from_pydict(
+            {"value": pa.array([1.0, 2.0, 3.0], type=pa.float64())},
+        )
+        invoke = build_batch_invoker(f)
+        self.assertEqual(invoke(batch), [2.0, 4.0, 6.0])
+        self.assertEqual(calls, [1.0, 2.0, 3.0])
 
 
 if __name__ == "__main__":

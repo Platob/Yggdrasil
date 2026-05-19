@@ -36,7 +36,10 @@ import statistics
 import time
 from typing import Callable
 
+import pyarrow as pa
+
 from yggdrasil.dataclasses.safe_function import (
+    build_batch_invoker,
     build_row_invoker,
     check_function_args,
 )
@@ -193,6 +196,53 @@ def scenarios(repeat: int) -> list[dict]:
         "check_function_args(_single_annotated, (str_row,)) -- per call",
         lambda: check_function_args(_single_annotated, (str_row,), None),
         repeat=repeat, inner=20_000,
+    ))
+
+    # ---- build_batch_invoker — vectorised vs per-row cost ----------------
+    # Single positional + annotated + arg name matches a column → the
+    # batch invoker should cast the column in one shot and skip the
+    # dict materialisation. Per-row fallback (multi-arg / no name match)
+    # quantifies the cost the vectorised path saves.
+    def _by_name(id: int) -> int:
+        return id + 1
+
+    int_batch_2k = pa.RecordBatch.from_pydict({
+        "id": pa.array(list(range(2_000)), type=pa.int64()),
+        "name": pa.array([f"r{i}" for i in range(2_000)], type=pa.string()),
+    })
+    str_batch_2k = pa.RecordBatch.from_pydict({
+        "id": pa.array([str(i) for i in range(2_000)], type=pa.string()),
+        "name": pa.array([f"r{i}" for i in range(2_000)], type=pa.string()),
+    })
+
+    invoke_batch_typed = build_batch_invoker(_by_name)
+    invoke_batch_multi = build_batch_invoker(_multi_arg)
+    row_invoker_by_name = build_row_invoker(_by_name)
+
+    out.append(_time_one(
+        "build_batch_invoker: _by_name",
+        lambda: build_batch_invoker(_by_name),
+        repeat=repeat, inner=5_000,
+    ))
+    out.append(_time_one(
+        "batch_invoker: single arg, int col, 2k rows (vectorised, no cast needed)",
+        lambda: invoke_batch_typed(int_batch_2k),
+        repeat=repeat, inner=500,
+    ))
+    out.append(_time_one(
+        "batch_invoker: single arg, str col -> int, 2k rows (pa.compute.cast)",
+        lambda: invoke_batch_typed(str_batch_2k),
+        repeat=repeat, inner=500,
+    ))
+    out.append(_time_one(
+        "batch_invoker: multi-arg (fallback to_pylist + per-row), 2k rows",
+        lambda: invoke_batch_multi(int_batch_2k),
+        repeat=repeat, inner=200,
+    ))
+    out.append(_time_one(
+        "row_invoker baseline: 2k rows through to_pylist + per-row",
+        lambda: [row_invoker_by_name(r) for r in int_batch_2k.to_pylist()],
+        repeat=repeat, inner=500,
     ))
 
     return out

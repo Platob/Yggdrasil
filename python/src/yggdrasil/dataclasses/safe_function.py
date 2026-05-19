@@ -37,9 +37,13 @@ import functools
 import importlib
 import inspect
 import logging
-from typing import Any, Callable, Mapping, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, TypeVar
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 __all__ = [
+    "build_batch_invoker",
     "build_row_invoker",
     "check_function_args",
     "checkargs",
@@ -546,7 +550,8 @@ def build_row_invoker(func: Callable[..., Any]) -> Callable[[Any], Any]:
     # ``def f(row): ...`` / ``def f(x: int): ...`` / lambdas case.
     if n_positional == 1 and not has_var_kw and not keyword_only:
         only_param = plan.positional_params[0]
-        only_ann = plan.resolved.get(only_param.name, only_param.annotation)
+        only_name = only_param.name
+        only_ann = plan.resolved.get(only_name, only_param.annotation)
         if only_ann is inspect.Parameter.empty or isinstance(only_ann, str):
             # No coercion to apply — call straight through. Fastest path.
             def _invoker_single(row: Any) -> Any:
@@ -565,8 +570,25 @@ def build_row_invoker(func: Callable[..., Any]) -> Callable[[Any], Any]:
         ann_is_type = isinstance(only_ann, type)
 
         def _invoker_single_typed(row: Any) -> Any:
+            # Whole row already matches the annotation — straight through.
             if ann_is_type and isinstance(row, only_ann):
                 return func(row)
+            # Mapping row + arg name matches a key → the caller's intent
+            # is "give me ``row[arg_name]``", not the whole mapping. Covers
+            # the common ``def f(id: int)`` over typed-mode dict rows /
+            # dynamic-mode dict-shaped pickled objects without forcing the
+            # caller to switch to ``def f(id: int, name: str)`` just to
+            # access one column. ``def f(row: dict)`` still gets the whole
+            # row via the ``isinstance(row, only_ann)`` fast-skip above.
+            if isinstance(row, Mapping) and only_name in row:
+                value = row[only_name]
+                if ann_is_type and isinstance(value, only_ann):
+                    return func(value)
+                try:
+                    value = convert(value, only_ann)
+                except (TypeError, ValueError):
+                    pass
+                return func(value)
             try:
                 row = convert(row, only_ann)
             except (TypeError, ValueError):
@@ -624,6 +646,127 @@ def build_row_invoker(func: Callable[..., Any]) -> Callable[[Any], Any]:
         return func(*args, **kwargs)
 
     return _invoker_generic
+
+
+# ---------------------------------------------------------------------------
+# Per-batch dispatch — vectorise the column cast when the function takes
+# a single column by name + type hint
+# ---------------------------------------------------------------------------
+
+def build_batch_invoker(
+    func: Callable[..., Any],
+) -> Callable[["pa.RecordBatch"], list[Any]]:
+    """Return a per-batch dispatcher ``invoker(batch) -> list[Any]``.
+
+    When *func* has a single positional annotated parameter whose name
+    matches a column in the incoming :class:`pyarrow.RecordBatch`, the
+    whole column is cast to the target Arrow type via
+    :func:`pyarrow.compute.cast` (vectorised, one C++ kernel call) and
+    then iterated through *func* — skipping the per-row dict
+    reconstruction that ``batch.to_pylist()`` would otherwise do.
+
+    Falls back to per-row dispatch via :func:`build_row_invoker` for
+    any other shape (multi-arg, ``**kwargs``, no column name match,
+    annotation that doesn't map to an Arrow type, …). The fallback
+    materialises ``batch.to_pylist()`` once and calls the row invoker
+    over the resulting dicts — exactly what the caller would have
+    done by hand, kept inside this helper so apply pipelines have a
+    single dispatch point.
+
+    The fast path mirrors the dict-key extraction
+    :func:`build_row_invoker` already does on dynamic-mode rows,
+    moved up one level to operate over a whole Arrow column at a
+    time. Per-row :func:`yggdrasil.data.cast.convert` calls collapse
+    into one ``pa.compute.cast`` plus an isinstance fast-skip when
+    the column already carries the right type.
+    """
+    plan = _SignaturePlan(func)
+    row_invoker = build_row_invoker(func)
+
+    arrow_target = None
+    only_name: Optional[str] = None
+    only_ann: Any = None
+    if (plan.introspectable
+            and len(plan.positional_params) == 1
+            and not plan.var_keyword
+            and not plan.keyword_only_params):
+        only_param = plan.positional_params[0]
+        only_name = only_param.name
+        only_ann = plan.resolved.get(only_name, only_param.annotation)
+        if isinstance(only_ann, type):
+            # Map ``int`` / ``float`` / ``str`` / ``bool`` / ``bytes`` /
+            # ``datetime`` / ``date`` / ``Decimal`` … to the Arrow type
+            # the cast registry would target. Generic aliases / unions /
+            # PEP-563-unresolved strings stay ``None`` and the path falls
+            # back to per-row dispatch.
+            try:
+                from yggdrasil.data.types.base import DataType
+                arrow_target = DataType.from_pytype(only_ann).to_arrow()
+            except Exception:
+                arrow_target = None
+
+    if only_name is None or arrow_target is None:
+        # No vectorisable shape — straight per-row dispatch over the
+        # batch's row dicts. Skipping the early-empty check here is
+        # fine: ``batch.to_pylist()`` on a zero-row batch yields ``[]``
+        # and the comprehension drops out the same way.
+        def _batch_row_only(batch: "pa.RecordBatch") -> list[Any]:
+            return [row_invoker(r) for r in batch.to_pylist()]
+        return _batch_row_only
+
+    ann_is_type = isinstance(only_ann, type)
+
+    def _batch_invoker(batch: "pa.RecordBatch") -> list[Any]:
+        # Look up the column by arg name. Missing column → fall back to
+        # the row-by-row path (which lets ``row_invoker`` find the
+        # value elsewhere or call ``func(row)`` directly).
+        try:
+            col = batch.column(only_name)
+        except (KeyError, ValueError):
+            return [row_invoker(r) for r in batch.to_pylist()]
+
+        import pyarrow as _pa
+        # Vectorise the cast — one C++ kernel call instead of N Python
+        # ``convert(value, ann)`` round trips. ``safe=True`` keeps the
+        # existing pickle-vs-convert error tone (overflow / inexact
+        # raises rather than silently truncates); the fallback below
+        # absorbs the raise so a partly-castable column still reaches
+        # the function.
+        if col.type != arrow_target:
+            try:
+                import pyarrow.compute as _pc
+                col = _pc.cast(col, arrow_target)
+            except (_pa.ArrowInvalid, _pa.ArrowNotImplementedError,
+                    _pa.ArrowTypeError):
+                # Cast not supported for this column shape — defer to
+                # per-row ``convert`` via the row invoker, which has
+                # access to the wider yggdrasil cast registry.
+                return [row_invoker(r) for r in batch.to_pylist()]
+
+        # Genuine row endpoint: the workload IS "yield Python values
+        # to a user function". ``Array.to_pylist`` on a primitive
+        # column is the canonical Arrow→Python bridge for this shape
+        # — same C-bridge cost as ``[col[i].as_py() for ...]`` with
+        # one less Python frame per cell.
+        values = col.to_pylist()
+        # When the column was already the right Arrow type AND the
+        # Python value's runtime type matches the annotation, skip
+        # the per-cell isinstance check entirely (the cast either
+        # succeeded loud or was unnecessary). For all other cases the
+        # isinstance gate keeps the row invoker out of the hot loop.
+        if ann_is_type:
+            # ``None`` cells skip the isinstance check (None isn't an
+            # instance of ``int`` / ``str`` / … but the function may
+            # still accept it via Optional). Pass them through unchanged.
+            out: list[Any] = []
+            for v in values:
+                if v is None or isinstance(v, only_ann):
+                    out.append(func(v))
+                else:
+                    out.append(row_invoker(v))
+            return out
+        return [func(v) for v in values]
+    return _batch_invoker
 
 
 def checkargs(func: F) -> F:

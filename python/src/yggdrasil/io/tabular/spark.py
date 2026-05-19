@@ -839,15 +839,23 @@ class Dataset(Tabular[CastOptions]):
         Input rows are unpickled objects (dynamic mode) or row-dicts
         (typed mode). The function's signature drives the row-shape
         adaptation via :func:`yggdrasil.dataclasses.build_row_invoker`:
-        single-arg functions get the row directly, multi-arg
-        / ``**kwargs`` functions get the dict spread as kwargs,
-        ``*args`` catch-alls get sequence rows spread positionally,
-        and annotated parameters are coerced through the
-        :func:`yggdrasil.data.cast.convert` registry. Output schema
-        follows ``schema`` if given, else the result is a dynamic frame.
+        single-arg functions get the row directly (or
+        ``row[arg_name]`` when the arg name matches a key in a dict
+        row), multi-arg / ``**kwargs`` functions get the dict spread
+        as kwargs, ``*args`` catch-alls get sequence rows spread
+        positionally, and annotated parameters are coerced through
+        the :func:`yggdrasil.data.cast.convert` registry. Typed-mode
+        batches go through
+        :func:`yggdrasil.dataclasses.build_batch_invoker` so a
+        single-positional-by-name function gets a vectorised column
+        cast. Output schema follows ``schema`` if given, else the
+        result is a dynamic frame.
         """
         from yggdrasil.data.schema import Schema as _Schema
-        from yggdrasil.dataclasses.safe_function import build_row_invoker
+        from yggdrasil.dataclasses.safe_function import (
+            build_batch_invoker,
+            build_row_invoker,
+        )
         from yggdrasil.pickle.ser import dumps, loads
         from yggdrasil.spark.frame import (
             DYNAMIC_SCHEMA,
@@ -880,22 +888,23 @@ class Dataset(Tabular[CastOptions]):
         schema = _Schema.from_any(schema)
 
         def _typed_runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
-            invoke = build_row_invoker(loads(function_pickle))
+            func = loads(function_pickle)
 
             def _groups() -> "Iterator[list[Any]]":
                 if is_dynamic_in:
+                    invoke_row = build_row_invoker(func)
                     for batch in batches:
                         col = batch.column(0)
                         n = batch.num_rows
                         if n == 0:
                             continue
-                        yield [invoke(loads(col[i].as_py())) for i in range(n)]
+                        yield [invoke_row(loads(col[i].as_py())) for i in range(n)]
                 else:
+                    invoke_batch = build_batch_invoker(func)
                     for batch in batches:
-                        rows = batch.to_pylist()
-                        if not rows:
+                        if batch.num_rows == 0:
                             continue
-                        yield [invoke(r) for r in rows]
+                        yield invoke_batch(batch)
 
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
@@ -926,6 +935,10 @@ class Dataset(Tabular[CastOptions]):
 
         * passes the row directly when ``function`` has one
           positional parameter,
+        * extracts ``row[arg_name]`` when the row is a mapping and
+          the single positional arg name matches a column key —
+          ``def f(id: int)`` on a ``{"id": ..., "name": ...}`` row
+          gets the ``id`` value, not the whole dict,
         * spreads mapping rows as ``**kwargs`` (filtered to
           declared names, unless ``**kwargs`` catches the rest)
           when ``function`` has multiple named parameters,
@@ -935,6 +948,13 @@ class Dataset(Tabular[CastOptions]):
           :func:`yggdrasil.data.cast.convert` so string-shaped
           inputs reach the function as the annotated Python type.
 
+        Typed-mode batches additionally route through
+        :func:`yggdrasil.dataclasses.build_batch_invoker`, which
+        vectorises the column cast via :func:`pyarrow.compute.cast`
+        when ``function`` is single-positional + annotated + the arg
+        name matches a column — one C++ kernel call instead of N
+        Python ``convert(value, ann)`` per batch.
+
         Without a schema this is :meth:`map`. With a schema,
         ``function`` may return any tabular shape (dict, dataclass,
         list-of-rows, polars/pandas/arrow frame, ``pa.RecordBatch``);
@@ -942,7 +962,10 @@ class Dataset(Tabular[CastOptions]):
         in one pass.
         """
         from yggdrasil.data.schema import Schema as _Schema
-        from yggdrasil.dataclasses.safe_function import build_row_invoker
+        from yggdrasil.dataclasses.safe_function import (
+            build_batch_invoker,
+            build_row_invoker,
+        )
         from yggdrasil.pickle.ser import dumps, loads
         from yggdrasil.spark.frame import _typed_cast
 
@@ -955,22 +978,28 @@ class Dataset(Tabular[CastOptions]):
         is_dynamic_in = self.is_dynamic
 
         def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
-            invoke = build_row_invoker(loads(function_pickle))
+            func = loads(function_pickle)
 
             def _groups() -> "Iterator[list[Any]]":
                 if is_dynamic_in:
+                    # Rows are pickled bytes — unpickle each one and dispatch
+                    # via the per-row invoker. ``build_batch_invoker`` would
+                    # have nothing to vectorise on a single binary column.
+                    invoke_row = build_row_invoker(func)
                     for batch in batches:
                         col = batch.column(0)
                         n = batch.num_rows
                         if n == 0:
                             continue
-                        yield [invoke(loads(col[i].as_py())) for i in range(n)]
+                        yield [invoke_row(loads(col[i].as_py())) for i in range(n)]
                 else:
+                    # Typed mode — let the batch invoker pick the column
+                    # by arg name and vectorise the cast when possible.
+                    invoke_batch = build_batch_invoker(func)
                     for batch in batches:
-                        rows = batch.to_pylist()
-                        if not rows:
+                        if batch.num_rows == 0:
                             continue
-                        yield [invoke(r) for r in rows]
+                        yield invoke_batch(batch)
 
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 

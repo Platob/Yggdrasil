@@ -119,6 +119,21 @@ def _coerce_strings(id: int, name: str) -> dict:
     return {"id": id, "label": name, "score": float(id)}
 
 
+def _single_by_name(id: int) -> dict:
+    # Single-positional annotated arg whose name matches the ``id``
+    # column → batch invoker should hand ``f`` just the int, not the
+    # whole row dict.
+    assert isinstance(id, int)
+    return {"id": id, "label": f"id-{id}", "score": float(id) + 0.25}
+
+
+def _vectorized_cast(id: int) -> dict:
+    # ``id`` arrives as strings in the input frame — the batch invoker
+    # routes through pa.compute.cast before this function ever runs.
+    assert isinstance(id, int)
+    return {"id": id, "label": f"v{id}", "score": float(id)}
+
+
 # ---------------------------------------------------------------------------
 # TestCase — self-managed local SparkSession + Dataset module-install stub.
 # ---------------------------------------------------------------------------
@@ -206,6 +221,37 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
         out = dyn.map(_multi_arg)
         collected = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["label"] for r in collected], [f"m{i}" for i in range(4)])
+
+    def test_single_arg_extracts_column_by_name_typed(self) -> None:
+        # Cast a dynamic frame into a typed one, then apply a function whose
+        # arg name matches the ``id`` column → batch invoker passes
+        # ``f(int)`` per row, not the whole row dict.
+        from yggdrasil.data import field, schema as schema_builder
+        in_schema = schema_builder([
+            field("id", Int64Type, nullable=False),
+            field("name", StringType),
+        ])
+        rows_in = [{"id": i, "name": f"n{i}"} for i in range(5)]
+        typed = Dataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
+        out = typed.apply(_single_by_name, _OUT_SCHEMA)
+        rows = sorted(out.collect(), key=lambda r: r["id"])
+        self.assertEqual([r["label"] for r in rows], [f"id-{i}" for i in range(5)])
+
+    def test_single_arg_vectorized_column_cast(self) -> None:
+        # The input frame's ``id`` column carries strings; the
+        # function wants ``int``. The batch invoker should cast the
+        # whole column via pa.compute.cast in one shot rather than
+        # converting per row.
+        from yggdrasil.data import field, schema as schema_builder
+        in_schema = schema_builder([
+            field("id", StringType, nullable=False),
+            field("name", StringType),
+        ])
+        rows_in = [{"id": str(i), "name": f"v{i}"} for i in range(4)]
+        typed = Dataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
+        out = typed.apply(_vectorized_cast, _OUT_SCHEMA)
+        rows = sorted(out.collect(), key=lambda r: r["id"])
+        self.assertEqual([r["id"] for r in rows], list(range(4)))
 
     def test_parallelize_with_multi_arg_function(self) -> None:
         rows_in = [{"id": i, "name": f"p{i}"} for i in range(5)]
