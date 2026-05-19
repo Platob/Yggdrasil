@@ -39,16 +39,44 @@ most for routing.
 | [`ygg-databricks-sql`](skills/ygg-databricks-sql.md) | `dbc.sql.execute(...)`, parameter binding, warehouse vs cluster routing |
 | [`ygg-databricks-tables`](skills/ygg-databricks-tables.md) | `Table.create / insert / async_insert / merge / delete_where` |
 | [`ygg-databricks-files`](skills/ygg-databricks-files.md) | `DatabricksPath`, DBFS / Volume / Workspace IO |
-| [`ygg-databricks-jobs`](skills/ygg-databricks-jobs.md) | Jobs, secrets, clusters, warehouses, `WaitingConfig` |
+| [`ygg-databricks-jobs`](skills/ygg-databricks-jobs.md) | Run / wait on jobs, secrets, clusters, warehouses, `WaitingConfig` |
+| [`ygg-databricks-job-workflows`](skills/ygg-databricks-job-workflows.md) | `dbc.jobs.create_or_update`, `JobTask.from_callable`, cron / file-arrival schedules, multi-task DAGs |
 | [`ygg-databricks-genie`](skills/ygg-databricks-genie.md) | `dbc.genie.ask`, `GenieSpace`, `GenieConversation` |
+| [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) | End-to-end recipe: HTTP / API / S3 → discover → cast → Unity Catalog → schedule |
+| [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) | Sample an unknown endpoint, infer + tighten a `Schema`, validate against fresh data |
 | [`ygg-cast`](skills/ygg-cast.md) | `convert(value, target)`, `CastOptions`, registry extension |
 | [`ygg-schema-fields`](skills/ygg-schema-fields.md) | `DataField` / `Schema` / `DataType`, schema intent |
 | [`ygg-statement-result`](skills/ygg-statement-result.md) | `StatementResult` / `Tabular` / `DataTable` consumption, streaming |
 | [`ygg-enums`](skills/ygg-enums.md) | `ByteUnit`, `Currency`, `MimeType`, `TimeZone`, … |
 | [`ygg-json-pickle`](skills/ygg-json-pickle.md) | `yggdrasil.pickle.json`, `serde`, singleton-by-config pickling |
 | [`ygg-http`](skills/ygg-http.md) | `HTTPSession`, `HTTPRequest`, `HTTPResponse`, `URL`, retries / caching |
+| [`ygg-benchmarks`](skills/ygg-benchmarks.md) | `python/benchmarks/`, before/after workflow, `run_all.py`, picking the right metric |
 | [`ygg-logging`](skills/ygg-logging.md) | `<Verb> <ResourceNoun> %r (...)`, `%r` lazy logging, anti-patterns |
 | [`ygg-pitfalls`](skills/ygg-pitfalls.md) | Post-generation checklist — row loops, bare imports, pre-checks, etc. |
+
+## Autonomous ingestion workflow
+
+The skills are organised so a prompt like *"ingest this API into
+`main.sales.orders` every hour"* (plus a docs URL or sample payload)
+can be answered end-to-end without further questions:
+
+1. [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) — probe
+   the source, infer a `Schema`, tighten it, commit the literal.
+2. [`ygg-schema-fields`](skills/ygg-schema-fields.md) +
+   [`ygg-databricks-tables`](skills/ygg-databricks-tables.md) —
+   reconcile the catalog/schema/table, `ensure_created`.
+3. [`ygg-http`](skills/ygg-http.md) +
+   [`ygg-cast`](skills/ygg-cast.md) — pull pages with
+   `HTTPSession`, cast through the schema, write via
+   `Table.insert / merge / async_insert`.
+4. [`ygg-databricks-job-workflows`](skills/ygg-databricks-job-workflows.md)
+   — stage the callable via `Job.pytask`, attach a
+   `CronSchedule` / `FileArrivalTriggerConfiguration`.
+5. [`ygg-benchmarks`](skills/ygg-benchmarks.md) — add a bench for the
+   hot transform path before merging.
+
+[`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) is the
+master recipe that chains the five.
 
 ## Keeping these files in sync with the library
 

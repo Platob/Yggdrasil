@@ -39,6 +39,36 @@ I primarily work in Python notebooks on Databricks against
 - Type hints match runtime, including `| None` on nullable returns.
 - Keyword-only arguments for ambiguous options.
 
+## Autonomy on ingestion tasks
+
+When I paste API docs / a Swagger URL / an S3 bucket / a vendor
+sample and say "ingest this", I expect a working pipeline, not
+fragments. The skills are wired for that — chain them without
+asking permission at each step:
+
+1. **Probe + discover schema** (sample 100–500 rows, infer via
+   `Field.from_arrow_schema` / `Field.from_polars_schema`, tighten
+   for nullability / decimal / timezone) → commit the `Schema(...)`
+   literal to source.
+2. **Reconcile target** via `dbc.catalog(...).ensure_created()` →
+   `dbc.schema(...).ensure_created()` → `dbc.table(...).ensure_created(schema=...)`.
+3. **Write the fetch-and-load callable** using `HTTPSession` for
+   HTTP, `DatabricksPath`/`Path` for S3/Volume, and `Table.insert`
+   / `merge` / `async_insert` for the write (pick from the size
+   table in [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md)).
+4. **Schedule** via `dbc.jobs.create_or_update(name=..., schedule=CronSchedule(...))`
+   + `job.pytask(callable, ..., task_key=...).create()` — auto-deps
+   resolve via the AST walker, splat `dbc.jobs.userinfo_defaults()`
+   for git source / notifications / tags.
+5. **Benchmark** the hot transform path before merging — see
+   [`ygg-benchmarks`](skills/ygg-benchmarks.md). Quote before /
+   after numbers in the commit body.
+
+If something is genuinely ambiguous (idempotency strategy, whether
+to overwrite vs append, secret-scope name), ask once with the
+options. Otherwise pick a defensible default and document it in a
+short comment, don't stall.
+
 ## Tone in responses
 
 Direct and concise. State the change, show the snippet, point me to
