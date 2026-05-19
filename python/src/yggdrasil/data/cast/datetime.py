@@ -70,8 +70,12 @@ _RE_COMPACT_DATETIME = re.compile(
     r")?"
     r"(?:(Z)|([+-]\d{2}:?\d{2}))?$"
 )
+# Days prefix accepts both the compact `Nd ` shorthand and Python's own
+# `str(timedelta(...))` shape — `N day, ` / `N days, ` — so values that
+# round-trip through `str()` (e.g. logs, CSVs, JSON via `default=str`)
+# parse back without the caller having to reformat.
 _RE_TIMEDELTA_HMS = re.compile(
-    r"(?:(?P<days>-?\d+)d\s+)?"
+    r"(?:(?P<days>-?\d+)\s*(?:d\s+|days?,\s+))?"
     r"(?P<hours>\d{1,2}):(?P<minutes>\d{1,2})"
     r"(?::(?P<seconds>\d{1,2})(?:\.(?P<fraction>\d{1,6}))?)?$"
 )
