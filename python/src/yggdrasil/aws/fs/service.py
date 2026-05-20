@@ -39,6 +39,7 @@ hot code is free.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from yggdrasil.aws.client import AWSClient, AWSService
@@ -51,6 +52,8 @@ if TYPE_CHECKING:
 
 
 __all__ = ["S3Service"]
+
+LOGGER = logging.getLogger(__name__)
 
 #: Default TTL for listing cache entries (seconds). Listings are more
 #: expensive than stats (paginated ListObjectsV2); callers that need
@@ -135,11 +138,17 @@ class S3Service(AWSService):
             return
 
         if bucket is None:
+            LOGGER.debug("Invalidating S3 listing cache for %r (all entries)", self)
             self._ls_cache.clear()
             return
 
         full = f"{bucket}/{key}" if key else bucket
         to_drop = [k for k in self._ls_cache if full.startswith(str(k))]
+        if to_drop:
+            LOGGER.debug(
+                "Invalidating S3 listing cache for %r (prefix=%r, dropped=%d)",
+                self, full, len(to_drop),
+            )
         for k in to_drop:
             self._ls_cache.pop(k, None)
 
@@ -207,10 +216,18 @@ class S3Service(AWSService):
         # near-expiry inside ``get_frozen_credentials()``.
         creds = self.client.session.get_credentials()
         if creds is None:
+            LOGGER.debug(
+                "Building pyarrow S3 filesystem for %r without snapshot (no credentials configured)",
+                self,
+            )
             # No credentials configured — let pyarrow walk its own
             # default chain (env / config / instance metadata).
             return S3FileSystem(region=region or self.client.region, **overrides)
         frozen = creds.get_frozen_credentials()
+        LOGGER.debug(
+            "Snapshotting credentials into pyarrow S3 filesystem for %r (region=%r, has_token=%s)",
+            self, region or self.client.region, frozen.token is not None,
+        )
         return S3FileSystem(
             access_key=frozen.access_key,
             secret_key=frozen.secret_key,

@@ -48,6 +48,7 @@ Filesystem surface
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
@@ -64,6 +65,8 @@ if TYPE_CHECKING:
 
 
 __all__ = ["S3Path"]
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +377,11 @@ class S3Path(RemotePath):
         paginator = self.client.get_paginator("list_objects_v2")
         try:
             pages = paginator.paginate(**kwargs)
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug(
+                "Listing S3 prefix %r failed — yielding empty (exc=%r)",
+                self, exc,
+            )
             return
 
         for page in pages:
@@ -423,6 +430,7 @@ class S3Path(RemotePath):
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
+        LOGGER.debug("Deleting S3 object %r (missing_ok=%s)", self, missing_ok)
         try:
             self._call(
                 self.client.delete_object,
@@ -432,6 +440,7 @@ class S3Path(RemotePath):
             if not missing_ok:
                 raise
             return
+        LOGGER.info("Deleted S3 object %r", self)
         self.invalidate_singleton()
 
     def _remove_dir(
@@ -448,6 +457,10 @@ class S3Path(RemotePath):
             placeholder = self.key
             if placeholder and not placeholder.endswith("/"):
                 placeholder = placeholder + "/"
+            LOGGER.debug(
+                "Deleting S3 prefix placeholder %r (missing_ok=%s)",
+                self, missing_ok,
+            )
             try:
                 self._call(
                     self.client.delete_object,
@@ -457,6 +470,7 @@ class S3Path(RemotePath):
                 if missing_ok:
                     return
                 raise
+            LOGGER.info("Deleted S3 prefix placeholder %r", self)
             self.invalidate_singleton()
             return
 
@@ -464,8 +478,12 @@ class S3Path(RemotePath):
         if prefix and not prefix.endswith("/"):
             prefix = prefix + "/"
 
+        LOGGER.debug(
+            "Deleting S3 prefix %r recursively (missing_ok=%s)", self, missing_ok,
+        )
         paginator = self.client.get_paginator("list_objects_v2")
         batch: list[dict[str, str]] = []
+        deleted = 0
         try:
             for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
                 for obj in page.get("Contents") or ():
@@ -475,13 +493,16 @@ class S3Path(RemotePath):
                     batch.append({"Key": key})
                     if len(batch) >= 1000:
                         self._delete_batch(batch)
+                        deleted += len(batch)
                         batch = []
             if batch:
                 self._delete_batch(batch)
+                deleted += len(batch)
         except Exception:
             if missing_ok:
                 return
             raise
+        LOGGER.info("Deleted S3 prefix %r (objects=%d)", self, deleted)
         self.invalidate_singleton()
 
     def _delete_batch(self, batch: list[dict]) -> None:
@@ -640,10 +661,15 @@ class S3Path(RemotePath):
         tail = existing[pos + n:]
         payload = head + bytes(data) + tail
 
+        LOGGER.debug(
+            "Writing S3 object %r (bytes=%d, pos=%d, rmw=True)",
+            self, len(payload), pos,
+        )
         self._call(
             self.client.put_object,
             Bucket=self.bucket, Key=self.key, Body=payload,
         )
+        LOGGER.info("Wrote S3 object %r (bytes=%d)", self, len(payload))
         self._persist_stat_cache(IOStats(
             size=len(payload),
             kind=IOKind.FILE,
@@ -681,10 +707,12 @@ class S3Path(RemotePath):
         else:
             payload = existing + b"\x00" * (n - len(existing))
 
+        LOGGER.debug("Truncating S3 object %r (size=%d)", self, n)
         self._call(
             self.client.put_object,
             Bucket=self.bucket, Key=self.key, Body=payload,
         )
+        LOGGER.info("Truncated S3 object %r (size=%d)", self, n)
         self._persist_stat_cache(IOStats(
             size=len(payload),
             kind=IOKind.FILE,
@@ -734,9 +762,11 @@ class S3Path(RemotePath):
         else:
             payload = bytes(data)
         if pos == 0:
+            LOGGER.debug("Writing S3 object %r (bytes=%d)", self, len(payload))
             self.client.put_object(
                 Bucket=self.bucket, Key=self.key, Body=payload,
             )
+            LOGGER.info("Wrote S3 object %r (bytes=%d)", self, len(payload))
             self._persist_stat_cache(IOStats(
                 size=len(payload),
                 kind=IOKind.FILE,

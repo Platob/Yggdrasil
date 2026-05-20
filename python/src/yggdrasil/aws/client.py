@@ -660,6 +660,8 @@ class AWSClient(Singleton):
 
     def close(self) -> None:
         """Drop the cached session, all per-service clients, all service objects."""
+        if self._session is not None:
+            LOGGER.debug("Closing AWS client %r", self)
         self._session = None
         self._client_cache = {}
         self._s3 = None
@@ -696,6 +698,10 @@ class AWSClient(Singleton):
         if cached is not None:
             return cached
 
+        LOGGER.debug(
+            "Building boto client for service %r on %r (overrides=%r)",
+            service, self, overrides or None,
+        )
         kwargs: dict[str, Any] = {}
         if self.region:
             kwargs["region_name"] = self.region
@@ -736,6 +742,7 @@ class AWSClient(Singleton):
 
     def caller_identity(self) -> dict[str, Any]:
         """Wrap STS GetCallerIdentity. Network call; not cached."""
+        LOGGER.debug("Fetching STS caller identity for %r", self)
         return self.sts_client().get_caller_identity()
 
     @property
@@ -763,12 +770,24 @@ class AWSClient(Singleton):
     def _build_session(self) -> "boto3.Session":
         boto3 = boto3_module()
         if self.has_refresher():
-            return self._build_refresher_session(boto3)
-        if self.has_assume_role():
-            return self._build_assume_role_session(boto3)
-        if self.has_sso():
-            return self._build_sso_session(boto3)
-        return self._build_simple_session(boto3)
+            mode = "refresher"
+        elif self.has_assume_role():
+            mode = "assume-role"
+        elif self.has_sso():
+            mode = "sso"
+        else:
+            mode = "simple"
+        LOGGER.debug("Building boto3 session for %r (mode=%s)", self, mode)
+        if mode == "refresher":
+            session = self._build_refresher_session(boto3)
+        elif mode == "assume-role":
+            session = self._build_assume_role_session(boto3)
+        elif mode == "sso":
+            session = self._build_sso_session(boto3)
+        else:
+            session = self._build_simple_session(boto3)
+        LOGGER.info("Built boto3 session for %r (mode=%s)", self, mode)
+        return session
 
     def _build_refresher_session(self, boto3) -> "boto3.Session":
         """Build a Session whose credentials auto-refresh via :attr:`refresher`."""
@@ -777,7 +796,13 @@ class AWSClient(Singleton):
         assert refresher is not None  # gated by has_refresher() above
 
         def refresh():
-            return _refresher_to_metadata(refresher)
+            LOGGER.debug("Refreshing credentials via refresher %r", refresher)
+            metadata = _refresher_to_metadata(refresher)
+            LOGGER.info(
+                "Refreshed credentials via refresher %r (expiry=%s)",
+                refresher, metadata.get("expiry_time"),
+            )
+            return metadata
 
         refreshable = (
             botocore.credentials.RefreshableCredentials
@@ -866,6 +891,10 @@ class AWSClient(Singleton):
         )
 
         def refresh():
+            LOGGER.debug(
+                "Refreshing STS AssumeRole credentials (role_arn=%r, session_name=%r, duration=%ds)",
+                self.role_arn, role_session_name, int(self.duration_seconds),
+            )
             sts = base_session.client("sts")
             assume_kwargs: dict[str, Any] = {
                 "RoleArn": self.role_arn,
@@ -877,15 +906,20 @@ class AWSClient(Singleton):
             response = sts.assume_role(**assume_kwargs)
             creds = response["Credentials"]
             expiration = creds["Expiration"]
+            expiry_str = (
+                expiration.isoformat()
+                if hasattr(expiration, "isoformat")
+                else str(expiration)
+            )
+            LOGGER.info(
+                "Refreshed STS AssumeRole credentials (role_arn=%r, expiry=%s)",
+                self.role_arn, expiry_str,
+            )
             return {
                 "access_key": creds["AccessKeyId"],
                 "secret_key": creds["SecretAccessKey"],
                 "token": creds["SessionToken"],
-                "expiry_time": (
-                    expiration.isoformat()
-                    if hasattr(expiration, "isoformat")
-                    else str(expiration)
-                ),
+                "expiry_time": expiry_str,
             }
 
         refreshable = (
