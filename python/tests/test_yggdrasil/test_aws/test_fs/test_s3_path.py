@@ -1,9 +1,10 @@
 """Mock-driven behavior tests for :class:`yggdrasil.aws.fs.path.S3Path`.
 
-Tests inject a :class:`unittest.mock.Mock` shaped like the boto3 S3
-client. The Path implementation must call the boto methods with the
-right arguments and translate responses + errors into the
-:class:`Holder` contract.
+Tests inject a :class:`unittest.mock.Mock` shaped like
+:class:`S3Service` whose ``boto_client`` attribute is the mock
+boto3 S3 client. The Path implementation must call the boto methods
+through ``self.service.boto_client`` with the right arguments and
+translate responses + errors into the :class:`Holder` contract.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from yggdrasil.aws.fs.path import S3Path
+from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.io.io_stats import IOKind
 
 
@@ -69,6 +71,22 @@ def client():
     return MagicMock()
 
 
+@pytest.fixture
+def service(client):
+    """Mock :class:`S3Service` whose ``boto_client`` is the test
+    fixture's boto :func:`client`.
+
+    :class:`S3Path` reaches the boto client through
+    ``self.service.boto_client``, so wiring the mock service to
+    expose the same underlying mock keeps the per-test
+    ``client.head_object.return_value = ...`` setup pattern
+    working unchanged.
+    """
+    svc = MagicMock(spec=S3Service)
+    svc.boto_client = client
+    return svc
+
+
 # ---------------------------------------------------------------------------
 # URL parsing + scheme normalization
 # ---------------------------------------------------------------------------
@@ -76,32 +94,32 @@ def client():
 
 class TestUrlParsing:
 
-    def test_basic_url(self, client) -> None:
-        p = S3Path("s3://my-bucket/data/file.parquet", client=client)
+    def test_basic_url(self, client, service) -> None:
+        p = S3Path("s3://my-bucket/data/file.parquet", service=service)
         assert p.bucket == "my-bucket"
         assert p.key == "data/file.parquet"
         assert p.full_path() == "s3://my-bucket/data/file.parquet"
 
-    def test_bucket_root(self, client) -> None:
-        p = S3Path("s3://my-bucket/", client=client)
+    def test_bucket_root(self, client, service) -> None:
+        p = S3Path("s3://my-bucket/", service=service)
         assert p.bucket == "my-bucket"
         assert p.key == ""
         assert p.full_path() == "s3://my-bucket/"
 
-    def test_s3a_normalizes_to_s3(self, client) -> None:
-        p = S3Path("s3a://my-bucket/x", client=client)
+    def test_s3a_normalizes_to_s3(self, client, service) -> None:
+        p = S3Path("s3a://my-bucket/x", service=service)
         assert p.url.scheme == "s3"
         assert p.full_path().startswith("s3://")
 
-    def test_s3n_normalizes_to_s3(self, client) -> None:
-        p = S3Path("s3n://my-bucket/x", client=client)
+    def test_s3n_normalizes_to_s3(self, client, service) -> None:
+        p = S3Path("s3n://my-bucket/x", service=service)
         assert p.url.scheme == "s3"
 
 
 class TestPredicates:
 
-    def test_remote_path_pins(self, client) -> None:
-        p = S3Path("s3://b/k", client=client)
+    def test_remote_path_pins(self, client, service) -> None:
+        p = S3Path("s3://b/k", service=service)
         assert p.is_remote_path
         assert not p.is_local_path
         assert not p.is_memory
@@ -114,33 +132,33 @@ class TestPredicates:
 
 class TestStat:
 
-    def test_existing_object(self, client) -> None:
+    def test_existing_object(self, client, service) -> None:
         client.head_object.return_value = {
             "ContentLength": 42,
             "LastModified": None,
         }
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         s = p._stat_uncached()
         assert s.kind is IOKind.FILE
         assert s.size == 42
         client.head_object.assert_called_once_with(Bucket="b", Key="k")
 
-    def test_existing_prefix(self, client) -> None:
+    def test_existing_prefix(self, client, service) -> None:
         client.head_object.side_effect = _client_error()
         client.list_objects_v2.return_value = {"KeyCount": 3}
-        p = S3Path("s3://b/folder", client=client)
+        p = S3Path("s3://b/folder", service=service)
         s = p._stat_uncached()
         assert s.kind is IOKind.DIRECTORY
 
-    def test_missing_object(self, client) -> None:
+    def test_missing_object(self, client, service) -> None:
         client.head_object.side_effect = _client_error()
         client.list_objects_v2.return_value = {"KeyCount": 0}
-        p = S3Path("s3://b/no-such", client=client)
+        p = S3Path("s3://b/no-such", service=service)
         s = p._stat_uncached()
         assert s.kind is IOKind.MISSING
 
-    def test_bucket_root_is_directory(self, client) -> None:
-        p = S3Path("s3://b/", client=client)
+    def test_bucket_root_is_directory(self, client, service) -> None:
+        p = S3Path("s3://b/", service=service)
         s = p._stat_uncached()
         assert s.kind is IOKind.DIRECTORY
         # Bucket-root probe must NOT call head_object.
@@ -154,13 +172,13 @@ class TestStat:
 
 class TestReadMv:
 
-    def test_full_object_read(self, client) -> None:
+    def test_full_object_read(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
         client.get_object.return_value = {
             "Body": _Body(b"hello"),
             "ContentLength": 5,
         }
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         assert p.read_bytes() == b"hello"
         # ``read_bytes()`` / ``read_mv(-1, 0)`` issues a single
         # whole-object GET (no ``Range`` header) — the ``HeadObject``
@@ -173,36 +191,36 @@ class TestReadMv:
         assert "Range" not in kwargs
         client.head_object.assert_not_called()
 
-    def test_range_read(self, client) -> None:
+    def test_range_read(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 100, "LastModified": None}
         client.get_object.return_value = {"Body": _Body(b"abc")}
         # Disable the page buffer so the test asserts the narrow
         # ``Range`` shape the user requested instead of the page-aligned
         # ``Range`` :class:`RemotePath` issues when buffersize is set.
-        p = S3Path("s3://b/k", client=client, buffersize=None)
+        p = S3Path("s3://b/k", service=service, buffersize=None)
         out = p.pread(3, 10)
         assert out == b"abc"
         assert client.get_object.call_args.kwargs["Range"] == "bytes=10-12"
 
-    def test_zero_byte_read_short_circuits(self, client) -> None:
+    def test_zero_byte_read_short_circuits(self, client, service) -> None:
         # n=0 is a no-op — the reworked Holder.read_mv normalizes to
         # an empty memoryview without hitting the client.
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         assert p.pread(0, 0) == b""
         client.get_object.assert_not_called()
 
-    def test_missing_key_raises_filenotfounderror(self, client) -> None:
+    def test_missing_key_raises_filenotfounderror(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
         client.get_object.side_effect = _client_error()
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         with pytest.raises(FileNotFoundError, match="s3://b/k"):
             p.read_bytes()
 
-    def test_invalid_range_returns_empty(self, client) -> None:
+    def test_invalid_range_returns_empty(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
         client.get_object.side_effect = _client_error("InvalidRange", 416)
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         # With size=5 the holder bounds n to remaining; force a bigger
         # range manually via pread to exercise the 416 branch.
         # ``pread`` resolves through ``read_mv``; ask for a window
@@ -218,10 +236,10 @@ class TestReadMv:
 
 class TestWrite:
 
-    def test_whole_object_put(self, client) -> None:
+    def test_whole_object_put(self, client, service) -> None:
         client.head_object.side_effect = _client_error()
         client.list_objects_v2.return_value = {"KeyCount": 0}
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         n = p.write_bytes(b"abcdef")
         assert n == 6
         kwargs = client.put_object.call_args.kwargs
@@ -229,35 +247,35 @@ class TestWrite:
         assert kwargs["Key"] == "k"
         assert kwargs["Body"] == b"abcdef"
 
-    def test_pwrite_does_rmw(self, client) -> None:
+    def test_pwrite_does_rmw(self, client, service) -> None:
         # Existing 5 bytes; positional write at offset 1 splices in 'XX'.
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
         client.get_object.return_value = {"Body": _Body(b"abcde")}
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         p.pwrite(b"XX", 1)
         body = client.put_object.call_args.kwargs["Body"]
         assert body == b"aXXde"
 
-    def test_pwrite_past_eof_zero_pads(self, client) -> None:
+    def test_pwrite_past_eof_zero_pads(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 2, "LastModified": None}
         client.get_object.return_value = {"Body": _Body(b"ab")}
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         p.pwrite(b"X", 5)
         body = client.put_object.call_args.kwargs["Body"]
         assert body == b"ab\x00\x00\x00X"
 
-    def test_truncate_shrinks(self, client) -> None:
+    def test_truncate_shrinks(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 6, "LastModified": None}
         client.get_object.return_value = {"Body": _Body(b"abcdef")}
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         p.truncate(3)
         body = client.put_object.call_args.kwargs["Body"]
         assert body == b"abc"
 
-    def test_truncate_to_zero_uploads_empty(self, client) -> None:
+    def test_truncate_to_zero_uploads_empty(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 6, "LastModified": None}
         client.get_object.return_value = {"Body": _Body(b"abcdef")}
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         p.truncate(0)
         body = client.put_object.call_args.kwargs["Body"]
         assert body == b""
@@ -270,7 +288,7 @@ class TestWrite:
 
 class TestListing:
 
-    def test_iterdir_mixes_objects_and_prefixes(self, client) -> None:
+    def test_iterdir_mixes_objects_and_prefixes(self, client, service) -> None:
         pages = [{
             "Contents": [
                 {"Key": "data/a.parquet", "Size": 100, "LastModified": None},
@@ -279,7 +297,7 @@ class TestListing:
             "CommonPrefixes": [{"Prefix": "data/sub/"}],
         }]
         client.get_paginator.return_value = _make_paginator(pages)
-        p = S3Path("s3://b/data/", client=client)
+        p = S3Path("s3://b/data/", service=service)
         children = list(p.iterdir())
         assert sorted(c.key for c in children) == [
             "data/a.parquet", "data/b.parquet", "data/sub/",
@@ -290,15 +308,15 @@ class TestListing:
         assert kwargs["Delimiter"] == "/"
         assert kwargs["Prefix"] == "data/"
 
-    def test_recursive_drops_delimiter(self, client) -> None:
+    def test_recursive_drops_delimiter(self, client, service) -> None:
         pages = [{"Contents": [{"Key": "data/x.parquet"}]}]
         client.get_paginator.return_value = _make_paginator(pages)
-        p = S3Path("s3://b/data/", client=client)
+        p = S3Path("s3://b/data/", service=service)
         list(p.ls(recursive=True))
         kwargs = client.get_paginator.return_value.paginate.call_args.kwargs
         assert "Delimiter" not in kwargs
 
-    def test_iterdir_filters_zero_byte_placeholders(self, client) -> None:
+    def test_iterdir_filters_zero_byte_placeholders(self, client, service) -> None:
         pages = [{
             "Contents": [
                 {"Key": "data/", "Size": 0},
@@ -306,7 +324,7 @@ class TestListing:
             ],
         }]
         client.get_paginator.return_value = _make_paginator(pages)
-        p = S3Path("s3://b/data/", client=client)
+        p = S3Path("s3://b/data/", service=service)
         names = [c.key for c in p.iterdir()]
         # The "data/" placeholder is suppressed; only the real file
         # comes through.
@@ -320,17 +338,17 @@ class TestListing:
 
 class TestRemove:
 
-    def test_unlink_calls_delete_object(self, client) -> None:
+    def test_unlink_calls_delete_object(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 1, "LastModified": None}
-        p = S3Path("s3://b/key", client=client)
+        p = S3Path("s3://b/key", service=service)
         p.unlink()
         client.delete_object.assert_called_once_with(Bucket="b", Key="key")
 
-    def test_remove_dir_paginates_and_batches(self, client) -> None:
+    def test_remove_dir_paginates_and_batches(self, client, service) -> None:
         pages = [{"Contents": [{"Key": f"d/x{i}"} for i in range(3)]}]
         client.get_paginator.return_value = _make_paginator(pages)
         client.delete_objects.return_value = {}
-        p = S3Path("s3://b/d/", client=client)
+        p = S3Path("s3://b/d/", service=service)
         # Force the directory branch.
         client.head_object.side_effect = _client_error()
         client.list_objects_v2.return_value = {"KeyCount": 3}
@@ -344,8 +362,8 @@ class TestRemove:
 
 class TestMkdir:
 
-    def test_is_no_op(self, client) -> None:
-        p = S3Path("s3://b/folder", client=client)
+    def test_is_no_op(self, client, service) -> None:
+        p = S3Path("s3://b/folder", service=service)
         p.mkdir()
         # No S3 call — directory creation is implicit on first child.
         client.put_object.assert_not_called()
@@ -358,17 +376,19 @@ class TestMkdir:
 
 class TestPathApi:
 
-    def test_joinpath_inherits_client(self, client) -> None:
-        p = S3Path("s3://b/folder/", client=client)
+    def test_joinpath_inherits_service(self, client, service) -> None:
+        p = S3Path("s3://b/folder/", service=service)
         child = p / "leaf.parquet"
         assert isinstance(child, S3Path)
         assert child.bucket == "b"
         assert child.key == "folder/leaf.parquet"
-        # Same client object propagates.
-        assert child._client is client
+        # Same service object propagates — and the boto client
+        # reached through it is the test fixture's mock.
+        assert child._service is service
+        assert child.client is client
 
-    def test_with_suffix(self, client) -> None:
-        p = S3Path("s3://b/data/x.csv", client=client)
+    def test_with_suffix(self, client, service) -> None:
+        p = S3Path("s3://b/data/x.csv", service=service)
         renamed = p.with_suffix(".parquet")
         assert renamed.key == "data/x.parquet"
 
@@ -380,21 +400,21 @@ class TestPathApi:
 
 class TestStatCaching:
 
-    def test_repeated_stat_hits_cache(self, client) -> None:
+    def test_repeated_stat_hits_cache(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         # First stat → real call.
         first = p.stat()
         second = p.stat()
         assert first is second
         assert client.head_object.call_count == 1
 
-    def test_write_seeds_post_write_size(self, client) -> None:
+    def test_write_seeds_post_write_size(self, client, service) -> None:
         # Initial probe → 5 bytes.
         client.head_object.return_value = {"ContentLength": 5, "LastModified": None}
         client.list_objects_v2.return_value = {"KeyCount": 0}
         client.get_object.return_value = {"Body": _Body(b"abcde")}
-        p = S3Path("s3://b/k", client=client)
+        p = S3Path("s3://b/k", service=service)
         assert p.size == 5
         # ``truncate`` re-uploads via ``put_object``, which seeds the
         # stat cache with the post-write size — the next ``size``
@@ -422,7 +442,7 @@ class TestRetryPolicy:
             recorded.append(t)
         return recorded, spy
 
-    def test_transient_eventually_succeeds(self, client, sleeps) -> None:
+    def test_transient_eventually_succeeds(self, client, sleeps, service) -> None:
         recorded, spy = sleeps
         responses = [
             _client_error("InternalError", 500),
@@ -437,46 +457,46 @@ class TestRetryPolicy:
             return r
 
         client.head_object.side_effect = head_object
-        p = S3Path("s3://b/k", client=client, retry_sleep=spy)
+        p = S3Path("s3://b/k", service=service, retry_sleep=spy)
         assert p.size == 7
         # Two transient retries → two flat 1 s sleeps.
         assert recorded == [1.0, 1.0]
         assert client.head_object.call_count == 3
 
-    def test_transient_gives_up_after_4_retries(self, client, sleeps) -> None:
+    def test_transient_gives_up_after_4_retries(self, client, sleeps, service) -> None:
         recorded, spy = sleeps
         client.head_object.side_effect = _client_error("InternalError", 500)
-        p = S3Path("s3://b/k", client=client, retry_sleep=spy)
+        p = S3Path("s3://b/k", service=service, retry_sleep=spy)
         with pytest.raises(Exception):
             p.stat()
         # 4 retries fired (flat 1 s each) before giving up; 5 head calls total.
         assert recorded == [1.0, 1.0, 1.0, 1.0]
         assert client.head_object.call_count == 5
 
-    def test_permission_fails_fast(self, client, sleeps) -> None:
+    def test_permission_fails_fast(self, client, sleeps, service) -> None:
         recorded, spy = sleeps
         client.head_object.side_effect = _client_error("AccessDenied", 403)
-        p = S3Path("s3://b/k", client=client, retry_sleep=spy)
+        p = S3Path("s3://b/k", service=service, retry_sleep=spy)
         with pytest.raises(Exception):
             p.stat()
         # Permission errors are deterministic; no retry, no sleep.
         assert recorded == []
         assert client.head_object.call_count == 1
 
-    def test_not_found_does_not_retry(self, client, sleeps) -> None:
+    def test_not_found_does_not_retry(self, client, sleeps, service) -> None:
         recorded, spy = sleeps
         client.head_object.side_effect = _client_error("NoSuchKey", 404)
         client.list_objects_v2.return_value = {"KeyCount": 0}
-        p = S3Path("s3://b/k", client=client, retry_sleep=spy)
+        p = S3Path("s3://b/k", service=service, retry_sleep=spy)
         s = p._stat_uncached()
         assert s.kind is IOKind.MISSING
         # No sleeps — NotFound is deterministic.
         assert recorded == []
 
-    def test_deterministic_errors_propagate(self, client, sleeps) -> None:
+    def test_deterministic_errors_propagate(self, client, sleeps, service) -> None:
         recorded, spy = sleeps
         client.put_object.side_effect = ValueError("not retryable")
-        p = S3Path("s3://b/k", client=client, retry_sleep=spy)
+        p = S3Path("s3://b/k", service=service, retry_sleep=spy)
         # Force an OVERWRITE of an empty object → put_object once.
         client.head_object.side_effect = _client_error()
         client.list_objects_v2.return_value = {"KeyCount": 0}
@@ -492,53 +512,57 @@ class TestRetryPolicy:
 
 class TestSingletonCaching:
     """:class:`S3Path` inherits :class:`Singleton` — two callers asking
-    for the same ``(URL, client)`` share the live instance + warm stat
-    cache. Different URLs or different clients land on distinct
+    for the same ``(URL, service)`` share the live instance + warm
+    stat cache. Different URLs or different services land on distinct
     instances."""
 
     def setup_method(self) -> None:
         # Drop any cached instances so each test starts clean.
         S3Path._INSTANCES.clear()
 
-    def test_same_url_and_client_returns_same_instance(self, client) -> None:
-        a = S3Path("s3://bucket/key.parquet", client=client)
-        b = S3Path("s3://bucket/key.parquet", client=client)
+    def test_same_url_and_client_returns_same_instance(self, client, service) -> None:
+        a = S3Path("s3://bucket/key.parquet", service=service)
+        b = S3Path("s3://bucket/key.parquet", service=service)
         assert a is b
 
-    def test_init_is_idempotent_under_cache_hit(self, client) -> None:
+    def test_init_is_idempotent_under_cache_hit(self, client, service) -> None:
         # Mutate after construction; the second constructor call must
         # NOT clobber the live state (preserves bound client + warm
         # stat cache).
-        a = S3Path("s3://bucket/k", client=client)
+        a = S3Path("s3://bucket/k", service=service)
         a._stat_cached = "sentinel-cache"  # type: ignore[assignment]
-        b = S3Path("s3://bucket/k", client=client)
+        b = S3Path("s3://bucket/k", service=service)
         assert a is b
         assert b._stat_cached == "sentinel-cache"
 
-    def test_different_url_returns_different_instance(self, client) -> None:
-        a = S3Path("s3://bucket/k1", client=client)
-        b = S3Path("s3://bucket/k2", client=client)
+    def test_different_url_returns_different_instance(self, client, service) -> None:
+        a = S3Path("s3://bucket/k1", service=service)
+        b = S3Path("s3://bucket/k2", service=service)
         assert a is not b
 
-    def test_different_client_returns_different_instance(self) -> None:
+    def test_different_service_returns_different_instance(self) -> None:
         c1 = MagicMock()
         c2 = MagicMock()
-        a = S3Path("s3://bucket/k", client=c1)
-        b = S3Path("s3://bucket/k", client=c2)
+        s1 = MagicMock(spec=S3Service)
+        s1.boto_client = c1
+        s2 = MagicMock(spec=S3Service)
+        s2.boto_client = c2
+        a = S3Path("s3://bucket/k", service=s1)
+        b = S3Path("s3://bucket/k", service=s2)
         assert a is not b
         assert a.client is c1
         assert b.client is c2
 
-    def test_scheme_aliases_collapse_onto_canonical(self, client) -> None:
+    def test_scheme_aliases_collapse_onto_canonical(self, client, service) -> None:
         # ``s3a://`` and ``s3n://`` normalize to ``s3://`` at construction;
         # the singleton key reflects the canonical URL so all three
         # spellings share one instance.
-        a = S3Path("s3://bucket/k", client=client)
-        b = S3Path("s3a://bucket/k", client=client)
-        c = S3Path("s3n://bucket/k", client=client)
+        a = S3Path("s3://bucket/k", service=service)
+        b = S3Path("s3a://bucket/k", service=service)
+        c = S3Path("s3n://bucket/k", service=service)
         assert a is b is c
 
-    def test_stat_cache_shared_across_constructions(self, client) -> None:
+    def test_stat_cache_shared_across_constructions(self, client, service) -> None:
         # First construction warms the stat cache via _stat(). Re-
         # constructing returns the same instance, so the second probe
         # rides the cached entry instead of re-issuing head_object.
@@ -547,11 +571,11 @@ class TestSingletonCaching:
             "LastModified": None,
             "ContentType": "application/octet-stream",
         }
-        a = S3Path("s3://bucket/k", client=client)
+        a = S3Path("s3://bucket/k", service=service)
         assert a._stat().size == 42
         assert client.head_object.call_count == 1
 
-        b = S3Path("s3://bucket/k", client=client)
+        b = S3Path("s3://bucket/k", service=service)
         assert b._stat().size == 42
         # Still only one head_object — the second path *is* the first
         # path, and its stat cache is fresh.
@@ -560,8 +584,8 @@ class TestSingletonCaching:
 
 class TestArrowFilesystem:
 
-    def test_arrow_uri_renders_bucket_key(self, client) -> None:
-        p = S3Path("s3://my-bucket/path/to/file.parquet", client=client)
+    def test_arrow_uri_renders_bucket_key(self, client, service) -> None:
+        p = S3Path("s3://my-bucket/path/to/file.parquet", service=service)
         assert p.arrow_uri == "my-bucket/path/to/file.parquet"
 
     def test_arrow_filesystem_returns_pyarrow_s3fs(self) -> None:
@@ -575,18 +599,18 @@ class TestArrowFilesystem:
         from yggdrasil.aws.fs.service import S3Service
 
         # Build a real AWSClient with static creds and bind an
-        # S3Path to its boto client. ``arrow_filesystem`` should
-        # snapshot the boto session and hand back pyarrow's S3FS.
+        # S3Path to its service. ``arrow_filesystem`` should snapshot
+        # the boto session and hand back pyarrow's S3FS.
         aws = AWSClient(
             access_key_id="AKIA",
             secret_access_key="secret",
             region="us-east-1",
         )
-        # Build through S3Service.path so the boto client wiring is
-        # the same as production. Pass-through ``service`` lives on
-        # ``_client`` thanks to ``S3Service.path``'s constructor.
-        service = S3Service(client=aws)
-        p = service.path("s3://b/k")
+        # ``S3Service.path`` builds an S3Path bound to this service;
+        # the service is stored on ``_service`` and the boto client
+        # is reached through ``service.boto_client``.
+        real_service = S3Service(client=aws)
+        p = real_service.path("s3://b/k")
         fs = p.arrow_filesystem()
         assert isinstance(fs, pafs.S3FileSystem)
 

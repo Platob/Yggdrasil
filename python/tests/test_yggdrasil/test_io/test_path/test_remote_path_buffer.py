@@ -13,6 +13,19 @@ from unittest.mock import MagicMock
 import pytest
 
 from yggdrasil.aws.fs.path import S3Path
+from yggdrasil.aws.fs.service import S3Service
+
+
+def _service_for(client: MagicMock) -> MagicMock:
+    """Wrap a boto-shaped mock client in a mock :class:`S3Service`.
+
+    :class:`S3Path` reaches the boto surface through
+    ``self.service.boto_client``; tests build the boto mock then
+    hand back a service-shaped wrapper that exposes it.
+    """
+    svc = MagicMock(spec=S3Service)
+    svc.boto_client = client
+    return svc
 
 
 class _Body:
@@ -75,7 +88,7 @@ class TestPagedReads:
         payload = b"x" * 10_000
         client, counts, _ = _counting_client(payload)
         # Page comfortably fits the whole file.
-        p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=64 * 1024)
         assert p.read_bytes(100, 0) == payload[:100]
         assert p.read_bytes(50, 50) == payload[50:100]
         assert p.read_bytes(200, 0) == payload[:200]
@@ -85,7 +98,7 @@ class TestPagedReads:
         payload = b"abcdefghij" * 1_024  # 10 KB
         client, counts, _ = _counting_client(payload)
         # 2 KB page → 5 pages.
-        p = S3Path("s3://b/k", client=client, buffersize=2048)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=2048)
         assert p.read_bytes(5000, 1000) == payload[1000:6000]
         # Window touches pages 0, 1, 2.
         assert counts["get"] == 3
@@ -100,25 +113,25 @@ class TestPagedReads:
     def test_buffersize_none_disables_paging(self) -> None:
         payload = b"y" * 100
         client, counts, _ = _counting_client(payload)
-        p = S3Path("s3://b/k", client=client, buffersize=None)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=None)
         assert p.buffersize is None
         p.read_bytes(10, 0)
         p.read_bytes(10, 0)
         assert counts["get"] == 2  # No paging → one GET per call.
 
     def test_buffersize_string_parses_via_byteunit(self) -> None:
-        p = S3Path("s3://b/k", client=MagicMock(), buffersize="8 KB")
+        p = S3Path("s3://b/k", service=_service_for(MagicMock()), buffersize="8 KB")
         assert p.buffersize == 8 * 1024
-        q = S3Path("s3://b/k2", client=MagicMock(), buffersize="4 MB")
+        q = S3Path("s3://b/k2", service=_service_for(MagicMock()), buffersize="4 MB")
         assert q.buffersize == 4 * 1024 * 1024
 
     def test_buffersize_invalid_raises(self) -> None:
         with pytest.raises(ValueError, match="buffersize"):
-            S3Path("s3://b/bad", client=MagicMock(), buffersize="oops")
+            S3Path("s3://b/bad", service=_service_for(MagicMock()), buffersize="oops")
 
     def test_default_buffersize_is_4mib(self) -> None:
         # Documents the default the CLAUDE.md guidance refers to.
-        p = S3Path("s3://b/k", client=MagicMock())
+        p = S3Path("s3://b/k", service=_service_for(MagicMock()))
         assert p.buffersize == 4 * 1024 * 1024
 
 
@@ -126,7 +139,7 @@ class TestBufferedWrites:
 
     def test_writes_batch_into_one_put_inside_with_block(self) -> None:
         client, counts, store = _counting_client(b"")
-        p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=64 * 1024)
         with p:
             p.write_mv(memoryview(b"AAAA"), offset=0)
             p.write_mv(memoryview(b"BBBB"), offset=10)
@@ -137,7 +150,7 @@ class TestBufferedWrites:
 
     def test_partial_write_preserves_existing_tail(self) -> None:
         client, counts, store = _counting_client(b"ABCDEFGHIJ")
-        p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=64 * 1024)
         # Outside a ``with`` block — buffered write flushes immediately
         # so the closed-state direct-call contract still holds.
         p.write_mv(memoryview(b"XY"), offset=2)
@@ -145,14 +158,14 @@ class TestBufferedWrites:
 
     def test_closed_state_write_flushes_immediately(self) -> None:
         client, counts, store = _counting_client(b"")
-        p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=64 * 1024)
         p.write_bytes(b"hello")
         assert counts["put"] == 1
         assert store["buf"] == b"hello"
 
     def test_explicit_flush(self) -> None:
         client, counts, store = _counting_client(b"")
-        p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=64 * 1024)
         p.acquire()
         try:
             p.write_mv(memoryview(b"x" * 500), offset=0)
@@ -178,7 +191,7 @@ class TestBufferedWrites:
         the exact PUT count here, only that the final state
         carries the payload and a follow-up read sees it."""
         client, counts, store = _counting_client(b"")
-        p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=64 * 1024)
         with p.open("wb") as fh:
             fh.write(b"hello context")
         # Cursor close → parent.flush() → buffered page lands.
@@ -188,7 +201,7 @@ class TestBufferedWrites:
 
     def test_invalidate_singleton_drops_pages(self) -> None:
         client, counts, _ = _counting_client(b"z" * 100)
-        p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
+        p = S3Path("s3://b/k", service=_service_for(client), buffersize=64 * 1024)
         # Warm the cache.
         p.read_bytes(10, 0)
         assert counts["get"] == 1

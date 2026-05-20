@@ -1,10 +1,12 @@
 """S3-backed :class:`Path` implementation.
 
 :class:`S3Path` is a :class:`RemotePath` over the ``s3://`` URL
-scheme, talking to a boto3-shaped S3 client. The client is injected
-at construction (``client=`` kwarg) — concrete production code uses
-the :class:`yggdrasil.aws.fs.service.S3Service` factory, tests pass
-a :class:`unittest.mock.Mock` that stubs the boto methods.
+scheme. The path holds an :class:`yggdrasil.aws.fs.service.S3Service`
+and reaches the boto3-shaped S3 client through ``self.client``
+(a property delegating to ``self.service.boto_client``). Construction
+takes a ``service=`` kwarg; tests build a :class:`unittest.mock.Mock`
+shaped like :class:`S3Service` whose ``boto_client`` attribute is the
+mock boto client.
 
 Holder primitives
 -----------------
@@ -58,7 +60,7 @@ from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 
 if TYPE_CHECKING:
-    from botocore.client import BaseClient  # type: ignore[import-untyped]
+    from yggdrasil.aws.fs.service import S3Service
 
 
 __all__ = ["S3Path"]
@@ -70,20 +72,21 @@ __all__ = ["S3Path"]
 
 
 class S3Path(RemotePath):
-    """:class:`Path` over an S3 bucket via a boto3-shaped client.
+    """:class:`Path` over an S3 bucket via an :class:`S3Service`.
 
     Construction shapes::
 
-        S3Path("s3://bucket/key.parquet")                # uses default service
-        S3Path("s3://bucket/", client=my_boto_client)    # explicit client
-        S3Path(url=URL("s3://bucket/key"), client=mock)  # tests inject mocks
+        S3Path("s3://bucket/key.parquet")                  # uses default service
+        S3Path("s3://bucket/", service=my_s3_service)      # explicit service
+        S3Path(url=URL("s3://bucket/key"), service=mock)   # tests inject mocks
 
-    The ``client`` kwarg accepts any object that quacks like the
-    boto3 S3 client surface — ``head_object``, ``get_object``,
-    ``put_object``, ``delete_object``, ``delete_objects``,
-    ``list_objects_v2``, ``get_paginator``. Tests use
-    :class:`unittest.mock.Mock`; production code passes the boto
-    client owned by :class:`S3Service`.
+    The ``service`` kwarg is an :class:`S3Service` (or anything with
+    a ``boto_client`` attribute exposing the boto3-shaped S3 surface
+    — ``head_object``, ``get_object``, ``put_object``,
+    ``delete_object``, ``delete_objects``, ``list_objects_v2``,
+    ``get_paginator``). The path reaches the boto client through the
+    :attr:`client` property; tests inject a :class:`unittest.mock.Mock`
+    with ``boto_client`` set to the mock boto client.
 
     Singleton identity caching, the 5-minute default TTL, and the
     bounded ``_INSTANCES`` dict are inherited from
@@ -112,20 +115,20 @@ class S3Path(RemotePath):
         data: Any = None,
         *,
         url: URL | None = None,
-        client: Any = None,
+        service: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """Identity = ``(cls, canonical s3 URL, client)``.
+        """Identity = ``(cls, canonical s3 URL, service)``.
 
         ``data`` collapses into ``url`` before keying so the string
         ``"s3://b/k"`` and the equivalent :class:`URL` map to the
-        same singleton. ``client`` is part of the key because two
-        callers binding the same URL to different boto clients
-        (cross-account access, separate test fixtures) must NOT
-        collide — passing ``client=None`` collapses to the lazy-
-        resolved :class:`S3Service` singleton, so production callers
-        share one instance per URL without paying the singleton key
-        for explicit clients.
+        same singleton. ``service`` is part of the key because two
+        callers binding the same URL to different :class:`S3Service`
+        instances (cross-account access, separate test fixtures)
+        must NOT collide — passing ``service=None`` collapses to the
+        lazy-resolved :class:`S3Service` singleton, so production
+        callers share one instance per URL without paying the
+        singleton key for explicit services.
         """
         if url is None and isinstance(data, URL):
             url = data
@@ -137,7 +140,7 @@ class S3Path(RemotePath):
             # unrelated paths.
             return (cls, object())
         normalized = cls._normalize_scheme(URL.from_(url))
-        return (cls, str(normalized), client)
+        return (cls, str(normalized), service)
 
     # ==================================================================
     # Construction
@@ -148,7 +151,7 @@ class S3Path(RemotePath):
         data: Any = None,
         *,
         url: URL | None = None,
-        client: "BaseClient | Any | None" = None,
+        service: Optional["S3Service"] = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
         singleton_ttl: Any = ...,
@@ -158,7 +161,7 @@ class S3Path(RemotePath):
         # accept it here so the constructor signature stays open. The
         # singleton-cached re-init guard mirrors ``DatabricksPath`` —
         # the second constructor call collapses onto the live
-        # instance, preserving the bound boto client + warm stat cache.
+        # instance, preserving the bound service + warm stat cache.
         del singleton_ttl
         if getattr(self, "_initialized", False):
             return
@@ -174,7 +177,7 @@ class S3Path(RemotePath):
 
         super().__init__(data=data, url=url, temporary=temporary, **kwargs)
 
-        self._client = client
+        self._service: Optional["S3Service"] = service
         # Injection point for tests — replace ``time.sleep`` with a
         # spy / no-op so retry behavior is observable without burning
         # wall-clock seconds.
@@ -194,32 +197,33 @@ class S3Path(RemotePath):
         return url
 
     # ==================================================================
-    # Client access
+    # Service / client access
     # ==================================================================
 
     @property
-    def client(self) -> Any:
-        """The boto-shaped S3 client.
+    def service(self) -> "S3Service":
+        """The :class:`S3Service` this path is bound to.
 
-        Lazily builds a real boto3 client via :class:`S3Service`
-        when none was passed. Tests that inject a :class:`Mock` at
-        construction never trigger this branch.
+        Lazily resolves to :meth:`S3Service.current` when none was
+        passed at construction. Tests that inject a service-shaped
+        mock at construction never trigger the lazy branch.
         """
-        if self._client is None:
+        if self._service is None:
             from yggdrasil.aws.fs.service import S3Service
-            self._client = S3Service.current().boto_client
-        return self._client
+            self._service = S3Service.current()
+        return self._service
 
-    def with_client(self, client: Any) -> "S3Path":
-        """Return *self* with *client* installed.
+    @property
+    def client(self) -> Any:
+        """The boto-shaped S3 client — ``self.service.boto_client``.
 
-        Mutating in place — same identity, new transport. Useful
-        for swapping a stubbed client onto an existing path tree
-        (e.g. wiring a test mock onto paths that came from a real
-        URL parse).
+        Convenience accessor so the call sites that issue boto API
+        calls (``self.client.head_object(...)``,
+        ``self.client.get_object(...)``) stay short. The underlying
+        client is owned by the :class:`S3Service`; this property
+        never mints one of its own.
         """
-        self._client = client
-        return self
+        return self.service.boto_client
 
     def _call(self, func, *args, **kwargs):
         """Invoke *func(*args, **kwargs)* under the standard retry policy.
@@ -262,8 +266,8 @@ class S3Path(RemotePath):
         return int(self._stat().size)
 
     def _from_url(self, url: URL) -> "S3Path":
-        """Sibling :class:`S3Path` with the same client."""
-        return S3Path(url=url, client=self._client)
+        """Sibling :class:`S3Path` with the same service."""
+        return S3Path(url=url, service=self._service)
 
     # ==================================================================
     # PyArrow filesystem fast path
@@ -287,12 +291,7 @@ class S3Path(RemotePath):
         S3FileSystem takes ``"bucket/key"`` strings, not full
         ``s3://`` URLs.
         """
-        from yggdrasil.aws.fs.service import S3Service
-        if isinstance(self._client, S3Service):
-            service: S3Service = self._client
-        else:
-            service = S3Service.current()
-        return service.arrow_filesystem(region=region, **overrides)
+        return self.service.arrow_filesystem(region=region, **overrides)
 
     @property
     def arrow_uri(self) -> str:
@@ -407,7 +406,7 @@ class S3Path(RemotePath):
         # that want cached children thread it through ``ls``.
         cleaned = key.lstrip("/")
         url = self.url._replace_path("/" + cleaned if cleaned else "/")
-        return S3Path(url=url, client=self._client, singleton_ttl=singleton_ttl)
+        return S3Path(url=url, service=self._service, singleton_ttl=singleton_ttl)
 
     # ==================================================================
     # Mutators — mkdir / remove
