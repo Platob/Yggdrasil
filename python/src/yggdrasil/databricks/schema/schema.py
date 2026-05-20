@@ -220,7 +220,6 @@ class Schema(DatabricksPath, Singleton):
         infos: SchemaInfo | None = None,
         infos_fetched_at: float | None = None,
         url: URL | None = None,
-        client: "DatabricksClient | None" = None,
         singleton_ttl: "int | None" = ...,
     ):
         # ``singleton_ttl`` is consumed by ``__new__``; accept it here
@@ -256,7 +255,7 @@ class Schema(DatabricksPath, Singleton):
                 path="/" + "/".join(path_parts) if path_parts else "/",
             )
 
-        super().__init__(url=url, client=client or (service.client if service else None))
+        super().__init__(url=url, service=service)
         self.service = service
         self.catalog_name = catalog_name
         self.schema_name = schema_name
@@ -360,13 +359,13 @@ class Schema(DatabricksPath, Singleton):
                 f"two path segments (e.g. ``dbfs+volume:///main/sales``)."
             )
         catalog_name, schema_name = parts[0], parts[1]
-        client = kwargs.pop("client", None)
-        if client is None:
+        service = kwargs.pop("service", None)
+        if service is None:
             client = (
                 DatabricksClient(host=f"https://{u.host}/")
                 if u.host else DatabricksClient.current()
             )
-        service = kwargs.pop("service", None) or Schemas(client=client)
+            service = Schemas(client=client)
         return cls(
             service=service,
             catalog_name=catalog_name,

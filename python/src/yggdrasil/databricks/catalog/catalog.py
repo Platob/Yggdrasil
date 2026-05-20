@@ -160,7 +160,6 @@ class Catalog(DatabricksPath, Singleton):
         infos: CatalogInfo | None = None,
         infos_fetched_at: float | None = None,
         url: URL | None = None,
-        client: "DatabricksClient | None" = None,
         singleton_ttl: "int | None" = ...,
     ):
         # ``singleton_ttl`` is consumed by ``__new__``; accept it here
@@ -191,7 +190,7 @@ class Catalog(DatabricksPath, Singleton):
                 path=f"/{catalog_name}" if catalog_name else "/",
             )
 
-        super().__init__(url=url, client=client or (service.client if service else None))
+        super().__init__(url=url, service=service)
         self.service = service
         self.catalog_name = catalog_name
         self._infos_ttl = infos_ttl or 1800.0
