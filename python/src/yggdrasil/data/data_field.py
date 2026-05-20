@@ -40,7 +40,7 @@ from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
 from yggdrasil.exceptions import CastError
 from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
-from yggdrasil.lazy_imports import path_class, schema_class
+from yggdrasil.lazy_imports import path_class, schema_class, spark_column_classes, spark_dataframe_classes
 from yggdrasil.pickle.serde import ObjectSerde
 from .cast.registry import register_converter
 from .data_utils import get_cast_options_class, safe_constraint_name
@@ -2755,7 +2755,7 @@ class Field(BaseChildrenFields):
 
         if isinstance(obj, _psql.types.StructField):
             return cls.from_spark_field(obj, from_metadata=from_metadata)
-        if isinstance(obj, _psql.DataFrame):
+        if isinstance(obj, spark_dataframe_classes()):
             obj = _psql.types.StructField(
                 DEFAULT_FIELD_NAME,
                 obj.schema,
@@ -2771,7 +2771,7 @@ class Field(BaseChildrenFields):
                 metadata=None,
             )
             return cls.from_spark_field(obj, from_metadata=from_metadata)
-        if isinstance(obj, _psql.Column):
+        if isinstance(obj, spark_column_classes()):
             return cls.from_spark_column(obj)
 
         raise TypeError(
@@ -3391,10 +3391,9 @@ class Field(BaseChildrenFields):
         DataFrame → :meth:`cast_spark_tabular`,
         Column → :meth:`cast_spark_column`.
         """
-        sql = spark_sql_module()
-        if isinstance(obj, sql.DataFrame):
+        if isinstance(obj, spark_dataframe_classes()):
             return self.cast_spark_tabular(obj, options=options, **more)
-        if isinstance(obj, sql.Column):
+        if isinstance(obj, spark_column_classes()):
             return self.cast_spark_column(obj, options=options, **more)
         raise TypeError(
             f"Field.cast_spark: expected pyspark.sql.DataFrame / Column, "
@@ -3705,10 +3704,9 @@ class Field(BaseChildrenFields):
 
     def fill_spark(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Fill nulls in any spark object."""
-        sql = spark_sql_module()
-        if isinstance(obj, sql.Column):
+        if isinstance(obj, spark_column_classes()):
             return self.fill_spark_column_nulls(obj, default_scalar=default_scalar)
-        if isinstance(obj, sql.DataFrame):
+        if isinstance(obj, spark_dataframe_classes()):
             return self.cast_spark_tabular(obj)
         raise TypeError(
             f"Field.fill_spark: expected pyspark.sql.DataFrame/Column, "
@@ -4065,10 +4063,9 @@ class Field(BaseChildrenFields):
         Column → fill + alias.
         DataFrame → identity (tabular cast already finalized).
         """
-        sql = spark_sql_module()
-        if isinstance(obj, sql.Column):
+        if isinstance(obj, spark_column_classes()):
             return self.finalize_spark_column(obj, default_scalar=default_scalar)
-        if isinstance(obj, sql.DataFrame):
+        if isinstance(obj, spark_dataframe_classes()):
             return obj
         raise TypeError(
             f"Field.finalize_spark: expected pyspark.sql.Column/DataFrame, "

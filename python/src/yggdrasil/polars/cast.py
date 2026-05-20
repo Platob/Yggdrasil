@@ -128,9 +128,9 @@ def any_to_polars_dataframe(
     elif module == "pandas":
         df = pl.from_pandas(obj)
     elif module == "pyspark":
-        import pyspark.sql as pyspark_sql
+        from yggdrasil.lazy_imports import spark_dataframe_classes
 
-        if isinstance(obj, pyspark_sql.DataFrame):
+        if isinstance(obj, spark_dataframe_classes()):
             from yggdrasil.spark.cast import spark_dataframe_to_arrow
             df = pl.from_arrow(spark_dataframe_to_arrow(obj))
         else:

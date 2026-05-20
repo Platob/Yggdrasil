@@ -60,7 +60,7 @@ from yggdrasil.data.schema import Schema, Field
 from yggdrasil.lazy_imports import (
     pandas_module,
     pyarrow_dataset_module,
-    spark_sql_module,
+    spark_dataframe_classes,
     polars_module,
 )
 from yggdrasil.pickle.serde import ObjectSerde
@@ -710,9 +710,7 @@ def _spark_to_arrow(obj: Any, options: CastOptions) -> tuple[pa.Table, CastOptio
        cast, which would materialize the whole frame before casting.
     4. Trigger ``toArrow()``.
     """
-    pyspark_sql = spark_sql_module()
-
-    if not isinstance(obj, pyspark_sql.DataFrame):
+    if not isinstance(obj, spark_dataframe_classes()):
         raise TypeError("Unsupported Spark object: %s" % (obj,))
 
     options = _bind_source(options, obj)
@@ -921,8 +919,7 @@ def any_to_arrow_batch_iterator(
     namespace = ObjectSerde.full_namespace(obj)
 
     if namespace.startswith("pyspark."):
-        pyspark_sql = spark_sql_module()
-        if isinstance(obj, pyspark_sql.DataFrame):
+        if isinstance(obj, spark_dataframe_classes()):
             options = _bind_source(options, obj)
             projection = _resolve_projection(options)
             if projection:

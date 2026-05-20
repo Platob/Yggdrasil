@@ -51,6 +51,7 @@ from yggdrasil.arrow.cast import (
 from yggdrasil.data.cast import register_converter
 from yggdrasil.data.options import CastOptions
 from yggdrasil.environ import PyEnv
+from yggdrasil.lazy_imports import spark_dataframe_classes
 
 __all__ = [
     "any_to_spark_field",
@@ -230,6 +231,18 @@ def cast_spark_dataframe(
     return CastOptions.check(options).cast_spark_tabular(dataframe)
 
 
+# Spark Connect's DataFrame class is a parallel implementation of
+# ``pyspark.sql.DataFrame`` (not a subclass on PySpark 3.5 and earlier),
+# so register the same cast under its exact type too. Without this the
+# (Connect-DF, Connect-DF) lookup falls through to scan-fallback and
+# misses, breaking ``convert(connect_df, type(connect_df))`` on the
+# Databricks Connect runtime.
+for _spark_df_cls in spark_dataframe_classes():
+    if _spark_df_cls is not pyspark_sql.DataFrame:
+        register_converter(_spark_df_cls, _spark_df_cls)(cast_spark_dataframe)
+        register_converter(_spark_df_cls, pyspark_sql.DataFrame)(cast_spark_dataframe)
+
+
 @register_converter(Any, pyspark_sql.DataFrame)
 def any_to_spark_dataframe(
     obj: Any,
@@ -237,7 +250,7 @@ def any_to_spark_dataframe(
 ) -> pyspark_sql.DataFrame:
     opts = CastOptions.check(options)
 
-    if isinstance(obj, pyspark_sql.DataFrame):
+    if isinstance(obj, spark_dataframe_classes()):
         return opts.cast_spark_tabular(obj)
 
     # ``Tabular`` (Response, StatementResult, ParquetFile, …) owns its

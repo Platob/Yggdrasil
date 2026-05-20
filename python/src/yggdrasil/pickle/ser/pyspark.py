@@ -190,7 +190,9 @@ class PySparkSerialized(Serialized[TPySpark], Generic[TPySpark]):
         except ImportError:
             return None
 
-        if isinstance(obj, _sql.DataFrame):
+        from yggdrasil.lazy_imports import spark_column_classes, spark_dataframe_classes
+
+        if isinstance(obj, spark_dataframe_classes()):
             return PySparkDataFrameSerialized.from_value(obj, metadata=metadata, codec=codec)
 
         if isinstance(obj, _sql.Row):
@@ -202,7 +204,7 @@ class PySparkSerialized(Serialized[TPySpark], Generic[TPySpark]):
         if isinstance(obj, _types.DataType):
             return PySparkDataTypeSerialized.from_value(obj, metadata=metadata, codec=codec)
 
-        if isinstance(obj, _sql.Column):
+        if isinstance(obj, spark_column_classes()):
             return PySparkColumnSerialized.from_value(obj, metadata=metadata, codec=codec)
 
         try:
