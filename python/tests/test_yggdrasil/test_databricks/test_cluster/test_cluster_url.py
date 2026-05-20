@@ -54,13 +54,13 @@ class TestClusterURLBased(DatabricksTestCase):
         url = URL.from_(
             "dbks+cluster://test.databricks.net/c-test-1",
         )
-        cluster = Cluster.from_url(url, client=self.client)
+        cluster = Cluster.from_url(url, service=self.clusters)
         self.assertEqual(cluster.cluster_id, "c-test-1")
         self.assertIs(cluster.client, self.client)
 
     def test_url_round_trip_preserves_cluster_id(self):
         original = Cluster(service=self.clusters, cluster_id="c-rt-1")
-        rebuilt = Cluster.from_url(original.to_url(), client=self.client)
+        rebuilt = Cluster.from_url(original.to_url(), service=self.clusters)
         self.assertEqual(rebuilt.cluster_id, original.cluster_id)
 
     def test_dispatch_routes_to_cluster_subclass(self):
@@ -68,7 +68,7 @@ class TestClusterURLBased(DatabricksTestCase):
         # subclass off the scheme.
         rebuilt = URLBased.dispatch(
             "dbks+cluster://test.databricks.net/c-dispatch-1",
-            client=self.client,
+            service=self.clusters,
         )
         self.assertIsInstance(rebuilt, Cluster)
         self.assertEqual(rebuilt.cluster_id, "c-dispatch-1")
@@ -107,7 +107,7 @@ class TestServerlessClusterURLBased(DatabricksTestCase):
         # the URL — that's the whole point of the separate scheme.
         rebuilt = URLBased.dispatch(
             "dbks+serverless-cluster://test.databricks.net/sl-dispatch-1",
-            client=self.client,
+            service=self.clusters,
         )
         self.assertIsInstance(rebuilt, ServerlessCluster)
         self.assertEqual(rebuilt.cluster_id, "sl-dispatch-1")

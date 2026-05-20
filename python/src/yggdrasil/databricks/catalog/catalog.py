@@ -299,13 +299,13 @@ class Catalog(DatabricksPath, Singleton):
                 f"least one path segment (e.g. ``dbfs+volume:///main``)."
             )
         catalog_name = parts[0]
-        client = kwargs.pop("client", None)
-        if client is None:
+        service = kwargs.pop("service", None)
+        if service is None:
             client = (
                 DatabricksClient(host=f"https://{u.host}/")
                 if u.host else DatabricksClient.current()
             )
-        service = kwargs.pop("service", None) or Catalogs(client=client)
+            service = Catalogs(client=client)
         return cls(service=service, catalog_name=catalog_name, **kwargs)
 
     # ── DatabricksResource compatibility ──────────────────────────────────────

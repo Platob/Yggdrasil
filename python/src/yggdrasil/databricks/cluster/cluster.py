@@ -320,13 +320,13 @@ class Cluster(Singleton, DatabricksResource, URLBased):
                 f"``{cls.scheme.value}://<host>/<cluster_id>``."
             )
         cluster_id = parts[0]
-        client = kwargs.pop("client", None)
-        if client is None:
+        service = kwargs.pop("service", None)
+        if service is None:
             client = (
                 DatabricksClient(host=f"https://{u.host}/")
                 if u.host else DatabricksClient.current()
             )
-        service = kwargs.pop("service", None) or client.compute.clusters
+            service = client.compute.clusters
         return cls(service=service, cluster_id=cluster_id, **kwargs)
 
     # ------------------------------------------------------------------ #
