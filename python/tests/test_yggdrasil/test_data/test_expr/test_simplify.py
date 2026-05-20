@@ -275,7 +275,7 @@ class TestEdgeCases:
 
 # ---------------------------------------------------------------------------
 # extract_partition_filters — over-approximate per-column value sets,
-# consumed by DeltaIO / Iceberg / Hive-style partition pruning.
+# consumed by DeltaFolder / Iceberg / Hive-style partition pruning.
 # ---------------------------------------------------------------------------
 
 

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from yggdrasil.arrow.tests import ArrowTestCase
 
 if TYPE_CHECKING:
-    from yggdrasil.io.nested.delta.delta_io import DeltaIO
+    from yggdrasil.io.nested.delta.delta_io import DeltaFolder
 
 
 __all__ = ["DeltaTestCase"]
@@ -24,20 +24,20 @@ class DeltaTestCase(ArrowTestCase):
 
     Adds:
 
-    - :meth:`delta_io` — return a fresh :class:`DeltaIO` over a
+    - :meth:`delta_io` — return a fresh :class:`DeltaFolder` over a
       sub-directory of the per-test :attr:`tmp_path`.
     - :meth:`new_table` — convenience for "create a brand-new
-      :class:`DeltaIO` and seed it with a pyarrow Table in one call."
+      :class:`DeltaFolder` and seed it with a pyarrow Table in one call."
     """
 
     require_parquet: ClassVar[bool] = True
 
-    def delta_io(self, name: str = "delta") -> "DeltaIO":
-        from yggdrasil.io.nested.delta.delta_io import DeltaIO
+    def delta_io(self, name: str = "delta") -> "DeltaFolder":
+        from yggdrasil.io.nested.delta.delta_io import DeltaFolder
 
         sub = self.tmp_path / name
         sub.mkdir(parents=True, exist_ok=True)
-        return DeltaIO(path=str(sub))
+        return DeltaFolder(path=str(sub))
 
     def new_table(
         self,
@@ -45,7 +45,7 @@ class DeltaTestCase(ArrowTestCase):
         *,
         name: str = "delta",
         options: Any = None,
-    ) -> "DeltaIO":
+    ) -> "DeltaFolder":
         d = self.delta_io(name)
         d.write_arrow_table(table, options=options)
         return d

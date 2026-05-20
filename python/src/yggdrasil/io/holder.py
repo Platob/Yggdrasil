@@ -1240,7 +1240,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
         The returned class is a :class:`Tabular` subclass — typically a
         :class:`Holder` byte-backed leaf, occasionally a non-Holder
-        leaf (:class:`FolderIO`, :class:`DeltaIO`). Returns *default*
+        leaf (:class:`FolderIO`, :class:`DeltaFolder`). Returns *default*
         on miss when supplied; otherwise raises :class:`KeyError` with
         the list of registered names.
         """
@@ -1259,7 +1259,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
         # Miss may just mean the leaf package hasn't been imported
         # yet — force the side-effect bootstrap once and retry. This
-        # is what catches nested leaves (ZipFile / FolderIO / DeltaIO)
+        # is what catches nested leaves (ZipFile / FolderIO / DeltaFolder)
         # for callers that never touched ``yggdrasil.io.nested``.
         if not _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
             _bootstrap_holder_format_registry()

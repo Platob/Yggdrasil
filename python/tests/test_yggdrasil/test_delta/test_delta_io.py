@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.delta.io.DeltaIO` end-to-end."""
+"""Tests for :class:`yggdrasil.delta.io.DeltaFolder` end-to-end."""
 from __future__ import annotations
 
 import os
@@ -303,8 +303,8 @@ class TestCheckpoints(DeltaTestCase):
         # Re-open with a fresh log so the checkpoint is the only way
         # the snapshot can recover the active set up to the
         # checkpoint version.
-        from yggdrasil.delta.io import DeltaIO
-        d2 = DeltaIO(path=str(d.path))
+        from yggdrasil.delta.io import DeltaFolder
+        d2 = DeltaFolder(path=str(d.path))
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(6)))
 
@@ -317,8 +317,8 @@ class TestCheckpoints(DeltaTestCase):
         self.assertTrue(any(
             n.endswith(".parquet") for n in os.listdir(sidecar_dir)
         ))
-        from yggdrasil.delta.io import DeltaIO
-        d2 = DeltaIO(path=str(d.path))
+        from yggdrasil.delta.io import DeltaFolder
+        d2 = DeltaFolder(path=str(d.path))
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(6)))
 

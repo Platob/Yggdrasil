@@ -29,7 +29,7 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.data.types.primitive import Int64Type
 from yggdrasil.io.nested.delta import (
     ConcurrentDeltaCommitError,
-    DeltaIO,
+    DeltaFolder,
     DeltaOptions,
 )
 from yggdrasil.io.nested.delta.tests import DeltaTestCase
@@ -133,7 +133,7 @@ class TestConcurrentRetry(DeltaTestCase):
     def _smuggle_commit(
         self,
         *,
-        target: DeltaIO,
+        target: DeltaFolder,
         version: int,
         rival_table: list[Any],
         rival_path_name: str = "rival",

@@ -1,4 +1,4 @@
-"""DeltaIO — :class:`FolderIO` over a Delta Lake table.
+"""DeltaFolder — :class:`FolderIO` over a Delta Lake table.
 
 The leaf orchestrates four subsystems documented in this package:
 
@@ -43,7 +43,7 @@ What changes vs :class:`FolderIO`
 Caching
 -------
 
-Every :class:`DeltaIO` carries a :class:`DeltaLog` instance whose
+Every :class:`DeltaFolder` carries a :class:`DeltaLog` instance whose
 listing + ``_last_checkpoint`` reads are memoized. A read pass that
 includes a schema collect, a row count, and a batch scan does
 exactly **one** ``_delta_log`` listing and **one** ``_last_checkpoint``
@@ -53,12 +53,12 @@ table moved underneath them.
 Engine bridges
 --------------
 
-:class:`DeltaIO` inherits :class:`FolderIO` -> :class:`Tabular`, so
+:class:`DeltaFolder` inherits :class:`FolderIO` -> :class:`Tabular`, so
 ``read_polars_frame`` / ``read_pandas_frame`` / ``read_spark_frame``
 work without any per-engine plumbing here. The Arrow batch stream
 :meth:`_read_arrow_batches` produces routes through
 :mod:`yggdrasil.data.cast` for the engine the caller asked for —
-reads go Arrow → engine, writes go engine → Arrow → DeltaIO. That
+reads go Arrow → engine, writes go engine → Arrow → DeltaFolder. That
 keeps a single code path for partition pruning, DV masking, and
 checkpoint replay regardless of which engine the caller is using.
 """
@@ -108,7 +108,7 @@ from yggdrasil.io.nested.delta.schema_codec import (
 )
 from yggdrasil.io.nested.delta.snapshot import Snapshot
 
-__all__ = ["ConcurrentDeltaCommitError", "DeltaIO", "DeltaOptions"]
+__all__ = ["ConcurrentDeltaCommitError", "DeltaFolder", "DeltaOptions"]
 
 
 class ConcurrentDeltaCommitError(RuntimeError):
@@ -163,7 +163,7 @@ class DeltaOptions(FolderOptions):
     #: feature requires it (DV → reader 3 / writer 7).
     min_reader_version: int = 1
     min_writer_version: int = 2
-    #: When ``True``, :meth:`DeltaIO._delete` marks rows via a deletion
+    #: When ``True``, :meth:`DeltaFolder._delete` marks rows via a deletion
     #: vector on the existing parquet rather than rewriting the file.
     #: Forces the protocol to declare the ``deletionVectors`` feature.
     delete_via_dv: bool = False
@@ -184,11 +184,11 @@ class DeltaOptions(FolderOptions):
 
 
 # ---------------------------------------------------------------------------
-# DeltaIO
+# DeltaFolder
 # ---------------------------------------------------------------------------
 
 
-class DeltaIO(FolderIO):
+class DeltaFolder(FolderIO):
     """:class:`FolderIO` over a Delta Lake table at a :class:`Path`."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.DELTA_FOLDER
@@ -221,13 +221,13 @@ class DeltaIO(FolderIO):
         self._snapshot: "Optional[Snapshot]" = None
 
     def __repr__(self) -> str:
-        return f"DeltaIO(path={self.path!r})"
+        return f"DeltaFolder(path={self.path!r})"
 
     # ==================================================================
     # Cache control
     # ==================================================================
 
-    def refresh(self) -> "DeltaIO":
+    def refresh(self) -> "DeltaFolder":
         """Drop cached log + snapshot. Next read re-fetches everything."""
         self._log.invalidate()
         self._snapshot = None

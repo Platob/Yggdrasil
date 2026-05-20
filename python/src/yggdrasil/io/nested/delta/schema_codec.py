@@ -132,7 +132,7 @@ def _arrow_type_to_spark(t: pa.DataType) -> Any:
     # widen them — ``uint8`` lands as ``byte`` (int8), ``uint64`` as
     # ``long`` (int64). Values that don't fit the signed range round-
     # trip via two's-complement when the parquet-write path casts
-    # ``uint`` → same-width signed (``DeltaIO._coerce_uints``); the
+    # ``uint`` → same-width signed (``DeltaFolder._coerce_uints``); the
     # Delta schema and the parquet payload then agree on width and
     # signedness. The default ``as_spark`` widening (which would land
     # ``uint64`` at ``DECIMAL(20, 0)``) costs storage and breaks the

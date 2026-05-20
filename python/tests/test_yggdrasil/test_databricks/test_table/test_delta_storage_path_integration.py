@@ -1,4 +1,4 @@
-"""Integration benchmark: SQL warehouse vs direct DeltaIO over the storage path.
+"""Integration benchmark: SQL warehouse vs direct DeltaFolder over the storage path.
 
 A Databricks-managed Delta table is, on disk, a folder of parquet files
 plus a ``_delta_log`` transaction log. Two ways to read it:
@@ -9,8 +9,8 @@ plus a ``_delta_log`` transaction log. Two ways to read it:
    features (auth, caching, photon-vectorised execution, row-level
    security, etc.) but pays one warehouse round trip per query.
 
-2. **Direct storage read via** :class:`yggdrasil.io.nested.delta.DeltaIO`
-   — point :class:`DeltaIO` at the table's :attr:`storage_location`
+2. **Direct storage read via** :class:`yggdrasil.io.nested.delta.DeltaFolder`
+   — point :class:`DeltaFolder` at the table's :attr:`storage_location`
    (an S3 / ABFS / GCS URI vended by Unity Catalog's temporary table
    credentials API) and open the parquet files directly. Skips the
    warehouse entirely and lets the predicate AST + ``simplify`` +
@@ -59,7 +59,7 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.databricks.table.table import Table
-from yggdrasil.io.nested.delta import DeltaIO, DeltaOptions
+from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions
 from yggdrasil.io.tabular.execution.expr import col as expr_col
 
 from .. import DatabricksIntegrationCase
@@ -265,8 +265,8 @@ class TestDeltaStoragePathBenchmark(DatabricksIntegrationCase):
         predicate: Any = None,
         prune_values: Any = None,
     ) -> pa.Table:
-        """Direct :class:`DeltaIO` read over the table's storage URI."""
-        delta_io = DeltaIO(path=str(self.storage_path.full_path()))
+        """Direct :class:`DeltaFolder` read over the table's storage URI."""
+        delta_io = DeltaFolder(path=str(self.storage_path.full_path()))
         opts = DeltaOptions(
             predicate=predicate, prune_values=prune_values,
         )

@@ -1,4 +1,4 @@
-"""Delta Lake support — :class:`DeltaIO` plus the log replay machinery.
+"""Delta Lake support — :class:`DeltaFolder` plus the log replay machinery.
 
 The package is layered so callers reach for the shape they need
 without pulling the whole stack:
@@ -20,7 +20,7 @@ without pulling the whole stack:
 - :mod:`yggdrasil.io.nested.delta.checkpoint` — V1 + V2 checkpoint
   writers (single parquet vs manifest+sidecars) and the
   ``_last_checkpoint`` pointer updater.
-- :mod:`yggdrasil.io.nested.delta.delta_io` — :class:`DeltaIO`, the
+- :mod:`yggdrasil.io.nested.delta.delta_io` — :class:`DeltaFolder`, the
   :class:`yggdrasil.io.nested.FolderIO` that runs the snapshot and
   surfaces the active files as Arrow batches with predicate /
   partition pruning, deletion-vector masking, and a write path that
@@ -29,7 +29,7 @@ without pulling the whole stack:
   surface, so reads and writes work in any registered engine.
 
 Everything routes through :class:`yggdrasil.io.path.Path`, so the
-same :class:`DeltaIO` works against a local folder, an S3 prefix, or
+same :class:`DeltaFolder` works against a local folder, an S3 prefix, or
 a DBFS path without code change. Metadata fetches are always
 coalesced through the path's ``iterdir`` and a single per-instance
 log cache — the hottest reads (``_last_checkpoint`` + the tail of
@@ -44,7 +44,7 @@ from yggdrasil.io.nested.delta.checkpoint import (
 )
 from yggdrasil.io.nested.delta.delta_io import (
     ConcurrentDeltaCommitError,
-    DeltaIO,
+    DeltaFolder,
     DeltaOptions,
 )
 from yggdrasil.io.nested.delta.deletion_vector import (
@@ -82,7 +82,7 @@ __all__ = [
     "DeletionVector",
     "DeletionVectorDescriptor",
     "DeltaAction",
-    "DeltaIO",
+    "DeltaFolder",
     "DeltaLog",
     "DeltaOptions",
     "DomainMetadata",
