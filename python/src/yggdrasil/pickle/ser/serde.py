@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, IO, Mapping
 
 from yggdrasil.io import BytesIO
+from yggdrasil.pickle.ser._scratch import _ScratchBuf
 from yggdrasil.pickle.ser.constants import is_valid_magic, MAGIC_LENGTH, MAGIC
 from yggdrasil.pickle.ser.errors import (
     HeaderDecodeError,
@@ -130,11 +131,9 @@ def dumps(
     b64: bool = False,
 ) -> bytes | str:
     """Serialise *obj* to ``bytes``, or to a URL-safe base-64 ``str`` when *b64* is ``True``."""
-    # Closed-state ``BytesIO`` writes route straight to its Memory holder
-    # — no scratch allocation, no commit-on-close copy. The ``with``
-    # block was double-buffering writes through scratch then committing
-    # back into the same in-memory holder for no benefit.
-    buffer = BytesIO()
+    # _ScratchBuf wraps stdlib io.BytesIO — avoids the full yggdrasil
+    # IO/Singleton overhead for this short-lived output accumulator.
+    buffer = _ScratchBuf()
     _dump(obj, buffer, metadata=metadata, codec=codec)
     value = buffer.getvalue()
 
@@ -147,6 +146,45 @@ def dumps(
 # load / loads
 # ---------------------------------------------------------------------------
 
+def _load_buf(
+    buffer: Any,
+    *,
+    unpickle: bool,
+    clean_corrupted: bool,
+    default: Any,
+    fp_label: Any,
+) -> Any:
+    """Read from *buffer* (a _ScratchBuf or yggdrasil BytesIO)."""
+    mag = buffer.read(MAGIC_LENGTH)
+    if not is_valid_magic(mag):
+        if isinstance(fp_label, (str, Path)):
+            p = Path(fp_label)
+            if clean_corrupted:
+                if not p.exists():
+                    return default
+                if p.stat().st_size > 0:
+                    LOGGER.warning(
+                        "Invalid magic header in %r; file may be corrupted. Removing.",
+                        fp_label,
+                    )
+                p.unlink(missing_ok=True)
+                return default
+            raise SerializationError(f"Invalid magic header in file {fp_label!r}")
+        raise SerializationError("Invalid magic header")
+
+    try:
+        read = Serialized.read_from(buffer)
+    except Exception:
+        if clean_corrupted:
+            LOGGER.warning("Failed to read serialized data from %r; removing.", fp_label)
+            if isinstance(fp_label, (str, Path)):
+                Path(fp_label).unlink(missing_ok=True)
+                return default
+        raise
+
+    return read.as_python() if unpickle else read
+
+
 def load(
     fp: IO[bytes] | Path | str,
     *,
@@ -155,37 +193,10 @@ def load(
     default: Any = None,
 ) -> Any:
     """Read a serialised payload from *fp* and optionally unpickle it."""
+    # yggdrasil BytesIO handles Path / str / file-like opening for us.
     buffer = BytesIO(fp)
-
-    mag = buffer.read(MAGIC_LENGTH)
-    if not is_valid_magic(mag):
-        if isinstance(fp, (str, Path)):
-            p = Path(fp)
-            if clean_corrupted:
-                if not p.exists():
-                    return default
-                if p.stat().st_size > 0:
-                    LOGGER.warning(
-                        "Invalid magic header in %r; file may be corrupted. Removing.", fp
-                    )
-                p.unlink(missing_ok=True)
-                return default
-            raise SerializationError(f"Invalid magic header in file {fp!r}")
-        raise SerializationError("Invalid magic header")
-
-    try:
-        read = Serialized.read_from(buffer)
-    except Exception:
-        if clean_corrupted:
-            LOGGER.warning(
-                "Failed to read serialized data from %r; removing.", fp
-            )
-            if isinstance(fp, (str, Path)):
-                Path(fp).unlink(missing_ok=True)
-                return default
-        raise
-
-    return read.as_python() if unpickle else read
+    return _load_buf(buffer, unpickle=unpickle, clean_corrupted=clean_corrupted,
+                     default=default, fp_label=fp)
 
 
 def loads(
@@ -203,8 +214,8 @@ def loads(
                 f"Invalid base64-encoded string {label!r}"
             ) from e
 
-    # Read-only over a fresh in-memory buffer — closed state already
-    # routes ops directly through the Memory holder; the ``with`` block
-    # was seeding a redundant scratch copy of the entire payload.
-    return load(BytesIO(s), unpickle=unpickle)
+    # _ScratchBuf avoids the two-layer yggdrasil BytesIO wrapping that
+    # load(BytesIO(s)) previously paid (once in loads, once in load).
+    return _load_buf(_ScratchBuf(s), unpickle=unpickle, clean_corrupted=False,
+                     default=None, fp_label=None)
 

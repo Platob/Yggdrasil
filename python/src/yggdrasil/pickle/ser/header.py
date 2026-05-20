@@ -4,6 +4,7 @@ import struct
 from typing import IO, Mapping
 
 from yggdrasil.io import BytesIO
+from yggdrasil.pickle.ser._scratch import _ScratchBuf
 from yggdrasil.pickle.ser.constants import HEADER_SIZE
 from yggdrasil.pickle.ser.errors import HeaderDecodeError, MetadataDecodeError
 
@@ -110,7 +111,7 @@ class Header:
         payload:size bytes
     """
 
-    __slots__ = ("tag", "codec", "size", "meta_size", "start", "metadata")
+    __slots__ = ("tag", "codec", "size", "meta_size", "start", "metadata", "_meta_blob")
 
     def __init__(
         self,
@@ -120,6 +121,8 @@ class Header:
         meta_size: int,
         start: int,
         metadata: Metadata = None,
+        *,
+        _meta_blob: bytes | None = None,
     ) -> None:
         self.tag = tag
         self.codec = codec
@@ -127,6 +130,7 @@ class Header:
         self.meta_size = meta_size
         self.start = start
         self.metadata = metadata
+        self._meta_blob = _meta_blob
 
     @property
     def header_start(self) -> int:
@@ -155,6 +159,7 @@ class Header:
             meta_size=len(encoded),
             start=start + HEADER_SIZE + len(encoded),
             metadata=dict(metadata) if metadata else None,
+            _meta_blob=encoded,
         )
 
     @classmethod
@@ -200,6 +205,7 @@ class Header:
             meta_size=meta_size,
             start=pos + HEADER_SIZE + meta_size,
             metadata=metadata,
+            _meta_blob=meta_blob,
         )
 
     def payload_view(self, buffer: BytesIO) -> BytesIO:
@@ -220,7 +226,7 @@ class Header:
         ``to_bytes()`` materialization that previous shapes incurred.
         """
         if buffer is None:
-            buffer = BytesIO()
+            buffer = _ScratchBuf()
 
         payload = memoryview(data)
         if len(payload) != self.size:
@@ -228,7 +234,11 @@ class Header:
                 f"Payload size mismatch: header.size={self.size}, actual={len(payload)}"
             )
 
-        metadata_blob = encode_metadata(self.metadata)
+        # Use cached blob; compute once and store if not already set.
+        metadata_blob = self._meta_blob
+        if metadata_blob is None:
+            metadata_blob = encode_metadata(self.metadata)
+            self._meta_blob = metadata_blob
         if len(metadata_blob) != self.meta_size:
             raise ValueError(
                 f"Metadata size mismatch: header.meta_size={self.meta_size}, "

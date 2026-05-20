@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import Any, Generic, Mapping, Optional, TypeVar
 
 from yggdrasil.io import BytesIO
+from yggdrasil.pickle.ser._scratch import _ScratchBuf
 from yggdrasil.pickle.ser.codec import (
     DEFAULT_CODEC,
     codec_name,
@@ -418,8 +419,10 @@ class Serialized(ABC, Generic[T]):
             size=len(encoded),
             metadata=metadata,
         )
-        buf = head.write_to(encoded)
-        payload = head.payload_view(buf)
+        # _ScratchBuf is a lightweight stdlib-backed buffer — avoids the full
+        # yggdrasil IO/Singleton construction overhead for these ephemeral
+        # payload holders. write_to() re-writes the header on demand.
+        payload = _ScratchBuf(encoded)
 
         if cls is Serialized:
             target = Tags.get_class(tag)
@@ -428,8 +431,6 @@ class Serialized(ABC, Generic[T]):
                     f"Tag {tag} resolved to invalid serializer class: {target!r}, "
                     "install more recent version with uv pip install ygg[data,databricks,pickle]>=0.6.21"
                 )
-        elif cls is Serialized:
-            raise TypeError(f"Tag {tag} resolved to invalid serializer class: {cls!r}")
         else:
             target = cls
 

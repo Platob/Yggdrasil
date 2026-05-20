@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from array import array
 from collections import deque
 from collections.abc import Generator as AbcGenerator
@@ -10,6 +11,7 @@ from types import MappingProxyType
 from typing import ClassVar, Generic, Iterator, Mapping
 
 from yggdrasil.io import BytesIO
+from yggdrasil.pickle.ser._scratch import _ScratchBuf
 from yggdrasil.pickle.ser.constants import CODEC_NONE
 from yggdrasil.pickle.ser.serialized import Serialized, T
 from yggdrasil.pickle.ser.tags import Tags
@@ -40,6 +42,8 @@ __all__ = [
 ]
 
 _U32_MAX = 0xFFFFFFFF
+_U32_STRUCT = struct.Struct(">I")
+_U64_STRUCT = struct.Struct(">Q")
 
 
 # ============================================================================
@@ -50,14 +54,14 @@ def _read_u32(buffer: BytesIO) -> int:
     raw = buffer.read(4)
     if len(raw) != 4:
         raise ValueError(f"Expected 4 bytes for u32, got {len(raw)}")
-    return int.from_bytes(raw, "big", signed=False)
+    return _U32_STRUCT.unpack(raw)[0]
 
 
 def _read_u64(buffer: BytesIO) -> int:
     raw = buffer.read(8)
     if len(raw) != 8:
         raise ValueError(f"Expected 8 bytes for u64, got {len(raw)}")
-    return int.from_bytes(raw, "big", signed=False)
+    return _U64_STRUCT.unpack(raw)[0]
 
 
 def _write_count(buffer: BytesIO, count: int, *, large: bool) -> None:
@@ -101,8 +105,8 @@ def _build_collection_payload(
     *,
     count: int,
     large: bool,
-) -> BytesIO:
-    payload = BytesIO()
+) -> _ScratchBuf:
+    payload: _ScratchBuf = _ScratchBuf()
     _write_count(payload, count, large=large)
     for item in items:
         Serialized.from_python_object(item).write_to(payload)
@@ -114,8 +118,8 @@ def _build_mapping_payload(
     *,
     count: int,
     large: bool,
-) -> BytesIO:
-    payload = BytesIO()
+) -> _ScratchBuf:
+    payload: _ScratchBuf = _ScratchBuf()
     _write_count(payload, count, large=large)
     for key, value in items:
         Serialized.from_python_object(key).write_to(payload)
@@ -190,13 +194,12 @@ class CollectionSerialized(Serialized[T], Generic[T]):
 
     TAG: ClassVar[int]
 
-    def _payload_buffer(self) -> BytesIO:
+    def _payload_buffer(self):  # → _ScratchBuf | BytesIO
         if self.codec == CODEC_NONE:
-            # Zero-copy: a non-owning view over the same holder, with
-            # an independent cursor at 0. Iteration here only reads, so
-            # sharing the wire payload's bytes with the parent is safe.
+            # Non-owning view at pos=0. Works for both _ScratchBuf (from
+            # build()) and yggdrasil BytesIO (from read_from()).
             return self.data.view(pos=0)
-        return BytesIO(self.decode())
+        return _ScratchBuf(self.decode())
 
     def _read_count(self, buffer: BytesIO) -> int:
         return _read_u32(buffer)

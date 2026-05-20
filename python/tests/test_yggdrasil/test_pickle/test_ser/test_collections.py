@@ -266,7 +266,6 @@ def test_payload_buffer_codec_none():
     ser = m.CollectionSerialized.from_python_object([1, 2, 3], codec=m.CODEC_NONE)
     assert ser is not None
     buf = ser._payload_buffer()
-    assert isinstance(buf, BytesIO)
     assert len(buf.getvalue()) > 0
 
 
