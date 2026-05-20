@@ -387,8 +387,7 @@ class PreparedRequest:
 
         Prefers an explicit override set via the :attr:`mode` setter
         (stashed on ``_mode``) — that's the value cache-aware sessions
-        (:class:`~yggdrasil.databricks.schema.SchemaSession`) should
-        propagate into any session-injected :class:`CacheConfig`.
+        should propagate into any session-injected :class:`CacheConfig`.
         Falls back to whichever of :attr:`remote_cache_config` /
         :attr:`local_cache_config` is set, so reads stay consistent
         whether the caller assigned ``mode`` directly or built the

@@ -1050,9 +1050,9 @@ class Table(DatabricksPath):
         """Build a Unity-Catalog-safe table name from any raw string.
 
         Centralized "raw string → table name" builder so every caller
-        (URL paths in :class:`SchemaSession`, free-text in user code,
-        composed names from upstream metadata) lands on the same
-        identifier without duplicating the sanitization logic.
+        (URL paths, free-text in user code, composed names from upstream
+        metadata) lands on the same identifier without duplicating the
+        sanitization logic.
 
         Pipeline:
 
