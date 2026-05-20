@@ -135,7 +135,7 @@ class TestSchemaIntegration(_SchemaFixture):
         :class:`Schema` bound to the right catalog + name."""
         resolved = DatabricksPath(
             f"/Volumes/{self.catalog_name}/{self.schema_name}",
-            client=self.client,
+            service=self.client.schemas,
         )
         self.assertIsInstance(resolved, Schema)
         self.assertEqual(resolved.catalog_name, self.catalog_name)
@@ -186,7 +186,7 @@ class TestVolumeIntegration(_SchemaFixture):
         same live :class:`Volume` the fixture created."""
         resolved = DatabricksPath(
             f"/Volumes/{self.catalog_name}/{self.schema_name}/{self.volume_name}",
-            client=self.client,
+            service=self.client.volumes,
         )
         self.assertIsInstance(resolved, Volume)
         self.assertEqual(resolved.catalog_name, self.catalog_name)
@@ -233,7 +233,7 @@ class TestVolumePathDispatchIntegration(_SchemaFixture):
             ) from exc
         cls.root = VolumePath(
             f"/Volumes/{cls.catalog_name}/{cls.schema_name}/{cls.volume_name}/scratch",
-            client=cls.client,
+            service=cls.client.volumes,
         )
         cls.root.mkdir(parents=True, exist_ok=True)
 
@@ -244,7 +244,7 @@ class TestVolumePathDispatchIntegration(_SchemaFixture):
         resolved = DatabricksPath(
             f"/Volumes/{self.catalog_name}/{self.schema_name}/"
             f"{self.volume_name}/scratch/probe.bin",
-            client=self.client,
+            service=self.client.volumes,
         )
         self.assertIsInstance(resolved, VolumePath)
         # ``catalog_name`` / ``schema_name`` / ``volume_name`` resolve
@@ -265,7 +265,7 @@ class TestVolumePathDispatchIntegration(_SchemaFixture):
         dispatched = DatabricksPath(
             f"/Volumes/{self.catalog_name}/{self.schema_name}/"
             f"{self.volume_name}/scratch/{leaf}",
-            client=self.client,
+            service=self.client.volumes,
         )
         dispatched.write_bytes(payload)
 
@@ -275,7 +275,7 @@ class TestVolumePathDispatchIntegration(_SchemaFixture):
         direct = VolumePath(
             f"/Volumes/{self.catalog_name}/{self.schema_name}/"
             f"{self.volume_name}/scratch/{leaf}",
-            client=self.client,
+            service=self.client.volumes,
         )
         try:
             stat = direct.stat()
