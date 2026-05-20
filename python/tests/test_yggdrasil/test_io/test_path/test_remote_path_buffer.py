@@ -166,6 +166,26 @@ class TestBufferedWrites:
         finally:
             p.close()
 
+    def test_open_wb_then_open_rb_round_trips_payload(self) -> None:
+        """``with path.open("wb") as fh: fh.write(...)`` must flush on
+        cursor close — the borrowed-parent cursor doesn't close the
+        path, so without an explicit flush hop the buffered pages
+        would never land. The follow-up ``open("rb")`` then reads
+        the just-uploaded bytes from the backend.
+
+        The OVERWRITE-mode truncate is a separate, pre-existing
+        round trip (``put_object`` with empty body); we don't pin
+        the exact PUT count here, only that the final state
+        carries the payload and a follow-up read sees it."""
+        client, counts, store = _counting_client(b"")
+        p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
+        with p.open("wb") as fh:
+            fh.write(b"hello context")
+        # Cursor close → parent.flush() → buffered page lands.
+        assert store["buf"] == b"hello context"
+        with p.open("rb") as fh:
+            assert fh.read() == b"hello context"
+
     def test_invalidate_singleton_drops_pages(self) -> None:
         client, counts, _ = _counting_client(b"z" * 100)
         p = S3Path("s3://b/k", client=client, buffersize=64 * 1024)
