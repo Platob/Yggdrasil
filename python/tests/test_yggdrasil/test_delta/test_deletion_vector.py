@@ -50,6 +50,67 @@ class TestMaskBatch(DeltaTestCase):
         out = mask_batch_with_dv(batch, dv)
         self.assertEqual(out.column("id").to_pylist(), [10, 30])
 
+    def test_base_offset_translates_deleted_ids(self) -> None:
+        # The DV holds *file-relative* row ids; a parquet read in
+        # chunks hands us a batch whose first row is at
+        # ``base_offset`` within the file. Pin the translation.
+        batch = self.pa.record_batch({"id": [10, 20, 30, 40]})
+        descriptor = DeletionVectorDescriptor(
+            storage_type="i", path_or_inline_dv="", size_in_bytes=0,
+        )
+        # File rows 101 and 103 → batch rows 1 and 3 with offset=100.
+        dv = DeletionVector(descriptor=descriptor, deleted_rows={101, 103})
+        out = mask_batch_with_dv(batch, dv, base_offset=100)
+        self.assertEqual(out.column("id").to_pylist(), [10, 30])
+
+    def test_deleted_outside_batch_range_is_a_noop(self) -> None:
+        # File rows 200..299 land in a later batch — for this batch
+        # the DV shouldn't drop anything. Vectorised path uses an
+        # in-range mask, so the cost stays O(|deleted|) regardless of
+        # batch size.
+        batch = self.pa.record_batch({"id": [10, 20, 30, 40]})
+        descriptor = DeletionVectorDescriptor(
+            storage_type="i", path_or_inline_dv="", size_in_bytes=0,
+        )
+        dv = DeletionVector(
+            descriptor=descriptor,
+            deleted_rows=frozenset(range(200, 300)),
+        )
+        out = mask_batch_with_dv(batch, dv, base_offset=0)
+        self.assertEqual(out.column("id").to_pylist(), [10, 20, 30, 40])
+
+    def test_all_rows_deleted_returns_empty_batch(self) -> None:
+        batch = self.pa.record_batch({"id": [10, 20, 30]})
+        descriptor = DeletionVectorDescriptor(
+            storage_type="i", path_or_inline_dv="", size_in_bytes=0,
+        )
+        dv = DeletionVector(descriptor=descriptor, deleted_rows={0, 1, 2})
+        out = mask_batch_with_dv(batch, dv)
+        self.assertEqual(out.num_rows, 0)
+        self.assertEqual(out.schema, batch.schema)
+
+    def test_dense_dv_preserves_row_order(self) -> None:
+        # Vectorised mask path must keep row order — pyarrow.compute
+        # filter is order-preserving but the regression target here
+        # is the case where the mask boolean array is mostly False.
+        n = 1000
+        batch = self.pa.record_batch({"id": list(range(n))})
+        descriptor = DeletionVectorDescriptor(
+            storage_type="i", path_or_inline_dv="", size_in_bytes=0,
+        )
+        # Delete every other row.
+        dv = DeletionVector(
+            descriptor=descriptor,
+            deleted_rows=frozenset(range(0, n, 2)),
+        )
+        out = mask_batch_with_dv(batch, dv)
+        self.assertEqual(out.num_rows, n // 2)
+        # Odd-indexed rows survive — id values 1, 3, 5, ...
+        self.assertEqual(
+            out.column("id").to_pylist()[:5], [1, 3, 5, 7, 9],
+        )
+        self.assertEqual(out.column("id").to_pylist()[-1], n - 1)
+
 
 class TestSidecarDecode(DeltaTestCase):
     def test_uuid_sidecar_simple_envelope(self) -> None:

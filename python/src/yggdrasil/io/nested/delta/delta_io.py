@@ -174,13 +174,22 @@ class DeltaOptions(FolderOptions):
     #: action set against the new HEAD, and retry. Set to 0 to fail
     #: fast on the first conflict.
     commit_max_retries: int = 8
-    #: Base sleep (seconds) before the first retry; the actual delay
-    #: is ``base * 2**attempt + jitter``. Keeps tight conflict loops
-    #: from amplifying when many writers commit at once.
+    #: Base sleep (seconds) before the first *backed-off* retry; the
+    #: actual delay is ``base * 2**(attempt - 1) + jitter``. The first
+    #: conflict retries immediately (no sleep) — the race is usually
+    #: just two writers landing in the same millisecond, so an extra
+    #: round trip is cheaper than a 50 ms idle. Subsequent retries
+    #: back off exponentially to stop a tight contention loop from
+    #: amplifying.
     commit_retry_backoff: float = 0.05
     #: Upper bound (seconds) on the per-attempt random jitter added to
     #: the backoff. Stays small so the retry pause stays predictable.
     commit_retry_jitter: float = 0.05
+    #: Hard cap on the per-attempt backoff before jitter. Stops the
+    #: exponential from blowing up under sustained contention — once
+    #: the delay hits this ceiling, every further retry waits at most
+    #: this long (still with jitter on top).
+    commit_retry_max_delay: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +789,9 @@ class DeltaFolder(FolderIO):
         ``None`` because their adds are valid at any version.
         """
         max_retries = max(0, int(options.commit_max_retries or 0))
+        backoff = float(options.commit_retry_backoff or 0.0)
+        jitter = float(options.commit_retry_jitter or 0.0)
+        max_delay = float(options.commit_retry_max_delay or 0.0)
         last_exc: "Optional[FileExistsError]" = None
         for attempt in range(max_retries + 1):
             snap = initial_snap if attempt == 0 else self.snapshot(fresh=True)
@@ -803,10 +815,20 @@ class DeltaFolder(FolderIO):
                         f"{max_retries}) if your contention level is "
                         f"genuinely this high."
                     ) from last_exc
-                # Exponential backoff with jitter so coordinated retries
-                # don't lock-step against each other.
-                delay = float(options.commit_retry_backoff or 0.0) * (2**attempt)
-                jitter = float(options.commit_retry_jitter or 0.0)
+                # First conflict retries immediately — the race is
+                # usually two writers landing in the same ms, the
+                # winning version is already visible on the next log
+                # listing, and an idle 50ms throws away the speedup
+                # from refreshing the snapshot right away. Subsequent
+                # retries back off exponentially, capped at
+                # ``max_delay`` so sustained contention doesn't blow
+                # the budget.
+                if attempt == 0 or backoff <= 0:
+                    delay = 0.0
+                else:
+                    delay = backoff * (2 ** (attempt - 1))
+                    if max_delay > 0 and delay > max_delay:
+                        delay = max_delay
                 if jitter > 0:
                     delay += random.uniform(0, jitter)
                 if delay > 0:

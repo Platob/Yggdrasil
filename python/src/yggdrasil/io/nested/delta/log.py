@@ -137,14 +137,22 @@ class DeltaLog:
         version-resolution + segment-build call. Remote backends with
         per-listing-call cost (S3 ``LIST``, Databricks REST) collapse
         to a single round trip per snapshot read.
+
+        Goes straight to ``iterdir()`` — no ``exists()`` probe. On
+        remote stores (S3, ABFS, DBFS) a HEAD-then-LIST pair doubles
+        the round-trip count for the common case (log directory is
+        present); ``FileNotFoundError`` from the missing case is just
+        as cheap to handle.
         """
         if self._listing is not None:
             return self._listing
-        if not self.log_path.exists():
+        names: List[str] = []
+        try:
+            entries = list(self.log_path.iterdir())
+        except FileNotFoundError:
             self._listing = ()
             return self._listing
-        names: List[str] = []
-        for entry in self.log_path.iterdir():
+        for entry in entries:
             n = entry.name
             if n and not n.startswith("."):
                 names.append(n)
@@ -164,6 +172,13 @@ class DeltaLog:
         version 0" path. We never crash on a malformed pointer; the
         Delta spec explicitly allows readers to ignore it and recover
         by listing.
+
+        No ``exists()`` probe: ``open("rb")`` either returns the
+        payload or raises ``FileNotFoundError`` in one round trip.
+        On remote stores (S3 / DBFS / ABFS) the HEAD-then-GET pair
+        the probe imposes doubles the latency on the common case
+        (pointer is present); local FS bottoms out in a single
+        ``stat`` either way.
         """
         if self._last_checkpoint is not None:
             # ``{}`` distinguishes "we tried and there's nothing" from
@@ -171,12 +186,12 @@ class DeltaLog:
             return self._last_checkpoint or None
 
         ptr = self.log_path / LAST_CHECKPOINT_NAME
-        if not ptr.exists():
-            self._last_checkpoint = {}
-            return None
         try:
             with ptr.open("rb") as bio:
                 payload = ygg_json.loads(bio.read())
+        except FileNotFoundError:
+            self._last_checkpoint = {}
+            return None
         except Exception:
             self._last_checkpoint = {}
             return None
@@ -473,17 +488,22 @@ class DeltaLog:
         import pyarrow.parquet as pq
 
         for path in files:
-            if not path.exists():
-                continue
             local = _local_str(path)
-            if local is not None:
-                table = pq.read_table(local)
-            else:
-                with path.open("rb") as bio:
-                    blob = bio.read()
-                import io as _io  # local — avoid the top-level shadow
+            try:
+                if local is not None:
+                    table = pq.read_table(local)
+                else:
+                    with path.open("rb") as bio:
+                        blob = bio.read()
+                    import io as _io  # local — avoid the top-level shadow
 
-                table = pq.read_table(_io.BytesIO(blob))
+                    table = pq.read_table(_io.BytesIO(blob))
+            except FileNotFoundError:
+                # Checkpoint parquet referenced by the listing but
+                # gone underneath us (vacuum race) — skip rather than
+                # crash. Saves one HEAD per checkpoint vs the
+                # ``exists()`` probe.
+                continue
 
             cols = table.column_names
             for row_idx in range(table.num_rows):

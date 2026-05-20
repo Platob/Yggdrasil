@@ -55,6 +55,7 @@ from typing import Callable, Iterable, Iterator
 import pyarrow as pa
 
 from yggdrasil.data.data_field import Field
+from yggdrasil.data.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions
@@ -472,6 +473,319 @@ def _read_scenarios(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Path-call counter — quantifies remote-store round trips
+#
+# Remote backends (S3 ``LIST/HEAD/GET``, Databricks REST ``list/read``,
+# ABFS) pay one network RTT per ``Path`` method call. Local FS pays
+# essentially nothing, so the wall-clock numbers above don't surface
+# the cost. We instrument ``Path`` directly (patch the abstract base
+# so every subclass — local, S3, DBFS — is counted in one shot),
+# count the calls per high-level read/write, and report.
+#
+# This is the single most important number for the remote-path
+# optimisation goal: every saved call here is a saved RTT in prod.
+# ---------------------------------------------------------------------------
+
+
+def _path_call_counts() -> dict:
+    """Counter dict shared across spies for a single bench block."""
+    return {
+        "exists": 0,
+        "iterdir": 0,
+        "stat": 0,
+        "open": 0,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "size": 0,
+        "size_known": 0,
+        "is_dir": 0,
+        "is_file": 0,
+        "unlink": 0,
+        "mkdir": 0,
+    }
+
+
+class _PathCallSpy:
+    """Context manager that counts Path-method calls across all subclasses.
+
+    Monkey-patches the abstract :class:`yggdrasil.io.io.Path` so every
+    concrete subclass (LocalPath, S3Path, VolumePath) inherits the
+    counted version. Captures the original methods on enter and
+    restores on exit — safe to nest only one at a time.
+    """
+
+    def __init__(self) -> None:
+        self.counts: dict = _path_call_counts()
+        self._originals: dict = {}
+
+    def __enter__(self) -> dict:
+        from yggdrasil.io.path.path import Path as _Path
+
+        # Methods that hit the storage backend (or could). The size
+        # property is also a stat in disguise on remote backends.
+        for name in (
+            "exists", "iterdir", "stat", "open", "read_bytes",
+            "write_bytes", "is_dir", "is_file", "unlink", "mkdir",
+        ):
+            attr = getattr(_Path, name, None)
+            if attr is None or not callable(attr):
+                continue
+            counts = self.counts
+            self._originals[name] = attr
+
+            def _wrap(orig=attr, counter_name=name):
+                def _spy(*args, **kwargs):
+                    counts[counter_name] += 1
+                    return orig(*args, **kwargs)
+                return _spy
+
+            setattr(_Path, name, _wrap())
+        # ``size`` is a property — patch via descriptor.
+        size_prop = getattr(_Path, "size", None)
+        if isinstance(size_prop, property):
+            self._originals["size"] = size_prop
+            counts = self.counts
+
+            def _size_fget(s, _orig=size_prop.fget):
+                counts["size"] += 1
+                return _orig(s)
+            setattr(_Path, "size", property(_size_fget))
+        return self.counts
+
+    def __exit__(self, *_exc) -> None:
+        from yggdrasil.io.path.path import Path as _Path
+        for name, orig in self._originals.items():
+            setattr(_Path, name, orig)
+
+
+def _path_call_scenarios(
+    table_path: Path,
+    rows: int,
+    partitions: int,
+    repeat: int,
+) -> list[dict]:
+    """Path-method call counters for the canonical read/write shapes.
+
+    The wall-clock numbers in :func:`_read_scenarios` /
+    :func:`_write_scenarios` reflect mostly the parquet decode + Arrow
+    work. The interesting number for remote-store performance is the
+    *count* of ``Path`` method calls each scenario makes — every
+    ``exists`` / ``iterdir`` / ``open`` / ``stat`` is one network
+    round trip on S3, DBFS, or ABFS.
+
+    Reports one line per scenario with the call breakdown. ``best`` /
+    ``median`` are still useful (the spy is cheap) so the table
+    formatter doesn't need a separate row shape.
+    """
+    out: list[dict] = []
+    keys = PARTITION_KEYS[:partitions]
+    target_key = keys[0]
+
+    def _run_with_counts(
+        label: str,
+        fn: Callable[[], object],
+    ) -> dict:
+        # Warmup once outside the spy so import-time path probes
+        # don't pollute the counters.
+        fn()
+        timings: list[float] = []
+        with _PathCallSpy() as counts:
+            for _ in range(repeat):
+                t0 = time.perf_counter()
+                fn()
+                timings.append(time.perf_counter() - t0)
+        # Per-run averages — divide total counts by repeat so the
+        # reported number is "calls per read/write" not "total".
+        per_run = {k: v // max(1, repeat) for k, v in counts.items()}
+        nonzero = {k: v for k, v in per_run.items() if v > 0}
+        # Pack the counts into the label so the standard
+        # _fmt-style row still works.
+        suffix = " ".join(f"{k}={v}" for k, v in sorted(nonzero.items()))
+        full_label = f"{label}  [{suffix}]"
+        return {
+            "label": full_label,
+            "best": min(timings),
+            "median": statistics.median(timings),
+            "mean": statistics.fmean(timings),
+            "peak_mem_bytes": 0,
+        }
+
+    out.append(_run_with_counts(
+        "path-calls: read streamed full-scan",
+        lambda: _count_streamed_rows(
+            DeltaFolder(path=str(table_path)).read_arrow_batches()
+        ),
+    ))
+    out.append(_run_with_counts(
+        f"path-calls: read predicate region == {target_key}",
+        lambda: _count_streamed_rows(
+            DeltaFolder(path=str(table_path)).read_arrow_batches(
+                options=DeltaOptions(predicate=expr_col("region") == target_key),
+            )
+        ),
+    ))
+    out.append(_run_with_counts(
+        "path-calls: snapshot-only (resolve + log replay, no parquet open)",
+        lambda: DeltaFolder(path=str(table_path)).snapshot(fresh=True),
+    ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Concurrency — N writers racing on the same Delta table
+#
+# Each writer goes through the same retry loop. Exercises the path the
+# real workloads hit when N ingestion tasks fan out on the same
+# partition table. Reports wall-clock to land all N commits + the
+# total retry count across writers — a regression that flips the
+# retry loop into a hot busy-spin shows up as a retry explosion.
+# ---------------------------------------------------------------------------
+
+
+def _concurrency_scenarios(repeat: int) -> list[dict]:
+    """N concurrent writers committing to one Delta table."""
+    import threading
+
+    out: list[dict] = []
+    seed = pa.table({"id": [0]})
+
+    def _run_concurrent(num_writers: int) -> tuple[float, int]:
+        tmp = tempfile.mkdtemp(prefix="ygg-delta-cc-")
+        try:
+            # Initialise the table once so all writers start with the
+            # same view of HEAD.
+            DeltaFolder(path=tmp + "/t").write_arrow_table(seed)
+
+            retries = {"n": 0}
+            barrier = threading.Barrier(num_writers)
+
+            def _writer(i: int) -> None:
+                d = DeltaFolder(path=tmp + "/t")
+                # Track retries by spying on _commit_atomic.
+                orig = d._commit_atomic
+                local_retries = [-1]  # first call is the initial attempt
+
+                def _spy(version, actions):
+                    local_retries[0] += 1
+                    return orig(version, actions)
+
+                d._commit_atomic = _spy  # type: ignore[assignment]
+                barrier.wait()  # synchronise the race start
+                d.write_arrow_batches(
+                    pa.table({"id": [i + 1]}).to_batches(),
+                    options=DeltaOptions(
+                        mode=Mode.APPEND,
+                        commit_max_retries=64,
+                        commit_retry_backoff=0.005,
+                        commit_retry_jitter=0.005,
+                        commit_retry_max_delay=0.05,
+                    ),
+                )
+                retries["n"] += local_retries[0]
+
+            threads = [
+                threading.Thread(target=_writer, args=(i,))
+                for i in range(num_writers)
+            ]
+            t0 = time.perf_counter()
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            elapsed = time.perf_counter() - t0
+
+            # Sanity — every writer's commit landed (versions
+            # 1..num_writers on top of the seed at v0).
+            head = DeltaFolder(path=tmp + "/t").snapshot(fresh=True)
+            assert head.version == num_writers, (
+                f"expected version={num_writers}, got {head.version}"
+            )
+            return elapsed, retries["n"]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    for n in (2, 4, 8):
+        elapsed_samples: list[float] = []
+        retry_samples: list[int] = []
+        for _ in range(repeat):
+            e, r = _run_concurrent(n)
+            elapsed_samples.append(e)
+            retry_samples.append(r)
+        # Pack retry count into the label (one number per scenario).
+        median_retries = statistics.median(retry_samples)
+        out.append({
+            "label": f"concurrency: {n} writers racing  [retries={int(median_retries)}]",
+            "best": min(elapsed_samples),
+            "median": statistics.median(elapsed_samples),
+            "mean": statistics.fmean(elapsed_samples),
+            "peak_mem_bytes": 0,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Deletion vectors — DV decode + per-batch masking
+# ---------------------------------------------------------------------------
+
+
+def _deletion_vector_scenarios(repeat: int) -> list[dict]:
+    """DV decode + mask throughput.
+
+    Sparse vs dense DV against a 10k-row batch. The mask hot path was
+    rewritten to vectorise through numpy + pyarrow.compute — this
+    pins the per-batch cost so the row-loop regression surfaces.
+    """
+    from yggdrasil.io.nested.delta.deletion_vector import (
+        DeletionVector, DeletionVectorDescriptor, mask_batch_with_dv,
+    )
+
+    out: list[dict] = []
+    n = 10_000
+    batch = pa.RecordBatch.from_pydict({
+        "id": pa.array(range(n), type=pa.int64()),
+        "val": pa.array([f"row-{i}" for i in range(n)], type=pa.string()),
+    })
+
+    descriptor_inline = DeletionVectorDescriptor(
+        storage_type="i",
+        path_or_inline_dv="",  # not consulted when deleted_rows is set
+        offset=0,
+        size_in_bytes=0,
+        cardinality=0,
+    )
+
+    sparse_dv = DeletionVector(
+        descriptor=descriptor_inline,
+        deleted_rows=frozenset(range(0, n, 1000)),  # 10 rows
+    )
+    medium_dv = DeletionVector(
+        descriptor=descriptor_inline,
+        deleted_rows=frozenset(range(0, n, 10)),  # 1000 rows
+    )
+    dense_dv = DeletionVector(
+        descriptor=descriptor_inline,
+        deleted_rows=frozenset(range(0, n // 2)),  # 5000 rows
+    )
+
+    out.append(_time_one(
+        f"dv-mask: sparse ({len(sparse_dv.deleted_rows)} / {n} rows deleted)",
+        lambda: mask_batch_with_dv(batch, sparse_dv),
+        repeat=repeat, inner=200,
+    ))
+    out.append(_time_one(
+        f"dv-mask: medium ({len(medium_dv.deleted_rows)} / {n} rows deleted)",
+        lambda: mask_batch_with_dv(batch, medium_dv),
+        repeat=repeat, inner=200,
+    ))
+    out.append(_time_one(
+        f"dv-mask: dense ({len(dense_dv.deleted_rows)} / {n} rows deleted)",
+        lambda: mask_batch_with_dv(batch, dense_dv),
+        repeat=repeat, inner=200,
+    ))
+    return out
+
+
 def scenarios(
     rows: int,
     partitions: int,
@@ -488,10 +802,13 @@ def scenarios(
         )
         out: list[dict] = []
         out.extend(_extractor_scenarios(repeat))
+        out.extend(_deletion_vector_scenarios(repeat))
         out.extend(_write_scenarios(
             table, rows, partitions, batch_rows, repeat,
         ))
         out.extend(_read_scenarios(read_path, rows, partitions, repeat))
+        out.extend(_path_call_scenarios(read_path, rows, partitions, repeat))
+        out.extend(_concurrency_scenarios(repeat))
         return out
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)

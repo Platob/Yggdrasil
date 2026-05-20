@@ -538,21 +538,45 @@ def mask_batch_with_dv(
     when a parquet is read in chunks and the DV's row ids are
     file-relative.
 
+    Mask construction is vectorised through numpy: a boolean array
+    of size ``n`` (one row per batch position) gets ``False`` written
+    at every in-range deleted offset, and the inverted mask drives a
+    single ``RecordBatch.filter`` kernel — no per-row Python loop
+    even when the DV's deleted set is large.
+
     Imported lazily to keep the cold module import cheap.
     """
+    import numpy as np
     import pyarrow as pa  # local — keeps the cold module import cheap.
+    import pyarrow.compute as pc
 
     if dv is None or dv.is_empty():
         return batch
     n = batch.num_rows
     if n == 0:
         return batch
+
     deleted = dv.deleted_rows
-    keep = [i for i in range(n) if (base_offset + i) not in deleted]
-    if len(keep) == n:
+    # Build the keep-mask vectorised. Materialise the deleted set
+    # into a numpy int64 array once (one Python-side hop, then C
+    # speed everywhere downstream), translate to batch-relative
+    # indices, and drop anything outside ``[0, n)``.
+    if not deleted:
         return batch
-    if not keep:
+    del_arr = np.fromiter(deleted, dtype=np.int64, count=len(deleted))
+    rel = del_arr - np.int64(base_offset)
+    in_range = (rel >= 0) & (rel < np.int64(n))
+    if not in_range.any():
+        return batch
+    rel = rel[in_range]
+
+    keep = np.ones(n, dtype=bool)
+    keep[rel] = False
+    if keep.all():
+        return batch
+    if not keep.any():
         return batch.slice(0, 0)
-    indices = pa.array(keep, type=pa.int64())
-    table = pa.Table.from_batches([batch]).take(indices)
-    return table.to_batches()[0] if table.num_rows else batch.slice(0, 0)
+
+    # One pyarrow.compute call masks every column in the batch.
+    mask = pa.array(keep)
+    return pc.filter(batch, mask)
