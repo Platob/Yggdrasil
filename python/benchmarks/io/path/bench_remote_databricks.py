@@ -104,11 +104,16 @@ def _total_sdk_calls(workspace: MagicMock) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _stub_databricks_client(*, payload: bytes = b"") -> tuple[MagicMock, MagicMock]:
-    """Return ``(client, workspace)`` pair shaped like ``DatabricksClient``.
+def _stub_databricks_service(*, payload: bytes = b"") -> tuple[MagicMock, MagicMock, MagicMock]:
+    """Return ``(service, client, workspace)`` shaped like a
+    :class:`DatabricksService` / :class:`DatabricksClient` /
+    :class:`databricks.sdk.WorkspaceClient` chain.
 
-    Configures the most common SDK return values so the path
-    operations succeed end-to-end:
+    :class:`DatabricksPath` reaches the workspace SDK through
+    ``self.service.client.workspace_client()`` — wiring a service-
+    shaped mock keeps the construction path independent of real
+    Databricks credentials. Configures the most common SDK return
+    values so the path operations succeed end-to-end:
 
     * ``dbfs.get_status`` → file with ``len(payload)`` bytes.
     * ``dbfs.read`` → base64 of ``payload`` in a single page (short
@@ -117,7 +122,8 @@ def _stub_databricks_client(*, payload: bytes = b"") -> tuple[MagicMock, MagicMo
     * ``workspace.workspace.get_status`` → NOTEBOOK kind.
     """
     import base64
-    client = MagicMock()
+    service = MagicMock()
+    client = service.client
     workspace = client.workspace_client.return_value
 
     # DBFS surface
@@ -159,7 +165,7 @@ def _stub_databricks_client(*, payload: bytes = b"") -> tuple[MagicMock, MagicMo
         size=len(payload),
         modified_at=1_700_000_000_000,
     )
-    return client, workspace
+    return service, client, workspace
 
 
 class _ReadOnce:
@@ -193,23 +199,23 @@ def scenarios(repeat: int) -> list[dict]:
     # DBFS construction + traversal
     # -------------------------------------------------------------------
 
-    client, workspace = _stub_databricks_client(payload=parquet_payload)
+    service, client, workspace = _stub_databricks_service(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
 
     out.append(_time_one(
         "DBFSPath('/dbfs/x') singleton hit",
-        lambda: DBFSPath("/dbfs/foo/bar.parquet", client=client),
+        lambda: DBFSPath("/dbfs/foo/bar.parquet", service=service),
         repeat=repeat, inner=20_000,
     ))
 
-    deep = DBFSPath("/dbfs/a/b/c/d/e/file.parquet", client=client)
+    deep = DBFSPath("/dbfs/a/b/c/d/e/file.parquet", service=service)
     out.append(_time_one(
         "DBFSPath.parent (5 levels)",
         lambda: _walk_parents(deep, 5),
         repeat=repeat, inner=5_000,
     ))
 
-    base = DBFSPath("/dbfs/base/", client=client)
+    base = DBFSPath("/dbfs/base/", service=service)
     out.append(_time_one(
         "DBFSPath.joinpath('sub', 'file.csv')",
         lambda: base.joinpath("sub", "file.csv"),
@@ -220,9 +226,9 @@ def scenarios(repeat: int) -> list[dict]:
     # DBFS — stat / read with SDK call counts
     # -------------------------------------------------------------------
 
-    client, workspace = _stub_databricks_client(payload=parquet_payload)
+    service, client, workspace = _stub_databricks_service(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
-    p = DBFSPath("/dbfs/x.parquet", client=client)
+    p = DBFSPath("/dbfs/x.parquet", service=service)
     p.invalidate_singleton(remove_global=False)
     workspace.dbfs.get_status.reset_mock()
     workspace.dbfs.read.reset_mock()
@@ -252,9 +258,9 @@ def scenarios(repeat: int) -> list[dict]:
     # read_bytes — should be one ``dbfs.read`` round trip (no preceding
     # ``get_status`` because :meth:`DatabricksPath.read_mv` short-circuits
     # the whole-file case).
-    client, workspace = _stub_databricks_client(payload=parquet_payload)
+    service, client, workspace = _stub_databricks_service(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
-    p = DBFSPath("/dbfs/x.parquet", client=client)
+    p = DBFSPath("/dbfs/x.parquet", service=service)
     p.invalidate_singleton(remove_global=False)
     workspace.dbfs.get_status.reset_mock()
     workspace.dbfs.read.reset_mock()
@@ -272,9 +278,9 @@ def scenarios(repeat: int) -> list[dict]:
     # Volume — stat / read with SDK call counts
     # -------------------------------------------------------------------
 
-    client, workspace = _stub_databricks_client(payload=parquet_payload)
+    service, client, workspace = _stub_databricks_service(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
-    p = VolumePath("/Volumes/cat/sch/vol/x.parquet", client=client)
+    p = VolumePath("/Volumes/cat/sch/vol/x.parquet", service=service)
     p.invalidate_singleton(remove_global=False)
     workspace.files.get_metadata.reset_mock()
     workspace.files.download.reset_mock()
@@ -300,9 +306,9 @@ def scenarios(repeat: int) -> list[dict]:
         ),
     })
 
-    client, workspace = _stub_databricks_client(payload=parquet_payload)
+    service, client, workspace = _stub_databricks_service(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
-    p = VolumePath("/Volumes/cat/sch/vol/x.parquet", client=client)
+    p = VolumePath("/Volumes/cat/sch/vol/x.parquet", service=service)
     p.invalidate_singleton(remove_global=False)
     workspace.files.get_metadata.reset_mock()
     workspace.files.download.reset_mock()
@@ -324,10 +330,10 @@ def scenarios(repeat: int) -> list[dict]:
     # bottom out in one download — the optimizer should fold the
     # size-probe and the read into a single round trip.
 
-    client, workspace = _stub_databricks_client(payload=parquet_payload)
+    service, client, workspace = _stub_databricks_service(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
     pio = ParquetFile(holder=VolumePath(
-        "/Volumes/cat/sch/vol/x.parquet", client=client,
+        "/Volumes/cat/sch/vol/x.parquet", service=service,
     ))
     pio.holder.invalidate_singleton(remove_global=False)
     workspace.files.get_metadata.reset_mock()
@@ -343,9 +349,9 @@ def scenarios(repeat: int) -> list[dict]:
     })
 
     # Same for DBFS.
-    client, workspace = _stub_databricks_client(payload=parquet_payload)
+    service, client, workspace = _stub_databricks_service(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
-    pio = ParquetFile(holder=DBFSPath("/dbfs/x.parquet", client=client))
+    pio = ParquetFile(holder=DBFSPath("/dbfs/x.parquet", service=service))
     pio.holder.invalidate_singleton(remove_global=False)
     workspace.dbfs.get_status.reset_mock()
     workspace.dbfs.read.reset_mock()
@@ -360,10 +366,10 @@ def scenarios(repeat: int) -> list[dict]:
     })
 
     # collect_schema — should hit the cheap footer read path.
-    client, workspace = _stub_databricks_client(payload=parquet_payload)
+    service, client, workspace = _stub_databricks_service(payload=parquet_payload)
     RemotePath._INSTANCES.clear()
     pio = ParquetFile(holder=VolumePath(
-        "/Volumes/cat/sch/vol/x.parquet", client=client,
+        "/Volumes/cat/sch/vol/x.parquet", service=service,
     ))
     pio.holder.invalidate_singleton(remove_global=False)
     workspace.files.get_metadata.reset_mock()
@@ -381,16 +387,16 @@ def scenarios(repeat: int) -> list[dict]:
     # Timings for the same operations
     out.append(_time_one(
         "ParquetFile(VolumePath).read_arrow_table",
-        lambda: _read_via_volume_path(client, parquet_payload),
+        lambda: _read_via_volume_path(service, parquet_payload),
         repeat=repeat, inner=200,
     ))
 
     return out
 
 
-def _read_via_volume_path(client, payload):
+def _read_via_volume_path(service, payload):
     RemotePath._INSTANCES.clear()
-    workspace = client.workspace_client.return_value
+    workspace = service.client.workspace_client.return_value
     # Re-prime the download response so each call gets a fresh _ReadOnce.
     workspace.files.download.return_value = SimpleNamespace(
         contents=_ReadOnce(payload),
@@ -398,7 +404,7 @@ def _read_via_volume_path(client, payload):
         last_modified="Mon, 01 Jan 2024 00:00:00 GMT",
     )
     return ParquetFile(holder=VolumePath(
-        "/Volumes/cat/sch/vol/x.parquet", client=client,
+        "/Volumes/cat/sch/vol/x.parquet", service=service,
     )).read_arrow_table()
 
 

@@ -133,17 +133,26 @@ class S3Path(RemotePath):
         callers share one instance per URL without paying the
         singleton key for explicit services.
         """
-        if url is None and isinstance(data, URL):
-            url = data
-        elif url is None and isinstance(data, str):
-            url = URL.from_(data)
         if url is None:
-            # No URL → no canonical identity. Fall back to a unique
-            # sentinel so the Singleton machinery doesn't collide
-            # unrelated paths.
-            return (cls, object())
-        normalized = cls._normalize_scheme(URL.from_(url))
-        return (cls, str(normalized), service)
+            if isinstance(data, URL):
+                url = data
+            elif isinstance(data, str):
+                url = URL.from_(data)
+            else:
+                # No URL → no canonical identity. Fall back to a unique
+                # sentinel so the Singleton machinery doesn't collide
+                # unrelated paths.
+                return (cls, object())
+        # ``url`` is already a :class:`URL` at this point — the
+        # ``URL.from_(url)`` no-op short-circuit costs a function call
+        # plus an ``isinstance`` probe per construction and the
+        # canonical s3 scheme covers >99% of real callers, so the
+        # ``_normalize_scheme`` fast path returns ``url`` unchanged.
+        # ``URL`` is hashable (``hash(self.to_string())``) and equal
+        # field-by-field, so it works as a dict key directly — drop the
+        # ``str(...)`` round trip that was building (and hashing) a
+        # fresh string on every singleton lookup.
+        return (cls, cls._normalize_scheme(url), service)
 
     # ==================================================================
     # Construction
