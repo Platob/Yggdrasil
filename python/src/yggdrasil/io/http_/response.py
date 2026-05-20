@@ -3,7 +3,16 @@ from __future__ import annotations
 import datetime as dt
 from typing import TYPE_CHECKING, Mapping, Optional
 
-from urllib3 import BaseHTTPResponse
+try:
+    # urllib3 2.x — ``BaseHTTPResponse`` is the public ABC every concrete
+    # response type (including ``HTTPResponse``) inherits from.
+    from urllib3 import BaseHTTPResponse
+except ImportError:  # pragma: no cover — urllib3 1.x branch
+    # urllib3 1.x has no ``BaseHTTPResponse``; the concrete
+    # ``urllib3.response.HTTPResponse`` is the only response type and
+    # plays the same role here (we only ever call ``.status``,
+    # ``.headers``, ``.stream``, ``.read``, ``.release_conn``).
+    from urllib3.response import HTTPResponse as BaseHTTPResponse  # type: ignore[assignment]
 
 from ..holder import Holder
 from ..memory import Memory

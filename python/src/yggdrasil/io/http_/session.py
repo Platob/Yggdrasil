@@ -1,7 +1,14 @@
-"""Concrete HTTP/HTTPS session backed by ``urllib3``."""
+"""Concrete HTTP/HTTPS session backed by ``urllib3``.
+
+Supports urllib3 ``>=1.26`` and ``>=2.0`` on the same code path —
+the two version-shaped knobs are isolated to module-level probes
+(:data:`_RETRY_ACCEPTS_BACKOFF_MAX`) so the rest of the file reads
+the same on either install.
+"""
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 from itertools import takewhile
 from typing import Optional
 
@@ -22,6 +29,14 @@ from ..session import Session
 from .response import HTTPResponse
 
 __all__ = ["HTTPSession"]
+
+# urllib3 ``Retry`` gained ``backoff_max`` as a constructor kwarg in 2.0.
+# On 1.x the cap lives as the ``Retry.BACKOFF_MAX`` class attribute (we
+# pin it via ``_TieredRetry.BACKOFF_MAX`` below so both versions honor
+# the same ceiling).
+_RETRY_ACCEPTS_BACKOFF_MAX: bool = (
+    "backoff_max" in inspect.signature(urllib3.Retry.__init__).parameters
+)
 
 
 # Backoff tuning. 429s still get a longer schedule than 5xx because rate
@@ -60,6 +75,13 @@ class _TieredRetry(urllib3.Retry):
       ``respect_retry_after_header=True`` — always overrides this, because
       ``urllib3`` checks ``get_retry_after`` before ``get_backoff_time``.
     """
+
+    # urllib3 1.x reads the backoff ceiling from this class attribute
+    # (there is no constructor kwarg). urllib3 2.x still consults the
+    # attribute as the default when ``backoff_max`` is not passed, so
+    # pinning it here keeps the ceiling consistent across versions even
+    # if a future call site drops the explicit kwarg.
+    BACKOFF_MAX = _BACKOFF_429_MAX
 
     def get_backoff_time(self) -> float:  # type: ignore[override]
         # Mirror urllib3's own short-circuit: no backoff before the second
@@ -147,7 +169,7 @@ class HTTPSession(Session):
         Subclasses can override to swap the policy entirely, or call
         ``super()._build_retry().new(...)`` to tweak a single field.
         """
-        return _TieredRetry(
+        kwargs: dict = dict(
             total=_RETRY_TOTAL,
             connect=_RETRY_CONNECT,
             read=_RETRY_READ,
@@ -163,8 +185,13 @@ class HTTPSession(Session):
             # fallback path (e.g. .new() that drops back to base behavior) is
             # still well-behaved.
             backoff_factor=_BACKOFF_5XX_FACTOR,
-            backoff_max=_BACKOFF_429_MAX,
         )
+        if _RETRY_ACCEPTS_BACKOFF_MAX:
+            # urllib3 2.x — explicit kwarg. urllib3 1.x has no such kwarg;
+            # the ceiling is enforced via ``_TieredRetry.BACKOFF_MAX``
+            # (class attribute) on that branch instead.
+            kwargs["backoff_max"] = _BACKOFF_429_MAX
+        return _TieredRetry(**kwargs)
 
     def _build_http_pool(self) -> urllib3.PoolManager:
         return urllib3.PoolManager(

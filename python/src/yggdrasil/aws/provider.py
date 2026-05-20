@@ -27,6 +27,7 @@ role ARN, …). Everything else — the singleton dance, the per-region
 
 from __future__ import annotations
 
+import logging
 import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple
@@ -40,6 +41,8 @@ if TYPE_CHECKING:
 
 
 __all__ = ["AwsCredentialsProvider"]
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AwsCredentialsProvider(ABC):
@@ -118,6 +121,9 @@ class AwsCredentialsProvider(ABC):
             existing = self._client_cache.get(region)
             if existing is not None:
                 return existing
+            LOGGER.debug(
+                "Building AWS client for provider %r (region=%r)", self, region,
+            )
             from .client import AWSClient
             client = AWSClient.from_refresher(self, region=region)
             self._client_cache[region] = client
