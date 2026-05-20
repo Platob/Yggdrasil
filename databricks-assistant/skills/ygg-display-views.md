@@ -227,6 +227,29 @@ Display tasks run in parallel after curated lands. A failure on one
 display task doesn't roll back the upstream curated refresh — that
 stays available to other consumers.
 
+## When a `dash_*` table isn't enough — graduate to a Databricks App
+
+Display tables are read through whatever the consumer prefers:
+Databricks SQL, Power BI, Tableau, Hex, an AI/BI Dashboard, or
+a Databricks App. The decision is mostly the consumer's, but two
+shapes specifically call for [`ygg-databricks-apps`](ygg-databricks-apps.md):
+
+- **Interactive controls or write-back** — slider that re-runs a
+  scoring job, button that promotes a model challenger, form that
+  triggers a counterfactual simulation. AI/BI tiles can't write;
+  an App backend can call `dbc.jobs.run(...)`.
+- **Custom layout, map + table + chart combined, sub-second renders
+  on a hot pre-aggregated table** — the UX of a real React frontend
+  (`react-leaflet` / `deck.gl` over the geo columns this layer
+  already inlines) plus Arrow IPC over HTTP for the wire format.
+
+Apps still read from `dash_*` tables — they don't replace this
+layer, they sit downstream of it. Build the display table first;
+point the App at it. See
+[`ygg-databricks-apps`](ygg-databricks-apps.md) for the two
+recipes (FastAPI + Next.js, or Next.js full-stack), OAuth OBO
+auth, the world-map shapes, and the deploy story.
+
 ## When NOT to build a display table
 
 - **Ad-hoc analyst exploration.** Curated tables are the right read

@@ -509,6 +509,27 @@ signal scoring + position sizing + risk + P&L + dashboard refresh
 are all UC-Delta jobs → **serverless** (`environment_key=DEFAULT_ENVIRONMENT_KEY`).
 Only the ingestion upstream needs classic compute.
 
+## Trader-facing surfaces — dashboard vs Databricks App
+
+The trader consumes through one of two surfaces; pick by
+interactivity, the same way the modelist does:
+
+| Surface | When |
+| --- | --- |
+| **AI/BI Dashboard** over `dash_analyst_<task>_*` | Read-only morning pack; embedded share link; "scroll and filter" UX. |
+| **Databricks App** ([Next.js + FastAPI or Next.js full-stack](ygg-databricks-apps.md)) | Trader needs a **world map** with per-zone clearing prices + position markers + cross-border flow arcs on one canvas; or a button that re-scores / promotes a signal; or sub-second tile renders the SQL Warehouse can't deliver. |
+
+When the desk's map view matters — EU bidding-zone choropleth
+coloured by today's price, position pins at zone centroids
+sized by `notional_eur`, deck.gl arc layer for cross-zone
+flows — graduate to a Databricks App. The curated geo columns
+this skill (and [`ygg-curated-views`](ygg-curated-views.md#3b-geographic-data--always-carry-latlon--optional-polygon))
+already ship (`lat`/`lon`, `boundary_geojson`, `geo_point`)
+are exactly what `react-leaflet` and `deck.gl` consume; no
+extra ingestion needed. Full recipe (backend split, OAuth OBO,
+Arrow IPC wire format, map plugins, trading-KPI tile set, deploy)
+lives in [`ygg-databricks-apps`](ygg-databricks-apps.md).
+
 ## Picking the analyst's reporting currency
 
 The book's `base_currency_iso` is a configuration knob, not a

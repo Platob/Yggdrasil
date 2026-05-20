@@ -120,7 +120,35 @@ args when the level is disabled. Keep the guard only when there's
 real pre-computation (materialising a generator, building a summary
 dict) outside the call.
 
-### 10. Logging cache hits at debug
+### 10. Row-shape data between pipeline stages
+
+```python
+# bad — both stages know the schema; the dict carrier re-infers per row
+def fetch_pages(url) -> Iterable[dict]:
+    for page in paginate(url):
+        for row in page["items"]:
+            yield row
+
+def write_rows(rows: Iterable[dict], target_table):
+    for row in rows:
+        dbc.sql.execute(f"INSERT INTO {target_table} VALUES (...)", row)
+
+# good — one Arrow batch crosses the boundary, vectorised cast + insert
+def fetch_pages(url, schema: Schema) -> Iterator[pa.RecordBatch]:
+    for page in paginate(url):
+        yield pa.RecordBatch.from_pylist(page["items"], schema=schema.arrow_schema)
+
+def write_batches(batches: Iterator[pa.RecordBatch], target_table):
+    dbc.table(target_table).insert(pa.Table.from_batches(batches), mode="APPEND")
+```
+
+Same trap with `.collect()` / `.iter_rows(named=True)` / `.to_pylist()`
+between a Spark / Polars producer and a Python consumer that both
+know the schema. Pass Arrow batches (or a Spark DataFrame on the
+Spark path); per-row dicts are for genuine row endpoints (ndjson,
+kafka producers, JSON HTTP responses), not for inter-stage transport.
+
+### 11. Logging cache hits at debug
 
 Hits are the steady-state success path; they drown the rare
 interesting events. Log misses / expiries / invalidations instead:

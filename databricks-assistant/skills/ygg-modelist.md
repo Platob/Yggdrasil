@@ -391,7 +391,7 @@ Two reach paths to the trader / risk officer; pick by interactivity:
 | Surface | When |
 | --- | --- |
 | **AI/BI Dashboard** (workspace dashboard reading `dash_ml_<task>_*` over SQL Warehouse) | Filter-and-scroll consumption; embeddable share link; no write-back needed. |
-| **Databricks App** (Streamlit / Dash served by Lakehouse Apps) | Interactive controls — re-score with custom features, counterfactual simulation, accept/reject a candidate for promotion. |
+| **Databricks App** ([Next.js + FastAPI or Next.js full-stack](ygg-databricks-apps.md), served by Lakehouse Apps) | Interactive controls — re-score with custom features, counterfactual simulation, accept/reject a candidate for promotion; sub-second map / KPI renders via Arrow IPC; SQL Warehouse round-trip per tile is too slow. |
 
 Tile layout the modelist ships by default (same on both surfaces):
 
@@ -414,17 +414,26 @@ Tile layout the modelist ships by default (same on both surfaces):
 ### Databricks App write-paths
 
 When the trader needs interactivity (override promotion,
-counterfactual simulation), build a Databricks App. Rules:
+counterfactual simulation), build a Databricks App over the
+same `dash_ml_<task>_*` tables. Full recipe — backend / frontend
+split, OAuth OBO, Arrow IPC wire format, map plugin choice,
+deploy — lives in [`ygg-databricks-apps`](ygg-databricks-apps.md).
+Modelist-specific rules that bind the app to this skill:
 
-- **Read paths** hit the SQL Warehouse via
-  `databricks-sql-connector` (or `DatabricksClient`) on the same
-  `dash_ml_<task>_*` tables the dashboard reads. Don't re-implement.
+- **Read paths** hit the SQL Warehouse on the same
+  `dash_ml_<task>_*` tables the dashboard reads. Don't re-implement
+  scoring in the app.
 - **Write paths** (override champion, counterfactual scoring) call
-  the modelist's *training / scoring callables via the Jobs API* —
-  never re-implement the logic in the app. The app is a UI shell
-  over the Job DAG.
+  the modelist's *training / scoring callables via the Jobs API*
+  (`dbc.jobs.find(name=...).run()`) — never re-implement the logic
+  in the app. The app is a UI shell over the Job DAG.
 - **Auth** — OAuth on-behalf-of, so RBAC on the tables / registered
   model carries through. No service-principal keys in the app.
+- **Audit** — every UI write lands a row in
+  `audit_app_actions_ml_<task>` with
+  `(user_email, action, payload_json, performed_at_utc)`. Apps run
+  outside the curated provenance trail; this is how you reconstruct
+  who promoted what.
 
 ## Trading-decision KPIs — make them computable
 

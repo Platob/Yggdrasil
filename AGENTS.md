@@ -545,6 +545,77 @@ vectorised form first. Same goes for `series.tolist()` /
 `df.values.tolist()` / numpy `arr.tolist()` — those are the same
 trap dressed in different syntax.
 
+### 6b. Prefer Arrow / Spark batch transports across pipeline stages
+
+When data flows from a producer to a consumer in a **streaming
+pipeline of same-structure records** — paginated HTTP responses
+with one schema, Kafka topic with a fixed value schema, CSV / NDJSON
+chunks of a known table shape, SQL result that feeds the next
+transform, Job-task output read by the next task — the unit that
+crosses the stage boundary should be an **Arrow batch** (`pa.Table`
+/ `pa.RecordBatch` / `RecordBatchReader`) or a **Spark DataFrame**
+on the Spark path, not a list / iterator of Python dicts / rows /
+namedtuples. The schema is the same on every record; pay the
+column-oriented packing cost once at the boundary and the rest of
+the pipeline runs in the C++ runtime / JVM.
+
+Default to:
+
+- **Producer side**: emit batches. `pa.json.read_json` and
+  `pa.csv.read_csv` already return `pa.Table`; a hand-rolled API
+  paginator should accumulate `N` pages into one `pa.RecordBatch`
+  (or yield one batch per page) instead of returning
+  `Iterable[dict]`. See `yggdrasil.io.tabular.Tabular.read_arrow_batches`
+  for the canonical iterator shape.
+- **Consumer side**: iterate batches, not rows.
+  `for batch in source.read_arrow_batches(options)` is correct;
+  `for row in source.read_records()` is the trap. Apply the
+  vectorised transform (§6) on each batch, write the result on,
+  never unfolding into Python objects between stages.
+- **Cross-process / cross-language** (Python ↔ Java ↔ Rust ↔ JS):
+  use Arrow IPC — `pa.ipc.RecordBatchStreamWriter` /
+  `RecordBatchStreamReader`, the `.arrow` / `.parquet` on-disk
+  formats, or Arrow Flight when latency matters. The wire format
+  preserves field names, dtypes, nullability, and nested structure
+  for free; downstream code reads the schema, doesn't reconstruct
+  it from a JSON shape it guessed.
+- **Spark-resident workloads**: keep the data in `DataFrame` until
+  the actual sink. Don't `df.collect()` → list of `Row` → loop;
+  build the transformation as Spark Column expressions and let
+  Catalyst plan it. When you genuinely need to leave Spark, hand
+  off via `df.toArrow()` / `df.toPandas()` (Arrow-backed) — the
+  batch boundary, not the row boundary.
+- **Same-structure stream off a queue / socket** (Kafka, Kinesis,
+  Pub/Sub, websocket, SSE): pull `N` messages, parse the `N`
+  payloads in one vectorised `pa.json.read_json` /
+  Polars `read_ndjson` call, write one Arrow batch downstream.
+  Per-message parse-then-append is the same row-loop trap as §6.
+
+Red flags that you are crossing a stage boundary in row shape:
+
+- a function whose signature is `Iterable[dict]` /
+  `Generator[dict, …]` between two pipeline stages that share a
+  schema — both sides know the columns, the dict carrier is
+  re-inferring them per row
+- `[row for row in result.iter_rows(named=True)]` materialising a
+  full result set into Python dicts before handing off
+- `.collect()` / `.to_pylist()` on a Spark / Polars / pyarrow
+  intermediate purely to feed the next stage
+- a Job task whose output is JSON written cell-by-cell into a
+  table when both producer and consumer are inside the same DAG
+  (write a Parquet / Delta batch, the next task reads it through
+  Arrow)
+- a Kafka / Kinesis consumer that calls `process_one(record)` per
+  message instead of buffering and parsing `N` records as a batch
+
+The carveouts are the same three §6a allows: documented per-row
+fallback for shapes the vectorised reader can't emit, **genuine
+row endpoints** (ndjson / xlsx writers, kafka producers,
+mongo inserts, JSON HTTP responses where the wire shape IS one row
+per element), and diagnostics. Everywhere else, the answer to
+"how do I pass data between stages" is *one Arrow batch (or one
+Spark DataFrame) at a time*.
+
 ---
 
 ## Public API design rules
