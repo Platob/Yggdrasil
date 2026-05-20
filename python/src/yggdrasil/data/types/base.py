@@ -42,7 +42,13 @@ from yggdrasil.data.types.parser import (
     parse_data_type,
 )
 from yggdrasil.lazy_imports import field_class
-from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
+from yggdrasil.lazy_imports import (
+    pandas_module,
+    polars_module,
+    spark_column_classes,
+    spark_dataframe_classes,
+    spark_sql_module,
+)
 from yggdrasil.pickle.serde import ObjectSerde
 from ..base_meta import BaseChildrenFields
 from ..data_utils import get_cast_options_class
@@ -1973,11 +1979,11 @@ class DataType(BaseChildrenFields, ABC):
             return cls.from_spark_type(value())
         if isinstance(value, sp.types.DataType):
             return cls.from_spark_type(value)
-        if isinstance(value, sp.DataFrame):
+        if isinstance(value, spark_dataframe_classes()):
             return cls.from_spark_type(value.schema)
         if isinstance(value, sp.types.StructField):
             return cls.from_spark_type(value.dataType)
-        if isinstance(value, sp.Column):
+        if isinstance(value, spark_column_classes()):
             # Route through ``Field.from_spark_column`` so the
             # SQL-string parser (cast / alias / leaf) is the single
             # source of truth — the legacy ``_jc.expr().dataType()``

@@ -242,6 +242,63 @@ def spark_sql_module():
     return sql
 
 
+@lru_cache(maxsize=1)
+def spark_dataframe_classes() -> tuple[type, ...]:
+    """Tuple of Spark DataFrame classes for ``isinstance`` checks.
+
+    On PySpark 3.5 and earlier, ``pyspark.sql.connect.dataframe.DataFrame``
+    (the class Databricks Connect / Spark Connect sessions return from
+    ``spark.sql(...)``) is **not** a subclass of
+    ``pyspark.sql.DataFrame`` — they are parallel implementations with
+    duck-type-compatible APIs.  A bare ``isinstance(obj,
+    pyspark.sql.DataFrame)`` check rejects a perfectly valid Connect
+    DataFrame.  PySpark 4.0 collapsed both onto a common ancestor, so
+    the tuple is redundant there but still correct.
+
+    Use:
+
+        from yggdrasil.lazy_imports import spark_dataframe_classes
+        if isinstance(obj, spark_dataframe_classes()):
+            ...
+    """
+    classes: list[type] = []
+    try:
+        from pyspark.sql import DataFrame as _ClassicDataFrame
+        classes.append(_ClassicDataFrame)
+    except ImportError:
+        pass
+    try:
+        from pyspark.sql.connect.dataframe import DataFrame as _ConnectDataFrame
+        if _ConnectDataFrame not in classes:
+            classes.append(_ConnectDataFrame)
+    except ImportError:
+        pass
+    return tuple(classes)
+
+
+@lru_cache(maxsize=1)
+def spark_column_classes() -> tuple[type, ...]:
+    """Tuple of Spark Column classes for ``isinstance`` checks.
+
+    Same Connect / classic split as :func:`spark_dataframe_classes` —
+    ``pyspark.sql.connect.column.Column`` is not a subclass of
+    ``pyspark.sql.Column`` on PySpark 3.5 and earlier.
+    """
+    classes: list[type] = []
+    try:
+        from pyspark.sql import Column as _ClassicColumn
+        classes.append(_ClassicColumn)
+    except ImportError:
+        pass
+    try:
+        from pyspark.sql.connect.column import Column as _ConnectColumn
+        if _ConnectColumn not in classes:
+            classes.append(_ConnectColumn)
+    except ImportError:
+        pass
+    return tuple(classes)
+
+
 def boto3_module(*, install: bool = False):
     return _lazy_import("boto3", install=install)
 
