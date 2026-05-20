@@ -505,10 +505,24 @@ class DeltaLog:
                 # ``exists()`` probe.
                 continue
 
+            # Checkpoint contract: exactly one column is non-null per
+            # row, identifying the action kind for that row. The old
+            # shape walked rows in Python, calling ``[row_idx].as_py()``
+            # on each column until one returned non-null — O(rows ×
+            # cols) per-row Python hops, ugly on a 10k-file table.
+            #
+            # Vectorised shape: materialise each column once with
+            # ``to_pylist`` (one C-bridge pass per column), then walk
+            # rows once and dispatch by the first non-null column.
+            # Still preserves the spec's required reduction order
+            # because we iterate the table in its on-disk row order.
             cols = table.column_names
+            if not cols or table.num_rows == 0:
+                continue
+            materialised = [table.column(c).to_pylist() for c in cols]
             for row_idx in range(table.num_rows):
-                for col in cols:
-                    val = table.column(col)[row_idx].as_py()
+                for col_idx, col in enumerate(cols):
+                    val = materialised[col_idx][row_idx]
                     if val is None:
                         continue
                     yield {col: val}
