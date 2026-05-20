@@ -52,7 +52,6 @@ dev = [
   "xxhash",
   "pandas>=2.1",
   "polars>=1.3",
-  "numpy>=1.26",
   "databricks-sdk>=0.97",
   "sqlglot",
 ]
