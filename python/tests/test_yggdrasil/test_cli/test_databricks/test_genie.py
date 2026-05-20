@@ -451,15 +451,12 @@ class TestDeploySkills(CLIBase):
                 self.dest = dest
                 self.parent = _MM()
 
-            def with_client(self, _client):
-                return self
-
             def write_bytes(self, data, overwrite=False):
                 recorded.append((self.dest, data))
 
         with _patch(
             "yggdrasil.databricks.fs.workspace_path.WorkspacePath.from_",
-            side_effect=lambda dest: _StubWP(dest),
+            side_effect=lambda dest, **_kw: _StubWP(dest),
         ):
             rc = self.cli.deploy_skills()
 
@@ -493,9 +490,6 @@ class TestDeploySkills(CLIBase):
                 self.dest = dest
                 self.parent = _MM()
 
-            def with_client(self, _client):
-                return self
-
             def write_bytes(self, data, overwrite=False):
                 # Make one of the writes fail; the rest still go through.
                 if "ygg-install" in self.dest:
@@ -504,7 +498,7 @@ class TestDeploySkills(CLIBase):
 
         with _patch(
             "yggdrasil.databricks.fs.workspace_path.WorkspacePath.from_",
-            side_effect=lambda dest: _StubWP(dest),
+            side_effect=lambda dest, **_kw: _StubWP(dest),
         ):
             rc = self.cli.deploy_skills()
 
@@ -548,9 +542,6 @@ class TestDeploySkills(CLIBase):
                 self.dest = dest
                 self.parent = _MM()
 
-            def with_client(self, _client):
-                return self
-
             def write_bytes(self, data, overwrite=False):
                 recorded.append(self.dest)
 
@@ -558,7 +549,7 @@ class TestDeploySkills(CLIBase):
         with _patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              _patch(
                 "yggdrasil.databricks.fs.workspace_path.WorkspacePath.from_",
-                side_effect=lambda dest: _StubWP(dest),
+                side_effect=lambda dest, **_kw: _StubWP(dest),
              ), \
              _patch("sys.stdout", buf):
             rc = main([
