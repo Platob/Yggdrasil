@@ -720,10 +720,19 @@ class DatabricksPath(DatabricksResource, RemotePath):
         Whole-file shape (``n < 0`` and ``pos == 0``) skips the size
         probe entirely. Partial / positional reads keep the base
         bounds check so out-of-range windows still raise.
+
+        Buffered state (dirty pages from an in-flight write, or a
+        cached buffered tip) routes through the page-cache path on
+        :class:`RemotePath` instead — the dirty pages aren't on the
+        backend yet, and the fast path would silently miss them.
         """
         if cursor:
             offset = self._pos
-        if size < 0 and offset == 0:
+        buffered = (
+            self._buffersize is not None
+            and (self._dirty_pages or self._buffered_size is not None)
+        )
+        if size < 0 and offset == 0 and not buffered:
             # ``FileNotFoundError`` propagates — semantics match the
             # base ``Holder.read_mv`` which would raise on a stat
             # probe against a missing object. The :meth:`_bread`

@@ -2002,6 +2002,20 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         clean up persisted-schema scratch via
         :meth:`Tabular._unpersist_schema`.
         """
+        # Closing a cursor is the user's signal that the write
+        # transaction is done — push any deferred writes through the
+        # parent's :meth:`flush` before the ownership cascade. Buffered
+        # remote paths (S3Path, VolumePath, DBFSPath, WorkspacePath)
+        # batch writes inside an acquired window; without this hop the
+        # ``with path.open("wb") as fh: fh.write(...)`` shape loses
+        # data when the cursor borrows the parent (owns_holder=False).
+        # Read cursors and unbuffered backends are unaffected — flush
+        # is a no-op without dirty state.
+        if self._parent is not None:
+            try:
+                self._parent.flush()
+            except Exception:
+                pass
         if self._parent is not None and self._owns_parent:
             try:
                 self._parent.close()
