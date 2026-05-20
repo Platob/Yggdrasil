@@ -288,8 +288,13 @@ class DeltaIO(FolderIO):
         Pipeline:
 
         1. Resolve snapshot at ``options.version`` (HEAD by default).
-        2. Filter active files via ``options.prune_values`` (partition
-           pruning) before any parquet open.
+        2. Filter active files via partition pruning before any
+           parquet open. The accepted-value sets come from
+           ``options.prune_values`` directly *and* from
+           :func:`extract_partition_filters` walking
+           ``options.predicate`` for the partition columns — so a
+           caller who passes only a ``Predicate`` still gets file-
+           level skipping for free.
         3. Read each parquet through :class:`ParquetFile` so codec /
            memory-map / native pushdown all work as usual.
         4. Mask rows with the file's :class:`DeletionVector` when one
@@ -313,7 +318,9 @@ class DeltaIO(FolderIO):
         # reference the same DV sidecar collapse to one window read.
         sidecar_cache: dict[str, bytes] = {}
 
-        prune = options.prune_values
+        prune = _merge_prune_with_predicate(
+            options.prune_values, options.predicate, partition_columns,
+        )
         for add in snap.prune_files(prune_values=prune):
             try:
                 yield from self._read_one_add(
@@ -363,6 +370,18 @@ class DeltaIO(FolderIO):
             mode=Mode.READ_ONLY,
         )
 
+        # Row-level filter — applied after partition stamping so the
+        # predicate can reference both partition columns (carried on
+        # the AddFile, not in the parquet payload) and data columns.
+        # The partition-pruning extractor already dropped files whose
+        # partition value was rejected; this is the residual non-
+        # partition filter (the ``id > 1`` in
+        # ``region == "us" AND id > 1``) plus the partition predicate
+        # re-run as a sanity pass.
+        row_filter = _arrow_row_filter_for(
+            options.predicate, partition_columns, target_schema,
+        )
+
         base_offset = 0
         with leaf as opened:
             for batch in opened._read_arrow_batches(leaf_options):
@@ -370,12 +389,17 @@ class DeltaIO(FolderIO):
                 base_offset += batch.num_rows
                 if masked.num_rows == 0:
                     continue
-                yield self._stamp_partitions(
+                stamped = self._stamp_partitions(
                     masked,
                     add.partition_values,
                     partition_columns,
                     target_schema,
                 )
+                if row_filter is not None:
+                    stamped = row_filter(stamped)
+                    if stamped.num_rows == 0:
+                        continue
+                yield stamped
 
     @staticmethod
     def _stamp_partitions(
@@ -1539,6 +1563,121 @@ def _reinterpret_unsigned_as_signed(batch: pa.RecordBatch) -> pa.RecordBatch:
             new_arrays.append(batch.column(i))
             new_fields.append(field)
     return pa.RecordBatch.from_arrays(new_arrays, schema=pa.schema(new_fields))
+
+
+def _arrow_row_filter_for(
+    predicate: "Any",
+    partition_columns: "List[str]",
+    target_schema: "Optional[pa.Schema]",
+) -> "Optional[Callable[[pa.RecordBatch], pa.RecordBatch]]":
+    """Compile ``predicate`` to a per-batch pyarrow filter, or ``None``.
+
+    Returns ``None`` (caller skips filtering) when:
+
+    - ``predicate`` is ``None`` — nothing to filter.
+    - One of the predicate's free columns is missing from the
+      stamped batch schema (partition columns + ``target_schema``
+      columns). Matches the documented contract on
+      :attr:`CastOptions.predicate`: "missing inputs can't yield a
+      coherent boolean, and the alternative ('drop everything') is
+      almost always wrong for heterogeneous-source folders."
+
+    Otherwise compiles the predicate to a
+    :class:`pyarrow.compute.Expression` once and returns a closure
+    that runs the C++ filter on each :class:`pa.RecordBatch`.
+    Compiled once per :meth:`_read_arrow_batches` invocation so the
+    per-batch work is just the kernel call.
+    """
+    if predicate is None:
+        return None
+    try:
+        from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+    except ImportError:
+        return None
+
+    referenced = set(free_columns(predicate))
+    if target_schema is not None:
+        available = set(target_schema.names) | set(partition_columns)
+    else:
+        available = set(partition_columns)
+    if not referenced.issubset(available):
+        # Predicate touches a column the snapshot's schema doesn't
+        # carry. Degrade to "accept everything" rather than raise —
+        # heterogeneous-source folders need that contract.
+        return None
+
+    try:
+        arrow_expr = predicate.to_arrow()
+    except Exception:
+        # Predicate compiles to a shape pyarrow can't lift (rare:
+        # custom node types, unsupported dtype). Degrade gracefully.
+        return None
+
+    import pyarrow.dataset as pds
+
+    def _filter(batch: "pa.RecordBatch") -> "pa.RecordBatch":
+        if batch.num_rows == 0:
+            return batch
+        filtered = pds.dataset(pa.Table.from_batches([batch])).to_table(
+            filter=arrow_expr,
+        )
+        if filtered.num_rows == 0:
+            return pa.RecordBatch.from_pylist([], schema=batch.schema)
+        # ``combine_chunks`` re-materialises into a single chunk so
+        # ``to_batches`` yields exactly one batch — saves the caller
+        # from re-stitching when filter survival is partial.
+        rebuilt = filtered.combine_chunks().to_batches()
+        return rebuilt[0] if rebuilt else pa.RecordBatch.from_pylist(
+            [], schema=batch.schema,
+        )
+
+    return _filter
+
+
+def _merge_prune_with_predicate(
+    explicit: "Optional[dict]",
+    predicate: "Any",
+    partition_columns: "List[str]",
+) -> "Optional[dict]":
+    """Combine caller-supplied ``prune_values`` with predicate-extracted hints.
+
+    The result is what :meth:`Snapshot.prune_files` consumes — a
+    ``Mapping[str, Iterable]`` of accepted values per partition
+    column, or ``None`` when nothing constrains the file set.
+    Sources are AND'd: a file matches iff its partition value lies
+    in *both* the explicit set (when given) and the predicate's
+    extracted set (when extractable).
+
+    Predicate extraction routes through
+    :func:`yggdrasil.io.tabular.execution.expr.extract_partition_filters`,
+    which over-approximates and only reports columns it can pin to
+    a finite set — comparisons, ``IN`` lists, ``IS NULL``, and their
+    ``AND`` / ``OR`` composition. Ranges, ``NOT``, and arithmetic
+    return no constraint for those columns — the row-level filter
+    still runs on every surviving file, so the soundness contract
+    is preserved.
+    """
+    if predicate is None or not partition_columns:
+        return explicit
+    from yggdrasil.io.tabular.execution.expr import extract_partition_filters
+
+    derived = extract_partition_filters(predicate, partition_columns)
+    if not derived:
+        return explicit
+    if not explicit:
+        # ``prune_files`` accepts any ``Mapping[str, Iterable]`` —
+        # frozensets satisfy that contract directly.
+        return derived
+    # Intersect column-by-column. Columns constrained on only one
+    # side keep that side's set.
+    merged: dict = dict(explicit)
+    for col_name, derived_set in derived.items():
+        if col_name in merged:
+            existing = frozenset(merged[col_name])
+            merged[col_name] = existing & derived_set
+        else:
+            merged[col_name] = derived_set
+    return merged
 
 
 def _split_batch(

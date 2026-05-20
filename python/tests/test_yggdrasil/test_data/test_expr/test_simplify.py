@@ -32,6 +32,7 @@ from yggdrasil.io.tabular.execution.expr import (
     Logical,
     LogicalOp,
     col,
+    extract_partition_filters,
     lit,
     simplify,
 )
@@ -270,3 +271,124 @@ class TestEdgeCases:
         once = simplify(p)
         twice = simplify(once)
         assert once.equals(twice)
+
+
+# ---------------------------------------------------------------------------
+# extract_partition_filters — over-approximate per-column value sets,
+# consumed by DeltaIO / Iceberg / Hive-style partition pruning.
+# ---------------------------------------------------------------------------
+
+
+PCOLS = ("region", "date")
+
+
+class TestExtractPartitionFiltersBasics:
+    def test_eq_pins_single_value(self):
+        assert extract_partition_filters(col("region") == "us", PCOLS) == {
+            "region": frozenset({"us"}),
+        }
+
+    def test_in_list_pins_value_set(self):
+        out = extract_partition_filters(
+            col("region").is_in(["us", "eu", "uk"]), PCOLS,
+        )
+        assert out == {"region": frozenset({"us", "eu", "uk"})}
+
+    def test_in_list_with_includes_null_carries_none(self):
+        out = extract_partition_filters(
+            col("region").is_in(["us", None]), PCOLS,
+        )
+        assert out == {"region": frozenset({"us", None})}
+
+    def test_is_null_pins_none(self):
+        out = extract_partition_filters(col("region").is_null(), PCOLS)
+        assert out == {"region": frozenset({None})}
+
+    def test_literal_on_left_recognized(self):
+        # ``lit(v) == col(c)`` should be picked up the same way
+        # ``col(c) == lit(v)`` is — the simplifier doesn't normalize
+        # the order, so the extractor checks both shapes.
+        out = extract_partition_filters(lit("us") == col("region"), PCOLS)
+        assert out == {"region": frozenset({"us"})}
+
+
+class TestExtractPartitionFiltersComposition:
+    def test_and_intersects_per_column(self):
+        p = col("region").is_in(["us", "eu", "uk"]) & col("region").is_in(["eu", "uk", "fr"])
+        out = extract_partition_filters(p, PCOLS)
+        assert out == {"region": frozenset({"eu", "uk"})}
+
+    def test_and_keeps_columns_constrained_on_only_one_side(self):
+        # ``c1 IN (...) AND c2 == v`` — both partition columns get
+        # their respective constraint, no intersection across them.
+        p = col("region").is_in(["us", "eu"]) & (col("date") == "2026-01-01")
+        out = extract_partition_filters(p, PCOLS)
+        assert out == {
+            "region": frozenset({"us", "eu"}),
+            "date": frozenset({"2026-01-01"}),
+        }
+
+    def test_or_of_same_column_collapses_via_simplify(self):
+        # The simplify pass turns this into a single InList, which
+        # the extractor pins natively.
+        p = (col("region") == "us") | (col("region") == "eu") | (col("region") == "uk")
+        out = extract_partition_filters(p, PCOLS)
+        assert out == {"region": frozenset({"us", "eu", "uk"})}
+
+    def test_or_across_columns_drops_both(self):
+        # If one branch leaves a column unconstrained, the OR could
+        # accept any value for that column via that branch. Safer to
+        # drop the constraint entirely.
+        p = (col("region") == "us") | (col("date") == "2026-01-01")
+        out = extract_partition_filters(p, PCOLS)
+        assert out == {}
+
+    def test_or_keeps_columns_constrained_on_every_branch(self):
+        # Both branches constrain *region* (one via eq, one via
+        # InList) — the union survives.
+        p = (col("region") == "us") | col("region").is_in(["eu", "uk"])
+        out = extract_partition_filters(p, PCOLS)
+        assert out == {"region": frozenset({"us", "eu", "uk"})}
+
+    def test_unsatisfiable_and_returns_empty_set(self):
+        # ``c == us AND c == eu`` — the intersection is empty. The
+        # caller can drop every file whose partition value for
+        # ``c`` exists, because no row can satisfy both clauses.
+        p = (col("region") == "us") & (col("region") == "eu")
+        out = extract_partition_filters(p, PCOLS)
+        assert out == {"region": frozenset()}
+
+
+class TestExtractPartitionFiltersUnconstrained:
+    """Shapes the extractor declines to over-approximate.
+
+    The contract is sound (no row accepted by the predicate can fall
+    outside the returned constraints) — when in doubt, drop the
+    column from the dict so the row-level filter handles it.
+    """
+
+    @pytest.mark.parametrize("build", [
+        lambda: col("region") > "aa",         # range op
+        lambda: col("region") < "zz",
+        lambda: col("region") != "us",        # NE
+        lambda: col("region").between("a", "z"),
+        lambda: col("region").like("u%"),
+        lambda: ~(col("region") == "us"),     # NOT
+        lambda: col("region").not_in(["us"]),
+        lambda: col("region") == None,        # NULL eq — UNKNOWN  # noqa: E711
+    ])
+    def test_unconstrained_shape_drops_column(self, build):
+        assert extract_partition_filters(build(), PCOLS) == {}
+
+    def test_non_partition_column_silently_dropped(self):
+        # ``id`` isn't in the partition list — the extractor mentions
+        # only constrained partition columns; the predicate's ``id``
+        # half is the row-level filter's job.
+        p = (col("region") == "us") & (col("id") > 100)
+        out = extract_partition_filters(p, PCOLS)
+        assert out == {"region": frozenset({"us"})}
+
+    def test_empty_partition_columns_short_circuits(self):
+        # ``allowed`` is empty → nothing to constrain, return ``{}``
+        # without walking the predicate.
+        assert extract_partition_filters(col("region") == "us", ()) == {}
