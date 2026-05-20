@@ -198,6 +198,23 @@ def _coerce_datetime(
     return parsed
 
 
+def _pick_historical_rate(df: "pl.DataFrame", at: dt.datetime) -> float:
+    """Return the rate row in *df* closest-but-not-after *at*.
+
+    Used by :meth:`FxRate.convert` when ``at`` falls on a market-closed
+    day (weekend, holiday) and the daily-sampled fetch returns the
+    surrounding business-day rows. Falls back to the earliest available
+    rate when every row in *df* is after *at* (mirrors how vendors
+    backfill the first published rate for queries before the series
+    started).
+    """
+    sorted_df = df.sort("from_timestamp")
+    on_or_before = sorted_df.filter(sorted_df["from_timestamp"] <= at)
+    if on_or_before.height > 0:
+        return float(on_or_before.row(on_or_before.height - 1, named=True)["value"])
+    return float(sorted_df.row(0, named=True)["value"])
+
+
 def _group_pairs_by_source(
     pairs: Sequence[tuple[Currency, Currency]],
 ) -> dict[Currency, tuple[Currency, ...]]:
@@ -468,6 +485,63 @@ class FxRate(HTTPSession):
             )
 
         return self._to_frame(all_quotes, geo=geo, lazy=lazy)
+
+    def convert(
+        self,
+        amount: float,
+        source: Union[Currency, str],
+        target: Union[Currency, str],
+        *,
+        at: DateLike = None,
+    ) -> float:
+        """Scalar currency conversion: ``amount`` *source* → *target*.
+
+        Routes through the same backend fallback chain as
+        :meth:`fetch` / :meth:`latest`. ``at=None`` (default) hits
+        :meth:`latest` for the most recent snapshot; ``at=<datetime>``
+        fetches the daily-sampled historical rate for that point.
+        Same-currency conversions short-circuit to ``amount`` without a
+        network round-trip.
+
+        Args:
+            amount: Source-currency amount.
+            source: Source currency — :class:`Currency`, ISO 4217
+                alpha-3, or any alias :meth:`Currency.parse_str` accepts.
+            target: Target currency — same coercion rules.
+            at: Optional historical point. Anything
+                :func:`yggdrasil.data.cast.convert` parses into a
+                :class:`datetime.datetime`; defaults to "latest".
+
+        Raises:
+            BackendError: every backend failed for this pair.
+            ValueError: empty / mis-shaped input.
+        """
+        src = _coerce_currency(source)
+        tgt = _coerce_currency(target)
+        if src == tgt:
+            return float(amount)
+        if at is None:
+            df = self.latest(pairs=[(src, tgt)])
+        else:
+            at_dt = _coerce_datetime(at)
+            df = self.fetch(
+                pairs=[(src, tgt)],
+                start=at_dt - dt.timedelta(days=1),
+                end=at_dt,
+                sampling="1d",
+            )
+        if df.height == 0:
+            raise BackendError(
+                f"FxRate.convert: no rate returned for {src.code}->{tgt.code} "
+                f"(at={at!r}). Every configured backend returned 0 rows."
+            )
+        # Latest is one row per pair; historical may be multiple — pick
+        # the row whose timestamp is closest-but-not-after ``at``.
+        if df.height == 1 or at is None:
+            rate = float(df.row(df.height - 1, named=True)["value"])
+        else:
+            rate = float(_pick_historical_rate(df, at_dt))
+        return float(amount) * rate
 
     def latest(
         self,

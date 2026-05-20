@@ -49,6 +49,7 @@ most for routing.
 | [`ygg-data-modeling`](skills/ygg-data-modeling.md) | Schema-per-source, `raw_<entity>` + provenance, PK / FK / partition via `Field` metadata, cross-source joins via shared ISO dims |
 | [`ygg-curated-views`](skills/ygg-curated-views.md) | UTC timestamps, decimal money, ISO currency / country / language / timezone, lat/lon + `geo_point()` + GeoJSON, naming, table vs view |
 | [`ygg-display-views`](skills/ygg-display-views.md) | Business-display `dash_*` layer — wide / pivoted / time-series rollups, KPI tables, geo-display, materialisation picker, multi-task refresh DAG |
+| [`ygg-databricks-apps`](skills/ygg-databricks-apps.md) | Databricks Apps (Next.js + FastAPI / Next.js full-stack) over `dash_*` tables — OAuth OBO auth, Arrow IPC wire format, `react-leaflet` / `deck.gl` world-map plugins keyed on ISO 3166 / EIC / WGS84, trader-facing KPI map shapes, deploy via `databricks apps deploy` |
 | [`ygg-trading-commodity`](skills/ygg-trading-commodity.md) | Trading / commodity / energy market data: MIC codes, ENTSO-E EIC, OHLCV bars, contracts, FX, idempotency for corrections / settlements |
 | [`ygg-energy-trading-analyst`](skills/ygg-energy-trading-analyst.md) | Shared energy-trading analyst conventions — `analyst_<task>_*` artifacts, FX risk via `FxRate`, cross-geo-zone risk, weather / freight / storage / macro feature universe |
 | [`ygg-trading-analyst-power`](skills/ygg-trading-analyst-power.md) | Power desk — ENTSO-E day-ahead / intraday, cross-zone spreads, spark / dark / clean spreads, residual load, NTC-bounded mean reversion |
@@ -98,11 +99,19 @@ can be answered end-to-end without further questions:
    pivoted / pre-rolled `dash_*` tables and views for dashboard
    query patterns. Refreshed as a downstream task on the same
    Job DAG.
-8. [`ygg-benchmarks`](skills/ygg-benchmarks.md) — add a bench for the
+8. [`ygg-databricks-apps`](skills/ygg-databricks-apps.md) —
+   **optional, only when AI/BI Dashboard isn't enough** — Next.js
+   + FastAPI (or Next.js full-stack) over the `dash_*` tables;
+   `react-leaflet` / `deck.gl` world maps keyed on ISO 3166 /
+   EIC / WGS84; Arrow IPC wire format for sub-second renders;
+   OAuth on-behalf-of so the user's RBAC carries through. Skip
+   this step when the consumer just needs scroll-and-filter.
+9. [`ygg-benchmarks`](skills/ygg-benchmarks.md) — add a bench for the
    hot transform path before merging.
 
 [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) is the
-master recipe that chains the eight.
+master recipe that chains the first seven; step 8 is the optional
+custom-frontend exit and step 9 is the cross-cutting performance gate.
 
 ## Energy trading desks — analyst + modelist track
 

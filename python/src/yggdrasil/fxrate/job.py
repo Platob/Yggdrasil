@@ -42,8 +42,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "deploy_scheduled_fxrate_job",
     "fxrate_ingestion_entrypoint",
+    "dash_fxrate_entrypoint",
     "FXRATE_INGESTION_PROVENANCE_COLUMNS",
+    "DEFAULT_DASH_TARGETS",
 ]
+
+
+#: Default per-currency standardised targets for the ``dash_fxrate``
+#: downstream task — aligned with
+#: :data:`yggdrasil.databricks.standardize.DEFAULT_CURRENCY_TARGETS`.
+#: Override per deploy by passing ``dash_targets=(...)``.
+DEFAULT_DASH_TARGETS: tuple[str, ...] = ("EUR", "USD", "CHF")
 
 
 LOGGER = logging.getLogger(__name__)
@@ -187,6 +196,143 @@ def fxrate_ingestion_entrypoint(
 
 
 # ---------------------------------------------------------------------------
+# Dash worker-side entrypoint
+# ---------------------------------------------------------------------------
+
+
+def dash_fxrate_entrypoint(
+    source_table: str,
+    target_table: str,
+    targets_json: str = '["EUR", "USD", "CHF"]',
+    lookback_days: int = 30,
+) -> int:
+    """Refresh ``dash_fxrate`` (wide-form) from ``raw_fxrate`` (long-form).
+
+    For each ``(source_currency, from_timestamp)`` in the raw FX table
+    within the lookback window, emits one row carrying the standardised
+    equivalent columns (``value_eur`` / ``value_usd`` / ``value_chf`` by
+    default — override via *targets_json*). Same-currency rows fill
+    ``1.0`` for their own target column so downstream consumers needn't
+    self-join to recover the diagonal.
+
+    Demonstrates the project's "source value + standardised equivalent"
+    curated/dash pattern using
+    :func:`yggdrasil.databricks.standardize.standardized_column_name`
+    for column naming. The pivot uses portable ``MAX(CASE WHEN …)`` SQL
+    per CLAUDE.md "Long → wide pivots use portable ``MAX(CASE WHEN …)``".
+
+    Args:
+        source_table: Three-part Unity Catalog name of the long-form
+            ``raw_fxrate`` table written by
+            :func:`fxrate_ingestion_entrypoint`.
+        target_table: Three-part Unity Catalog name to refresh.
+            Typically ``"<catalog>.<source>.dash_fxrate"``.
+        targets_json: JSON-encoded list of target currency ISO 4217
+            codes (``["EUR","USD","CHF"]``). Validated through
+            :meth:`Currency.parse` so typos fail at deploy time.
+        lookback_days: Refresh window depth. Defaults to 30 days —
+            enough to absorb late upstream republishes the raw
+            ingestion job picks up.
+
+    Returns:
+        Row count of the refreshed dash table — surfaces in the
+        Databricks task-output panel.
+    """
+    import datetime as _dt
+    import json as _json
+    import logging as _logging
+
+    from yggdrasil.databricks.client import DatabricksClient
+    from yggdrasil.data import DataType
+    from yggdrasil.data.data_field import field as _field
+    from yggdrasil.data.enums.currency import Currency
+    from yggdrasil.data.schema import Schema
+    from yggdrasil.databricks.standardize import standardized_column_name
+
+    _logger = _logging.getLogger("yggdrasil.fxrate.dash")
+
+    targets = [Currency.parse(t) for t in _json.loads(targets_json)]
+    if not targets:
+        raise ValueError(
+            "dash_fxrate_entrypoint: targets_json must decode to a non-empty "
+            "list of ISO 4217 currency codes (e.g. '[\"EUR\",\"USD\",\"CHF\"]')."
+        )
+
+    for name, label in ((source_table, "source_table"), (target_table, "target_table")):
+        if len(name.split(".")) != 3:
+            raise ValueError(
+                f"{label} must be a three-part 'catalog.schema.table' name; "
+                f"got {name!r}."
+            )
+
+    catalog_name, schema_name, table_name = target_table.split(".")
+
+    client = DatabricksClient.current()
+
+    # Build the schema first so the table exists before the INSERT
+    # OVERWRITE runs. ``ensure_created`` is idempotent — first refresh
+    # creates, subsequent refreshes no-op when the schema matches.
+    fields = [
+        _field("currency",       DataType.from_str("string"),                nullable=False),
+        _field("from_timestamp", DataType.from_str("timestamp[us, tz=UTC]"), nullable=False),
+    ]
+    for tgt in targets:
+        col = standardized_column_name("value", tgt)
+        fields.append(_field(col, DataType.from_str("float64"), nullable=True))
+    fields.append(
+        _field("_refreshed_at", DataType.from_str("timestamp[us, tz=UTC]"), nullable=False)
+    )
+    table = client.tables.table(
+        catalog_name=catalog_name, schema_name=schema_name, table_name=table_name,
+    )
+    table.ensure_created(definition=Schema.from_fields(fields))
+
+    # Portable wide-form pivot via MAX(CASE WHEN …). Currency codes are
+    # ISO 4217 alpha-3 (validated by ``Currency.parse``), so the inline
+    # interpolation is safe; table names came from the deploy-time call
+    # site, same authority as every other SQL in this codebase.
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=int(lookback_days))
+    cutoff_sql = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+    now_sql = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    select_parts = ["source AS currency", "from_timestamp"]
+    for tgt in targets:
+        col = standardized_column_name("value", tgt)
+        select_parts.append(
+            f"CASE WHEN source = '{tgt.code}' "
+            f"THEN CAST(1.0 AS DOUBLE) "
+            f"ELSE MAX(CASE WHEN target = '{tgt.code}' THEN value END) "
+            f"END AS {col}"
+        )
+    select_parts.append(f"TIMESTAMP'{now_sql}+00:00' AS _refreshed_at")
+    select_sql = ",\n           ".join(select_parts)
+
+    sql = (
+        f"INSERT OVERWRITE {target_table}\n"
+        f"SELECT {select_sql}\n"
+        f"FROM {source_table}\n"
+        f"WHERE from_timestamp >= TIMESTAMP'{cutoff_sql}+00:00'\n"
+        f"GROUP BY source, from_timestamp"
+    )
+    _logger.info(
+        "Refreshing dash_fxrate %r from %r (lookback=%d days, targets=%r)",
+        target_table, source_table, int(lookback_days),
+        [t.code for t in targets],
+    )
+    client.sql.execute(sql)
+
+    count_arrow = client.sql.execute(
+        f"SELECT COUNT(*) AS n FROM {target_table}"
+    ).read_arrow_table()
+    n_rows = int(count_arrow.column(0)[0].as_py())
+    _logger.info(
+        "Refreshed dash_fxrate rows=%d source=%r target=%r",
+        n_rows, source_table, target_table,
+    )
+    return n_rows
+
+
+# ---------------------------------------------------------------------------
 # Coercion helpers
 # ---------------------------------------------------------------------------
 
@@ -267,6 +413,9 @@ def deploy_scheduled_fxrate_job(
     cluster_extra_libraries: Optional[Iterable[str]] = None,
     cluster_spec: Optional[Mapping[str, Any]] = None,
     tags: Optional[Mapping[str, str]] = None,
+    dash_table: Optional[str] = None,
+    dash_targets: Iterable[str] = DEFAULT_DASH_TARGETS,
+    dash_lookback_days: int = 30,
     client: Optional["DatabricksClient"] = None,
 ) -> "Job":
     """Upsert a scheduled Databricks Job that ingests FX rates.
@@ -340,6 +489,22 @@ def deploy_scheduled_fxrate_job(
             the deploy-function defaults.
         tags: Optional Databricks job tags — useful for cost
             attribution / ownership in the Databricks UI.
+        dash_table: Three-part UC name of the curated wide-form
+            ``dash_fxrate`` table. When set, a downstream task is
+            staged that depends on the ingestion task, refreshing the
+            dash view via :func:`dash_fxrate_entrypoint`. When ``None``
+            (default) the dash task is omitted — pure raw-only
+            ingestion. Typically
+            ``"<catalog>.<source>.dash_fxrate"``.
+        dash_targets: Iterable of ISO 4217 currency codes that the
+            dash view materialises as standardised equivalent columns.
+            Defaults to :data:`DEFAULT_DASH_TARGETS` (EUR/USD/CHF —
+            same default as
+            :data:`yggdrasil.databricks.standardize.DEFAULT_CURRENCY_TARGETS`).
+        dash_lookback_days: Lookback window for the dash refresh.
+            Default 30 days — wider than the ingestion default so the
+            dash carries a stable rolling window even when an upstream
+            republish lands.
         client: Workspace :class:`DatabricksClient`. Defaults to
             :meth:`DatabricksClient.current`.
 
@@ -465,11 +630,89 @@ def deploy_scheduled_fxrate_job(
         )
 
     task.create()
+
+    # Phase 4: optional downstream dash_fxrate task. Wired with a
+    # ``TaskDependency`` so the dash refresh only runs after the
+    # ingestion task succeeds; failed ingestion leaves the dash table
+    # untouched (its previous snapshot stays current). Same compute
+    # pin shape as the ingestion task — the dash workload is internal
+    # (UC SQL only, no outbound HTTP), so serverless is fine even when
+    # ingestion is pinned to an all-purpose cluster.
+    if dash_table is not None:
+        dash_targets_normalised = _normalise_dash_targets(dash_targets)
+        dash_targets_json = json.dumps(dash_targets_normalised, separators=(",", ":"))
+        dash_task = JobTask.from_callable(
+            job,
+            dash_fxrate_entrypoint,
+            target_table,            # source for the dash task
+            dash_table,              # target for the dash task
+            targets_json=dash_targets_json,
+            lookback_days=int(dash_lookback_days),
+            task_key="dash_fxrate",
+        )
+        # Stamp the depends_on link onto the staged Task spec — the
+        # SDK's ``TaskDependency`` carries just the upstream task_key.
+        from databricks.sdk.service.jobs import TaskDependency
+        details = dash_task._details
+        if details is None:
+            raise RuntimeError(
+                "JobTask.from_callable did not produce a Task details "
+                "object for the dash task — cannot wire depends_on."
+            )
+        dash_task._details = _dc.replace(
+            details,
+            depends_on=[TaskDependency(task_key=task.task_key)],
+        )
+        # Mirror the ingestion task's compute pin onto the dash task
+        # by default — same workspace constraints, same auth, same
+        # cluster (when one is pinned). The dash workload itself
+        # would be happy on serverless, but staying on the same
+        # compute keeps the deploy story uniform per CLAUDE.md
+        # "Pick compute by workload type".
+        if using_cluster_pin or environment_key is not None:
+            dash_task._details = _dc.replace(
+                dash_task._details,
+                **{k: v for k, v in patches.items() if v is not None or k == "environment_key"},
+            )
+        dash_task.create()
+        LOGGER.info(
+            "Deployed FX dash task %r (job_id=%s) source=%r target=%r targets=%r",
+            "dash_fxrate", getattr(job, "job_id", None),
+            target_table, dash_table, dash_targets_normalised,
+        )
+
     LOGGER.info(
-        "Deployed FX ingestion Job %r (job_id=%s) schedule=%r",
+        "Deployed FX ingestion Job %r (job_id=%s) schedule=%r dash=%r",
         name, getattr(job, "job_id", None), cron.quartz_cron_expression,
+        dash_table,
     )
     return job
+
+
+def _normalise_dash_targets(targets: Iterable[str]) -> list[str]:
+    """Normalise *targets* through :meth:`Currency.parse` and dedupe.
+
+    Validates at deploy time so a typo doesn't ride into a scheduled
+    run; preserves the caller's order so the dash table's column order
+    matches the caller's expectation (``["EUR","USD","CHF"]`` →
+    ``value_eur, value_usd, value_chf``).
+    """
+    from yggdrasil.data.enums.currency import Currency
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in targets:
+        code = Currency.parse(t).code
+        if code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    if not out:
+        raise ValueError(
+            "deploy_scheduled_fxrate_job(dash_targets=()): pass at least one "
+            "ISO 4217 currency code (default: EUR/USD/CHF)."
+        )
+    return out
 
 
 def _resolve_or_create_cluster(

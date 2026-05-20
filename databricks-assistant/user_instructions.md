@@ -21,6 +21,13 @@ I primarily work in Python notebooks on Databricks against
 - **No row-loops over data.** No `for row in df.iterrows()`, no
   `array.to_pylist()` followed by a comprehension. Vectorise via
   `pyarrow.compute`, Polars expressions, or numpy ufuncs.
+- **Cross pipeline stages in Arrow / Spark batches, not rows.**
+  When two stages share a schema (HTTP page → cast → write, Job
+  task → Job task, SQL → transform → sink, Kafka batch → frame →
+  insert), the unit on the wire is `pa.Table` / `pa.RecordBatch` /
+  Spark `DataFrame` — never `Iterable[dict]` / `.collect()` /
+  `.iter_rows(named=True)`. The schema travels for free; the
+  consumer iterates batches, not rows.
 - **JSON:** Use `yggdrasil.pickle.json` (orjson-backed) instead of
   stdlib `json` — handles datetime / UUID / Path / Enum / dataclass.
 - **Lifecycle ops:** Call the resource singleton's own method
@@ -83,7 +90,15 @@ asking permission at each step:
    `(kpi, value, unit, computed_at_utc)` table. Refresh runs as
    a downstream task on the same Job DAG (`depends_on=["curate"]`).
    See [`ygg-display-views`](skills/ygg-display-views.md).
-8. **Benchmark** the hot transform path before merging — see
+8. **(Optional) Custom frontend** — when AI/BI Dashboards can't
+   give the interactivity / map / sub-second polling the consumer
+   needs, build a Databricks App (Next.js + FastAPI, or Next.js
+   full-stack) over the `dash_*` tables. OAuth on-behalf-of for
+   auth, Arrow IPC over HTTP for the wire format, `react-leaflet` /
+   `deck.gl` for world maps keyed on ISO 3166 / EIC / WGS84. See
+   [`ygg-databricks-apps`](skills/ygg-databricks-apps.md). Skip
+   this step when the consumer just needs scroll-and-filter.
+9. **Benchmark** the hot transform path before merging — see
    [`ygg-benchmarks`](skills/ygg-benchmarks.md). Quote before /
    after numbers in the commit body.
 

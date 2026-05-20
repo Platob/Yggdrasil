@@ -24,7 +24,9 @@ from .backends import (
     FrankfurterBackend,
 )
 from .job import (
+    DEFAULT_DASH_TARGETS,
     FXRATE_INGESTION_PROVENANCE_COLUMNS,
+    dash_fxrate_entrypoint,
     deploy_scheduled_fxrate_job,
     fxrate_ingestion_entrypoint,
 )
@@ -53,5 +55,7 @@ __all__ = [
     "ErApiBackend",
     "deploy_scheduled_fxrate_job",
     "fxrate_ingestion_entrypoint",
+    "dash_fxrate_entrypoint",
+    "DEFAULT_DASH_TARGETS",
     "FXRATE_INGESTION_PROVENANCE_COLUMNS",
 ]
