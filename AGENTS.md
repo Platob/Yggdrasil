@@ -1020,6 +1020,46 @@ Changes here must preserve:
 - Arrow / Parquet / JSON / IPC compatibility
 - typed IO semantics
 
+### Build the session subclass you need; don't fit every vendor through one mega-class
+
+The library ships the transport primitives (`HTTPSession`, `PreparedRequest`, `Response`, `SendConfig` / `SendManyConfig`, `_TieredRetry`, `ErrorNotifyingHTTPSession`, `CacheConfig`) and the Databricks resource singletons (`Schema`, `Table`, `Volume`, `Warehouse`, `Cluster`, `Job`, …). Application / integration code is **expected** to subclass or compose these into the session / service / resource class that fits its API contract.
+
+Default to:
+- one small `HTTPSession` subclass per vendor — per-API auth handler, cache layout, time-window snap, pagination quirk, rate-limit policy
+- override `_attach_cache(request)` for cache-config stamping (per-path table, per-URL Delta key, time-window normalisation)
+- override `prepare_request_before_send(request)` for headers / auth / signing
+- override `_local_send` only when the transport itself changes
+- follow the singleton + picklable pattern (`@dataclass(frozen=True)` configs, `_INSTANCES` cache, `__getnewargs_ex__`, `_TRANSIENT_STATE_ATTRS`) — see rule "Make objects picklable and hashable by default"
+- land the subclass next to the integration that uses it (`yggdrasil.<source>.session`, `yggdrasil.<source>.client`), not in shared infrastructure
+
+Do not:
+- stack N feature flags onto one shared session class so it can serve every vendor; one small subclass per source is the right shape
+- promote an integration-specific session into shared infrastructure on its first user — wait for the second real caller
+- build a "generic" cache / fetch / window-snap layer with no concrete caller and hope someone uses it
+
+### Standardise the fetch shape per vendor so the cache is reusable
+
+Within one application / source, every call to the same API must produce the same URL when the underlying data is the same — otherwise the per-URL Delta / disk cache key never hits.
+
+Default to:
+- snapping time-range query params onto a grid (`?start=10:23&end=10:38` → `?start=10:00&end=11:00`) so overlapping windows collapse to one cache row
+- picking *one* canonical date format (`YYYY-MM-DDTHH:MM:SSZ`, always UTC, no `+00:00` ↔ `Z` flips) and one canonical timezone
+- picking *one* spelling per param (`startTime` xor `start_time`, not both at random call sites) and sorting multi-valued params via `URL.with_query_items(..., sort_keys=True)`
+- routing every fetch through the same session subclass so a drifting URL can't bypass the cache from a forgotten call site
+
+The session subclass is the single place this normalisation lives; the call sites stay short. The Delta / disk cache key is a hash of the URL — undisciplined fetching means every call is a cache miss.
+
+### Don't keep evolutionary scaffolding in the library
+
+Temporary helpers, half-finished services, "we might need this later" wrappers, and integration-specific glue that grew during a project don't belong in `yggdrasil`. The library carries the *primitives every integration needs*, not the bespoke layering each integration built on top.
+
+Default to:
+- inlining a class into its only call site when removing it would leave a shorter, clearer caller
+- shipping integration-specific session / service / resource subclasses inside the downstream project, not back into `yggdrasil`
+- deleting an unused module rather than keeping it "for migration / fallback" — the next agent can rebuild the thin layer they actually need; rebuilding is cheap, carrying dead surface is not
+
+If a class only has one caller, and that caller would be simpler with the body inlined, inline it. If a module hosts behavior only one downstream project uses, ship it in that project.
+
 ### Fail fast on remote resources, retry the real call — don't pre-check
 Every call to a remote resource (HTTP, Databricks Files / SQL / Workspace,
 S3, MongoDB, Spark cluster, …) costs latency, quota, and a chance to fail
