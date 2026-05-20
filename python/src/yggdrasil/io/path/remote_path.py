@@ -19,10 +19,11 @@ import logging
 import time
 from abc import abstractmethod
 from threading import RLock
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Optional
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.io.memory import Memory
 from yggdrasil.io.path.path import Path
 
 
@@ -37,6 +38,13 @@ __all__ = ["RemotePath"]
 #: against the same key, short enough that a stale entry doesn't
 #: outlive a meaningful change to the underlying object.
 _STAT_CACHE_TTL: float = 300.0
+
+#: Default page size for the inner read/write buffer. A 4 MiB grain
+#: matches Parquet row-group / Arrow IPC chunk sizes — one page covers
+#: a typical footer or batch, so the first read populates exactly one
+#: page and follow-up reads against the same region collapse to
+#: in-process slicing.
+_DEFAULT_BUFFER_SIZE: int = 4 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +74,13 @@ class RemotePath(Path):
     # that beats credential / consistency drift.
     STAT_CACHE_TTL: ClassVar["float | None"] = _STAT_CACHE_TTL
 
+    # Default page size for the inner buffered-page cache. ``None``
+    # disables paging entirely; an int / ByteUnit / size string sets
+    # the per-page grain. Subclasses with a hard backend-imposed
+    # block size (e.g. an SDK that only supports whole-object PUTs
+    # below a certain threshold) can pin their own default here.
+    DEFAULT_BUFFER_SIZE: ClassVar["int | None"] = _DEFAULT_BUFFER_SIZE
+
     # Activate the :class:`Singleton` cache for every concrete remote
     # backend: 5-minute default TTL, bounded at 10 000 entries as
     # defence-in-depth against accidental cardinality explosions.
@@ -77,6 +92,77 @@ class RemotePath(Path):
         default_ttl=_STAT_CACHE_TTL, max_size=10_000,
     )
     _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+
+    # ------------------------------------------------------------------
+    # Inner buffered-page cache — reduces remote round trips for
+    # repeated reads against the same byte ranges, batches partial
+    # writes into a single backend PUT on :meth:`flush` / release.
+    # ------------------------------------------------------------------
+
+    def __init__(
+        self,
+        *args: Any,
+        buffersize: Any = ...,
+        **kwargs: Any,
+    ) -> None:
+        """Wire the page-buffer state alongside the standard :class:`Path` init.
+
+        ``buffersize`` accepts an int (bytes), a
+        :class:`~yggdrasil.data.enums.byteunit.ByteUnit` member, or a
+        size string (``"4 MB"``). ``None`` disables paging and routes
+        every read/write straight through to the subclass primitives.
+        Omitting the kwarg uses :attr:`DEFAULT_BUFFER_SIZE`.
+
+        Singleton-aware: a re-init on a cached instance preserves the
+        pages already in flight so a second constructor call doesn't
+        silently lose dirty buffered writes from the first.
+        """
+        super().__init__(*args, **kwargs)
+        if hasattr(self, "_buffersize"):
+            # Singleton re-init: keep pages + dirty markers from the
+            # original construction so a second ``RemotePath(...)`` call
+            # against the same key doesn't strand pending writes.
+            return
+        self._buffersize: Optional[int] = self._normalize_buffersize(buffersize)
+        # Lazy: only allocate the dict when paging actually fires.
+        self._pages: Optional[ExpiringDict[int, Memory]] = None
+        self._dirty_pages: set[int] = set()
+        # Tracks the logical size while buffered writes outrun what
+        # the backend has committed. ``None`` means "ask the backend"
+        # via the normal stat-cache path.
+        self._buffered_size: Optional[int] = None
+
+    @classmethod
+    def _normalize_buffersize(cls, value: Any) -> Optional[int]:
+        if value is ...:
+            value = cls.DEFAULT_BUFFER_SIZE
+        if value is None:
+            return None
+        from yggdrasil.data.enums.byteunit import ByteUnit
+        try:
+            n = ByteUnit.parse_size(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"buffersize must be a non-negative byte count "
+                f"(int / ByteUnit / size string / None), got {value!r}"
+            ) from exc
+        return n if n > 0 else None
+
+    @property
+    def buffersize(self) -> Optional[int]:
+        """Page size for buffered reads/writes, or ``None`` when disabled."""
+        return self._buffersize
+
+    def _ensure_pages(self) -> "ExpiringDict[int, Memory]":
+        if self._pages is None:
+            # Pages share the stat cache's TTL: a backend object that's
+            # been quiet for 5 minutes is the same horizon at which a
+            # cached size / mtime is no longer trusted. No ``max_size``
+            # — dirty pages must not be evicted under the caller's feet;
+            # callers manage memory via explicit :meth:`flush` /
+            # :meth:`invalidate_singleton`.
+            self._pages = ExpiringDict(default_ttl=self.STAT_CACHE_TTL)
+        return self._pages
 
     # ------------------------------------------------------------------
     # Backing-shape predicates
@@ -134,7 +220,17 @@ class RemotePath(Path):
 
     def invalidate_singleton(self, remove_global: bool = True) -> None:
         """Drop this path's cached :class:`IOStats`, schema, and
-        ``_INSTANCES`` entry — see :meth:`Path.invalidate_singleton`."""
+        ``_INSTANCES`` entry — see :meth:`Path.invalidate_singleton`.
+
+        Also clears the inner page cache: a mutation just ran, so the
+        bytes the pages held are no longer authoritative. Dirty pages
+        are dropped on the floor — callers must :meth:`flush` before
+        invalidating if they want pending writes to survive.
+        """
+        if self._pages is not None:
+            self._pages.clear()
+        self._dirty_pages.clear()
+        self._buffered_size = None
         super().invalidate_singleton(remove_global=remove_global)
         self._unpersist_schema()
 
@@ -155,3 +251,315 @@ class RemotePath(Path):
         if n < 0:
             raise ValueError(f"resize size must be >= 0, got {n!r}")
         return n
+
+    # ==================================================================
+    # Buffered read / write — page cache over backend ``_read_mv`` /
+    # ``_write_mv``. Public ``read_mv`` / ``write_mv`` route through
+    # here when :attr:`buffersize` is set; subclass primitives still do
+    # the actual network calls, just one per page miss instead of one
+    # per logical access.
+    # ==================================================================
+
+    def _effective_total(self) -> int:
+        """Logical byte count, including buffered writes.
+
+        Prefer the buffered-write tip when set; fall back to the
+        subclass's ``size`` accessor (which may itself be a stat-cache
+        probe) otherwise.
+        """
+        if self._buffered_size is not None:
+            return self._buffered_size
+        return int(self.size)
+
+    def _stamp_buffered_size(self, new_total: int) -> None:
+        """Reflect a buffered write into the stat cache.
+
+        Buffered writes don't go to the backend until :meth:`flush`,
+        but follow-up :meth:`size` / :meth:`exists` / :meth:`is_file`
+        calls must observe the post-write state — subclasses (S3Path,
+        VolumePath, ...) shadow :attr:`size` with their own stat-cache
+        reads, so we keep the cache itself in sync rather than fighting
+        the property override.
+        """
+        self._buffered_size = new_total
+        cached = self._stat_cached
+        now = time.time()
+        if cached is None or cached.kind == IOKind.MISSING:
+            self._persist_stat_cache(IOStats(
+                size=new_total,
+                kind=IOKind.FILE,
+                mtime=now,
+                media_type=self.media_type,
+            ))
+            return
+        cached.size = new_total
+        cached.mtime = now
+        self._persist_stat_cache(cached)
+
+    def read_mv(
+        self,
+        size: int = -1,
+        offset: int = 0,
+        *,
+        cursor: bool = False,
+    ) -> memoryview:
+        if self._buffersize is None or self._parent is not None:
+            return super().read_mv(size, offset, cursor=cursor)
+        from yggdrasil.io.holder import _resolve_pos
+        if cursor:
+            offset = self._pos
+        total = self._effective_total()
+        offset = _resolve_pos(offset, total)
+        if offset < 0 or offset > total:
+            raise ValueError(
+                f"Offset {offset} is out of bounds for "
+                f"{type(self).__name__} of size {total}"
+            )
+        if size < 0:
+            size = total - offset
+        if size < 0 or offset + size > total:
+            raise ValueError(
+                f"Range [{offset}, {offset + size}) is out of bounds for "
+                f"{type(self).__name__} of size {total}"
+            )
+        out = self._paged_read(size, offset) if size > 0 else memoryview(b"")
+        if cursor:
+            self._pos = offset + size
+        return out
+
+    def write_mv(
+        self,
+        data: memoryview,
+        offset: int = 0,
+        *,
+        size: int = -1,
+        overwrite: bool = False,
+        update_stat: bool = True,
+        cursor: bool = False,
+    ) -> int:
+        if self._buffersize is None or self._parent is not None:
+            return super().write_mv(
+                data, offset, size=size, overwrite=overwrite,
+                update_stat=update_stat, cursor=cursor,
+            )
+        from yggdrasil.io.holder import _resolve_pos
+        if cursor:
+            offset = self._pos
+        if size >= 0 and len(data) > size:
+            data = data[:size]
+        total = self._effective_total()
+        offset = _resolve_pos(offset, total)
+        if offset < 0:
+            raise ValueError(
+                f"Offset {offset} is out of bounds for "
+                f"{type(self).__name__} of size {total}"
+            )
+        n = len(data)
+        end = offset + n
+        if n == 0:
+            if overwrite and end < total:
+                self._discard_pages_past(end)
+                self._stamp_buffered_size(end)
+                if update_stat:
+                    self.mark_dirty()
+            if cursor:
+                self._pos = offset
+            return 0
+        new_total = end if overwrite else max(total, end)
+        self._paged_write(memoryview(data), offset)
+        if overwrite and new_total < total:
+            self._discard_pages_past(new_total)
+        elif not overwrite:
+            # The stat probe can lie on some backends (e.g. a Volumes
+            # directory-heuristic miss reports a file as size 0); the
+            # page we just loaded carries the real tail. Stretch
+            # ``new_total`` so the trailing bytes survive the flush.
+            tail = self._actual_tail()
+            if tail > new_total:
+                new_total = tail
+        self._stamp_buffered_size(new_total)
+        if update_stat:
+            self.mark_dirty()
+        if cursor:
+            self._pos = end
+        # Outside an explicit acquire (``with path:`` /
+        # ``path.open(owns_holder=True)``) there's no release hook to
+        # flush on, so the closed-state direct-write contract still
+        # demands the bytes land on the backend before this call
+        # returns. The page cache still serves follow-up reads via
+        # :meth:`_paged_read`.
+        if not self._acquired:
+            self.flush()
+        return n
+
+    def flush(self) -> None:
+        """Commit any dirty buffered pages to the backend.
+
+        Assembles the full payload from the page cache (fetching any
+        non-dirty gaps from the backend on the way) and writes it
+        through the subclass ``_write_mv`` primitive in a single
+        round trip. Whole-file backends (HTTP PUT, Volumes upload,
+        S3 PutObject) get the same shape as a direct
+        :meth:`write_bytes`; positional backends absorb one combined
+        write instead of one per buffered ``write_mv``. Pages are
+        marked clean afterwards so a follow-up read collapses to
+        cache hits.
+        """
+        if self._dirty_pages:
+            size = self._effective_total()
+            payload = bytes(self._paged_read(size, 0)) if size > 0 else b""
+            # Strip the buffered-write tip off the stat cache before
+            # the subclass primitive runs. S3 / Volumes /…
+            # ``_write_mv`` consults ``_existing_size_or_zero`` to
+            # know how many bytes to splice in; with the buffered
+            # tip stamped onto the cache they'd issue a phantom GET
+            # for bytes the backend never had. The subclass's own
+            # ``_persist_stat_cache`` restamps the cache to reflect
+            # the freshly-committed object.
+            self._stat_cached = None
+            self._stat_cached_at = 0.0
+            self._buffered_size = None
+            try:
+                super().write_mv(memoryview(payload), 0, overwrite=True)
+            finally:
+                self._dirty_pages.clear()
+        super().flush()
+
+    def _release(self) -> None:
+        """Flush dirty pages before the standard release.
+
+        Called from :meth:`close` (explicit) and :meth:`__del__` (GC).
+        A failed flush at GC time is logged and swallowed — never
+        raise from ``__del__`` per :class:`Disposable`.
+        """
+        try:
+            self.flush()
+        except Exception as exc:
+            logger.warning(
+                "Buffered flush failed during release of %r: %s", self, exc,
+            )
+        super()._release()
+
+    # ------------------------------------------------------------------
+    # Page-level helpers
+    # ------------------------------------------------------------------
+
+    def _paged_read(self, n: int, pos: int) -> memoryview:
+        page_size = self._buffersize
+        pages = self._ensure_pages()
+        first_page = pos // page_size
+        last_page = (pos + n - 1) // page_size
+        if first_page == last_page:
+            page = pages.get(first_page)
+            if page is None:
+                page = self._fetch_page(first_page)
+                pages.set(first_page, page)
+            page_start = first_page * page_size
+            local = pos - page_start
+            return memoryview(bytes(page._buf[local : local + n]))
+        out = bytearray(n)
+        out_pos = 0
+        end = pos + n
+        for page_idx in range(first_page, last_page + 1):
+            page = pages.get(page_idx)
+            if page is None:
+                page = self._fetch_page(page_idx)
+                pages.set(page_idx, page)
+            page_start = page_idx * page_size
+            slice_start = max(pos, page_start) - page_start
+            slice_end = min(end, page_start + page_size) - page_start
+            take = slice_end - slice_start
+            out[out_pos : out_pos + take] = page._buf[slice_start:slice_end]
+            out_pos += take
+        return memoryview(bytes(out))
+
+    def _fetch_page(self, page_idx: int) -> Memory:
+        """Load one page from the backend via the subclass primitive.
+
+        Asks for ``page_size`` bytes and trusts the response length —
+        backends that downloads the whole object (Databricks Volumes)
+        return what they have; ranged backends (S3) cap at EOF on
+        their own. A missing object surfaces as an empty page.
+        """
+        page_size = self._buffersize
+        page_offset = page_idx * page_size
+        try:
+            chunk = bytes(self._read_mv(page_size, page_offset))
+        except FileNotFoundError:
+            return Memory.view(bytearray(page_size), size=0)
+        if not chunk:
+            return Memory.view(bytearray(page_size), size=0)
+        buf = bytearray(page_size)
+        n = min(len(chunk), page_size)
+        buf[:n] = chunk[:n]
+        return Memory.view(buf, size=n)
+
+    def _paged_write(self, data: memoryview, offset: int) -> None:
+        page_size = self._buffersize
+        pages = self._ensure_pages()
+        n = len(data)
+        end = offset + n
+        first_page = offset // page_size
+        last_page = (end - 1) // page_size
+        src_pos = 0
+        backend_total = Path.size.fget(self)  # type: ignore[attr-defined]
+        for page_idx in range(first_page, last_page + 1):
+            page_start = page_idx * page_size
+            page = pages.get(page_idx)
+            slice_start = max(offset, page_start) - page_start
+            slice_end = min(end, page_start + page_size) - page_start
+            take = slice_end - slice_start
+            page_backend_len = min(
+                page_size, max(0, backend_total - page_start),
+            )
+            if page is None:
+                # Avoid the backend hit when the write fully covers
+                # both this page's slot and any backend tail past the
+                # write — there's nothing to preserve.
+                if slice_start == 0 and slice_end >= page_backend_len:
+                    page = Memory.view(bytearray(page_size), size=slice_end)
+                else:
+                    page = self._fetch_page(page_idx)
+                pages.set(page_idx, page)
+            if page._size < slice_end:
+                page._size = slice_end
+            page._buf[slice_start:slice_end] = data[src_pos : src_pos + take]
+            src_pos += take
+            self._dirty_pages.add(page_idx)
+            # Re-stamp with no expiry so a dirty page can't TTL out
+            # from under a pending flush.
+            pages.set(page_idx, page, ttl=None)
+
+    def _actual_tail(self) -> int:
+        """Largest logical byte index any loaded page reports.
+
+        The page cache learns the file's real tail as a side effect of
+        :meth:`_fetch_page` — backends that download whole objects
+        regardless of the requested range surface their true size on
+        the loaded :class:`Memory`, even when :meth:`_stat` lies about
+        it. Walk the live pages and report the max ``page_start +
+        page._size`` so partial writes don't truncate the unread tail.
+        """
+        if self._pages is None:
+            return 0
+        page_size = self._buffersize
+        tail = 0
+        for key in list(self._pages.keys()):
+            page = self._pages.get(key)
+            if page is None:
+                continue
+            candidate = key * page_size + page._size
+            if candidate > tail:
+                tail = candidate
+        return tail
+
+    def _discard_pages_past(self, end: int) -> None:
+        if self._pages is None:
+            return
+        page_size = self._buffersize
+        # Index of the first page that lies entirely past ``end``.
+        cutoff = (end + page_size - 1) // page_size
+        for key in list(self._pages.keys()):
+            if key >= cutoff:
+                self._pages.pop(key, None)
+                self._dirty_pages.discard(key)
