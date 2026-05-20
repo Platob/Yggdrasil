@@ -176,7 +176,10 @@ class TestReadMv:
     def test_range_read(self, client) -> None:
         client.head_object.return_value = {"ContentLength": 100, "LastModified": None}
         client.get_object.return_value = {"Body": _Body(b"abc")}
-        p = S3Path("s3://b/k", client=client)
+        # Disable the page buffer so the test asserts the narrow
+        # ``Range`` shape the user requested instead of the page-aligned
+        # ``Range`` :class:`RemotePath` issues when buffersize is set.
+        p = S3Path("s3://b/k", client=client, buffersize=None)
         out = p.pread(3, 10)
         assert out == b"abc"
         assert client.get_object.call_args.kwargs["Range"] == "bytes=10-12"
