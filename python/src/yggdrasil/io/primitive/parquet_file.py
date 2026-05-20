@@ -39,6 +39,7 @@ from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:
+    import pandas
     import polars as pl
     import pyarrow.dataset as pds
 
@@ -376,6 +377,38 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                         casted = write_options.cast_arrow_tabular(batch)
                         if casted.num_rows > 0:
                             writer.write_batch(casted, row_group_size=options.row_group_size)
+
+    # ==================================================================
+    # Pandas — round-trip the DataFrame index through parquet metadata
+    # ==================================================================
+
+    def _write_pandas_frame(
+        self, frame: "pandas.DataFrame", options: ParquetOptions,
+    ) -> None:
+        """Write a pandas DataFrame, preserving any non-default index.
+
+        The base implementation only preserves named indices, which
+        silently drops a non-default ``RangeIndex`` (e.g. a slice of a
+        larger frame) or an unnamed non-range :class:`pandas.Index`.
+        Parquet has a first-class channel for this — pyarrow stamps a
+        ``b"pandas"`` JSON key on the schema metadata describing the
+        index columns, and :meth:`pa.Table.to_pandas` rebuilds the
+        index from it on read. Passing ``preserve_index=None``
+        delegates the decision to pyarrow's "auto" mode: a default
+        ``RangeIndex(0, len(df))`` stays implicit (no synthetic
+        column, just a range descriptor), every other shape rides
+        along as either a metadata-only range or a real column.
+
+        Target-bound writes fall back to the base path — a bound
+        target field strictly defines the column shape, leaving no
+        slot for an index round-trip.
+        """
+        if getattr(options, "target", None) is not None:
+            super()._write_pandas_frame(frame, options)
+            return
+
+        table = pa.Table.from_pandas(frame, preserve_index=None)
+        self._write_arrow_table(table, options)
 
     # ==================================================================
     # Native engine overrides — push reads to format-aware scanners
