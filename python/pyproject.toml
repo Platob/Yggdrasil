@@ -64,7 +64,6 @@ http = [
 
 data = [
   "pandas>=2.1",
-  "numpy>=1.26",
   "sqlglot",
 ]
 
