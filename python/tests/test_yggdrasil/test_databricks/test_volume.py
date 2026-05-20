@@ -328,8 +328,9 @@ class TestVolumePathDelegation:
     def test_two_paths_share_one_volume_info_read(self, workspace, client):
         from yggdrasil.databricks.fs.volume_path import VolumePath
         workspace.volumes.read.return_value = _info()
-        p1 = VolumePath("/Volumes/cat/sch/vol/a", client=client)
-        p2 = VolumePath("/Volumes/cat/sch/vol/b", client=client)
+        service = Volumes(client=client)
+        p1 = VolumePath("/Volumes/cat/sch/vol/a", service=service)
+        p2 = VolumePath("/Volumes/cat/sch/vol/b", service=service)
         assert p1.volume is p2.volume
         p1.volume_info()
         p2.volume_info()

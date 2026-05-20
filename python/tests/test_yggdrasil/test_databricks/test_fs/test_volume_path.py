@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from yggdrasil.databricks.fs import VolumePath
+from yggdrasil.databricks.volume.volumes import Volumes
 from yggdrasil.io.io_stats import IOKind
 
 
@@ -64,6 +65,21 @@ def workspace(client):
     return client.workspace_client.return_value
 
 
+@pytest.fixture
+def service(client):
+    """Mock :class:`Volumes` service whose ``client`` is the fixture
+    :func:`client`.
+
+    :class:`VolumePath` reaches the :class:`DatabricksClient` through
+    ``self.service.client``; wiring the spec'd mock keeps the
+    existing ``client.workspace_client.return_value.<api>``
+    configuration working unchanged.
+    """
+    svc = MagicMock(spec=Volumes)
+    svc.client = client
+    return svc
+
+
 def _file_meta(size: int, mtime_ms: int = 0):
     return SimpleNamespace(
         content_length=size,
@@ -85,67 +101,67 @@ def _op_token(op) -> str:
 
 class TestConstruction:
 
-    def test_legacy_posix_string(self, workspace, client) -> None:
+    def test_legacy_posix_string(self, workspace, client, service) -> None:
         p = VolumePath(
-            "/Volumes/cat/sch/vol/data.parquet", client=client,
+            "/Volumes/cat/sch/vol/data.parquet", service=service,
         )
         assert p.full_path() == "/Volumes/cat/sch/vol/data.parquet"
         assert p.api_path == "/Volumes/cat/sch/vol/data.parquet"
 
-    def test_url_form(self, workspace, client) -> None:
-        p = VolumePath("dbfs+volume:///cat/sch/vol/x", client=client)
+    def test_url_form(self, workspace, client, service) -> None:
+        p = VolumePath("dbfs+volume:///cat/sch/vol/x", service=service)
         assert p.full_path() == "/Volumes/cat/sch/vol/x"
 
 
 class TestStat:
 
-    def test_existing_file(self, workspace, client) -> None:
+    def test_existing_file(self, workspace, client, service) -> None:
         # Leaf carries ``.`` — heuristic probes ``get_metadata`` first.
         workspace.files.get_metadata.return_value = _file_meta(42)
-        p = VolumePath("/Volumes/c/s/v/x.parquet", client=client)
+        p = VolumePath("/Volumes/c/s/v/x.parquet", service=service)
         s = p._stat_uncached()
         assert s.kind is IOKind.FILE
         assert s.size == 42
         workspace.files.get_directory_metadata.assert_not_called()
 
-    def test_existing_directory_no_extension(self, workspace, client) -> None:
+    def test_existing_directory_no_extension(self, workspace, client, service) -> None:
         # Bare leaf — heuristic probes ``get_directory_metadata`` first,
         # so the single round trip resolves the directory without
         # touching ``get_metadata``.
         workspace.files.get_directory_metadata.return_value = SimpleNamespace()
-        p = VolumePath("/Volumes/c/s/v/dir", client=client)
+        p = VolumePath("/Volumes/c/s/v/dir", service=service)
         assert p._stat_uncached().kind is IOKind.DIRECTORY
         workspace.files.get_metadata.assert_not_called()
 
-    def test_file_fallback_when_leaf_has_no_extension(self, workspace, client) -> None:
+    def test_file_fallback_when_leaf_has_no_extension(self, workspace, client, service) -> None:
         # Even a bare-leaf path can be a file (extensionless data
         # dumps). When the directory probe NotFounds, fall back to
         # ``get_metadata``.
         workspace.files.get_directory_metadata.side_effect = NotFound()
         workspace.files.get_metadata.return_value = _file_meta(7)
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         s = p._stat_uncached()
         assert s.kind is IOKind.FILE
         assert s.size == 7
 
-    def test_directory_fallback_when_leaf_has_extension(self, workspace, client) -> None:
+    def test_directory_fallback_when_leaf_has_extension(self, workspace, client, service) -> None:
         # ``foo.parquet`` looks like a file but could legitimately be a
         # directory; when ``get_metadata`` NotFounds we fall back to
         # ``get_directory_metadata``.
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.return_value = SimpleNamespace()
-        p = VolumePath("/Volumes/c/s/v/dir.d", client=client)
+        p = VolumePath("/Volumes/c/s/v/dir.d", service=service)
         assert p._stat_uncached().kind is IOKind.DIRECTORY
 
-    def test_missing(self, workspace, client) -> None:
+    def test_missing(self, workspace, client, service) -> None:
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
         workspace.files.list_directory_contents.side_effect = NotFound()
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         assert p._stat_uncached().kind is IOKind.MISSING
 
     def test_implicit_directory_visible_through_listing(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         # ``files.upload("/.../parent/file.bin")`` against a parent
         # the caller never explicitly mkdir'd silently materialises
@@ -163,41 +179,41 @@ class TestStat:
                 is_directory=False,
             ),
         ])
-        p = VolumePath("/Volumes/c/s/v/parent", client=client)
+        p = VolumePath("/Volumes/c/s/v/parent", service=service)
         assert p._stat_uncached().kind is IOKind.DIRECTORY
 
 
 class TestRead:
 
-    def test_full_object_read(self, workspace, client) -> None:
+    def test_full_object_read(self, workspace, client, service) -> None:
         workspace.files.get_metadata.return_value = _file_meta(5)
         body = SimpleNamespace(read=lambda: b"hello")
         workspace.files.download.return_value = SimpleNamespace(contents=body)
 
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         assert p.read_bytes() == b"hello"
         workspace.files.download.assert_called_once_with("/Volumes/c/s/v/x")
 
-    def test_missing_raises(self, workspace, client) -> None:
+    def test_missing_raises(self, workspace, client, service) -> None:
         workspace.files.get_metadata.return_value = _file_meta(5)
         workspace.files.download.side_effect = NotFound()
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         with pytest.raises(FileNotFoundError):
             p.read_bytes()
 
-    def test_read_bytes_skips_metadata_probe(self, workspace, client) -> None:
+    def test_read_bytes_skips_metadata_probe(self, workspace, client, service) -> None:
         # ``DatabricksPath.read_mv(-1, 0)`` short-circuits the base
         # ``Holder.read_mv`` size probe, so a whole-file read is one
         # ``files.download`` round trip — no preceding
         # ``files.get_metadata`` call.
         body = SimpleNamespace(read=lambda: b"hello")
         workspace.files.download.return_value = SimpleNamespace(contents=body)
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         assert p.read_bytes() == b"hello"
         workspace.files.get_metadata.assert_not_called()
         workspace.files.download.assert_called_once()
 
-    def test_parquet_read_arrow_table_one_sdk_call(self, workspace, client) -> None:
+    def test_parquet_read_arrow_table_one_sdk_call(self, workspace, client, service) -> None:
         # The tabular IO ↔ remote path interaction is the headline
         # scenario: ``ParquetFile(VolumePath).read_arrow_table()`` must
         # bottom out in a single ``files.download`` call. Earlier
@@ -224,7 +240,7 @@ class TestRead:
             content_type="application/octet-stream",
             last_modified="Mon, 01 Jan 2024 00:00:00 GMT",
         )
-        p = VolumePath("/Volumes/c/s/v/x.parquet", client=client)
+        p = VolumePath("/Volumes/c/s/v/x.parquet", service=service)
         ParquetFile(holder=p).read_arrow_table()
         workspace.files.get_metadata.assert_not_called()
         assert workspace.files.download.call_count == 1
@@ -232,11 +248,11 @@ class TestRead:
 
 class TestWrite:
 
-    def test_overwrite(self, workspace, client) -> None:
+    def test_overwrite(self, workspace, client, service) -> None:
         # Initial probe: missing.
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         p.write_bytes(b"abcdef")
         kwargs = workspace.files.upload.call_args.kwargs
         assert kwargs["file_path"] == "/Volumes/c/s/v/x"
@@ -248,7 +264,7 @@ class TestWrite:
         assert isinstance(sent, io.BytesIO)
         assert sent.getvalue() == b"abcdef"
 
-    def test_stream_input_routes_through_upload(self, workspace, client) -> None:
+    def test_stream_input_routes_through_upload(self, workspace, client, service) -> None:
         """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
         :class:`IO[bytes]` and lands on one ``files.upload`` call."""
         import io
@@ -258,7 +274,7 @@ class TestWrite:
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
         stream = io.BytesIO(b"streamed-payload")
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         p.write_bytes(stream)
 
         kwargs = workspace.files.upload.call_args.kwargs
@@ -267,7 +283,7 @@ class TestWrite:
         assert isinstance(kwargs["contents"], _IO)
         assert workspace.files.upload.call_count == 1
 
-    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client) -> None:
+    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client, service) -> None:
         """Transient ``files.upload`` failures must rewind a stream input."""
         import io
         from unittest.mock import patch
@@ -292,18 +308,18 @@ class TestWrite:
         workspace.files.upload.side_effect = upload_side_effect
 
         with patch("yggdrasil.io.path._retry.time.sleep"):
-            VolumePath("/Volumes/c/s/v/x", client=client).write_bytes(
+            VolumePath("/Volumes/c/s/v/x", service=service).write_bytes(
                 io.BytesIO(b"abcdef"),
             )
 
         assert calls["n"] == 2
         assert seen == [b"abcdef"]
 
-    def test_pwrite_does_rmw(self, workspace, client) -> None:
+    def test_pwrite_does_rmw(self, workspace, client, service) -> None:
         workspace.files.get_metadata.return_value = _file_meta(5)
         body = SimpleNamespace(read=lambda: b"abcde")
         workspace.files.download.return_value = SimpleNamespace(contents=body)
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         p.pwrite(b"XX", 1)
         sent = workspace.files.upload.call_args.kwargs["contents"]
         assert isinstance(sent, io.BytesIO)
@@ -312,16 +328,16 @@ class TestWrite:
 
 class TestMutators:
 
-    def test_unlink(self, workspace, client) -> None:
+    def test_unlink(self, workspace, client, service) -> None:
         workspace.files.get_metadata.return_value = _file_meta(0)
         # Leaf has ``.`` so the heuristic resolves it as a file
         # without spuriously routing through ``get_directory_metadata``.
-        p = VolumePath("/Volumes/c/s/v/x.bin", client=client)
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
         p.unlink()
         workspace.files.delete.assert_called_once_with("/Volumes/c/s/v/x.bin")
 
-    def test_mkdir(self, workspace, client) -> None:
-        p = VolumePath("/Volumes/c/s/v/folder", client=client)
+    def test_mkdir(self, workspace, client, service) -> None:
+        p = VolumePath("/Volumes/c/s/v/folder", service=service)
         p.mkdir()
         workspace.files.create_directory.assert_called_once_with(
             "/Volumes/c/s/v/folder",
@@ -330,7 +346,7 @@ class TestMutators:
 
 class TestListing:
 
-    def test_iterdir_preserves_catalog(self, workspace, client) -> None:
+    def test_iterdir_preserves_catalog(self, workspace, client, service) -> None:
         # ``list_directory_contents`` returns canonical
         # ``/Volumes/<cat>/<sch>/<vol>/...`` paths; the catalog
         # segment must round-trip through child construction.
@@ -340,7 +356,7 @@ class TestListing:
             SimpleNamespace(path="/Volumes/trading/sch/vol/folder/sub",
                             is_directory=True),
         ]
-        p = VolumePath("/Volumes/trading/sch/vol/folder", client=client)
+        p = VolumePath("/Volumes/trading/sch/vol/folder", service=service)
         children = list(p.iterdir())
         assert [c.full_path() for c in children] == [
             "/Volumes/trading/sch/vol/folder/a.bin",
@@ -349,7 +365,7 @@ class TestListing:
         assert all(isinstance(c, VolumePath) for c in children)
 
     def test_iterdir_does_not_persist_children_as_singletons(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         # ``_ls`` builds children with ``singleton_ttl=False`` so an
         # iterdir-style hot loop doesn't pin thousands of short-lived
@@ -368,7 +384,7 @@ class TestListing:
                 is_directory=False,
             ),
         ]
-        p = VolumePath("/Volumes/c/s/v/folder", client=client)
+        p = VolumePath("/Volumes/c/s/v/folder", service=service)
         # Force materialisation so the listing actually runs.
         children = list(p.iterdir())
         assert len(children) == 2
@@ -382,7 +398,7 @@ class TestListing:
                 f"listing children should not enter _INSTANCES, found {k!r}"
             )
 
-    def test_iterdir_seeds_child_stat(self, workspace, client) -> None:
+    def test_iterdir_seeds_child_stat(self, workspace, client, service) -> None:
         # ``list_directory_contents`` already carries ``is_directory``
         # + ``file_size`` per entry, so every child's stat cache must
         # land warm. Otherwise, an N-entry iterdir() that asks
@@ -402,7 +418,7 @@ class TestListing:
                 last_modified=None,
             ),
         ]
-        p = VolumePath("/Volumes/c/s/v/folder", client=client)
+        p = VolumePath("/Volumes/c/s/v/folder", service=service)
         children = list(p.iterdir())
         # Inspecting every child collapses to a local hit.
         assert children[0].size == 1024
@@ -417,7 +433,7 @@ class TestVolumeAutoCreate:
     (``create_directory`` on the parent) and only blind-create the
     catalog / schema / managed volume when that fails NotFound."""
 
-    def test_only_subdir_missing_skips_volume_create(self, workspace, client) -> None:
+    def test_only_subdir_missing_skips_volume_create(self, workspace, client, service) -> None:
         # Upload fails because parent dir missing; one parent
         # ``create_directory`` is enough — no catalog/schema/volume
         # creates should happen.
@@ -431,7 +447,7 @@ class TestVolumeAutoCreate:
 
         workspace.files.upload.side_effect = upload
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", client=client,
+            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
         )
         p.write_bytes(b"payload")
 
@@ -443,7 +459,7 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.assert_not_called()
         assert workspace.files.upload.call_count == 2
 
-    def test_volume_missing_only_creates_volume(self, workspace, client) -> None:
+    def test_volume_missing_only_creates_volume(self, workspace, client, service) -> None:
         # Common case: catalog + schema already exist, only the volume
         # is missing. The upload's ``NotFound("Volume … does not exist")``
         # message names the volume directly, so the recovery path skips
@@ -461,7 +477,7 @@ class TestVolumeAutoCreate:
         workspace.files.upload.side_effect = upload
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", client=client,
+            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
         )
         p.write_bytes(b"payload")
 
@@ -485,7 +501,7 @@ class TestVolumeAutoCreate:
         assert getattr(vt, "name", str(vt)).upper() == "MANAGED"
 
     def test_generic_not_found_still_probes_create_directory(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         # When the upload error doesn't name the volume (just a generic
         # ``"does not exist"``), the recovery path still attempts the
@@ -512,7 +528,7 @@ class TestVolumeAutoCreate:
         workspace.files.create_directory.side_effect = create_directory
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", client=client,
+            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
         )
         p.write_bytes(b"payload")
 
@@ -522,7 +538,7 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.assert_called_once()
 
     def test_schema_missing_creates_schema_then_volume(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         # Schema is also missing — first ``volumes.create`` fails
         # NotFound, then ``schemas.create`` succeeds, then volume create
@@ -546,7 +562,7 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.side_effect = volumes_create
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", client=client,
+            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
         )
         p.write_bytes(b"payload")
 
@@ -556,7 +572,7 @@ class TestVolumeAutoCreate:
         )
         assert workspace.volumes.create.call_count == 2
 
-    def test_catalog_missing_creates_full_chain(self, workspace, client) -> None:
+    def test_catalog_missing_creates_full_chain(self, workspace, client, service) -> None:
         # Both schema and catalog are missing — volume.create then
         # schema.create both fail NotFound, falling through to catalog
         # → schema → volume creation.
@@ -587,7 +603,7 @@ class TestVolumeAutoCreate:
         workspace.schemas.create.side_effect = schemas_create
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", client=client,
+            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
         )
         p.write_bytes(b"payload")
 
@@ -595,7 +611,7 @@ class TestVolumeAutoCreate:
         assert workspace.schemas.create.call_count == 2
         assert workspace.volumes.create.call_count == 2
 
-    def test_already_exists_swallowed(self, workspace, client) -> None:
+    def test_already_exists_swallowed(self, workspace, client, service) -> None:
         # Volume create races with another caller — ``AlreadyExists``
         # is treated as success, no retry storm.
         uploads = [NotFound("Volume does not exist"), None]
@@ -613,7 +629,7 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.side_effect = AlreadyExists()
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", client=client,
+            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
         )
         p.write_bytes(b"payload")  # should not raise
 
@@ -621,11 +637,11 @@ class TestVolumeAutoCreate:
         workspace.catalogs.create.assert_not_called()
         workspace.schemas.create.assert_not_called()
 
-    def test_propagates_when_not_a_volume_path(self, workspace, client) -> None:
+    def test_propagates_when_not_a_volume_path(self, workspace, client, service) -> None:
         # Path too shallow to address a volume — auto-create can't help,
         # so the original error must surface.
         workspace.files.upload.side_effect = NotFound("does not exist")
-        p = VolumePath("/Volumes/onlycat", client=client)
+        p = VolumePath("/Volumes/onlycat", service=service)
         with pytest.raises(NotFound):
             p.write_bytes(b"x")
         workspace.volumes.create.assert_not_called()
@@ -638,7 +654,7 @@ class TestRetryPolicy:
         recorded: list[float] = []
         return recorded, recorded.append
 
-    def test_internal_error_retries(self, workspace, client, sleeps) -> None:
+    def test_internal_error_retries(self, workspace, client, service, sleeps) -> None:
         recorded, spy = sleeps
         attempts = [InternalError(), InternalError(), _file_meta(3)]
 
@@ -653,7 +669,7 @@ class TestRetryPolicy:
         # InternalError-then-success sequence through
         # ``get_metadata`` rather than ``get_directory_metadata``.
         p = VolumePath(
-            "/Volumes/c/s/v/x.bin", client=client, retry_sleep=spy,
+            "/Volumes/c/s/v/x.bin", service=service, retry_sleep=spy,
         )
         assert p.size == 3
         assert recorded == [1.0, 1.0]
@@ -709,33 +725,33 @@ def _aws_creds_response(
 
 class TestVolumeInfoCaching:
 
-    def test_volume_info_caches_after_first_read(self, workspace, client) -> None:
+    def test_volume_info_caches_after_first_read(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info()
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         first = p.volume_info()
         second = p.volume_info()
         assert first is second
         workspace.volumes.read.assert_called_once_with("cat.sch.vol")
 
-    def test_volume_info_refresh_forces_reread(self, workspace, client) -> None:
+    def test_volume_info_refresh_forces_reread(self, workspace, client, service) -> None:
         workspace.volumes.read.side_effect = [_volume_info(), _volume_info()]
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         p.volume_info()
         p.volume_info(refresh=True)
         assert workspace.volumes.read.call_count == 2
 
-    def test_storage_location_resolves_from_volume_info(self, workspace, client) -> None:
+    def test_storage_location_resolves_from_volume_info(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://bkt/__unitystorage/c/s/v",
         )
-        p = VolumePath("/Volumes/c/s/v/sub/y.parquet", client=client)
+        p = VolumePath("/Volumes/c/s/v/sub/y.parquet", service=service)
         assert p.storage_location() == "s3://bkt/__unitystorage/c/s/v"
 
     def test_storage_location_caches_independently_of_volume_info(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         workspace.volumes.read.return_value = _volume_info()
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         p.storage_location()
         p.storage_location()
         # One read call drives both — the value is snapshotted onto
@@ -743,21 +759,21 @@ class TestVolumeInfoCaching:
         # string without re-touching ``VolumeInfo``.
         workspace.volumes.read.assert_called_once()
 
-    def test_storage_location_missing_raises(self, workspace, client) -> None:
+    def test_storage_location_missing_raises(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(storage_location=None)
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         with pytest.raises(ValueError, match="storage_location"):
             p.storage_location()
 
 
 class TestTemporaryCredentials:
 
-    def test_vends_via_volume_id(self, workspace, client) -> None:
+    def test_vends_via_volume_id(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-42")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         resp = p.temporary_credentials(mode="read")
         assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
 
@@ -772,18 +788,18 @@ class TestTemporaryCredentials:
         assert kwargs["volume_id"] == "vid-42"
         assert _op_token(kwargs["operation"]) == "READ_VOLUME"
 
-    def test_write_operation_maps_to_write_volume(self, workspace, client) -> None:
+    def test_write_operation_maps_to_write_volume(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info()
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         p.temporary_credentials(mode="overwrite")
 
         assert _op_token(gen.call_args.kwargs["operation"]) == "WRITE_VOLUME"
 
-    def test_missing_volume_id_raises(self, workspace, client) -> None:
+    def test_missing_volume_id_raises(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id=None)
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         with pytest.raises(ValueError, match="volume_id"):
             p.temporary_credentials()
 
@@ -796,7 +812,7 @@ class TestTemporaryCredentials:
 class TestCredentialsRefresherSingleton:
 
     def test_same_volume_collapses_to_one_provider(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         from yggdrasil.databricks.fs.volume_path import VolumeCredentialsRefresher
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
@@ -804,21 +820,21 @@ class TestCredentialsRefresherSingleton:
         gen.return_value = _aws_creds_response()
 
         # Two distinct VolumePath instances pointing at the same volume.
-        p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client)
+        p1 = VolumePath("/Volumes/cat/sch/vol/x", service=service)
+        p2 = VolumePath("/Volumes/cat/sch/vol/y", service=service)
         r1 = p1.credentials_refresher()
         r2 = p2.credentials_refresher()
         assert isinstance(r1, VolumeCredentialsRefresher)
         assert r1 is r2
 
     def test_get_credentials_per_mode_hits_right_operation(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         r = p.credentials_refresher()
         r.get_credentials(mode="read")
         r.get_credentials(mode="overwrite")
@@ -826,7 +842,7 @@ class TestCredentialsRefresherSingleton:
         assert "READ_VOLUME" in ops and "WRITE_VOLUME" in ops
 
     def test_different_volume_id_yields_different_provider(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
@@ -834,34 +850,34 @@ class TestCredentialsRefresherSingleton:
         workspace.volumes.read.return_value = _volume_info(
             name="v1", volume_id="vid-A",
         )
-        p1 = VolumePath("/Volumes/cat/sch/v1/x", client=client)
+        p1 = VolumePath("/Volumes/cat/sch/v1/x", service=service)
         r1 = p1.credentials_refresher()
 
         workspace.volumes.read.return_value = _volume_info(
             name="v2", volume_id="vid-B",
         )
-        p2 = VolumePath("/Volumes/cat/sch/v2/x", client=client)
+        p2 = VolumePath("/Volumes/cat/sch/v2/x", service=service)
         r2 = p2.credentials_refresher()
         assert r1 is not r2
 
-    def test_aws_client_shared_through_provider(self, workspace, client) -> None:
+    def test_aws_client_shared_through_provider(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
-        p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client)
+        p1 = VolumePath("/Volumes/cat/sch/vol/x", service=service)
+        p2 = VolumePath("/Volumes/cat/sch/vol/y", service=service)
         # Same volume + mode + region → same AWSClient instance.
         c1 = p1.aws(mode="read", region="us-east-1")
         c2 = p2.aws(mode="read", region="us-east-1")
         assert c1 is c2
 
-    def test_aws_client_cached_per_mode_and_region(self, workspace, client) -> None:
+    def test_aws_client_cached_per_mode_and_region(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         r = p.credentials_refresher()
         c_us = r.aws_client(mode="read", region="us-east-1")
         c_eu = r.aws_client(mode="read", region="eu-central-1")
@@ -871,13 +887,13 @@ class TestCredentialsRefresherSingleton:
         assert c_us is not c_eu
         assert c_us is not c_us_write
 
-    def test_workspace_rebound_on_repeat_construction(self, workspace, client) -> None:
+    def test_workspace_rebound_on_repeat_construction(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
         # First binding uses ``workspace`` (fixture-provided).
-        p1 = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p1 = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         r1 = p1.credentials_refresher()
         assert r1.workspace is workspace
 
@@ -888,25 +904,27 @@ class TestCredentialsRefresherSingleton:
         workspace_b = client_b.workspace_client.return_value
         workspace_b.volumes.read.return_value = _volume_info(volume_id="vid-A")
         workspace_b.temporary_volume_credentials.generate_temporary_volume_credentials.return_value = _aws_creds_response()
-        p2 = VolumePath("/Volumes/cat/sch/vol/y", client=client_b)
+        service_b = MagicMock(spec=Volumes)
+        service_b.client = client_b
+        p2 = VolumePath("/Volumes/cat/sch/vol/y", service=service_b)
         r2 = p2.credentials_refresher()
         assert r2 is r1
         assert r2.workspace is workspace_b
 
-    def test_pickle_collapses_to_live_singleton(self, workspace, client) -> None:
+    def test_pickle_collapses_to_live_singleton(self, workspace, client, service) -> None:
         import pickle
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         r = p.credentials_refresher()
         # In-process pickle round-trip must collapse to the same
         # singleton (no duplicate boto session, no duplicate refresh).
         loaded = pickle.loads(pickle.dumps(r))
         assert loaded is r
 
-    def test_get_credentials_returns_canonical_credentials(self, workspace, client) -> None:
+    def test_get_credentials_returns_canonical_credentials(self, workspace, client, service) -> None:
         from yggdrasil.aws.config import AwsCredentials
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
@@ -914,7 +932,7 @@ class TestCredentialsRefresherSingleton:
             access_key_id="AKIA-direct", secret_access_key="secret-direct",
         )
 
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         r = p.credentials_refresher()
         out = r.get_credentials(mode="read")
         assert isinstance(out, AwsCredentials)
@@ -924,7 +942,7 @@ class TestCredentialsRefresherSingleton:
 
 class TestVolumeInfoNotFoundRecovery:
 
-    def test_creates_volume_on_not_found_then_re_reads(self, workspace, client) -> None:
+    def test_creates_volume_on_not_found_then_re_reads(self, workspace, client, service) -> None:
         # First ``volumes.read`` raises NotFound; the recovery path
         first_call = {"done": False}
 
@@ -939,7 +957,7 @@ class TestVolumeInfoNotFoundRecovery:
             volume_id="volume-uuid-0001",
         )
 
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         info = p.volume_info()
         assert info.volume_id == "volume-uuid-0001"
         assert workspace.volumes.read.call_count == 2
@@ -950,7 +968,7 @@ class TestVolumeInfoNotFoundRecovery:
         assert create_kwargs["schema_name"] == "sch"
         assert create_kwargs["name"] == "vol"
 
-    def test_recovery_also_creates_missing_schema(self, workspace, client) -> None:
+    def test_recovery_also_creates_missing_schema(self, workspace, client, service) -> None:
         read_outcomes = [NotFound("missing"), _volume_info(volume_id="vid")]
 
         def read(full_name):
@@ -973,22 +991,22 @@ class TestVolumeInfoNotFoundRecovery:
         workspace.volumes.read.side_effect = read
         workspace.volumes.create.side_effect = create
 
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         info = p.volume_info()
         assert info.volume_id == "vid"
         workspace.schemas.create.assert_called_once()
 
-    def test_propagates_other_errors_unchanged(self, workspace, client) -> None:
+    def test_propagates_other_errors_unchanged(self, workspace, client, service) -> None:
         # PermissionDenied is deterministic — the recovery path must
         # not swallow it.
         workspace.volumes.read.side_effect = PermissionDenied("nope")
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         with pytest.raises(PermissionDenied):
             p.volume_info()
         workspace.volumes.create.assert_not_called()
 
     def test_temporary_credentials_inherits_create_on_not_found(
-        self, workspace, client,
+        self, workspace, client, service,
     ) -> None:
         # ``temporary_credentials`` calls ``volume_info`` first, so
         # the create-on-NotFound flow surfaces transparently — the
@@ -1009,7 +1027,7 @@ class TestVolumeInfoNotFoundRecovery:
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         resp = p.temporary_credentials(mode="read")
         assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
         workspace.volumes.create.assert_called_once()
@@ -1024,7 +1042,7 @@ class TestVolumeInfoNotFoundRecovery:
 
 class TestStoragePath:
 
-    def test_returns_s3_path_for_s3_volume(self, workspace, client) -> None:
+    def test_returns_s3_path_for_s3_volume(self, workspace, client, service) -> None:
         from yggdrasil.aws.fs.path import S3Path
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://my-bucket/__unitystorage/cat/sch/vol",
@@ -1032,25 +1050,25 @@ class TestStoragePath:
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/cat/sch/vol/x.parquet", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x.parquet", service=service)
         root = p.storage_path(region="us-east-1")
         assert isinstance(root, S3Path)
         assert root.full_path() == "s3://my-bucket/__unitystorage/cat/sch/vol"
 
-    def test_caches_path_on_instance(self, workspace, client) -> None:
+    def test_caches_path_on_instance(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://bkt/u/c/s/v",
         )
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         first = p.storage_path()
         second = p.storage_path()
         # Same Path instance — no rebuild on subsequent calls.
         assert first is second
 
-    def test_refresh_drops_instance_cache(self, workspace, client) -> None:
+    def test_refresh_drops_instance_cache(self, workspace, client, service) -> None:
         workspace.volumes.read.side_effect = [
             _volume_info(storage_location="s3://bkt/u/c/s/v"),
             _volume_info(storage_location="s3://bkt/u/c/s/v"),
@@ -1058,7 +1076,7 @@ class TestStoragePath:
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         p.storage_path()
         p.storage_path(refresh=True)
         # ``refresh=True`` forces a fresh ``volumes.read``; the
@@ -1066,18 +1084,18 @@ class TestStoragePath:
         # singleton-by-URL instance, but the SDK was hit twice.
         assert workspace.volumes.read.call_count == 2
 
-    def test_unsupported_scheme_raises(self, workspace, client) -> None:
+    def test_unsupported_scheme_raises(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(
             storage_location="ftp://nope/no",
         )
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         with pytest.raises(ValueError, match="Unknown scheme"):
             p.storage_path()
 
 
 class TestVolumeArrowFilesystem:
 
-    def test_builds_pyarrow_s3_filesystem(self, workspace, client) -> None:
+    def test_builds_pyarrow_s3_filesystem(self, workspace, client, service) -> None:
         # The credential snapshot path imports boto3 — skip cleanly
         # when the optional dep is missing instead of letting the
         # install probe hit the network.
@@ -1090,11 +1108,11 @@ class TestVolumeArrowFilesystem:
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         fs = p.arrow_filesystem(region="us-east-1")
         assert isinstance(fs, pafs.S3FileSystem)
 
-    def test_arrow_filesystem_routes_through_s3service(self, workspace, client) -> None:
+    def test_arrow_filesystem_routes_through_s3service(self, workspace, client, service) -> None:
         # Spy that ``VolumePath.arrow_filesystem`` actually goes
         # through ``S3Service.arrow_filesystem`` rather than building
         # the pyarrow object directly. That keeps the credential
@@ -1105,7 +1123,7 @@ class TestVolumeArrowFilesystem:
         gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/c/s/v/x", client=client)
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
         aws_client = p.aws(region="us-east-1")
         from unittest.mock import patch
         sentinel = object()
@@ -1138,7 +1156,7 @@ class TestS3ServiceArrowFilesystem:
             session_token="tok",
             region="us-east-1",
         )
-        service = S3Service(client=client)
+        service = S3Service(service=service)
         fs = service.arrow_filesystem()
         assert isinstance(fs, pafs.S3FileSystem)
 
@@ -1154,7 +1172,7 @@ class TestS3ServiceArrowFilesystem:
             secret_access_key="secret",
             region="us-east-1",
         )
-        service = S3Service(client=client)
+        service = S3Service(service=service)
         # The override region should land on the pyarrow filesystem;
         # there isn't a public reader on S3FileSystem for the region,
         # but constructing without error is sufficient signal.
@@ -1166,42 +1184,42 @@ class TestUCNavigation:
     """``catalog_name`` / ``schema_name`` / ``volume_name`` plus the
     lazy ``catalog`` / ``schema`` properties."""
 
-    def test_names_under_volume(self, workspace, client) -> None:
-        p = VolumePath("/Volumes/cat/sch/vol/sub/x.bin", client=client)
+    def test_names_under_volume(self, workspace, client, service) -> None:
+        p = VolumePath("/Volumes/cat/sch/vol/sub/x.bin", service=service)
         assert p.catalog_name == "cat"
         assert p.schema_name == "sch"
         assert p.volume_name == "vol"
 
-    def test_names_none_for_volumes_root(self, workspace, client) -> None:
-        p = VolumePath("/Volumes", client=client)
+    def test_names_none_for_volumes_root(self, workspace, client, service) -> None:
+        p = VolumePath("/Volumes", service=service)
         assert p.catalog_name is None
         assert p.schema_name is None
         assert p.volume_name is None
 
-    def test_catalog_property_is_cached(self, workspace, client) -> None:
+    def test_catalog_property_is_cached(self, workspace, client, service) -> None:
         sentinel = object()
         client.catalogs.catalog.return_value = sentinel
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         assert p.catalog is sentinel
         assert p.catalog is sentinel
         client.catalogs.catalog.assert_called_once_with("cat")
 
-    def test_schema_property_is_cached(self, workspace, client) -> None:
+    def test_schema_property_is_cached(self, workspace, client, service) -> None:
         sentinel = object()
         client.schemas.schema.return_value = sentinel
-        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         assert p.schema is sentinel
         assert p.schema is sentinel
         client.schemas.schema.assert_called_once_with(
             catalog_name="cat", schema_name="sch",
         )
 
-    def test_catalog_raises_without_uc_prefix(self, workspace, client) -> None:
-        p = VolumePath("/Volumes", client=client)
+    def test_catalog_raises_without_uc_prefix(self, workspace, client, service) -> None:
+        p = VolumePath("/Volumes", service=service)
         with pytest.raises(ValueError, match="/Volumes/<cat>/<sch>/<vol>"):
             _ = p.catalog
 
-    def test_schema_raises_without_uc_prefix(self, workspace, client) -> None:
-        p = VolumePath("/Volumes", client=client)
+    def test_schema_raises_without_uc_prefix(self, workspace, client, service) -> None:
+        p = VolumePath("/Volumes", service=service)
         with pytest.raises(ValueError, match="/Volumes/<cat>/<sch>/<vol>"):
             _ = p.schema

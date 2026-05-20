@@ -436,7 +436,7 @@ class GenieCLI(DatabricksCLI):
         """
         from yggdrasil.databricks import WorkspacePath
 
-        wp = WorkspacePath.from_(dest).with_client(self.client)
+        wp = WorkspacePath.from_(dest, service=self.client.workspaces)
         wp.parent.mkdir(parents=True, exist_ok=True)
         wp.write_bytes(src.read_bytes(), overwrite=overwrite)
 

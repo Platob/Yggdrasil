@@ -533,7 +533,7 @@ def stage_python_callable(
     # the digest disambiguates between revisions.
     path = WorkspacePath(
         f"{staging_root.rstrip('/')}/{key}/main-{digest}.py",
-        client=client,
+        service=client.workspaces,
     )
 
     LOGGER.debug(
@@ -651,7 +651,7 @@ def stage_python_notebook_callable(
     # below.
     upload_path = WorkspacePath(
         f"{staging_root.rstrip('/')}/{key}/main-{digest}.py",
-        client=client,
+        service=client.workspaces,
     )
     LOGGER.debug(
         "Staging callable %r as Databricks notebook at %r",

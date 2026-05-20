@@ -18,6 +18,8 @@ import pytest
 from yggdrasil.aws.fs.path import S3Path
 from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.databricks.fs import DBFSPath, VolumePath
+from yggdrasil.databricks.fs.service import DBFSService
+from yggdrasil.databricks.volume.volumes import Volumes
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.primitive.csv_file import CSVFile
 from yggdrasil.io.primitive.ndjson_file import NDJSONFile
@@ -32,6 +34,22 @@ def _s3_service(client: MagicMock) -> MagicMock:
     """
     svc = MagicMock(spec=S3Service)
     svc.boto_client = client
+    return svc
+
+
+def _dbfs_service(client: MagicMock) -> MagicMock:
+    """Wrap a :class:`DatabricksClient`-shaped mock in a mock
+    :class:`DBFSService` so :class:`DBFSPath` reaches the workspace
+    handle through ``self.service.client``."""
+    svc = MagicMock(spec=DBFSService)
+    svc.client = client
+    return svc
+
+
+def _volumes_service(client: MagicMock) -> MagicMock:
+    """Mock :class:`Volumes` service whose ``client`` is *client*."""
+    svc = MagicMock(spec=Volumes)
+    svc.client = client
     return svc
 
 
@@ -269,7 +287,7 @@ class TestParquetOverDBFS:
     def test_round_trip(self, table) -> None:
         store = {}
         client = _dbfs_round_trip_client(store)
-        dbfs = DBFSPath("/dbfs/data.parquet", client=client)
+        dbfs = DBFSPath("/dbfs/data.parquet", service=_dbfs_service(client))
 
         ParquetFile(holder=dbfs, owns_holder=False).write_arrow_table(table)
         assert store["buf"].startswith(b"PAR1")
@@ -292,7 +310,7 @@ class TestCsvOverDBFS:
     def test_round_trip(self, table) -> None:
         store = {}
         client = _dbfs_round_trip_client(store)
-        dbfs = DBFSPath("/dbfs/data.csv", client=client)
+        dbfs = DBFSPath("/dbfs/data.csv", service=_dbfs_service(client))
 
         CSVFile(holder=dbfs, owns_holder=False).write_arrow_table(table)
         dbfs.invalidate_singleton()
@@ -341,7 +359,7 @@ class TestArrowIPCOverVolume:
         ws.files.download.side_effect = download
         ws.files.upload.side_effect = upload
 
-        vol = VolumePath("/Volumes/c/s/v/data.arrow", client=client)
+        vol = VolumePath("/Volumes/c/s/v/data.arrow", service=_volumes_service(client))
         ArrowIPCFile(holder=vol, owns_holder=False).write_arrow_table(table)
         vol.invalidate_singleton()
         loaded = ArrowIPCFile(holder=vol, owns_holder=False).read_arrow_table()
