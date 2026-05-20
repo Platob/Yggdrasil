@@ -325,6 +325,56 @@ class TestWrite:
         assert isinstance(sent, io.BytesIO)
         assert sent.getvalue() == b"aXXde"
 
+    def test_open_wb_multi_page_payload_uploads_once(
+        self, workspace, client, service,
+    ) -> None:
+        # ``with vp.open("wb") as fh: fh.write(...)`` must collapse to
+        # a single ``files.upload`` even when the payload spans
+        # multiple buffered pages — the cursor's release flush and the
+        # parent's release flush both fire (``IO._release`` →
+        # ``parent.flush()`` plus ``RemotePath._release`` →
+        # ``self.flush()``), but the second hop must observe a clean
+        # dirty-page set and skip the upload. Without this guarantee
+        # every ``open("wb") + write`` round-trips the body twice over
+        # the wire.
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        workspace.files.download.side_effect = NotFound()
+        page_size = 1024
+        payload = b"A" * (page_size * 5 + 13)  # 5+ pages, off-boundary tail
+        p = VolumePath(
+            "/Volumes/c/s/v/x.bin", service=service, buffersize=page_size,
+        )
+        with p.open("wb") as fh:
+            fh.write(payload)
+        assert workspace.files.upload.call_count == 1
+        sent = workspace.files.upload.call_args.kwargs["contents"]
+        assert isinstance(sent, io.BytesIO)
+        assert sent.getvalue() == payload
+
+    def test_open_wb_many_small_writes_uploads_once(
+        self, workspace, client, service,
+    ) -> None:
+        # Repeated small writes inside one ``open("wb")`` accumulate in
+        # the page cache and commit on close as one upload — no
+        # per-write flush, even when the running total crosses a page
+        # boundary partway through.
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        workspace.files.download.side_effect = NotFound()
+        page_size = 1024
+        chunk = b"X" * 200
+        n_chunks = 50  # 10_000 bytes total, ~10 pages
+        p = VolumePath(
+            "/Volumes/c/s/v/x.bin", service=service, buffersize=page_size,
+        )
+        with p.open("wb") as fh:
+            for _ in range(n_chunks):
+                fh.write(chunk)
+        assert workspace.files.upload.call_count == 1
+        sent = workspace.files.upload.call_args.kwargs["contents"]
+        assert sent.getvalue() == chunk * n_chunks
+
 
 class TestMutators:
 
