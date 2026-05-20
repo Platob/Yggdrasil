@@ -32,15 +32,41 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.arrow.ops import upsert_arrow_batches
+from yggdrasil.data.constants import TAG_PREFIX
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
+from yggdrasil.pickle import json as ygg_json
 
 if TYPE_CHECKING:
+    import pandas
     import polars as pl
     import pyarrow.dataset as pds
+
+
+#: Tag name (sans :data:`TAG_PREFIX`) that marks a column as a pandas
+#: index level — exposed to consumers as
+#: ``Field.tags[b"pandas_index_level"]``. The value is the level
+#: position encoded as ASCII bytes (``b"0"``, ``b"1"``, …). This tag
+#: is the canonical channel for the pandas-index round-trip,
+#: replacing pyarrow's ``b"pandas"`` JSON blob — every engine that
+#: walks a yggdrasil :class:`Schema` (polars, spark, …) sees the
+#: index intent the same way pandas does.
+_PANDAS_INDEX_LEVEL_KEY_NAME: bytes = b"pandas_index_level"
+
+#: Pre-computed full metadata key (``TAG_PREFIX + tag name``) for the
+#: index-level tag. Reading per-field metadata directly is the
+#: hot-path access pattern across the codebase.
+_PANDAS_INDEX_LEVEL_KEY: bytes = TAG_PREFIX + _PANDAS_INDEX_LEVEL_KEY_NAME
+
+#: Placeholder column-name prefix pyarrow uses for index levels that
+#: had no ``name`` on the source DataFrame (``__index_level_0__`` for
+#: an unnamed top level, ``__index_level_1__`` for the second level of
+#: a partially-named MultiIndex, …). When restoring the index on read
+#: we map these back to ``None`` so the round-trip matches the source.
+_INDEX_PLACEHOLDER_PREFIX: str = "__index_level_"
 
 
 __all__ = ["ParquetFile", "ParquetOptions"]
@@ -376,6 +402,146 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                         casted = write_options.cast_arrow_tabular(batch)
                         if casted.num_rows > 0:
                             writer.write_batch(casted, row_group_size=options.row_group_size)
+
+    # ==================================================================
+    # Pandas — tag each index level as a Field, set_index() on read
+    # ==================================================================
+
+    @staticmethod
+    def _is_default_range_index(frame: "pandas.DataFrame") -> bool:
+        """Is this the freebie ``RangeIndex(0, len(df), 1, name=None)``?
+
+        Default pandas indexes carry no information the read side has
+        to recover — ``to_pandas()`` synthesises the same range from
+        scratch. Skipping the tag for this case avoids writing a
+        synthetic ``__index_level_0__`` column that would just hold
+        ``0, 1, …, n-1``.
+        """
+        idx = frame.index
+        return (
+            type(idx).__name__ == "RangeIndex"
+            and idx.name is None
+            and getattr(idx, "start", 0) == 0
+            and getattr(idx, "step", 1) == 1
+            and getattr(idx, "stop", 0) == len(frame)
+        )
+
+    def _write_pandas_frame(
+        self, frame: "pandas.DataFrame", options: ParquetOptions,
+    ) -> None:
+        """Write a pandas DataFrame, tagging index columns in the schema.
+
+        ``preserve_index=True`` materialises every index level as a
+        real column (named after the level, or ``__index_level_N__``
+        when the level was unnamed). Each materialised column then
+        gets a :data:`_PANDAS_INDEX_LEVEL_KEY` per-field tag carrying
+        its level position, and pyarrow's ``b"pandas"`` JSON blob is
+        stripped — the yggdrasil schema is now the single source of
+        truth for the round-trip, visible to every engine that reads
+        through a :class:`Field` tree. :meth:`_read_pandas_frame`
+        reads the tag back and promotes those columns into the
+        pandas index via ``set_index``.
+
+        Default ``RangeIndex(0, len(df))`` skips preservation entirely
+        — its values can be regenerated for free on the read side.
+        Target-bound writes also defer to the base path: a strict
+        target schema has no slot for an index round-trip.
+        """
+        if getattr(options, "target", None) is not None:
+            super()._write_pandas_frame(frame, options)
+            return
+
+        if self._is_default_range_index(frame):
+            self._write_arrow_table(
+                pa.Table.from_pandas(frame, preserve_index=False),
+                options,
+            )
+            return
+
+        table = pa.Table.from_pandas(frame, preserve_index=True)
+
+        # Parse pyarrow's ``b"pandas"`` JSON to discover which columns
+        # are index levels and in what order. ``preserve_index=True``
+        # always materialises every level as a column, so range
+        # descriptors (dicts in ``index_columns``) shouldn't surface —
+        # filter to strings defensively in case a future pyarrow
+        # version changes the shape.
+        raw = (table.schema.metadata or {}).get(b"pandas")
+        pandas_meta = ygg_json.loads(raw) if raw else {}
+        level_by_name: dict[str, int] = {
+            entry: position
+            for position, entry in enumerate(pandas_meta.get("index_columns", ()))
+            if isinstance(entry, str)
+        }
+
+        if not level_by_name:
+            # No materialised index columns to tag. Drop ``b"pandas"``
+            # so the write side stays the single source of truth.
+            self._write_arrow_table(
+                table.replace_schema_metadata(None), options,
+            )
+            return
+
+        tagged_fields: list[pa.Field] = []
+        for arrow_field in table.schema:
+            level = level_by_name.get(arrow_field.name)
+            if level is None:
+                tagged_fields.append(arrow_field)
+                continue
+            merged = dict(arrow_field.metadata or {})
+            merged[_PANDAS_INDEX_LEVEL_KEY] = str(level).encode("ascii")
+            tagged_fields.append(arrow_field.with_metadata(merged))
+
+        enriched = pa.Table.from_arrays(
+            list(table.itercolumns()),
+            schema=pa.schema(tagged_fields, metadata=None),
+        )
+        self._write_arrow_table(enriched, options)
+
+    def _read_pandas_frame(self, options: ParquetOptions) -> "pandas.DataFrame":
+        """Restore the pandas index from :data:`_PANDAS_INDEX_LEVEL_KEY`.
+
+        Reads the arrow table (parquet preserves per-field metadata
+        end-to-end), collects every field carrying an index-level
+        tag, materialises the DataFrame, and promotes the tagged
+        columns into the index via ``set_index`` in level order.
+        ``__index_level_N__`` placeholder names — pyarrow's stand-in
+        for an unnamed index level — are mapped back to ``None`` so
+        the round-trip matches the source frame.
+
+        When no field carries the tag the result is whatever the
+        base path produced — a plain default ``RangeIndex`` for our
+        own writes, or whatever ``to_pandas()`` infers for parquet
+        produced by other tools.
+        """
+        table = self._read_arrow_table(options)
+
+        levels: list[tuple[int, str]] = []
+        for arrow_field in table.schema:
+            meta = arrow_field.metadata
+            if not meta:
+                continue
+            raw = meta.get(_PANDAS_INDEX_LEVEL_KEY)
+            if raw is None:
+                continue
+            try:
+                levels.append((int(raw), arrow_field.name))
+            except (TypeError, ValueError):
+                continue
+
+        df = table.to_pandas()
+        if not levels:
+            return df
+
+        levels.sort()
+        ordered = [name for _, name in levels]
+        df = df.set_index(ordered)
+        df.index.names = [
+            None if isinstance(n, str) and n.startswith(_INDEX_PLACEHOLDER_PREFIX)
+            else n
+            for n in df.index.names
+        ]
+        return df
 
     # ==================================================================
     # Native engine overrides — push reads to format-aware scanners
