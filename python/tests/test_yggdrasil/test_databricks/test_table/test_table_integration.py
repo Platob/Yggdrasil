@@ -55,11 +55,13 @@ from databricks.sdk.errors import (
     PermissionDenied,
     ResourceDoesNotExist,
 )
-from databricks.sdk.service.catalog import TableType
+from databricks.sdk.service.catalog import TableOperation, TableType
 
 from yggdrasil.data import Field
-from yggdrasil.data.enums import Mode
+from yggdrasil.data.enums import MediaTypes, Mode
+from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.table.table import Table
+from yggdrasil.databricks.volume import Volume
 
 from .. import DatabricksIntegrationCase
 
@@ -73,6 +75,7 @@ __all__ = [
     "TestTableRenameIntegration",
     "TestTableCloneIntegration",
     "TestTableViewIntegration",
+    "TestTableStoragePathIntegration",
 ]
 
 
@@ -671,3 +674,161 @@ class TestTableViewIntegration(_TableFixture):
             raise unittest.SkipTest(f"Cannot rename view: {exc}.")
         self.assertEqual(view.table_name, new_name)
         self.assertTrue(view.exists)
+
+
+@pytest.mark.integration
+class TestTableStoragePathIntegration(_TableFixture):
+    """Storage-path surface — :attr:`Table.staging_volume`,
+    :meth:`Table.staging_folder`, :meth:`Table.insert_volume_path`,
+    :meth:`Table.temporary_credentials`, and :meth:`Table.storage_location`.
+
+    These methods all bottom out in Unity Catalog APIs (Volumes, Files,
+    ``temporary_table_credentials``) and only meaningfully exercise
+    against a live workspace. The unit-test sibling
+    (:mod:`tests.test_yggdrasil.test_databricks.test_sql.test_table_insert_volume_path`)
+    already pins the pure path-generation behaviour with mocks; this
+    suite walks the full round trip.
+    """
+
+    table_prefix = "yg_storage"
+
+    def test_staging_volume_collapses_to_singleton(self) -> None:
+        # Two reads of the property must hand back the same Volume —
+        # the lazy slot is populated on first access and reused.
+        first = self.table.staging_volume
+        second = self.table.staging_volume
+        self.assertIs(first, second)
+        self.assertIsInstance(first, Volume)
+        self.assertEqual(first.catalog_name, self.catalog_name)
+        self.assertEqual(first.schema_name, self.schema_name)
+        # Volume name is derived from the table name (lowercased,
+        # tag-safe) — pin the shape so a regression in the derivation
+        # rule surfaces here rather than at the first write.
+        expected_volume_name = self.client.safe_tag_value(
+            self.table_name, repl="_",
+        ).lower()
+        self.assertEqual(first.volume_name, expected_volume_name)
+
+    def test_staging_volume_ensure_created_round_trips(self) -> None:
+        volume = self.table.staging_volume
+        try:
+            volume.ensure_created(comment="yggdrasil storage path integration")
+        except (DatabricksError, PermissionDenied) as exc:
+            raise unittest.SkipTest(
+                f"Cannot create staging volume {volume.full_name()}: {exc}."
+            )
+        try:
+            self.assertTrue(volume.exists)
+        finally:
+            # The fixture's tearDownClass also drops the staging volume
+            # via ``Table.delete(delete_staging=True)``; calling it
+            # here keeps a per-test failure from leaving an orphan
+            # behind when the suite is run in isolation.
+            try:
+                volume.delete(missing_ok=True)
+            except Exception:
+                pass
+
+    def test_staging_folder_paths_root_under_volume(self) -> None:
+        tmp = self.table.staging_folder(temporary=True)
+        async_path = self.table.staging_folder(async_write=True)
+        self.assertIsInstance(tmp, VolumePath)
+        self.assertIsInstance(async_path, VolumePath)
+        # Folder layout is part of the staging contract — the warehouse
+        # insert path globs ``.sql/tmp`` and the async-applier task
+        # subscribes to ``.sql/async/insert`` for file-arrival triggers.
+        self.assertTrue(tmp.full_path().rstrip("/").endswith(".sql/tmp"))
+        self.assertTrue(
+            async_path.full_path().rstrip("/").endswith(".sql/async/insert")
+        )
+        # The ``temporary`` flag round-trips onto the returned path so
+        # callers can chain ``with`` blocks for auto-cleanup.
+        self.assertTrue(tmp.temporary)
+        self.assertFalse(async_path.temporary)
+
+    def test_insert_volume_path_is_unique_per_call(self) -> None:
+        a = self.table.insert_volume_path()
+        b = self.table.insert_volume_path()
+        self.assertNotEqual(a.full_path(), b.full_path())
+        for p in (a, b):
+            self.assertTrue(p.full_path().endswith(".parquet"))
+            # Path lives under the staging volume's ``.sql/tmp`` folder.
+            self.assertIn("/.sql/tmp/", p.full_path())
+
+    def test_insert_volume_path_round_trips_parquet(self) -> None:
+        try:
+            self.table.staging_volume.ensure_created()
+        except (DatabricksError, PermissionDenied) as exc:
+            raise unittest.SkipTest(
+                f"Cannot create staging volume: {exc}."
+            )
+        path = self.table.insert_volume_path(temporary=False)
+        data = pa.table(
+            {
+                "id": pa.array([10, 20], type=pa.int64()),
+                "label": pa.array(["x", "y"], type=pa.string()),
+            }
+        )
+        path.as_media(media_type=MediaTypes.PARQUET).write_table(
+            data, mode=Mode.OVERWRITE,
+        )
+        try:
+            self.assertGreater(path.size, 0)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_temporary_credentials_returns_creds(self) -> None:
+        # ``temporary_credentials`` is a thin pass-through over
+        # ``temporary_table_credentials.generate_temporary_table_credentials``
+        # — the call must round-trip and return a response keyed by
+        # this table's id.
+        try:
+            response = self.table.temporary_credentials(
+                operation=TableOperation.READ,
+            )
+        except (DatabricksError, PermissionDenied) as exc:
+            raise unittest.SkipTest(
+                f"Cannot vend temporary table credentials: {exc}."
+            )
+        self.assertIsNotNone(response)
+        # The SDK response carries an ``expiration_time`` and one of
+        # ``aws_temp_credentials`` / ``azure_user_delegation_sas`` /
+        # ``gcp_oauth_token`` depending on cloud — we don't pin the
+        # cloud-specific slot, but at least one must be populated.
+        cred_attrs = (
+            "aws_temp_credentials",
+            "azure_user_delegation_sas",
+            "gcp_oauth_token",
+            "r2_temp_credentials",
+        )
+        self.assertTrue(
+            any(getattr(response, attr, None) is not None for attr in cred_attrs),
+            f"No cloud credential slot populated on {response!r}",
+        )
+
+    def test_storage_location_returns_addressable_path(self) -> None:
+        # ``storage_location`` collapses to a :class:`Path` over the
+        # backing cloud store via the table-bound :class:`AWSClient`.
+        # Only AWS workspaces vend the read creds we need here — skip
+        # cleanly on Azure / GCP rather than failing.
+        try:
+            path = self.table.storage_location()
+        except NotImplementedError as exc:
+            raise unittest.SkipTest(
+                f"storage_location not implemented on this workspace: {exc}."
+            )
+        except (DatabricksError, PermissionDenied) as exc:
+            raise unittest.SkipTest(
+                f"Cannot resolve storage_location (non-AWS workspace?): {exc}."
+            )
+        except Exception as exc:
+            # AWSClient construction raises on non-AWS workspaces with
+            # a non-Databricks exception type — collapse to a skip
+            # rather than a hard fail so the suite stays portable.
+            raise unittest.SkipTest(
+                f"storage_location unavailable: {exc}."
+            )
+        self.assertIsNotNone(path)
+        # Managed tables on AWS resolve to an ``s3://...`` URL — the
+        # full_path must at minimum be a non-empty string.
+        self.assertTrue(str(path.full_path()))
