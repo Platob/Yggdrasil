@@ -48,6 +48,7 @@ from .nodes import (
     Not,
     Predicate,
     lit,
+    simplify,
 )
 
 __all__ = [
@@ -72,4 +73,5 @@ __all__ = [
     "col",
     "lit",
     "neg",
+    "simplify",
 ]
