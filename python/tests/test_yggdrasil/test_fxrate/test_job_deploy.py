@@ -429,3 +429,166 @@ class TestDeploySchedule(DatabricksTestCase):
         first_call = update_mock.call_args_list[0]
         assert isinstance(first_call.kwargs["schedule"], CronSchedule)
         assert "main.fx.raw_fxrate" in first_call.kwargs["description"]
+
+
+class TestDeployDashTask(DatabricksTestCase):
+    """Coverage for the downstream ``dash_fxrate`` task wiring.
+
+    The dash task only stages when *dash_table* is set on the deploy
+    call. When it does, two ``JobTask`` instances flow through
+    ``JobTask.create`` — the ingestion task plus the dash task — and
+    the dash task's ``Task`` spec carries a ``depends_on`` link
+    pointing at the ingestion task_key.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._capture = _StagedScriptCapture()
+        self._capture.install(self)
+        self.workspace_client.jobs.list.return_value = iter([])
+
+    def _patch_create(self):
+        return patch.object(self.client.jobs, "create_or_update")
+
+    def test_no_dash_table_stages_one_task(self) -> None:
+        captured_tasks: list = []
+        with self._patch_create() as create_or_update, \
+                patch(
+                    "yggdrasil.databricks.jobs.task.JobTask.create",
+                    lambda self_task: captured_tasks.append(self_task) or self_task,
+                ):
+            create_or_update.return_value = MagicMock(
+                job_id=1, job_name="ygg-fxrate-ingestion",
+            )
+            deploy_scheduled_fxrate_job(
+                target_table="main.fx.raw_fxrate",
+                pairs=[("EUR", "USD")],
+                schedule="0 0 6 * * ?",
+                client=self.client,
+            )
+        # Single ingestion task, no dash task.
+        assert len(captured_tasks) == 1
+        assert captured_tasks[0].task_key == "fxrate_ingestion"
+
+    def test_dash_table_stages_two_tasks_with_depends_on(self) -> None:
+        captured_tasks: list = []
+        with self._patch_create() as create_or_update, \
+                patch(
+                    "yggdrasil.databricks.jobs.task.JobTask.create",
+                    lambda self_task: captured_tasks.append(self_task) or self_task,
+                ):
+            create_or_update.return_value = MagicMock(
+                job_id=1, job_name="ygg-fxrate-ingestion",
+            )
+            deploy_scheduled_fxrate_job(
+                target_table="main.fx.raw_fxrate",
+                pairs=[("EUR", "USD")],
+                schedule="0 0 6 * * ?",
+                dash_table="main.fx.dash_fxrate",
+                client=self.client,
+            )
+
+        # Ingestion task + dash task — exactly two staged.
+        keys = [t.task_key for t in captured_tasks]
+        assert keys == ["fxrate_ingestion", "dash_fxrate"]
+
+        ingestion_details = captured_tasks[0]._details
+        dash_details = captured_tasks[1]._details
+
+        # The ingestion task carries no depends_on; the dash task
+        # depends on the ingestion task_key.
+        assert not ingestion_details.depends_on
+        assert dash_details.depends_on is not None
+        assert len(dash_details.depends_on) == 1
+        assert dash_details.depends_on[0].task_key == "fxrate_ingestion"
+
+    def test_dash_task_script_bakes_default_targets(self) -> None:
+        with self._patch_create() as create_or_update:
+            create_or_update.return_value = MagicMock(
+                job_id=1, job_name="ygg-fxrate-ingestion",
+            )
+            deploy_scheduled_fxrate_job(
+                target_table="main.fx.raw_fxrate",
+                pairs=[("EUR", "USD")],
+                schedule="0 0 6 * * ?",
+                dash_table="main.fx.dash_fxrate",
+                client=self.client,
+            )
+
+        scripts = self._capture.captured.values()
+        dash_bodies = [s for s in scripts if "dash_fxrate_entrypoint" in s]
+        assert len(dash_bodies) == 1
+        body = dash_bodies[0]
+        # Source / target tables baked as ``repr``-d literals.
+        assert "'main.fx.raw_fxrate'" in body
+        assert "'main.fx.dash_fxrate'" in body
+        # Default EUR/USD/CHF targets ride as JSON literal — bake
+        # carries the ISO codes inside the targets_json kwarg.
+        for code in ("EUR", "USD", "CHF"):
+            assert code in body
+        # Default lookback is 30 days.
+        assert "lookback_days=30" in body
+
+    def test_dash_targets_override(self) -> None:
+        with self._patch_create() as create_or_update:
+            create_or_update.return_value = MagicMock(
+                job_id=1, job_name="ygg-fxrate-ingestion",
+            )
+            deploy_scheduled_fxrate_job(
+                target_table="main.fx.raw_fxrate",
+                pairs=[("EUR", "USD"), ("EUR", "JPY")],
+                schedule="0 0 6 * * ?",
+                dash_table="main.fx.dash_fxrate",
+                dash_targets=("EUR", "JPY", "GBP"),
+                dash_lookback_days=14,
+                client=self.client,
+            )
+
+        scripts = self._capture.captured.values()
+        dash_body = next(s for s in scripts if "dash_fxrate_entrypoint" in s)
+        # Custom targets land in the staged script body.
+        assert '"EUR"' in dash_body and '"JPY"' in dash_body and '"GBP"' in dash_body
+        assert "lookback_days=14" in dash_body
+
+    def test_dash_targets_invalid_raises_at_deploy_time(self) -> None:
+        # ``Currency.parse`` enforces ISO 4217 — a 4-char code fails fast.
+        with self._patch_create() as create_or_update:
+            create_or_update.return_value = MagicMock(
+                job_id=1, job_name="ygg-fxrate-ingestion",
+            )
+            with pytest.raises(ValueError, match="ISO-4217"):
+                deploy_scheduled_fxrate_job(
+                    target_table="main.fx.raw_fxrate",
+                    pairs=[("EUR", "USD")],
+                    schedule="0 0 6 * * ?",
+                    dash_table="main.fx.dash_fxrate",
+                    dash_targets=("EUROS",),  # 5-char — invalid ISO 4217
+                    client=self.client,
+                )
+
+    def test_dash_task_inherits_cluster_pin(self) -> None:
+        captured_tasks: list = []
+        with self._patch_create() as create_or_update, \
+                patch(
+                    "yggdrasil.databricks.jobs.task.JobTask.create",
+                    lambda self_task: captured_tasks.append(self_task) or self_task,
+                ):
+            create_or_update.return_value = MagicMock(
+                job_id=1, job_name="ygg-fxrate-ingestion",
+            )
+            deploy_scheduled_fxrate_job(
+                target_table="main.fx.raw_fxrate",
+                pairs=[("EUR", "USD")],
+                schedule="0 0 6 * * ?",
+                dash_table="main.fx.dash_fxrate",
+                existing_cluster_id="0123-456789-abc",
+                client=self.client,
+            )
+
+        assert len(captured_tasks) == 2
+        ingestion, dash_task = captured_tasks
+        # Both tasks pinned to the same cluster — the dash task
+        # inherits the ingestion task's compute pin so the deploy
+        # story is uniform (CLAUDE.md "Pick compute by workload type").
+        assert ingestion._details.existing_cluster_id == "0123-456789-abc"
+        assert dash_task._details.existing_cluster_id == "0123-456789-abc"
