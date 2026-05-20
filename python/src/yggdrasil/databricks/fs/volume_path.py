@@ -51,7 +51,6 @@ from yggdrasil.data.enums.media_type import MediaType
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
-from ..client import DatabricksClient
 from ..path import DatabricksPath
 
 if TYPE_CHECKING:
@@ -100,7 +99,6 @@ class VolumePath(DatabricksPath):
         url: "URL | None" = None,
         volume: "Volume | None" = None,
         service: Any = None,
-        client: "DatabricksClient | None" = None,
         **kwargs: Any,
     ) -> None:
         # Idempotent under ``Singleton`` caching — see ``DatabricksPath.__init__``.
@@ -109,15 +107,15 @@ class VolumePath(DatabricksPath):
 
         self._volume: Optional["Volume"] = volume
 
-        # A bound :class:`Volume` carries both the service and the
-        # client — prefer the Volume's service so the resource stays
-        # navigable (``volume_path.volume`` short-circuits to the
-        # cached instance without re-resolving).
-        if volume is not None and service is None and client is None:
+        # A bound :class:`Volume` carries the service — prefer the
+        # Volume's service so the resource stays navigable
+        # (``volume_path.volume`` short-circuits to the cached
+        # instance without re-resolving).
+        if volume is not None and service is None:
             service = volume.service
 
         super().__init__(
-            data=data, service=service, client=client, url=url,
+            data=data, service=service, url=url,
             **kwargs,
         )
 

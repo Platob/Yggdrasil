@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from yggdrasil.databricks.fs import WorkspacePath
+from yggdrasil.databricks.workspaces.service import Workspaces
 from yggdrasil.io.io_stats import IOKind
 
 
@@ -37,6 +38,15 @@ def workspace(client):
     return client.workspace_client.return_value
 
 
+@pytest.fixture
+def service(client):
+    """Mock :class:`Workspaces` service whose ``client`` is the fixture
+    :func:`client`."""
+    svc = MagicMock(spec=Workspaces)
+    svc.client = client
+    return svc
+
+
 def _file_status(size: int) -> SimpleNamespace:
     return SimpleNamespace(
         object_type=SimpleNamespace(name="FILE"),
@@ -55,44 +65,44 @@ def _dir_status() -> SimpleNamespace:
 
 class TestConstruction:
 
-    def test_legacy_posix_string(self, workspace, client) -> None:
-        p = WorkspacePath("/Workspace/Users/me/notebook.py", client=client)
+    def test_legacy_posix_string(self, workspace, client, service) -> None:
+        p = WorkspacePath("/Workspace/Users/me/notebook.py", service=service)
         assert p.full_path() == "/Workspace/Users/me/notebook.py"
         assert p.api_path == "/Workspace/Users/me/notebook.py"
 
-    def test_url_form(self, workspace, client) -> None:
-        p = WorkspacePath("dbfs+workspace:///Users/me/x", client=client)
+    def test_url_form(self, workspace, client, service) -> None:
+        p = WorkspacePath("dbfs+workspace:///Users/me/x", service=service)
         assert p.full_path() == "/Workspace/Users/me/x"
 
 
 class TestStat:
 
-    def test_existing_file(self, workspace, client) -> None:
+    def test_existing_file(self, workspace, client, service) -> None:
         workspace.workspace.get_status.return_value = _file_status(42)
-        p = WorkspacePath("/Workspace/x", client=client)
+        p = WorkspacePath("/Workspace/x", service=service)
         s = p._stat_uncached()
         assert s.kind is IOKind.FILE
         assert s.size == 42
 
-    def test_directory(self, workspace, client) -> None:
+    def test_directory(self, workspace, client, service) -> None:
         workspace.workspace.get_status.return_value = _dir_status()
-        p = WorkspacePath("/Workspace/folder", client=client)
+        p = WorkspacePath("/Workspace/folder", service=service)
         assert p._stat_uncached().kind is IOKind.DIRECTORY
 
-    def test_missing(self, workspace, client) -> None:
+    def test_missing(self, workspace, client, service) -> None:
         workspace.workspace.get_status.side_effect = NotFound()
-        p = WorkspacePath("/Workspace/x", client=client)
+        p = WorkspacePath("/Workspace/x", service=service)
         assert p._stat_uncached().kind is IOKind.MISSING
 
 
 class TestRead:
 
-    def test_read_bytes(self, workspace, client) -> None:
+    def test_read_bytes(self, workspace, client, service) -> None:
         workspace.workspace.get_status.return_value = _file_status(5)
         body = SimpleNamespace(read=lambda: b"hello")
         workspace.workspace.download.return_value = SimpleNamespace(contents=body)
 
-        p = WorkspacePath("/Workspace/x", client=client)
+        p = WorkspacePath("/Workspace/x", service=service)
         assert p.read_bytes() == b"hello"
         # ``format`` must be passed: the SDK default is ``SOURCE``,
         # which routes through the notebook export path and returns
@@ -103,19 +113,19 @@ class TestRead:
         fmt = kwargs["format"]
         assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
 
-    def test_missing_raises(self, workspace, client) -> None:
+    def test_missing_raises(self, workspace, client, service) -> None:
         workspace.workspace.get_status.return_value = _file_status(5)
         workspace.workspace.download.side_effect = NotFound()
-        p = WorkspacePath("/Workspace/x", client=client)
+        p = WorkspacePath("/Workspace/x", service=service)
         with pytest.raises(FileNotFoundError):
             p.read_bytes()
 
 
 class TestWrite:
 
-    def test_overwrite(self, workspace, client) -> None:
+    def test_overwrite(self, workspace, client, service) -> None:
         workspace.workspace.get_status.side_effect = NotFound()
-        p = WorkspacePath("/Workspace/x", client=client)
+        p = WorkspacePath("/Workspace/x", service=service)
         p.write_bytes(b"abcdef")
         kwargs = workspace.workspace.upload.call_args.kwargs
         assert kwargs["path"] == "/Workspace/x"
@@ -131,7 +141,7 @@ class TestWrite:
         fmt = kwargs["format"]
         assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
 
-    def test_stream_input_routes_through_upload(self, workspace, client) -> None:
+    def test_stream_input_routes_through_upload(self, workspace, client, service) -> None:
         """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
         :class:`IO[bytes]` by the public :meth:`Holder.write_stream`
         and lands on the single ``workspace.upload`` request via
@@ -142,7 +152,7 @@ class TestWrite:
 
         workspace.workspace.get_status.side_effect = NotFound()
         stream = io.BytesIO(b"streamed-payload")
-        p = WorkspacePath("/Workspace/z", client=client)
+        p = WorkspacePath("/Workspace/z", service=service)
         p.write_bytes(stream)
 
         kwargs = workspace.workspace.upload.call_args.kwargs
@@ -152,7 +162,7 @@ class TestWrite:
         # And only one upload call (no chunked RMW loop).
         assert workspace.workspace.upload.call_count == 1
 
-    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client) -> None:
+    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client, service) -> None:
         """Transient failures must rewind a caller-supplied stream.
 
         A live IO input ridden through ``_upload`` would otherwise
@@ -182,7 +192,7 @@ class TestWrite:
         workspace.workspace.upload.side_effect = upload_side_effect
 
         with patch("yggdrasil.io.path._retry.time.sleep"):
-            WorkspacePath("/Workspace/y", client=client).write_bytes(
+            WorkspacePath("/Workspace/y", service=service).write_bytes(
                 io.BytesIO(b"abcdef"),
             )
 
@@ -195,31 +205,31 @@ class TestWrite:
 
 class TestMutators:
 
-    def test_unlink(self, workspace, client) -> None:
+    def test_unlink(self, workspace, client, service) -> None:
         workspace.workspace.get_status.return_value = _file_status(0)
-        p = WorkspacePath("/Workspace/x", client=client)
+        p = WorkspacePath("/Workspace/x", service=service)
         p.unlink()
         workspace.workspace.delete.assert_called_once_with(
             "/Workspace/x", recursive=False,
         )
 
-    def test_remove_dir(self, workspace, client) -> None:
+    def test_remove_dir(self, workspace, client, service) -> None:
         workspace.workspace.get_status.return_value = _dir_status()
-        p = WorkspacePath("/Workspace/folder", client=client)
+        p = WorkspacePath("/Workspace/folder", service=service)
         p.remove(recursive=True)
         workspace.workspace.delete.assert_called_once_with(
             "/Workspace/folder", recursive=True,
         )
 
-    def test_mkdir(self, workspace, client) -> None:
-        p = WorkspacePath("/Workspace/a/b", client=client)
+    def test_mkdir(self, workspace, client, service) -> None:
+        p = WorkspacePath("/Workspace/a/b", service=service)
         p.mkdir()
         workspace.workspace.mkdirs.assert_called_once_with("/Workspace/a/b")
 
 
 class TestListing:
 
-    def test_iterdir(self, workspace, client) -> None:
+    def test_iterdir(self, workspace, client, service) -> None:
         workspace.workspace.list.return_value = [
             SimpleNamespace(
                 path="/Workspace/Users/me/a.py",
@@ -230,7 +240,7 @@ class TestListing:
                 object_type=SimpleNamespace(name="DIRECTORY"),
             ),
         ]
-        p = WorkspacePath("/Workspace/Users/me", client=client)
+        p = WorkspacePath("/Workspace/Users/me", service=service)
         children = list(p.iterdir())
         assert [c.full_path() for c in children] == [
             "/Workspace/Users/me/a.py",
@@ -242,7 +252,7 @@ class TestMePlaceholder:
     """``/Workspace/Users/<me>/...`` should resolve ``<me>`` to the
     bound workspace client's ``current_user.me().user_name``."""
 
-    def test_resolves_me_from_current_user(self, workspace, client) -> None:
+    def test_resolves_me_from_current_user(self, workspace, client, service) -> None:
         workspace.current_user.me.return_value = SimpleNamespace(
             user_name="alice@example.com",
         )
@@ -251,7 +261,7 @@ class TestMePlaceholder:
         _USER_NAME_CACHE.clear()
 
         p = WorkspacePath(
-            "/Workspace/Users/<me>/scratch/x.txt", client=client,
+            "/Workspace/Users/<me>/scratch/x.txt", service=service,
         )
         assert p.full_path() == (
             "/Workspace/Users/alice@example.com/scratch/x.txt"
@@ -261,18 +271,18 @@ class TestMePlaceholder:
         _ = p.full_path()
         assert workspace.current_user.me.call_count == 1
 
-    def test_unrelated_path_untouched(self, workspace, client) -> None:
+    def test_unrelated_path_untouched(self, workspace, client, service) -> None:
         # No ``<me>`` segment → no SDK call.
-        p = WorkspacePath("/Workspace/Shared/x.txt", client=client)
+        p = WorkspacePath("/Workspace/Shared/x.txt", service=service)
         assert p.full_path() == "/Workspace/Shared/x.txt"
         workspace.current_user.me.assert_not_called()
 
-    def test_resolution_failure_leaves_placeholder(self, workspace, client) -> None:
+    def test_resolution_failure_leaves_placeholder(self, workspace, client, service) -> None:
         from yggdrasil.databricks.fs.workspace_path import _USER_NAME_CACHE
         _USER_NAME_CACHE.clear()
         workspace.current_user.me.side_effect = RuntimeError("no perms")
         p = WorkspacePath(
-            "/Workspace/Users/<me>/x.txt", client=client,
+            "/Workspace/Users/<me>/x.txt", service=service,
         )
         # Returns the original path; no exception.
         assert p.full_path() == "/Workspace/Users/<me>/x.txt"
@@ -283,7 +293,7 @@ class TestParentRetry:
     swallow ``Folder X is protected`` messages from a protected
     ancestor."""
 
-    def test_upload_creates_parent_on_not_found(self, workspace, client) -> None:
+    def test_upload_creates_parent_on_not_found(self, workspace, client, service) -> None:
         attempts = [NotFound("does not exist"), None]
 
         def upload(**_kwargs):
@@ -294,7 +304,7 @@ class TestParentRetry:
 
         workspace.workspace.upload.side_effect = upload
         p = WorkspacePath(
-            "/Workspace/Users/me/run-1/sub/file.txt", client=client,
+            "/Workspace/Users/me/run-1/sub/file.txt", service=service,
         )
         p.write_bytes(b"abc")
         # Parent directory should have been created.
@@ -303,12 +313,12 @@ class TestParentRetry:
         )
         assert workspace.workspace.upload.call_count == 2
 
-    def test_mkdirs_protected_ancestor_is_non_fatal(self, workspace, client) -> None:
+    def test_mkdirs_protected_ancestor_is_non_fatal(self, workspace, client, service) -> None:
         workspace.workspace.mkdirs.side_effect = type(
             "BadRequest", (Exception,), {},
         )("Folder Users is protected")
         p = WorkspacePath(
-            "/Workspace/Users/me/run-1/listing", client=client,
+            "/Workspace/Users/me/run-1/listing", service=service,
         )
         # Should not raise.
         p.mkdir(parents=True, exist_ok=True)
@@ -326,7 +336,7 @@ class TestUploadModule:
         (pkg / "__init__.py").write_text("X = 1\n")
         return pkg
 
-    def test_upload_streams_archive(self, workspace, client, demo_package) -> None:
+    def test_upload_streams_archive(self, workspace, client, service, demo_package) -> None:
         workspace.workspace.get_status.side_effect = NotFound()
 
         captured: dict = {}
@@ -342,7 +352,7 @@ class TestUploadModule:
         workspace.workspace.upload.side_effect = capture_upload
 
         target = WorkspacePath(
-            "/Workspace/Users/me/.ygg/modules", client=client,
+            "/Workspace/Users/me/.ygg/modules", service=service,
         )
         archive = target.upload_module(demo_package)
 
@@ -365,10 +375,10 @@ class TestUploadModule:
         with zipfile.ZipFile(_io.BytesIO(captured["body"])) as zf:
             assert "demo_ws_mod/__init__.py" in zf.namelist()
 
-    def test_upload_to_explicit_zip_path(self, workspace, client, demo_package) -> None:
+    def test_upload_to_explicit_zip_path(self, workspace, client, service, demo_package) -> None:
         workspace.workspace.get_status.side_effect = NotFound()
         target = WorkspacePath(
-            "/Workspace/Users/me/libs/custom.zip", client=client,
+            "/Workspace/Users/me/libs/custom.zip", service=service,
         )
         archive = target.upload_module(demo_package)
         assert archive.full_path() == "/Workspace/Users/me/libs/custom.zip"
@@ -377,11 +387,11 @@ class TestUploadModule:
         assert kwargs["path"] == "/Workspace/Users/me/libs/custom.zip"
 
     def test_upload_no_overwrite_raises_when_exists(
-        self, workspace, client, demo_package,
+        self, workspace, client, service, demo_package,
     ) -> None:
         workspace.workspace.get_status.return_value = _file_status(123)
         target = WorkspacePath(
-            "/Workspace/Users/me/.ygg/modules", client=client,
+            "/Workspace/Users/me/.ygg/modules", service=service,
         )
         with pytest.raises(FileExistsError):
             target.upload_module(demo_package, overwrite=False)
@@ -401,7 +411,7 @@ class TestRetryPolicy:
         recorded: list[float] = []
         return recorded, recorded.append
 
-    def test_internal_error_retries(self, workspace, client, sleeps) -> None:
+    def test_internal_error_retries(self, workspace, client, service, sleeps) -> None:
         recorded, spy = sleeps
         attempts = [InternalError(), _file_status(3)]
 
@@ -412,6 +422,6 @@ class TestRetryPolicy:
             return r
 
         workspace.workspace.get_status.side_effect = get_status
-        p = WorkspacePath("/Workspace/x", client=client, retry_sleep=spy)
+        p = WorkspacePath("/Workspace/x", service=service, retry_sleep=spy)
         assert p.size == 3
         assert recorded == [1.0]

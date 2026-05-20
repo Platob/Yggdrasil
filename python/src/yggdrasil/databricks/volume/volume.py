@@ -615,7 +615,7 @@ class Volume(DatabricksResource, Singleton):
         *,
         url: URL | None = None,
         volume: "Volume | None" = None,
-        client: "DatabricksClient | None" = None,
+        service: Any = None,
         temporary: bool = False,
         **kwargs
     ) -> "VolumePath":
@@ -634,7 +634,7 @@ class Volume(DatabricksResource, Singleton):
                 path=f"/{self.catalog_name}/{self.schema_name}/{self.volume_name}{leaf}",
             ),
             volume=volume or self,
-            client=client or self.client,
+            service=service or self.service,
             temporary=temporary,
             **kwargs
         )

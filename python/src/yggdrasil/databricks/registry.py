@@ -367,12 +367,21 @@ class WorkspacePyPIRegistry:
     def __post_init__(self) -> None:
         from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 
+        # Route every workspace-path construction through the same
+        # :class:`Workspaces` collection so all paths in this registry
+        # share one service binding.
+        workspaces = self.client.workspaces
         if self.base_path is None:
-            self.base_path = WorkspacePath(self.DEFAULT_BASE, client=self.client)
+            self.base_path = WorkspacePath(self.DEFAULT_BASE, service=workspaces)
         elif not isinstance(self.base_path, WorkspacePath):
-            self.base_path = WorkspacePath.from_(self.base_path, client=self.client)
+            self.base_path = WorkspacePath.from_(self.base_path, service=workspaces)
         else:
-            self.base_path = self.base_path.with_client(self.client)
+            # Rebuild against the registry's client by constructing a
+            # fresh path on the right service — same URL collapses to
+            # the singleton bound to that service.
+            self.base_path = WorkspacePath(
+                url=self.base_path.url, service=workspaces,
+            )
 
         if self.local_cache is None:
             self.local_cache = _LocalPath(

@@ -247,6 +247,6 @@ class TestWorkspacePyPIIntegration(_UserInfoIntegrationBase):
             finally:
                 # Best-effort cleanup of the per-test index folder.
                 try:
-                    WorkspacePath(root_path, client=self.client).rmdir()
+                    WorkspacePath(root_path, service=self.client.workspaces).rmdir()
                 except Exception:
                     pass

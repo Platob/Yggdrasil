@@ -15,10 +15,11 @@ service exposes).
 
 What :class:`S3Service` *does* expose:
 
-- :meth:`boto_client` — the cached boto S3 client (inherited from
-  :class:`AWSService`).
-- :attr:`client` shorthand — same thing, named for ergonomics so
-  ``service.client.head_object(...)`` reads well from S3Path.
+- :attr:`boto_client` — the cached boto S3 client (inherited from
+  :class:`AWSService`). :class:`S3Path` reaches this via its own
+  ``client`` property (= ``self.service.boto_client``).
+- :attr:`s3_client` shorthand — same thing, explicit about which
+  service the boto client is for.
 - :meth:`path` — convenience constructor for :class:`S3Path`
   bound to this service.
 - :attr:`ls_cache` — short-lived ``ListObjectsV2`` cache shared
@@ -143,8 +144,8 @@ class S3Service(AWSService):
             self._ls_cache.pop(k, None)
 
     # ------------------------------------------------------------------
-    # Ergonomic alias — `service.client` reads better than
-    # `service.boto_client` from inside S3Path.
+    # Ergonomic alias — `service.s3_client` reads better than
+    # `service.boto_client` from outside S3Path.
     # ------------------------------------------------------------------
 
     @property

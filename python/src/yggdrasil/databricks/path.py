@@ -19,22 +19,24 @@ The base owns:
   Catalog :class:`Table`) based on the URL scheme or the POSIX
   namespace in the path. Construction via the abstract base
   "just works" — no need for callers to pick a subclass up front.
-- **Client binding** — :attr:`client` is a
-  :class:`yggdrasil.databricks.client.DatabricksClient` aggregator.
-  The SDK workspace handle is reached through ``client.workspace_client()``
-  — :class:`DatabricksPath` never holds a bare workspace client
-  directly. No imports of ``databricks.sdk`` happen at module load.
+- **Service binding** — the path holds a :class:`DatabricksService`
+  (subclass) via ``self.service``; :attr:`client` (inherited from
+  :class:`DatabricksResource`) returns ``self.service.client``.
+  The SDK workspace handle is reached through
+  ``self.client.workspace_client()`` — :class:`DatabricksPath` never
+  holds a bare workspace client directly. No imports of
+  ``databricks.sdk`` happen at module load.
 
-Tests pass a :class:`DatabricksClient` (or a mock shaped like one
-— typically ``MagicMock()`` with ``workspace_client.return_value``
-wired to a workspace-shaped mock). There is no alternate
-"workspace-only" entry point: every caller routes through
-:class:`DatabricksClient`.
+Tests pass a service-shaped mock (e.g. ``MagicMock(spec=Volumes)``
+with ``service.client`` wired to a :class:`DatabricksClient`-shaped
+mock that itself exposes ``workspace_client``). There is no
+alternate "workspace-only" entry point: every caller routes through
+the service.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Tuple
+from typing import Any, Callable, ClassVar, Optional, Tuple
 
 from yggdrasil.data.enums import Scheme
 from yggdrasil.io.path import RemotePath
@@ -42,9 +44,6 @@ from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL
 from .resource import DatabricksResource
 from .service import DatabricksService
-
-if TYPE_CHECKING:
-    from yggdrasil.databricks.client import DatabricksClient
 
 
 __all__ = ["DatabricksPath"]
@@ -312,25 +311,19 @@ class DatabricksPath(DatabricksResource, RemotePath):
         *,
         url: "URL | None" = None,
         service: Any = None,
-        client: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """Identity = (subclass, canonical URL string, client).
+        """Identity = (subclass, canonical URL string, service).
 
         ``data`` collapses into ``url`` before keying so ``"/Volumes/x"``
         and ``URL.from_("/Volumes/x")`` map to the same singleton.
-        ``client`` is part of the key because the same URL can be
-        backed by different workspaces; passing ``client=None``
-        (or ``service=None``) collapses to the lazy-resolved
-        :meth:`DatabricksClient.current`. When ``service`` is given,
-        its client wins so two paths bound to different services on
-        the same client still collapse.
+        ``service`` is part of the key because the same URL can be
+        backed by different workspaces; passing ``service=None``
+        collapses to the lazy-resolved
+        :meth:`DatabricksService.current`. Two paths bound to
+        distinct services (cross-workspace fixtures) stay distinct
+        singletons.
         """
-        if client is None and service is not None:
-            try:
-                client = service.client
-            except Exception:
-                client = None
         if url is None and isinstance(data, URL):
             url = data
         elif url is None and isinstance(data, str):
@@ -339,7 +332,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
             # Without a URL there's no canonical identity — fall through
             # to ``id``-based hashing by returning a unique sentinel.
             return (cls, object())
-        return (cls, str(url), client)
+        return (cls, str(url), service)
 
     # ==================================================================
     # Construction — dispatch on the abstract base, allocate on subclasses
@@ -454,7 +447,6 @@ class DatabricksPath(DatabricksResource, RemotePath):
         *,
         url: URL | None = None,
         service: Optional[DatabricksService] = None,
-        client: "DatabricksClient | None" = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
         singleton_ttl: Any = ...,
@@ -464,9 +456,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
         if getattr(self, "_initialized", False):
             return
 
-        if service is None and client is not None:
-            service = self._SERVICE_CLASS(client=client)
-        elif service is None:
+        if service is None:
             service = self._SERVICE_CLASS.current()
 
         # ``__new__`` already normalized POSIX-string seeds into a
@@ -590,13 +580,9 @@ class DatabricksPath(DatabricksResource, RemotePath):
     # (``self.service.client`` / ``self.client.sql``). Production callers
     # let ``service`` default to :meth:`DatabricksService.current` and
     # the active workspace selection follows the process-wide singleton.
-    # Tests inject a :class:`DatabricksClient` mock at construction so
-    # ``service.client`` returns the mock directly.
-
-    def with_client(self, client: "DatabricksClient") -> "DatabricksPath":
-        """Rebind to *client* by rebuilding the resource service. Returns *self*."""
-        self.service = self._SERVICE_CLASS(client=client)
-        return self
+    # Tests inject a service-shaped mock whose ``client`` attribute is
+    # the mock :class:`DatabricksClient` so ``self.client`` returns the
+    # mock directly.
 
     @property
     def workspace_client(self) -> Any:

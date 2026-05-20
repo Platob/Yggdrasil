@@ -16,11 +16,41 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.aws.fs.path import S3Path
+from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.databricks.fs import DBFSPath, VolumePath
+from yggdrasil.databricks.fs.service import DBFSService
+from yggdrasil.databricks.volume.volumes import Volumes
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.primitive.csv_file import CSVFile
 from yggdrasil.io.primitive.ndjson_file import NDJSONFile
 from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+
+def _s3_service(client: MagicMock) -> MagicMock:
+    """Wrap a boto-shaped mock client in a mock :class:`S3Service`.
+
+    :class:`S3Path` reaches the boto surface through
+    ``self.service.boto_client``.
+    """
+    svc = MagicMock(spec=S3Service)
+    svc.boto_client = client
+    return svc
+
+
+def _dbfs_service(client: MagicMock) -> MagicMock:
+    """Wrap a :class:`DatabricksClient`-shaped mock in a mock
+    :class:`DBFSService` so :class:`DBFSPath` reaches the workspace
+    handle through ``self.service.client``."""
+    svc = MagicMock(spec=DBFSService)
+    svc.client = client
+    return svc
+
+
+def _volumes_service(client: MagicMock) -> MagicMock:
+    """Mock :class:`Volumes` service whose ``client`` is *client*."""
+    svc = MagicMock(spec=Volumes)
+    svc.client = client
+    return svc
 
 
 @pytest.fixture
@@ -172,7 +202,7 @@ class TestParquetOverS3:
     def test_round_trip(self, table) -> None:
         store = {}
         client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.parquet", client=client)
+        s3 = S3Path("s3://my-bucket/data.parquet", service=_s3_service(client))
 
         writer = ParquetFile(holder=s3, owns_holder=False)
         writer.write_arrow_table(table)
@@ -186,7 +216,7 @@ class TestParquetOverS3:
     def test_collect_schema(self, table) -> None:
         store = {}
         client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.parquet", client=client)
+        s3 = S3Path("s3://my-bucket/data.parquet", service=_s3_service(client))
         ParquetFile(holder=s3, owns_holder=False).write_arrow_table(table)
 
         schema = ParquetFile(holder=s3, owns_holder=False).collect_schema()
@@ -203,7 +233,7 @@ class TestCsvOverS3:
     def test_round_trip(self, table) -> None:
         store = {}
         client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.csv", client=client)
+        s3 = S3Path("s3://my-bucket/data.csv", service=_s3_service(client))
 
         CSVFile(holder=s3, owns_holder=False).write_arrow_table(table)
         loaded = CSVFile(holder=s3, owns_holder=False).read_arrow_table()
@@ -220,7 +250,7 @@ class TestArrowIPCOverS3:
     def test_round_trip(self, table) -> None:
         store = {}
         client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.arrow", client=client)
+        s3 = S3Path("s3://my-bucket/data.arrow", service=_s3_service(client))
 
         ArrowIPCFile(holder=s3, owns_holder=False).write_arrow_table(table)
         loaded = ArrowIPCFile(holder=s3, owns_holder=False).read_arrow_table()
@@ -237,7 +267,7 @@ class TestNDJsonOverS3:
     def test_round_trip(self, table) -> None:
         store = {}
         client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.ndjson", client=client)
+        s3 = S3Path("s3://my-bucket/data.ndjson", service=_s3_service(client))
 
         NDJSONFile(holder=s3, owns_holder=False).write_arrow_table(table)
         # Sanity check the line shape on the wire.
@@ -257,7 +287,7 @@ class TestParquetOverDBFS:
     def test_round_trip(self, table) -> None:
         store = {}
         client = _dbfs_round_trip_client(store)
-        dbfs = DBFSPath("/dbfs/data.parquet", client=client)
+        dbfs = DBFSPath("/dbfs/data.parquet", service=_dbfs_service(client))
 
         ParquetFile(holder=dbfs, owns_holder=False).write_arrow_table(table)
         assert store["buf"].startswith(b"PAR1")
@@ -280,7 +310,7 @@ class TestCsvOverDBFS:
     def test_round_trip(self, table) -> None:
         store = {}
         client = _dbfs_round_trip_client(store)
-        dbfs = DBFSPath("/dbfs/data.csv", client=client)
+        dbfs = DBFSPath("/dbfs/data.csv", service=_dbfs_service(client))
 
         CSVFile(holder=dbfs, owns_holder=False).write_arrow_table(table)
         dbfs.invalidate_singleton()
@@ -329,7 +359,7 @@ class TestArrowIPCOverVolume:
         ws.files.download.side_effect = download
         ws.files.upload.side_effect = upload
 
-        vol = VolumePath("/Volumes/c/s/v/data.arrow", client=client)
+        vol = VolumePath("/Volumes/c/s/v/data.arrow", service=_volumes_service(client))
         ArrowIPCFile(holder=vol, owns_holder=False).write_arrow_table(table)
         vol.invalidate_singleton()
         loaded = ArrowIPCFile(holder=vol, owns_holder=False).read_arrow_table()

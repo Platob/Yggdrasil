@@ -76,6 +76,6 @@ class WorkspacePyPI(PyPIPath):
         from ..fs.workspace_path import WorkspacePath
 
         if isinstance(root, str):
-            root = WorkspacePath(root, client=client)
+            root = WorkspacePath(root, service=client.workspaces)
         super().__init__(root)
         self.client = client
