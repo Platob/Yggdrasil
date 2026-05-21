@@ -474,12 +474,37 @@ class TestCacheConfigCoercion:
     """``CacheConfig.check_arg`` accepts a few convenience shapes."""
 
     def test_check_arg_path_sets_local_path(self, tmp_path) -> None:
+        from yggdrasil.io.path import LocalPath, Path as YggPath
+
         cfg = CacheConfig.check_arg(tmp_path)
         assert cfg.is_local is True
         assert cfg.is_remote is False
+        # ``path`` is coerced to a live abstract :class:`Path`; equality
+        # against the string form still holds via Path.__eq__.
+        assert isinstance(cfg.path, YggPath)
+        assert isinstance(cfg.path, LocalPath)
         assert cfg.path == str(tmp_path)
         assert cfg.local_cache_enabled is True
         assert str(cfg.local_cache_folder()) == str(tmp_path)
+
+    def test_check_arg_abstract_path_is_held_as_is(self, tmp_path) -> None:
+        # Passing a live :class:`Path` (any backend) round-trips through
+        # :meth:`check_arg` unchanged — the singleton identity is
+        # preserved so a downstream caller reading ``cfg.path`` gets the
+        # very same backend handle the call site built.
+        from yggdrasil.io.path import LocalPath
+
+        target = LocalPath(str(tmp_path))
+        cfg = CacheConfig.check_arg(target)
+        assert cfg.path is target
+        assert cfg.local_cache_folder() is target
+
+    def test_check_arg_str_path_coerces_to_localpath(self, tmp_path) -> None:
+        from yggdrasil.io.path import LocalPath
+
+        cfg = CacheConfig.check_arg(str(tmp_path))
+        assert isinstance(cfg.path, LocalPath)
+        assert cfg.path == str(tmp_path)
 
     def test_check_arg_timedelta_sets_window(self) -> None:
         import datetime as dt
@@ -494,6 +519,21 @@ class TestCacheConfigCoercion:
     def test_check_arg_dict_round_trip(self) -> None:
         cfg = CacheConfig.check_arg({"mode": "APPEND"})
         assert cfg.mode is Mode.APPEND
+
+    def test_pickle_round_trip_preserves_path(self, tmp_path) -> None:
+        # The dataclass holds a live :class:`Path` but :meth:`__getstate__`
+        # projects to the URL string for transport — so the config still
+        # crosses Spark / multiprocessing / Power Query worker boundaries
+        # without dragging a bound backend handle along, and
+        # :meth:`__setstate__` rehydrates via :meth:`Path.from_`.
+        import pickle
+
+        from yggdrasil.io.path import LocalPath
+
+        cfg = CacheConfig(path=LocalPath(str(tmp_path)))
+        restored = pickle.loads(pickle.dumps(cfg))
+        assert isinstance(restored.path, LocalPath)
+        assert restored.path == cfg.path
 
 
 class TestLocalCacheFolderPerHost:
@@ -525,8 +565,9 @@ class TestLocalCacheFolderPerHost:
         s = StubSession(base_url=URL.from_("https://api.example.com/v1/markets/"))
         path = CacheConfig().local_cache_folder(session=s)
         # Trailing / on base_url must not produce an empty leaf.
-        assert path.parts[-3:] == ("response", "api.example.com", "v1/markets") or (
-            path.parts[-4:] == ("response", "api.example.com", "v1", "markets")
+        parts = tuple(path.parts)
+        assert parts[-3:] == ("response", "api.example.com", "v1/markets") or (
+            parts[-4:] == ("response", "api.example.com", "v1", "markets")
         )
 
     def test_explicit_path_overrides_default(self, tmp_path) -> None:

@@ -37,6 +37,7 @@ from yggdrasil.io.session import (
     _cleanup_local_fast_path,
     _local_fast_path_relative,
     _maybe_autocompress_body_for_cache,
+    _read_fast_path_arrow_batch,
     _safe_fast_path_segment,
 )
 
@@ -283,6 +284,76 @@ class TestCleanupLocalFastPath:
         )
         assert removed == 0
         assert live.exists()
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers accept any path-like root (str / pathlib / yggdrasil Path)
+# ---------------------------------------------------------------------------
+
+
+class TestCacheRootShapes:
+    """The store / read / cleanup helpers all route their ``cache_root``
+    argument through :func:`Path.from_` — so any shape :meth:`Path.from_`
+    accepts works: ``str`` (back-compat with the old string-only call
+    sites), :class:`pathlib.Path` (handy in tests), or a live abstract
+    :class:`yggdrasil.io.path.Path` (any backend — LocalPath today,
+    VolumePath / S3Path / … without touching the helpers when those
+    integrations land their fast-path glue).
+    """
+
+    def _batch(self) -> pa.RecordBatch:
+        return pa.RecordBatch.from_arrays(
+            [pa.array([1, 2, 3])],
+            schema=pa.schema([("x", pa.int64())]),
+        )
+
+    def _rel(self) -> str:
+        return os.sep.join(["GET", "example.com", "v1", "0123456789abcdef.arrow"])
+
+    def test_str_root_roundtrip(self, tmp_path) -> None:
+        from yggdrasil.io.session import _store_fast_path_arrow_batch
+
+        rel = self._rel()
+        _store_fast_path_arrow_batch(str(tmp_path), rel, self._batch())
+        out = _read_fast_path_arrow_batch(str(tmp_path), rel)
+        assert out is not None
+        assert out.num_rows == 3
+
+    def test_pathlib_root_roundtrip(self, tmp_path) -> None:
+        from yggdrasil.io.session import _store_fast_path_arrow_batch
+
+        rel = self._rel()
+        _store_fast_path_arrow_batch(tmp_path, rel, self._batch())
+        out = _read_fast_path_arrow_batch(tmp_path, rel)
+        assert out is not None
+        assert out.num_rows == 3
+
+    def test_abstract_path_root_roundtrip(self, tmp_path) -> None:
+        from yggdrasil.io.path import LocalPath
+        from yggdrasil.io.session import _store_fast_path_arrow_batch
+
+        root = LocalPath(str(tmp_path))
+        rel = self._rel()
+        _store_fast_path_arrow_batch(root, rel, self._batch())
+        out = _read_fast_path_arrow_batch(root, rel)
+        assert out is not None
+        assert out.num_rows == 3
+
+    def test_cleanup_accepts_abstract_path(self, tmp_path) -> None:
+        from yggdrasil.io.path import LocalPath
+        from yggdrasil.io.session import _store_fast_path_arrow_batch
+
+        root = LocalPath(str(tmp_path))
+        rel = self._rel()
+        _store_fast_path_arrow_batch(root, rel, self._batch())
+        # Backdate the entry so the TTL sweep sees it as stale.
+        stored = tmp_path / rel
+        os.utime(stored, (time.time() - 3600, time.time() - 3600))
+        removed = _cleanup_local_fast_path(
+            root, ttl_seconds=60.0, throttle_seconds=0.0,
+        )
+        assert removed == 1
+        assert not stored.exists()
 
 
 # ---------------------------------------------------------------------------

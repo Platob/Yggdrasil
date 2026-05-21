@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import pathlib
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
@@ -12,6 +12,7 @@ from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.data.enums import Mode
 from yggdrasil.environ import PyEnv
+from yggdrasil.io.path import Path
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
 
@@ -280,13 +281,18 @@ class _ConfigBase:
 class CacheConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
-    # Local cache root directory. When set, the session writes each
+    # Local cache root directory — any :class:`yggdrasil.io.path.Path`
+    # backend works (LocalPath for on-disk, VolumePath / S3Path / … for
+    # shared remote caches). When set, the session writes each
     # successful response as one Arrow IPC file at
     # ``<path>/<METHOD>/<host>/<seg>/.../<public_hash>.arrow`` (see
-    # :mod:`yggdrasil.io.session._local_fast_path_relative`). Stored
-    # as a string so the frozen-dataclass instance pickles cleanly
-    # across worker boundaries (Spark, multiprocessing, Power Query).
-    path: Optional[str] = field(default=None, hash=False, compare=False)
+    # :mod:`yggdrasil.io.session._local_fast_path_relative`). Holds the
+    # live :class:`Path` instance internally; :meth:`__getstate__`
+    # projects to the URL string so the frozen-dataclass instance still
+    # pickles cleanly across worker boundaries (Spark, multiprocessing,
+    # Power Query), and :meth:`__setstate__` rehydrates via
+    # :meth:`Path.from_`.
+    path: Optional[Path] = field(default=None, hash=False, compare=False)
     # Remote cache backend — a :class:`Tabular` subclass (Databricks
     # Table, …). Mutually exclusive with :attr:`path`: a single
     # config is either local *or* remote, not both.
@@ -346,8 +352,11 @@ class CacheConfig(_ConfigBase):
             values["received_to"] = _coerce_optional_datetime(received_to)
 
         path = values.get("path")
-        if path is not None and not isinstance(path, str):
-            values["path"] = str(path)
+        if path is not None and not isinstance(path, Path):
+            # Accept str / pathlib.Path / URL / any path-like — route
+            # through :meth:`Path.from_` so the backend dispatch (local
+            # FS, Volume, S3, …) happens once at the boundary.
+            values["path"] = Path.from_(path)
 
         return values
 
@@ -384,8 +393,8 @@ class CacheConfig(_ConfigBase):
             if not self.received_from:
                 object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
 
-        if self.path is not None and not isinstance(self.path, str):
-            object.__setattr__(self, "path", str(self.path))
+        if self.path is not None and not isinstance(self.path, Path):
+            object.__setattr__(self, "path", Path.from_(self.path))
 
         if self.path is not None and self.tabular is not None:
             raise ValueError(
@@ -394,10 +403,18 @@ class CacheConfig(_ConfigBase):
             )
 
     def __getstate__(self):
+        # Project the live :class:`Path` down to its URL string for
+        # transport — keeps the payload free of bound backend handles
+        # (Databricks client on a :class:`VolumePath`, boto3 client on
+        # an :class:`S3Path`, …) so the dataclass survives Spark /
+        # multiprocessing / Power Query worker boundaries without
+        # dragging unpicklable live state. :meth:`__setstate__`
+        # rehydrates via :meth:`Path.from_`, which short-circuits to
+        # the singleton instance on the receiving side.
         return {
             "mode": self.mode,
             "wait": self.wait,
-            "path": self.path,
+            "path": str(self.path.url) if self.path is not None else None,
             "request_by": self.request_by,
             "response_by": self.response_by,
             "received_from": self.received_from,
@@ -415,7 +432,12 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "received_from", state["received_from"])
         object.__setattr__(self, "received_to", state["received_to"])
         object.__setattr__(self, "received_ttl", state["received_ttl"])
-        object.__setattr__(self, "path", state.get("path"))
+        path_state = state.get("path")
+        object.__setattr__(
+            self,
+            "path",
+            Path.from_(path_state) if path_state is not None else None,
+        )
         # ``tabular`` is intentionally excluded from __getstate__ —
         # remote :class:`Tabular` handles wrap a live Databricks
         # client and don't survive process boundaries. Init to None
@@ -452,10 +474,10 @@ class CacheConfig(_ConfigBase):
         if isinstance(arg, Mapping):
             return cls.parse_mapping(arg, **overrides)
 
-        if isinstance(arg, Path):
-            overrides["path"] = str(arg)
-
-        elif isinstance(arg, str):
+        if isinstance(arg, (Path, pathlib.PurePath, str)):
+            # Path-shaped → local cache backend. :meth:`_check_mapping`
+            # normalises through :meth:`Path.from_` so the stored
+            # ``path`` is always a live abstract :class:`Path`.
             overrides["path"] = arg
 
         elif _is_tabular_io(arg):
@@ -639,13 +661,16 @@ class CacheConfig(_ConfigBase):
         return f"'{value.replace(chr(39), chr(39) * 2)}'"
 
     def local_cache_folder(self, session: "Session | None" = None) -> Path:
-        """Filesystem root for the local cache.
+        """Backend-agnostic root for the local cache.
 
-        Returns :attr:`path` when explicitly set, otherwise builds
-        the default path under ``~/.yggdrasil/cache/response``,
-        suffixed with the session's ``base_url`` host + path when
-        one is available so different APIs sharing the same machine
-        don't collide on disk:
+        Returns :attr:`path` when explicitly set — whatever
+        :class:`yggdrasil.io.path.Path` subclass the caller passed
+        (LocalPath on disk, VolumePath on a Databricks Volume,
+        S3Path on a bucket, …) — otherwise builds the default
+        LocalPath under ``~/.yggdrasil/cache/response``, suffixed
+        with the session's ``base_url`` host + path when one is
+        available so different APIs sharing the same machine don't
+        collide on disk:
 
         * ``base_url=https://api.example.com/v1/`` → ``…/response/api.example.com/v1``
         * ``base_url`` unset → ``…/response/default``
@@ -654,31 +679,34 @@ class CacheConfig(_ConfigBase):
         :class:`yggdrasil.io.response_batch.ResponseBatch`.
         """
         if self.path is not None:
-            return Path(self.path)
-        root = Path.home() / ".yggdrasil" / "cache" / "response"
+            return self.path
+        root = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
         base_url = getattr(session, "base_url", None) if session is not None else None
         host = getattr(base_url, "host", None) if base_url is not None else None
         if not host:
-            return root / "default"
-        path = (getattr(base_url, "path", "") or "").strip("/")
-        return root / host / path if path else root / host
+            folder = root / "default"
+        else:
+            url_path = (getattr(base_url, "path", "") or "").strip("/")
+            folder = root / host / url_path if url_path else root / host
+        return Path.from_(folder)
 
     def local_cache_path(self, session: "Session | None" = None) -> str:
-        """Return the local-cache root as a string and memoize it on :attr:`path`.
+        """Return the local-cache root as a string and memoize the resolved :class:`Path` on :attr:`path`.
 
-        Wraps :meth:`local_cache_folder` and stores the resolved
-        directory back onto the frozen dataclass via
+        Resolves :meth:`local_cache_folder` once and stores the
+        :class:`Path` instance back onto the frozen dataclass via
         ``object.__setattr__`` so repeat calls (per-batch lookups,
         per-response writes) don't keep recomputing the default-path
-        suffix from the session's ``base_url``. The string form is
-        what every downstream caller needs (Job pickle payloads,
-        ``str(...)`` group keys, ``os.path.join`` callers).
+        suffix from the session's ``base_url``. The returned string
+        is the backend-native form (``LocalPath`` → OS path,
+        ``VolumePath`` → ``/Volumes/...``, …) — what dict-key callers
+        and the legacy stringified-cache-root signature expect.
+        Reach for :meth:`local_cache_folder` when you need the live
+        :class:`Path` instance to do I/O against.
         """
-        if self.path is not None:
-            return self.path
-        resolved = str(self.local_cache_folder(session=session))
-        object.__setattr__(self, "path", resolved)
-        return resolved
+        if self.path is None:
+            object.__setattr__(self, "path", self.local_cache_folder(session=session))
+        return str(self.path)
 
     def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
         """Materialise :attr:`path` for local-cache configs.

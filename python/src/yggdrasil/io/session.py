@@ -6,7 +6,6 @@ import datetime as dt
 import itertools
 import logging
 import os
-import pathlib
 import pickle
 import re
 import threading
@@ -39,6 +38,7 @@ from .authorization.base import Authorization
 from .bytes_io import BytesIO
 from .headers import Headers
 from .memory import Memory
+from .path import Path
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -240,39 +240,51 @@ def _maybe_autocompress_body_for_cache(
     response.set_media_type(MediaType.from_mime(mime_type=mime, codec=codec))
 
 
+def _as_cache_path(cache_root: Any) -> "Path":
+    """Coerce *cache_root* into an abstract :class:`yggdrasil.io.path.Path`.
+
+    Every cache helper accepts the same shapes the public
+    :attr:`CacheConfig.path` field does — a live :class:`Path`
+    (LocalPath / VolumePath / S3Path / …), a :class:`str`, or a
+    :class:`pathlib.Path`. :meth:`Path.from_` handles the dispatch
+    once at the boundary so the helpers themselves work uniformly
+    against any backend.
+    """
+    if isinstance(cache_root, Path):
+        return cache_root
+    return Path.from_(cache_root)
+
+
 def _store_fast_path_arrow_batch(
-    cache_root_str: str,
+    cache_root: Any,
     rel_path: str,
     batch: pa.RecordBatch,
 ) -> None:
-    """Persist *batch* to the per-request fast-path file under *cache_root_str*.
+    """Persist *batch* to the per-request fast-path file under *cache_root*.
 
-    *rel_path* is the precomputed URL-mirrored location (see
-    :func:`_local_fast_path_relative`) — strings only, so the
-    fire-and-forget :class:`Job` pickles cheaply. Bypasses
-    :class:`FolderIO` entirely: one Arrow IPC stream per request
-    ``public_hash``, parent dirs created on demand. Tmp + atomic
-    ``os.replace`` keeps a partial write from being read mid-flush by
-    a concurrent fast-path reader.
+    *cache_root* is anything :meth:`Path.from_` accepts — a live
+    :class:`yggdrasil.io.path.Path` (LocalPath for on-disk caches,
+    VolumePath / S3Path / … for remote-shared caches), a string, or
+    a :class:`pathlib.Path`. *rel_path* is the precomputed URL-mirrored
+    location (see :func:`_local_fast_path_relative`). One Arrow IPC
+    stream per request ``public_hash``; parent dirs are created on
+    demand. The write is best-effort — backend failures are swallowed
+    so a single cache-miss-write can't take down the network leg.
     """
-    final = pathlib.Path(cache_root_str) / rel_path
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    payload = sink.getvalue().to_pybytes()
+
+    final = _as_cache_path(cache_root).joinpath(rel_path)
     try:
         final.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return
-
-    tmp = final.parent / f".{final.name}.{os.urandom(4).hex()}.tmp"
-    try:
-        sink = pa.BufferOutputStream()
-        with pa.ipc.new_stream(sink, batch.schema) as writer:
-            writer.write_batch(batch)
-        tmp.write_bytes(sink.getvalue().to_pybytes())
-        os.replace(tmp, final)
     except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
+        return
+    try:
+        final.write_bytes(payload)
+    except Exception:
+        pass
 
 
 def _read_fast_path_arrow_batch(
@@ -280,15 +292,17 @@ def _read_fast_path_arrow_batch(
 ) -> "pa.RecordBatch | None":
     """Read the per-request fast-path file at *rel_path* under *cache_root*.
 
-    Returns ``None`` when the file is missing, empty, or otherwise
-    unreadable so the caller can fall through to the bulk-lookup
-    path without a special error case (corrupt entry, race with a
-    concurrent rewrite, schema drift, …).
+    *cache_root* takes the same shapes as
+    :func:`_store_fast_path_arrow_batch`. Returns ``None`` when the
+    file is missing, empty, or otherwise unreadable so the caller
+    can fall through to the bulk-lookup path without a special error
+    case (corrupt entry, race with a concurrent rewrite, schema
+    drift, …).
     """
-    file_path = pathlib.Path(os.fspath(cache_root)) / rel_path
+    file_path = _as_cache_path(cache_root).joinpath(rel_path)
     try:
         payload = file_path.read_bytes()
-    except OSError:
+    except Exception:
         return None
     if not payload:
         return None
@@ -312,32 +326,34 @@ _FAST_PATH_CLEANUP_SENTINEL: str = ".last_cleanup"
 
 
 def _cleanup_local_fast_path(
-    cache_root_str: str,
+    cache_root: Any,
     *,
     ttl_seconds: float,
     throttle_seconds: float = 60.0,
 ) -> int:
     """Walk the URL-mirrored fast-path tree and unlink ``.arrow`` files older than *ttl_seconds*.
 
-    Throttled by the ``.last_cleanup`` sentinel under *cache_root_str*
-    — a write within ``throttle_seconds`` of the last successful
-    pass short-circuits, so a hot batch of 10k requests only walks
-    the tree once. Tmp / hidden files (leading ``.``) are skipped so
-    a partial fast-path write in flight isn't yanked out from under
-    the writer. Best-effort: any per-file ``OSError`` is logged and
-    the walk continues. Returns the number of files unlinked.
+    *cache_root* takes the same shapes as
+    :func:`_store_fast_path_arrow_batch`. Throttled by the
+    ``.last_cleanup`` sentinel under the root — a write within
+    ``throttle_seconds`` of the last successful pass short-circuits,
+    so a hot batch of 10k requests only walks the tree once. Hidden
+    files (leading ``.``) are skipped so any in-flight write isn't
+    yanked out from under the writer. Best-effort: any per-file
+    backend error is logged and the walk continues. Returns the
+    number of files unlinked.
     """
     if ttl_seconds <= 0:
         return 0
-    root = pathlib.Path(cache_root_str)
+    root = _as_cache_path(cache_root)
     if not root.is_dir():
         return 0
 
     sentinel = root / _FAST_PATH_CLEANUP_SENTINEL
     now = time.time()
     try:
-        last = sentinel.stat().st_mtime
-    except OSError:
+        last = sentinel.mtime if sentinel.exists() else 0.0
+    except Exception:
         last = 0.0
     if last and now - last < throttle_seconds:
         return 0
@@ -345,29 +361,32 @@ def _cleanup_local_fast_path(
     cutoff = now - ttl_seconds
     removed = 0
     try:
-        for entry in root.rglob("*.arrow"):
-            if entry.name.startswith("."):
+        for entry in root.ls(recursive=True):
+            name = entry.name
+            if not name.endswith(".arrow") or name.startswith("."):
+                continue
+            if not entry.is_file():
                 continue
             try:
-                mtime = entry.stat().st_mtime
-            except OSError:
+                mtime = entry.mtime
+            except Exception:
                 continue
             if mtime >= cutoff:
                 continue
             try:
                 entry.unlink()
                 removed += 1
-            except OSError as exc:
-                LOGGER.debug("Cache cleanup: failed to unlink %s: %s", entry, exc)
-    except OSError as exc:
-        LOGGER.debug("Cache cleanup: walk under %s aborted: %s", root, exc)
+            except Exception as exc:
+                LOGGER.debug("Cache cleanup: failed to unlink %r: %s", entry, exc)
+    except Exception as exc:
+        LOGGER.debug("Cache cleanup: walk under %r aborted: %s", root, exc)
         return removed
 
     # Refresh the sentinel even when nothing was unlinked — that's
     # what the throttle is checking for, not the unlink count.
     try:
         sentinel.touch()
-    except OSError:
+    except Exception:
         pass
     return removed
 
@@ -698,7 +717,7 @@ class Session(Singleton, ABC):
         except Exception:
             return None
 
-        root = cache_cfg.local_cache_path(session=self)
+        root = cache_cfg.local_cache_folder(session=self)
         rel_path = _local_fast_path_relative(
             request.method, request.url, public_hash,
         )
@@ -734,7 +753,7 @@ class Session(Singleton, ABC):
         response: Response,
         cache_cfg: CacheConfig,
         *,
-        root: "str | None" = None,
+        root: "Path | None" = None,
     ) -> None:
         """Persist one response to the URL-mirrored fast-path cache.
 
@@ -746,8 +765,8 @@ class Session(Singleton, ABC):
         matching on the read side keys off the ``public_*`` hash
         columns which already use the anonymize='remove' projection.
 
-        ``root`` lets a hot-loop caller pass the resolved cache root
-        once instead of re-resolving it per response.
+        ``root`` lets a hot-loop caller pass the resolved cache
+        :class:`Path` once instead of re-resolving it per response.
         """
         if not response.ok:
             return
@@ -759,7 +778,7 @@ class Session(Singleton, ABC):
         except Exception:
             return
 
-        root = root or cache_cfg.local_cache_path(session=self)
+        root = root if root is not None else cache_cfg.local_cache_folder(session=self)
         rel_path = _local_fast_path_relative(req.method, req.url, public_hash)
         _maybe_autocompress_body_for_cache(response)
         batch = response.to_arrow_batch(parse=False)
@@ -1085,11 +1104,11 @@ class Session(Singleton, ABC):
 
         # --- 1. Check local cache first (fast, disk-based) ---
         # UPSERT mode skips the lookup outright — the fresh fetch
-        # below will overwrite the on-disk entry on its way through
-        # ``_store_fast_path_arrow_batch``'s atomic ``os.replace``.
-        local_cache_root: "str | None" = None
+        # below will overwrite the on-disk entry through
+        # ``_store_fast_path_arrow_batch``.
+        local_cache_root: "Path | None" = None
         if effective_local_cfg.local_cache_enabled:
-            local_cache_root = effective_local_cfg.local_cache_path(session=self)
+            local_cache_root = effective_local_cfg.local_cache_folder(session=self)
             if effective_local_cfg.mode != Mode.UPSERT:
                 local_response = self._load_local_cached_response(
                     request, effective_local_cfg
@@ -1246,7 +1265,7 @@ class Session(Singleton, ABC):
         # Prebuild the per-request override the same way
         # :meth:`_send_many_batches` prebuilds the session-level
         # config — so the downstream code can reach ``eff.path``
-        # uniformly without a ``local_cache_path(session=...)``
+        # uniformly without a ``local_cache_folder(session=...)``
         # dance. ``prebuild`` is idempotent and skips remote-only /
         # disabled configs.
         cfg = request.local_cache_config or session_cfg
@@ -1283,7 +1302,7 @@ class Session(Singleton, ABC):
         session_local_cfg: CacheConfig,
         *,
         key_to_local_cfg: Optional[Mapping[int, CacheConfig]] = None,
-    ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
+    ) -> tuple[dict[Path, list[Response]], list[PreparedRequest]]:
         """Stage 1: scan the local cache.
 
         Returns ``(hits_by_path, misses)``. UPSERT entries are evicted
@@ -1293,11 +1312,13 @@ class Session(Singleton, ABC):
         session-level fallback) via the per-``public_hash`` fast-path
         file — one ``stat`` + IPC decode per request, no folder walk.
 
-        Hits are grouped by the effective config's resolved cache root
-        — :attr:`CacheConfig.path` after :meth:`prebuild` filled in
-        the default ``~/.yggdrasil/cache/response`` suffix — so the
-        per-config split survives all the way to
-        :class:`ResponseBatch.local_hits`.
+        Hits are grouped by the effective config's resolved cache
+        :class:`Path` — :attr:`CacheConfig.path` after :meth:`prebuild`
+        filled in the default ``~/.yggdrasil/cache/response`` suffix
+        — so the per-config split survives all the way to
+        :class:`ResponseBatch.local_hits`. The dict key is the live
+        :class:`Path` (hashable, singleton-keyed) so two distinct
+        backends with the same ``full_path()`` string don't collide.
 
         ``key_to_local_cfg`` is the per-request effective-config map
         :meth:`_send_many_batches` builds once at the top of a chunk.
@@ -1305,7 +1326,7 @@ class Session(Singleton, ABC):
         dict lookup; otherwise we resolve on the fly (used by callers
         that don't precompute, e.g. unit tests).
         """
-        hits: dict[str, list[Response]] = {}
+        hits: dict[Path, list[Response]] = {}
         misses: list[PreparedRequest] = []
 
         if not session_local_cfg.local_cache_enabled and not any(
@@ -1327,7 +1348,7 @@ class Session(Singleton, ABC):
             if cached is None:
                 misses.append(req)
                 continue
-            hits.setdefault(eff.local_cache_path(session=self), []).append(cached)
+            hits.setdefault(eff.local_cache_folder(session=self), []).append(cached)
 
         if hits:
             total = sum(len(v) for v in hits.values())
@@ -1876,7 +1897,7 @@ class Session(Singleton, ABC):
         the in-tree sentinel so a hot batch only walks the tree once
         per cleanup window.
         """
-        cleanup_roots: dict[str, CacheConfig] = {}
+        cleanup_roots: dict[Path, CacheConfig] = {}
         for response in responses:
             req = response.request
             cfg_key = req.public_url_hash if req is not None else None
@@ -1885,7 +1906,7 @@ class Session(Singleton, ABC):
                 eff = session_local_cfg
             if not eff.local_cache_enabled:
                 continue
-            root = eff.local_cache_path(session=self)
+            root = eff.local_cache_folder(session=self)
             self._store_local_cached_response(response, eff, root=root)
             cleanup_roots.setdefault(root, eff)
 
@@ -1985,7 +2006,7 @@ class Session(Singleton, ABC):
 
     def _mirror_local_hits_to_remote(
         self,
-        local_hits_by_path: Mapping[str, "list[Response]"],
+        local_hits_by_path: Mapping[Path, "list[Response]"],
         key_to_remote_cfg: Mapping[int, CacheConfig],
         session_remote_cfg: CacheConfig,
     ) -> None:
