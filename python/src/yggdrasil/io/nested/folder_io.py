@@ -235,7 +235,6 @@ class FolderIO(IO[bytes, FolderOptions]):
         *,
         path: Any = None,
         tabular_parent: "Tabular | None" = None,
-        static_values: "Mapping[str, Any] | None" = None,
         yggmeta: bool = True,
         **kwargs: Any,
     ) -> None:
@@ -244,12 +243,13 @@ class FolderIO(IO[bytes, FolderOptions]):
         ``data`` and ``path`` accept the same shape; ``path`` wins
         when both are supplied. ``tabular_parent`` rides through to
         the :class:`Tabular` slot — set by the enclosing folder when
-        it yields this one as a child. ``static_values`` rides
-        through too: an aggregator (e.g. :class:`YGGFolderIO`)
-        minting a per-partition leaf seeds the kv here so every
-        descendant inherits the partition constants via the
-        :attr:`Tabular.static_values` parent chain — no extra
-        per-batch stamping needed to assert the column equality.
+        it yields this one as a child.
+
+        Partition KV doesn't need a constructor seed: a Hive-shaped
+        sub-folder at ``<base>/partition_key=42/`` reports
+        ``{"partition_key": 42}`` via :attr:`static_values` directly
+        from the bound :attr:`path` URL — see :attr:`static_values`
+        for the parsing contract.
 
         ``yggmeta`` (default ``True``) enables the dot-prefixed
         sidecar at ``<path>/.ygg/`` — see :attr:`yggmeta`.
@@ -282,7 +282,6 @@ class FolderIO(IO[bytes, FolderOptions]):
         super().__init__(
             url=self.path.url,
             tabular_parent=tabular_parent,
-            static_values=static_values,
             **kwargs,
         )
 
@@ -351,6 +350,50 @@ class FolderIO(IO[bytes, FolderOptions]):
 
     def __exit__(self, exc_type, exc, tb) -> None:
         return None
+
+    # ==================================================================
+    # Static values — Hive partition KV parsed off the bound URL
+    # ==================================================================
+
+    @property
+    def static_values(self) -> "Mapping[str, Any]":
+        """Partition KV parsed from the folder's bound :attr:`path` URL.
+
+        Walks the URL's segments (``self.path.url.parts``) and picks
+        every Hive-shaped ``<col>=<val>`` chunk — a folder at
+        ``<base>/year=2024/month=05/`` reports
+        ``{"year": 2024, "month": 5}`` without any constructor seed.
+        Values are cast to their declared dtype when
+        :meth:`collect_schema` knows the column (so an int64
+        ``partition_key`` lands as :class:`int`, a timestamp
+        partition as :class:`datetime`); columns the schema doesn't
+        cover fall through as raw URL-decoded strings — the
+        downstream :meth:`matches_static` prune is conservative
+        and just degrades to a row-level filter.
+
+        Computed on each access — :class:`URL` segment splitting is
+        cheap, and the cache layer's read paths typically hit this
+        once per child during the partition-aware listing pass.
+        """
+        parts = getattr(self.path.url, "parts", None) or ()
+        if not parts:
+            return {}
+        out: "dict[str, Any]" = {}
+        schema: Any = ...
+        for segment in parts:
+            parsed = _hive_split_name(segment)
+            if parsed is None:
+                continue
+            col, raw = parsed
+            if schema is ...:
+                try:
+                    schema = self.collect_schema()
+                except Exception:
+                    schema = None
+            out[col] = _cast_partition_value(
+                raw, self._partition_dtype(col, schema=schema),
+            )
+        return out
 
     # ==================================================================
     # Yggmeta sidecar — folder-level metadata under ``<path>/.ygg/``
@@ -624,18 +667,18 @@ class FolderIO(IO[bytes, FolderOptions]):
         column: str,
         value: Any,
     ) -> "Tabular":
-        """Mint a child FolderIO seeded with the parsed partition KV.
+        """Mint a child FolderIO bound to the partition sub-path.
 
-        The child's :attr:`static_values` carries the consumed
-        partition (column → value); the next call to
-        :meth:`partition_columns` on the child filters that column
-        out of the schema-driven lookup, so the next level naturally
-        picks up the remaining partition columns without any
-        side-channel bookkeeping.
+        ``column`` / ``value`` are accepted for the call-site
+        readability of "this child carries the partition <col>=<val>"
+        — but no seed is stashed on the child. :attr:`static_values`
+        parses the same KV straight off the bound :attr:`path` URL,
+        so the next call to :meth:`partition_columns` on the child
+        filters that column out of the schema-driven lookup
+        naturally.
         """
-        return self.adopt_child(type(self)(
-            path=path, static_values={column: value},
-        ))
+        del column, value  # Parsed by :attr:`static_values` from path.
+        return self.adopt_child(type(self)(path=path))
 
     def _accepted_partition_values(
         self,
@@ -668,20 +711,27 @@ class FolderIO(IO[bytes, FolderOptions]):
             return None
         return extracted.get(column)
 
-    def _partition_dtype(self, column: str) -> "pa.DataType | None":
+    def _partition_dtype(
+        self, column: str, *, schema: Any = ...,
+    ) -> "pa.DataType | None":
         """Best-effort partition dtype lookup for *column*.
 
-        Reads :attr:`Tabular.schema` when the subclass exposes one;
-        falls back to ``None`` (meaning "leave the value as a
-        decoded string"). The static-value prune is conservative on
+        Uses *schema* when supplied (caller may have already paid
+        the :meth:`collect_schema` cost — pass it through to avoid
+        re-collecting once per segment), else calls
+        :meth:`collect_schema` itself. Returns the column's arrow
+        dtype, or ``None`` when the schema is empty / doesn't know
+        the column. The static-value prune is conservative on
         undecidable predicates so a missing schema doesn't break
-        correctness — it just turns a partition-level skip into a
-        row-level filter.
+        correctness — it just leaves the partition value as the
+        URL-decoded string and turns a partition-level skip into
+        a row-level filter.
         """
-        try:
-            schema = getattr(self, "schema", None)
-        except Exception:
-            return None
+        if schema is ...:
+            try:
+                schema = self.collect_schema()
+            except Exception:
+                schema = None
         if schema is None:
             return None
         try:
@@ -691,7 +741,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         if field is None:
             return None
         try:
-            return field.arrow_field.type
+            return field.arrow_type
         except Exception:
             return None
 
@@ -958,10 +1008,7 @@ class FolderIO(IO[bytes, FolderOptions]):
                 if subset.num_rows == 0:
                     continue
                 encoded = _hive_encode(value)
-                child = type(self)(
-                    path=self.path / f"{head}={encoded}",
-                    static_values={head: value},
-                )
+                child = type(self)(path=self.path / f"{head}={encoded}")
                 self.adopt_child(child)
                 child._write_arrow_batches(
                     iter(subset.to_batches()), options,

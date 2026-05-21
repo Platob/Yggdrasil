@@ -79,7 +79,7 @@ if TYPE_CHECKING:
     from yggdrasil.io.tabular.spark import Dataset
 
 
-__all__ = ["Tabular", "TabularStaticValues", "is_tabular_source"]
+__all__ = ["Tabular", "is_tabular_source"]
 
 
 def is_tabular_source(obj: Any) -> bool:
@@ -120,76 +120,6 @@ O = TypeVar("O", bound=CastOptions)
 _ChildT = TypeVar("_ChildT", bound="Tabular")
 
 
-class TabularStaticValues(Mapping):
-    """Lazy mapping of column → constant value the owning :class:`Tabular`
-    knows holds across every row it yields.
-
-    Per-key lookup so a query against one column doesn't pay for
-    every column's discovery, cached on hit. Inherits from
-    :attr:`Tabular.tabular_parent` automatically — a Hive partition
-    leaf inside ``region=us/`` reports ``{"region": "us"}`` even
-    when the leaf class doesn't know about partitioning, because
-    :meth:`__getitem__` walks up the parent chain after the owner's
-    own resolver returns ``...``.
-
-    Subclasses extend :meth:`Tabular._resolve_static_value` /
-    :meth:`Tabular._known_static_keys` to plug in their source
-    (Hive partition KV from the directory path, Parquet column
-    stats with min == max, Delta file-level partition values, …);
-    every Tabular reuses this Mapping shape so callers don't branch
-    on the concrete class to read constants.
-    """
-
-    __slots__ = ("_owner", "_cache")
-
-    def __init__(self, owner: "Tabular") -> None:
-        self._owner = owner
-        self._cache: "dict[str, Any]" = {}
-
-    def __getitem__(self, key: str) -> Any:
-        cache = self._cache
-        if key in cache:
-            return cache[key]
-
-        # Owner first — leaf-level invariants override anything an
-        # outer scope might assert. Parent fallback only on the
-        # owner's "I don't know" answer.
-        value = self._owner._resolve_static_value(key)
-        if value is ...:
-            parent = self._owner.tabular_parent
-            if parent is not None:
-                try:
-                    value = parent.static_values[key]
-                except KeyError:
-                    pass
-
-        if value is ...:
-            raise KeyError(key)
-        cache[key] = value
-        return value
-
-    def __iter__(self) -> Iterator[str]:
-        keys: "set[str]" = set(self._owner._known_static_keys())
-        parent = self._owner.tabular_parent
-        if parent is not None:
-            keys.update(parent.static_values.keys())
-        return iter(keys)
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self)
-
-    def __contains__(self, key: Any) -> bool:
-        if not isinstance(key, str):
-            return False
-        try:
-            self[key]
-        except KeyError:
-            return False
-        return True
-
-    def __repr__(self) -> str:
-        return f"TabularStaticValues({dict(self)!r})"
-
 class Tabular(ABC, Generic[O]):
     """Pure interface — Arrow record-batch source/sink + engine fan-out.
 
@@ -213,7 +143,6 @@ class Tabular(ABC, Generic[O]):
         self,
         *,
         tabular_parent: "Tabular | None" = None,
-        static_values: "Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the tree-parent slot.
@@ -226,24 +155,10 @@ class Tabular(ABC, Generic[O]):
         doesn't collide with :attr:`yggdrasil.io.path.path.Path.parent`,
         which is the path-shaped parent directory and therefore
         property-backed and read-only.
-
-        ``static_values`` seeds :attr:`static_values` with constants
-        the constructor already knows hold across every row this
-        Tabular yields — typically the partition KV when an
-        aggregator (e.g. :class:`YGGFolderIO`) mints a per-partition
-        leaf. The full lookup is :meth:`static_values`'s lazy
-        Mapping; callers shouldn't read this slot directly.
         """
         super().__init__()
         self.tabular_parent: "Tabular | None" = tabular_parent
         self._schema_cache: "Schema | Any" = ...
-        self._static_value_seed: "dict[str, Any]" = (
-            dict(static_values) if static_values else {}
-        )
-        # Lazy :class:`TabularStaticValues` view — built on first
-        # access so a Tabular that nobody asks for constants on
-        # never allocates the Mapping wrapper.
-        self._static_values_view: "TabularStaticValues | None" = None
 
     # ==================================================================
     # Parent / child linkage
@@ -272,48 +187,20 @@ class Tabular(ABC, Generic[O]):
     # ==================================================================
 
     @property
-    def static_values(self) -> "TabularStaticValues":
-        """Lazy Mapping of column → constant value across every row
-        this Tabular yields.
+    def static_values(self) -> "Mapping[str, Any]":
+        """Column → constant value across every row this Tabular yields.
 
-        See :class:`TabularStaticValues` for the exact contract:
-        per-key lookup with caching, parent-chain inheritance, and
-        a per-Tabular resolver hook (:meth:`_resolve_static_value`
-        + :meth:`_known_static_keys`) so each subclass plugs in its
-        own metadata source without callers branching on the
-        concrete class.
+        Default: empty mapping. Subclasses with a cheap source of
+        invariants override — :class:`FolderIO` parses Hive
+        ``<col>=<val>/`` segments off its bound :attr:`path` URL,
+        a future Parquet-stats-based subclass would read
+        min==max column stats from the footer, a Delta leaf would
+        pull from its ``AddFile.partition_values``, etc. There is
+        no parent-chain inheritance built into the base — each
+        subclass decides what "constant across rows" means for its
+        backing store.
         """
-        view = self._static_values_view
-        if view is None:
-            view = TabularStaticValues(self)
-            self._static_values_view = view
-        return view
-
-    def _resolve_static_value(self, key: str) -> Any:
-        """Hook: return the constant value of column *key* across
-        every row this Tabular yields, or ``...`` (Ellipsis) when
-        the value is unknown / not statically constant.
-
-        Default reads from the constructor seed
-        (``static_values=...``). Subclasses with cheap-to-read
-        metadata (Hive partition KV from the directory path,
-        Parquet column stats with min == max, Delta file-level
-        partition values, …) override and may bypass the seed
-        entirely.
-        """
-        return self._static_value_seed.get(key, ...)
-
-    def _known_static_keys(self) -> "Iterable[str]":
-        """Hook: column names this Tabular knows about statically.
-
-        Default returns the constructor seed's keys. Subclasses with
-        a cheap "list every constant column" path (a parsed
-        ``col=val/...`` tail, a parquet footer's column-stat
-        coverage, …) override for richer ``__iter__`` /
-        ``len(static_values)`` semantics; per-key lookup still
-        routes through :meth:`_resolve_static_value`.
-        """
-        return self._static_value_seed.keys()
+        return {}
 
     def matches_static(self, predicate: "Any") -> bool:
         """True iff *predicate* could match any row given
@@ -323,10 +210,9 @@ class Tabular(ABC, Generic[O]):
 
         Builds a one-row pyarrow Table from the predicate's free
         columns that we have static values for, then evaluates the
-        predicate against it — same trick :meth:`YGGFolderIO._delete`
-        already used inline for partition-only conjuncts, generalised
-        so any aggregator (read prune, optimize prune, future
-        warehouse-style file skip) reuses the one helper.
+        predicate against it — generalises the partition-only
+        prune so any aggregator (folder read, future warehouse
+        file skip) reuses the one helper.
         """
         if predicate is None:
             return True
@@ -340,12 +226,11 @@ class Tabular(ABC, Generic[O]):
         sv = self.static_values
         relevant: "dict[str, Any]" = {}
         for name in free:
-            try:
-                relevant[name] = sv[name]
-            except KeyError:
+            if name not in sv:
                 # Predicate touches a column outside our static
                 # surface — can't decide, must read.
                 return True
+            relevant[name] = sv[name]
         try:
             table = pa.Table.from_pydict({k: [v] for k, v in relevant.items()})
             return predicate.filter_arrow_table(table).num_rows == 1
@@ -361,11 +246,7 @@ class Tabular(ABC, Generic[O]):
         off *options* (any object that exposes a ``predicate``
         attribute; absence and ``None`` both mean "no prune") and
         inverts the sense so an aggregator's read loop reads as
-        ``if self._should_prune_by_predicate(options): return``. The
-        inherited :class:`TabularStaticValues` parent chain does the
-        rest — a child folder under a Hive ``col=val/`` leaf inherits
-        the partition KV without anyone re-stamping it, so the prune
-        fires uniformly at every level the read recurses through.
+        ``if self._should_prune_by_predicate(options): return``.
 
         Conservative on undecidables: a predicate over a column we
         have no static value for returns ``False`` (no prune) and the
