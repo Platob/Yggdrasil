@@ -470,10 +470,123 @@ def _lift_sqlglot(node: Any, sge: Any) -> Expression:
     if isinstance(node, sge.Paren):
         return _lift_sqlglot(node.this, sge)
 
+    if isinstance(node, sge.Cast):
+        return _lift_cast(node, sge)
+
     raise NotImplementedError(
         f"from_sql: sqlglot node type {type(node).__name__!r} "
         f"is not implemented yet. Pass-through value: {node.sql()}"
     )
+
+
+# sqlglot DataType.Type names → (parser, yggdrasil DataType string).
+# These cover the ``TIMESTAMP('...')`` / ``DATE('...')`` / ``TIME('...')``
+# call shapes (and their ``CAST('...' AS …)`` and ``TIMESTAMP '…'`` literal
+# spellings) — sqlglot collapses all three into a ``Cast`` node, and we
+# eagerly fold the string-literal operand into a typed Python value so
+# round-tripping through ``to_sql`` regenerates the correct
+# ``TIMESTAMP 'iso'`` / ``DATE 'iso'`` rendering.
+def _parse_iso_date(text: str) -> dt.date:
+    # Strip a trailing time component so ``DATE('2024-01-01 00:00:00')``
+    # parses — sqlglot keeps the original string verbatim.
+    return dt.datetime.fromisoformat(text).date() if (
+        "T" in text or " " in text
+    ) else dt.date.fromisoformat(text)
+
+
+_CAST_TEMPORAL_PARSERS: dict[str, "tuple[Any, str]"] = {
+    "DATE": (_parse_iso_date, "date"),
+    "DATETIME": (dt.datetime.fromisoformat, "timestamp_ntz"),
+    "TIMESTAMP": (dt.datetime.fromisoformat, "timestamp"),
+    "TIMESTAMPTZ": (dt.datetime.fromisoformat, "timestamp"),
+    "TIMESTAMPLTZ": (dt.datetime.fromisoformat, "timestamp"),
+    "TIMESTAMPNTZ": (dt.datetime.fromisoformat, "timestamp_ntz"),
+    "TIMESTAMP_S": (dt.datetime.fromisoformat, "timestamp"),
+    "TIMESTAMP_MS": (dt.datetime.fromisoformat, "timestamp"),
+    "TIMESTAMP_NS": (dt.datetime.fromisoformat, "timestamp"),
+    "TIME": (dt.time.fromisoformat, "time"),
+    "TIMETZ": (dt.time.fromisoformat, "time"),
+}
+
+
+# sqlglot DataType.Type names → yggdrasil ``DataType.from_str`` aliases
+# for cases where the lowercase name doesn't round-trip directly.
+_CAST_DTYPE_ALIASES: dict[str, str] = {
+    "BIGINT": "int64",
+    "INT": "int32",
+    "SMALLINT": "int16",
+    "TINYINT": "int8",
+    "DOUBLE": "float64",
+    "FLOAT": "float32",
+    "TEXT": "string",
+    "VARCHAR": "string",
+    "CHAR": "string",
+    "TIMESTAMPTZ": "timestamp",
+    "TIMESTAMPLTZ": "timestamp",
+    "TIMESTAMPNTZ": "timestamp_ntz",
+    "DATETIME": "timestamp_ntz",
+}
+
+
+def _lift_cast(node: Any, sge: Any) -> Expression:
+    """Lift a sqlglot ``Cast`` — ``TIMESTAMP('…')`` / ``DATE('…')`` / ``CAST(… AS …)``.
+
+    String-literal operands of temporal target types fold eagerly into
+    a typed :class:`Literal` (parsed ``datetime`` / ``date`` / ``time``)
+    so backends see the right Python value and ``to_sql`` regenerates
+    the matching ``TIMESTAMP 'iso'`` / ``DATE 'iso'`` rendering on
+    round-trip. Other casts wrap the lifted operand in a :class:`Cast`
+    node carrying the resolved yggdrasil :class:`DataType`; if the
+    target type name is unknown to ``DataType.from_str`` the cast is
+    treated as a no-op (return the inner operand) — the predicate
+    still functions, the type intent is dropped.
+    """
+    inner = _lift_sqlglot(node.this, sge)
+    target_name = _cast_target_name(node)
+
+    if (
+        isinstance(inner, Literal)
+        and isinstance(inner.value, str)
+        and target_name in _CAST_TEMPORAL_PARSERS
+    ):
+        parser, dtype_name = _CAST_TEMPORAL_PARSERS[target_name]
+        try:
+            parsed = parser(inner.value)
+        except ValueError as exc:
+            raise ValueError(
+                f"from_sql: cannot parse {inner.value!r} as {target_name}: {exc}"
+            ) from exc
+        return Literal(value=parsed, dtype=_resolve_cast_dtype_str(dtype_name))
+
+    dtype = _resolve_cast_dtype(target_name)
+    if dtype is None:
+        return inner
+    return Cast(inner, dtype)
+
+
+def _cast_target_name(node: Any) -> str:
+    target = node.to
+    if target is None or getattr(target, "this", None) is None:
+        return ""
+    this = target.this
+    return getattr(this, "name", str(this)).upper()
+
+
+def _resolve_cast_dtype(target_name: str) -> Any:
+    if not target_name:
+        return None
+    return _resolve_cast_dtype_str(
+        _CAST_DTYPE_ALIASES.get(target_name, target_name.lower())
+    )
+
+
+def _resolve_cast_dtype_str(name: str) -> Any:
+    from yggdrasil.data import DataType
+
+    try:
+        return DataType.from_str(name)
+    except Exception:
+        return None
 
 
 _CMP_FROM_SQLGLOT: dict[str, CompareOp] = {

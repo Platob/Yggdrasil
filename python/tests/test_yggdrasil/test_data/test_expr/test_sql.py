@@ -130,3 +130,51 @@ class TestFromSqlRoundtrip:
         sql = col("d").between(1, 10).to_sql()
         back = from_sql(sql)
         assert to_sql(back) == "`d` BETWEEN 1 AND 10"
+
+    def test_between_timestamp_call_lifts_typed_literals(self):
+        # ``TIMESTAMP('...')`` parses as ``Cast(string-lit, TIMESTAMP)``
+        # in sqlglot. The lifter folds the cast into a typed
+        # :class:`Literal` carrying a Python ``datetime`` so the
+        # rendered SQL regenerates the ``TIMESTAMP 'iso'`` form.
+        back = from_sql(
+            "issue_date BETWEEN TIMESTAMP('2024-01-01 00:00:00') "
+            "AND TIMESTAMP('2024-02-01 00:00:00')"
+        )
+        assert to_sql(back) == (
+            "`issue_date` BETWEEN "
+            "TIMESTAMP '2024-01-01 00:00:00.000000' "
+            "AND TIMESTAMP '2024-02-01 00:00:00.000000'"
+        )
+        fn = back.to_python()
+        assert fn({"issue_date": dt.datetime(2024, 1, 15)}) is True
+        assert fn({"issue_date": dt.datetime(2023, 12, 31)}) is False
+
+    def test_between_date_call_lifts_typed_literals(self):
+        back = from_sql(
+            "d BETWEEN DATE('2024-01-01') AND DATE('2024-02-01')"
+        )
+        assert to_sql(back) == (
+            "`d` BETWEEN DATE '2024-01-01' AND DATE '2024-02-01'"
+        )
+        fn = back.to_python()
+        assert fn({"d": dt.date(2024, 1, 15)}) is True
+        assert fn({"d": dt.date(2024, 2, 1)}) is True  # inclusive
+
+    def test_compound_in_and_between_timestamp(self):
+        back = from_sql(
+            "content_id IN (1, 2) "
+            "AND issue_date BETWEEN TIMESTAMP('2024-01-01 00:00:00') "
+            "AND TIMESTAMP('2024-02-01 00:00:00')"
+        )
+        rendered = to_sql(back)
+        assert "`content_id` IN (1, 2)" in rendered
+        assert "`issue_date` BETWEEN TIMESTAMP '2024-01-01" in rendered
+
+    def test_typed_date_literal_round_trips(self):
+        # ``DATE '2024-01-01'`` and ``CAST('2024-01-01' AS DATE)``
+        # both parse through the same Cast path in sqlglot.
+        back = from_sql("d >= DATE '2024-01-01'")
+        assert to_sql(back) == "`d` >= DATE '2024-01-01'"
+
+        back = from_sql("d >= CAST('2024-01-01' AS DATE)")
+        assert to_sql(back) == "`d` >= DATE '2024-01-01'"
