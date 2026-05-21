@@ -14,7 +14,7 @@ Quick start
 
     >>> from yggdrasil.jwt import JWTToken
     >>>
-    >>> tok = JWTToken.parse("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig")
+    >>> tok = JWTToken.from_("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig")
     >>> tok.alg
     'HS256'
     >>> tok.sub
@@ -142,27 +142,45 @@ class JWTToken:
     # --- constructors --------------------------------------------------
 
     @classmethod
-    def parse(cls, token: str | bytes) -> "JWTToken":
-        """Parse a token string (or bytes) into a :class:`JWTToken`.
+    def from_(cls, value: Any) -> "JWTToken":
+        """Generic dispatch — parse a JWT from whatever the caller has.
+
+        Accepts:
+
+        * an existing :class:`JWTToken` (returned as-is, identity short-circuit),
+        * a :class:`str` — delegated to :meth:`from_str`,
+        * :class:`bytes` / :class:`bytearray` / :class:`memoryview` —
+          delegated to :meth:`from_bytes`.
+
+        Other shapes raise :class:`JWTParseError` with the value's
+        type so the caller sees what they passed.
+        """
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls.from_str(value)
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return cls.from_bytes(bytes(value))
+        raise JWTParseError(
+            f"JWTToken.from_ expects str, bytes, or JWTToken; "
+            f"got {type(value).__name__}."
+        )
+
+    @classmethod
+    def from_str(cls, value: str) -> "JWTToken":
+        """Parse a JWT from a string.
 
         Accepts the bare ``a.b.c`` form and the ``Bearer a.b.c`` form
         from an ``Authorization`` header — the prefix is stripped
         transparently. Surrounding whitespace is tolerated.
         """
-        if isinstance(token, bytes):
-            try:
-                token = token.decode("ascii")
-            except UnicodeDecodeError as exc:
-                raise JWTParseError(
-                    "JWT bytes must be ASCII (base64url + dots). "
-                    "Got non-ASCII bytes."
-                ) from exc
-        if not isinstance(token, str):
+        if not isinstance(value, str):
             raise JWTParseError(
-                f"JWTToken.parse expects str or bytes, got {type(token).__name__}."
+                f"JWTToken.from_str expects str, got {type(value).__name__}. "
+                "Use JWTToken.from_(value) for generic dispatch."
             )
 
-        candidate = _strip_bearer(token.strip())
+        candidate = _strip_bearer(value.strip())
         match = _JWT_RE.match(candidate)
         if not match:
             # Show a truncated preview so the message stays log-safe
@@ -190,12 +208,28 @@ class JWTToken:
         )
 
     @classmethod
+    def from_bytes(cls, value: bytes) -> "JWTToken":
+        """Parse a JWT from raw bytes — must be ASCII (base64url + dots)."""
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            raise JWTParseError(
+                f"JWTToken.from_bytes expects bytes, got {type(value).__name__}."
+            )
+        try:
+            text = bytes(value).decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise JWTParseError(
+                "JWT bytes must be ASCII (base64url + dots). "
+                "Got non-ASCII bytes."
+            ) from exc
+        return cls.from_str(text)
+
+    @classmethod
     def from_authorization(cls, header_value: str | None) -> "JWTToken | None":
         """Parse the JWT out of an ``Authorization`` header value.
 
         Returns ``None`` when the value is empty, missing, or doesn't
         carry a Bearer-style token — callers usually want a no-token
-        path instead of a try/except. Use :meth:`parse` directly if a
+        path instead of a try/except. Use :meth:`from_str` directly if a
         missing token should raise.
         """
         if not header_value:
@@ -203,7 +237,7 @@ class JWTToken:
         candidate = _strip_bearer(header_value.strip())
         if not _JWT_RE.match(candidate):
             return None
-        return cls.parse(candidate)
+        return cls.from_str(candidate)
 
     # --- header claims -------------------------------------------------
 

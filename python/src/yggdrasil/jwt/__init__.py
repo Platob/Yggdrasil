@@ -10,7 +10,7 @@ Quick start
 
     >>> from yggdrasil.jwt import JWTToken
     >>>
-    >>> tok = JWTToken.parse("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig")
+    >>> tok = JWTToken.from_("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig")
     >>> tok.alg, tok.sub
     ('HS256', '123')
     >>>

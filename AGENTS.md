@@ -648,6 +648,47 @@ Do not fake stricter types just because the happy path returns a value.
 ### Keyword-only arguments are good for ambiguous options
 Use keyword-only arguments when they make calls easier to read and harder to misuse.
 
+### Constructors are named `from_*`, not `parse` / `load` / `of` / `make`
+
+Alternative constructors on a class follow the project-wide naming convention used by `DataType`, `Field`, `URL`, `DatabricksPath`, `MimeType`, `ByteUnit`, `TimeUnit`, `Codec`, `Mode`, every `data.enums.*` enum, and the rest of the codebase. Two shapes, in this order:
+
+- **`from_(value: Any) -> Cls`** — the **generic dispatch** entry point. Accepts whatever the caller has (str, bytes, dict, an instance of `Cls`, an Arrow / pandas / Polars / Spark object, a `Path`, …), routes by type to the right `from_X` sibling, and **returns the instance unchanged** when handed one already (identity short-circuit — `Cls.from_(x) is x` when `isinstance(x, Cls)`). This is the call site every "I have *something*, give me a `Cls`" reflex resolves to.
+- **`from_str(value: str)`, `from_bytes(value: bytes)`, `from_dict(value: dict)`, `from_pandas(...)`, `from_arrow(...)`, `from_pytype(...)`, `from_pathlib(...)`, `from_authorization(...)`** — the **type-specific** constructors. Each one takes a single concrete shape and does the actual work; `from_` is mostly a dispatch table over these.
+
+Worked example (`yggdrasil.data.types.base.DataType.from_any` is the canonical one):
+
+```python
+@classmethod
+def from_(cls, value: Any) -> "Cls":
+    if isinstance(value, cls):
+        return value                       # identity short-circuit
+    if isinstance(value, str):
+        return cls.from_str(value)
+    if isinstance(value, bytes):
+        return cls.from_bytes(value)
+    if isinstance(value, Mapping):
+        return cls.from_dict(value)
+    raise TypeError(
+        f"{cls.__name__}.from_ expects str, bytes, Mapping, or {cls.__name__}; "
+        f"got {type(value).__name__}."
+    )
+
+@classmethod
+def from_str(cls, value: str) -> "Cls":
+    ...  # the actual parsing logic
+```
+
+Rules:
+
+- **Do not introduce `parse(...)` / `load(...)` / `of(...)` / `make(...)` / `create(...)` as parallel spellings** for the class-constructor role. They fragment the surface and break the "I have X, can I get Y" reflex callers rely on across the library. If you find yourself typing `def parse(cls, ...)` on a new class, rename it to `from_str` (or whatever the input type actually is) before committing.
+- **`from_` is dispatch-only.** Real work belongs in the per-type siblings. A `from_` that contains the parser body is a smell — when the caller hands a different shape (the wire bytes from an HTTP response, a dict from JSON, a Polars Series), the dispatch can't find the right method because the work is welded to one input shape.
+- **The identity short-circuit is required.** `Cls.from_(x) is x` when `x` is already a `Cls`. Without it, callers wrap-on-every-call and the library produces N copies of the same value across a pipeline.
+- **If the input space is a single shape, skip `from_`** — just write the right `from_X`. Don't add a one-line dispatcher that only ever forwards to one sibling.
+- **`parse(...)` is reserved for *non*-constructor parsing helpers** that return a parser-internal value (a token / tree / `ParsedDataType` / dict shape), *not* an instance of the public class. `parse_data_type(s) -> ParsedDataType` is fine; `DataType.parse(s) -> DataType` is not — use `DataType.from_str` instead.
+- **Errors mention the class name and the constructor.** `f"{cls.__name__}.from_str expects str, got {type(value).__name__}."` reads cleanly in a stacktrace; bare `"expected str"` doesn't tell the reader which constructor rejected the input.
+
+When in doubt, grep for `def from_` in `data/types/`, `data/enums/`, `io/url.py`, or `databricks/path.py` — every long-lived class in the library uses this shape.
+
 ---
 
 ## Rules for comments

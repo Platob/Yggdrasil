@@ -36,14 +36,14 @@ def _build_token(
 # ---------------------------------------------------------------------------
 
 
-def test_parse_decodes_header_payload_signature():
+def test_from_str_decodes_header_payload_signature():
     raw = _build_token(
         {"alg": "HS256", "typ": "JWT", "kid": "abc"},
         {"sub": "user-1", "iss": "issuer-x", "aud": "audience-y"},
         signature=b"\x00\x01\x02",
     )
 
-    tok = JWTToken.parse(raw)
+    tok = JWTToken.from_str(raw)
 
     assert tok.alg == "HS256"
     assert tok.typ == "JWT"
@@ -55,33 +55,52 @@ def test_parse_decodes_header_payload_signature():
     assert tok.raw == raw
 
 
-def test_parse_audience_list_normalized_to_tuple():
+def test_from_str_audience_list_normalized_to_tuple():
     raw = _build_token(
         {"alg": "RS256"},
         {"aud": ["api://a", "api://b"]},
     )
-    assert JWTToken.parse(raw).aud == ("api://a", "api://b")
+    assert JWTToken.from_str(raw).aud == ("api://a", "api://b")
 
 
-def test_parse_bytes_input():
+def test_from_bytes_decodes_ascii_token():
     raw = _build_token({"alg": "HS256"}, {"sub": "bob"})
-    tok = JWTToken.parse(raw.encode("ascii"))
+    tok = JWTToken.from_bytes(raw.encode("ascii"))
     assert tok.sub == "bob"
 
 
-def test_parse_strips_bearer_prefix_and_whitespace():
+def test_from_dispatches_by_input_type():
+    raw = _build_token({"alg": "HS256"}, {"sub": "dispatch"})
+    # str → from_str
+    assert JWTToken.from_(raw).sub == "dispatch"
+    # bytes → from_bytes
+    assert JWTToken.from_(raw.encode("ascii")).sub == "dispatch"
+    # bytearray + memoryview also accepted
+    assert JWTToken.from_(bytearray(raw, "ascii")).sub == "dispatch"
+    assert JWTToken.from_(memoryview(raw.encode("ascii"))).sub == "dispatch"
+    # JWTToken passthrough (identity short-circuit)
+    tok = JWTToken.from_str(raw)
+    assert JWTToken.from_(tok) is tok
+
+
+def test_from_rejects_unsupported_type():
+    with pytest.raises(JWTParseError, match="expects str, bytes, or JWTToken"):
+        JWTToken.from_(12345)  # type: ignore[arg-type]
+
+
+def test_from_str_strips_bearer_prefix_and_whitespace():
     raw = _build_token({"alg": "HS256"}, {"sub": "alice"})
-    tok = JWTToken.parse(f"  Bearer  {raw}  ")
+    tok = JWTToken.from_str(f"  Bearer  {raw}  ")
     assert tok.sub == "alice"
     # The Bearer prefix and outer whitespace are stripped, but the
     # token bytes themselves are unchanged.
     assert tok.raw == raw
 
 
-def test_parse_unsecured_token_has_empty_signature():
+def test_from_str_unsecured_token_has_empty_signature():
     # alg=none style — trailing dot present, signature segment empty.
     raw = _build_token({"alg": "none"}, {"sub": "x"}, signature=b"")
-    tok = JWTToken.parse(raw)
+    tok = JWTToken.from_str(raw)
     assert tok.signature == b""
     assert tok.signature_segment == ""
 
@@ -107,7 +126,7 @@ def test_from_authorization_returns_none_for_missing_or_unrecognized():
 
 def test_expires_at_returns_aware_utc_datetime():
     raw = _build_token({"alg": "HS256"}, {"exp": 1_700_000_000})
-    tok = JWTToken.parse(raw)
+    tok = JWTToken.from_str(raw)
     expected = datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
     assert tok.expires_at == expected
     assert tok.expires_at.tzinfo is timezone.utc
@@ -124,15 +143,15 @@ def test_is_expired_uses_now_and_leeway():
         {"exp": (now - timedelta(seconds=60)).timestamp()},
     )
 
-    assert JWTToken.parse(fresh).is_expired(now=now) is False
-    assert JWTToken.parse(stale).is_expired(now=now) is True
+    assert JWTToken.from_str(fresh).is_expired(now=now) is False
+    assert JWTToken.from_str(stale).is_expired(now=now) is True
     # Leeway of 120s widens the window enough to accept the stale token.
-    assert JWTToken.parse(stale).is_expired(now=now, leeway=120) is False
+    assert JWTToken.from_str(stale).is_expired(now=now, leeway=120) is False
 
 
 def test_is_expired_false_when_exp_missing():
     raw = _build_token({"alg": "HS256"}, {"sub": "no-exp"})
-    assert JWTToken.parse(raw).is_expired() is False
+    assert JWTToken.from_str(raw).is_expired() is False
 
 
 def test_is_not_yet_valid_uses_nbf():
@@ -146,8 +165,8 @@ def test_is_not_yet_valid_uses_nbf():
         {"nbf": (now - timedelta(seconds=60)).timestamp()},
     )
 
-    assert JWTToken.parse(future).is_not_yet_valid(now=now) is True
-    assert JWTToken.parse(past).is_not_yet_valid(now=now) is False
+    assert JWTToken.from_str(future).is_not_yet_valid(now=now) is True
+    assert JWTToken.from_str(past).is_not_yet_valid(now=now) is False
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +176,14 @@ def test_is_not_yet_valid_uses_nbf():
 
 def test_signing_input_matches_header_dot_payload_segments():
     raw = _build_token({"alg": "HS256"}, {"sub": "x"})
-    tok = JWTToken.parse(raw)
+    tok = JWTToken.from_str(raw)
     expected = f"{tok.header_segment}.{tok.payload_segment}".encode("ascii")
     assert tok.signing_input == expected
 
 
 def test_repr_hides_signature():
     raw = _build_token({"alg": "HS256"}, {"sub": "secret-leak-test"})
-    tok = JWTToken.parse(raw)
+    tok = JWTToken.from_str(raw)
     text = repr(tok)
     assert "HS256" in text
     assert "secret-leak-test" in text
@@ -174,7 +193,7 @@ def test_repr_hides_signature():
 
 def test_str_returns_raw_token():
     raw = _build_token({"alg": "HS256"}, {"sub": "x"})
-    tok = JWTToken.parse(raw)
+    tok = JWTToken.from_str(raw)
     assert str(tok) == raw
 
 
@@ -183,32 +202,42 @@ def test_str_returns_raw_token():
 # ---------------------------------------------------------------------------
 
 
-def test_parse_rejects_wrong_segment_count():
+def test_from_str_rejects_wrong_segment_count():
     with pytest.raises(JWTParseError, match="three base64url segments"):
-        JWTToken.parse("only.two")
+        JWTToken.from_str("only.two")
 
 
-def test_parse_rejects_bad_base64():
+def test_from_str_rejects_bad_base64():
     # Valid shape regex-wise but the header segment is not valid JSON
     # after base64url decode.
     payload_seg = _b64url(_json_dumps({"sub": "x"}))
     raw = f"!!!!.{payload_seg}.sig"
     with pytest.raises(JWTParseError):
-        JWTToken.parse(raw)
+        JWTToken.from_str(raw)
 
 
-def test_parse_rejects_non_object_payload():
+def test_from_str_rejects_non_object_payload():
     header_seg = _b64url(_json_dumps({"alg": "HS256"}))
     # Payload decodes to a JSON array — RFC 7519 requires an object.
     payload_seg = _b64url(b"[1, 2, 3]")
     raw = f"{header_seg}.{payload_seg}.sig"
     with pytest.raises(JWTParseError, match="must be a JSON object"):
-        JWTToken.parse(raw)
+        JWTToken.from_str(raw)
 
 
-def test_parse_rejects_wrong_type():
-    with pytest.raises(JWTParseError, match="expects str or bytes"):
-        JWTToken.parse(12345)  # type: ignore[arg-type]
+def test_from_str_rejects_non_str():
+    with pytest.raises(JWTParseError, match="expects str"):
+        JWTToken.from_str(12345)  # type: ignore[arg-type]
+
+
+def test_from_bytes_rejects_non_bytes():
+    with pytest.raises(JWTParseError, match="expects bytes"):
+        JWTToken.from_bytes("not-bytes")  # type: ignore[arg-type]
+
+
+def test_from_bytes_rejects_non_ascii():
+    with pytest.raises(JWTParseError, match="ASCII"):
+        JWTToken.from_bytes("café.payload.sig".encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +247,11 @@ def test_parse_rejects_wrong_type():
 
 def test_token_is_frozen():
     raw = _build_token({"alg": "HS256"}, {"sub": "x"})
-    tok = JWTToken.parse(raw)
+    tok = JWTToken.from_str(raw)
     with pytest.raises(Exception):  # FrozenInstanceError subclass of AttributeError
         tok.raw = "different"  # type: ignore[misc]
 
 
 def test_equal_tokens_compare_equal():
     raw = _build_token({"alg": "HS256"}, {"sub": "x"})
-    assert JWTToken.parse(raw) == JWTToken.parse(raw)
+    assert JWTToken.from_str(raw) == JWTToken.from_str(raw)
