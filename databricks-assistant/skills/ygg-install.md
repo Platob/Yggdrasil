@@ -24,7 +24,7 @@ dbutils.library.restartPython()
 ### Pinning a version
 
 ```python
-%pip install "ygg[data,databricks]==0.7.89"
+%pip install "ygg[data,databricks]==0.7.93"
 ```
 
 Check the latest at https://pypi.org/project/ygg/.
