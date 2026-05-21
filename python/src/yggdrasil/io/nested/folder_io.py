@@ -18,13 +18,15 @@ non-private entry:
   concrete class, so a tree of folders flattens transparently into
   one batch stream.
 
-When :attr:`FolderOptions.partition_columns` is set the listing is
-Hive-aware: subdirectory names of the form ``<col>=<val>/`` seed
-the child folder's :attr:`Tabular.static_values` with the parsed
-KV (typed via :attr:`FolderOptions.schema` when present) so the
-inherited :meth:`Tabular._should_prune_by_predicate` skips the
-whole subtree when ``options.predicate`` is provably false on
-that partition value — no descent, no read. When the predicate
+When the folder's resolved schema (sidecar / target / first
+batch) declares any :class:`Field` children tagged
+``partition_by=True``, the listing is Hive-aware: subdirectory
+names of the form ``<col>=<val>/`` seed the child folder's
+:attr:`Tabular.static_values` with the parsed KV (typed via
+the schema's field dtype) so the inherited
+:meth:`Tabular._should_prune_by_predicate` skips the whole
+subtree when ``options.predicate`` is provably false on that
+partition value — no descent, no read. When the predicate
 constrains the partition column to a finite value set (via
 :func:`extract_partition_filters`), the listing **doesn't even
 walk the filesystem**: the candidate child paths are built
@@ -45,11 +47,13 @@ matches the in-memory batch shape almost 1:1, so it's the
 cheapest format to land a stream of small batches into. Callers
 that want parquet supply ``FolderOptions(child_extension="parquet")``.
 
-With ``partition_columns`` set on the write call, the folder
-splits each incoming batch by the partition column values and
-routes the per-value subsets to ``<base>/<col>=<val>/`` sub-folders,
-each receiving its own ``part-*.{ext}`` leaf — mirrors the Hive
-read shape so the same options round-trip.
+When the incoming data carries a schema with ``partition_by``-
+tagged children, the folder aggregates every batch into one
+table, groups by the leading partition column, and routes the
+per-value subsets to ``<base>/<col>=<val>/`` sub-folders, each
+receiving its own ``part-*.{ext}`` leaf — mirrors the Hive read
+shape. There is no ``partition_columns`` knob on
+:class:`FolderOptions`: the schema is the only source of truth.
 
 What "private" means
 --------------------
@@ -186,33 +190,17 @@ class FolderOptions(CastOptions):
     #: to override; a bare string (``"parquet"``) / extension
     #: (``"csv"``) / mime value (``"application/json"``) is coerced
     #: through :meth:`MediaType.from_`.
+    #:
+    #: Partition layout has no knob here — the schema owns it. Every
+    #: :class:`yggdrasil.data.data_field.Field` child tagged
+    #: ``partition_by=True`` becomes a Hive partition level, with the
+    #: outermost-first ordering taken from the schema's child order.
+    #: Source priority (most specific wins) when the folder needs to
+    #: resolve the layout: the incoming batch's
+    #: ``Schema.from_arrow(batch.schema)`` on writes, then
+    #: :meth:`FolderIO.collect_schema` (the persisted ``.ygg/`` sidecar
+    #: or the first-batch fallback), then ``options.target``.
     child_media_type: MediaType = MediaTypes.ARROW_IPC
-
-    #: Hive-style partition column names, outermost first.
-    #: ``("partition_key",)`` lays children out as
-    #: ``<base>/partition_key=<val>/part-*.<ext>``;
-    #: ``("year", "month")`` lays them out as
-    #: ``<base>/year=<v1>/month=<v2>/part-*.<ext>``.
-    #:
-    #: On **read** the listing parses each ``<col>=<val>/`` directory
-    #: name, seeds the parsed KV on the child's
-    #: :attr:`Tabular.static_values`, and the inherited
-    #: :meth:`Tabular._should_prune_by_predicate` skips the whole
-    #: subtree when ``options.predicate`` is provably false against
-    #: that value. When the predicate constrains the leading
-    #: partition column to a finite value set (via
-    #: :func:`yggdrasil.io.tabular.execution.expr.extract_partition_filters`),
-    #: the listing builds candidate sub-paths from the accepted
-    #: values and probes them directly instead of walking
-    #: ``iterdir`` — N probes instead of one full scan.
-    #:
-    #: On **write** the folder splits incoming batches by the listed
-    #: column values and routes each subset to its
-    #: ``<col>=<val>/`` sub-folder.
-    #:
-    #: Empty tuple keeps the legacy flat-folder behaviour. The order
-    #: matters: it dictates the directory nesting on disk.
-    partition_columns: "tuple[str, ...]" = ()
 
     def __post_init__(self) -> None:
         CastOptions.__post_init__(self)
@@ -226,10 +214,6 @@ class FolderOptions(CastOptions):
             )
         if coerced is not self.child_media_type:
             object.__setattr__(self, "child_media_type", coerced)
-        if self.partition_columns and not isinstance(self.partition_columns, tuple):
-            object.__setattr__(
-                self, "partition_columns", tuple(self.partition_columns),
-            )
 
 
 class FolderIO(IO[bytes, FolderOptions]):
@@ -244,7 +228,7 @@ class FolderIO(IO[bytes, FolderOptions]):
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
 
-    __slots__ = ("path", "_partition_remainder", "_yggmeta_enabled")
+    __slots__ = ("path", "_yggmeta_enabled")
 
     #: Sidecar directory name under :attr:`path` where folder-level
     #: metadata (the dumped schema, future per-format hints) lives.
@@ -311,13 +295,6 @@ class FolderIO(IO[bytes, FolderOptions]):
 
         from yggdrasil.io.path.path import Path as _Path
         self.path: "Path" = raw if isinstance(raw, _Path) else _Path.from_(raw)
-        # Outer read's ``partition_columns`` tail, stashed by the
-        # parent when it yields this child via
-        # :meth:`_mint_partition_child` so :meth:`_read_arrow_batches`
-        # can forward the remaining levels on its recursive read
-        # without re-reading the parent's options. Empty tuple for
-        # non-Hive children and top-level instances.
-        self._partition_remainder: "tuple[str, ...]" = ()
         self._yggmeta_enabled: bool = bool(yggmeta)
 
         # Don't forward ``data`` / ``path`` / ``binary`` — Holder
@@ -577,45 +554,47 @@ class FolderIO(IO[bytes, FolderOptions]):
 
     def _resolve_partition_columns(
         self,
-        options: "FolderOptions | None",
+        options: "FolderOptions | None" = None,
         *,
         batch_schema: Any = None,
     ) -> "tuple[str, ...]":
-        """Resolve the partition layout from the most specific source available.
+        """Resolve the partition layout from the schema.
 
-        Priority:
+        The schema owns partition layout — there is no
+        ``partition_columns`` knob on :class:`FolderOptions`. Source
+        priority (most specific wins):
 
-        1. ``options.partition_columns`` — explicit caller override.
-        2. *batch_schema* — when the write path peeks the first
-           incoming batch, the schema (via :meth:`Schema.from_arrow`)
-           already carries every :class:`Field` tag, so we just walk
-           ``schema.children`` for partition-tagged ones.
-        3. :meth:`collect_schema` — for the read path, returns the
-           sidecar schema persisted on the last write (preferred) or
-           the first batch's schema (fallback).
-        4. ``options.target`` — the schema-bearing slot the caller
-           may pass explicitly.
+        1. *batch_schema* — the write path peeks the first incoming
+           batch and feeds its :class:`Schema.from_arrow` here, so
+           the partition layout the caller declared on the data
+           itself drives the directory nesting without a second
+           parameter.
+        2. :meth:`collect_schema` — for the read path, returns the
+           ``.ygg/schema.arrow`` sidecar persisted on the last
+           write (preferred) or the first-batch fallback.
+        3. ``options.target`` — the schema-bearing slot the caller
+           may pass explicitly when neither of the above is
+           populated yet (e.g. an empty folder being asked for the
+           layout before its first write).
 
         Columns already pinned by :attr:`static_values` (i.e. ones
         the enclosing partition layer already consumed when it
         minted this child) are filtered out — without that, a
-        partition-key=v leaf would re-infer ``partition_key`` from
-        its own data and recurse forever into
-        ``partition_key=v/partition_key=v/…``.
+        ``partition_key=v`` leaf would re-infer ``partition_key``
+        from its own data and recurse forever into
+        ``partition_key=v/partition_key=v/…``. :class:`Field`
+        already parses every tag off the Arrow schema, so the
+        helper just hands off to it via
+        :func:`_partition_columns_from_schema`.
 
         Returns an empty tuple when no source pins the layout —
-        the caller's flat-folder branch then applies. :class:`Field`
-        already parses every tag, so the helper just hands off to it.
+        the caller's flat-folder branch then applies.
         """
-        if options is None:
-            return ()
         consumed = set(self.static_values)
 
         def _filter(cols: "tuple[str, ...]") -> "tuple[str, ...]":
             return tuple(c for c in cols if c not in consumed)
 
-        if options.partition_columns:
-            return _filter(tuple(options.partition_columns))
         cols = _filter(_partition_columns_from_schema(batch_schema))
         if cols:
             return cols
@@ -626,9 +605,8 @@ class FolderIO(IO[bytes, FolderOptions]):
         cols = _filter(_partition_columns_from_schema(schema))
         if cols:
             return cols
-        return _filter(_partition_columns_from_schema(
-            getattr(options, "target", None),
-        ))
+        target = getattr(options, "target", None) if options is not None else None
+        return _filter(_partition_columns_from_schema(target))
 
     def _iter_partition_children(
         self,
@@ -638,20 +616,21 @@ class FolderIO(IO[bytes, FolderOptions]):
         """Hive-aware listing variant — see :meth:`iter_children`.
 
         ``partition_columns[0]`` is the column this level resolves;
-        descendants see the tail. Leaf files at this level (plain
-        ``part-*.<ext>``, no ``<col>=<val>`` prefix) still pass
-        through so a partially-populated tree (e.g. a freshly minted
-        folder where the writer happened to land a non-partitioned
-        leaf alongside the partition dirs) reads cleanly.
+        descendants re-resolve the layout from their own
+        :attr:`static_values` (the consumed head gets filtered out
+        of the schema-driven lookup, so the next level naturally
+        picks up the remaining partition columns). Leaf files at
+        this level (plain ``part-*.<ext>``, no ``<col>=<val>``
+        prefix) still pass through so a partially-populated tree
+        (e.g. a freshly minted folder where the writer happened to
+        land a non-partitioned leaf alongside the partition dirs)
+        reads cleanly.
         """
-        head, *tail = partition_columns
-        remaining = tuple(tail)
+        head = partition_columns[0]
         accepted = self._accepted_partition_values(options, head)
 
         if accepted is not None:
-            yield from self._iter_partition_candidates(
-                head, accepted, remaining,
-            )
+            yield from self._iter_partition_candidates(head, accepted)
             return
 
         for entry in self.path.iterdir():
@@ -667,9 +646,7 @@ class FolderIO(IO[bytes, FolderOptions]):
                     value = _cast_partition_value(
                         parsed[1], self._partition_dtype(head),
                     )
-                    yield self._mint_partition_child(
-                        entry, head, value, remaining,
-                    )
+                    yield self._mint_partition_child(entry, head, value)
                 else:
                     # Non-Hive sub-folder mixed in (older layout,
                     # operator scratch dir, …): yield it as a plain
@@ -688,7 +665,6 @@ class FolderIO(IO[bytes, FolderOptions]):
         self,
         column: str,
         values: "frozenset[Any]",
-        remaining: "tuple[str, ...]",
     ) -> "Iterator[Tabular]":
         """Probe ``<base>/<column>=<val>/`` directly for each accepted value.
 
@@ -704,35 +680,26 @@ class FolderIO(IO[bytes, FolderOptions]):
             encoded = _hive_encode(value)
             candidate = self.path / f"{column}={encoded}"
             typed_value = _cast_partition_value(value, dtype)
-            yield self._mint_partition_child(
-                candidate, column, typed_value, remaining,
-            )
+            yield self._mint_partition_child(candidate, column, typed_value)
 
     def _mint_partition_child(
         self,
         path: "Path",
         column: str,
         value: Any,
-        remaining: "tuple[str, ...]",
     ) -> "Tabular":
         """Mint a child FolderIO seeded with the parsed partition KV.
 
-        ``remaining`` is the *outer* read's ``partition_columns``
-        tail, kept as bookkeeping for the read pipeline — when the
-        child's ``_read_arrow_batches`` recurses, it forwards a
-        ``FolderOptions`` whose ``partition_columns`` is this tail
-        so the next level can keep consuming.
+        The child's :attr:`static_values` carries the consumed
+        partition (column → value); the next call to
+        :meth:`_resolve_partition_columns` on the child filters that
+        column out of the schema-driven lookup, so the next level
+        naturally picks up the remaining partition columns without
+        any side-channel bookkeeping.
         """
-        child = type(self)(
-            path=path,
-            static_values={column: value},
-        )
-        # Stash the remaining tail on the child via an attribute the
-        # read pipeline reads back out. Plain attribute (not a slot)
-        # keeps the FolderOptions surface immutable / hashable while
-        # giving the read recursion a cheap handoff.
-        child._partition_remainder = remaining  # type: ignore[attr-defined]
-        return self.adopt_child(child)
+        return self.adopt_child(type(self)(
+            path=path, static_values={column: value},
+        ))
 
     def _accepted_partition_values(
         self,
@@ -885,13 +852,16 @@ class FolderIO(IO[bytes, FolderOptions]):
         through unchanged (undecidable → read), so a vanilla folder
         without partition KV behaves exactly as before.
 
-        When ``options.partition_columns`` is set, the listing is
-        Hive-aware (see :meth:`iter_children`). Each yielded child
-        carries the leftover partition-columns tail on
-        :attr:`_partition_remainder`; the recursive read forwards
-        ``predicate`` / ``prune_values`` plus that shrunken tail so
-        the next level can keep consuming partition columns until
-        the leaves are reached.
+        When the folder's resolved schema declares any partition
+        columns (via :class:`Field` ``partition_by`` tags), the
+        listing is Hive-aware (see :meth:`iter_children`). Each
+        yielded child carries the consumed partition KV on its
+        :attr:`static_values`; the recursive read just forwards
+        ``predicate`` / ``prune_values``, and the child's
+        :meth:`_resolve_partition_columns` filters the consumed
+        column out of its own schema-driven lookup so the next
+        level naturally drops to the remaining partitions (or to a
+        flat write when the schema's partition set is exhausted).
         """
         if self._should_prune_by_predicate(options):
             return
@@ -917,30 +887,26 @@ class FolderIO(IO[bytes, FolderOptions]):
     def _child_read_options(
         self, child: "Tabular", options: FolderOptions,
     ) -> Any:
-        """Forward predicate / prune / partition-tail to *child*'s read.
+        """Forward predicate / prune-values to *child*'s read.
 
         Predicates and explicit prune-value sets need to ride down
         the tree — otherwise a partition-aware caller would have to
         re-seed them at every level, and a row-level predicate on a
-        nested folder would silently no-op. Hive children carry the
-        consumed-tail on :attr:`_partition_remainder` so the next
-        level only sees columns it hasn't already pinned via
-        :attr:`Tabular.static_values`. Non-FolderIO children fall
-        back to their own default options — leaf formats
-        (parquet / arrow IPC / csv) accept ``predicate`` /
+        nested folder would silently no-op. Partition layout itself
+        is **not** forwarded: each level re-resolves it from its
+        own schema (sidecar / target / batch), with the consumed
+        columns filtered out via :attr:`Tabular.static_values`. Leaf
+        formats (parquet / arrow IPC / csv) accept ``predicate`` /
         ``prune_values`` via :class:`CastOptions`, the shared base.
         """
         opts_cls = child.options_class()
-        kwargs: dict[str, Any] = {
+        kwargs: "dict[str, Any]" = {
             "predicate": options.predicate,
             "prune_values": options.prune_values,
         }
-        if isinstance(child, FolderIO):
-            kwargs["partition_columns"] = getattr(
-                child, "_partition_remainder", (),
-            )
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
-            return opts_cls(**{k: v for k, v in kwargs.items() if v is not None or k == "partition_columns"})
+            return opts_cls(**kwargs)
         except TypeError:
             # The leaf options class doesn't know about one of our
             # kwargs (e.g. an older subclass without ``prune_values``).
@@ -948,8 +914,7 @@ class FolderIO(IO[bytes, FolderOptions]):
             # still wins via row-level filtering after read.
             safe = {
                 k: v for k, v in kwargs.items()
-                if v is not None
-                and k in getattr(opts_cls, "__dataclass_fields__", ())
+                if k in getattr(opts_cls, "__dataclass_fields__", ())
             }
             return opts_cls(**safe)
 
@@ -1028,17 +993,18 @@ class FolderIO(IO[bytes, FolderOptions]):
         if partition_columns:
             # Partition split: union the materialised batches, group
             # by the leading partition column, and recurse into each
-            # ``<self.path>/<col>=<val>/`` with ``partition_columns``
-            # shrunk by one. The recursion lands back at the top of
-            # this method with the tail tuple empty (single-column
-            # case) or with the next level pinned (multi-level), so
-            # the nesting unwinds naturally without a separate
-            # helper. The partition column stays in the written
-            # payload — Hive convention drops it, but the cache
-            # layout keeps it so the row-level predicate on read
-            # runs against the same in-payload column without re-
-            # stamping from the directory name.
-            head, *tail = partition_columns
+            # ``<self.path>/<col>=<val>/``. The recursion re-resolves
+            # the partition layout from the same schema; the child's
+            # ``static_values`` pins the consumed column so
+            # ``_resolve_partition_columns`` filters it out and only
+            # the remaining levels fire. Multi-level layouts unwind
+            # automatically, single-column layouts land in the flat
+            # branch on the second hop. The partition column stays
+            # in the written payload — Hive convention drops it,
+            # but the cache layout keeps it so the row-level
+            # predicate on read runs against the same in-payload
+            # column without re-stamping from the directory name.
+            head = partition_columns[0]
             if head not in first.schema.names:
                 raise ValueError(
                     f"FolderIO partition write: batches are missing the "
@@ -1046,9 +1012,6 @@ class FolderIO(IO[bytes, FolderOptions]):
                     f"{first.schema.names!r}; partition_columns="
                     f"{partition_columns!r}."
                 )
-            child_options = dataclasses.replace(
-                options, partition_columns=tuple(tail),
-            )
             table = pa.Table.from_batches(materialised)
             column = table.column(head)
             for scalar in pc.unique(column.combine_chunks()):
@@ -1067,7 +1030,7 @@ class FolderIO(IO[bytes, FolderOptions]):
                 )
                 self.adopt_child(child)
                 child._write_arrow_batches(
-                    iter(subset.to_batches()), child_options,
+                    iter(subset.to_batches()), options,
                 )
             self._persist_yggmeta_schema(first_schema)
             return
