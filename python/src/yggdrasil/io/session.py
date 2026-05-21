@@ -924,6 +924,56 @@ class Session(Singleton, ABC):
             "or override _build_idle_response on a custom subclass."
         )
 
+    def check_auth(
+        self,
+        request: PreparedRequest,
+        force: bool = True,
+    ) -> PreparedRequest:
+        """Resolve the auth handler and stamp the Authorization header.
+
+        Per-request ``request.auth`` wins over the session-wide
+        ``self.auth``; when neither is bound, the request is returned
+        untouched (callers that target unauthenticated endpoints
+        keep working). When a handler is bound, ``check_auth`` calls
+        its ``refresh(force=force)`` if it exposes one — MSAL-style
+        handlers use ``force`` to bypass the in-memory token cache
+        and mint a fresh credential — then reads its ``authorization``
+        property and writes the value to ``request.headers["Authorization"]``.
+
+        Two call sites:
+
+        - :meth:`prepare_request_before_send` calls this with
+          ``force=False`` so steady-state requests reuse the cached
+          token (the handler's own ``is_expired`` / refresh-skew
+          logic still mints a new one when the cache is empty or
+          stale).
+        - The HTTP send path calls this with the default ``force=True``
+          after a 403, to mint a fresh token before the single retry —
+          some vendors (Salesforce, M365, …) return 403 instead of
+          401 when a previously-valid token has been silently rotated
+          upstream.
+
+        The request is mutated in place and returned for chaining.
+        Subclasses with vendor-specific auth (HMAC signing, SigV4,
+        challenge-response) override this to do whatever their API
+        needs while keeping the same contract.
+        """
+        handler = request.auth or self.auth
+        if handler is None:
+            return request
+        refresh = getattr(handler, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh(force=force)
+            except TypeError:
+                # Handler's refresh() doesn't accept ``force`` — fall
+                # back to a no-arg call so legacy handlers still work.
+                refresh()
+        if request.headers is None:
+            request.headers = Headers()
+        request.headers["Authorization"] = handler.authorization
+        return request
+
     def prepare_request_before_send(self, request: PreparedRequest) -> PreparedRequest:
         """Session-wide request hook fired once per outbound request.
 
@@ -939,18 +989,11 @@ class Session(Singleton, ABC):
             if request.headers is None:
                 request.headers = {}
             request.headers.update(self.headers)
-        # Lazy auth resolution: per-request handler wins, else fall
-        # back to the session-wide handler. Each call hits the
-        # handler's ``authorization`` property so refresh-on-expiry
-        # handlers (e.g. MSAL) emit the current token per send. We
-        # write the resolved header directly instead of mutating
-        # ``request.auth`` so a request reused across sessions doesn't
-        # carry a stale session-level binding.
-        handler = request.auth or self.auth
-        if handler is not None:
-            if request.headers is None:
-                request.headers = Headers()
-            request.headers["Authorization"] = handler.authorization
+        # Steady-state requests reuse the handler's cached token; the
+        # 403 retry path in HTTPSession._local_send re-calls
+        # ``check_auth`` with ``force=True`` to bypass that cache when
+        # the upstream rotated the credential.
+        self.check_auth(request, force=False)
         return request
 
     def prepare_response_after_received(self, response: Response) -> Response:

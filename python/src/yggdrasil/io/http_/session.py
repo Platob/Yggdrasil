@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import datetime as dt
 import inspect
+import logging
 from itertools import takewhile
-from typing import Optional
+from typing import Any, Optional
 
 import urllib3
 
@@ -29,6 +30,9 @@ from ..session import Session
 from .response import HTTPResponse
 
 __all__ = ["HTTPSession"]
+
+
+LOGGER = logging.getLogger(__name__)
 
 # urllib3 ``Retry`` gained ``backoff_max`` as a constructor kwarg in 2.0.
 # On 1.x the cap lives as the ``Retry.BACKOFF_MAX`` class attribute (we
@@ -222,25 +226,22 @@ class HTTPSession(Session):
     ) -> HTTPResponse:
         wait_cfg = self.waiting if config.wait is None else config.wait
 
-        raw_resp = self.http_pool.request(
-            method=request.method,
-            url=request.url.to_string(),
-            body=request.buffer.to_bytes() if request.buffer is not None else None,
-            headers=request.headers,
-            timeout=wait_cfg.timeout_urllib3,
-            preload_content=False,
-            decode_content=False,
-            redirect=True,
-        )
+        raw_resp, result = self._wire_send(request, wait_cfg)
 
-        result = HTTPResponse.from_urllib3(
-            request=request,
-            response=raw_resp,
-            tags=None,
-            received_at=dt.datetime.now(dt.timezone.utc),
-            stream=True,
-            release_conn=True,
-        )
+        # 403 → refresh auth and retry once. urllib3's _RETRY_STATUSES
+        # covers 5xx / 429 transients; 403 is a deliberate auth signal
+        # some vendors (Salesforce, M365 SharePoint, …) emit instead
+        # of 401 when a previously-valid token has been silently
+        # rotated upstream. Only worth retrying when an auth handler
+        # is actually bound — otherwise the second attempt would
+        # carry the same headers and 403 again.
+        if result.status_code == 403 and (request.auth or self.auth) is not None:
+            LOGGER.warning(
+                "Refreshing auth after 403 for %s %s — retrying once",
+                request.method, request.url,
+            )
+            self.check_auth(request)  # force=True default
+            raw_resp, result = self._wire_send(request, wait_cfg)
 
         x_current_page = raw_resp.headers.get("X-Current-Page")
         x_total_pages = raw_resp.headers.get("X-Last-Page")
@@ -260,6 +261,39 @@ class HTTPSession(Session):
             result.raise_for_status()
 
         return result
+
+    def _wire_send(
+        self,
+        request: PreparedRequest,
+        wait_cfg: WaitingConfig,
+    ) -> tuple[Any, HTTPResponse]:
+        """Single wire-level send.
+
+        Returns the raw urllib3 response (kept around so the caller
+        can read pagination headers like ``X-Current-Page`` without a
+        second round trip) alongside the drained :class:`HTTPResponse`.
+        Extracted from :meth:`_local_send` so the 403-retry branch
+        re-uses the exact same transport call.
+        """
+        raw_resp = self.http_pool.request(
+            method=request.method,
+            url=request.url.to_string(),
+            body=request.buffer.to_bytes() if request.buffer is not None else None,
+            headers=request.headers,
+            timeout=wait_cfg.timeout_urllib3,
+            preload_content=False,
+            decode_content=False,
+            redirect=True,
+        )
+        result = HTTPResponse.from_urllib3(
+            request=request,
+            response=raw_resp,
+            tags=None,
+            received_at=dt.datetime.now(dt.timezone.utc),
+            stream=True,
+            release_conn=True,
+        )
+        return raw_resp, result
 
     def _fetch_paginated_page(
         self,
