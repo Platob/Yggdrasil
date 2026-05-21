@@ -38,8 +38,6 @@ from dataclasses import replace as _dc_replace
 
 from .resources import (
     DEFAULT_MANAGED_SPACE_TITLE,
-    DEFAULT_POLL_INTERVAL_SECONDS,
-    DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_WAIT,
     GenieAnswer,
     GenieConversation,
@@ -49,7 +47,7 @@ from .resources import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from databricks.sdk.service.dashboards import GenieAPI, GenieMessage
+    from databricks.sdk.service.dashboards import GenieAPI
     from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
     from .agent import GenieAgent
