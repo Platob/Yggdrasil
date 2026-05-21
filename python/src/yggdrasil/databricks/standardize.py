@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence, Union
 
 from yggdrasil.data.enums.currency import Currency
 from yggdrasil.data.enums.units import Unit, unit_family_for
@@ -288,6 +288,30 @@ def _is_likely_column_name(
     return value in columns
 
 
+def _resolve_currency_col(
+    currency_col: Union[str, Currency],
+    columns: list[str],
+    get_distinct: Callable[[], tuple[Currency, ...]],
+    fn_name: str,
+) -> tuple[tuple[Currency, ...], Optional[Currency]]:
+    """Return ``(sources, static_source)`` for a currency_col argument.
+
+    ``static_source`` is ``None`` when *currency_col* names a per-row column;
+    otherwise it is the resolved :class:`Currency` that applies to every row.
+    """
+    if isinstance(currency_col, Currency):
+        return (currency_col,), currency_col
+    if isinstance(currency_col, str) and currency_col in columns:
+        return get_distinct(), None
+    if isinstance(currency_col, str):
+        static = Currency.parse(currency_col)
+        return (static,), static
+    raise TypeError(
+        f"{fn_name}: currency_col must be a Currency, ISO code str, or column name; "
+        f"got {type(currency_col).__name__}: {currency_col!r}"
+    )
+
+
 def with_currency_equivalents(
     df: "pl.DataFrame | pl.LazyFrame",
     *,
@@ -355,25 +379,13 @@ def with_currency_equivalents(
     is_lazy = isinstance(df, pl.LazyFrame)
     eager = df.collect() if is_lazy else df
 
-    # Resolve the source-currency mode (static literal vs per-row column).
-    if isinstance(currency_col, Currency):
-        sources = (currency_col,)
-        static_source = currency_col
-    elif isinstance(currency_col, str) and currency_col in eager.columns:
-        # Per-row column path
-        seen = eager[currency_col].cast(pl.Utf8).drop_nulls().unique().to_list()
-        sources = tuple(Currency.parse(s) for s in seen if s)
-        static_source = None
-    elif isinstance(currency_col, str):
-        # Treat as a static ISO code literal
-        sources = (Currency.parse(currency_col),)
-        static_source = sources[0]
-    else:
-        raise TypeError(
-            f"with_currency_equivalents: currency_col must be a Currency, "
-            f"ISO code str, or column name; got {type(currency_col).__name__}: "
-            f"{currency_col!r}"
-        )
+    def _get_distinct_polars() -> tuple[Currency, ...]:
+        seen = eager[currency_col].cast(pl.Utf8).drop_nulls().unique().to_list()  # type: ignore[union-attr]
+        return tuple(Currency.parse(s) for s in seen if s)
+
+    sources, static_source = _resolve_currency_col(
+        currency_col, list(eager.columns), _get_distinct_polars, "with_currency_equivalents"
+    )
 
     pairs: list[tuple[Currency, Currency]] = [
         (src, tgt)
@@ -630,23 +642,12 @@ def spark_with_currency_equivalents(
             "target currency."
         )
 
-    # Source-currency mode: static literal vs per-row column.
-    static_source: Optional[Currency]
-    if isinstance(currency_col, Currency):
-        sources = (currency_col,)
-        static_source = currency_col
-    elif isinstance(currency_col, str) and currency_col in df.columns:
-        sources = tuple(_distinct_currencies_spark(df, currency_col))
-        static_source = None
-    elif isinstance(currency_col, str):
-        sources = (Currency.parse(currency_col),)
-        static_source = sources[0]
-    else:
-        raise TypeError(
-            f"spark_with_currency_equivalents: currency_col must be a "
-            f"Currency, ISO code str, or column name; got "
-            f"{type(currency_col).__name__}: {currency_col!r}"
-        )
+    sources, static_source = _resolve_currency_col(
+        currency_col,
+        list(df.columns),
+        lambda: tuple(_distinct_currencies_spark(df, currency_col)),  # type: ignore[arg-type]
+        "spark_with_currency_equivalents",
+    )
 
     pairs: list[tuple[Currency, Currency]] = [
         (src, tgt)

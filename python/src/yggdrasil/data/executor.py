@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Generic, Iterable, Mapping, Optional, TypeVar
 

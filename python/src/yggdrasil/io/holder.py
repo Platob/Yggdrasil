@@ -43,13 +43,10 @@ with its own ``_pos``; see :meth:`open` for patterns.
 
 from __future__ import annotations
 
-import io as _stdlib_io
 import os
 import pathlib
 import struct
-import tempfile
 import time
-from abc import abstractmethod
 from collections.abc import Iterable
 from typing import (
     TYPE_CHECKING,
@@ -68,7 +65,6 @@ import pyarrow as pa
 
 from yggdrasil.data.enums import MediaType, MimeType
 from yggdrasil.data.enums.mode import Mode, ModeLike
-from yggdrasil.data.options import CastOptions
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular

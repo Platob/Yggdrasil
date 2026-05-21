@@ -52,14 +52,12 @@ tree directly.
 from __future__ import annotations
 
 import dataclasses
-import time
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import pyarrow as pa
 
 from yggdrasil.io.tabular.execution.expr import Expression, Predicate
-from yggdrasil.data.options import CastOptions
-from yggdrasil.io.tabular import ArrowTabular, Tabular
+from yggdrasil.io.tabular import Tabular
 
 from yggdrasil.io.tabular.execution.sql.dialect import Dialect, resolve_dialect
 from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog

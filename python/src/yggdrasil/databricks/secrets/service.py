@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
 
-from databricks.sdk.errors import NotFound, ResourceAlreadyExists, ResourceDoesNotExist
+from databricks.sdk.errors import ResourceAlreadyExists, ResourceDoesNotExist
 
 from ..client import DatabricksService
 

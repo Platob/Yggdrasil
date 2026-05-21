@@ -42,7 +42,6 @@ from typing import (
 
 import pyarrow as pa
 import pyarrow.ipc as pipc
-import urllib3
 from databricks.sdk.service.sql import (
     Disposition,
     ExecuteStatementRequestOnWaitTimeout,

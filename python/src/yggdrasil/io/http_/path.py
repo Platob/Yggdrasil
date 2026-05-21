@@ -20,8 +20,7 @@ own session when one is attached so the connection pool is reused.
 """
 from __future__ import annotations
 
-import datetime as dt
-from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator
 
 from yggdrasil.data.enums import Mode, Scheme
 from yggdrasil.io.bytes_io import BytesIO
