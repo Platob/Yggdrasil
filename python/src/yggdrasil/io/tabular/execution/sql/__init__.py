@@ -81,7 +81,6 @@ from .catalog import (
     registered,
 )
 from .dialect import DEFAULT_DIALECT, Dialect, resolve_dialect
-from .dynamic_catalog import DynamicCatalog
 from .engine import Engine, EnginePlan
 from .executor import (
     ArrowSqlExecutor,
@@ -114,8 +113,6 @@ from .plan import (
 )
 from .planner import PlanError, Planner, plan
 from .statement import PersistTarget, SqlPreparedStatement, SqlStatementResult
-from . import system_catalog
-from .system_catalog import SYSTEM_CATALOG
 from .utils import (
     is_valid_identifier,
     parse_dotted_name,
@@ -136,9 +133,6 @@ __all__ = [
     "registered",
     "default_context",
     "SqlContext",
-    "DynamicCatalog",
-    "SYSTEM_CATALOG",
-    "system_catalog",
     "Engine",
     "EnginePlan",
     "Planner",

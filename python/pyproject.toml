@@ -62,7 +62,6 @@ http = [
 ]
 
 data = [
-  "pandas>=2.1",
 ]
 
 bigdata = [

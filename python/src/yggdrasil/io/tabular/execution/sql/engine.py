@@ -14,10 +14,10 @@ The end-to-end driver for the in-process SQL stack:
 
 Three things sit behind that one-liner:
 
-1. :class:`yggdrasil.sql.dynamic_catalog.DynamicCatalog` resolves
-   ``trades`` to a :class:`Tabular`. Anything :func:`coerce_source`
-   accepts (pyarrow Table, polars / pandas frame, list of dicts,
-   path string, existing Tabular) registers transparently.
+1. :class:`yggdrasil.sql.catalog.SqlContext` resolves ``trades`` to
+   a :class:`Tabular`. Anything :func:`coerce_source` accepts
+   (pyarrow Table, polars / pandas frame, list of dicts, path
+   string, existing Tabular) registers transparently.
 2. :class:`yggdrasil.sql.planner.Planner` parses the SQL via sqlglot
    and emits an :class:`yggdrasil.sql.plan.PlanNode` tree —
    ``Scan`` / ``Filter`` / ``Project`` / ``Aggregate`` / ``Sort`` /
@@ -59,8 +59,8 @@ import pyarrow as pa
 from yggdrasil.io.tabular.execution.expr import Expression, Predicate
 from yggdrasil.io.tabular import Tabular
 
+from yggdrasil.io.tabular.execution.sql.catalog import SqlContext
 from yggdrasil.io.tabular.execution.sql.dialect import Dialect, resolve_dialect
-from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
 from yggdrasil.io.tabular.execution.sql.plan import PlanNode
 from yggdrasil.io.tabular.execution.sql.planner import Planner
 from yggdrasil.io.tabular.execution.sql.statement import (
@@ -123,10 +123,10 @@ class Engine:
         sources: "Mapping[str, Any] | None" = None,
         *,
         dialect: "Dialect | str | None" = None,
-        catalog: "DynamicCatalog | None" = None,
+        catalog: "SqlContext | None" = None,
     ) -> None:
         self.dialect: Dialect = resolve_dialect(dialect)
-        self.catalog: DynamicCatalog = catalog or DynamicCatalog(sources)
+        self.catalog: SqlContext = catalog or SqlContext(sources)
         if catalog is not None and sources:
             self.catalog.register_many(sources)
 

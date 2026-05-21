@@ -39,7 +39,7 @@ and lets us inherit dialect support for free as sqlglot grows.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from yggdrasil.io.tabular.execution.expr import Expression, Predicate
 
@@ -62,8 +62,6 @@ from yggdrasil.io.tabular.execution.sql.plan import (
 )
 
 
-if TYPE_CHECKING:
-    from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
 
 
 __all__ = ["Planner", "PlanError", "plan"]

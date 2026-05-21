@@ -46,7 +46,7 @@ from yggdrasil.io.tabular import ArrowTabular, Tabular
 
 
 if TYPE_CHECKING:
-    from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
+    from yggdrasil.io.tabular.execution.sql.catalog import SqlContext
 
 
 __all__ = [
@@ -146,7 +146,7 @@ class PlanNode(ABC):
         """Iterate child nodes in left-to-right order."""
 
     @abstractmethod
-    def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
+    def _execute_arrow(self, ctx: "SqlContext") -> pa.Table:
         """Materialize this node's output as a :class:`pyarrow.Table`.
 
         Recursion is the subclass's responsibility — most operators
@@ -154,7 +154,7 @@ class PlanNode(ABC):
         node and then run the operator-specific Arrow code on top.
         """
 
-    def execute(self, ctx: "DynamicCatalog") -> Tabular:
+    def execute(self, ctx: "SqlContext") -> Tabular:
         """Evaluate the plan and return a :class:`Tabular` result.
 
         The default builds an :class:`ArrowTabular` over the table
@@ -196,7 +196,7 @@ class PlanNode(ABC):
     # ------------------------------------------------------------------
 
     def _child_table(
-        self, ctx: "DynamicCatalog", *, index: int = 0,
+        self, ctx: "SqlContext", *, index: int = 0,
     ) -> pa.Table:
         """Materialize the *index*-th child as a single :class:`pa.Table`."""
         kids = list(self.children())
@@ -243,9 +243,9 @@ class Scan(PlanNode):
             bits.append(f"limit={self.limit}")
         return " ".join(bits)
 
-    def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
-        source = ctx.resolve(self.name)
-        options = self._build_options(source, ctx)
+    def _execute_arrow(self, ctx: "SqlContext") -> pa.Table:
+        source = ctx[self.name]
+        options = self._build_options(source)
         table = source.read_arrow_table(options=options)
         # Pushdown is a hint — the source may or may not honour it.
         # Re-apply both filter and projection so the output of Scan
@@ -260,7 +260,7 @@ class Scan(PlanNode):
             table = table.slice(0, self.limit)
         return table
 
-    def _build_options(self, source: Tabular, ctx: "DynamicCatalog") -> CastOptions:
+    def _build_options(self, source: Tabular) -> CastOptions:
         """Build :class:`CastOptions` carrying the predicate + projection.
 
         For a column projection to push into a SQL-backed source
@@ -281,7 +281,7 @@ class Scan(PlanNode):
         if not self.projection:
             return CastOptions(predicate=self.predicate)
         try:
-            full = ctx.schema_of(self.name)
+            full = source.collect_schema()
         except Exception:
             return CastOptions(predicate=self.predicate)
 
@@ -320,7 +320,7 @@ class Filter(PlanNode):
     def _format_args(self) -> str:
         return f"pred={self.predicate.to_sql()}"
 
-    def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
+    def _execute_arrow(self, ctx: "SqlContext") -> pa.Table:
         table = self._child_table(ctx)
         mask = pc.cast(_eval_predicate_arrow(self.predicate, table), pa.bool_())
         return table.filter(mask)
@@ -354,7 +354,7 @@ class Project(PlanNode):
                 bits.append(f"({it.source.to_sql()}) AS {it.alias}")
         return "items=[" + ", ".join(bits) + "]"
 
-    def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
+    def _execute_arrow(self, ctx: "SqlContext") -> pa.Table:
         table = self._child_table(ctx)
         out_arrays: list[pa.ChunkedArray] = []
         out_names: list[str] = []
@@ -410,7 +410,7 @@ class Aggregate(PlanNode):
             bits.append("aggs=[" + ", ".join(agg) + "]")
         return " ".join(bits)
 
-    def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
+    def _execute_arrow(self, ctx: "SqlContext") -> pa.Table:
         table = self._child_table(ctx)
 
         # Build the (function, options, target) triples pyarrow's
@@ -509,7 +509,7 @@ class Sort(PlanNode):
         bits = [f"{k.column}{' DESC' if k.descending else ''}" for k in self.keys]
         return "by=[" + ", ".join(bits) + "]"
 
-    def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
+    def _execute_arrow(self, ctx: "SqlContext") -> pa.Table:
         table = self._child_table(ctx)
         if table.num_rows == 0:
             return table
@@ -537,7 +537,7 @@ class Limit(PlanNode):
     def _format_args(self) -> str:
         return f"n={self.n} offset={self.offset}"
 
-    def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
+    def _execute_arrow(self, ctx: "SqlContext") -> pa.Table:
         table = self._child_table(ctx)
         return table.slice(self.offset, self.n)
 
@@ -574,7 +574,7 @@ class Join(PlanNode):
         on_bits = ", ".join(f"{l}={r}" for l, r in self.on)
         return f"kind={self.kind} on=[{on_bits}]"
 
-    def _execute_arrow(self, ctx: "DynamicCatalog") -> pa.Table:
+    def _execute_arrow(self, ctx: "SqlContext") -> pa.Table:
         left = self._child_table(ctx, index=0)
         right = self._child_table(ctx, index=1)
 
@@ -628,7 +628,7 @@ class Join(PlanNode):
 # ---------------------------------------------------------------------------
 
 
-def evaluate(plan: PlanNode, ctx: "DynamicCatalog") -> Tabular:
+def evaluate(plan: PlanNode, ctx: "SqlContext") -> Tabular:
     """One-shot evaluation entry point — equivalent to ``plan.execute(ctx)``."""
     return plan.execute(ctx)
 

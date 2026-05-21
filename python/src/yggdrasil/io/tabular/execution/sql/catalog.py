@@ -22,7 +22,7 @@ from __future__ import annotations
 import threading
 from typing import Any, Iterator, Mapping, MutableMapping
 
-from yggdrasil.io.tabular import Tabular
+from yggdrasil.io.tabular import ArrowTabular, Tabular
 
 __all__ = [
     "SqlContext",
@@ -37,18 +37,57 @@ __all__ = [
 def coerce_source(obj: Any) -> Tabular:
     """Lift *obj* into a :class:`Tabular`.
 
-    Delegates to :func:`yggdrasil.sql.dynamic_catalog.coerce_to_tabular`,
-    which handles every shape the registry accepts (existing
-    :class:`Tabular`, pyarrow Table / RecordBatch, polars / pandas
-    frames, ``list[dict]`` / ``dict[str, list]``, path-likes). Kept
-    as a separate function in this module so legacy call sites that
-    import ``coerce_source`` from the legacy catalog module still
-    work — the canonical helper now lives next to the
-    :class:`DynamicCatalog`.
-    """
-    from yggdrasil.io.tabular.execution.sql.dynamic_catalog import coerce_to_tabular
+    Supported inputs (in priority order):
 
-    return coerce_to_tabular(obj)
+    - already a :class:`Tabular` → passthrough.
+    - :class:`pyarrow.Table` / :class:`pyarrow.RecordBatch` →
+      :class:`ArrowTabular`.
+    - :class:`polars.DataFrame` / :class:`polars.LazyFrame` → bridge
+      to Arrow then :class:`ArrowTabular`.
+    - :class:`pandas.DataFrame` → ``pa.Table.from_pandas`` →
+      :class:`ArrowTabular`.
+    - ``list[dict]`` / ``dict[str, list]`` → :class:`pa.Table` →
+      :class:`ArrowTabular`.
+    - path-like (``str`` / ``bytes`` / ``__fspath__``) → open via
+      :class:`Path` and wrap with :meth:`Holder.for_holder`.
+
+    Optional packages (polars, pandas) are duck-typed on the
+    runtime module name so a base install doesn't have to import
+    them just for dispatch.
+    """
+    import pyarrow as pa  # local — keep the import out of cold paths
+
+    if isinstance(obj, Tabular):
+        return obj
+    if isinstance(obj, pa.Table):
+        return ArrowTabular(obj)
+    if isinstance(obj, pa.RecordBatch):
+        return ArrowTabular(pa.Table.from_batches([obj]))
+    if isinstance(obj, list) and (not obj or isinstance(obj[0], dict)):
+        return ArrowTabular(pa.Table.from_pylist(obj))
+    if isinstance(obj, dict):
+        return ArrowTabular(pa.table(obj))
+    if hasattr(obj, "to_arrow") and type(obj).__module__.startswith("polars"):
+        is_lazy = type(obj).__name__ == "LazyFrame"
+        try:
+            arrow = obj.collect().to_arrow() if is_lazy else obj.to_arrow()
+        except Exception:
+            arrow = None
+        if isinstance(arrow, pa.Table):
+            return ArrowTabular(arrow)
+    if type(obj).__module__.startswith("pandas") and hasattr(obj, "columns"):
+        return ArrowTabular(pa.Table.from_pandas(obj))
+    if isinstance(obj, (str, bytes)) or hasattr(obj, "__fspath__"):
+        from yggdrasil.io.holder import Holder
+        from yggdrasil.io.path import Path
+
+        path = Path.from_(obj)
+        return Holder.for_holder(path)
+    raise TypeError(
+        f"Cannot register {type(obj).__name__} as a SQL source. "
+        "Pass a Tabular, pyarrow Table/RecordBatch, polars / pandas frame, "
+        "list[dict], dict[str, list], or a path string."
+    )
 
 
 class SqlContext:
