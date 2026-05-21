@@ -311,9 +311,10 @@ class DatabricksPath(DatabricksResource, RemotePath):
         *,
         url: "URL | None" = None,
         service: Any = None,
+        client: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """Identity = (subclass, canonical URL string, service).
+        """Identity = (subclass, canonical URL string, service-or-client).
 
         ``data`` collapses into ``url`` before keying so ``"/Volumes/x"``
         and ``URL.from_("/Volumes/x")`` map to the same singleton.
@@ -322,7 +323,10 @@ class DatabricksPath(DatabricksResource, RemotePath):
         collapses to the lazy-resolved
         :meth:`DatabricksService.current`. Two paths bound to
         distinct services (cross-workspace fixtures) stay distinct
-        singletons.
+        singletons. ``client`` is accepted as the convenience shortcut
+        for ``service=cls._SERVICE_CLASS(client=client)`` and folds into
+        the same identity slot so ``DatabricksPath.from_(url, client=A)``
+        and ``DatabricksPath.from_(url, client=B)`` don't collide.
         """
         if url is None:
             if isinstance(data, URL):
@@ -338,7 +342,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
         # field-by-field — it works as a dict key directly. Drop the
         # ``str(url)`` round trip that the hot parent-walk loop was
         # paying on every step.
-        return (cls, url, service)
+        return (cls, url, service if service is not None else client)
 
     # ==================================================================
     # Construction — dispatch on the abstract base, allocate on subclasses
@@ -463,6 +467,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
         *,
         url: URL | None = None,
         service: Optional[DatabricksService] = None,
+        client: Optional["DatabricksClient"] = None,
         temporary: bool = False,
         retry_sleep: Optional[Callable[[float], None]] = None,
         singleton_ttl: Any = ...,
@@ -473,7 +478,17 @@ class DatabricksPath(DatabricksResource, RemotePath):
             return
 
         if service is None:
-            service = self._SERVICE_CLASS.current()
+            if client is not None:
+                # ``client=`` is the user-facing shortcut for "bind this
+                # path to the workspace this client speaks to". Wrap
+                # the client in the typed collection-level service
+                # (:class:`Volumes` / :class:`Workspaces` / :class:`DBFSService`)
+                # so ``self.service.client`` returns the caller's client
+                # verbatim — and every parent/child the path mints via
+                # :meth:`_from_url` inherits the same service.
+                service = self._SERVICE_CLASS(client=client)
+            else:
+                service = self._SERVICE_CLASS.current()
 
         # ``__new__`` already normalized POSIX-string seeds into a
         # canonical URL and stashed the result on the instance — pick
