@@ -98,7 +98,7 @@ _ = RESP.hash, RESP.public_hash, RESP.partition_key
 # - remote-only with request_by — drives the SQL builders and
 #   request_by_is_public branch.
 CFG_DEFAULT = CacheConfig()
-CFG_LOCAL = CacheConfig(path=tempfile.mkdtemp(prefix="ygg-bench-cache-"))
+CFG_LOCAL = CacheConfig(tabular=tempfile.mkdtemp(prefix="ygg-bench-cache-"))
 CFG_REMOTE_BY_PUBLIC = CacheConfig(
     request_by=["public_hash", "public_url_hash"],
     received_ttl=dt.timedelta(days=1),
@@ -123,8 +123,8 @@ _LOCAL_TABULAR.write_arrow_batches(
 
 
 def _cleanup_tmp() -> None:
-    if CFG_LOCAL.path is not None:
-        shutil.rmtree(str(CFG_LOCAL.path), ignore_errors=True)
+    if CFG_LOCAL.is_local:
+        shutil.rmtree(str(CFG_LOCAL.tabular.path), ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +316,7 @@ def _local_folder_cache_scenarios(repeat: int) -> list[dict]:
     # FolderPath surface: URL-driven static_values, schema-driven
     # partition_columns, sidecar collect/persist round trip.
     partition_folder = FolderPath(
-        path=Path(str(CFG_LOCAL.path)) / f"partition_key={REQ.partition_key}",
+        path=Path(str(CFG_LOCAL.tabular.path)) / f"partition_key={REQ.partition_key}",
     )
     out.append(_time_one(
         "FolderPath.static_values (Hive partition leaf)",
@@ -401,7 +401,7 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
     # doesn't accumulate part files in the shared CFG_LOCAL — every
     # subsequent inner iteration would otherwise pay an iterdir over
     # the running total of written parts.
-    store_cfg = CacheConfig(path=tempfile.mkdtemp(prefix="ygg-bench-store-"))
+    store_cfg = CacheConfig(tabular=tempfile.mkdtemp(prefix="ygg-bench-store-"))
     store_tabular = store_cfg.cache_tabular()
     out.append(_time_one(
         "Session._store_cached_response (local, fire-and-forget)",

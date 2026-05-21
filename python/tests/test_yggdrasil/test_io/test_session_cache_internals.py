@@ -228,7 +228,7 @@ class TestPartitionedLocalCache:
     def _seed(self, tmp_path: Path, *requests) -> tuple[CacheConfig, "Any"]:
         from yggdrasil.io.nested.folder_path import FolderOptions
 
-        cfg = CacheConfig(path=str(tmp_path))
+        cfg = CacheConfig(tabular=str(tmp_path))
         tabular = cfg.cache_tabular()
         opts = FolderOptions(mode=cfg.mode)
         # Partition layout is auto-detected from the response batch's
@@ -307,7 +307,7 @@ class TestPartitionedLocalCache:
 
     def test_lookup_misses_when_partition_directory_empty(self, tmp_path) -> None:
         # Empty cache → predicate yields no rows, no exceptions.
-        cfg = CacheConfig(path=str(tmp_path))
+        cfg = CacheConfig(tabular=str(tmp_path))
         tabular = cfg.cache_tabular()
         req = make_request("https://example.com/x")
         predicate = cfg.make_lookup_predicate(request=req)

@@ -39,7 +39,6 @@ _DEFAULT_REQUEST_BY: tuple[str, ...] = (
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
         "tabular",
-        "path",
         "request_by",
         "response_by",
         "mode",
@@ -281,21 +280,29 @@ class _ConfigBase:
 class CacheConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
-    # Local cache root directory — any :class:`yggdrasil.io.path.Path`
-    # backend works (LocalPath for on-disk, VolumePath / S3Path / … for
-    # shared remote caches). When set, the session writes each
-    # successful response as one Arrow IPC file at
-    # ``<path>/<METHOD>/<host>/<seg>/.../<public_hash>.arrow`` (see
-    # :mod:`yggdrasil.io.session._local_fast_path_relative`). Holds the
-    # live :class:`Path` instance internally; :meth:`__getstate__`
-    # projects to the URL string so the frozen-dataclass instance still
-    # pickles cleanly across worker boundaries (Spark, multiprocessing,
-    # Power Query), and :meth:`__setstate__` rehydrates via
-    # :meth:`Path.from_`.
-    path: Optional[Path] = field(default=None, hash=False, compare=False)
-    # Remote cache backend — a :class:`Tabular` subclass (Databricks
-    # Table, …). Mutually exclusive with :attr:`path`: a single
-    # config is either local *or* remote, not both.
+    # Cache backend — any :class:`Tabular` subclass:
+    #
+    #   - :class:`~yggdrasil.io.nested.folder_path.FolderPath` for the
+    #     on-disk fast-path local cache (string / pathlib /
+    #     :class:`~yggdrasil.io.path.Path` constructor arguments are
+    #     auto-coerced to a :class:`FolderPath` by :meth:`check_arg`);
+    #   - :class:`~yggdrasil.databricks.table.table.Table` (or any
+    #     third-party adapter exposing ``read_arrow_batches`` /
+    #     ``write_arrow_batches``) for the remote / network-backed
+    #     cache.
+    #
+    # The Session-level read / write helpers
+    # (:meth:`Session._load_cached_response`,
+    # :meth:`Session._lookup_cached`,
+    # :meth:`Session._store_cached_response`,
+    # :func:`Session._insert_cache`) dispatch entirely through this
+    # one slot — local vs. remote is determined by the backend type,
+    # not by a parallel ``path`` field. :meth:`__getstate__` projects
+    # a local FolderPath down to its URL string so the frozen-
+    # dataclass instance survives Spark / multiprocessing /
+    # Power Query worker boundaries without dragging bound backend
+    # handles; remote backends are dropped on pickle and the
+    # receiver rebuilds them from session-level config.
     tabular: Optional["Tabular"] = field(default=None, hash=False, compare=False)
     request_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
     response_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
@@ -351,12 +358,10 @@ class CacheConfig(_ConfigBase):
         if received_to is not None:
             values["received_to"] = _coerce_optional_datetime(received_to)
 
-        path = values.get("path")
-        if path is not None and not isinstance(path, Path):
-            # Accept str / pathlib.Path / URL / any path-like — route
-            # through :meth:`Path.from_` so the backend dispatch (local
-            # FS, Volume, S3, …) happens once at the boundary.
-            values["path"] = Path.from_(path)
+        # ``tabular`` accepts a live Tabular or a path-shaped sugar;
+        # ``__post_init__`` resolves the sugar to a FolderPath. We
+        # don't pre-coerce here so the canonical normalisation lives
+        # in one place.
 
         return values
 
@@ -393,28 +398,42 @@ class CacheConfig(_ConfigBase):
             if not self.received_from:
                 object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
 
-        if self.path is not None and not isinstance(self.path, Path):
-            object.__setattr__(self, "path", Path.from_(self.path))
-
-        if self.path is not None and self.tabular is not None:
-            raise ValueError(
-                "CacheConfig accepts either ``path`` (local cache) or "
-                "``tabular`` (remote cache), not both."
+        # Path-shaped inputs to ``tabular`` are local-cache sugar:
+        # ``CacheConfig(tabular="/cache")`` builds a FolderPath under
+        # the hood so callers don't have to import the class. Live
+        # Tabular instances (FolderPath, Databricks Table, third-
+        # party adapters) pass through unchanged — recognised by the
+        # ``read_arrow_batches`` / ``write_arrow_batches`` duck-test
+        # so test doubles that only stub the bits a particular path
+        # exercises (``_StubTabular.full_name``, …) still flow
+        # through without being mis-coerced to a FolderPath.
+        tab = self.tabular
+        if isinstance(tab, (Path, pathlib.PurePath, str)):
+            from yggdrasil.io.nested.folder_path import FolderPath
+            object.__setattr__(
+                self, "tabular", FolderPath(path=Path.from_(tab)),
             )
 
     def __getstate__(self):
-        # Project the live :class:`Path` down to its URL string for
+        # Project local FolderPath caches down to their URL string for
         # transport — keeps the payload free of bound backend handles
         # (Databricks client on a :class:`VolumePath`, boto3 client on
         # an :class:`S3Path`, …) so the dataclass survives Spark /
         # multiprocessing / Power Query worker boundaries without
         # dragging unpicklable live state. :meth:`__setstate__`
-        # rehydrates via :meth:`Path.from_`, which short-circuits to
-        # the singleton instance on the receiving side.
+        # rehydrates by rebuilding the FolderPath, which is
+        # Singleton-cached so the receiving side coalesces onto the
+        # same live instance as any other config pointing there.
+        #
+        # Remote :class:`Tabular` backends (Databricks Table, …) are
+        # dropped on pickle — they wrap live SDK clients that don't
+        # cross process boundaries; the receiver rebuilds them from
+        # session-level config.
+        local_url = self._local_cache_url()
         return {
             "mode": self.mode,
             "wait": self.wait,
-            "path": str(self.path.url) if self.path is not None else None,
+            "tabular_url": local_url,
             "request_by": self.request_by,
             "response_by": self.response_by,
             "received_from": self.received_from,
@@ -432,18 +451,18 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "received_from", state["received_from"])
         object.__setattr__(self, "received_to", state["received_to"])
         object.__setattr__(self, "received_ttl", state["received_ttl"])
-        path_state = state.get("path")
-        object.__setattr__(
-            self,
-            "path",
-            Path.from_(path_state) if path_state is not None else None,
-        )
-        # ``tabular`` is intentionally excluded from __getstate__ —
-        # remote :class:`Tabular` handles wrap a live Databricks
-        # client and don't survive process boundaries. Init to None
-        # so attribute access on the deserialized side doesn't
-        # AttributeError.
-        object.__setattr__(self, "tabular", state.get("tabular"))
+        # Rehydrate local FolderPath from its URL string; remote
+        # backends are reattached out-of-band by the receiver.
+        # Accept the legacy ``path`` key from snapshots taken before
+        # the unification so old pickled payloads still load.
+        tabular_url = state.get("tabular_url", state.get("path"))
+        if tabular_url is not None:
+            from yggdrasil.io.nested.folder_path import FolderPath
+            object.__setattr__(
+                self, "tabular", FolderPath(path=Path.from_(tabular_url)),
+            )
+        else:
+            object.__setattr__(self, "tabular", None)
         object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
         object.__setattr__(
             self, "mirror_local_to_remote",
@@ -454,6 +473,23 @@ class CacheConfig(_ConfigBase):
             state.get("cleanup_ttl", dt.timedelta(days=1)),
         )
         object.__setattr__(self, "_derived", None)
+
+    def _local_cache_url(self) -> "str | None":
+        """URL string of the local cache root, or ``None`` for non-local.
+
+        Local cache (FolderPath) carries an addressable path; remote
+        backends are dropped from the pickle wire format.
+        """
+        tab = self.tabular
+        if tab is None:
+            return None
+        try:
+            from yggdrasil.io.nested.folder_path import FolderPath
+        except ImportError:
+            return None
+        if isinstance(tab, FolderPath):
+            return str(tab.path.url)
+        return None
 
     @classmethod
     def check_arg(
@@ -475,10 +511,10 @@ class CacheConfig(_ConfigBase):
             return cls.parse_mapping(arg, **overrides)
 
         if isinstance(arg, (Path, pathlib.PurePath, str)):
-            # Path-shaped → local cache backend. :meth:`_check_mapping`
-            # normalises through :meth:`Path.from_` so the stored
-            # ``path`` is always a live abstract :class:`Path`.
-            overrides["path"] = arg
+            # Path-shaped → local cache backend. ``__post_init__``
+            # wraps it in a :class:`FolderPath` so the stored
+            # ``tabular`` is always a live :class:`Tabular`.
+            overrides["tabular"] = arg
 
         elif _is_tabular_io(arg):
             overrides["tabular"] = arg
@@ -527,23 +563,38 @@ class CacheConfig(_ConfigBase):
 
     @property
     def is_local(self) -> bool:
-        """True when this config drives the on-disk fast-path cache."""
-        # ``path`` may be lazy-filled by :meth:`local_cache_path`, so
-        # don't cache this one — read straight from the field.
-        return self.path is not None
+        """True when the bound :attr:`tabular` is a :class:`FolderPath`.
+
+        The local-cache fast path keys on this — it's the on-disk
+        backend that supports the partitioned write directly. Lazy
+        import keeps the property cheap for the no-cache default.
+        """
+        tab = self.tabular
+        if tab is None:
+            return False
+        from yggdrasil.io.nested.folder_path import FolderPath
+        return isinstance(tab, FolderPath)
 
     @property
     def is_remote(self) -> bool:
-        """True when this config drives a remote :class:`Tabular`-backed cache."""
-        return self.tabular is not None
+        """True when the bound :attr:`tabular` is a remote backend.
+
+        Any :class:`Tabular` that isn't a :class:`FolderPath` —
+        Databricks Table, third-party adapters — drives the remote
+        cache pipeline (predicate→SQL translation, MERGE writes,
+        spark-frame dispatch).
+        """
+        return self.tabular is not None and not self.is_local
 
     @property
     def local_cache_enabled(self):
         # Two ways to opt into a local cache layer:
-        #   1) ``path`` is set to a directory (explicit local backend);
+        #   1) ``tabular`` is a :class:`FolderPath` (explicit local
+        #      backend, either constructor-supplied or sugar-coerced
+        #      from a path-shaped argument);
         #   2) a ``received_from`` / ``received_to`` window is set,
-        #      in which case ``local_cache_path()`` lazy-fills the
-        #      default ``~/.yggdrasil/cache/response/...`` root.
+        #      in which case :meth:`cache_tabular` lazy-fills the
+        #      default ``~/.yggdrasil/cache/response/...`` FolderPath.
         if not self.cache_enabled:
             return False
         if self.is_local:
@@ -651,10 +702,10 @@ class CacheConfig(_ConfigBase):
     def local_cache_folder(self, session: "Session | None" = None) -> Path:
         """Backend-agnostic root for the local cache.
 
-        Returns :attr:`path` when explicitly set — whatever
-        :class:`yggdrasil.io.path.Path` subclass the caller passed
-        (LocalPath on disk, VolumePath on a Databricks Volume,
-        S3Path on a bucket, …) — otherwise builds the default
+        Returns the bound :class:`FolderPath`'s :attr:`path` when
+        :attr:`tabular` is local (any :class:`yggdrasil.io.path.Path`
+        subclass — LocalPath on disk, VolumePath on a Databricks
+        Volume, S3Path on a bucket, …); otherwise builds the default
         LocalPath under ``~/.yggdrasil/cache/response``, suffixed
         with the session's ``base_url`` host + path when one is
         available so different APIs sharing the same machine don't
@@ -666,8 +717,8 @@ class CacheConfig(_ConfigBase):
         Used as the per-config key for grouping cache hits in
         :class:`yggdrasil.io.response_batch.ResponseBatch`.
         """
-        if self.path is not None:
-            return self.path
+        if self.is_local:
+            return self.tabular.path
         root = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
         base_url = getattr(session, "base_url", None) if session is not None else None
         host = getattr(base_url, "host", None) if base_url is not None else None
@@ -678,24 +729,6 @@ class CacheConfig(_ConfigBase):
             folder = root / host / url_path if url_path else root / host
         return Path.from_(folder)
 
-    def local_cache_path(self, session: "Session | None" = None) -> str:
-        """Return the local-cache root as a string and memoize the resolved :class:`Path` on :attr:`path`.
-
-        Resolves :meth:`local_cache_folder` once and stores the
-        :class:`Path` instance back onto the frozen dataclass via
-        ``object.__setattr__`` so repeat calls (per-batch lookups,
-        per-response writes) don't keep recomputing the default-path
-        suffix from the session's ``base_url``. The returned string
-        is the backend-native form (``LocalPath`` → OS path,
-        ``VolumePath`` → ``/Volumes/...``, …) — what dict-key callers
-        and the legacy stringified-cache-root signature expect.
-        Reach for :meth:`local_cache_folder` when you need the live
-        :class:`Path` instance to do I/O against.
-        """
-        if self.path is None:
-            object.__setattr__(self, "path", self.local_cache_folder(session=session))
-        return str(self.path)
-
     def cache_tabular(
         self, session: "Session | None" = None,
     ) -> "Any":
@@ -704,21 +737,14 @@ class CacheConfig(_ConfigBase):
         Single entry point both the local and remote pipelines call
         through:
 
-        * :attr:`tabular` set explicitly (remote case — a Databricks
-          :class:`~yggdrasil.databricks.table.table.Table` or any
-          third-party Tabular) — returned as-is.
-        * :attr:`path` set (local case) — wrapped in a
-          :class:`~yggdrasil.io.nested.folder_path.FolderPath` rooted at
-          that path. The folder is memoised back onto :attr:`tabular`
-          on first call so repeated lookups (every ``send`` /
-          ``send_many`` cache scan) hand back the same instance —
-          its in-memory schema cache, predicate ``free_columns`` memo,
-          and yggmeta sidecar buffer all stay warm across calls.
-        * Neither set but the cache is otherwise enabled
-          (``received_*`` window) — the default
-          ``~/.yggdrasil/cache/response/...`` :class:`FolderPath` is
-          materialised via :meth:`local_cache_folder` and memoised
-          back on :attr:`path` + :attr:`tabular` so the next call
+        * :attr:`tabular` already set (constructor-supplied: live
+          :class:`FolderPath` for local, Databricks Table or any
+          third-party adapter for remote) — returned as-is.
+        * Unset but the cache is otherwise enabled (``received_*``
+          window) — the default
+          ``~/.yggdrasil/cache/response/...`` :class:`FolderPath`
+          is materialised via :meth:`local_cache_folder` and
+          memoised back on :attr:`tabular` so the next call
           short-circuits.
 
         The on-disk layout is Hive-partitioned by whichever fields
@@ -734,46 +760,38 @@ class CacheConfig(_ConfigBase):
             return self.tabular
         from yggdrasil.io.nested.folder_path import FolderPath
 
-        folder_path = self.local_cache_folder(session=session)
-        if self.path is None:
-            object.__setattr__(self, "path", folder_path)
-        tabular = FolderPath(path=folder_path)
+        tabular = FolderPath(path=self.local_cache_folder(session=session))
         # Stash the built folder back on the config so subsequent
         # cache scans reuse the same instance — the schema cache and
-        # predicate ``free_columns`` memo only stay warm across
-        # calls if the FolderPath is itself reused. ``tabular`` is
-        # ``compare=False, hash=False``, and excluded from
+        # predicate ``free_columns`` memo only stay warm across calls
+        # if the FolderPath is itself reused. ``tabular`` is
+        # ``compare=False, hash=False`` and excluded from
         # ``__getstate__``, so the mutation doesn't affect equality
         # or pickling.
         object.__setattr__(self, "tabular", tabular)
         return tabular
 
     def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
-        """Materialise :attr:`path` for local-cache configs.
+        """Materialise :attr:`tabular` for local-cache configs.
 
         After this call the session-level cache flow can reach for
-        ``cfg.path`` directly without a ``local_cache_path(session)``
+        ``cfg.tabular`` directly without a ``cache_tabular(session)``
         dance. Symmetric to remote configs which always ship with a
         prebuilt :attr:`tabular`.
 
-        No-op when:
-
-        - :attr:`path` is already set;
-        - the cache is remote-only (:attr:`tabular` is set);
-        - :attr:`local_cache_enabled` is False (mode disables the
-          cache, no ``received_*`` window, etc).
+        No-op when :attr:`tabular` is already set or
+        :attr:`local_cache_enabled` is False (mode disables the
+        cache, no ``received_*`` window, etc).
 
         Returns ``self`` so callers can chain
         ``cfg.prebuild(session)`` at the entry of
         :meth:`Session._send_many_batches`.
         """
-        if self.path is not None:
-            return self
-        if self.is_remote:
+        if self.tabular is not None:
             return self
         if not self.local_cache_enabled:
             return self
-        self.local_cache_path(session=session)
+        self.cache_tabular(session=session)
         return self
 
     def request_values(

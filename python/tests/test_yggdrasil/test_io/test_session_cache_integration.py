@@ -85,7 +85,7 @@ def _clear_session_singleton_cache():
 
 def _local_cfg(root: Path | str, **overrides: Any) -> CacheConfig:
     overrides.setdefault("mode", Mode.APPEND)
-    return CacheConfig(path=str(root), **overrides)
+    return CacheConfig(tabular=str(root), **overrides)
 
 
 def _remote_cfg(tab: "_FakeRemoteTabular", **overrides: Any) -> CacheConfig:
@@ -134,7 +134,7 @@ def _wait_for_local(cache: CacheConfig, *, count: int = 1, timeout: float = 5.0)
     any ``partition_key=*/`` sub-directory (the partitioned layout).
     """
     deadline = time.monotonic() + timeout
-    root = Path(str(cache.path))
+    root = Path(str(cache.tabular.path))
     last = 0
     while time.monotonic() < deadline:
         try:
