@@ -5,12 +5,24 @@ import datetime as dt
 import os
 import sys
 from collections.abc import Mapping
+from enum import Enum
 from typing import Any
 from unittest import mock
 
 import pytest
 
 from yggdrasil.environ import SystemParameters
+
+# Force registration of the IO / Path converters.
+from yggdrasil.io import Holder  # noqa: F401, E402
+from yggdrasil.io.path.path import Path  # noqa: F401, E402
+
+
+class _Color(Enum):
+    """Module-scope enum so ``get_type_hints`` can resolve forward refs."""
+
+    RED = "red"
+    BLUE = "blue"
 
 
 class _FakeWidgets:
@@ -450,3 +462,264 @@ class TestAccessors:
         text = repr(params)
         assert "SystemParameters" in text
         assert "pos" in text
+
+
+# ============================================================================
+# Iterable target — CSV pre-split for multiselect-shaped sources
+# ============================================================================
+
+
+class TestIterableCasting:
+    def test_csv_string_to_list_of_strings(self) -> None:
+        class Config(SystemParameters):
+            names: list[str] = []
+
+        cfg = Config(argv=["--names=a,b,c"], dbutils=None)
+        assert cfg.names == ["a", "b", "c"]
+
+    def test_csv_string_to_list_of_ints(self) -> None:
+        class Config(SystemParameters):
+            ports: list[int] = []
+
+        cfg = Config(argv=["--ports=80,443,8080"], dbutils=None)
+        assert cfg.ports == [80, 443, 8080]
+
+    def test_all_values_tag_filtered(self) -> None:
+        from yggdrasil.environ.parameters import ALL_VALUES_TAG
+
+        class Config(SystemParameters):
+            names: list[str] = []
+
+        cfg = Config(argv=[f"--names=a,{ALL_VALUES_TAG},b"], dbutils=None)
+        assert cfg.names == ["a", "b"]
+
+    def test_bare_list_annotation(self) -> None:
+        class Config(SystemParameters):
+            items: list = []
+
+        cfg = Config(argv=["--items=x,y"], dbutils=None)
+        assert cfg.items == ["x", "y"]
+
+    def test_set_annotation(self) -> None:
+        class Config(SystemParameters):
+            tags: set[str] = set()
+
+        cfg = Config(argv=["--tags=a,b,a"], dbutils=None)
+        assert cfg.tags == {"a", "b"}
+
+    def test_str_field_not_split(self) -> None:
+        class Config(SystemParameters):
+            csv: str = ""
+
+        cfg = Config(argv=["--csv=a,b,c"], dbutils=None)
+        # ``str`` is iterable in Python but explicitly excluded from the
+        # CSV-split heuristic — the raw value passes through.
+        assert cfg.csv == "a,b,c"
+
+
+# ============================================================================
+# Widget surface (init_widgets / init_job / from_environment)
+# ============================================================================
+
+
+class _RecordingWidgets:
+    """Captures every ``dbutils.widgets.*`` call for inspection."""
+
+    def __init__(self, existing: set[str] | None = None) -> None:
+        self.existing = set(existing or ())
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    def get(self, name: str) -> str:
+        if name not in self.existing:
+            raise RuntimeError(f"no such widget: {name}")
+        return ""
+
+    def text(self, name: str, default: str, label: str) -> None:
+        self.calls.append(("text", (name, default, label), {}))
+
+    def dropdown(self, name: str, default: str, options: list, label: str) -> None:
+        self.calls.append(("dropdown", (name, default, tuple(options), label), {}))
+
+    def combobox(self, name: str, default: str, options: list, label: str) -> None:
+        self.calls.append(("combobox", (name, default, tuple(options), label), {}))
+
+    def multiselect(self, name: str, default: str, options: list, label: str) -> None:
+        self.calls.append(("multiselect", (name, default, tuple(options), label), {}))
+
+
+class _RecordingDBUtils:
+    def __init__(self, existing: set[str] | None = None) -> None:
+        self.widgets = _RecordingWidgets(existing=existing)
+        self.notebook = mock.MagicMock()
+
+
+class TestInitWidgets:
+    def test_text_widget_for_string_field(self) -> None:
+        class Config(SystemParameters):
+            name: str = "alice"
+
+        dbutils = _RecordingDBUtils()
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        assert any(call[0] == "text" and call[1][0] == "name" for call in dbutils.widgets.calls)
+        text_call = next(c for c in dbutils.widgets.calls if c[1][0] == "name")
+        assert text_call[1][1] == "alice"
+
+    def test_dropdown_widget_for_bool(self) -> None:
+        class Config(SystemParameters):
+            verbose: bool = False
+
+        dbutils = _RecordingDBUtils()
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        dd = next(c for c in dbutils.widgets.calls if c[0] == "dropdown")
+        assert dd[1][0] == "verbose"
+        assert dd[1][2] == ("true", "false")
+
+    def test_multiselect_for_list(self) -> None:
+        class Config(SystemParameters):
+            names: list[str] = ["a", "b"]
+
+        dbutils = _RecordingDBUtils()
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        ms = next(c for c in dbutils.widgets.calls if c[0] == "multiselect")
+        assert ms[1][0] == "names"
+        assert ms[1][2] == ("a", "b")
+
+    def test_dropdown_for_enum(self) -> None:
+        class Config(SystemParameters):
+            color: _Color = _Color.RED
+
+        dbutils = _RecordingDBUtils()
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        dd = next(c for c in dbutils.widgets.calls if c[0] == "dropdown")
+        assert dd[1][0] == "color"
+        assert dd[1][2] == ("red", "blue")
+
+    def test_datetime_widget_isoformat(self) -> None:
+        import datetime as dt
+
+        class Config(SystemParameters):
+            when: dt.datetime = dt.datetime(2026, 5, 21, 10, 0, 0)
+
+        dbutils = _RecordingDBUtils()
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        text_call = next(c for c in dbutils.widgets.calls if c[1][0] == "when")
+        assert text_call[1][1] == "2026-05-21T10:00:00"
+
+    def test_skip_existing(self) -> None:
+        class Config(SystemParameters):
+            a: int = 1
+            b: int = 2
+
+        dbutils = _RecordingDBUtils(existing={"a"})
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        names = {c[1][0] for c in dbutils.widgets.calls}
+        assert "b" in names
+        assert "a" not in names
+
+    def test_silent_no_op_without_dbutils(self) -> None:
+        class Config(SystemParameters):
+            a: int = 1
+
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None):
+            Config.init_widgets()  # no raise
+
+
+class TestFromEnvironment:
+    def test_from_environment_returns_instance(self) -> None:
+        class Config(SystemParameters):
+            count: int = 1
+
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None), \
+             mock.patch.object(sys, "argv", ["prog", "--count=42"]):
+            cfg = Config.from_environment()
+        assert cfg.count == 42
+
+
+# ============================================================================
+# NotebookConfig backward-compat alias
+# ============================================================================
+
+
+class TestNotebookConfigAlias:
+    def test_alias_identity(self) -> None:
+        from yggdrasil.databricks.jobs.config import NotebookConfig
+        assert NotebookConfig is SystemParameters
+
+    def test_subclass_works(self) -> None:
+        from yggdrasil.databricks.jobs.config import NotebookConfig
+
+        class Config(NotebookConfig):
+            count: int = 1
+
+        cfg = Config(argv=["--count=42"], dbutils=None)
+        assert cfg.count == 42
+
+    def test_reexport_from_jobs_package(self) -> None:
+        from yggdrasil.databricks.jobs import NotebookConfig
+        assert NotebookConfig is SystemParameters
+
+
+# ============================================================================
+# Converters: any_to_holder, any_to_path
+# ============================================================================
+
+
+class TestConverters:
+    def test_any_to_holder_from_bytes(self) -> None:
+        from yggdrasil.data.cast import convert
+        from yggdrasil.io import Holder
+
+        h = convert(b"hello", Holder)
+        assert isinstance(h, Holder)
+        assert h.read_bytes() == b"hello"
+
+    def test_any_to_holder_identity(self) -> None:
+        from yggdrasil.data.cast import convert
+        from yggdrasil.io import Holder, Memory
+
+        m = Memory(binary=b"x")
+        assert convert(m, Holder) is m
+
+    def test_any_to_path_from_str(self) -> None:
+        from yggdrasil.data.cast import convert
+        from yggdrasil.io.path.path import Path
+
+        p = convert("/tmp/test.txt", Path)
+        assert isinstance(p, Path)
+        assert str(p).endswith("/tmp/test.txt")
+
+    def test_any_to_path_identity(self) -> None:
+        from yggdrasil.data.cast import convert
+        from yggdrasil.io.path.path import Path
+        from yggdrasil.io.path.local_path import LocalPath
+
+        p = LocalPath("/tmp/x")
+        assert convert(p, Path) is p
+
+    def test_path_field_in_subclass(self) -> None:
+        class Config(SystemParameters):
+            data_dir: Path = None  # type: ignore[assignment]
+
+        cfg = Config(argv=["--data_dir=/tmp/data"], dbutils=None)
+        assert isinstance(cfg.data_dir, Path)
+        assert str(cfg.data_dir).endswith("/tmp/data")
+
+    def test_holder_field_in_subclass(self) -> None:
+        class Config(SystemParameters):
+            blob: Holder = None  # type: ignore[assignment]
+
+        cfg = Config({"blob": b"payload"}, argv=None, dbutils=None)
+        assert isinstance(cfg.blob, Holder)
+        assert cfg.blob.read_bytes() == b"payload"

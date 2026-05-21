@@ -36,15 +36,32 @@ widgets). Cast results are cached per-key for the lifetime of the instance.
 from __future__ import annotations
 
 import builtins
+import datetime as dt
 import logging
 import os
 import sys
 from collections.abc import Mapping as MappingABC
-from typing import Any, ClassVar, Iterator, Mapping, get_type_hints
+from enum import Enum
+from typing import Any, ClassVar, Iterator, Mapping, get_origin, get_type_hints
 
 from yggdrasil.data.cast import convert
 
-__all__ = ["SystemParameters"]
+__all__ = ["SystemParameters", "WidgetType", "ALL_VALUES_TAG"]
+
+#: Sentinel surfaced on Databricks ``multiselect`` widgets when the user
+#: hasn't picked anything — split out of the resolved value so callers get
+#: an empty list instead of a list containing the literal ``"**all**"``.
+ALL_VALUES_TAG = "**all**"
+
+
+class WidgetType(Enum):
+    """Databricks notebook widget kinds used by :meth:`SystemParameters.init_widgets`."""
+
+    TEXT = "text"
+    DROPDOWN = "dropdown"
+    COMBOBOX = "combobox"
+    MULTISELECT = "multiselect"
+    DATETIME = "datetime"  # text widget under the hood, dt.* formatted
 
 LOGGER = logging.getLogger(__name__)
 
@@ -221,6 +238,13 @@ class SystemParameters(MappingABC):
         elif type_ is Any or type_ is None:
             result = raw
         else:
+            # CSV split for iterable target types — Databricks multiselect
+            # widgets and ``--names=a,b,c`` argv tokens hand back one string
+            # the cast registry would reject (it bans ``str`` → ``list``).
+            # Filter the ``**all**`` placeholder dbutils emits when nothing
+            # is selected.
+            if isinstance(raw, str) and self._is_iterable_type(type_):
+                raw = [part for part in raw.split(",") if part != ALL_VALUES_TAG]
             try:
                 result = convert(raw, type_)
             except Exception as exc:
@@ -232,6 +256,22 @@ class SystemParameters(MappingABC):
                 ) from exc
         self._cast_cache[name] = result
         return result
+
+    @staticmethod
+    def _is_iterable_type(type_: Any) -> bool:
+        """Return ``True`` when *type_* is a list/set-shaped annotation.
+
+        Handles bare ``list`` / ``set``, parameterised ``list[int]`` /
+        ``set[str]``, and nested ``Optional[list[...]]`` via origin lookup.
+        ``str`` / ``bytes`` are *not* iterable for this purpose — we don't
+        want a declared ``str`` field to be split on commas.
+        """
+        if type_ in (list, set, tuple, frozenset):
+            return True
+        origin = get_origin(type_)
+        if origin is None:
+            return False
+        return origin in (list, set, tuple, frozenset)
 
     def _lookup_raw(self, key: str) -> Any:
         """Resolve raw value across the source stack. Returns ``...`` on miss.
@@ -350,6 +390,151 @@ class SystemParameters(MappingABC):
         if not prefixes:
             return cls(dict(os.environ), argv=None, dbutils=None)
         return cls(argv=None, dbutils=None, env_prefix=prefixes)
+
+    @classmethod
+    def from_environment(cls) -> SystemParameters:
+        """Auto-fetch from every channel — alias for ``cls()``.
+
+        Kept as the canonical entry point for the historical
+        ``NotebookConfig.from_environment()`` shape.
+        """
+        return cls()
+
+    # ---------------------------------------------------------------------
+    # Databricks widget surface
+    # ---------------------------------------------------------------------
+
+    @classmethod
+    def init_widgets(cls, *, skip_existing: bool = True) -> None:
+        """Create a Databricks notebook widget for each declared field.
+
+        Resolves the widget shape from the field's annotation:
+        ``bool`` → dropdown(``"true"`` / ``"false"``), ``Enum`` →
+        dropdown over enum values, ``list`` / ``set`` → multiselect,
+        :class:`datetime.datetime` / :class:`datetime.date` → text widget
+        with ISO 8601 default, everything else → text widget.
+
+        Silent no-op outside a Databricks notebook (no ``dbutils``).
+        Pass ``skip_existing=False`` to recreate widgets already present.
+        """
+        dbutils = cls._get_dbutils()
+        if dbutils is None or not hasattr(dbutils, "widgets"):
+            LOGGER.info(
+                "SystemParameters.init_widgets: dbutils.widgets unavailable — "
+                "widgets are only created inside a Databricks notebook"
+            )
+            return
+
+        for name, (type_, default) in cls._declared_fields.items():
+            if skip_existing and cls._widget_exists(dbutils, name):
+                continue
+            widget_type = cls._determine_widget_type(type_)
+            cls._create_widget(dbutils, name, type_, default, widget_type)
+
+    @classmethod
+    def init_job(cls) -> SystemParameters:
+        """Initialize widgets, tweak the active Spark session, return the populated config.
+
+        Mirrors the historical ``NotebookConfig.init_job()`` entry point.
+        Spark tweaks are silently skipped when PySpark isn't importable or
+        no session is active.
+        """
+        cls.init_widgets()
+        try:
+            from pyspark.sql import SparkSession
+        except ImportError:
+            return cls()
+        try:
+            spark = SparkSession.getActiveSession()
+        except Exception:
+            spark = None
+        if spark is not None:
+            spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
+            spark.conf.set("spark.databricks.delta.merge.enableLowShuffle", "true")
+            spark.conf.set("spark.databricks.delta.merge.optimizeInsertOnlyMerge", "true")
+            spark.conf.set("spark.sql.session.timeZone", "UTC")
+        return cls()
+
+    @staticmethod
+    def _widget_exists(dbutils: Any, name: str) -> bool:
+        """``True`` when *name* is already wired on the notebook's widget panel."""
+        if not hasattr(dbutils, "widgets"):
+            return False
+        try:
+            dbutils.widgets.get(name)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _determine_widget_type(field_type: Any) -> WidgetType:
+        """Resolve the widget shape for a declared annotation."""
+        if field_type is dt.datetime or field_type is dt.date:
+            return WidgetType.DATETIME
+        if isinstance(field_type, type) and issubclass(field_type, Enum):
+            return WidgetType.DROPDOWN
+        if field_type is bool:
+            return WidgetType.DROPDOWN
+        if SystemParameters._is_iterable_type(field_type):
+            return WidgetType.MULTISELECT
+        return WidgetType.TEXT
+
+    @staticmethod
+    def _format_widget_default(value: Any, widget_type: WidgetType) -> str:
+        """Render *value* into the string shape the dbutils widget API expects."""
+        if value is _UNSET or value is None:
+            return ""
+        if widget_type is WidgetType.DATETIME:
+            if isinstance(value, dt.datetime):
+                return value.isoformat()
+            if isinstance(value, dt.date):
+                return value.strftime("%Y-%m-%d")
+        if widget_type is WidgetType.MULTISELECT and isinstance(value, (list, tuple, set, frozenset)):
+            return ",".join(
+                v.value if isinstance(v, Enum) else str(v)
+                for v in value
+            )
+        if isinstance(value, Enum):
+            return str(value.value)
+        return str(value)
+
+    @classmethod
+    def _create_widget(
+        cls,
+        dbutils: Any,
+        name: str,
+        field_type: Any,
+        default: Any,
+        widget_type: WidgetType,
+    ) -> None:
+        """Issue the ``dbutils.widgets.*`` call matching *widget_type*."""
+        # Build the option list for dropdown / multiselect widgets.
+        if field_type is bool:
+            options = ["true", "false"]
+        elif isinstance(field_type, type) and issubclass(field_type, Enum):
+            options = [str(e.value) for e in field_type]
+        elif isinstance(default, (list, set, tuple, frozenset)) and default:
+            options = [
+                v.value if isinstance(v, Enum) else str(v)
+                for v in default
+            ]
+        else:
+            options = [cls._format_widget_default(default, widget_type)]
+        if not options:
+            options = [ALL_VALUES_TAG]
+
+        if widget_type is WidgetType.DROPDOWN:
+            dbutils.widgets.dropdown(name, options[0], options, name)
+        elif widget_type is WidgetType.COMBOBOX:
+            dbutils.widgets.combobox(name, options[0], options, name)
+        elif widget_type is WidgetType.MULTISELECT:
+            dbutils.widgets.multiselect(name, options[0], options, name)
+        else:  # TEXT and DATETIME both use text widgets.
+            dbutils.widgets.text(
+                name,
+                cls._format_widget_default(default, widget_type),
+                name,
+            )
 
     # ---------------------------------------------------------------------
     # Accessors

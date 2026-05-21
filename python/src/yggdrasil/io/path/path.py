@@ -765,3 +765,22 @@ class Path(IO, os.PathLike, ABC):
 
     def __str__(self) -> str:
         return self.full_path()
+
+
+# ---------------------------------------------------------------------------
+# Cast registry — Any → Path routes through :meth:`Path.from_`
+# ---------------------------------------------------------------------------
+
+from yggdrasil.data.cast.registry import register_converter  # noqa: E402
+
+
+@register_converter(Any, Path)
+def any_to_path(value: Any, opts: Any = None) -> Path:
+    """Coerce *value* to a :class:`Path` via :meth:`Path.from_`.
+
+    Accepts ``str`` / :class:`pathlib.PurePath` / :class:`URL` /
+    existing :class:`Path` instances (identity on same-class).
+    Dispatches by URL scheme to the matching :class:`Path` subclass
+    (``LocalPath`` for the no-scheme case).
+    """
+    return Path.from_(value)
