@@ -534,7 +534,12 @@ class Expression:
         *,
         dialect: "str | None" = None,
     ) -> "Expression":
-        """Parse a SQL predicate string into our AST (sqlglot)."""
+        """Parse a SQL predicate string into our AST.
+
+        Uses the in-tree tokenizer + recursive-descent parser in
+        ``backends.sql`` — no third-party SQL parser dependency.
+        See :func:`backends.sql.from_sql` for the supported grammar.
+        """
         from .backends.sql import from_sql
 
         chosen = flavor if flavor is not None else dialect

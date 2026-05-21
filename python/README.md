@@ -25,7 +25,7 @@ pip install ygg
 
 ```bash
 pip install ygg                   # core: pyarrow + polars + xxhash + orjson
-pip install "ygg[data]"           # pandas + numpy + sqlglot
+pip install "ygg[data]"           # reserved for tabular extras
 pip install "ygg[bigdata]"        # pyspark + delta-spark
 pip install "ygg[delta]"          # deltalake
 pip install "ygg[databricks]"     # databricks-sdk

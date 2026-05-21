@@ -128,14 +128,14 @@ class TabularEngine:
         """Register *tabular* under ``catalog.schema.name``.
 
         Replaces any prior binding at the same key. *tabular* is
-        coerced via the SQL catalog's :func:`coerce_to_tabular`, so any
+        coerced via the SQL catalog's :func:`coerce_source`, so any
         pyarrow / polars / pandas frame, ``list[dict]``, ``dict[str,
         list]``, or path-like accepted by the SQL registry also works
         here.
         """
         key = self._check_key(catalog, schema, name)
-        from yggdrasil.io.tabular.execution.sql.dynamic_catalog import coerce_to_tabular
-        io = coerce_to_tabular(tabular)
+        from yggdrasil.io.tabular.execution.sql.catalog import coerce_source
+        io = coerce_source(tabular)
         entry = TabularEntry(catalog=key[0], schema=key[1], name=key[2], tabular=io)
         with self._lock:
             self._entries[key] = entry
@@ -283,8 +283,7 @@ class TabularEngine:
 
     # ------------------------------------------------------------------
     # Flat-name resolution — SqlContext-shaped surface so the engine
-    # can act as a parent of :class:`DynamicCatalog` and feed the SQL
-    # executor without a wrapper class.
+    # can feed the SQL executor without a wrapper class.
     # ------------------------------------------------------------------
 
     def resolve(self, name: str) -> Tabular:
@@ -333,9 +332,9 @@ class TabularEngine:
             return matches[0].tabular
         return None
 
-    # SqlContext-shaped lookup so a :class:`DynamicCatalog` can list
-    # this engine as a parent. ``names`` returns dotted identifiers so
-    # the SQL planner sees stable, fully-qualified table names.
+    # SqlContext-shaped lookup so the SQL planner can drive lookups
+    # through the same surface. ``names`` returns dotted identifiers
+    # so the planner sees stable, fully-qualified table names.
     def get_by_name(self, name: str) -> "Tabular | None":
         return self.lookup(name)
 

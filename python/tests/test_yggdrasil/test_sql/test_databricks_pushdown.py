@@ -20,7 +20,7 @@ import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.io.tabular import ArrowTabular
-from yggdrasil.io.tabular.execution.sql import Engine, system_catalog
+from yggdrasil.io.tabular.execution.sql import Engine, SqlContext
 from yggdrasil.io.tabular.execution.sql.databricks_pushdown import (
     is_databricks_table,
     try_databricks_pushdown,
@@ -196,14 +196,9 @@ class TestDuckType(ArrowTestCase):
 class TestPushdownRewrite(ArrowTestCase):
     def setUp(self) -> None:
         super().setUp()
-        system_catalog.clear()
         self.client = _FakeClient(pa.table({
             "symbol": ["AAPL"], "total": [100],
         }))
-
-    def tearDown(self) -> None:
-        system_catalog.clear()
-        super().tearDown()
 
     def test_simple_rewrite(self) -> None:
         eng = Engine(sources={"trades": _trades(self.client)})
@@ -244,12 +239,7 @@ class TestPushdownRewrite(ArrowTestCase):
 class TestPushdownFallback(ArrowTestCase):
     def setUp(self) -> None:
         super().setUp()
-        system_catalog.clear()
         self.client = _FakeClient(pa.table({"x": [1]}))
-
-    def tearDown(self) -> None:
-        system_catalog.clear()
-        super().tearDown()
 
     def test_mixed_sources_fall_back_to_arrow(self) -> None:
         eng = Engine(sources={
@@ -290,19 +280,8 @@ class TestPushdownFallback(ArrowTestCase):
 
 
 class TestDirectEntry(ArrowTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        system_catalog.clear()
-        self.client = _FakeClient(pa.table({"x": [1]}))
-
-    def tearDown(self) -> None:
-        system_catalog.clear()
-        super().tearDown()
-
     def test_returns_none_on_unknown_source(self) -> None:
-        from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
-        catalog = DynamicCatalog(parents=[])
         out = try_databricks_pushdown(
-            "SELECT * FROM nope", catalog=catalog,
+            "SELECT * FROM nope", catalog=SqlContext(),
         )
         self.assertIsNone(out)

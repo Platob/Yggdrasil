@@ -51,7 +51,7 @@ from yggdrasil.io.tabular.execution.sql.dialect import Dialect, resolve_dialect
 
 if TYPE_CHECKING:
     from yggdrasil.data.statement import StatementResult
-    from yggdrasil.io.tabular.execution.sql.dynamic_catalog import DynamicCatalog
+    from yggdrasil.io.tabular.execution.sql.catalog import SqlContext
 
 
 __all__ = ["try_databricks_pushdown", "is_databricks_table"]
@@ -82,7 +82,7 @@ def try_databricks_pushdown(
     query: str,
     *,
     dialect: "Dialect | str | None" = None,
-    catalog: "DynamicCatalog",
+    catalog: "SqlContext",
     where: "Expression | str | None" = None,
 ) -> "Optional[StatementResult]":
     """Try to push *query* down to a Databricks warehouse, return its result.

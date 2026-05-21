@@ -62,8 +62,6 @@ http = [
 ]
 
 data = [
-  "pandas>=2.1",
-  "sqlglot",
 ]
 
 bigdata = [
