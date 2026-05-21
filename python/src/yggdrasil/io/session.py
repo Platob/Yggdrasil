@@ -169,14 +169,13 @@ def _insert_local_cache(
 
     Single-call write that the Session fires either inline (single
     response) or in bulk (backfill). Goes through the canonical
-    :meth:`Tabular.write_arrow_batches` surface with a
-    :class:`FolderOptions` carrying the cache's mode + the
-    :meth:`CacheConfig.partition_columns` set (driven off
-    :data:`RESPONSE_SCHEMA`'s ``partition_by`` fields), so the
-    FolderIO splits the batch by partition value and mints one
-    ``part-*.<ext>`` per ``<col>=<val>/`` directory. Errors are
-    swallowed and logged — a cache miss-write must not poison the
-    request flow.
+    :meth:`Tabular.write_arrow_batches` surface — the FolderIO
+    auto-detects the partition layout from the incoming batch's
+    per-field ``t:partition_by`` metadata (stamped by
+    :meth:`Response.to_arrow_batch` from :data:`RESPONSE_SCHEMA`'s
+    ``partition_by`` declarations), so the cache write path never
+    has to repeat the partition columns. Errors are swallowed and
+    logged — a cache miss-write must not poison the request flow.
     """
     from yggdrasil.io.nested.folder_io import FolderOptions
 
@@ -184,11 +183,7 @@ def _insert_local_cache(
         return
     try:
         tabular.write_arrow_batches(
-            (batch,),
-            options=FolderOptions(
-                mode=cache_cfg.mode,
-                partition_columns=cache_cfg.partition_columns(),
-            ),
+            (batch,), options=FolderOptions(mode=cache_cfg.mode),
         )
     except Exception as exc:
         LOGGER.debug(
@@ -529,10 +524,7 @@ class Session(Singleton, ABC):
             return None
 
         predicate = cache_cfg.make_lookup_predicate(request=request)
-        opts = FolderOptions(
-            predicate=predicate,
-            partition_columns=cache_cfg.partition_columns(),
-        )
+        opts = FolderOptions(predicate=predicate)
         for batch in tabular.read_arrow_batches(options=opts):
             for resp in Response.from_arrow_tabular(batch):
                 if not cache_cfg.filter_response(resp, request=request):
@@ -1213,10 +1205,7 @@ class Session(Singleton, ABC):
             return [], list(requests)
 
         predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
-        opts = FolderOptions(
-            predicate=predicate,
-            partition_columns=cfg.partition_columns(),
-        )
+        opts = FolderOptions(predicate=predicate)
 
         result_map: dict[tuple, Response] = {}
         for batch in tabular.read_arrow_batches(options=opts):

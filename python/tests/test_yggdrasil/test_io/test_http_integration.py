@@ -332,10 +332,7 @@ class TestLocalCacheIntegration:
         tabular = cache.cache_tabular()
         tabular.write_arrow_batches(
             (response.to_arrow_batch(parse=False),),
-            options=FolderOptions(
-                mode=cache.mode,
-                partition_columns=cache.partition_columns(),
-            ),
+            options=FolderOptions(mode=cache.mode),
         )
 
     def test_writeback_persists_response(self, tmp_path) -> None:

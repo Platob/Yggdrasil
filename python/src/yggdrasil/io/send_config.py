@@ -708,25 +708,6 @@ class CacheConfig(_ConfigBase):
             object.__setattr__(self, "path", self.local_cache_folder(session=session))
         return str(self.path)
 
-    @classmethod
-    def partition_columns(cls) -> tuple[str, ...]:
-        """Partition columns the cache lays out on disk / Delta partitions.
-
-        Driven straight off :data:`RESPONSE_SCHEMA` — every field
-        tagged ``partition_by=True`` becomes a partition level, in
-        schema-declaration order. Same source of truth the remote
-        :class:`Tabular`-backed cache reads from when issuing its
-        SQL ``partition_key IN (...)`` prune, so the local
-        :class:`FolderIO` Hive layout stays in lockstep with the
-        remote table's partition columns automatically — extend the
-        schema with a second ``partition_by`` field (e.g. a daily
-        bucket alongside ``partition_key``) and both backends pick
-        it up without a CacheConfig change.
-        """
-        return tuple(
-            f.name for f in RESPONSE_SCHEMA.children if f.partition_by
-        )
-
     def cache_tabular(
         self, session: "Session | None" = None,
     ) -> "Any":

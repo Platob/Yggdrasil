@@ -151,6 +151,27 @@ def _cast_partition_value(value: Any, dtype: "pa.DataType | None") -> Any:
     return arr[0].as_py()
 
 
+def _partition_columns_from_schema(schema: Any) -> "tuple[str, ...]":
+    """Return field names tagged ``partition_by=True`` on *schema*'s children.
+
+    *schema* is a :class:`yggdrasil.data.schema.StructField` — :class:`Field`
+    already parses every per-field tag (``partition_by``,
+    ``cluster_by``, ``primary_key``, …) from the Arrow metadata, so
+    we just walk ``schema.children`` and pick the ones whose
+    :attr:`Field.partition_by` flag is set. Empty / schema-less
+    inputs produce an empty tuple — the caller falls back to a
+    flat-folder layout.
+    """
+    if schema is None:
+        return ()
+    children = getattr(schema, "children", None)
+    if not children:
+        return ()
+    return tuple(
+        f.name for f in children if getattr(f, "partition_by", False)
+    )
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class FolderOptions(CastOptions):
     """:class:`CastOptions` extended with folder-write knobs."""
@@ -223,7 +244,19 @@ class FolderIO(IO[bytes, FolderOptions]):
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
 
-    __slots__ = ("path", "_partition_remainder")
+    __slots__ = ("path", "_partition_remainder", "_yggmeta_enabled")
+
+    #: Sidecar directory name under :attr:`path` where folder-level
+    #: metadata (the dumped schema, future per-format hints) lives.
+    #: Dot-prefixed so :meth:`iter_children`'s skip-private filter
+    #: drops it from data listings without an explicit exclude.
+    YGGMETA_DIRNAME: ClassVar[str] = ".ygg"
+
+    #: Filename of the schema sidecar inside :attr:`YGGMETA_DIRNAME`.
+    #: Zero-row Arrow IPC file — the schema (with every Field tag —
+    #: ``partition_by``, ``cluster_by``, primary keys, comments, …)
+    #: round-trips byte-for-byte through pyarrow.
+    YGGMETA_SCHEMA_FILENAME: ClassVar[str] = "schema.arrow"
 
     @classmethod
     def options_class(cls):
@@ -240,6 +273,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         path: Any = None,
         tabular_parent: "Tabular | None" = None,
         static_values: "Mapping[str, Any] | None" = None,
+        yggmeta: bool = True,
         **kwargs: Any,
     ) -> None:
         """Bind to a folder path. No I/O.
@@ -253,6 +287,17 @@ class FolderIO(IO[bytes, FolderOptions]):
         descendant inherits the partition constants via the
         :attr:`Tabular.static_values` parent chain — no extra
         per-batch stamping needed to assert the column equality.
+
+        ``yggmeta`` (default ``True``) enables the dot-prefixed
+        sidecar at ``<path>/.ygg/`` — see :attr:`yggmeta`. Writes
+        dump the schema there via :meth:`_persist_yggmeta_schema`
+        so :meth:`collect_schema` can return the typed
+        :class:`Schema` (with every :class:`Field` tag —
+        ``partition_by``, ``cluster_by``, primary keys, …) on the
+        next read without re-opening a data leaf. Disable for
+        ad-hoc folders where the sidecar would be noise (the
+        sidecar folder itself constructs with ``yggmeta=False``
+        so we never recurse).
         """
         # Resolve the path first; we hand the folder's URL up to
         # :class:`Holder` so the URL-keyed surfaces (singleton key,
@@ -273,6 +318,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         # without re-reading the parent's options. Empty tuple for
         # non-Hive children and top-level instances.
         self._partition_remainder: "tuple[str, ...]" = ()
+        self._yggmeta_enabled: bool = bool(yggmeta)
 
         # Don't forward ``data`` / ``path`` / ``binary`` — Holder
         # would try to seed bytes from the directory path. The folder
@@ -351,6 +397,116 @@ class FolderIO(IO[bytes, FolderOptions]):
         return None
 
     # ==================================================================
+    # Yggmeta sidecar — folder-level metadata under ``<path>/.ygg/``
+    # ==================================================================
+
+    @property
+    def yggmeta(self) -> "FolderIO | None":
+        """Sidecar :class:`FolderIO` at ``<self.path>/.ygg/``.
+
+        ``None`` when this folder was constructed with
+        ``yggmeta=False`` (the sidecar disables itself recursively
+        so the ``.ygg/`` folder never builds its own ``.ygg/.ygg/``).
+        Same concrete type as the parent so a custom
+        :class:`FolderIO` subclass keeps its overrides inside the
+        sidecar tree.
+
+        :meth:`iter_children` skips ``.``-prefixed entries by
+        default so the sidecar is invisible to data reads — calling
+        ``self.yggmeta`` is the only way to surface it.
+        """
+        if not self._yggmeta_enabled:
+            return None
+        return type(self)(path=self.path / self.YGGMETA_DIRNAME, yggmeta=False)
+
+    def _yggmeta_schema_holder(self) -> "Tabular | None":
+        """Return the Arrow IPC leaf bound to the sidecar schema file, or ``None``."""
+        ygg = self.yggmeta
+        if ygg is None:
+            return None
+        schema_path = ygg.path / self.YGGMETA_SCHEMA_FILENAME
+        return ygg._leaf_for(schema_path)
+
+    def _persist_yggmeta_schema(self, schema: Any) -> None:
+        """Write *schema* to ``.ygg/schema.arrow`` as a zero-row IPC file.
+
+        Persists the whole :class:`yggdrasil.data.schema.StructField`
+        (every per-field tag, every metadata entry) so the next
+        :meth:`collect_schema` returns the typed schema without
+        re-opening a data leaf — :class:`Field` already parses
+        everything off the Arrow schema, so the round trip is
+        lossless. Best-effort: a failed sidecar write logs and
+        moves on; the data write is already on disk and the next
+        read can still fall back to the first-batch shape.
+        """
+        if not self._yggmeta_enabled or schema is None:
+            return
+        arrow_schema = (
+            schema.to_arrow_schema() if hasattr(schema, "to_arrow_schema")
+            else schema
+        )
+        if arrow_schema is None:
+            return
+        try:
+            self.path.mkdir(parents=True, exist_ok=True)
+            sidecar_dir = self.path / self.YGGMETA_DIRNAME
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sink = pa.BufferOutputStream()
+            with pa.ipc.new_file(sink, arrow_schema):
+                pass  # zero-row file, schema-only
+            (sidecar_dir / self.YGGMETA_SCHEMA_FILENAME).write_bytes(
+                sink.getvalue().to_pybytes(),
+            )
+        except Exception:
+            # Sidecar is opportunistic — never fail the data write.
+            pass
+
+    def _load_yggmeta_schema(self) -> Any:
+        """Read the sidecar schema back as a :class:`Schema`, or ``None``.
+
+        Reverse of :meth:`_persist_yggmeta_schema`. Returns ``None``
+        when yggmeta is disabled, the sidecar doesn't exist, or the
+        file is unreadable — caller falls back to the standard
+        first-batch :meth:`_collect_schema` path.
+        """
+        if not self._yggmeta_enabled:
+            return None
+        sidecar_dir = self.path / self.YGGMETA_DIRNAME
+        schema_path = sidecar_dir / self.YGGMETA_SCHEMA_FILENAME
+        try:
+            if not schema_path.exists():
+                return None
+            payload = schema_path.read_bytes()
+        except Exception:
+            return None
+        if not payload:
+            return None
+        try:
+            reader = pa.ipc.open_file(pa.BufferReader(payload))
+            arrow_schema = reader.schema
+        except Exception:
+            return None
+        try:
+            from yggdrasil.data.schema import Schema
+            return Schema.from_arrow(arrow_schema)
+        except Exception:
+            return None
+
+    def _collect_schema(self, options: FolderOptions) -> Any:
+        """Sidecar-first schema collection.
+
+        Returns the dumped ``.ygg/schema.arrow`` schema when present
+        — that's the canonical record of what the folder writer
+        last persisted, complete with every :class:`Field` tag.
+        Falls through to :meth:`Tabular._collect_schema` (first
+        batch's schema) when the sidecar is missing or unreadable.
+        """
+        sidecar = self._load_yggmeta_schema()
+        if sidecar is not None:
+            return sidecar
+        return super()._collect_schema(options)
+
+    # ==================================================================
     # Children — read
     # ==================================================================
 
@@ -396,9 +552,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         if not self.path.exists():
             return
 
-        partition_columns = (
-            options.partition_columns if options is not None else ()
-        )
+        partition_columns = self._resolve_partition_columns(options)
         if partition_columns:
             yield from self._iter_partition_children(options, partition_columns)
             return
@@ -420,6 +574,61 @@ class FolderIO(IO[bytes, FolderOptions]):
             if child is None:
                 continue
             yield self.adopt_child(child)
+
+    def _resolve_partition_columns(
+        self,
+        options: "FolderOptions | None",
+        *,
+        batch_schema: Any = None,
+    ) -> "tuple[str, ...]":
+        """Resolve the partition layout from the most specific source available.
+
+        Priority:
+
+        1. ``options.partition_columns`` — explicit caller override.
+        2. *batch_schema* — when the write path peeks the first
+           incoming batch, the schema (via :meth:`Schema.from_arrow`)
+           already carries every :class:`Field` tag, so we just walk
+           ``schema.children`` for partition-tagged ones.
+        3. :meth:`collect_schema` — for the read path, returns the
+           sidecar schema persisted on the last write (preferred) or
+           the first batch's schema (fallback).
+        4. ``options.target`` — the schema-bearing slot the caller
+           may pass explicitly.
+
+        Columns already pinned by :attr:`static_values` (i.e. ones
+        the enclosing partition layer already consumed when it
+        minted this child) are filtered out — without that, a
+        partition-key=v leaf would re-infer ``partition_key`` from
+        its own data and recurse forever into
+        ``partition_key=v/partition_key=v/…``.
+
+        Returns an empty tuple when no source pins the layout —
+        the caller's flat-folder branch then applies. :class:`Field`
+        already parses every tag, so the helper just hands off to it.
+        """
+        if options is None:
+            return ()
+        consumed = set(self.static_values)
+
+        def _filter(cols: "tuple[str, ...]") -> "tuple[str, ...]":
+            return tuple(c for c in cols if c not in consumed)
+
+        if options.partition_columns:
+            return _filter(tuple(options.partition_columns))
+        cols = _filter(_partition_columns_from_schema(batch_schema))
+        if cols:
+            return cols
+        try:
+            schema = self.collect_schema(options)
+        except Exception:
+            schema = None
+        cols = _filter(_partition_columns_from_schema(schema))
+        if cols:
+            return cols
+        return _filter(_partition_columns_from_schema(
+            getattr(options, "target", None),
+        ))
 
     def _iter_partition_children(
         self,
@@ -780,9 +989,47 @@ class FolderIO(IO[bytes, FolderOptions]):
         bin-packing applies regardless of which mode picked the
         rows. Setting both knobs unset keeps the legacy
         "one part file per write call" shape.
+
+        Partition layout is auto-detected from the incoming data:
+        when ``options.partition_columns`` is empty, the first
+        batch's schema is parsed via :meth:`Schema.from_arrow` and
+        any child :class:`Field` with ``partition_by=True`` becomes
+        a partition level. ``Response.to_arrow_batch`` ships that
+        metadata on its emitted schema (straight from
+        ``RESPONSE_SCHEMA``), so the cache write path doesn't have
+        to repeat ``partition_columns=`` on every call — the data
+        carries its own partition shape. After every successful
+        write the schema is persisted to ``.ygg/schema.arrow`` so
+        subsequent reads round-trip the typed layout via
+        :meth:`collect_schema` without re-opening a data leaf.
         """
-        if options.partition_columns:
+        from yggdrasil.data.schema import Schema
+
+        # Peek the first batch — even with ``options.partition_columns``
+        # pinned we still capture the schema to persist into the
+        # ``.ygg/`` sidecar so the next read picks up the typed
+        # layout. ``_chain_first`` puts the peeked batch back in front
+        # of the iterator so the downstream branches see the same
+        # stream the caller handed in.
+        batch_iter = iter(batches)
+        first = next(batch_iter, None)
+        if first is None:
+            return
+        try:
+            first_schema = Schema.from_arrow(first.schema)
+        except Exception:
+            first_schema = None
+        batches = _chain_first(first, batch_iter)
+
+        partition_columns = self._resolve_partition_columns(
+            options, batch_schema=first_schema,
+        )
+        if partition_columns:
+            options = dataclasses.replace(
+                options, partition_columns=partition_columns,
+            )
             self._write_partitioned_batches(batches, options)
+            self._persist_yggmeta_schema(first_schema)
             return
 
         action = self._resolve_action(options.mode)
@@ -797,6 +1044,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         if action is Mode.OVERWRITE:
             self._clear_tabular_children()
             self._write_parts(batches, options)
+            self._persist_yggmeta_schema(first_schema)
             return
 
         match_by = list(options.match_by_keys or ())
@@ -807,10 +1055,12 @@ class FolderIO(IO[bytes, FolderOptions]):
                 self._merge_upsert(batches, match_by, options)
             else:
                 self._merge_append(batches, match_by, options)
+            self._persist_yggmeta_schema(first_schema)
             return
 
         # Plain APPEND (or empty folder): mint a fresh part and drain.
         self._write_parts(batches, options)
+        self._persist_yggmeta_schema(first_schema)
 
     def _write_partitioned_batches(
         self,
@@ -874,6 +1124,13 @@ class FolderIO(IO[bytes, FolderOptions]):
                 child = type(self)(
                     path=child_path,
                     static_values={head: value},
+                    # Per-partition child stays sidecar-less: the
+                    # top-level folder owns the canonical
+                    # ``<root>/.ygg/schema.arrow`` record. Recursing
+                    # into partition children with ``yggmeta=True``
+                    # would scatter one ``.ygg/`` per partition
+                    # directory for zero added value.
+                    yggmeta=False,
                 )
                 self.adopt_child(child)
                 child._write_arrow_batches(iter((subset,)), child_options)

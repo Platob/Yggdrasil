@@ -230,10 +230,13 @@ class TestPartitionedLocalCache:
 
         cfg = CacheConfig(path=str(tmp_path))
         tabular = cfg.cache_tabular()
-        opts = FolderOptions(
-            mode=cfg.mode,
-            partition_columns=cfg.partition_columns(),
-        )
+        opts = FolderOptions(mode=cfg.mode)
+        # Partition layout is auto-detected from the response batch's
+        # per-field metadata — no explicit ``partition_columns`` on
+        # the FolderOptions: Response.to_arrow_batch stamps
+        # ``t:partition_by=true`` on ``partition_key`` straight from
+        # RESPONSE_SCHEMA, and the FolderIO reads that to drive the
+        # Hive layout.
         for req in requests:
             resp = make_response(request=req, body=b'{"ok":true}')
             tabular.write_arrow_batches(
@@ -243,10 +246,13 @@ class TestPartitionedLocalCache:
 
     def _read(self, tabular, predicate):
         from yggdrasil.io.nested.folder_io import FolderOptions
-        return list(tabular.read_arrow_batches(options=FolderOptions(
-            predicate=predicate,
-            partition_columns=CacheConfig.partition_columns(),
-        )))
+        # No explicit partition hint: the folder's ``collect_schema``
+        # reads ``.ygg/schema.arrow`` (persisted on prior writes),
+        # ``Field.partition_by`` flags the partition columns, and
+        # ``_resolve_partition_columns`` picks them up automatically.
+        return list(tabular.read_arrow_batches(
+            options=FolderOptions(predicate=predicate),
+        ))
 
     def test_writes_land_under_partition_key_directory(self, tmp_path) -> None:
         req = make_request("https://example.com/x")

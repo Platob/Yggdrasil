@@ -116,10 +116,7 @@ def _seed_local(cache: CacheConfig, response: Response) -> None:
     tabular = cache.cache_tabular()
     tabular.write_arrow_batches(
         (response.to_arrow_batch(parse=False),),
-        options=FolderOptions(
-            mode=cache.mode,
-            partition_columns=cache.partition_columns(),
-        ),
+        options=FolderOptions(mode=cache.mode),
     )
 
 
