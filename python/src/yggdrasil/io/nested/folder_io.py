@@ -297,17 +297,19 @@ class FolderIO(IO[bytes, FolderOptions]):
         every Hive-shaped ``<col>=<val>`` chunk — a folder at
         ``<base>/year=2024/month=05/`` reports
         ``{"year": 2024, "month": 5}`` without any constructor seed.
-        Values are cast to their declared dtype when
-        :meth:`collect_schema` knows the column (so an int64
-        ``partition_key`` lands as :class:`int`, a timestamp
-        partition as :class:`datetime`); columns the schema doesn't
-        cover fall through as raw URL-decoded strings — the
-        downstream :meth:`matches_static` prune is conservative
-        and just degrades to a row-level filter.
+        Values are cast to their declared dtype when a parent
+        :class:`FolderIO` (or this folder itself) already has the
+        schema cached, otherwise the decoded string passes through;
+        the downstream :meth:`matches_static` prune is conservative
+        and just degrades to a row-level filter on undecidable
+        compares.
 
-        Computed on each access — :class:`URL` segment splitting is
-        cheap, and the cache layer's read paths typically hit this
-        once per child during the partition-aware listing pass.
+        Schema lookup walks ``tabular_parent`` first so partition
+        children minted during a read reuse the root folder's
+        cached schema instead of paying a per-child sidecar load.
+        Only when no ancestor has the schema cached does the read
+        fall through to :meth:`collect_schema`'s sidecar / first-
+        batch path.
         """
         parts = getattr(self.path.url, "parts", None) or ()
         if not parts:
@@ -353,16 +355,32 @@ class FolderIO(IO[bytes, FolderOptions]):
         return type(self)(path=self.path / self.YGGMETA_DIRNAME, yggmeta=False)
 
     def _collect_schema(self, options: FolderOptions) -> Any:
-        """Sidecar-first schema collection.
+        """Ancestor-cache / sidecar / first-batch schema collection.
 
-        Reads ``.ygg/schema.arrow`` when present — the canonical
-        record of what the folder's last writer persisted, complete
-        with every :class:`Field` tag. Falls through to
-        :meth:`Tabular._collect_schema` (first batch's schema) when
-        the sidecar is missing or unreadable. Sidecar is best-effort:
-        unreadable / corrupt entries just degrade to the fallback,
-        never raise.
+        Resolution order (most-specific wins):
+
+        1. Walks :attr:`tabular_parent` and returns the first cached
+           schema reached — partition children minted during a
+           partitioned read share their root's schema, so the
+           per-child sidecar load is redundant. The root pays for
+           its sidecar once on first read; every nested child after
+           that hits a process-local in-memory mapping.
+        2. Reads ``.ygg/schema.arrow`` when present — the canonical
+           record of what the folder's last writer persisted, with
+           every :class:`Field` tag intact.
+        3. Falls through to :meth:`Tabular._collect_schema` (first
+           batch's schema) when no sidecar exists.
+
+        Sidecar I/O is best-effort: unreadable / corrupt entries
+        degrade to the next step, never raise.
         """
+        parent = self.tabular_parent
+        while parent is not None:
+            cached = getattr(parent, "_schema_cache", ...)
+            if cached is not ...:
+                return cached
+            parent = getattr(parent, "tabular_parent", None)
+
         if self._yggmeta_enabled:
             schema_path = (
                 self.path / self.YGGMETA_DIRNAME / self.YGGMETA_SCHEMA_FILENAME
@@ -370,9 +388,6 @@ class FolderIO(IO[bytes, FolderOptions]):
             try:
                 payload = schema_path.read_bytes()
             except Exception:
-                # Missing / unreadable sidecar — fall through to the
-                # first-batch path. No pre-existence probe: the read
-                # itself surfaces the missing case in one round trip.
                 payload = b""
             if payload:
                 try:
@@ -382,6 +397,38 @@ class FolderIO(IO[bytes, FolderOptions]):
                 except Exception:
                     pass  # corrupt sidecar — fall through to first-batch
         return super()._collect_schema(options)
+
+    def _schema_for_arrow(self, arrow_schema: Any) -> Any:
+        """Return a :class:`Schema` matching *arrow_schema*, reusing the cache.
+
+        ``Schema.from_arrow`` walks every field of the pa.Schema and
+        builds a fresh :class:`Field` per column — ~30 columns for
+        :data:`RESPONSE_SCHEMA`, ~1 ms per call. The steady state of
+        a hot cache-write loop is "every response carries the same
+        shape", so rebuilding the Schema on every write is wasted
+        work. This helper short-circuits to the cached
+        :class:`Schema` (in :attr:`_schema_cache`, or any ancestor
+        :attr:`tabular_parent`'s cache) when its arrow projection
+        compares equal to *arrow_schema* — :meth:`pa.Schema.equals`
+        is a C++-native comparison, so the win is the saved
+        per-field rebuild.
+        """
+        node: Any = self
+        while node is not None:
+            cached = getattr(node, "_schema_cache", ...)
+            if cached is not ... and cached is not None:
+                try:
+                    if cached.to_arrow_schema().equals(arrow_schema):
+                        return cached
+                except Exception:
+                    pass
+                break  # only the nearest cache holder; don't walk past it
+            node = getattr(node, "tabular_parent", None)
+        try:
+            from yggdrasil.data.schema import Schema
+            return Schema.from_arrow(arrow_schema)
+        except Exception:
+            return None
 
     def _persist_schema(self, schema: Any) -> None:
         """Cache *schema* in memory AND dump to ``.ygg/schema.arrow``.
@@ -915,8 +962,6 @@ class FolderIO(IO[bytes, FolderOptions]):
         """
         import pyarrow.compute as pc
 
-        from yggdrasil.data.schema import Schema
-
         # Materialise the input once. The partition split needs to
         # see every batch at once (per-batch splitting scatters one
         # part file per (batch, value) pair into the same partition
@@ -927,10 +972,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         if not materialised:
             return
         first = materialised[0]
-        try:
-            first_schema = Schema.from_arrow(first.schema)
-        except Exception:
-            first_schema = None
+        first_schema = self._schema_for_arrow(first.schema)
 
         partition_columns = self.partition_columns(options, schema=first_schema)
         if partition_columns:

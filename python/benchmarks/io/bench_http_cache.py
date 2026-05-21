@@ -10,13 +10,16 @@ plus their config plumbing:
   every ``send`` call funnels through), the predicate properties used
   to gate the cache pipeline (``cache_enabled``, ``local_cache_enabled``,
   ``remote_cache_enabled``, ``request_by_is_public``, ``match_by``,
-  ``sql_match_by``), and the SQL builders that produce the remote
-  cache lookup (``sql_request_clause``, ``sql_response_clause``,
-  ``sql_clause``, ``make_lookup_sql``, ``make_batch_lookup_sql``).
-* Local fast-path cache primitives — :func:`_safe_fast_path_segment`
-  (per-segment sanitizer fired once per URL component on every
-  store/lookup), :func:`_local_fast_path_relative` (full URL→path
-  mirror), and the on-disk store + read round trip.
+  ``sql_match_by``), the SQL builders that drive the remote cache
+  lookup (``sql_request_clause``, ``make_lookup_sql``,
+  ``make_batch_lookup_sql``), and their pyarrow-:class:`Predicate`
+  mirrors (``make_lookup_predicate``, ``make_batch_lookup_predicate``)
+  that drive the partitioned local :class:`FolderIO` cache.
+* :class:`FolderIO` — partition-aware write
+  (``write_arrow_batches`` with a batch whose schema carries
+  ``partition_by`` tags), partition-aware read (predicate-pushed,
+  sidecar-driven), the URL-driven ``static_values`` parse, and the
+  ``.ygg/schema.arrow`` collect / persist round trip.
 * :class:`Session` integration — :meth:`Session._load_local_cached_response`
   on a miss (the common case for cold cache) and on a hit (warm
   re-fetch), plus :meth:`Session._store_local_cached_response`
@@ -46,15 +49,10 @@ from typing import Callable
 from yggdrasil.io import URL
 from yggdrasil.io.http_.session import HTTPSession
 from yggdrasil.io.memory import Memory
+from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
-from yggdrasil.io.session import (
-    _local_fast_path_relative,
-    _read_fast_path_arrow_batch,
-    _safe_fast_path_segment,
-    _store_fast_path_arrow_batch,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -118,14 +116,16 @@ SESSION = HTTPSession(base_url="https://api.example.com/bench-cache")
 
 # Pre-store one response into the local cache so the
 # ``_load_local_cached_response`` hit path has something to read.
-_STORE_PATH = CFG_LOCAL.path
-_REL_PATH = _local_fast_path_relative(REQ.method, REQ.url, REQ.public_hash)
-_store_fast_path_arrow_batch(_STORE_PATH, _REL_PATH, RESP.to_arrow_batch(parse=False))
+_LOCAL_TABULAR = CFG_LOCAL.cache_tabular()
+_LOCAL_TABULAR.write_arrow_batches(
+    (RESP.to_arrow_batch(parse=False),),
+    options=FolderOptions(mode=CFG_LOCAL.mode),
+)
 
 
 def _cleanup_tmp() -> None:
-    if CFG_LOCAL.path:
-        shutil.rmtree(CFG_LOCAL.path, ignore_errors=True)
+    if CFG_LOCAL.path is not None:
+        shutil.rmtree(str(CFG_LOCAL.path), ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -331,50 +331,88 @@ def _sql_scenarios(repeat: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Local fast-path primitives
+# Predicate builders (Folder-cache lookup primitives)
 # ---------------------------------------------------------------------------
 
 
-def _local_fast_path_scenarios(repeat: int) -> list[dict]:
+def _predicate_builder_scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
 
     out.append(_time_one(
-        "_safe_fast_path_segment(short)",
-        lambda: _safe_fast_path_segment("api.example.com"),
-        repeat=repeat, inner=200_000,
+        "CacheConfig.make_lookup_predicate(single request)",
+        lambda: CFG_REMOTE_BY_PUBLIC.make_lookup_predicate(request=REQ),
+        repeat=repeat, inner=10_000,
     ))
     out.append(_time_one(
-        "_safe_fast_path_segment(long token > 80B)",
-        lambda: _safe_fast_path_segment("a" * 200),
-        repeat=repeat, inner=50_000,
-    ))
-    out.append(_time_one(
-        "_safe_fast_path_segment(special chars)",
-        lambda: _safe_fast_path_segment("v1/accounts:lookup?x=1"),
-        repeat=repeat, inner=100_000,
-    ))
-    out.append(_time_one(
-        "_local_fast_path_relative(method, url, hash)",
-        lambda: _local_fast_path_relative(REQ.method, REQ.url, REQ.public_hash),
-        repeat=repeat, inner=50_000,
+        f"CacheConfig.make_batch_lookup_predicate({BATCH_SIZE} requests)",
+        lambda: CFG_REMOTE_BY_PUBLIC.make_batch_lookup_predicate(requests=REQ_BATCH),
+        repeat=repeat, inner=1_000,
     ))
 
-    # On-disk round trip — measures Arrow IPC encode + write + read +
-    # decode on the same fixture. Uses a fresh temp dir per inner loop
-    # would dominate the bench; instead, the same destination file is
-    # overwritten in place (atomic ``os.replace`` swap inside).
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Local partitioned-folder cache primitives
+# ---------------------------------------------------------------------------
+
+
+def _local_folder_cache_scenarios(repeat: int) -> list[dict]:
+    out: list[dict] = []
+
+    # FolderIO surface: URL-driven static_values, schema-driven
+    # partition_columns, sidecar collect/persist round trip.
+    partition_folder = FolderIO(
+        path=Path(str(CFG_LOCAL.path)) / f"partition_key={REQ.partition_key}",
+    )
+    out.append(_time_one(
+        "FolderIO.static_values (Hive partition leaf)",
+        lambda: dict(partition_folder.static_values),
+        repeat=repeat, inner=20_000,
+    ))
+    out.append(_time_one(
+        "FolderIO.partition_columns (root, sidecar hit)",
+        lambda: _LOCAL_TABULAR.partition_columns(),
+        repeat=repeat, inner=20_000,
+    ))
+    out.append(_time_one(
+        "FolderIO.collect_schema (sidecar hit, cached)",
+        lambda: _LOCAL_TABULAR.collect_schema(),
+        repeat=repeat, inner=200_000,
+    ))
+
+    # On-disk round trip — partition-aware write + predicate read.
+    # Separate temp dirs per scenario so the write bench's accumulated
+    # part files (one ``part-*.<ext>`` per iteration under
+    # ``partition_key=<v>/``) don't poison the read bench's iter_children
+    # walk, which would otherwise scan every prior-iteration leaf.
     batch = RESP.to_arrow_batch(parse=False)
-    with tempfile.TemporaryDirectory(prefix="ygg-bench-fastpath-") as tmp:
-        rel = "rt/key.arrow"
+    write_opts = FolderOptions(mode=CFG_LOCAL.mode)
+    with tempfile.TemporaryDirectory(prefix="ygg-bench-folder-write-") as wtmp:
+        write_tab = FolderIO(path=wtmp)
+        # Prime the in-memory schema cache so the bench measures the
+        # steady-state hot path (sidecar already persisted, in-memory
+        # cache short-circuits the sidecar rewrite via the
+        # ``prior == schema`` check in ``_persist_schema``).
+        write_tab.write_arrow_batches((batch,), options=write_opts)
         out.append(_time_one(
-            "_store_fast_path_arrow_batch (rewrite)",
-            lambda: _store_fast_path_arrow_batch(tmp, rel, batch),
-            repeat=repeat, inner=500,
+            "FolderIO.write_arrow_batches (partitioned, schema unchanged)",
+            lambda: write_tab.write_arrow_batches((batch,), options=write_opts),
+            repeat=repeat, inner=200,
         ))
+
+    with tempfile.TemporaryDirectory(prefix="ygg-bench-folder-read-") as rtmp:
+        read_tab = FolderIO(path=rtmp)
+        # Seed exactly one part file under one partition so the read
+        # measures the partition-prune + predicate filter cost, not a
+        # 500-leaf iterdir scan.
+        read_tab.write_arrow_batches((batch,), options=write_opts)
+        predicate = CacheConfig().make_lookup_predicate(request=REQ)
+        read_opts = FolderOptions(predicate=predicate)
         out.append(_time_one(
-            "_read_fast_path_arrow_batch (cached file)",
-            lambda: _read_fast_path_arrow_batch(tmp, rel),
-            repeat=repeat, inner=2_000,
+            "FolderIO.read_arrow_batches (predicate hit)",
+            lambda: list(read_tab.read_arrow_batches(options=read_opts)),
+            repeat=repeat, inner=500,
         ))
 
     return out
@@ -391,7 +429,7 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
     out.append(_time_one(
         "Session._load_local_cached_response (hit)",
         lambda: SESSION._load_local_cached_response(REQ, CFG_LOCAL),
-        repeat=repeat, inner=1_000,
+        repeat=repeat, inner=500,
     ))
 
     miss_req = PreparedRequest.prepare(
@@ -403,13 +441,21 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
     out.append(_time_one(
         "Session._load_local_cached_response (miss)",
         lambda: SESSION._load_local_cached_response(miss_req, CFG_LOCAL),
-        repeat=repeat, inner=5_000,
+        repeat=repeat, inner=2_000,
     ))
 
+    # Use a dedicated folder so the fire-and-forget writeback queue
+    # doesn't accumulate part files in the shared CFG_LOCAL — every
+    # subsequent inner iteration would otherwise pay an iterdir over
+    # the running total of written parts.
+    store_cfg = CacheConfig(path=tempfile.mkdtemp(prefix="ygg-bench-store-"))
+    store_tabular = store_cfg.cache_tabular()
     out.append(_time_one(
         "Session._store_local_cached_response (fire-and-forget)",
-        lambda: SESSION._store_local_cached_response(RESP, CFG_LOCAL, root=CFG_LOCAL.path),
-        repeat=repeat, inner=2_000,
+        lambda: SESSION._store_local_cached_response(
+            RESP, store_cfg, tabular=store_tabular,
+        ),
+        repeat=repeat, inner=500,
     ))
 
     return out
@@ -567,7 +613,8 @@ def scenarios(repeat: int) -> list[dict]:
         *_predicate_scenarios(repeat),
         *_matching_scenarios(repeat),
         *_sql_scenarios(repeat),
-        *_local_fast_path_scenarios(repeat),
+        *_predicate_builder_scenarios(repeat),
+        *_local_folder_cache_scenarios(repeat),
         *_session_cache_scenarios(repeat),
         *_send_many_cache_scenarios(repeat),
     ]

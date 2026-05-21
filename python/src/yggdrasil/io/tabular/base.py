@@ -587,6 +587,12 @@ class Tabular(ABC, Generic[O]):
 
     def collect_schema(self, options: "O | None" = None, **kwargs: Any) -> Schema:
         """Return this Tabular's :class:`Schema`, caching the first hit.
+
+        The cache slot is :attr:`_schema_cache`; on first call this
+        method stamps the resolved schema into it so subsequent
+        ``collect_schema`` calls short-circuit. Writers overwrite
+        the slot via :meth:`_persist_schema`; lifecycle hooks clear
+        it via :meth:`_unpersist_schema`.
         """
         if self._schema_cache is not ...:
             return self._schema_cache
@@ -597,6 +603,8 @@ class Tabular(ABC, Generic[O]):
             return options.target
 
         schema = self._collect_schema(options)
+        if schema is not None:
+            self._schema_cache = schema
         return schema
 
     def _collect_schema(self, options: O) -> Schema:
