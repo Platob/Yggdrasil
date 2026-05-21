@@ -368,10 +368,11 @@ class FolderIO(IO[bytes, FolderOptions]):
                 self.path / self.YGGMETA_DIRNAME / self.YGGMETA_SCHEMA_FILENAME
             )
             try:
-                payload = (
-                    schema_path.read_bytes() if schema_path.exists() else b""
-                )
+                payload = schema_path.read_bytes()
             except Exception:
+                # Missing / unreadable sidecar — fall through to the
+                # first-batch path. No pre-existence probe: the read
+                # itself surfaces the missing case in one round trip.
                 payload = b""
             if payload:
                 try:
@@ -417,17 +418,17 @@ class FolderIO(IO[bytes, FolderOptions]):
         )
         if arrow_schema is None:
             return
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_file(sink, arrow_schema):
+            pass  # zero-row file, schema-only
         try:
-            self.path.mkdir(parents=True, exist_ok=True)
-            sidecar_dir = self.path / self.YGGMETA_DIRNAME
-            sidecar_dir.mkdir(parents=True, exist_ok=True)
-            sink = pa.BufferOutputStream()
-            with pa.ipc.new_file(sink, arrow_schema):
-                pass  # zero-row file, schema-only
-            (sidecar_dir / self.YGGMETA_SCHEMA_FILENAME).write_bytes(
-                sink.getvalue().to_pybytes(),
-            )
+            (
+                self.path
+                / self.YGGMETA_DIRNAME
+                / self.YGGMETA_SCHEMA_FILENAME
+            ).write_bytes(sink.getvalue().to_pybytes())
         except Exception:
+            # Sidecar is opportunistic — never fail the data write.
             pass
 
     # ==================================================================
@@ -473,9 +474,16 @@ class FolderIO(IO[bytes, FolderOptions]):
         Non-partitioned folders and unset ``options`` keep the
         legacy flat-listing behaviour.
         """
+        # Cheap early exit on a folder that hasn't been created yet
+        # — without this :meth:`partition_columns` would call
+        # :meth:`collect_schema`, which falls back to
+        # ``super()._collect_schema`` → ``_read_arrow_batches`` →
+        # back here, cycling forever on the very first write to a
+        # fresh partition child whose sidecar doesn't exist yet.
+        # ``Path.exists`` is one stat probe and we'd pay the same on
+        # the unguarded ``iterdir`` anyway.
         if not self.path.exists():
             return
-
         partition_columns = self.partition_columns(options)
         if partition_columns:
             yield from self._iter_partition_children(options, partition_columns)
@@ -748,8 +756,10 @@ class FolderIO(IO[bytes, FolderOptions]):
         block to write bytes.
         """
         opts = options or FolderOptions()
-        self.path.mkdir(parents=True, exist_ok=True)
-
+        # No mkdir pre-check: the leaf's first write goes through
+        # Path's auto-create-parents path, so a missing folder
+        # materializes on the byte landing instead of an extra
+        # round trip we'd pay on every part mint.
         ext = opts.child_media_type.full_extension
         suffix = f".{ext}" if ext else ""
         epoch_ms = int(time.time() * 1000)
@@ -1092,8 +1102,6 @@ class FolderIO(IO[bytes, FolderOptions]):
                 pass
 
     def _tabular_files(self) -> "list[Path]":
-        if not self.path.exists():
-            return []
         out: "list[Path]" = []
         for entry in self.path.iterdir():
             if entry.name.startswith("."):
@@ -1198,8 +1206,6 @@ class FolderIO(IO[bytes, FolderOptions]):
         return False
 
     def _clear_tabular_children(self) -> None:
-        if not self.path.exists():
-            return
         for entry in self.path.iterdir():
             if entry.name.startswith("."):
                 continue
@@ -1231,8 +1237,6 @@ class FolderIO(IO[bytes, FolderOptions]):
         :meth:`Predicate.filter_arrow_batches`, so the row work runs
         in pyarrow's C++ kernels — no Python row iteration.
         """
-        if not self.path.exists():
-            return 0
         not_pred = ~predicate
         deleted = 0
         for child in self.iter_children():
@@ -1325,8 +1329,6 @@ class FolderIO(IO[bytes, FolderOptions]):
         second call on a tree that's already at target leaves
         nothing to do and returns ``0``.
         """
-        if not self.path.exists():
-            return 0
         media = MediaType.from_(target_media_type, default=MediaTypes.ARROW_IPC)
         return self._optimize_walk(
             self.path,

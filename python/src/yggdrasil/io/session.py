@@ -520,11 +520,14 @@ class Session(Singleton, ABC):
         from yggdrasil.io.nested.folder_io import FolderOptions
 
         tabular = cache_cfg.cache_tabular(session=self)
-        if tabular is None or not getattr(tabular.path, "exists", lambda: False)():
+        if tabular is None:
             return None
 
         predicate = cache_cfg.make_lookup_predicate(request=request)
         opts = FolderOptions(predicate=predicate)
+        # No pre-existence probe — FolderIO.read_arrow_batches yields
+        # an empty stream when the cache folder hasn't been written to
+        # yet (Path.iterdir's documented missing-dir → empty contract).
         for batch in tabular.read_arrow_batches(options=opts):
             for resp in Response.from_arrow_tabular(batch):
                 if not cache_cfg.filter_response(resp, request=request):
@@ -1201,12 +1204,15 @@ class Session(Singleton, ABC):
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
 
         tabular = cfg.cache_tabular(session=self)
-        if tabular is None or not getattr(tabular.path, "exists", lambda: False)():
+        if tabular is None:
             return [], list(requests)
 
         predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
         opts = FolderOptions(predicate=predicate)
 
+        # No pre-existence probe — the folder read yields an empty
+        # batch stream on a missing cache root, so result_map stays
+        # empty and every request flows out as a miss.
         result_map: dict[tuple, Response] = {}
         for batch in tabular.read_arrow_batches(options=opts):
             for response in Response.from_arrow_tabular(batch):
