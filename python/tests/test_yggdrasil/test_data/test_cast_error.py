@@ -104,8 +104,8 @@ class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
         self.assertEqual(err.target.name, "payload")
         # Message mentions the failing column on both ends.
         msg = str(err)
-        self.assertIn("payload: string", msg)
-        self.assertIn("payload: list<", msg)
+        self.assertIn("'payload' string", msg)
+        self.assertIn("'payload' list", msg)
         self.assertIn("pypsa", msg)
 
 
@@ -145,18 +145,36 @@ class TestCastErrorBackCompat(ArrowTestCase):
 
 
 class TestCastErrorMessageShape(ArrowTestCase):
-    """``CastError`` renders source / target on a single line for logs."""
+    """``CastError`` describes source / target via ``Field.pretty_format``."""
 
     def test_constructed_message_includes_both_sides(self) -> None:
         src = Field.from_arrow(self.pa.field("price", self.pa.string()))
         tgt = Field.from_arrow(self.pa.field("price", self.pa.float64()))
         err = CastError("bad value 'oops'", source=src, target=tgt)
         msg = str(err)
-        self.assertIn("price: string", msg)
-        self.assertIn("price: double", msg)
+        # Field.pretty_format renders as `field: 'name' <dtype>` — same
+        # shape we use everywhere else in the library, so the error
+        # message stays in lock-step with logs / repr / __str__.
+        self.assertIn("'price' string", msg)
+        self.assertIn("'price' float64", msg)
         self.assertIn("bad value 'oops'", msg)
-        # Single-line — nested types must stay readable in log lines.
-        self.assertNotIn("\n", msg)
+        # Primitive fields stay single-line; nested fields use the
+        # multi-line tree shape Field.pretty_format already defines.
+
+    def test_nested_field_uses_pretty_tree(self) -> None:
+        # Nested fields render the tree exactly as Field.pretty_format does,
+        # so a CastError on a struct surfaces the full child layout.
+        tgt = Field.from_arrow(
+            self.pa.field("row", self.pa.struct([
+                self.pa.field("a", self.pa.int64()),
+                self.pa.field("b", self.pa.string()),
+            ])),
+        )
+        err = CastError("nested cast failed", target=tgt)
+        msg = str(err)
+        self.assertIn("'row' struct", msg)
+        self.assertIn("'a' int64", msg)
+        self.assertIn("'b' string", msg)
 
     def test_missing_fields_render_question_mark(self) -> None:
         err = CastError("dunno")
@@ -210,8 +228,8 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
 
         # The leaf is what got bound — not the outer ``row`` field.
         self.assertEqual(ctx.exception.target.name, "bad")
-        self.assertIn("bad: string", str(ctx.exception))
-        self.assertIn("bad: int64", str(ctx.exception))
+        self.assertIn("'bad' string", str(ctx.exception))
+        self.assertIn("'bad' int64", str(ctx.exception))
 
     def test_list_of_struct_leaf_failure(self) -> None:
         pa = self.pa
@@ -265,8 +283,8 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
         # Bound to the deepest leaf, not the outer ``outer`` / ``inner``
         # wrappers.
         self.assertEqual(ctx.exception.target.name, "val")
-        self.assertIn("val: string", str(ctx.exception))
-        self.assertIn("val: int64", str(ctx.exception))
+        self.assertIn("'val' string", str(ctx.exception))
+        self.assertIn("'val' int64", str(ctx.exception))
 
     def test_cast_arrow_array_direct_wraps(self) -> None:
         # Direct :meth:`Field.cast_arrow_array` call (no tabular shell)

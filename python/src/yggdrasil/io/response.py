@@ -1064,6 +1064,51 @@ class Response(Tabular["ResponseOptions"]):
     def ok(self) -> bool:
         return 200 <= self.status_code < 400
 
+    def refresh_auth(self, force: bool = True) -> "tuple[Response, bool]":
+        """Refresh the Authorization header on the bound request.
+
+        Delegates to :meth:`Session.refresh_auth` on the request's
+        attached session, which re-runs the handler's refresh
+        (force-minting a fresh token when ``force=True``) and
+        re-stamps ``request.headers["Authorization"]``. The next
+        ``self.request.send()`` (or any caller that reuses the same
+        :class:`PreparedRequest`) carries the rotated credential.
+
+        Returns ``(self, refreshed)`` where ``refreshed`` is ``True``
+        when the handler ran and the header was stamped, ``False``
+        when the silent no-op branch was taken (force=False + no
+        handler). Returning ``self`` lets the caller chain
+        (``response.refresh_auth()[0].request.send()``); the bool
+        surfaces whether anything actually changed so a manual retry
+        loop knows when to bail out.
+
+        Useful when the caller is sitting on a non-2xx :class:`Response`
+        and wants to retry the request with refreshed auth — same
+        seam :meth:`HTTPSession._local_send` uses internally on a 403,
+        exposed so external code (manual retry loops, notifying
+        middleware, the FastAPI bridge) doesn't have to replicate it.
+
+        Raises :class:`~yggdrasil.exceptions.AuthRequiredError` when
+        ``force=True`` (default) and no handler is bound — see
+        :meth:`Session.refresh_auth` for the full contract.
+
+        Raises :class:`RuntimeError` when the request has no attached
+        session (orphan request — call ``request.attach_session(s)``
+        first, or use ``session.refresh_auth(response.request, force=...)``
+        directly).
+        """
+        session = self.request.session
+        if session is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.refresh_auth requires the bound "
+                f"request to carry an attached session — got "
+                f"{self.request!r} with session=None. Attach one via "
+                "request.attach_session(session) or call "
+                "session.refresh_auth(response.request, force=...) directly."
+            )
+        _, refreshed = session.refresh_auth(self.request, force=force)
+        return self, refreshed
+
     def raise_for_status(self) -> None:
         if not self.ok:
             raise self.error()
@@ -1075,7 +1120,7 @@ class Response(Tabular["ResponseOptions"]):
 
     def error(self) -> Optional[Exception]:
         if not self.ok:
-            from .errors import make_for_status
+            from yggdrasil.exceptions import make_for_status
             return make_for_status(self)
         return None
 

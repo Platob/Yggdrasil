@@ -1,8 +1,8 @@
-"""Yggdrasil-wide exception types.
+"""Cast-related exception types.
 
-Subclasses live here so any module can import them without pulling in
-``data`` or ``arrow`` first — exceptions need to be importable from the
-hot path without ordering surprises.
+Lives under :mod:`yggdrasil.exceptions` so any module can import these
+without pulling :mod:`yggdrasil.data` or :mod:`yggdrasil.arrow` first —
+exceptions are reachable from the hot path without ordering surprises.
 """
 from __future__ import annotations
 
@@ -10,18 +10,13 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from .base import YGGException
+
 if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
 
 
-__all__ = [
-    "YGGException",
-    "CastError",
-]
-
-
-class YGGException(Exception):
-    pass
+__all__ = ["CastError"]
 
 
 class CastError(YGGException, pa.ArrowInvalid):
@@ -32,7 +27,8 @@ class CastError(YGGException, pa.ArrowInvalid):
     write meant guessing which child raised. Subclassing
     :class:`pyarrow.ArrowInvalid` keeps every existing
     ``except pa.ArrowInvalid`` handler in the wider codebase catching
-    these unchanged.
+    these unchanged; subclassing :class:`YGGException` lets a generic
+    ``except YGGException`` catch every error this library raises.
 
     Message shape (single line so logs stay readable):
 
@@ -67,43 +63,28 @@ class CastError(YGGException, pa.ArrowInvalid):
 
 
 def _describe_field(field: "Field | None") -> str | None:
-    """Render a :class:`Field` as ``name: dtype`` on a single line.
+    """Render a :class:`Field` via its own pretty format.
 
-    Prefers the Arrow type representation when available — ``DataType``'s
-    own ``__str__`` formats nested types multi-line, which turns log
-    lines into a mess. Falls back through ``arrow_type`` → ``type`` →
-    ``dtype`` → ``repr(field)`` so this stays useful for non-yggdrasil
-    field-shaped objects too. Only touches attributes every Field
-    implementation exposes, so this module stays importable without
-    dragging :mod:`yggdrasil.data` in.
+    :class:`Field` defines ``__str__`` / ``__repr__`` as
+    :meth:`Field.pretty_format`, so ``str(field)`` already produces
+    the canonical representation used everywhere else in the library
+    (single-line ``field: 'name' <dtype> {markers}`` for primitives,
+    multi-line tree for nested struct / list / map). Going through
+    the field's own format keeps the error message in lock-step with
+    the rest of the library — no second projection of names /
+    nullability / markers / comments — and avoids the
+    self-referential-struct recursion the old ``arrow_type``
+    fallback could hit (``Field.to_arrow_field`` → ``arrow_type`` →
+    ``Field.to_arrow_field``…).
+
+    :func:`_safe_str` keeps the formatter finite for non-yggdrasil
+    field-shaped objects (or a half-built field whose ``pretty_format``
+    raises) so the original :class:`CastError` always surfaces, even
+    when its own description fails to render.
     """
     if field is None:
         return None
-    name = _safe_attr(field, "name")
-    # ``arrow_type`` is a cached property on Field — for a self-referential
-    # struct (a CastError target that recurses on itself), accessing it
-    # triggers ``StructType.to_arrow`` → ``Field.to_arrow_field`` → ``arrow_type``
-    # forever and the error formatter never returns. Guard the chain so the
-    # original CastError surfaces with a degraded but finite description.
-    dtype: Any = (
-        _safe_attr(field, "arrow_type")
-        or _safe_attr(field, "type")
-        or _safe_attr(field, "dtype")
-    )
-    if name and dtype is not None:
-        return f"{name}: {dtype}"
-    if dtype is not None:
-        return _safe_str(dtype)
-    if name:
-        return str(name)
     return _safe_str(field, default=object.__repr__(field))
-
-
-def _safe_attr(obj: Any, name: str) -> Any:
-    try:
-        return getattr(obj, name, None)
-    except Exception:
-        return None
 
 
 def _safe_str(value: Any, default: str = "?") -> str:

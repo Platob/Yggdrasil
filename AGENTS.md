@@ -648,6 +648,156 @@ Do not fake stricter types just because the happy path returns a value.
 ### Keyword-only arguments are good for ambiguous options
 Use keyword-only arguments when they make calls easier to read and harder to misuse.
 
+### Centralise exceptions in `yggdrasil.exceptions`
+
+The library has **one** root: :class:`YGGException`. Every exception yggdrasil deliberately raises must derive from it — directly or transitively — so a caller can write:
+
+```python
+try:
+    do_yggdrasil_things()
+except YGGException:
+    ...
+```
+
+and catch every failure the library deliberately generates in one branch.
+
+Concrete types live in peer modules under `yggdrasil/exceptions/`:
+
+- `base.py` → :class:`YGGException` (the root, nothing else).
+- `cast.py` → :class:`CastError` (conversion failures; also subclasses :class:`pyarrow.ArrowInvalid` so existing Arrow-aware catch blocks still match).
+- `http.py` → the full HTTP hierarchy (:class:`HTTPError`, :class:`RequestError`, :class:`ResponseError`, :class:`HTTPStatusError`, :class:`ClientError`, :class:`ServerError`, :class:`NotFoundError`, :class:`ForbiddenError`, :class:`UnauthorizedError`, :class:`TooManyRequests`, …). :class:`HTTPError` double-subclasses :class:`urllib3.exceptions.HTTPError` so `except urllib3.exceptions.HTTPError:` keeps working.
+
+Every name above is re-exported from `yggdrasil/exceptions/__init__.py`, so the *only* import path callers should use is:
+
+```python
+from yggdrasil.exceptions import NotFoundError, CastError, HTTPError, YGGException
+```
+
+Don't reach into `yggdrasil.exceptions.http` / `yggdrasil.exceptions.cast` directly from feature code — the root module is the public surface.
+
+#### Rules for new failure modes
+
+1. **Reuse before you invent.** Before defining a new exception class, grep `yggdrasil/exceptions/` (and the catalog above) for one that already fits the semantics. A 404 from a Databricks SDK call, an S3 listing miss, a Kafka topic-not-found, and a Postgres "relation does not exist" are all :class:`NotFoundError`. A failed Arrow / Polars / pandas cast is :class:`CastError`. A 403 from any vendor is :class:`ForbiddenError`. Sharing the type means one cross-vendor catch block ("retry on `NotFoundError`, escalate on `ForbiddenError`") works uniformly.
+
+2. **When you must add a new type, add it in `yggdrasil/exceptions/`** — not as a local `class FooError(Exception):` in the feature module:
+   - File: `yggdrasil/exceptions/<area>.py` (`cast.py`, `http.py`, or a new sibling like `data.py` / `sql.py` if the area is large; one-offs can live in `__init__.py` directly).
+   - Base list: subclass **the most specific existing yggdrasil type** the failure semantically inherits from — an SDK-shaped 404 subclasses :class:`NotFoundError`, not just :class:`YGGException`. If nothing fits, subclass :class:`YGGException` directly.
+   - Third-party compat bases (`pyarrow.ArrowInvalid`, `urllib3.exceptions.*`, `ValueError`, `RuntimeError`) go **after** the yggdrasil base so the C3 MRO keeps the yggdrasil root visible first (and `isinstance(exc, YGGException)` short-circuits to the right branch).
+   - Re-export from `exceptions/__init__.py` and add to `__all__`.
+   - Add a test (mirroring `test_yggdrasil/test_exceptions.py`) that asserts the new type is `issubclass(YGGException)` and `issubclass(<parent>)` — keeps the centralisation invariant enforced.
+
+3. **Don't define ad-hoc local exceptions in feature modules.** If you find yourself typing `class _FooError(Exception):` mid-file, stop — promote it into `yggdrasil.exceptions` and import it back. The legacy file-local exceptions still in the tree (`pickle.ser.errors.SerializationError`, `mongoengine.decorator.MongoConnectError`, `fxrate.backends.BackendError`, `environ.system_command.SystemCommandError`, `dataclasses.expiring.ExpiredError`, …) predate this rule — they're grandfathered, but **don't add a sibling** to those modules; the next migration moves them into `yggdrasil.exceptions` and subclasses them to :class:`YGGException`.
+
+4. **Raise the specific subclass, not the root.** `raise NotFoundError(f"No volume at {path!r}. Available: {…}")` is correct; `raise YGGException("missing")` throws away the catch-narrowing every downstream caller depends on. The root exists for *callers* to catch with one branch — it's not the right thing to raise unless you genuinely mean "any library failure" (you almost never do).
+
+5. **Carry the same payload as the rest of the library's error messages.** What you passed, what was expected, valid values / nearby matches, what to try next. See the *Error messages should help, not just complain* rule for the worked shape and tone — the centralisation rule doesn't change error-message style, it just means every helpful message ends up in the same hierarchy.
+
+6. **Translate third-party SDK errors at the boundary.** Catch the vendor exception (`databricks.sdk.errors.NotFound`, `urllib3.exceptions.MaxRetryError`, `boto3.exceptions.ClientError`, `psycopg.errors.UndefinedTable`, …), pick the matching `yggdrasil.exceptions` type, and `raise <Ygg>(...) from exc` so the original cause stays on the traceback. This is exactly what :func:`yggdrasil.exceptions.from_urllib3` does for urllib3 errors at `HTTPSession._local_send`; new integrations mirror it (a `from_databricks_sdk(exc, ...)`, `from_boto(exc, ...)`, `from_psycopg(exc, ...)` helper if the integration translates more than two or three vendor types). The library-wide catch shape works *because* every cross-vendor failure surfaces as a `YGGException` — leaking the raw vendor type past the IO boundary breaks that contract.
+
+#### Worked example: adding a new exception
+
+Suppose a new SQL backend needs to signal "the table the caller named exists but the user lacks SELECT on it" — distinct from `NotFoundError` (missing) and `ForbiddenError` (HTTP-layer 403):
+
+```python
+# yggdrasil/exceptions/sql.py  (new file)
+from __future__ import annotations
+
+from .base import YGGException
+
+__all__ = ["SQLPermissionError"]
+
+
+class SQLPermissionError(YGGException):
+    """Raised when a SQL caller is missing a privilege on an existing object.
+
+    Distinguishes "object exists but caller can't see it" from
+    :class:`NotFoundError` ("object doesn't exist") so cross-engine
+    retry / escalation logic can branch on the right cause.
+    """
+
+    def __init__(self, *, object_name: str, action: str, missing_grant: str) -> None:
+        msg = (
+            f"Action {action!r} on {object_name!r} requires {missing_grant!r}. "
+            f"Grant it with: GRANT {missing_grant} ON {object_name} TO <principal>."
+        )
+        super().__init__(msg)
+        self.object_name = object_name
+        self.action = action
+        self.missing_grant = missing_grant
+```
+
+```python
+# yggdrasil/exceptions/__init__.py — add to imports + __all__
+from .sql import SQLPermissionError
+__all__ = [..., "SQLPermissionError"]
+```
+
+```python
+# yggdrasil/<integration>/<module>.py — translate at the boundary
+from yggdrasil.exceptions import SQLPermissionError
+
+try:
+    ws.statement_execution.execute_statement(...)
+except DatabricksError as exc:
+    if "PERMISSION_DENIED" in str(exc):
+        raise SQLPermissionError(
+            object_name=full_table_name,
+            action="SELECT",
+            missing_grant="SELECT",
+        ) from exc
+    raise
+```
+
+```python
+# tests/test_yggdrasil/test_exceptions.py — extend coverage
+def test_sql_permission_error_is_ygg_exception():
+    from yggdrasil.exceptions import SQLPermissionError, YGGException
+    assert issubclass(SQLPermissionError, YGGException)
+```
+
+That's the whole shape — new type, single import path, generic catch still works, no leak of `DatabricksError` past the integration boundary.
+
+### Constructors are named `from_*`, not `parse` / `load` / `of` / `make`
+
+Alternative constructors on a class follow the project-wide naming convention used by `DataType`, `Field`, `URL`, `DatabricksPath`, `MimeType`, `ByteUnit`, `TimeUnit`, `Codec`, `Mode`, every `data.enums.*` enum, and the rest of the codebase. Two shapes, in this order:
+
+- **`from_(value: Any) -> Cls`** — the **generic dispatch** entry point. Accepts whatever the caller has (str, bytes, dict, an instance of `Cls`, an Arrow / pandas / Polars / Spark object, a `Path`, …), routes by type to the right `from_X` sibling, and **returns the instance unchanged** when handed one already (identity short-circuit — `Cls.from_(x) is x` when `isinstance(x, Cls)`). This is the call site every "I have *something*, give me a `Cls`" reflex resolves to.
+- **`from_str(value: str)`, `from_bytes(value: bytes)`, `from_dict(value: dict)`, `from_pandas(...)`, `from_arrow(...)`, `from_pytype(...)`, `from_pathlib(...)`, `from_authorization(...)`** — the **type-specific** constructors. Each one takes a single concrete shape and does the actual work; `from_` is mostly a dispatch table over these.
+
+Worked example (`yggdrasil.data.types.base.DataType.from_any` is the canonical one):
+
+```python
+@classmethod
+def from_(cls, value: Any) -> "Cls":
+    if isinstance(value, cls):
+        return value                       # identity short-circuit
+    if isinstance(value, str):
+        return cls.from_str(value)
+    if isinstance(value, bytes):
+        return cls.from_bytes(value)
+    if isinstance(value, Mapping):
+        return cls.from_dict(value)
+    raise TypeError(
+        f"{cls.__name__}.from_ expects str, bytes, Mapping, or {cls.__name__}; "
+        f"got {type(value).__name__}."
+    )
+
+@classmethod
+def from_str(cls, value: str) -> "Cls":
+    ...  # the actual parsing logic
+```
+
+Rules:
+
+- **Do not introduce `parse(...)` / `load(...)` / `of(...)` / `make(...)` / `create(...)` as parallel spellings** for the class-constructor role. They fragment the surface and break the "I have X, can I get Y" reflex callers rely on across the library. If you find yourself typing `def parse(cls, ...)` on a new class, rename it to `from_str` (or whatever the input type actually is) before committing.
+- **`from_` is dispatch-only.** Real work belongs in the per-type siblings. A `from_` that contains the parser body is a smell — when the caller hands a different shape (the wire bytes from an HTTP response, a dict from JSON, a Polars Series), the dispatch can't find the right method because the work is welded to one input shape.
+- **The identity short-circuit is required.** `Cls.from_(x) is x` when `x` is already a `Cls`. Without it, callers wrap-on-every-call and the library produces N copies of the same value across a pipeline.
+- **If the input space is a single shape, skip `from_`** — just write the right `from_X`. Don't add a one-line dispatcher that only ever forwards to one sibling.
+- **`parse(...)` is reserved for *non*-constructor parsing helpers** that return a parser-internal value (a token / tree / `ParsedDataType` / dict shape), *not* an instance of the public class. `parse_data_type(s) -> ParsedDataType` is fine; `DataType.parse(s) -> DataType` is not — use `DataType.from_str` instead.
+- **Errors mention the class name and the constructor.** `f"{cls.__name__}.from_str expects str, got {type(value).__name__}."` reads cleanly in a stacktrace; bare `"expected str"` doesn't tell the reader which constructor rejected the input.
+
+When in doubt, grep for `def from_` in `data/types/`, `data/enums/`, `io/url.py`, or `databricks/path.py` — every long-lived class in the library uses this shape.
+
 ---
 
 ## Rules for comments

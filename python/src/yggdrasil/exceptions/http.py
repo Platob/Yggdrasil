@@ -1,8 +1,16 @@
-"""
-yggdrasil.io.http_.exceptions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""HTTP exception hierarchy — lives under :mod:`yggdrasil.exceptions`.
 
-HTTP exception hierarchy that:
+Every type defined here subclasses :class:`YGGException` through
+:class:`HTTPError`, so a generic ``except YGGException`` catches
+every error the library deliberately raises (HTTP-bound included,
+alongside :class:`CastError` and any future global type). Keeping
+the hierarchy at the package root (and not under ``io/``) means
+non-IO modules can ``raise NotFoundError(...)`` / ``raise
+ForbiddenError(...)`` / ``raise TooManyRequests(...)`` without
+pulling :mod:`yggdrasil.io` first; see ``AGENTS.md`` →
+"Centralise exceptions in :mod:`yggdrasil.exceptions`" for the rule.
+
+The hierarchy also:
 
 1. Inherits from ``urllib3.exceptions`` so existing urllib3-aware retry
    logic, catch blocks, and middleware work without modification.
@@ -64,9 +72,11 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import urllib3.exceptions as _u3
 
+from .base import YGGException
+
 if TYPE_CHECKING:
-    from .request import PreparedRequest
-    from .response import Response
+    from yggdrasil.io.request import PreparedRequest
+    from yggdrasil.io.response import Response
     from starlette.responses import JSONResponse as StarletteResponse
     from fastapi.responses import JSONResponse as FastAPIJSONResponse
 
@@ -75,6 +85,7 @@ __all__ = [
     "HTTPError",
     # Request-bound
     "RequestError",
+    "AuthRequiredError",
     "ConnectionError",
     "TimeoutError",
     "ConnectTimeoutError",
@@ -139,7 +150,7 @@ def _body_snippet(response: "Response", max_bytes: int = 2048) -> str:
         raw = response.buffer.to_bytes() if response.buffer else b""
         if not raw:
             return ""
-        from .response import _get_charset
+        from yggdrasil.io.response import _get_charset
         charset = _get_charset(response.headers)
         text = raw[:max_bytes].decode(charset, errors="replace").strip()
         suffix = "…" if len(raw) > max_bytes else ""
@@ -161,10 +172,14 @@ def _fmt(response: "Response") -> str:
 # Root
 # ---------------------------------------------------------------------------
 
-class HTTPError(_u3.HTTPError):
+class HTTPError(YGGException, _u3.HTTPError):
     """
     Root of the yggdrasil HTTP exception hierarchy.
-    Inherits from urllib3.HTTPError so all urllib3-aware catch blocks match.
+
+    Inherits from :class:`urllib3.exceptions.HTTPError` so all
+    urllib3-aware catch blocks match, AND from
+    :class:`~yggdrasil.exceptions.YGGException` so the library-wide
+    ``except YGGException`` catches every HTTP failure too.
     """
 
     def __str__(self) -> str:
@@ -191,6 +206,20 @@ class RequestError(HTTPError):
     def __repr__(self) -> str:
         url = self.request.url.to_string() if self.request else "?"
         return f"{type(self).__name__}(url={url!r})"
+
+
+class AuthRequiredError(RequestError):
+    """
+    Raised when an operation needs an :class:`Authorization` handler
+    but none is bound — either on the request or on the session.
+
+    Fired by :meth:`Session.refresh_auth` when ``force=True`` (the
+    default) and the caller has not configured any auth source. The
+    silent no-op branch is reserved for ``force=False``, which is what
+    :meth:`Session.prepare_request_before_send` uses on steady-state
+    sends (a request to a public endpoint shouldn't fail just because
+    the session doesn't have a token to refresh).
+    """
 
 
 class ConnectionError(RequestError, _u3.NewConnectionError):  # type: ignore[misc]
