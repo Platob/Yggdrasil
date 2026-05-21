@@ -1124,13 +1124,6 @@ class FolderIO(IO[bytes, FolderOptions]):
                 child = type(self)(
                     path=child_path,
                     static_values={head: value},
-                    # Per-partition child stays sidecar-less: the
-                    # top-level folder owns the canonical
-                    # ``<root>/.ygg/schema.arrow`` record. Recursing
-                    # into partition children with ``yggmeta=True``
-                    # would scatter one ``.ygg/`` per partition
-                    # directory for zero added value.
-                    yggmeta=False,
                 )
                 self.adopt_child(child)
                 child._write_arrow_batches(iter((subset,)), child_options)
