@@ -36,10 +36,6 @@ import pytest
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.io.send_config import CacheConfig, SendConfig
-from yggdrasil.io.session import (
-    _local_fast_path_relative,
-    _store_fast_path_arrow_batch,
-)
 
 from ._helpers import StubSession, make_request, make_response
 
@@ -293,20 +289,23 @@ class TestLocalCacheIntegration:
         return False
 
     def _wait_for_readable(self, cache, *, timeout: float = 3.0) -> bool:
-        """Poll until any non-hidden ``.arrow`` file lands in the cache tree.
+        """Poll until any partitioned part file lands in the cache tree.
 
         Writeback fires on a daemon thread; the file may not be on
-        disk immediately after :meth:`Session.send` returns.
+        disk immediately after :meth:`Session.send` returns. The
+        partitioned layout writes ``partition_key=<int>/part-*.<ext>``
+        leaves, so we look for any non-hidden file under any
+        ``partition_key=*/`` directory.
         """
         import time as _time
 
         deadline = _time.monotonic() + timeout
-        root = Path(cache.path)
+        root = Path(str(cache.path))
         while _time.monotonic() < deadline:
             try:
                 if root.exists() and any(
                     p.is_file() and not p.name.startswith(".")
-                    for p in root.rglob("*.arrow")
+                    for p in root.rglob("partition_key=*/part-*")
                 ):
                     return True
             except OSError:
@@ -317,16 +316,22 @@ class TestLocalCacheIntegration:
     def _prepopulate(
         self, cache: CacheConfig, response,
     ) -> None:
-        """Synchronously seed the fast-path file for *response*.
+        """Synchronously seed the partitioned cache leaf for *response*.
 
         Bypasses the session's fire-and-forget writeback so the
-        test can assert read-side behavior without racing against
-        a background thread.
+        test can assert read-side behavior without racing against a
+        background thread. Goes through the cache's
+        :meth:`Tabular.insert` — same call the production write
+        path uses — so the on-disk layout (Hive-style
+        ``partition_key=<int>/part-*.<ext>``) matches what
+        :meth:`Session.send` writeback produces. Skips the
+        ``response.ok`` guard so fixtures can seed 4xx / 5xx rows.
         """
-        req = response.request
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        _store_fast_path_arrow_batch(
-            cache.path, rel, response.to_arrow_batch(parse=False),
+        tabular = cache.cache_tabular()
+        tabular.insert(
+            response.to_arrow_batch(parse=False),
+            mode=cache.mode,
+            partition_columns=CacheConfig.LOCAL_CACHE_PARTITION_COLUMNS,
         )
 
     def test_writeback_persists_response(self, tmp_path) -> None:

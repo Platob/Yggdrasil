@@ -708,6 +708,52 @@ class CacheConfig(_ConfigBase):
             object.__setattr__(self, "path", self.local_cache_folder(session=session))
         return str(self.path)
 
+    #: Partition columns the local-cache :class:`FolderIO` lays out
+    #: on disk. Mirrors the partition_by column declared on
+    #: :data:`RESPONSE_SCHEMA` so lookup predicates that filter by
+    #: ``partition_key`` skip whole partition directories at the
+    #: listing step.
+    LOCAL_CACHE_PARTITION_COLUMNS: ClassVar[tuple[str, ...]] = ("partition_key",)
+
+    def cache_tabular(
+        self, session: "Session | None" = None,
+    ) -> "Any":
+        """Return the active cache backend as a :class:`Tabular`.
+
+        Single entry point both the local and remote pipelines call
+        through:
+
+        * :attr:`tabular` set explicitly (remote case — a Databricks
+          :class:`~yggdrasil.databricks.table.table.Table` or any
+          third-party Tabular) — returned as-is.
+        * :attr:`path` set (local case) — wrapped in a
+          :class:`~yggdrasil.io.nested.folder_io.FolderIO` rooted at
+          that path. The folder is singleton-keyed on the path, so
+          repeat calls hand back the same live instance.
+        * Neither set but the cache is otherwise enabled
+          (``received_*`` window) — the default
+          ``~/.yggdrasil/cache/response/...`` :class:`FolderIO` is
+          materialised via :meth:`local_cache_folder` and memoised
+          back on :attr:`path` so the next call short-circuits.
+
+        With the on-disk layout being Hive-partitioned by
+        ``partition_key`` (see
+        :attr:`LOCAL_CACHE_PARTITION_COLUMNS`), the local Folder and
+        the remote Table accept the same logical lookup primitive —
+        the :class:`Predicate` built by :meth:`make_lookup_predicate`
+        / :meth:`make_batch_lookup_predicate` — and the same
+        :meth:`Tabular.insert` write call. Returns ``None`` when the
+        cache is fully disabled.
+        """
+        if self.tabular is not None:
+            return self.tabular
+        from yggdrasil.io.nested.folder_io import FolderIO
+
+        folder_path = self.local_cache_folder(session=session)
+        if self.path is None:
+            object.__setattr__(self, "path", folder_path)
+        return FolderIO(path=folder_path)
+
     def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
         """Materialise :attr:`path` for local-cache configs.
 
@@ -1005,6 +1051,151 @@ class CacheConfig(_ConfigBase):
             )
 
         return base_query
+
+    # ------------------------------------------------------------------
+    # Predicate builders — mirror the SQL builders for FolderIO callers
+    # ------------------------------------------------------------------
+
+    def request_predicate(
+        self,
+        request: PreparedRequest | None,
+    ) -> "Any | None":
+        """Build the per-request match predicate as an :class:`Expression`.
+
+        Mirrors :meth:`sql_request_clause` but emits the abstract
+        :class:`yggdrasil.io.tabular.execution.expr.Predicate` tree
+        instead of a SQL string. ``None`` request → ``None`` (no
+        per-request constraint, equivalent to the SQL ``1=1`` branch).
+        """
+        if request is None or not self.request_by:
+            return None
+        from yggdrasil.io.tabular.execution.expr import all_of, col
+
+        clauses: list[Any] = []
+        match_value = request.match_value
+        for column, key in zip(self.request_sql_columns, self.request_by):
+            value = match_value(key)
+            clauses.append(
+                col(column).is_null() if value is None else col(column) == value
+            )
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return all_of(*clauses)
+
+    def response_predicate(
+        self,
+        response: "Response | None" = None,
+    ) -> "Any | None":
+        """Build the response-side / time-window predicate as an :class:`Expression`.
+
+        Mirrors :meth:`sql_response_clause`. ``None`` when no clauses
+        apply so callers can compose with :func:`all_of` cleanly.
+        """
+        from yggdrasil.io.tabular.execution.expr import all_of, col
+
+        clauses: list[Any] = []
+        if response is not None:
+            for key, value in self.response_values(response).items():
+                clauses.append(
+                    col(key).is_null() if value is None else col(key) == value
+                )
+        if self.received_from is not None:
+            clauses.append(col("received_at") >= self.received_from)
+        if self.received_to is not None:
+            clauses.append(col("received_at") < self.received_to)
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return all_of(*clauses)
+
+    def make_lookup_predicate(
+        self,
+        request: PreparedRequest | None = None,
+        response: "Response | None" = None,
+    ) -> "Any | None":
+        """Single-request :class:`Predicate` mirror of :meth:`make_lookup_sql`.
+
+        Shape: ``partition_key == <req.partition_key>`` AND the
+        per-request match clause AND the response/time-window clause.
+        Returns ``None`` when no clauses apply (an unconstrained
+        :class:`FolderIO` read).
+
+        FolderIO consumes the result via
+        ``FolderOptions(predicate=..., partition_columns=("partition_key",))``;
+        the partition-aware listing in :meth:`FolderIO.iter_children`
+        uses :func:`extract_partition_filters` on the predicate to
+        skip every non-matching ``partition_key=<v>/`` sub-folder
+        without ever calling ``iterdir`` on the cache root.
+        """
+        from yggdrasil.io.tabular.execution.expr import all_of, col
+
+        clauses: list[Any] = []
+        if request is not None:
+            clauses.append(col("partition_key") == request.partition_key)
+        req_pred = self.request_predicate(request)
+        if req_pred is not None:
+            clauses.append(req_pred)
+        resp_pred = self.response_predicate(response)
+        if resp_pred is not None:
+            clauses.append(resp_pred)
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return all_of(*clauses)
+
+    def make_batch_lookup_predicate(
+        self,
+        requests: Iterable[PreparedRequest],
+    ) -> "Any | None":
+        """Batch :class:`Predicate` mirror of :meth:`make_batch_lookup_sql`.
+
+        Shape: ``partition_key IN (<distinct keys>)`` AND
+        ``(req1_match) OR (req2_match) OR …`` AND the
+        response/time-window clause. Returns ``None`` when the batch
+        is empty and no time window applies (matches the SQL
+        ``SELECT * FROM table`` no-WHERE form).
+
+        Designed as the read-path predicate for the local
+        :class:`FolderIO` cache: the partition ``IN (...)`` lets
+        :meth:`FolderIO.iter_children` probe candidate
+        ``partition_key=<v>/`` sub-folders directly (one ``stat``
+        per accepted value, no ``iterdir`` over the full tree), and
+        the per-row OR-of-AND match clause is forwarded to
+        :meth:`Predicate.filter_arrow_batches` to keep the matching
+        rows once each part file is opened.
+        """
+        from yggdrasil.io.tabular.execution.expr import all_of, any_of, col
+
+        request_list = list(requests)
+        clauses: list[Any] = []
+
+        if request_list:
+            partition_keys = sorted({r.partition_key for r in request_list})
+            clauses.append(col("partition_key").is_in(partition_keys))
+
+            request_preds = [
+                pred
+                for pred in (self.request_predicate(r) for r in request_list)
+                if pred is not None
+            ]
+            if len(request_preds) == 1:
+                clauses.append(request_preds[0])
+            elif request_preds:
+                clauses.append(any_of(*request_preds))
+
+        resp_pred = self.response_predicate(None)
+        if resp_pred is not None:
+            clauses.append(resp_pred)
+
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return all_of(*clauses)
 
     def copy(
         self,

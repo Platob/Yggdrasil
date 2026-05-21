@@ -54,11 +54,7 @@ import pytest
 from yggdrasil.data.enums import Mode
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
-from yggdrasil.io.session import (
-    Session,
-    _local_fast_path_relative,
-    _store_fast_path_arrow_batch,
-)
+from yggdrasil.io.session import Session
 
 from ._helpers import StubSession, make_request, make_response
 
@@ -105,15 +101,21 @@ def _remote_cfg(tab: "_FakeRemoteTabular", **overrides: Any) -> CacheConfig:
 
 
 def _seed_local(cache: CacheConfig, response: Response) -> None:
-    """Synchronously plant *response* in the URL-mirrored fast-path tree.
+    """Synchronously plant *response* in the partitioned cache tree.
 
     Bypasses the session's fire-and-forget writeback so a test can
     assert read-side behaviour without racing the daemon writer.
+    Goes through :meth:`Tabular.insert` on the cache's backend —
+    the same call the production writeback uses — so the on-disk
+    layout (``<root>/partition_key=<int>/part-*.<ext>``) matches
+    exactly. Skips the ``response.ok`` guard the production path
+    enforces so fixtures can seed 4xx / 5xx rows.
     """
-    req = response.request
-    rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-    _store_fast_path_arrow_batch(
-        cache.path, rel, response.to_arrow_batch(parse=False),
+    tabular = cache.cache_tabular()
+    tabular.insert(
+        response.to_arrow_batch(parse=False),
+        mode=cache.mode,
+        partition_columns=CacheConfig.LOCAL_CACHE_PARTITION_COLUMNS,
     )
 
 
@@ -123,19 +125,20 @@ def _seed_remote(tab: "_FakeRemoteTabular", response: Response) -> None:
 
 
 def _wait_for_local(cache: CacheConfig, *, count: int = 1, timeout: float = 5.0) -> int:
-    """Poll until at least *count* live ``.arrow`` files land in *cache*.
+    """Poll until at least *count* partitioned part files land in *cache*.
 
     The local writeback is fire-and-forget on the job pool. A polling
     helper beats a fixed ``sleep`` — slow CI machines get the time
-    they need; fast ones don't pay it.
+    they need; fast ones don't pay it. Counts ``part-*`` leaves under
+    any ``partition_key=*/`` sub-directory (the partitioned layout).
     """
     deadline = time.monotonic() + timeout
-    root = Path(cache.path)
+    root = Path(str(cache.path))
     last = 0
     while time.monotonic() < deadline:
         try:
             last = sum(
-                1 for p in root.rglob("*.arrow")
+                1 for p in root.rglob("partition_key=*/part-*")
                 if p.is_file() and not p.name.startswith(".")
             )
         except OSError:
@@ -363,9 +366,16 @@ class TestLocalCacheSend:
         assert out.json() == {"v": "network"}
 
     def test_distinct_post_bodies_do_not_alias(self, tmp_path) -> None:
-        # ``public_hash`` mixes the body in, so two POSTs to the same
-        # URL with different bytes hash to distinct ``.arrow`` leaves.
-        cache = _local_cfg(tmp_path)
+        # ``public_hash`` folds the body bytes into the request
+        # identity, so two POSTs to the same URL with different bytes
+        # match against distinct rows in the partitioned cache. They
+        # share a ``partition_key`` (URL-derived) so they land in the
+        # same partition directory — the row-level match-by predicate
+        # is what distinguishes them. Passing ``request_by=["public_hash"]``
+        # explicitly opts into body-aware identity (the default
+        # ``public_url_hash`` is URL-only by design — see
+        # :data:`_DEFAULT_REQUEST_BY`).
+        cache = _local_cfg(tmp_path, request_by=["public_hash"])
         url = "https://example.com/echo"
         req_a = make_request(url, method="POST", body=b"payload-A")
         req_b = make_request(url, method="POST", body=b"payload-B")
