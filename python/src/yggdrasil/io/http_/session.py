@@ -240,8 +240,9 @@ class HTTPSession(Session):
                 "Refreshing auth after 403 for %s %s — retrying once",
                 request.method, request.url,
             )
-            self.check_auth(request)  # force=True default
-            raw_resp, result = self._wire_send(request, wait_cfg)
+            _, refreshed = self.refresh_auth(request)  # force=True default
+            if refreshed:
+                raw_resp, result = self._wire_send(request, wait_cfg)
 
         x_current_page = raw_resp.headers.get("X-Current-Page")
         x_total_pages = raw_resp.headers.get("X-Last-Page")

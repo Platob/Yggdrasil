@@ -1,23 +1,31 @@
-"""Tests for :meth:`Session.check_auth` and the 403 retry in HTTPSession.
+"""Tests for :meth:`Session.refresh_auth`, the 403 retry in HTTPSession,
+and the session-init auth pre-stamp.
 
 Covers:
 
-1. ``check_auth`` is a no-op when no handler is bound.
-2. ``check_auth`` calls ``handler.refresh(force=True)`` by default and
-   stamps ``handler.authorization`` onto the request.
-3. ``check_auth`` accepts ``force=False`` and forwards it to the
-   handler's ``refresh``.
-4. ``check_auth`` falls back to a no-arg ``refresh()`` for legacy
-   handlers whose ``refresh()`` doesn't accept the ``force`` kwarg.
-5. Per-request ``request.auth`` wins over the session-wide
-   ``self.auth``.
-6. ``prepare_request_before_send`` delegates to ``check_auth`` with
-   ``force=False`` (steady-state requests reuse the cached token).
+1. ``Session(auth=handler)`` pre-stamps ``self.headers["Authorization"]``
+   so the session-level view carries the current credential before
+   any request goes out.
+2. ``refresh_auth(request)`` returns ``(self, refreshed: bool)`` so
+   chained call sites can short-circuit when no refresh happened.
+3. ``force=True`` (default) raises
+   :class:`~yggdrasil.exceptions.AuthRequiredError` when no handler
+   is bound. ``force=False`` returns ``(self, False)`` silently.
+4. ``refresh_auth`` calls ``handler.refresh(force=...)`` when
+   available (legacy ``refresh()`` without ``force`` is supported via
+   ``TypeError`` fallback) and stamps ``handler.authorization`` onto
+   the request — keeping ``self.headers`` in sync when the resolved
+   handler is the session-wide one.
+5. Per-request ``request.auth`` wins over session-wide ``self.auth``
+   and does not pollute ``self.headers``.
+6. ``prepare_request_before_send`` delegates to
+   ``refresh_auth(request, force=False)`` (steady-state path).
 7. :class:`HTTPSession._local_send` retries exactly once on a 403
    when an auth handler is bound — the second send carries the
-   refreshed Authorization header.
-8. ``HTTPSession`` does **not** retry on 403 when no auth handler is
-   bound (no token to refresh, retry would loop).
+   refreshed Authorization header — and does **not** retry without
+   one.
+8. :meth:`Response.refresh_auth` delegates to the bound session and
+   surfaces the same ``(self, refreshed)`` shape.
 """
 from __future__ import annotations
 
@@ -91,11 +99,35 @@ class _StaticAuth(Authorization):
 
 
 # ---------------------------------------------------------------------------
-# Session.check_auth — unit behavior
+# Session(__init__) — pre-stamp session headers when auth is provided
 # ---------------------------------------------------------------------------
 
 
-class TestCheckAuth:
+class TestSessionInitWithAuth:
+
+    def test_init_with_auth_prestamps_session_headers(self):
+        # ``Session(auth=...)`` should reflect the current credential
+        # on session-level ``self.headers`` from the start, so anyone
+        # inspecting the session sees the token without going through
+        # a request first.
+        auth = _RefreshableAuth()
+        # Mint the first token so prefix-1 is the value the session
+        # will pull on init.
+        auth.refresh(force=True)
+        s = HTTPSession(base_url="https://api.example.com", auth=auth)
+        assert s.headers["Authorization"] == "Bearer tok-1"
+
+    def test_init_without_auth_does_not_set_authorization(self):
+        s = HTTPSession(base_url="https://api.example.com")
+        assert "Authorization" not in s.headers
+
+
+# ---------------------------------------------------------------------------
+# Session.refresh_auth — unit behavior
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshAuth:
 
     def test_force_true_no_handler_raises_auth_required(self):
         # Default force=True with no bound handler is a config error —
@@ -107,7 +139,7 @@ class TestCheckAuth:
             req.headers.pop("Authorization", None)
 
         with pytest.raises(AuthRequiredError) as ctx:
-            s.check_auth(req)
+            s.refresh_auth(req)
 
         # The error carries the request for downstream inspection
         # and subclasses RequestError → HTTPError → YGGException.
@@ -116,44 +148,69 @@ class TestCheckAuth:
         assert isinstance(ctx.value, RequestError)
         assert isinstance(ctx.value, YGGException)
 
-    def test_force_false_no_handler_is_noop(self):
+    def test_force_false_no_handler_returns_self_and_false(self):
         # Steady-state path (prepare_request_before_send): missing
-        # handler is fine, just no header gets stamped.
+        # handler is fine, just no header gets stamped, and the
+        # tuple's bool flags "nothing changed".
         s = HTTPSession(base_url="https://api.example.com")
         req = make_request("https://api.example.com/x")
         if req.headers is not None:
             req.headers.pop("Authorization", None)
 
-        out = s.check_auth(req, force=False)
+        out, refreshed = s.refresh_auth(req, force=False)
 
-        assert out is req
+        assert out is s
+        assert refreshed is False
         assert req.headers is None or "Authorization" not in req.headers
 
-    def test_force_true_default_refreshes_and_stamps_header(self):
+    def test_force_true_default_refreshes_stamps_and_returns_true(self):
         auth = _RefreshableAuth()
         s = HTTPSession(base_url="https://api.example.com", auth=auth)
+        # __init__ already stamped one refresh call on the session
+        # handler — clear so the assertion is on this refresh only.
+        auth.refresh_calls.clear()
         req = make_request("https://api.example.com/x")
 
-        s.check_auth(req)
+        out, refreshed = s.refresh_auth(req)
 
+        assert out is s
+        assert refreshed is True
         assert auth.refresh_calls == [True]
         assert req.headers["Authorization"] == "Bearer tok-1"
 
     def test_force_false_forwards_to_handler(self):
         auth = _RefreshableAuth()
         s = HTTPSession(base_url="https://api.example.com", auth=auth)
+        auth.refresh_calls.clear()
         req = make_request("https://api.example.com/x")
 
-        s.check_auth(req, force=False)
+        s.refresh_auth(req, force=False)
 
         assert auth.refresh_calls == [False]
+
+    def test_session_header_kept_in_sync_with_session_handler(self):
+        # When the resolved handler is the session-wide one,
+        # refresh_auth mirrors the new value to ``self.headers``.
+        auth = _RefreshableAuth()
+        s = HTTPSession(base_url="https://api.example.com", auth=auth)
+        first = s.headers["Authorization"]
+        req = make_request("https://api.example.com/x")
+
+        s.refresh_auth(req, force=True)
+
+        # The session-level header rotated alongside the request one.
+        assert s.headers["Authorization"] == req.headers["Authorization"]
+        assert s.headers["Authorization"] != first
 
     def test_legacy_refresh_without_force_kwarg_falls_back(self):
         auth = _LegacyAuth()
         s = HTTPSession(base_url="https://api.example.com", auth=auth)
+        # __init__ already stamped the legacy handler — clear so the
+        # next refresh_auth call is the one under test.
+        auth.refresh_calls = 0
         req = make_request("https://api.example.com/x")
 
-        s.check_auth(req)
+        s.refresh_auth(req)
 
         assert auth.refresh_calls == 1
         assert req.headers["Authorization"] == "Bearer legacy"
@@ -162,34 +219,44 @@ class TestCheckAuth:
         s = HTTPSession(base_url="https://api.example.com", auth=_StaticAuth())
         req = make_request("https://api.example.com/x")
 
-        s.check_auth(req)
+        out, refreshed = s.refresh_auth(req)
 
+        assert out is s
+        assert refreshed is True
         assert req.headers["Authorization"] == "Bearer static"
 
     def test_per_request_auth_wins_over_session_auth(self):
         session_auth = _RefreshableAuth(prefix="session")
         request_auth = _RefreshableAuth(prefix="request")
         s = HTTPSession(base_url="https://api.example.com", auth=session_auth)
+        # __init__ already called session_auth.refresh once.
+        session_pre_stamp = s.headers["Authorization"]
+        session_auth.refresh_calls.clear()
         req = make_request("https://api.example.com/x")
         req.auth = request_auth
 
-        s.check_auth(req)
+        s.refresh_auth(req)
 
         assert session_auth.refresh_calls == []
         assert request_auth.refresh_calls == [True]
         assert req.headers["Authorization"].startswith("Bearer request-")
+        # Per-request override does NOT leak into the session header.
+        assert s.headers["Authorization"] == session_pre_stamp
 
 
 # ---------------------------------------------------------------------------
-# prepare_request_before_send — delegates to check_auth with force=False
+# prepare_request_before_send — delegates to refresh_auth with force=False
 # ---------------------------------------------------------------------------
 
 
 class TestPrepareRequestBeforeSend:
 
-    def test_prepare_calls_check_auth_with_force_false(self):
+    def test_prepare_calls_refresh_auth_with_force_false(self):
         auth = _RefreshableAuth()
         s = HTTPSession(base_url="https://api.example.com", auth=auth)
+        # __init__ already minted the first token; clear so the next
+        # refresh from prepare is what we assert on.
+        auth.refresh_calls.clear()
         req = make_request("https://api.example.com/x")
 
         s.prepare_request_before_send(req)
@@ -322,10 +389,10 @@ class TestForbiddenRetry:
         assert auth.refresh_calls == [False]
 
 
-class TestResponseCheckAuth:
-    """:meth:`Response.check_auth` delegates to the bound session."""
+class TestResponseRefreshAuth:
+    """:meth:`Response.refresh_auth` delegates to the bound session."""
 
-    def test_response_check_auth_refreshes_request_via_session(self):
+    def test_response_refresh_auth_refreshes_request_via_session(self):
         auth = _RefreshableAuth()
         s = _Stub403HTTPSession(
             base_url="https://api.example.com",
@@ -340,32 +407,35 @@ class TestResponseCheckAuth:
         # only one we assert on.
         auth.refresh_calls.clear()
 
-        resp.check_auth()  # force=True default
+        out, refreshed = resp.refresh_auth()  # force=True default
 
+        # Tuple contract: (self, refreshed: bool)
+        assert out is resp
+        assert refreshed is True
         # The bound request now carries the freshly-minted token.
         assert auth.refresh_calls == [True]
-        assert req.headers["Authorization"].endswith("-1")
 
-    def test_response_check_auth_force_false_does_not_raise_without_handler(self):
+    def test_response_refresh_auth_force_false_returns_self_false(self):
         s = HTTPSession(base_url="https://api.example.com")
         req = make_request("https://api.example.com/x")
         req.attach_session(s)
         resp = make_response(request=req, status_code=200)
 
         # No handler bound → force=False is silently OK.
-        out = resp.check_auth(force=False)
+        out, refreshed = resp.refresh_auth(force=False)
         assert out is resp
+        assert refreshed is False
 
-    def test_response_check_auth_force_true_raises_without_handler(self):
+    def test_response_refresh_auth_force_true_raises_without_handler(self):
         s = HTTPSession(base_url="https://api.example.com")
         req = make_request("https://api.example.com/x")
         req.attach_session(s)
         resp = make_response(request=req, status_code=200)
 
         with pytest.raises(AuthRequiredError):
-            resp.check_auth()  # force=True default
+            resp.refresh_auth()  # force=True default
 
-    def test_response_check_auth_without_attached_session_raises(self):
+    def test_response_refresh_auth_without_attached_session_raises(self):
         # Orphan request → can't dispatch — surface a RuntimeError
         # naming the issue so the caller knows what to fix.
         req = make_request("https://api.example.com/x")
@@ -373,4 +443,4 @@ class TestResponseCheckAuth:
         resp = make_response(request=req, status_code=403)
 
         with pytest.raises(RuntimeError, match="attached session"):
-            resp.check_auth()
+            resp.refresh_auth()

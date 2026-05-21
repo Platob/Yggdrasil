@@ -213,7 +213,7 @@ class AuthRequiredError(RequestError):
     Raised when an operation needs an :class:`Authorization` handler
     but none is bound — either on the request or on the session.
 
-    Fired by :meth:`Session.check_auth` when ``force=True`` (the
+    Fired by :meth:`Session.refresh_auth` when ``force=True`` (the
     default) and the caller has not configured any auth source. The
     silent no-op branch is reserved for ``force=False``, which is what
     :meth:`Session.prepare_request_before_send` uses on steady-state

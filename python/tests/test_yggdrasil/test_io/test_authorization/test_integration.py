@@ -373,9 +373,12 @@ class TestSendIntegration:
     def test_handler_invoked_per_send_for_rotating_token(self) -> None:
         # Each send hits the handler's ``authorization`` property afresh
         # — refresh-on-expiry handlers (MSAL et al.) rely on this to
-        # roll the token between calls.
+        # roll the token between calls. Session.__init__ also reads
+        # the handler once to pre-stamp ``self.headers["Authorization"]``,
+        # so the per-send tokens land at +1 relative to init.
         handler = _RotatingAuth()
         session = StubSession(auth=handler)
+        # ``Session(auth=...)`` pre-stamped one read at init → tok-1.
 
         req1 = make_request()
         session.queue(make_response(request=req1))
@@ -385,9 +388,10 @@ class TestSendIntegration:
         session.queue(make_response(request=req2))
         session.send(req2)
 
-        assert handler.calls == 2
-        assert session.calls[0].headers["Authorization"] == "Bearer tok-1"
-        assert session.calls[1].headers["Authorization"] == "Bearer tok-2"
+        # 1 init read + 2 per-send reads = 3 calls.
+        assert handler.calls == 3
+        assert session.calls[0].headers["Authorization"] == "Bearer tok-2"
+        assert session.calls[1].headers["Authorization"] == "Bearer tok-3"
 
     def test_request_handler_takes_precedence_per_call(self) -> None:
         # The per-request override is decided independently each send —
@@ -396,6 +400,7 @@ class TestSendIntegration:
         session_handler = _RotatingAuth(prefix="Session ")
         request_handler = _RotatingAuth(prefix="Request ")
         session = StubSession(auth=session_handler)
+        # session_handler.calls == 1 here (from the __init__ pre-stamp).
 
         req_override = make_request()
         req_override.auth = request_handler
@@ -406,8 +411,12 @@ class TestSendIntegration:
         session.queue(make_response(request=req_fallback))
         session.send(req_fallback)
 
+        # Override path uses request_handler (its first read → tok-1).
         assert session.calls[0].headers["Authorization"] == "Request tok-1"
-        assert session.calls[1].headers["Authorization"] == "Session tok-1"
-        # Only one handler is called per send — no double-resolve.
+        # Fallback path uses session_handler (init read was tok-1,
+        # the per-send read is tok-2).
+        assert session.calls[1].headers["Authorization"] == "Session tok-2"
+        # 1 init pre-stamp + 1 per-send on the session handler;
+        # 1 per-send on the request handler.
         assert request_handler.calls == 1
-        assert session_handler.calls == 1
+        assert session_handler.calls == 2

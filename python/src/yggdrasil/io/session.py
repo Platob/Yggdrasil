@@ -521,6 +521,14 @@ class Session(Singleton, ABC):
         kwargs.pop("singleton_ttl", None)
         probe = object.__new__(cls)
         object.__setattr__(probe, "_initialized", False)
+        # ``_in_probe`` flags this object as a throwaway used purely
+        # for key derivation. ``__init__`` paths that have user-visible
+        # side-effects on constructor arguments (e.g. reading
+        # ``auth.authorization`` on a rotating handler, opening a
+        # connection pool, hitting a credentials cache) gate on this
+        # flag so the probe stays observation-free — the real instance
+        # init runs the side-effects exactly once.
+        object.__setattr__(probe, "_in_probe", True)
         cls.__init__(probe, *args, **kwargs)
         param_names = cls._init_param_names()
         excluded = cls._identity_excluded_attrs()
@@ -557,6 +565,16 @@ class Session(Singleton, ABC):
         self.headers: Headers = Headers.from_(headers)
         self.waiting = waiting
         self.auth: Authorization | None = auth
+        # When a session-wide auth handler is bound at construction
+        # time, pre-stamp ``self.headers["Authorization"]`` so anyone
+        # inspecting the session sees the current credential without
+        # going through a request first. :meth:`refresh_auth` keeps
+        # the session header in sync on subsequent refreshes.
+        # Skipped on the singleton-key probe (see ``_singleton_key``)
+        # so rotating handlers don't tick a counter twice per
+        # constructor call.
+        if auth is not None and not getattr(self, "_in_probe", False):
+            self.headers["Authorization"] = auth.authorization
         self._lock = threading.RLock()
         self._job_pool: Optional[JobPoolExecutor] = None
         self._initialized = True
@@ -924,20 +942,30 @@ class Session(Singleton, ABC):
             "or override _build_idle_response on a custom subclass."
         )
 
-    def check_auth(
+    def refresh_auth(
         self,
         request: PreparedRequest,
         force: bool = True,
-    ) -> PreparedRequest:
+    ) -> "tuple[Session, bool]":
         """Resolve the auth handler and stamp the Authorization header.
 
         Per-request ``request.auth`` wins over the session-wide
-        ``self.auth``. When a handler is bound, ``check_auth`` calls
+        ``self.auth``. When a handler is bound, ``refresh_auth`` calls
         its ``refresh(force=force)`` if it exposes one — MSAL-style
         handlers use ``force`` to bypass the in-memory token cache
         and mint a fresh credential — then reads its ``authorization``
-        property and writes the value to
-        ``request.headers["Authorization"]``.
+        property, writes the value to ``request.headers["Authorization"]``,
+        and (when the resolved handler is the session-wide one) keeps
+        ``self.headers["Authorization"]`` in sync so the session-level
+        view stays current too.
+
+        Returns ``(self, refreshed)`` where ``refreshed`` is ``True``
+        when a handler ran and the header was stamped, ``False`` when
+        the silent no-op branch was taken (force=False + no handler).
+        Returning ``self`` lets the caller chain
+        (``session.refresh_auth(req)[0].send(req)``); the bool surfaces
+        whether the request now carries an Authorization header so a
+        retry loop can short-circuit when nothing changed.
 
         When **no** handler is bound:
 
@@ -947,8 +975,8 @@ class Session(Singleton, ABC):
           nothing to refresh — failing fast catches misconfigured
           integrations at the right line instead of letting an
           un-authenticated send go to the wire.
-        - ``force=False`` → returns the request unchanged. This is
-          the steady-state path used by
+        - ``force=False`` → returns ``(self, False)``. This is the
+          steady-state path used by
           :meth:`prepare_request_before_send`: a request to a public
           endpoint shouldn't fail just because the session doesn't
           have a token to refresh.
@@ -966,7 +994,6 @@ class Session(Singleton, ABC):
           401 when a previously-valid token has been silently rotated
           upstream.
 
-        The request is mutated in place and returned for chaining.
         Subclasses with vendor-specific auth (HMAC signing, SigV4,
         challenge-response) override this to do whatever their API
         needs while keeping the same contract.
@@ -976,14 +1003,14 @@ class Session(Singleton, ABC):
             if force:
                 from yggdrasil.exceptions import AuthRequiredError
                 raise AuthRequiredError(
-                    f"check_auth(force=True) requested but no Authorization "
+                    f"refresh_auth(force=True) requested but no Authorization "
                     f"handler is bound to the request or to {type(self).__name__}. "
                     "Bind one via Session(auth=handler), request.auth=handler, "
-                    "or call check_auth(request, force=False) if a missing "
+                    "or call refresh_auth(request, force=False) if a missing "
                     "handler should be tolerated.",
                     request=request,
                 )
-            return request
+            return self, False
         refresh = getattr(handler, "refresh", None)
         if callable(refresh):
             try:
@@ -992,10 +1019,17 @@ class Session(Singleton, ABC):
                 # Handler's refresh() doesn't accept ``force`` — fall
                 # back to a no-arg call so legacy handlers still work.
                 refresh()
+        authorization = handler.authorization
         if request.headers is None:
             request.headers = Headers()
-        request.headers["Authorization"] = handler.authorization
-        return request
+        request.headers["Authorization"] = authorization
+        # Mirror the refresh on the session-level header when the
+        # session-wide handler is what we just ran — a per-request
+        # override (request.auth) deliberately doesn't pollute the
+        # session view.
+        if handler is self.auth:
+            self.headers["Authorization"] = authorization
+        return self, True
 
     def prepare_request_before_send(self, request: PreparedRequest) -> PreparedRequest:
         """Session-wide request hook fired once per outbound request.
@@ -1014,9 +1048,9 @@ class Session(Singleton, ABC):
             request.headers.update(self.headers)
         # Steady-state requests reuse the handler's cached token; the
         # 403 retry path in HTTPSession._local_send re-calls
-        # ``check_auth`` with ``force=True`` to bypass that cache when
-        # the upstream rotated the credential.
-        self.check_auth(request, force=False)
+        # ``refresh_auth`` with ``force=True`` to bypass that cache
+        # when the upstream rotated the credential.
+        self.refresh_auth(request, force=False)
         return request
 
     def prepare_response_after_received(self, response: Response) -> Response:
