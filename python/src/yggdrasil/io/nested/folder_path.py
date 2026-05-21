@@ -271,15 +271,14 @@ class FolderPath(IO[bytes, FolderOptions]):
         for the parsing contract.
 
         ``yggmeta`` (default ``True``) enables the dot-prefixed
-        sidecar at ``<path>/.ygg/`` — see :attr:`yggmeta`.
-        :meth:`_persist_schema` (the Tabular write hook) dumps the
-        schema there so :meth:`_collect_schema` returns the typed
-        :class:`Schema` (with every :class:`Field` tag —
-        ``partition_by``, ``cluster_by``, primary keys, …) on the
-        next read without re-opening a data leaf. Disable for
-        ad-hoc folders where the sidecar would be noise (the
-        sidecar folder itself constructs with ``yggmeta=False``
-        so we never recurse).
+        sidecar at ``<path>/.ygg/``. :meth:`_persist_schema` (the
+        Tabular write hook) dumps the schema there so
+        :meth:`_collect_schema` returns the typed :class:`Schema`
+        (with every :class:`Field` tag — ``partition_by``,
+        ``cluster_by``, primary keys, …) on the next read without
+        re-opening a data leaf. Disable for ad-hoc folders where the
+        sidecar would be noise (the sidecar folder itself constructs
+        with ``yggmeta=False`` so we never recurse).
         """
         # Singleton-cached re-entry: :meth:`Singleton.__new__` returns
         # the live instance when the (url, yggmeta) key already
@@ -462,25 +461,16 @@ class FolderPath(IO[bytes, FolderOptions]):
     # ==================================================================
     # Yggmeta sidecar — folder-level metadata under ``<path>/.ygg/``
     # ==================================================================
-
-    @property
-    def yggmeta(self) -> "FolderPath | None":
-        """Sidecar :class:`FolderPath` at ``<self.path>/.ygg/``.
-
-        ``None`` when this folder was constructed with
-        ``yggmeta=False`` (the sidecar disables itself recursively
-        so the ``.ygg/`` folder never builds its own ``.ygg/.ygg/``).
-        Same concrete type as the parent so a custom
-        :class:`FolderPath` subclass keeps its overrides inside the
-        sidecar tree.
-
-        :meth:`iter_children` skips ``.``-prefixed entries by
-        default so the sidecar is invisible to data reads — calling
-        ``self.yggmeta`` is the only way to surface it.
-        """
-        if not self._yggmeta_enabled:
-            return None
-        return type(self)(path=self.path / self.YGGMETA_DIRNAME, yggmeta=False)
+    #
+    # The sidecar tree is private to :meth:`_collect_schema` /
+    # :meth:`_persist_schema` — they build the ``<path>/.ygg/...``
+    # paths inline because the sidecar folder is opened at most twice
+    # per FolderPath lifetime (one read on first ``_collect_schema``,
+    # one write per persisted schema), and the recursion guard is just
+    # ``self._yggmeta_enabled`` propagating ``yggmeta=False`` to the
+    # sidecar's own FolderPath. No public surface for fishing it out
+    # currently has a caller — add one back if a real consumer shows
+    # up.
 
     def _collect_schema(self, options: FolderOptions) -> Any:
         """Ancestor-cache / sidecar / first-batch schema collection.
