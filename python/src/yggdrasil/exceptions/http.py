@@ -85,6 +85,7 @@ __all__ = [
     "HTTPError",
     # Request-bound
     "RequestError",
+    "AuthRequiredError",
     "ConnectionError",
     "TimeoutError",
     "ConnectTimeoutError",
@@ -205,6 +206,20 @@ class RequestError(HTTPError):
     def __repr__(self) -> str:
         url = self.request.url.to_string() if self.request else "?"
         return f"{type(self).__name__}(url={url!r})"
+
+
+class AuthRequiredError(RequestError):
+    """
+    Raised when an operation needs an :class:`Authorization` handler
+    but none is bound — either on the request or on the session.
+
+    Fired by :meth:`Session.check_auth` when ``force=True`` (the
+    default) and the caller has not configured any auth source. The
+    silent no-op branch is reserved for ``force=False``, which is what
+    :meth:`Session.prepare_request_before_send` uses on steady-state
+    sends (a request to a public endpoint shouldn't fail just because
+    the session doesn't have a token to refresh).
+    """
 
 
 class ConnectionError(RequestError, _u3.NewConnectionError):  # type: ignore[misc]

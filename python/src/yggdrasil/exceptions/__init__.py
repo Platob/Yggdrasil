@@ -27,6 +27,7 @@ from __future__ import annotations
 from .base import YGGException
 from .cast import CastError
 from .http import (
+    AuthRequiredError,
     BadGatewayError,
     BadRequest,
     CacheError,
@@ -79,6 +80,7 @@ __all__ = [
     "HTTPError",
     # HTTP — request-bound
     "RequestError",
+    "AuthRequiredError",
     "ConnectionError",
     "TimeoutError",
     "ConnectTimeoutError",

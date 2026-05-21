@@ -932,15 +932,28 @@ class Session(Singleton, ABC):
         """Resolve the auth handler and stamp the Authorization header.
 
         Per-request ``request.auth`` wins over the session-wide
-        ``self.auth``; when neither is bound, the request is returned
-        untouched (callers that target unauthenticated endpoints
-        keep working). When a handler is bound, ``check_auth`` calls
+        ``self.auth``. When a handler is bound, ``check_auth`` calls
         its ``refresh(force=force)`` if it exposes one — MSAL-style
         handlers use ``force`` to bypass the in-memory token cache
         and mint a fresh credential — then reads its ``authorization``
-        property and writes the value to ``request.headers["Authorization"]``.
+        property and writes the value to
+        ``request.headers["Authorization"]``.
 
-        Two call sites:
+        When **no** handler is bound:
+
+        - ``force=True`` (default) → raises
+          :class:`~yggdrasil.exceptions.AuthRequiredError`. The caller
+          explicitly asked to force-refresh credentials and there is
+          nothing to refresh — failing fast catches misconfigured
+          integrations at the right line instead of letting an
+          un-authenticated send go to the wire.
+        - ``force=False`` → returns the request unchanged. This is
+          the steady-state path used by
+          :meth:`prepare_request_before_send`: a request to a public
+          endpoint shouldn't fail just because the session doesn't
+          have a token to refresh.
+
+        Two regular call sites:
 
         - :meth:`prepare_request_before_send` calls this with
           ``force=False`` so steady-state requests reuse the cached
@@ -960,6 +973,16 @@ class Session(Singleton, ABC):
         """
         handler = request.auth or self.auth
         if handler is None:
+            if force:
+                from yggdrasil.exceptions import AuthRequiredError
+                raise AuthRequiredError(
+                    f"check_auth(force=True) requested but no Authorization "
+                    f"handler is bound to the request or to {type(self).__name__}. "
+                    "Bind one via Session(auth=handler), request.auth=handler, "
+                    "or call check_auth(request, force=False) if a missing "
+                    "handler should be tolerated.",
+                    request=request,
+                )
             return request
         refresh = getattr(handler, "refresh", None)
         if callable(refresh):

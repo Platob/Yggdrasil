@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from yggdrasil.exceptions import AuthRequiredError
 from yggdrasil.io.authorization.base import Authorization
 from yggdrasil.io.http_ import HTTPSession
 from yggdrasil.io.session import Session
@@ -96,14 +97,34 @@ class _StaticAuth(Authorization):
 
 class TestCheckAuth:
 
-    def test_no_handler_is_noop(self):
+    def test_force_true_no_handler_raises_auth_required(self):
+        # Default force=True with no bound handler is a config error —
+        # surface it at the right line instead of letting an
+        # un-authenticated send hit the wire.
         s = HTTPSession(base_url="https://api.example.com")
         req = make_request("https://api.example.com/x")
-        # Strip any inherited Authorization so the noop branch is observable.
         if req.headers is not None:
             req.headers.pop("Authorization", None)
 
-        out = s.check_auth(req)
+        with pytest.raises(AuthRequiredError) as ctx:
+            s.check_auth(req)
+
+        # The error carries the request for downstream inspection
+        # and subclasses RequestError → HTTPError → YGGException.
+        assert ctx.value.request is req
+        from yggdrasil.exceptions import RequestError, YGGException
+        assert isinstance(ctx.value, RequestError)
+        assert isinstance(ctx.value, YGGException)
+
+    def test_force_false_no_handler_is_noop(self):
+        # Steady-state path (prepare_request_before_send): missing
+        # handler is fine, just no header gets stamped.
+        s = HTTPSession(base_url="https://api.example.com")
+        req = make_request("https://api.example.com/x")
+        if req.headers is not None:
+            req.headers.pop("Authorization", None)
+
+        out = s.check_auth(req, force=False)
 
         assert out is req
         assert req.headers is None or "Authorization" not in req.headers
@@ -299,3 +320,57 @@ class TestForbiddenRetry:
         # Only the initial prepare refresh — no force-refresh from
         # a 403 retry path.
         assert auth.refresh_calls == [False]
+
+
+class TestResponseCheckAuth:
+    """:meth:`Response.check_auth` delegates to the bound session."""
+
+    def test_response_check_auth_refreshes_request_via_session(self):
+        auth = _RefreshableAuth()
+        s = _Stub403HTTPSession(
+            base_url="https://api.example.com",
+            auth=auth,
+        )
+        s.queue(make_response(status_code=403))
+        req = make_request("https://api.example.com/x")
+        req.attach_session(s)
+        resp = s.send(req)
+
+        # Drop the refresh log so the test's force=True call is the
+        # only one we assert on.
+        auth.refresh_calls.clear()
+
+        resp.check_auth()  # force=True default
+
+        # The bound request now carries the freshly-minted token.
+        assert auth.refresh_calls == [True]
+        assert req.headers["Authorization"].endswith("-1")
+
+    def test_response_check_auth_force_false_does_not_raise_without_handler(self):
+        s = HTTPSession(base_url="https://api.example.com")
+        req = make_request("https://api.example.com/x")
+        req.attach_session(s)
+        resp = make_response(request=req, status_code=200)
+
+        # No handler bound → force=False is silently OK.
+        out = resp.check_auth(force=False)
+        assert out is resp
+
+    def test_response_check_auth_force_true_raises_without_handler(self):
+        s = HTTPSession(base_url="https://api.example.com")
+        req = make_request("https://api.example.com/x")
+        req.attach_session(s)
+        resp = make_response(request=req, status_code=200)
+
+        with pytest.raises(AuthRequiredError):
+            resp.check_auth()  # force=True default
+
+    def test_response_check_auth_without_attached_session_raises(self):
+        # Orphan request → can't dispatch — surface a RuntimeError
+        # naming the issue so the caller knows what to fix.
+        req = make_request("https://api.example.com/x")
+        req.detach_session()
+        resp = make_response(request=req, status_code=403)
+
+        with pytest.raises(RuntimeError, match="attached session"):
+            resp.check_auth()
