@@ -866,7 +866,7 @@ class FolderPath(IO[bytes, FolderOptions]):
 
     def _accepted_partition_values(
         self,
-        options: "FolderOptions",
+        options: "FolderOptions | None",
         column: str,
     ) -> "frozenset[Any] | None":
         """Return the finite accepted-value set for *column*, or ``None``.
@@ -876,8 +876,13 @@ class FolderPath(IO[bytes, FolderOptions]):
         ``options.predicate`` via :func:`extract_partition_filters`.
         Returns ``None`` when neither source pins the column to a
         finite set — the caller falls back to a full ``iterdir`` +
-        per-child prune.
+        per-child prune. ``options=None`` (the unpopulated default
+        for :meth:`_has_tabular_children` and other "is there
+        anything here?" probes) is treated the same way: no prune
+        set, no predicate, walk everything.
         """
+        if options is None:
+            return None
         prune_values = options.prune_values
         if prune_values:
             forced = prune_values.get(column)
@@ -1228,6 +1233,42 @@ class FolderPath(IO[bytes, FolderOptions]):
                     f"{first.schema.names!r}; partition_columns="
                     f"{partition_columns!r}."
                 )
+
+            # Apply mode semantics at the **folder level** before
+            # recursing — without this, a partitioned OVERWRITE
+            # would leave untouched partitions on disk (children
+            # only see the partition values that exist in the
+            # incoming batch, not the ones that previously lived
+            # there) and IGNORE / ERROR_IF_EXISTS would silently
+            # become "append at partition level".
+            action = self._resolve_action(options.mode)
+            if action is Mode.IGNORE and self._has_tabular_children():
+                return
+            if action is Mode.ERROR_IF_EXISTS and self._has_tabular_children():
+                raise FileExistsError(
+                    f"{type(self).__name__} already contains tabular files; "
+                    f"refusing to write under mode={options.mode!r}."
+                )
+            if action is Mode.OVERWRITE:
+                # Drop every existing child (files **and** partition
+                # subtrees — see :meth:`_clear_tabular_children`) so
+                # the new write fully replaces the old layout. The
+                # recursive child writes below then land as a fresh
+                # APPEND on the empty parent.
+                self._clear_tabular_children()
+
+            # Children get plain APPEND: the parent has already
+            # honoured the mode (cleared for OVERWRITE, no-op for
+            # APPEND / AUTO). UPSERT / MERGE pass through unchanged
+            # so per-partition dedup against existing rows still
+            # fires inside each child's flat branch.
+            if action is Mode.OVERWRITE or action in (
+                Mode.IGNORE, Mode.ERROR_IF_EXISTS,
+            ):
+                child_options = dataclasses.replace(options, mode=Mode.APPEND)
+            else:
+                child_options = options
+
             table = pa.Table.from_batches(materialised)
             column = table.column(head)
             for scalar in pc.unique(column.combine_chunks()):
@@ -1243,7 +1284,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 child = type(self)(path=self.path / f"{head}={encoded}")
                 self.adopt_child(child)
                 child._write_arrow_batches(
-                    iter(subset.to_batches()), options,
+                    iter(subset.to_batches()), child_options,
                 )
             self._persist_schema(first_schema, media_type=options.child_media_type)
             return
@@ -1479,16 +1520,27 @@ class FolderPath(IO[bytes, FolderOptions]):
         return False
 
     def _clear_tabular_children(self) -> None:
+        """Remove every non-private child — files **and** partition dirs.
+
+        OVERWRITE semantics require the folder to be empty of
+        tabular data before the new write lands, so a previous
+        Hive-partitioned layout (any ``<col>=<val>/`` subtree)
+        has to go too; skipping directories would leave stale
+        partitions on disk that a subsequent read would still
+        surface via :meth:`iter_children`. Dot-prefixed entries
+        (the ``.ygg/`` sidecar, transient ``.tmp`` fragments) stay
+        — :meth:`_persist_schema` immediately re-stamps the
+        sidecar after the parent finishes the write.
+        """
         for entry in self.path.iterdir():
             if entry.name.startswith("."):
                 continue
             try:
-                if entry.is_dir():
-                    continue
-            except Exception:
-                continue
-            try:
-                entry.unlink(missing_ok=True)
+                # ``Path.remove(recursive=True)`` handles both files
+                # and directories (rmtree-style for dirs); the call
+                # is best-effort so a transient race with a sibling
+                # writer doesn't poison the overwrite.
+                entry.remove(recursive=True, missing_ok=True)
             except Exception:
                 pass
 

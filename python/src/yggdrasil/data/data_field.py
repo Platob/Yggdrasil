@@ -1475,12 +1475,19 @@ class Field(BaseChildrenFields):
         if not raw:
             return None
         from yggdrasil.data.enums.media_type import MediaType
+        # ``raw.decode`` can raise ``UnicodeDecodeError`` on a
+        # corrupted metadata byte payload; ``MediaType.from_`` with
+        # ``default=None`` already short-circuits unknown mime
+        # strings without raising, but the underlying parser can
+        # still surface ``ValueError`` / ``TypeError`` on truly
+        # malformed input. Catch the narrow trio and degrade to
+        # "no media type known".
         try:
             return MediaType.from_(
                 raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw,
                 default=None,
             )
-        except Exception:
+        except (UnicodeDecodeError, ValueError, TypeError):
             return None
 
     # ==================================================================

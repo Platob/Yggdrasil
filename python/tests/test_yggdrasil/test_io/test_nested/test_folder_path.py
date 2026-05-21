@@ -129,3 +129,106 @@ class TestMediaTypeMetadata:
         # No write — schema falls back to empty / inferred, no media
         # type was ever stamped.
         assert folder.collect_schema().media_type is None
+
+
+def _partitioned_batch(part_values: list[int], ids: list[int]) -> "pa.RecordBatch":
+    """Build a RecordBatch whose ``pk`` column is tagged ``partition_by``.
+
+    Drives :meth:`FolderPath._write_arrow_batches` into the partition
+    split branch — one ``pk=<v>/`` directory per distinct value.
+    """
+    schema = pa.schema([
+        pa.field("pk", pa.int64(), metadata={b"t:partition_by": b"True"}),
+        pa.field("id", pa.int64()),
+    ])
+    return pa.record_batch(
+        [pa.array(part_values, pa.int64()), pa.array(ids, pa.int64())],
+        schema=schema,
+    )
+
+
+class TestPartitionWriteModes:
+    """Mode handling on partitioned writes (Hive-layout overwrite, ignore, …).
+
+    Bug surface: previous behaviour returned from the partition branch
+    before applying mode handling at the folder level, so OVERWRITE
+    left untouched partition directories on disk and IGNORE /
+    ERROR_IF_EXISTS silently became "append at partition level".
+    """
+
+    def test_overwrite_clears_stale_partitions(self, tmp_path) -> None:
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        # Round 1: lands two partitions (pk=1, pk=2).
+        folder.write_arrow_batches(
+            (_partitioned_batch([1, 2], [10, 20]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        assert (tmp_path / "pk=1").is_dir()
+        assert (tmp_path / "pk=2").is_dir()
+        # Round 2: OVERWRITE writes a different partition (pk=3).
+        # The previous pk=1 / pk=2 trees must be gone — otherwise a
+        # subsequent read returns stale rows from those partitions.
+        folder.write_arrow_batches(
+            (_partitioned_batch([3], [30]),),
+            options=FolderOptions(mode=Mode.OVERWRITE),
+        )
+        assert not (tmp_path / "pk=1").exists()
+        assert not (tmp_path / "pk=2").exists()
+        assert (tmp_path / "pk=3").is_dir()
+
+    def test_ignore_short_circuits_when_any_partition_present(self, tmp_path) -> None:
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (_partitioned_batch([1], [10]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        # Second write under IGNORE must NOT land a new partition.
+        folder.write_arrow_batches(
+            (_partitioned_batch([2], [20]),),
+            options=FolderOptions(mode=Mode.IGNORE),
+        )
+        assert (tmp_path / "pk=1").is_dir()
+        assert not (tmp_path / "pk=2").exists()
+
+    def test_error_if_exists_raises(self, tmp_path) -> None:
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (_partitioned_batch([1], [10]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        with pytest.raises(FileExistsError):
+            folder.write_arrow_batches(
+                (_partitioned_batch([2], [20]),),
+                options=FolderOptions(mode=Mode.ERROR_IF_EXISTS),
+            )
+
+
+class TestClearTabularChildren:
+    """``_clear_tabular_children`` must remove partition directories too."""
+
+    def test_removes_partition_subtrees_not_just_files(self, tmp_path) -> None:
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (_partitioned_batch([1, 2], [10, 20]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        assert (tmp_path / "pk=1").is_dir()
+        assert (tmp_path / "pk=2").is_dir()
+        folder._clear_tabular_children()
+        assert not (tmp_path / "pk=1").exists()
+        assert not (tmp_path / "pk=2").exists()
+        # ``.ygg/`` sidecar (dot-prefixed) survives — the persist
+        # hook will overwrite it on the next write.
+        assert (tmp_path / ".ygg").is_dir()
