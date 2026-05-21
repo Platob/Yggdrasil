@@ -112,6 +112,37 @@ class TestConstruction:
         p = VolumePath("dbfs+volume:///cat/sch/vol/x", service=service)
         assert p.full_path() == "/Volumes/cat/sch/vol/x"
 
+    def test_client_kwarg_wraps_into_service(self, client) -> None:
+        # ``client=`` is the user-facing shortcut for "bind this path
+        # to this workspace" — wraps into a fresh ``Volumes(client=…)``
+        # so ``self.client`` returns the caller's client verbatim. Was
+        # silently dropped before fixing — fell back to
+        # ``DatabricksService.current()`` which builds a default
+        # ``DatabricksClient`` against the env vars (typically empty)
+        # and then explodes inside ``make_config`` on the first SDK call.
+        p = VolumePath("/Volumes/cat/sch/vol/x", client=client)
+        assert p.client is client
+
+    def test_client_kwarg_propagates_to_children_and_parents(self, client) -> None:
+        # Parent / child paths derived via ``_from_url`` must carry the
+        # same explicit client through the URL walk.
+        p = VolumePath("/Volumes/cat/sch/vol/dir/x", client=client)
+        assert p.parent.client is client
+        assert (p / "sub").client is client
+
+    def test_distinct_clients_get_distinct_singletons(self) -> None:
+        # The singleton cache key folds ``client`` into the slot
+        # ``service`` would occupy so two callers passing different
+        # ``DatabricksClient`` instances against the same URL don't
+        # collide on the cached path.
+        c1 = MagicMock()
+        c2 = MagicMock()
+        p1 = VolumePath("/Volumes/cat/sch/vol/x", client=c1)
+        p2 = VolumePath("/Volumes/cat/sch/vol/x", client=c2)
+        assert p1 is not p2
+        assert p1.client is c1
+        assert p2.client is c2
+
 
 class TestStat:
 
