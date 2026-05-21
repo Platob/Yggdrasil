@@ -18,10 +18,11 @@ plus their config plumbing:
   ``partition_by`` tags), partition-aware read (predicate-pushed,
   sidecar-driven), the URL-driven ``static_values`` parse, and the
   ``.ygg/schema.arrow`` collect / persist round trip.
-* :class:`Session` integration — :meth:`Session._load_local_cached_response`
-  on a miss (the common case for cold cache) and on a hit (warm
-  re-fetch), plus :meth:`Session._store_local_cached_response`
-  (fire-and-forget queueing of the actual write).
+* :class:`Session` integration — :meth:`Session._load_cached_response`
+  (``source="local"``) on a miss (the common case for cold cache)
+  and on a hit (warm re-fetch), plus
+  :meth:`Session._store_cached_response` (``source="local"``,
+  fire-and-forget queueing of the actual write).
 
 Skips out-of-process work (real Databricks SQL, real disk on hot
 read benches where we use a pre-stored fixture, no network) so the
@@ -113,7 +114,7 @@ SESSION = HTTPSession(base_url="https://api.example.com/bench-cache")
 
 
 # Pre-store one response into the local cache so the
-# ``_load_local_cached_response`` hit path has something to read.
+# ``_load_cached_response`` (local) hit path has something to read.
 _LOCAL_TABULAR = CFG_LOCAL.cache_tabular()
 _LOCAL_TABULAR.write_arrow_batches(
     (RESP.to_arrow_batch(parse=False),),
@@ -379,8 +380,8 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
 
     out.append(_time_one(
-        "Session._load_local_cached_response (hit)",
-        lambda: SESSION._load_local_cached_response(REQ, CFG_LOCAL),
+        "Session._load_cached_response (local hit)",
+        lambda: SESSION._load_cached_response(REQ, CFG_LOCAL, source="local"),
         repeat=repeat, inner=500,
     ))
 
@@ -391,8 +392,8 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
     )
     _ = miss_req.public_hash
     out.append(_time_one(
-        "Session._load_local_cached_response (miss)",
-        lambda: SESSION._load_local_cached_response(miss_req, CFG_LOCAL),
+        "Session._load_cached_response (local miss)",
+        lambda: SESSION._load_cached_response(miss_req, CFG_LOCAL, source="local"),
         repeat=repeat, inner=2_000,
     ))
 
@@ -403,9 +404,9 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
     store_cfg = CacheConfig(path=tempfile.mkdtemp(prefix="ygg-bench-store-"))
     store_tabular = store_cfg.cache_tabular()
     out.append(_time_one(
-        "Session._store_local_cached_response (fire-and-forget)",
-        lambda: SESSION._store_local_cached_response(
-            RESP, store_cfg, tabular=store_tabular,
+        "Session._store_cached_response (local, fire-and-forget)",
+        lambda: SESSION._store_cached_response(
+            RESP, store_cfg, source="local", tabular=store_tabular,
         ),
         repeat=repeat, inner=500,
     ))

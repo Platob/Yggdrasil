@@ -197,29 +197,42 @@ class _FakeRemoteTabular:
             return iter(batches)
         return predicate.filter_arrow_batches(iter(batches))
 
-    def insert(
+    def write_arrow_batches(
         self,
-        batch: Any,
-        *,
-        mode: Mode = Mode.APPEND,
-        match_by: Any = None,
-        wait: bool = False,
-        prune_values: Any = None,
-        prune_by: Any = None,
-        spark_session: Any = None,
+        batches: Any,
+        options: Any = None,
+        **kwargs: Any,
     ) -> None:
-        if isinstance(batch, pa.Table):
-            new_batches = batch.to_batches()
-        elif isinstance(batch, pa.RecordBatch):
-            new_batches = [batch]
-        else:
-            new_batches = []
+        """Unified write surface — what ``Session._insert_cache`` calls.
+
+        Mirrors the real :class:`Tabular.write_arrow_batches` contract:
+        accepts an iterable of :class:`pa.RecordBatch`, reads write
+        knobs (``mode``, ``match_by``, ``wait``, ``prune_values``)
+        from :class:`CastOptions`. Records the call in ``self.inserts``
+        so existing test assertions continue to work.
+        """
+        new_batches: list[pa.RecordBatch] = []
+        for entry in batches:
+            if isinstance(entry, pa.Table):
+                new_batches.extend(entry.to_batches())
+            elif isinstance(entry, pa.RecordBatch):
+                new_batches.append(entry)
+        mode = getattr(options, "mode", None)
+        match_by_fields = getattr(options, "match_by", None)
+        match_by = (
+            tuple(f.name for f in match_by_fields)
+            if match_by_fields else None
+        )
+        wait = getattr(options, "wait", False)
+        prune_values = getattr(options, "prune_values", None)
         self.inserts.append({
             "mode": mode,
-            "match_by": tuple(match_by) if match_by else None,
+            "match_by": match_by,
             "wait": wait,
             "rows": sum(b.num_rows for b in new_batches),
-            "prune_keys": tuple(sorted(prune_values.keys())) if prune_values else (),
+            "prune_keys": (
+                tuple(sorted(prune_values.keys())) if prune_values else ()
+            ),
         })
         self.rows.extend(new_batches)
 
@@ -272,7 +285,7 @@ class TestLocalCacheSend:
         s.queue(make_response(request=req, status_code=500, body=b"boom"))
 
         # ``raise_error=False`` so the test owns the assertions —
-        # ``_store_local_cached_response`` early-exits on
+        # ``_store_cached_response`` early-exits on
         # ``response.ok=False`` so the writeback never fires.
         s.send(req, local_cache=cache, raise_error=False)
 
