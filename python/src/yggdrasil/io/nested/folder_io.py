@@ -1003,32 +1003,72 @@ class FolderIO(IO[bytes, FolderOptions]):
         subsequent reads round-trip the typed layout via
         :meth:`collect_schema` without re-opening a data leaf.
         """
+        import pyarrow.compute as pc
+
         from yggdrasil.data.schema import Schema
 
-        # Peek the first batch — even with ``options.partition_columns``
-        # pinned we still capture the schema to persist into the
-        # ``.ygg/`` sidecar so the next read picks up the typed
-        # layout. ``_chain_first`` puts the peeked batch back in front
-        # of the iterator so the downstream branches see the same
-        # stream the caller handed in.
-        batch_iter = iter(batches)
-        first = next(batch_iter, None)
-        if first is None:
+        # Materialise the input once. The partition split needs to
+        # see every batch at once (per-batch splitting scatters one
+        # part file per (batch, value) pair into the same partition
+        # directory), and even the flat-write branch needs the first
+        # batch's schema for the ``.ygg/`` sidecar — buffering up
+        # front is the simplest path that serves both.
+        materialised = [b for b in batches if b.num_rows > 0]
+        if not materialised:
             return
+        first = materialised[0]
         try:
             first_schema = Schema.from_arrow(first.schema)
         except Exception:
             first_schema = None
-        batches = _chain_first(first, batch_iter)
 
         partition_columns = self._resolve_partition_columns(
             options, batch_schema=first_schema,
         )
         if partition_columns:
-            options = dataclasses.replace(
-                options, partition_columns=partition_columns,
+            # Partition split: union the materialised batches, group
+            # by the leading partition column, and recurse into each
+            # ``<self.path>/<col>=<val>/`` with ``partition_columns``
+            # shrunk by one. The recursion lands back at the top of
+            # this method with the tail tuple empty (single-column
+            # case) or with the next level pinned (multi-level), so
+            # the nesting unwinds naturally without a separate
+            # helper. The partition column stays in the written
+            # payload — Hive convention drops it, but the cache
+            # layout keeps it so the row-level predicate on read
+            # runs against the same in-payload column without re-
+            # stamping from the directory name.
+            head, *tail = partition_columns
+            if head not in first.schema.names:
+                raise ValueError(
+                    f"FolderIO partition write: batches are missing the "
+                    f"partition column {head!r}. Schema has "
+                    f"{first.schema.names!r}; partition_columns="
+                    f"{partition_columns!r}."
+                )
+            child_options = dataclasses.replace(
+                options, partition_columns=tuple(tail),
             )
-            self._write_partitioned_batches(batches, options)
+            table = pa.Table.from_batches(materialised)
+            column = table.column(head)
+            for scalar in pc.unique(column.combine_chunks()):
+                value = scalar.as_py()
+                mask = (
+                    pc.equal(column, scalar) if value is not None
+                    else pc.is_null(column)
+                )
+                subset = table.filter(mask)
+                if subset.num_rows == 0:
+                    continue
+                encoded = _hive_encode(value)
+                child = type(self)(
+                    path=self.path / f"{head}={encoded}",
+                    static_values={head: value},
+                )
+                self.adopt_child(child)
+                child._write_arrow_batches(
+                    iter(subset.to_batches()), child_options,
+                )
             self._persist_yggmeta_schema(first_schema)
             return
 
@@ -1043,7 +1083,7 @@ class FolderIO(IO[bytes, FolderOptions]):
             )
         if action is Mode.OVERWRITE:
             self._clear_tabular_children()
-            self._write_parts(batches, options)
+            self._write_parts(materialised, options)
             self._persist_yggmeta_schema(first_schema)
             return
 
@@ -1052,98 +1092,15 @@ class FolderIO(IO[bytes, FolderOptions]):
 
         if match_by and self._has_tabular_children():
             if is_upsert:
-                self._merge_upsert(batches, match_by, options)
+                self._merge_upsert(materialised, match_by, options)
             else:
-                self._merge_append(batches, match_by, options)
+                self._merge_append(materialised, match_by, options)
             self._persist_yggmeta_schema(first_schema)
             return
 
         # Plain APPEND (or empty folder): mint a fresh part and drain.
-        self._write_parts(batches, options)
+        self._write_parts(materialised, options)
         self._persist_yggmeta_schema(first_schema)
-
-    def _write_partitioned_batches(
-        self,
-        batches: Iterable[pa.RecordBatch],
-        options: FolderOptions,
-    ) -> None:
-        """Group incoming *batches* by partition value, write each group once.
-
-        Concatenates the whole input stream into one
-        :class:`pa.Table` so the partition split is taken **across
-        every incoming batch at once** — without this aggregation a
-        streaming input with the same partition value scattered
-        across multiple batches would scatter one ``part-*.<ext>``
-        per (batch, partition-value) pair into the same partition
-        directory; with it, each partition receives exactly one
-        recursive write call carrying every matching row, so the
-        per-partition leaf collapses to a single part file (and
-        OVERWRITE mode works correctly — the second batch can't
-        clobber the first).
-
-        Per distinct partition value the rows are filtered out of
-        the union table, the per-partition :class:`FolderIO` is
-        minted at ``<self.path>/<col>=<val>/``, and the recursion
-        descends with ``partition_columns`` shrunk by one — the
-        nesting unwinds naturally, and when the tail is empty the
-        recursive call lands in the flat-write branch above and
-        mints a ``part-*.<ext>`` leaf.
-
-        The partition column stays in the written payload (Hive
-        convention is to drop it, but the cache layout deliberately
-        keeps it — the row-level predicate at the read side runs
-        against the same in-payload column so the read doesn't have
-        to re-stamp from the directory name).
-        """
-        import pyarrow.compute as pc
-
-        head, *tail = options.partition_columns
-        tail_tuple: "tuple[str, ...]" = tuple(tail)
-        # Build the child write options once — same shape minus the
-        # consumed partition column, same mode / match_by / media
-        # type so the per-partition append behaves identically to the
-        # flat case.
-        child_options = dataclasses.replace(
-            options, partition_columns=tail_tuple,
-        )
-
-        # Concat every incoming batch into one table so the partition
-        # split is taken across the WHOLE stream, not per-batch.
-        # ``pa.Table.from_batches`` skips zero-row inputs by default
-        # and zero-copies the rest into a chunked table.
-        materialised = [b for b in batches if b.num_rows > 0]
-        if not materialised:
-            return
-        if head not in materialised[0].schema.names:
-            raise ValueError(
-                f"FolderIO partition write: batches are missing the "
-                f"partition column {head!r}. Schema has "
-                f"{materialised[0].schema.names!r}; partition_columns="
-                f"{options.partition_columns!r}."
-            )
-        table = pa.Table.from_batches(materialised)
-        column = table.column(head)
-        distinct = pc.unique(column.combine_chunks())
-
-        for scalar in distinct:
-            value = scalar.as_py()
-            mask = (
-                pc.equal(column, scalar) if value is not None
-                else pc.is_null(column)
-            )
-            subset = table.filter(mask)
-            if subset.num_rows == 0:
-                continue
-            encoded = _hive_encode(value)
-            child_path = self.path / f"{head}={encoded}"
-            child = type(self)(
-                path=child_path,
-                static_values={head: value},
-            )
-            self.adopt_child(child)
-            child._write_arrow_batches(
-                iter(subset.to_batches()), child_options,
-            )
 
     def _write_parts(
         self,
