@@ -167,6 +167,7 @@ def _insert_cache(
     *,
     mode: "Mode | None" = None,
     spark_session: Optional["SparkSession"] = None,
+    prune_values: "Mapping[str, Any] | None" = None,
     raise_error: bool = False,
 ) -> None:
     """Write *batch* to any cache backend through the unified surface.
@@ -180,14 +181,15 @@ def _insert_cache(
 
     ``cache_cfg.match_by_columns`` rides through
     :attr:`CastOptions.match_by` so MERGE-mode writes (UPSERT)
-    dedup on the right keys; ``prune_values`` rides through
-    :attr:`CastOptions.prune_values` — the remote backend turns
-    ``{"partition_key": <ints>, "public_hash": <ints>}`` into a
-    Delta MERGE narrow-target predicate (partition pruning +
-    IN-set narrowing), the local backend uses it for read-time
-    partition probes (writes ignore it since the partition layout
-    is driven by the batch's per-field ``t:partition_by``
-    metadata).
+    dedup on the right keys. ``prune_values`` rides through
+    :attr:`CastOptions.prune_values` and is **caller-supplied** —
+    the remote backend turns ``{"partition_key": <ints>,
+    "public_hash": <ints>}`` into a Delta MERGE narrow-target
+    predicate (partition pruning + IN-set narrowing), the local
+    :class:`FolderPath` ignores it on writes (partition layout is
+    driven by the batch's per-field ``t:partition_by`` metadata).
+    Default ``None`` keeps the local hot path free of the dict
+    build the local backend wouldn't use anyway.
 
     Errors are caught and logged by default — a failed cache write
     must not poison the request flow that just produced the
@@ -199,16 +201,6 @@ def _insert_cache(
     n_rows = batch.num_rows if hasattr(batch, "num_rows") else 0
     if n_rows == 0:
         return
-    # ``prune_values`` is a column → array map. ``batch[col]`` works
-    # on both ``pa.RecordBatch`` and ``pa.Table``; the underlying
-    # backends consume it through ``CastOptions.prune_values``.
-    try:
-        prune_values = {
-            "partition_key": batch["partition_key"],
-            "public_hash":   batch["public_hash"],
-        }
-    except (KeyError, IndexError):
-        prune_values = None
     from yggdrasil.data.options import CastOptions
     batches: "Iterable[pa.RecordBatch]"
     if isinstance(batch, pa.Table):
@@ -230,6 +222,21 @@ def _insert_cache(
         LOGGER.debug(
             "Cache write failed for %r: %s", tabular, exc,
         )
+
+
+def _cache_prune_values_for(batch: "pa.RecordBatch | pa.Table") -> "dict[str, Any]":
+    """Return the MERGE narrow-target prune set for *batch*.
+
+    ``{"partition_key": <column>, "public_hash": <column>}`` — both
+    int64 so the IN-set literal stays compact. The columns are read
+    straight off the batch (zero-copy reference to the data we're
+    about to insert), so the caller doesn't materialise anything new
+    — they're naming the columns the remote MERGE should narrow on.
+    """
+    return {
+        "partition_key": batch["partition_key"],
+        "public_hash":   batch["public_hash"],
+    }
 
 
 def _encode_request_data(
@@ -688,6 +695,15 @@ class Session(Singleton, ABC):
             return
         _maybe_autocompress_body_for_cache(response)
         batch = response.to_arrow_batch(parse=False)
+        # Prune values matter for the remote MERGE narrow-target
+        # path; the local FolderPath ignores them on writes (it
+        # splits by partition automatically from the batch's
+        # ``t:partition_by`` schema metadata). Skip the build for
+        # local so the cache hot path doesn't pay the dict-build
+        # the local backend wouldn't use.
+        prune_values = (
+            _cache_prune_values_for(batch) if source == "remote" else None
+        )
         if async_write is None:
             async_write = (source == "local")
         if async_write:
@@ -698,6 +714,7 @@ class Session(Singleton, ABC):
                 batch,
                 mode=mode,
                 spark_session=spark_session,
+                prune_values=prune_values,
             ).fire_and_forget()
         else:
             _insert_cache(
@@ -706,6 +723,7 @@ class Session(Singleton, ABC):
                 batch,
                 mode=mode,
                 spark_session=spark_session,
+                prune_values=prune_values,
             )
 
     @classmethod
@@ -1868,7 +1886,10 @@ class Session(Singleton, ABC):
                 [Response.values_to_arrow_batch(group_responses)]
             )
             _insert_cache(
-                cfg.tabular, cfg, batches, mode=mode, raise_error=True,
+                cfg.tabular, cfg, batches,
+                mode=mode,
+                prune_values=_cache_prune_values_for(batches),
+                raise_error=True,
             )
 
         self._run_concurrently(
