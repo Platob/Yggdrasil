@@ -3640,3 +3640,23 @@ def _local_path_for_handle(obj: Any) -> Optional[str]:
 # sites that still import ``Holder`` continue to work — every Holder
 # IS now an IO.
 Holder = IO
+
+
+# ---------------------------------------------------------------------------
+# Cast registry — Any → IO / Holder routes through :meth:`IO.from_`
+# ---------------------------------------------------------------------------
+
+from yggdrasil.data.cast.registry import register_converter  # noqa: E402
+
+
+@register_converter(Any, IO)
+def any_to_holder(value: Any, opts: Any = None) -> IO:
+    """Coerce *value* to an :class:`IO` (a.k.a. :class:`Holder`).
+
+    Thin wrapper over :meth:`IO.from_` — recognises ``bytes`` /
+    ``bytearray`` / ``memoryview``, ``str`` / :class:`pathlib.PurePath`
+    / :class:`URL` (routed to the URL-scheme storage class), live file
+    handles, other :class:`IO` instances (idempotent), and falls back
+    to a drained :class:`MemoryStream` for generic file-likes.
+    """
+    return IO.from_(value)
