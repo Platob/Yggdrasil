@@ -165,23 +165,30 @@ def _insert_local_cache(
     cache_cfg: CacheConfig,
     batch: pa.RecordBatch,
 ) -> None:
-    """Append *batch* to the partitioned local cache via :meth:`Tabular.insert`.
+    """Append *batch* to the partitioned local cache.
 
     Single-call write that the Session fires either inline (single
-    response) or in bulk (backfill). Routes through the same
-    :meth:`Tabular.insert` surface the remote cache uses, with the
-    cache's mode + ``partition_columns=("partition_key",)`` set so
-    the FolderIO splits the batch by partition value and mints one
-    ``part-*.<ext>`` per directory. Errors are swallowed and logged
-    — a cache miss-write must not poison the request flow.
+    response) or in bulk (backfill). Goes through the canonical
+    :meth:`Tabular.write_arrow_batches` surface with a
+    :class:`FolderOptions` carrying the cache's mode + the
+    :meth:`CacheConfig.partition_columns` set (driven off
+    :data:`RESPONSE_SCHEMA`'s ``partition_by`` fields), so the
+    FolderIO splits the batch by partition value and mints one
+    ``part-*.<ext>`` per ``<col>=<val>/`` directory. Errors are
+    swallowed and logged — a cache miss-write must not poison the
+    request flow.
     """
+    from yggdrasil.io.nested.folder_io import FolderOptions
+
     if batch is None or batch.num_rows == 0:
         return
     try:
-        tabular.insert(
-            batch,
-            mode=cache_cfg.mode,
-            partition_columns=CacheConfig.LOCAL_CACHE_PARTITION_COLUMNS,
+        tabular.write_arrow_batches(
+            (batch,),
+            options=FolderOptions(
+                mode=cache_cfg.mode,
+                partition_columns=cache_cfg.partition_columns(),
+            ),
         )
     except Exception as exc:
         LOGGER.debug(
@@ -524,7 +531,7 @@ class Session(Singleton, ABC):
         predicate = cache_cfg.make_lookup_predicate(request=request)
         opts = FolderOptions(
             predicate=predicate,
-            partition_columns=CacheConfig.LOCAL_CACHE_PARTITION_COLUMNS,
+            partition_columns=cache_cfg.partition_columns(),
         )
         for batch in tabular.read_arrow_batches(options=opts):
             for resp in Response.from_arrow_tabular(batch):
@@ -1208,7 +1215,7 @@ class Session(Singleton, ABC):
         predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
         opts = FolderOptions(
             predicate=predicate,
-            partition_columns=CacheConfig.LOCAL_CACHE_PARTITION_COLUMNS,
+            partition_columns=cfg.partition_columns(),
         )
 
         result_map: dict[tuple, Response] = {}
@@ -1793,7 +1800,7 @@ class Session(Singleton, ABC):
             tabular = eff.cache_tabular(session=self)
             # One C++ struct walk per bucket beats N per-response
             # writes — same shape :meth:`_persist_remote` uses on
-            # the SQL side. ``Tabular.insert(..., partition_columns=...)``
+            # the SQL side. The folder's ``_write_arrow_batches``
             # splits the batch back out by ``partition_key`` so each
             # response still lands under its own
             # ``partition_key=<v>/`` directory.

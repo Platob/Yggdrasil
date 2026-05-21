@@ -708,12 +708,24 @@ class CacheConfig(_ConfigBase):
             object.__setattr__(self, "path", self.local_cache_folder(session=session))
         return str(self.path)
 
-    #: Partition columns the local-cache :class:`FolderIO` lays out
-    #: on disk. Mirrors the partition_by column declared on
-    #: :data:`RESPONSE_SCHEMA` so lookup predicates that filter by
-    #: ``partition_key`` skip whole partition directories at the
-    #: listing step.
-    LOCAL_CACHE_PARTITION_COLUMNS: ClassVar[tuple[str, ...]] = ("partition_key",)
+    @classmethod
+    def partition_columns(cls) -> tuple[str, ...]:
+        """Partition columns the cache lays out on disk / Delta partitions.
+
+        Driven straight off :data:`RESPONSE_SCHEMA` — every field
+        tagged ``partition_by=True`` becomes a partition level, in
+        schema-declaration order. Same source of truth the remote
+        :class:`Tabular`-backed cache reads from when issuing its
+        SQL ``partition_key IN (...)`` prune, so the local
+        :class:`FolderIO` Hive layout stays in lockstep with the
+        remote table's partition columns automatically — extend the
+        schema with a second ``partition_by`` field (e.g. a daily
+        bucket alongside ``partition_key``) and both backends pick
+        it up without a CacheConfig change.
+        """
+        return tuple(
+            f.name for f in RESPONSE_SCHEMA.children if f.partition_by
+        )
 
     def cache_tabular(
         self, session: "Session | None" = None,
@@ -736,14 +748,14 @@ class CacheConfig(_ConfigBase):
           materialised via :meth:`local_cache_folder` and memoised
           back on :attr:`path` so the next call short-circuits.
 
-        With the on-disk layout being Hive-partitioned by
-        ``partition_key`` (see
-        :attr:`LOCAL_CACHE_PARTITION_COLUMNS`), the local Folder and
-        the remote Table accept the same logical lookup primitive —
-        the :class:`Predicate` built by :meth:`make_lookup_predicate`
-        / :meth:`make_batch_lookup_predicate` — and the same
-        :meth:`Tabular.insert` write call. Returns ``None`` when the
-        cache is fully disabled.
+        The on-disk layout is Hive-partitioned by whichever fields
+        :meth:`partition_columns` reports (RESPONSE_SCHEMA's
+        ``partition_by`` set — ``partition_key`` today), so the
+        local Folder and the remote Table accept the same logical
+        lookup primitive — the :class:`Predicate` built by
+        :meth:`make_lookup_predicate` /
+        :meth:`make_batch_lookup_predicate` — and the same
+        :meth:`Tabular.write_arrow_batches` write call.
         """
         if self.tabular is not None:
             return self.tabular

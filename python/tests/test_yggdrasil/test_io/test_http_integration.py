@@ -327,11 +327,15 @@ class TestLocalCacheIntegration:
         :meth:`Session.send` writeback produces. Skips the
         ``response.ok`` guard so fixtures can seed 4xx / 5xx rows.
         """
+        from yggdrasil.io.nested.folder_io import FolderOptions
+
         tabular = cache.cache_tabular()
-        tabular.insert(
-            response.to_arrow_batch(parse=False),
-            mode=cache.mode,
-            partition_columns=CacheConfig.LOCAL_CACHE_PARTITION_COLUMNS,
+        tabular.write_arrow_batches(
+            (response.to_arrow_batch(parse=False),),
+            options=FolderOptions(
+                mode=cache.mode,
+                partition_columns=cache.partition_columns(),
+            ),
         )
 
     def test_writeback_persists_response(self, tmp_path) -> None:

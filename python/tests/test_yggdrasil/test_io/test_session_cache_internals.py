@@ -220,9 +220,9 @@ class TestPartitionedLocalCache:
     plus the listing-time partition prune on
     :meth:`FolderIO.iter_children` shrinking the read to only the
     matching directories. Both write and read go through the same
-    :meth:`Tabular.insert` / :meth:`Tabular.read_arrow_batches`
-    calls the Session uses, so the test stays representative of
-    the production path.
+    :meth:`Tabular.write_arrow_batches` /
+    :meth:`Tabular.read_arrow_batches` calls the Session uses, so
+    the test stays representative of the production path.
     """
 
     def _seed(self, tmp_path: Path, *requests) -> tuple[CacheConfig, "Any"]:
@@ -230,12 +230,14 @@ class TestPartitionedLocalCache:
 
         cfg = CacheConfig(path=str(tmp_path))
         tabular = cfg.cache_tabular()
+        opts = FolderOptions(
+            mode=cfg.mode,
+            partition_columns=cfg.partition_columns(),
+        )
         for req in requests:
             resp = make_response(request=req, body=b'{"ok":true}')
-            tabular.insert(
-                resp.to_arrow_batch(parse=False),
-                mode=cfg.mode,
-                partition_columns=CacheConfig.LOCAL_CACHE_PARTITION_COLUMNS,
+            tabular.write_arrow_batches(
+                (resp.to_arrow_batch(parse=False),), options=opts,
             )
         return cfg, tabular
 
@@ -243,7 +245,7 @@ class TestPartitionedLocalCache:
         from yggdrasil.io.nested.folder_io import FolderOptions
         return list(tabular.read_arrow_batches(options=FolderOptions(
             predicate=predicate,
-            partition_columns=CacheConfig.LOCAL_CACHE_PARTITION_COLUMNS,
+            partition_columns=CacheConfig.partition_columns(),
         )))
 
     def test_writes_land_under_partition_key_directory(self, tmp_path) -> None:
