@@ -324,15 +324,21 @@ class DatabricksPath(DatabricksResource, RemotePath):
         distinct services (cross-workspace fixtures) stay distinct
         singletons.
         """
-        if url is None and isinstance(data, URL):
-            url = data
-        elif url is None and isinstance(data, str):
-            url = URL.from_(_coerce_to_url_str(data))
         if url is None:
-            # Without a URL there's no canonical identity — fall through
-            # to ``id``-based hashing by returning a unique sentinel.
-            return (cls, object())
-        return (cls, str(url), service)
+            if isinstance(data, URL):
+                url = data
+            elif isinstance(data, str):
+                url = URL.from_(_coerce_to_url_str(data))
+            else:
+                # Without a URL there's no canonical identity — fall
+                # through to ``id``-based hashing by returning a unique
+                # sentinel.
+                return (cls, object())
+        # ``URL`` is hashable (``hash(self.to_string())``) and compares
+        # field-by-field — it works as a dict key directly. Drop the
+        # ``str(url)`` round trip that the hot parent-walk loop was
+        # paying on every step.
+        return (cls, url, service)
 
     # ==================================================================
     # Construction — dispatch on the abstract base, allocate on subclasses
@@ -372,8 +378,18 @@ class DatabricksPath(DatabricksResource, RemotePath):
         can skip the second parse.
         """
         if cls is not DatabricksPath:
+            # Hot path: explicit ``url=`` kwarg with no ``data=`` to
+            # resolve. Sibling construction (``_from_url`` /
+            # ``_url_parent`` / ``joinpath``) and the ``_ls`` listing
+            # loop all hit this shape, so the parent-walk inner loop
+            # skips the dispatcher, the stash bookkeeping, and the
+            # ``getattr(instance, "_initialized")`` probe entirely —
+            # straight through to ``Holder.__new__`` →
+            # ``Singleton.__new__``.
+            if url is not None and data is None:
+                return super().__new__(cls, data=None, url=url, **kwargs)
             normalized: "URL | None" = None
-            if url is None and data is not None:
+            if data is not None:
                 _, normalized = _resolve_databricks_subclass(data=data)
                 if normalized is not None:
                     url = normalized

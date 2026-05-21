@@ -138,6 +138,20 @@ class RemotePath(Path):
             value = cls.DEFAULT_BUFFER_SIZE
         if value is None:
             return None
+        # Plain non-negative ``int`` covers the default buffer size and
+        # every realistic caller (``buffersize=4 * 1024 * 1024``,
+        # ``buffersize=None``, ``buffersize=...``). Bypass the
+        # ``ByteUnit.parse_size`` round trip — five isinstance probes
+        # plus a function-call frame — when we already have the
+        # canonical type. ``bool`` is an ``int`` subclass; reject it
+        # before the fast path so ``buffersize=True`` still raises.
+        if type(value) is int:
+            if value < 0:
+                raise ValueError(
+                    f"buffersize must be a non-negative byte count "
+                    f"(int / ByteUnit / size string / None), got {value!r}"
+                )
+            return value if value > 0 else None
         from yggdrasil.data.enums.byteunit import ByteUnit
         try:
             n = ByteUnit.parse_size(value)

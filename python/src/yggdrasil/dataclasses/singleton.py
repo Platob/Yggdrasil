@@ -116,7 +116,21 @@ class Singleton:
             object.__setattr__(instance, "_singleton_key_", key)
             return instance
 
+        # Lock-free hot read: :class:`ExpiringDict.get` is atomic under
+        # the GIL (one ``dict.get`` + one wall-clock read) and the
+        # steady-state path is "instance is already cached" — every
+        # ``RemotePath`` parent walk, ``joinpath`` traversal, and
+        # repeat construction lands here. Skip the ``RLock`` round
+        # trip for the hit and only pay it on miss when we have to
+        # serialise an insert.
+        existing = cls._INSTANCES.get(key)
+        if existing is not None:
+            return existing
+
         with cls._INSTANCES_LOCK:
+            # Re-check under the lock: a concurrent constructor may
+            # have raced past the unlocked probe above and inserted
+            # the same key while we were reaching for the lock.
             existing = cls._INSTANCES.get(key)
             if existing is not None:
                 return existing

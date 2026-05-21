@@ -404,6 +404,14 @@ class URL(os.PathLike):
     # mode-keyed cache turns the second-and-later call into a dict
     # lookup. ``None`` means "not computed yet for this mode".
     _anonymized_cache: dict | None = field(default=None, init=False, repr=False, compare=False)
+    # Memoised :attr:`parent` URL. ``parent`` is hit by every "walk
+    # up the tree" iteration in path registries, listings, and
+    # singleton lookups — caching the result turns the per-call
+    # ``_replace_path`` + slot reset chain into a slot read, and
+    # carries the parent's ``_str_enc`` cache forward so follow-up
+    # ``str(url.parent)`` calls in singleton keys collapse to a
+    # local hit. ``None`` means "not computed yet".
+    _parent_url: "URL | None" = field(default=None, init=False, repr=False, compare=False)
 
     def __hash__(self):
         return hash(self.to_string())
@@ -584,21 +592,31 @@ class URL(os.PathLike):
         String-level walk rather than ``PurePosixPath(...).parent`` —
         ``parent`` is hit by every "walk up the tree" iteration in path
         registries and listings; ``PurePosixPath`` allocates a fresh
-        object each call.
+        object each call. The computed parent is memoised on the
+        instance via :attr:`_parent_url` so the second-and-later
+        access — every iteration of a parent-walk loop — collapses
+        to a slot read.
         """
+        cached = self._parent_url
+        if cached is not None:
+            return cached
         path = self.path
         if not path or path == "/":
             # Root is its own parent (pathlib semantics) and also the
             # sensible answer when path is empty (the dataclass default
             # is "/", so "" shouldn't occur in practice but guard anyway).
-            return self._replace_path("/")
-        # Strip trailing slashes (``"a/b/c/" → "a/b/c"`` so we don't
-        # peel off the empty tail and end up at the same path).
-        stripped = path.rstrip("/")
-        idx = stripped.rfind("/")
-        if idx <= 0:
-            return self._replace_path("/")
-        return self._replace_path(stripped[:idx])
+            result = self._replace_path("/")
+        else:
+            # Strip trailing slashes (``"a/b/c/" → "a/b/c"`` so we don't
+            # peel off the empty tail and end up at the same path).
+            stripped = path.rstrip("/")
+            idx = stripped.rfind("/")
+            if idx <= 0:
+                result = self._replace_path("/")
+            else:
+                result = self._replace_path(stripped[:idx])
+        object.__setattr__(self, "_parent_url", result)
+        return result
 
     @property
     def parents(self) -> tuple[URL, ...]:
@@ -1282,6 +1300,7 @@ class URL(os.PathLike):
         setattr_(new, "_str_raw", None)
         setattr_(new, "_anonymized", None)
         setattr_(new, "_anonymized_cache", None)
+        setattr_(new, "_parent_url", None)
         return new
 
     @property

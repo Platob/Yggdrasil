@@ -25,6 +25,7 @@ from typing import Callable
 from unittest.mock import Mock
 
 from yggdrasil.aws.fs.path import S3Path
+from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.io.path.remote_path import RemotePath
 from yggdrasil.io.url import URL
 
@@ -66,6 +67,19 @@ def _fmt(r: dict) -> str:
 # ---------------------------------------------------------------------------
 # Mock client builders — return canned boto-shaped responses
 # ---------------------------------------------------------------------------
+
+
+def _stub_service(body_bytes: bytes = b"") -> Mock:
+    """Return a mock :class:`S3Service` whose ``boto_client`` is a
+    canned boto-shaped mock.
+
+    :class:`S3Path` reaches the boto client through
+    ``self.service.boto_client`` — wiring a service-shaped mock keeps
+    the construction path independent of real AWS credentials.
+    """
+    svc = Mock(spec=S3Service)
+    svc.boto_client = _stub_client(body_bytes)
+    return svc
 
 
 def _stub_client(body_bytes: bytes = b"") -> Mock:
@@ -124,21 +138,21 @@ class _ReadOnce:
 def scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
 
-    client = _stub_client(b"x" * 4096)
+    service = _stub_service(b"x" * 4096)
 
     # Singleton cache — same URL every call.
     RemotePath._INSTANCES.clear()
-    S3Path("s3://bucket/key.parquet", client=client)  # prime
+    S3Path("s3://bucket/key.parquet", service=service)  # prime
     out.append(_time_one(
         "S3Path(str) singleton hit",
-        lambda: S3Path("s3://bucket/key.parquet", client=client),
+        lambda: S3Path("s3://bucket/key.parquet", service=service),
         repeat=repeat, inner=20_000,
     ))
 
     url_obj = URL.from_("s3://bucket/key.parquet")
     out.append(_time_one(
         "S3Path(url=URL) singleton hit",
-        lambda: S3Path(url=url_obj, client=client),
+        lambda: S3Path(url=url_obj, service=service),
         repeat=repeat, inner=50_000,
     ))
 
@@ -154,7 +168,7 @@ def scenarios(repeat: int) -> list[dict]:
         RemotePath._INSTANCES.clear()
         u = fresh_urls[fresh_idx[0] % len(fresh_urls)]
         fresh_idx[0] += 1
-        S3Path(url=u, client=client)
+        S3Path(url=u, service=service)
 
     out.append(_time_one(
         "S3Path(url=fresh) singleton miss",
@@ -165,14 +179,14 @@ def scenarios(repeat: int) -> list[dict]:
     # Traversal — parent walk + joinpath. Hot in folder readers,
     # Delta replay, partition discovery.
     RemotePath._INSTANCES.clear()
-    deep = S3Path("s3://bucket/a/b/c/d/e/file.parquet", client=client)
+    deep = S3Path("s3://bucket/a/b/c/d/e/file.parquet", service=service)
     out.append(_time_one(
         "S3Path.parent (5 levels)",
         lambda: _walk_parents(deep, 5),
         repeat=repeat, inner=5_000,
     ))
 
-    base = S3Path("s3://bucket/base/", client=client)
+    base = S3Path("s3://bucket/base/", service=service)
     out.append(_time_one(
         "S3Path.joinpath('sub','file.csv')",
         lambda: base.joinpath("sub", "file.csv"),
@@ -190,7 +204,7 @@ def scenarios(repeat: int) -> list[dict]:
     ))
 
     # Stat — warm cache hit (post-priming round-trip).
-    primed = S3Path("s3://bucket/key.parquet", client=client)
+    primed = S3Path("s3://bucket/key.parquet", service=service)
     primed.exists()  # prime cache
     out.append(_time_one(
         "S3Path.exists() (cache warm)",
@@ -226,7 +240,7 @@ def scenarios(repeat: int) -> list[dict]:
     # Listing — every page hit yields N children; each child pays
     # ``_make_child`` + ``_from_url``. The mock returns 32 children
     # per page.
-    listing_root = S3Path("s3://bucket/prefix/", client=_stub_client())
+    listing_root = S3Path("s3://bucket/prefix/", service=_stub_service())
     out.append(_time_one(
         "S3Path._ls (32 children per page)",
         lambda: _exhaust(listing_root._ls(recursive=False)),

@@ -489,13 +489,19 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         distinct from ``self.url`` (i.e., not at the root). Subclasses
         without a meaningful URL hierarchy (:class:`Memory`'s
         synthetic ``mem://...`` URLs) override to return ``None``.
+
+        Detect "at the root" by reading the URL's ``path`` directly
+        rather than computing ``url.parent`` and comparing — saves the
+        7-slot ``URL.__eq__`` walk on every parent-walk iteration,
+        which the cached ``URL.parent`` cannot.
         """
-        if self._url is None:
+        url = self._url
+        if url is None:
             return None
-        parent_url = self._url.parent
-        if parent_url == self._url:
+        path = url.path
+        if not path or path == "/":
             return None
-        return self._from_url(parent_url)
+        return self._from_url(url.parent)
 
     @property
     def parents(self) -> "Iterator[IO]":
