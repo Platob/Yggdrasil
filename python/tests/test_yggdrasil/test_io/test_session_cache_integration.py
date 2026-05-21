@@ -111,7 +111,7 @@ def _seed_local(cache: CacheConfig, response: Response) -> None:
     exactly. Skips the ``response.ok`` guard the production path
     enforces so fixtures can seed 4xx / 5xx rows.
     """
-    from yggdrasil.io.nested.folder_io import FolderOptions
+    from yggdrasil.io.nested.folder_path import FolderOptions
 
     tabular = cache.cache_tabular()
     tabular.write_arrow_batches(

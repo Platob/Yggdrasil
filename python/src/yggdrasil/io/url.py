@@ -284,7 +284,7 @@ def _decode_maybe(value: str, decode: bool) -> str:
 # Hive partition layout — ``<col>=<val>/`` directory encoding
 # ---------------------------------------------------------------------------
 #
-# Used by :class:`yggdrasil.io.nested.folder_io.FolderIO` to lay out
+# Used by :class:`yggdrasil.io.nested.folder_path.FolderPath` to lay out
 # tabular folders the same way Hive / Spark / Delta do, so the on-disk
 # tree round-trips through any partition-aware reader. The helpers
 # live here next to the URL-component encoders because the convention

@@ -1,9 +1,18 @@
 """Filesystem folder of tabular files.
 
-:class:`FolderIO` is a :class:`Tabular` over a directory whose
+:class:`FolderPath` is a :class:`Tabular` over a directory whose
 entries are tabular files (parquet, csv, arrow IPC, ndjson, …) and /
 or sub-directories. The class has no byte buffer of its own — its
 state is the bound :attr:`path` plus the children walk.
+
+It is :class:`Singleton`-cached with a 15-minute TTL keyed on the
+folder's URL string + the ``yggmeta`` flag, so every
+``FolderPath(path=p)`` and every recursive
+``iter_children`` /  partition-candidate probe with the same URL
+hands back the same live instance. The schema cache,
+``free_columns`` memo, and Hive ``static_values`` cache stay warm
+across the whole ``send_many`` cache-scan loop — see
+``_singleton_key``.
 
 Reads
 -----
@@ -14,7 +23,7 @@ non-private entry:
 * Files resolve through :class:`MediaType.from_` (extension first,
   magic-byte fallback) to a :class:`Tabular` leaf, or to a generic
   :class:`BytesIO` if the resolution fails.
-* Directories come back as a fresh :class:`FolderIO` of the same
+* Directories come back as a fresh :class:`FolderPath` of the same
   concrete class, so a tree of folders flattens transparently into
   one batch stream.
 
@@ -40,12 +49,12 @@ Writes
 :meth:`make_child` mints ``part-{epoch_ms}-{seed}.{ext}`` under
 :attr:`path` and returns a closed :class:`Tabular` leaf bound to
 the new path. The default writer extension is configurable on
-:class:`FolderOptions` via ``child_extension``; the default is
-``"arrow"`` (Arrow IPC) — single-pass column-oriented encoding,
-no row-group footer to rewrite on append, and a write-side that
-matches the in-memory batch shape almost 1:1, so it's the
-cheapest format to land a stream of small batches into. Callers
-that want parquet supply ``FolderOptions(child_extension="parquet")``.
+:class:`FolderOptions` via ``child_media_type``; the default is
+Arrow IPC — single-pass column-oriented encoding, no row-group
+footer to rewrite on append, and a write-side that matches the
+in-memory batch shape almost 1:1, so it's the cheapest format to
+land a stream of small batches into. Callers that want parquet
+supply ``FolderOptions(child_media_type=MediaTypes.PARQUET)``.
 
 When the incoming data carries a schema with ``partition_by``-
 tagged children, the folder aggregates every batch into one
@@ -70,6 +79,7 @@ import dataclasses
 import os
 import time
 from collections.abc import Mapping
+from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
@@ -77,6 +87,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.enums.media_type import MediaType, MediaTypes
+from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
@@ -86,7 +97,15 @@ if TYPE_CHECKING:
     from yggdrasil.io.path import Path
 
 
-__all__ = ["FolderIO", "FolderOptions"]
+__all__ = ["FolderPath", "FolderOptions"]
+
+
+# 15-minute TTL for the FolderPath singleton cache. The cache holds
+# the schema, free_columns memo, and Hive static_values lookup that
+# every send_many cache-scan loop walks; collapsing repeat
+# constructors onto one instance keeps those warm across calls
+# without leaking across the lifetime of long-running workers.
+_FOLDER_PATH_SINGLETON_TTL: float = 15.0 * 60.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -111,7 +130,7 @@ class FolderOptions(CastOptions):
     #: Source priority (most specific wins) when the folder needs to
     #: resolve the layout: the incoming batch's
     #: ``Schema.from_arrow(batch.schema)`` on writes, then
-    #: :meth:`FolderIO.collect_schema` (the persisted ``.ygg/`` sidecar
+    #: :meth:`FolderPath.collect_schema` (the persisted ``.ygg/`` sidecar
     #: or the first-batch fallback), then ``options.target``.
     child_media_type: MediaType = MediaTypes.ARROW_IPC
 
@@ -129,7 +148,7 @@ class FolderOptions(CastOptions):
             object.__setattr__(self, "child_media_type", coerced)
 
 
-class FolderIO(IO[bytes, FolderOptions]):
+class FolderPath(IO[bytes, FolderOptions]):
     """:class:`Tabular` over a directory of tabular files.
 
     Inherits :class:`Holder` so it registers in the cross-cutting
@@ -137,6 +156,15 @@ class FolderIO(IO[bytes, FolderOptions]):
     primitives raise :class:`NotImplementedError` — a folder is a
     logical container, not a positional buffer; navigate via
     :meth:`iter_children` / :meth:`read_arrow_batches` instead.
+
+    :class:`Singleton`-cached with a 15-minute TTL, keyed on the
+    backing URL string + the ``yggmeta`` flag (see
+    :meth:`_singleton_key`). Every ``FolderPath(path=p)`` and every
+    recursive partition-candidate probe with the same URL collapses
+    to one live instance, so the on-instance schema cache,
+    ``free_columns`` memo, and Hive ``static_values`` cache stay
+    warm across the whole ``send_many`` cache-scan loop without
+    leaking across long-running workers.
     """
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
@@ -146,6 +174,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         "_yggmeta_enabled",
         "_predicate_free_cols",
         "_static_values_cache",
+        "_initialized",
     )
 
     #: Sidecar directory name under :attr:`path` where folder-level
@@ -159,6 +188,57 @@ class FolderIO(IO[bytes, FolderOptions]):
     #: ``partition_by``, ``cluster_by``, primary keys, comments, …)
     #: round-trips byte-for-byte through pyarrow.
     YGGMETA_SCHEMA_FILENAME: ClassVar[str] = "schema.arrow"
+
+    # 15-minute cache shared across every FolderPath. The default
+    # Singleton ``_INSTANCES`` is process-lifetime — overriding to
+    # an :class:`ExpiringDict` with TTL + bounded capacity stops
+    # long-running ingestion workers from accumulating one entry
+    # per ever-seen cache root.
+    _SINGLETON_TTL: ClassVar[Any] = _FOLDER_PATH_SINGLETON_TTL
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=_FOLDER_PATH_SINGLETON_TTL, max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+
+    @classmethod
+    def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
+        """Key by ``(cls, url_str, yggmeta_enabled)``.
+
+        The default ``(cls, args, sorted_kwargs)`` would split
+        instances by every cosmetic difference in how the caller
+        spelled the path (``"foo"`` vs ``URL.from_("foo")`` vs a
+        live :class:`Path`) and by transient kwargs like
+        ``tabular_parent`` — the singleton would never coalesce in
+        practice. Two FolderPaths backed by the same URL serve the
+        same on-disk state, so they share one instance regardless
+        of how the caller phrased the constructor.
+        """
+        raw = kwargs.get("path")
+        if raw is None and args:
+            raw = args[0]
+        if raw is None:
+            raw = kwargs.get("data")
+        if raw is None:
+            raw = kwargs.get("url")
+        # Canonicalise through :class:`Path` so every spelling of
+        # the same on-disk root resolves to one key — str, pathlib,
+        # URL, and live :class:`Path` instances all flow through the
+        # backend-specific ``full_path``. Live :class:`Path` short-
+        # circuits the construction so the singleton-cached Path
+        # itself does the dispatch.
+        if hasattr(raw, "full_path"):
+            url_key = raw.full_path()
+        else:
+            from yggdrasil.io.path.path import Path as _Path
+            try:
+                url_key = _Path.from_(raw).full_path()
+            except Exception:
+                # Last resort: fall back to the literal value so we
+                # at least share instances within the misuse case
+                # rather than building a new one per call.
+                url_key = repr(raw)
+        yggmeta = kwargs.get("yggmeta", True)
+        return (cls, url_key, bool(yggmeta))
 
     @classmethod
     def options_class(cls):
@@ -201,6 +281,21 @@ class FolderIO(IO[bytes, FolderOptions]):
         sidecar folder itself constructs with ``yggmeta=False``
         so we never recurse).
         """
+        # Singleton-cached re-entry: :meth:`Singleton.__new__` returns
+        # the live instance when the (url, yggmeta) key already
+        # resolved one — Python still calls ``__init__`` after that,
+        # but a second pass through here would reset every
+        # on-instance cache (schema, free_cols memo, static_values)
+        # we built earlier. Bail out so the cached state stays warm.
+        if getattr(self, "_initialized", False):
+            if tabular_parent is not None:
+                # Late parent linkage from ``adopt_child`` — record it
+                # so the schema / free_cols walk can find an
+                # already-warm ancestor without overwriting cleaned
+                # caches.
+                self.tabular_parent = tabular_parent
+            return
+
         # Resolve the path first; we hand the folder's URL up to
         # :class:`Holder` so the URL-keyed surfaces (singleton key,
         # repr, equality) line up with the underlying path.
@@ -238,6 +333,7 @@ class FolderIO(IO[bytes, FolderOptions]):
             tabular_parent=tabular_parent,
             **kwargs,
         )
+        self._initialized = True
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(path={self.path!r})"
@@ -299,7 +395,7 @@ class FolderIO(IO[bytes, FolderOptions]):
     # against either a BytesIO (real Disposable) or a folder.
     # ==================================================================
 
-    def __enter__(self) -> "FolderIO":
+    def __enter__(self) -> "FolderPath":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -318,7 +414,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         ``<base>/year=2024/month=05/`` reports
         ``{"year": 2024, "month": 5}`` without any constructor seed.
         Values are cast to their declared dtype when a parent
-        :class:`FolderIO` (or this folder itself) already has the
+        :class:`FolderPath` (or this folder itself) already has the
         schema cached, otherwise the decoded string passes through;
         the downstream :meth:`matches_static` prune is conservative
         and just degrades to a row-level filter on undecidable
@@ -368,14 +464,14 @@ class FolderIO(IO[bytes, FolderOptions]):
     # ==================================================================
 
     @property
-    def yggmeta(self) -> "FolderIO | None":
-        """Sidecar :class:`FolderIO` at ``<self.path>/.ygg/``.
+    def yggmeta(self) -> "FolderPath | None":
+        """Sidecar :class:`FolderPath` at ``<self.path>/.ygg/``.
 
         ``None`` when this folder was constructed with
         ``yggmeta=False`` (the sidecar disables itself recursively
         so the ``.ygg/`` folder never builds its own ``.ygg/.ygg/``).
         Same concrete type as the parent so a custom
-        :class:`FolderIO` subclass keeps its overrides inside the
+        :class:`FolderPath` subclass keeps its overrides inside the
         sidecar tree.
 
         :meth:`iter_children` skips ``.``-prefixed entries by
@@ -533,7 +629,7 @@ class FolderIO(IO[bytes, FolderOptions]):
     ) -> "Iterator[Tabular]":
         """Yield every non-private direct entry of :attr:`path`.
 
-        Sub-directories come back as a fresh :class:`FolderIO`. File
+        Sub-directories come back as a fresh :class:`FolderPath`. File
         entries route through :class:`MediaType.from_` (extension
         first, magic-byte fallback) to a registered :class:`Tabular`
         leaf — :class:`ParquetFile` for ``.parquet``,
@@ -703,7 +799,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         The existence check is taken here, before minting the child:
         on a 64-OR batch lookup against a partially-populated cache
         the hot shape is "most candidates miss". Skipping the
-        FolderIO allocation + adoption + downstream ``_read_arrow_batches``
+        FolderPath allocation + adoption + downstream ``_read_arrow_batches``
         for misses cuts ~95 us per non-existent partition. When the
         candidate does exist we'd have paid a stat inside the
         child's ``iter_children`` anyway, so the early stat doesn't
@@ -730,7 +826,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         column: str,
         value: Any,
     ) -> "Tabular":
-        """Mint a child FolderIO bound to the partition sub-path.
+        """Mint a child FolderPath bound to the partition sub-path.
 
         ``column`` / ``value`` are accepted for the call-site
         readability of "this child carries the partition <col>=<val>"
@@ -919,7 +1015,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         # subtree. :meth:`_free_cols_for` checks this folder and
         # every ``tabular_parent`` for a cached entry keyed by
         # ``id(predicate)`` — the candidate-probe loop yields fresh
-        # child FolderIOs, but they all share the same root and the
+        # child FolderPaths, but they all share the same root and the
         # same predicate instance, so the walk happens exactly once
         # per ``read_arrow_batches`` call instead of N times per
         # iter_children iteration.
@@ -939,7 +1035,7 @@ class FolderIO(IO[bytes, FolderOptions]):
             # prune above already eliminated whole sub-trees the
             # predicate rejects on a partition column; this is the
             # residual non-partition filter.
-            if predicate is not None and not isinstance(child, FolderIO):
+            if predicate is not None and not isinstance(child, FolderPath):
                 yield from predicate.filter_arrow_batches(stream)
             else:
                 yield from stream
@@ -950,7 +1046,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         Walks ``tabular_parent`` looking for an already-cached
         ``(id(predicate), free_cols)`` tuple; on miss, computes the
         free-column tuple once and stashes it on the *topmost*
-        :class:`FolderIO` ancestor so every recursive child read
+        :class:`FolderPath` ancestor so every recursive child read
         finds it without re-walking the AST.
 
         Predicate AST nodes are immutable and short-lived (their
@@ -962,15 +1058,15 @@ class FolderIO(IO[bytes, FolderOptions]):
             return None
         pid = id(predicate)
         # Search self + ancestors for a cached entry. The top-level
-        # FolderIO is where we stash, but any ancestor along the way
+        # FolderPath is where we stash, but any ancestor along the way
         # may already hold the cache.
         node: Any = self
-        topmost: "FolderIO" = self
+        topmost: "FolderPath" = self
         while node is not None:
             cached = getattr(node, "_predicate_free_cols", None)
             if cached is not None and cached[0] == pid:
                 return cached[1]
-            if isinstance(node, FolderIO):
+            if isinstance(node, FolderPath):
                 topmost = node
             node = getattr(node, "tabular_parent", None)
         try:
@@ -978,7 +1074,7 @@ class FolderIO(IO[bytes, FolderOptions]):
             cols = free_columns(predicate)
         except Exception:
             return None
-        # Stash on the topmost FolderIO so every recursive child read
+        # Stash on the topmost FolderPath so every recursive child read
         # finds the cache on its first parent walk.
         try:
             topmost._predicate_free_cols = (pid, cols)
@@ -1102,7 +1198,7 @@ class FolderIO(IO[bytes, FolderOptions]):
             head = partition_columns[0]
             if head not in first.schema.names:
                 raise ValueError(
-                    f"FolderIO partition write: batches are missing the "
+                    f"FolderPath partition write: batches are missing the "
                     f"partition column {head!r}. Schema has "
                     f"{first.schema.names!r}; partition_columns="
                     f"{partition_columns!r}."
@@ -1271,7 +1367,7 @@ class FolderIO(IO[bytes, FolderOptions]):
     ) -> "set[tuple]":
         keys: "set[tuple]" = set()
         for child in self.iter_children():
-            if isinstance(child, FolderIO):
+            if isinstance(child, FolderPath):
                 continue
             try:
                 for batch in child._read_arrow_batches(child.options_class()()):
@@ -1286,7 +1382,7 @@ class FolderIO(IO[bytes, FolderOptions]):
     ) -> "set[tuple]":
         keys: "set[tuple]" = set()
         for batch in batches:
-            FolderIO._extend_keys_from_batch(keys, batch, match_by)
+            FolderPath._extend_keys_from_batch(keys, batch, match_by)
         return keys
 
     @staticmethod
@@ -1344,7 +1440,7 @@ class FolderIO(IO[bytes, FolderOptions]):
     ) -> "Iterator[pa.RecordBatch]":
         """Walk existing leaves, yielding only rows whose key isn't in *drop_keys*."""
         for child in self.iter_children():
-            if isinstance(child, FolderIO):
+            if isinstance(child, FolderPath):
                 continue
             try:
                 stream = child._read_arrow_batches(child.options_class()())
@@ -1392,7 +1488,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         not_pred = ~predicate
         deleted = 0
         for child in self.iter_children():
-            if isinstance(child, FolderIO):
+            if isinstance(child, FolderPath):
                 deleted += child._delete(predicate, child.options_class()())
                 continue
             deleted += self._delete_leaf(child, not_pred, options)
@@ -1586,7 +1682,7 @@ class FolderIO(IO[bytes, FolderOptions]):
                     bin_sizes.append(size)
 
         compacted = 0
-        leaf_folder = FolderIO(path=directory)
+        leaf_folder = FolderPath(path=directory)
         write_options = FolderOptions(
             mode=Mode.APPEND, child_media_type=target_media_type,
         )

@@ -152,7 +152,7 @@ def _is_tabular_io(arg: Any) -> bool:
     in :class:`Tabular` (and its transitive ``yggdrasil.io.buffer``
     imports) at config-construction time. Anything that exposes
     both ``read_arrow_batches`` and ``write_arrow_batches`` qualifies
-    — covers :class:`FolderIO`, :class:`Table`, and any third-party
+    — covers :class:`FolderPath`, :class:`Table`, and any third-party
     adapter following the same surface.
     """
     return (
@@ -315,8 +315,8 @@ class CacheConfig(_ConfigBase):
     mirror_local_to_remote: bool = False
     # TTL after which orphaned fast-path ``.arrow`` files in the
     # local cache tree are unlinked by the writer-side cleanup pass.
-    # Default 1 day mirrors the previous YGGFolderIO behaviour. Set
-    # to ``None`` to disable cleanup entirely (cache grows unbounded).
+    # Default 1 day. Set to ``None`` to disable cleanup entirely
+    # (cache grows unbounded).
     cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1)
     # Lazy memo for derived predicates and SQL column lists
     # (``match_by``, ``match_by_columns``, ``request_by_is_public``, the
@@ -708,7 +708,7 @@ class CacheConfig(_ConfigBase):
           :class:`~yggdrasil.databricks.table.table.Table` or any
           third-party Tabular) — returned as-is.
         * :attr:`path` set (local case) — wrapped in a
-          :class:`~yggdrasil.io.nested.folder_io.FolderIO` rooted at
+          :class:`~yggdrasil.io.nested.folder_path.FolderPath` rooted at
           that path. The folder is memoised back onto :attr:`tabular`
           on first call so repeated lookups (every ``send`` /
           ``send_many`` cache scan) hand back the same instance —
@@ -716,7 +716,7 @@ class CacheConfig(_ConfigBase):
           and yggmeta sidecar buffer all stay warm across calls.
         * Neither set but the cache is otherwise enabled
           (``received_*`` window) — the default
-          ``~/.yggdrasil/cache/response/...`` :class:`FolderIO` is
+          ``~/.yggdrasil/cache/response/...`` :class:`FolderPath` is
           materialised via :meth:`local_cache_folder` and memoised
           back on :attr:`path` + :attr:`tabular` so the next call
           short-circuits.
@@ -732,16 +732,16 @@ class CacheConfig(_ConfigBase):
         """
         if self.tabular is not None:
             return self.tabular
-        from yggdrasil.io.nested.folder_io import FolderIO
+        from yggdrasil.io.nested.folder_path import FolderPath
 
         folder_path = self.local_cache_folder(session=session)
         if self.path is None:
             object.__setattr__(self, "path", folder_path)
-        tabular = FolderIO(path=folder_path)
+        tabular = FolderPath(path=folder_path)
         # Stash the built folder back on the config so subsequent
         # cache scans reuse the same instance — the schema cache and
         # predicate ``free_columns`` memo only stay warm across
-        # calls if the FolderIO is itself reused. ``tabular`` is
+        # calls if the FolderPath is itself reused. ``tabular`` is
         # ``compare=False, hash=False``, and excluded from
         # ``__getstate__``, so the mutation doesn't affect equality
         # or pickling.
@@ -852,7 +852,7 @@ class CacheConfig(_ConfigBase):
     # Predicate builders — single source of truth for cache lookups
     # ------------------------------------------------------------------
     #
-    # Both backends (local :class:`FolderIO` and remote
+    # Both backends (local :class:`FolderPath` and remote
     # :class:`~yggdrasil.databricks.table.table.Table`) read through
     # :meth:`Tabular.read_arrow_batches` with the same ``options.predicate``
     # — :class:`Field`-aware backends translate the predicate to whatever
@@ -928,7 +928,7 @@ class CacheConfig(_ConfigBase):
         clause. Returns ``None`` when no clauses apply (an
         unconstrained :class:`Tabular` read).
 
-        The same predicate drives both backends: a :class:`FolderIO`
+        The same predicate drives both backends: a :class:`FolderPath`
         consumes it via :meth:`Predicate.filter_arrow_batches` (with
         ``extract_partition_filters`` short-circuiting the
         ``<col>=<val>/`` listing), and a remote
@@ -965,7 +965,7 @@ class CacheConfig(_ConfigBase):
         batch is empty and no time window applies.
 
         Drives both backends through :meth:`Tabular.read_arrow_batches`:
-        :class:`FolderIO` lets :meth:`iter_children` probe candidate
+        :class:`FolderPath` lets :meth:`iter_children` probe candidate
         ``partition_key=<v>/`` sub-folders directly (one ``stat``
         per accepted value, no ``iterdir`` over the full tree) and
         :meth:`Predicate.filter_arrow_batches` keeps the matching

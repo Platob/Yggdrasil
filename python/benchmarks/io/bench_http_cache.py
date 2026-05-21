@@ -13,7 +13,7 @@ plus their config plumbing:
   ``match_by_columns``), and the :class:`Predicate` builders that
   drive *both* backends through :meth:`Tabular.read_arrow_batches`
   (``make_lookup_predicate``, ``make_batch_lookup_predicate``).
-* :class:`FolderIO` — partition-aware write
+* :class:`FolderPath` — partition-aware write
   (``write_arrow_batches`` with a batch whose schema carries
   ``partition_by`` tags), partition-aware read (predicate-pushed,
   sidecar-driven), the URL-driven ``static_values`` parse, and the
@@ -47,7 +47,7 @@ from typing import Callable
 from yggdrasil.io import URL
 from yggdrasil.io.http_.session import HTTPSession
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
+from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
@@ -312,23 +312,23 @@ def _predicate_builder_scenarios(repeat: int) -> list[dict]:
 def _local_folder_cache_scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
 
-    # FolderIO surface: URL-driven static_values, schema-driven
+    # FolderPath surface: URL-driven static_values, schema-driven
     # partition_columns, sidecar collect/persist round trip.
-    partition_folder = FolderIO(
+    partition_folder = FolderPath(
         path=Path(str(CFG_LOCAL.path)) / f"partition_key={REQ.partition_key}",
     )
     out.append(_time_one(
-        "FolderIO.static_values (Hive partition leaf)",
+        "FolderPath.static_values (Hive partition leaf)",
         lambda: dict(partition_folder.static_values),
         repeat=repeat, inner=20_000,
     ))
     out.append(_time_one(
-        "FolderIO.partition_columns (root, sidecar hit)",
+        "FolderPath.partition_columns (root, sidecar hit)",
         lambda: _LOCAL_TABULAR.partition_columns(),
         repeat=repeat, inner=20_000,
     ))
     out.append(_time_one(
-        "FolderIO.collect_schema (sidecar hit, cached)",
+        "FolderPath.collect_schema (sidecar hit, cached)",
         lambda: _LOCAL_TABULAR.collect_schema(),
         repeat=repeat, inner=200_000,
     ))
@@ -341,20 +341,20 @@ def _local_folder_cache_scenarios(repeat: int) -> list[dict]:
     batch = RESP.to_arrow_batch(parse=False)
     write_opts = FolderOptions(mode=CFG_LOCAL.mode)
     with tempfile.TemporaryDirectory(prefix="ygg-bench-folder-write-") as wtmp:
-        write_tab = FolderIO(path=wtmp)
+        write_tab = FolderPath(path=wtmp)
         # Prime the in-memory schema cache so the bench measures the
         # steady-state hot path (sidecar already persisted, in-memory
         # cache short-circuits the sidecar rewrite via the
         # ``prior == schema`` check in ``_persist_schema``).
         write_tab.write_arrow_batches((batch,), options=write_opts)
         out.append(_time_one(
-            "FolderIO.write_arrow_batches (partitioned, schema unchanged)",
+            "FolderPath.write_arrow_batches (partitioned, schema unchanged)",
             lambda: write_tab.write_arrow_batches((batch,), options=write_opts),
             repeat=repeat, inner=200,
         ))
 
     with tempfile.TemporaryDirectory(prefix="ygg-bench-folder-read-") as rtmp:
-        read_tab = FolderIO(path=rtmp)
+        read_tab = FolderPath(path=rtmp)
         # Seed exactly one part file under one partition so the read
         # measures the partition-prune + predicate filter cost, not a
         # 500-leaf iterdir scan.
@@ -362,7 +362,7 @@ def _local_folder_cache_scenarios(repeat: int) -> list[dict]:
         predicate = CacheConfig().make_lookup_predicate(request=REQ)
         read_opts = FolderOptions(predicate=predicate)
         out.append(_time_one(
-            "FolderIO.read_arrow_batches (predicate hit)",
+            "FolderPath.read_arrow_batches (predicate hit)",
             lambda: list(read_tab.read_arrow_batches(options=read_opts)),
             repeat=repeat, inner=500,
         ))

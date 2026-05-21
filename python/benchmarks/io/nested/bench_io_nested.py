@@ -1,4 +1,4 @@
-"""Benchmark the nested :class:`Tabular` leaves: FolderIO + ZipFile.
+"""Benchmark the nested :class:`Tabular` leaves: FolderPath + ZipFile.
 
 What this covers
 ----------------
@@ -12,7 +12,7 @@ surface, so the interesting paths are:
 * Per-framework variants (arrow / polars / pandas) — measures the
   bridge from the aggregated Arrow read through to the engine frame.
 
-ZipFile uses a self-built in-memory archive (no disk). FolderIO uses a
+ZipFile uses a self-built in-memory archive (no disk). FolderPath uses a
 temp directory of parquet files.
 
 Usage::
@@ -36,7 +36,7 @@ from typing import Callable
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from yggdrasil.io.nested.folder_io import FolderIO
+from yggdrasil.io.nested.folder_path import FolderPath
 from yggdrasil.io.nested.zip_file import ZipFile
 from yggdrasil.io.primitive.parquet_file import ParquetFile
 
@@ -196,22 +196,22 @@ def _folder_scenarios(repeat: int, tmp_root: str) -> list[dict]:
 
     out.append(_time_one(
         "folder: iter_children 8 files",
-        lambda: list(FolderIO(path=small_dir).iter_children()),
+        lambda: list(FolderPath(path=small_dir).iter_children()),
         repeat=repeat, inner=500,
     ))
     out.append(_time_one(
         "folder: collect_schema 8 files",
-        lambda: FolderIO(path=small_dir).collect_schema(),
+        lambda: FolderPath(path=small_dir).collect_schema(),
         repeat=repeat, inner=200,
     ))
     out.append(_time_one(
         "folder: read_arrow_table 8x1k",
-        lambda: FolderIO(path=small_dir).read_arrow_table(),
+        lambda: FolderPath(path=small_dir).read_arrow_table(),
         repeat=repeat, inner=100,
     ))
     out.append(_time_one(
         "folder: read_arrow_table 8x50k",
-        lambda: FolderIO(path=large_dir).read_arrow_table(),
+        lambda: FolderPath(path=large_dir).read_arrow_table(),
         repeat=repeat, inner=20,
     ))
 
@@ -219,12 +219,12 @@ def _folder_scenarios(repeat: int, tmp_root: str) -> list[dict]:
         import polars  # noqa: F401
         out.append(_time_one(
             "folder: read_polars_frame 8x1k",
-            lambda: FolderIO(path=small_dir).read_polars_frame(),
+            lambda: FolderPath(path=small_dir).read_polars_frame(),
             repeat=repeat, inner=100,
         ))
         out.append(_time_one(
             "folder: read_polars_frame 8x50k",
-            lambda: FolderIO(path=large_dir).read_polars_frame(),
+            lambda: FolderPath(path=large_dir).read_polars_frame(),
             repeat=repeat, inner=20,
         ))
     except ImportError:
@@ -234,12 +234,12 @@ def _folder_scenarios(repeat: int, tmp_root: str) -> list[dict]:
         import pandas  # noqa: F401
         out.append(_time_one(
             "folder: read_pandas_frame 8x1k",
-            lambda: FolderIO(path=small_dir).read_pandas_frame(),
+            lambda: FolderPath(path=small_dir).read_pandas_frame(),
             repeat=repeat, inner=100,
         ))
         out.append(_time_one(
             "folder: read_pandas_frame 8x50k",
-            lambda: FolderIO(path=large_dir).read_pandas_frame(),
+            lambda: FolderPath(path=large_dir).read_pandas_frame(),
             repeat=repeat, inner=20,
         ))
     except ImportError:

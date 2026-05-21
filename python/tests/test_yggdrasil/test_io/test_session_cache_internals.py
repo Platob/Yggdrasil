@@ -5,11 +5,11 @@ These pin the contracts of the small, side-effect-free helpers the
 
 * ``CacheConfig.make_lookup_predicate`` / ``.make_batch_lookup_predicate``
   — the per-request and batch :class:`Predicate` shape the partitioned
-  local cache pushes through :meth:`FolderIO._read_arrow_batches`.
+  local cache pushes through :meth:`FolderPath._read_arrow_batches`.
   Mirrors the SQL the remote cache uses, so the partition prune fires
   on both backends with the same logical clause.
 * The unified :meth:`CacheConfig.cache_tabular` surface — both
-  local (FolderIO) and remote (Databricks Table) plug into the
+  local (FolderPath) and remote (Databricks Table) plug into the
   Session through :meth:`Tabular.read_arrow_batches` +
   :meth:`Tabular.insert`, so the cache pipeline is backend-
   agnostic.
@@ -127,7 +127,7 @@ class TestCacheLookupPredicates:
     :meth:`CacheConfig.make_batch_lookup_predicate` build the
     :class:`Predicate` the Session pushes through
     :meth:`Tabular.read_arrow_batches` — same call shape for both
-    the local :class:`FolderIO` cache and remote :class:`Tabular`
+    the local :class:`FolderPath` cache and remote :class:`Tabular`
     backends (Databricks Table, …). Asserted shape: partition key
     prune + per-request match + response time window.
     """
@@ -181,7 +181,7 @@ class TestCacheLookupPredicates:
         pred = cfg.make_batch_lookup_predicate(requests=reqs)
         # The partition pruner walks the predicate and returns the
         # finite accepted-value set — that's what
-        # FolderIO.iter_children probes against.
+        # FolderPath.iter_children probes against.
         extracted = extract_partition_filters(pred, ("partition_key",))
         assert "partition_key" in extracted
         assert extracted["partition_key"] == frozenset(
@@ -207,7 +207,7 @@ class TestCacheLookupPredicates:
 
 
 # ---------------------------------------------------------------------------
-# Partitioned local-cache layout (FolderIO under CacheConfig)
+# Partitioned local-cache layout (FolderPath under CacheConfig)
 # ---------------------------------------------------------------------------
 
 
@@ -218,7 +218,7 @@ class TestPartitionedLocalCache:
     The asserted contract is the on-disk shape — Hive-style
     ``partition_key=<int>/part-*.<ext>`` under the cache root —
     plus the listing-time partition prune on
-    :meth:`FolderIO.iter_children` shrinking the read to only the
+    :meth:`FolderPath.iter_children` shrinking the read to only the
     matching directories. Both write and read go through the same
     :meth:`Tabular.write_arrow_batches` /
     :meth:`Tabular.read_arrow_batches` calls the Session uses, so
@@ -226,7 +226,7 @@ class TestPartitionedLocalCache:
     """
 
     def _seed(self, tmp_path: Path, *requests) -> tuple[CacheConfig, "Any"]:
-        from yggdrasil.io.nested.folder_io import FolderOptions
+        from yggdrasil.io.nested.folder_path import FolderOptions
 
         cfg = CacheConfig(path=str(tmp_path))
         tabular = cfg.cache_tabular()
@@ -235,7 +235,7 @@ class TestPartitionedLocalCache:
         # per-field metadata — no explicit ``partition_columns`` on
         # the FolderOptions: Response.to_arrow_batch stamps
         # ``t:partition_by=true`` on ``partition_key`` straight from
-        # RESPONSE_SCHEMA, and the FolderIO reads that to drive the
+        # RESPONSE_SCHEMA, and the FolderPath reads that to drive the
         # Hive layout.
         for req in requests:
             resp = make_response(request=req, body=b'{"ok":true}')
@@ -245,7 +245,7 @@ class TestPartitionedLocalCache:
         return cfg, tabular
 
     def _read(self, tabular, predicate):
-        from yggdrasil.io.nested.folder_io import FolderOptions
+        from yggdrasil.io.nested.folder_path import FolderOptions
         # No explicit partition hint: the folder's ``collect_schema``
         # reads ``.ygg/schema.arrow`` (persisted on prior writes),
         # ``Field.partition_by`` flags the partition columns, and

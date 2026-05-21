@@ -191,7 +191,7 @@ class Tabular(ABC, Generic[O]):
         """Column → constant value across every row this Tabular yields.
 
         Default: empty mapping. Subclasses with a cheap source of
-        invariants override — :class:`FolderIO` parses Hive
+        invariants override — :class:`FolderPath` parses Hive
         ``<col>=<val>/`` segments off its bound :attr:`path` URL,
         a future Parquet-stats-based subclass would read
         min==max column stats from the footer, a Delta leaf would
@@ -407,9 +407,8 @@ class Tabular(ABC, Generic[O]):
 
         Default no-op (returns ``0``) — single-file leaves and
         warehouse-backed tables don't have a sweep concept the
-        client owns. :class:`yggdrasil.io.nested.ygg_folder_io.YGGFolderIO`
-        overrides this to unlink stale ``part-*`` files, throttled by
-        TTL.
+        client owns. Folder-shaped subclasses override to unlink
+        stale ``part-*`` files, throttled by TTL.
 
         ``wait`` controls sync vs async dispatch on backends that
         support it: a truthy :class:`yggdrasil.dataclasses.waiting.WaitingConfig`
@@ -436,9 +435,9 @@ class Tabular(ABC, Generic[O]):
 
         Default implementation is a no-op and returns ``0`` — single-file
         leaves (parquet, csv, arrow IPC, …) don't have a compaction
-        concept. Aggregator subclasses (:class:`FolderIO`,
-        :class:`YGGFolderIO`) override this to walk their child leaves
-        and bin-pack small part files into bundles near *byte_size*.
+        concept. Aggregator subclasses (:class:`FolderPath`) override
+        this to walk their child leaves and bin-pack small part files
+        into bundles near *byte_size*.
         Files already close to the target size are left alone so a
         repeated call is cheap.
 
@@ -471,13 +470,13 @@ class Tabular(ABC, Generic[O]):
 
         The default implementation reads every batch, drops rows the
         predicate accepts, and rewrites the leaf with the survivors.
-        Aggregator subclasses (:class:`yggdrasil.io.nested.folder_io.FolderIO`,
-        :class:`yggdrasil.io.nested.ygg_folder_io.YGGFolderIO`)
-        override to walk children, prune subtrees whose partition
-        bounds make the predicate trivially false, and only rewrite
-        the leaves that actually hold matched rows — so a delete on a
-        hive-partitioned tree never scans partitions it can prove
-        don't match.
+        Aggregator subclasses
+        (:class:`yggdrasil.io.nested.folder_path.FolderPath`) override
+        to walk children, prune subtrees whose partition bounds make
+        the predicate trivially false, and only rewrite the leaves
+        that actually hold matched rows — so a delete on a hive-
+        partitioned tree never scans partitions it can prove don't
+        match.
         """
         from yggdrasil.io.tabular.execution.expr import Expression, Predicate
 

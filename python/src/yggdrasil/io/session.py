@@ -69,13 +69,13 @@ _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
 # Local cache is a partitioned tabular tree backed by
-# :class:`yggdrasil.io.nested.folder_io.FolderIO`:
+# :class:`yggdrasil.io.nested.folder_path.FolderPath`:
 # ``<root>/partition_key=<int>/part-{epoch_ms}-{seed}.<ext>``.
 # Same Hive-style partition shape the remote :class:`Tabular` cache
 # uses, so the same lookup primitives — :meth:`CacheConfig.make_lookup_predicate`
 # / :meth:`CacheConfig.make_batch_lookup_predicate` — prune both
 # backends identically. The predicate's ``partition_key IN (...)``
-# clause flows through :meth:`FolderIO.iter_children`'s candidate
+# clause flows through :meth:`FolderPath.iter_children`'s candidate
 # probe, so a batch lookup ``stat``s only the partition directories
 # its requests touch instead of walking the whole tree.
 
@@ -169,7 +169,7 @@ def _insert_local_cache(
 
     Single-call write that the Session fires either inline (single
     response) or in bulk (backfill). Goes through the canonical
-    :meth:`Tabular.write_arrow_batches` surface — the FolderIO
+    :meth:`Tabular.write_arrow_batches` surface — the FolderPath
     auto-detects the partition layout from the incoming batch's
     per-field ``t:partition_by`` metadata (stamped by
     :meth:`Response.to_arrow_batch` from :data:`RESPONSE_SCHEMA`'s
@@ -177,7 +177,7 @@ def _insert_local_cache(
     has to repeat the partition columns. Errors are swallowed and
     logged — a cache miss-write must not poison the request flow.
     """
-    from yggdrasil.io.nested.folder_io import FolderOptions
+    from yggdrasil.io.nested.folder_path import FolderOptions
 
     if batch is None or batch.num_rows == 0:
         return
@@ -510,14 +510,14 @@ class Session(Singleton, ABC):
         :meth:`CacheConfig.make_lookup_predicate` — same logical
         shape as the SQL the remote cache emits — and pushes it
         through :meth:`Tabular.read_arrow_batches` on the cache's
-        :class:`FolderIO`. ``partition_columns=("partition_key",)``
+        :class:`FolderPath`. ``partition_columns=("partition_key",)``
         lets the folder's listing ``stat`` only the matching
         partition directory instead of walking the whole tree.
         Returns ``None`` when the folder is missing, every candidate
         row was filtered out by the row-level predicate, or the row
         falls outside the configured ``received_*`` window.
         """
-        from yggdrasil.io.nested.folder_io import FolderOptions
+        from yggdrasil.io.nested.folder_path import FolderOptions
 
         tabular = cache_cfg.cache_tabular(session=self)
         if tabular is None:
@@ -525,7 +525,7 @@ class Session(Singleton, ABC):
 
         predicate = cache_cfg.make_lookup_predicate(request=request)
         opts = FolderOptions(predicate=predicate)
-        # No pre-existence probe — FolderIO.read_arrow_batches yields
+        # No pre-existence probe — FolderPath.read_arrow_batches yields
         # an empty stream when the cache folder hasn't been written to
         # yet (Path.iterdir's documented missing-dir → empty contract).
         for batch in tabular.read_arrow_batches(options=opts):
@@ -561,7 +561,7 @@ class Session(Singleton, ABC):
         doesn't block on disk IO. The write goes through
         :meth:`Tabular.insert` — the same call the remote-cache
         path uses — so any backend that implements the protocol
-        (local :class:`FolderIO`, Databricks Table, third-party
+        (local :class:`FolderPath`, Databricks Table, third-party
         :class:`Tabular` adapter) drops in here without a code
         change on the Session side.
 
@@ -1102,7 +1102,7 @@ class Session(Singleton, ABC):
 
         Returns ``(hits_by_path, misses)``. UPSERT entries bypass the
         read entirely (always miss, refetch). Non-UPSERT requests are
-        grouped by their effective cache :class:`FolderIO` so we
+        grouped by their effective cache :class:`FolderPath` so we
         execute exactly **one** partition-pruned folder read per
         cache root — mirrors :meth:`_split_remote_cache`'s
         "one SQL per table" shape so the lookup cost scales with
@@ -1111,7 +1111,7 @@ class Session(Singleton, ABC):
         Each per-folder read builds its predicate via
         :meth:`CacheConfig.make_batch_lookup_predicate`. The
         partition ``IN (...)`` clause flows through
-        :meth:`FolderIO.iter_children`'s candidate probe so the
+        :meth:`FolderPath.iter_children`'s candidate probe so the
         listing stays at one ``stat`` per distinct ``partition_key``
         — no ``iterdir`` over the full cache tree.
 
@@ -1182,7 +1182,7 @@ class Session(Singleton, ABC):
         Counterpart to :meth:`_lookup_remote_table` on the local
         side: builds the batch :class:`Predicate` via
         :meth:`CacheConfig.make_batch_lookup_predicate`, reads the
-        :class:`FolderIO` once with that predicate +
+        :class:`FolderPath` once with that predicate +
         ``partition_columns=("partition_key",)`` so the listing
         skips non-matching partition directories, then maps each
         returned row back to its input request via
@@ -1194,7 +1194,7 @@ class Session(Singleton, ABC):
         side already takes — because all match keys hash through the
         anonymize='remove' projection by construction.
         """
-        from yggdrasil.io.nested.folder_io import FolderOptions
+        from yggdrasil.io.nested.folder_path import FolderOptions
 
         if cfg.request_by_is_public:
             lookup_batch: list[PreparedRequest] = list(requests)
@@ -1315,7 +1315,7 @@ class Session(Singleton, ABC):
 
         Builds :meth:`CacheConfig.make_batch_lookup_predicate` and
         pushes it through :meth:`Tabular.read_arrow_batches` — same
-        call shape the local :class:`FolderIO` cache uses, so the
+        call shape the local :class:`FolderPath` cache uses, so the
         Session pipeline stays backend-agnostic. Remote
         :class:`Tabular` backends translate the predicate into their
         engine's native filter (SQL ``WHERE``) inside
@@ -1783,7 +1783,7 @@ class Session(Singleton, ABC):
         Responses are bucketed by their effective cache folder; each
         bucket fans out one Arrow batch built from
         :meth:`Response.values_to_arrow_batch` and routed through
-        :meth:`FolderIO._write_arrow_batches` with
+        :meth:`FolderPath._write_arrow_batches` with
         ``partition_columns=("partition_key",)`` — so a bucket of N
         responses spread across K distinct ``partition_key`` values
         lands K part files, one per partition directory, in a single
