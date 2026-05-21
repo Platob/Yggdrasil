@@ -163,50 +163,53 @@ def _maybe_autocompress_body_for_cache(
 def _insert_cache(
     tabular: Any,
     cache_cfg: CacheConfig,
-    batch: pa.RecordBatch | pa.Table,
+    data: "pa.RecordBatch | pa.Table | SparkDataFrame",
     *,
     mode: "Mode | None" = None,
     spark_session: Optional["SparkSession"] = None,
     prune_values: "Mapping[str, Any] | None" = None,
     raise_error: bool = False,
 ) -> None:
-    """Write *batch* to any cache backend through the unified surface.
+    """Write *data* to any cache backend through the unified surface.
 
     Both local :class:`FolderPath` and remote
-    :class:`~yggdrasil.databricks.table.Table` implement
-    :meth:`Tabular.write_arrow_batches`, so the Session never has to
+    :class:`~yggdrasil.databricks.table.Table` implement the
+    :class:`Tabular` write protocol, so the Session never has to
     branch on which backend it's talking to — same call shape for
-    the single-response store, the bulk backfill, and the bulk
-    persist.
+    the single-response store, the bulk backfill, the bulk
+    persist, and the Spark persist.
+
+    Dispatches on input type:
+
+    * :class:`pa.RecordBatch` / :class:`pa.Table` →
+      :meth:`Tabular.write_arrow_batches` (the Arrow-native path
+      both backends implement).
+    * :class:`pyspark.sql.DataFrame` →
+      :meth:`Tabular.write_spark_frame` (Databricks Table routes
+      this through its Spark-native MERGE / append plan; the local
+      :class:`FolderPath` falls through to ``toArrow()`` then the
+      Arrow path on the rare local-+-Spark mix).
 
     ``cache_cfg.match_by_columns`` rides through
-    :attr:`CastOptions.match_by` so MERGE-mode writes (UPSERT)
-    dedup on the right keys. ``prune_values`` rides through
+    :attr:`CastOptions.match_by` so MERGE-mode writes dedup on the
+    right keys. ``prune_values`` rides through
     :attr:`CastOptions.prune_values` and is **caller-supplied** —
-    the remote backend turns ``{"partition_key": <ints>,
-    "public_hash": <ints>}`` into a Delta MERGE narrow-target
-    predicate (partition pruning + IN-set narrowing), the local
-    :class:`FolderPath` ignores it on writes (partition layout is
-    driven by the batch's per-field ``t:partition_by`` metadata).
-    Default ``None`` keeps the local hot path free of the dict
-    build the local backend wouldn't use anyway.
+    the remote MERGE turns it into a narrow-target predicate
+    (partition pruning + IN-set narrowing); the local
+    :class:`FolderPath` ignores it on writes. Default ``None``
+    keeps the local hot path free of the dict-build the local
+    backend wouldn't use anyway. Spark inserts also skip the
+    ``prune_values`` knob — :meth:`_spark_persist_remote`
+    pre-dedups via a ``left_anti`` join before reaching here.
 
     Errors are caught and logged by default — a failed cache write
     must not poison the request flow that just produced the
     response. ``raise_error=True`` flips that for the bulk-persist
-    path where the caller wants to surface failures.
+    paths where the caller wants to surface failures.
     """
-    if batch is None:
-        return
-    n_rows = batch.num_rows if hasattr(batch, "num_rows") else 0
-    if n_rows == 0:
+    if data is None:
         return
     from yggdrasil.data.options import CastOptions
-    batches: "Iterable[pa.RecordBatch]"
-    if isinstance(batch, pa.Table):
-        batches = batch.to_batches()
-    else:
-        batches = (batch,)
     opts = CastOptions(
         mode=mode if mode is not None else cache_cfg.mode,
         match_by=cache_cfg.match_by_columns or None,
@@ -215,6 +218,27 @@ def _insert_cache(
         prune_values=prune_values,
     )
     try:
+        # Spark frames go through ``write_spark_frame``; everything
+        # else (RecordBatch, Table) through ``write_arrow_batches``.
+        # The Spark detection is duck-typed via ``toArrow`` /
+        # ``toPandas`` so we don't import pyspark at module load
+        # for the common arrow-only path.
+        if not isinstance(data, (pa.RecordBatch, pa.Table)) and (
+            hasattr(data, "toArrow") or hasattr(data, "toPandas")
+        ):
+            tabular.write_spark_frame(data, options=opts)
+            return
+        if isinstance(data, pa.RecordBatch):
+            if data.num_rows == 0:
+                return
+            batches: "Iterable[pa.RecordBatch]" = (data,)
+        elif isinstance(data, pa.Table):
+            if data.num_rows == 0:
+                return
+            batches = data.to_batches()
+        else:
+            # Unknown shape — let the backend decide / fail loudly.
+            batches = data
         tabular.write_arrow_batches(batches, options=opts)
     except Exception as exc:
         if raise_error:
@@ -2477,12 +2501,13 @@ class Session(Singleton, ABC):
 
             # --- Stage 4: bulk remote writeback ---
             if is_spark:
-                # `cfg.tabular.insert` accepts the Spark DataFrame
-                # directly, so we hand off the lazy DF without
-                # materialising on the driver. Per-request overrides
-                # ride through ``key_to_remote_cfg`` — mirrors the
-                # non-Spark ``_persist_remote`` so a chunk targeting
-                # multiple remote tables fans out instead of collapsing
+                # ``_insert_cache`` routes the Spark DataFrame through
+                # :meth:`Tabular.write_spark_frame` so the lazy DF
+                # crosses straight to the backend without materialising
+                # on the driver. Per-request overrides ride through
+                # ``key_to_remote_cfg`` — mirrors the non-Spark
+                # ``_persist_remote`` so a chunk targeting multiple
+                # remote tables fans out instead of collapsing
                 # onto the session-level cfg.
                 if new_hits is not None:
                     self._spark_persist_remote(
@@ -2705,12 +2730,15 @@ class Session(Singleton, ABC):
                 "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
                 cfg.tabular,
             )
-            cfg.tabular.insert(
-                df,
-                mode=cfg.mode,
-                match_by=cfg.match_by_columns or None,
-                wait=cfg.wait,
+            # Same unified surface every other cache write path
+            # uses — ``_insert_cache`` dispatches the SparkDataFrame
+            # through :meth:`Tabular.write_spark_frame`. The
+            # ``left_anti`` dedup above already narrowed the frame
+            # so ``prune_values`` would be redundant here.
+            _insert_cache(
+                cfg.tabular, cfg, df,
                 spark_session=spark,
+                raise_error=True,
             )
 
         try:
