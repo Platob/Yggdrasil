@@ -594,47 +594,45 @@ class Session(Singleton, ABC):
         if not cache_cfg.remote_cache_enabled:
             return None
 
+        from yggdrasil.data.options import CastOptions
+
         # Skip the per-request ``anonymize()`` when the match keys are
-        # all ``public_*`` — the SQL clause and the response-side
+        # all ``public_*`` — the predicate and the response-side
         # join key both come out identical without it.
         lookup_request = (
             request
             if cache_cfg.request_by_is_public
             else request.anonymize(mode=cache_cfg.anonymize)
         )
-        query = cache_cfg.make_batch_lookup_sql(
-            table_name=cache_cfg.tabular.full_name(safe=True),
-            requests=[lookup_request],
-        )
+        predicate = cache_cfg.make_lookup_predicate(request=lookup_request)
+        opts = CastOptions(predicate=predicate, spark_session=spark_session)
 
         try:
-            cache_result = cache_cfg.tabular.sql.execute(
-                query,
-                spark_session=spark_session,
-            )
+            batches = list(cache_cfg.tabular.read_arrow_batches(options=opts))
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
                 cache_cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cache_cfg.tabular.sql.execute(
-                    query,
-                    spark_session=spark_session,
-                )
+                batches = list(cache_cfg.tabular.read_arrow_batches(options=opts))
             else:
                 raise
 
-        for response in Response.from_arrow_tabular(cache_result.read_arrow_batches()):
-            if cache_cfg.filter_response(response, request=request):
-                LOGGER.debug(
-                    "Found remote %s %s in %s",
-                    request.method,
-                    request.url,
-                    cache_cfg.tabular,
-                )
-                response.remote_cached = True
-                response.local_cached = False
-                return response
-
-        return None
+        # Server-side ranked-row dedup is gone — pick the latest
+        # ``received_at`` client-side. Cheap when the predicate
+        # already narrowed the row count to a handful per request.
+        best: Optional[Response] = None
+        for response in Response.from_arrow_tabular(iter(batches)):
+            if not cache_cfg.filter_response(response, request=request):
+                continue
+            if best is None or response.received_at >= best.received_at:
+                best = response
+        if best is not None:
+            LOGGER.debug(
+                "Found remote %s %s in %r",
+                request.method, request.url, cache_cfg.tabular,
+            )
+            best.remote_cached = True
+            best.local_cached = False
+        return best
 
     def _store_remote_cached_response(
         self,
@@ -658,7 +656,7 @@ class Session(Singleton, ABC):
         cache_cfg.tabular.insert(
             batch,
             mode=mode if mode is not None else cache_cfg.mode,
-            match_by=cache_cfg.sql_match_by or None,
+            match_by=cache_cfg.match_by_columns or None,
             wait=cache_cfg.wait,
             # Two-level prune: ``partition_key`` triggers Delta file
             # pruning (partition column on RESPONSE_SCHEMA);
@@ -1313,36 +1311,56 @@ class Session(Singleton, ABC):
         *,
         spark_session: Optional["SparkSession"] = None,
     ) -> tuple[list[Response], list[PreparedRequest]]:
-        """Execute one batch SQL lookup against a single cache table.
+        """Execute one batch predicate lookup against a single cache table.
+
+        Builds :meth:`CacheConfig.make_batch_lookup_predicate` and
+        pushes it through :meth:`Tabular.read_arrow_batches` — same
+        call shape the local :class:`FolderIO` cache uses, so the
+        Session pipeline stays backend-agnostic. Remote
+        :class:`Tabular` backends translate the predicate into their
+        engine's native filter (SQL ``WHERE``) inside
+        ``_read_arrow_batches``; no SQL string is built here.
 
         When ``cfg.request_by_is_public`` holds, the per-request
-        ``anonymize()`` pass is skipped — ``public_*`` match keys hash
-        to the same value on the original and the anonymized request,
-        so the lookup tuple and SQL clause both come out identical
-        without paying for one URL parse + header normalize per
-        request.
+        ``anonymize()`` pass is skipped — ``public_*`` match keys
+        hash to the same value on the original and the anonymized
+        request, so the lookup tuple and the predicate's match
+        clause both come out identical without paying for one URL
+        parse + header normalize per request.
+
+        Server-side ranked-row dedup (the old SQL ``row_number()
+        OVER (PARTITION BY ... ORDER BY received_at DESC)`` window)
+        is gone — multiple rows per request identity are
+        deduplicated client-side by keeping the latest
+        ``received_at`` per ``cfg.request_tuple``.
         """
+        from yggdrasil.data.options import CastOptions
+
         if cfg.request_by_is_public:
             lookup_batch: list[PreparedRequest] = list(requests)
         else:
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
 
-        query = cfg.make_batch_lookup_sql(
-            table_name=cfg.tabular.full_name(safe=True),
-            requests=lookup_batch,
-        )
+        predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
+        opts = CastOptions(predicate=predicate, spark_session=spark_session)
         try:
-            cache_result = cfg.tabular.sql.execute(query, spark_session=spark_session)
+            batches = list(cfg.tabular.read_arrow_batches(options=opts))
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
                 cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cfg.tabular.sql.execute(query, spark_session=spark_session)
+                batches = list(cfg.tabular.read_arrow_batches(options=opts))
             else:
                 raise
 
+        # Client-side dedup: keep the latest ``received_at`` per
+        # request-tuple. APPEND-mode caches may hold multiple rows
+        # per identity; the SQL window did this server-side.
         result_map: dict[tuple, Response] = {}
-        for response in Response.from_arrow_tabular(cache_result.read_arrow_batches()):
-            result_map[cfg.request_tuple(response.request)] = response
+        for response in Response.from_arrow_tabular(iter(batches)):
+            key = cfg.request_tuple(response.request)
+            existing = result_map.get(key)
+            if existing is None or response.received_at >= existing.received_at:
+                result_map[key] = response
 
         hits: list[Response] = []
         misses: list[PreparedRequest] = []
@@ -1522,28 +1540,26 @@ class Session(Singleton, ABC):
 
         :meth:`CacheConfig.filter_response`'s per-row branch is skipped
         on the spark path: ``received_from`` / ``received_to`` are
-        already encoded in :meth:`CacheConfig.make_batch_lookup_sql`'s
-        ``WHERE`` clause, and the request-key check is what the
-        ``request_tuple`` diff already enforces.
+        already encoded in the predicate the backend pushed down,
+        and the request-key check is what the ``request_tuple`` diff
+        already enforces.
         """
+        from yggdrasil.data.options import CastOptions
+
         if cfg.request_by_is_public:
             lookup_batch: list[PreparedRequest] = list(requests)
         else:
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
-        query = cfg.make_batch_lookup_sql(
-            table_name=cfg.tabular.full_name(safe=True),
-            requests=lookup_batch,
-        )
+        predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
+        opts = CastOptions(predicate=predicate, spark_session=spark)
         try:
-            cache_result = cfg.tabular.sql.execute(query, spark_session=spark)
+            hits_df = cfg.tabular.read_spark_frame(options=opts)
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
                 cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cfg.tabular.sql.execute(query, spark_session=spark)
+                hits_df = cfg.tabular.read_spark_frame(options=opts)
             else:
                 raise
-
-        hits_df = cache_result.read_spark_frame()
         # Stamp the origin flags on the read side. Stored values may be
         # stale (``mirror_local_to_remote`` pushes local hits into the
         # remote table with ``local_cached=True``) — overwrite both so
@@ -1869,7 +1885,7 @@ class Session(Singleton, ABC):
             cfg.tabular.insert(
                 batches,
                 mode=mode,
-                match_by=cfg.sql_match_by or None,
+                match_by=cfg.match_by_columns or None,
                 wait=cfg.wait,
                 prune_values={
                     "partition_key": batches["partition_key"],
@@ -2693,7 +2709,7 @@ class Session(Singleton, ABC):
             cfg.tabular.insert(
                 df,
                 mode=cfg.mode,
-                match_by=cfg.sql_match_by or None,
+                match_by=cfg.match_by_columns or None,
                 wait=cfg.wait,
                 spark_session=spark,
             )

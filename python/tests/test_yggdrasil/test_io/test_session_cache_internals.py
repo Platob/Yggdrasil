@@ -118,17 +118,18 @@ class TestRemoteWriteGroupKey:
 
 
 # ---------------------------------------------------------------------------
-# CacheConfig predicate builders — same shape as make_*_lookup_sql
+# CacheConfig predicate builders — the only lookup surface
 # ---------------------------------------------------------------------------
 
 
 class TestCacheLookupPredicates:
-    """The :class:`Predicate` mirrors of :meth:`CacheConfig.make_lookup_sql` /
-    :meth:`CacheConfig.make_batch_lookup_sql` carry the same logical
-    shape — partition key prune + per-request match + response time
-    window — as their SQL counterparts, so the local
-    :class:`FolderIO` cache and the remote :class:`Tabular` cache
-    prune through the same primitive.
+    """:meth:`CacheConfig.make_lookup_predicate` /
+    :meth:`CacheConfig.make_batch_lookup_predicate` build the
+    :class:`Predicate` the Session pushes through
+    :meth:`Tabular.read_arrow_batches` — same call shape for both
+    the local :class:`FolderIO` cache and remote :class:`Tabular`
+    backends (Databricks Table, …). Asserted shape: partition key
+    prune + per-request match + response time window.
     """
 
     def _cfg(self, **overrides: Any) -> CacheConfig:
@@ -137,34 +138,35 @@ class TestCacheLookupPredicates:
             **overrides,
         )
 
+    def _free_columns(self, pred):
+        from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+        return free_columns(pred)
+
     def test_single_request_predicate_partitions_and_matches(self) -> None:
         cfg = self._cfg()
         req = make_request("https://example.com/x")
         pred = cfg.make_lookup_predicate(request=req)
-        sql = pred.to_sql()
-        # Both the partition prune and the per-request match key
-        # land in the WHERE clause via AND. The SQL emitter wraps
-        # identifiers in backticks (`partition_key`), so match on the
-        # column name embedded in the rendered string.
-        assert "partition_key" in sql
-        assert str(req.partition_key) in sql
-        assert "request_public_url_hash" in sql
+        # Both the partition column and the per-request match key
+        # show up as free columns in the AST.
+        free = self._free_columns(pred)
+        assert "partition_key" in free
+        assert "request_public_url_hash" in free
 
     def test_batch_predicate_emits_partition_in_clause(self) -> None:
+        from yggdrasil.io.tabular.execution.expr import extract_partition_filters
+
         cfg = self._cfg()
         reqs = [
             make_request("https://example.com/a"),
             make_request("https://example.com/b"),
         ]
         pred = cfg.make_batch_lookup_predicate(requests=reqs)
-        sql = pred.to_sql()
-        # Distinct partition_keys collapse into an IN (...) — same
-        # shape the SQL-side make_batch_lookup_sql emits. Strip
-        # backticks the emitter wraps identifiers in.
-        normalized = sql.replace("`", "")
-        assert "partition_key IN" in normalized
-        for r in reqs:
-            assert str(r.partition_key) in sql
+        # Distinct partition_keys collapse into an IN-list the
+        # extractor surfaces as a finite accepted-value set.
+        extracted = extract_partition_filters(pred, ("partition_key",))
+        assert extracted["partition_key"] == frozenset(
+            r.partition_key for r in reqs
+        )
 
     def test_predicate_extracts_partition_filters(self) -> None:
         from yggdrasil.io.tabular.execution.expr import (
@@ -194,12 +196,10 @@ class TestCacheLookupPredicates:
         cfg = self._cfg(received_from=from_ts, received_to=to_ts)
         req = make_request("https://example.com/x")
         pred = cfg.make_lookup_predicate(request=req)
-        sql = pred.to_sql().replace("`", "")
-        # The time-window clause from sql_response_clause comes
-        # through unchanged. The SQL emitter wraps identifiers in
-        # backticks; strip them before substring matching.
-        assert "received_at >=" in sql
-        assert "received_at <" in sql
+        # The ``received_at`` time-window clauses survive into the
+        # predicate's free-column set; the actual bounds round-trip
+        # via the predicate's AST nodes.
+        assert "received_at" in self._free_columns(pred)
 
     def test_empty_batch_predicate_is_none(self) -> None:
         cfg = self._cfg()

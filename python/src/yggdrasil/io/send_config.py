@@ -319,7 +319,7 @@ class CacheConfig(_ConfigBase):
     # to ``None`` to disable cleanup entirely (cache grows unbounded).
     cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1)
     # Lazy memo for derived predicates and SQL column lists
-    # (``match_by``, ``sql_match_by``, ``request_by_is_public``, the
+    # (``match_by``, ``match_by_columns``, ``request_by_is_public``, the
     # ``request_sql_column_names`` array, the partition_by SQL clause).
     # Each is purely a function of the frozen fields above — caching
     # turns a per-send (or per-batch-request) recomputation into a
@@ -567,38 +567,43 @@ class CacheConfig(_ConfigBase):
         return out
 
     @property
-    def sql_match_by(self) -> list[str]:
-        # Cache-table column names for the merge join. Request-side keys
-        # are stored on the response table under the flattened
-        # ``request_<col>`` form (cf. :data:`RESPONSE_SCHEMA`), so a
-        # bare ``public_url_hash`` / ``method`` / etc. needs the
-        # ``request_`` prefix before it can be referenced as a target
-        # column in a Delta MERGE. Response-side keys map 1:1 already.
+    def match_by_columns(self) -> list[str]:
+        """Flattened column names for keyed cache operations.
+
+        Request-side keys are stored on the response table under the
+        flattened ``request_<col>`` form (cf. :data:`RESPONSE_SCHEMA`),
+        so a bare ``public_url_hash`` / ``method`` / etc. needs the
+        ``request_`` prefix before it can be referenced as a target
+        column in :meth:`Tabular.insert(match_by=...)` /
+        :meth:`Tabular.write_arrow_batches`. Response-side keys map
+        1:1 already.
+        """
         cache = self._derived_cache()
-        out = cache.get("sql_match_by", ...)
+        out = cache.get("match_by_columns", ...)
         if out is ...:
             out = [
                 *(_request_column_sql_name(k) for k in (self.request_by or ())),
                 *(self.response_by or ()),
             ]
-            cache["sql_match_by"] = out
+            cache["match_by_columns"] = out
         return out
 
     @property
-    def request_sql_columns(self) -> list[str]:
-        """Cached ``_request_column_sql_name`` mapping for every ``request_by`` key.
+    def request_match_columns(self) -> list[str]:
+        """Flattened column names for every ``request_by`` key.
 
-        ``make_batch_lookup_sql`` walks N requests and emits the same
-        column name for each (it depends only on the config), so
-        precomputing the list cuts the per-request loop's cost — at
-        ``BATCH_SIZE=64`` requests that is 64 ``_request_column_sql_name``
-        calls replaced by one shared list of strings.
+        :meth:`make_batch_lookup_predicate` walks N requests and
+        emits the same column name for each (it depends only on
+        the config), so precomputing the list cuts the per-request
+        loop's cost — at ``BATCH_SIZE=64`` requests that is 64
+        ``_request_column_sql_name`` calls replaced by one shared
+        list of strings.
         """
         cache = self._derived_cache()
-        out = cache.get("request_sql_columns", ...)
+        out = cache.get("request_match_columns", ...)
         if out is ...:
             out = [_request_column_sql_name(k) for k in (self.request_by or ())]
-            cache["request_sql_columns"] = out
+            cache["request_match_columns"] = out
         return out
 
     @property
@@ -642,23 +647,6 @@ class CacheConfig(_ConfigBase):
             time.time() + 3600,
             tz=dt.timezone.utc,
         )
-
-    @staticmethod
-    def sql_literal(value: Any) -> str:
-        if value is None:
-            return "null"
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if isinstance(value, (int, float)):
-            return str(value)
-        if isinstance(value, dt.datetime):
-            return f"timestamp '{value.isoformat(sep=' ', timespec='microseconds')}'"
-        if isinstance(value, bytes):
-            import base64
-            value = base64.b64encode(value).decode("ascii")
-        else:
-            value = str(value)
-        return f"'{value.replace(chr(39), chr(39) * 2)}'"
 
     def local_cache_folder(self, session: "Session | None" = None) -> Path:
         """Backend-agnostic root for the local cache.
@@ -847,207 +835,17 @@ class CacheConfig(_ConfigBase):
         out.extend(self.response_tuple(response))
         return tuple(out)
 
-    def sql_request_clause(
-        self,
-        request: PreparedRequest | None,
-    ) -> str:
-        if request is None:
-            return "1=1"
-
-        request_by = self.request_by
-        if not request_by:
-            return "1=1"
-
-        # Walk the precomputed columns in parallel with the keys —
-        # ``make_batch_lookup_sql`` calls this once per request in a
-        # 100-1000-wide batch, and ``_request_column_sql_name`` is
-        # config-level (not request-level), so the per-request loop
-        # shouldn't repeat the prefix lookup.
-        columns = self.request_sql_columns
-        match_value = request.match_value
-        sql_literal = self.sql_literal
-        clauses: list[str] = []
-        for column, key in zip(columns, request_by):
-            value = match_value(key)
-            if value is None:
-                clauses.append(f"{column} IS NULL")
-            else:
-                clauses.append(f"{column} = {sql_literal(value)}")
-
-        return " AND ".join(clauses) if clauses else "1=1"
-
-    def sql_response_clause(
-        self,
-        response: "Response | None" = None,
-    ) -> str:
-        clauses: list[str] = []
-
-        if response is not None:
-            for key, value in self.response_values(response).items():
-                if value is None:
-                    clauses.append(f"{key} IS NULL")
-                else:
-                    clauses.append(f"{key} = {self.sql_literal(value)}")
-
-        if self.received_from is not None:
-            clauses.append(f"received_at >= {self.sql_literal(self.received_from)}")
-
-        if self.received_to is not None:
-            clauses.append(f"received_at < {self.sql_literal(self.received_to)}")
-
-        return " AND ".join(clauses) if clauses else "1=1"
-
-    def sql_clause(
-        self,
-        request: PreparedRequest | None = None,
-        response: "Response | None" = None,
-    ) -> str:
-        clauses: list[str] = []
-
-        request_clause = self.sql_request_clause(request)
-        if request_clause != "1=1":
-            clauses.append(f"({request_clause})")
-
-        response_clause = self.sql_response_clause(response)
-        if response_clause != "1=1":
-            clauses.append(f"({response_clause})")
-
-        return " AND ".join(clauses) if clauses else "1=1"
-
-    def make_lookup_sql(
-        self,
-        table_name: str,
-        request: PreparedRequest | None = None,
-        response: "Response | None" = None,
-        *,
-        identity_by: Optional[Iterable[str]] = None,
-    ) -> str:
-        where_clause = self.sql_clause(request=request, response=response)
-        # Single-request partition prune — narrows the SQL engine's
-        # data-file scan to one partition before any per-row predicate.
-        if request is not None:
-            partition_clause = (
-                f"partition_key = {self.sql_literal(request.partition_key)}"
-            )
-            where_clause = (
-                f"({partition_clause}) AND ({where_clause})"
-                if where_clause != "1=1"
-                else partition_clause
-            )
-        base_query = f"SELECT * FROM {table_name}"
-        if where_clause != "1=1":
-            base_query += f" WHERE {where_clause}"
-
-        partition_by = self._ranked_window_partition_by(identity_by)
-        if partition_by is not None:
-            return (
-                "SELECT * FROM ("
-                "  SELECT t.*, row_number() OVER ("
-                f"    PARTITION BY {partition_by} "
-                "    ORDER BY received_at DESC"
-                "  ) AS __rn "
-                f"  FROM ({base_query}) t"
-                ") ranked WHERE __rn = 1"
-            )
-
-        return base_query
-
-    def _ranked_window_partition_by(
-        self,
-        identity_by: Optional[Iterable[str]],
-    ) -> Optional[str]:
-        """Build the ``PARTITION BY`` clause for the ranked-row window.
-
-        When *identity_by* is ``None`` the result depends only on the
-        config — memoize it on ``_derived`` so a 100-wide
-        ``send_many`` batch doesn't rebuild the same string per
-        request. With an explicit *identity_by* the caller is opting
-        out of the default; recompute fresh each time.
-        """
-        if identity_by is None:
-            cache = self._derived_cache()
-            cached = cache.get("ranked_window_partition_by", ...)
-            if cached is not ...:
-                return cached
-            identity_cols = self.match_by
-            if not identity_cols:
-                cache["ranked_window_partition_by"] = None
-                return None
-            out = ", ".join(
-                _request_column_sql_name(col)
-                if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
-                else col
-                for col in identity_cols
-            )
-            cache["ranked_window_partition_by"] = out
-            return out
-
-        identity_cols = list(identity_by)
-        if not identity_cols:
-            return None
-        return ", ".join(
-            _request_column_sql_name(col)
-            if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
-            else col
-            for col in identity_cols
-        )
-
-    def make_batch_lookup_sql(
-        self,
-        table_name: str,
-        requests: Iterable[PreparedRequest],
-        *,
-        identity_by: Optional[Iterable[str]] = None,
-    ) -> str:
-        request_list = list(requests)
-        request_clauses = " OR ".join(
-            f"({self.sql_request_clause(req)})"
-            for req in request_list
-        )
-        response_clause = self.sql_response_clause(None)
-
-        # Partition prune: ``partition_key`` is the table's partition
-        # column (declared on RESPONSE_SCHEMA). An ``IN (…)`` clause
-        # over the request batch's distinct partition_keys lets the
-        # SQL engine skip every other partition before evaluating the
-        # per-request OR — turns a full-table scan into an N-partition
-        # read on a partition-pruned engine (Delta / Iceberg / etc.).
-        partition_clause = ""
-        if request_list:
-            partition_keys = sorted({r.partition_key for r in request_list})
-            if partition_keys:
-                literals = ", ".join(self.sql_literal(v) for v in partition_keys)
-                partition_clause = f"partition_key IN ({literals})"
-
-        where_parts: list[str] = []
-        if partition_clause:
-            where_parts.append(f"({partition_clause})")
-        if request_clauses:
-            where_parts.append(f"({request_clauses})")
-        if response_clause != "1=1":
-            where_parts.append(f"({response_clause})")
-
-        base_query = f"SELECT * FROM {table_name}"
-        if where_parts:
-            base_query += " WHERE " + " AND ".join(where_parts)
-
-        partition_by = self._ranked_window_partition_by(identity_by)
-        if partition_by is not None:
-            return (
-                "SELECT * FROM ("
-                "  SELECT t.*, row_number() OVER ("
-                f"    PARTITION BY {partition_by} "
-                "    ORDER BY received_at DESC"
-                "  ) AS __rn "
-                f"  FROM ({base_query}) t"
-                ") ranked WHERE __rn = 1"
-            )
-
-        return base_query
-
     # ------------------------------------------------------------------
-    # Predicate builders — mirror the SQL builders for FolderIO callers
+    # Predicate builders — single source of truth for cache lookups
     # ------------------------------------------------------------------
+    #
+    # Both backends (local :class:`FolderIO` and remote
+    # :class:`~yggdrasil.databricks.table.table.Table`) read through
+    # :meth:`Tabular.read_arrow_batches` with the same ``options.predicate``
+    # — :class:`Field`-aware backends translate the predicate to whatever
+    # their engine speaks (Arrow ``RecordBatch.filter`` for the
+    # folder, SQL ``WHERE`` for Databricks Tables). No SQL is built
+    # here.
 
     def request_predicate(
         self,
@@ -1055,10 +853,9 @@ class CacheConfig(_ConfigBase):
     ) -> "Any | None":
         """Build the per-request match predicate as an :class:`Expression`.
 
-        Mirrors :meth:`sql_request_clause` but emits the abstract
-        :class:`yggdrasil.io.tabular.execution.expr.Predicate` tree
-        instead of a SQL string. ``None`` request → ``None`` (no
-        per-request constraint, equivalent to the SQL ``1=1`` branch).
+        Walks ``request_by`` keys, builds ``col(request_<key>) ==
+        request.match_value(key)`` per entry, and ANDs them together.
+        ``None`` request → ``None`` (no per-request constraint).
         """
         if request is None or not self.request_by:
             return None
@@ -1066,7 +863,7 @@ class CacheConfig(_ConfigBase):
 
         clauses: list[Any] = []
         match_value = request.match_value
-        for column, key in zip(self.request_sql_columns, self.request_by):
+        for column, key in zip(self.request_match_columns, self.request_by):
             value = match_value(key)
             clauses.append(
                 col(column).is_null() if value is None else col(column) == value
@@ -1083,8 +880,10 @@ class CacheConfig(_ConfigBase):
     ) -> "Any | None":
         """Build the response-side / time-window predicate as an :class:`Expression`.
 
-        Mirrors :meth:`sql_response_clause`. ``None`` when no clauses
-        apply so callers can compose with :func:`all_of` cleanly.
+        Carries the response-side match keys (when *response* is
+        supplied) plus the configured ``received_*`` window. Returns
+        ``None`` when no clauses apply so callers can compose with
+        :func:`all_of` cleanly.
         """
         from yggdrasil.io.tabular.execution.expr import all_of, col
 
@@ -1109,19 +908,20 @@ class CacheConfig(_ConfigBase):
         request: PreparedRequest | None = None,
         response: "Response | None" = None,
     ) -> "Any | None":
-        """Single-request :class:`Predicate` mirror of :meth:`make_lookup_sql`.
+        """Single-request :class:`Predicate` for the cache read.
 
         Shape: ``partition_key == <req.partition_key>`` AND the
-        per-request match clause AND the response/time-window clause.
-        Returns ``None`` when no clauses apply (an unconstrained
-        :class:`FolderIO` read).
+        per-request match clause AND the response/time-window
+        clause. Returns ``None`` when no clauses apply (an
+        unconstrained :class:`Tabular` read).
 
-        FolderIO consumes the result via
-        ``FolderOptions(predicate=..., partition_columns=("partition_key",))``;
-        the partition-aware listing in :meth:`FolderIO.iter_children`
-        uses :func:`extract_partition_filters` on the predicate to
-        skip every non-matching ``partition_key=<v>/`` sub-folder
-        without ever calling ``iterdir`` on the cache root.
+        The same predicate drives both backends: a :class:`FolderIO`
+        consumes it via :meth:`Predicate.filter_arrow_batches` (with
+        ``extract_partition_filters`` short-circuiting the
+        ``<col>=<val>/`` listing), and a remote
+        :class:`Tabular` (Databricks Table, …) translates it to its
+        engine's native filter (SQL ``WHERE``) inside
+        :meth:`Tabular.read_arrow_batches`.
         """
         from yggdrasil.io.tabular.execution.expr import all_of, col
 
@@ -1144,22 +944,20 @@ class CacheConfig(_ConfigBase):
         self,
         requests: Iterable[PreparedRequest],
     ) -> "Any | None":
-        """Batch :class:`Predicate` mirror of :meth:`make_batch_lookup_sql`.
+        """Batch :class:`Predicate` for the cache read.
 
         Shape: ``partition_key IN (<distinct keys>)`` AND
         ``(req1_match) OR (req2_match) OR …`` AND the
-        response/time-window clause. Returns ``None`` when the batch
-        is empty and no time window applies (matches the SQL
-        ``SELECT * FROM table`` no-WHERE form).
+        response/time-window clause. Returns ``None`` when the
+        batch is empty and no time window applies.
 
-        Designed as the read-path predicate for the local
-        :class:`FolderIO` cache: the partition ``IN (...)`` lets
-        :meth:`FolderIO.iter_children` probe candidate
+        Drives both backends through :meth:`Tabular.read_arrow_batches`:
+        :class:`FolderIO` lets :meth:`iter_children` probe candidate
         ``partition_key=<v>/`` sub-folders directly (one ``stat``
-        per accepted value, no ``iterdir`` over the full tree), and
-        the per-row OR-of-AND match clause is forwarded to
-        :meth:`Predicate.filter_arrow_batches` to keep the matching
-        rows once each part file is opened.
+        per accepted value, no ``iterdir`` over the full tree) and
+        :meth:`Predicate.filter_arrow_batches` keeps the matching
+        rows on the read side; remote Tabular backends translate the
+        same predicate into their engine's native filter.
         """
         from yggdrasil.io.tabular.execution.expr import all_of, any_of, col
 

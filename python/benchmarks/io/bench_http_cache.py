@@ -10,11 +10,9 @@ plus their config plumbing:
   every ``send`` call funnels through), the predicate properties used
   to gate the cache pipeline (``cache_enabled``, ``local_cache_enabled``,
   ``remote_cache_enabled``, ``request_by_is_public``, ``match_by``,
-  ``sql_match_by``), the SQL builders that drive the remote cache
-  lookup (``sql_request_clause``, ``make_lookup_sql``,
-  ``make_batch_lookup_sql``), and their pyarrow-:class:`Predicate`
-  mirrors (``make_lookup_predicate``, ``make_batch_lookup_predicate``)
-  that drive the partitioned local :class:`FolderIO` cache.
+  ``match_by_columns``), and the :class:`Predicate` builders that
+  drive *both* backends through :meth:`Tabular.read_arrow_batches`
+  (``make_lookup_predicate``, ``make_batch_lookup_predicate``).
 * :class:`FolderIO` — partition-aware write
   (``write_arrow_batches`` with a batch whose schema carries
   ``partition_by`` tags), partition-aware read (predicate-pushed,
@@ -69,7 +67,7 @@ REQ = PreparedRequest.prepare(
 # Warm caches so identity is paid once outside the bench.
 _ = REQ.public_hash, REQ.public_url_hash, REQ.partition_key
 
-# Build a batch of requests with distinct URLs — make_batch_lookup_sql
+# Build a batch of requests with distinct URLs — make_batch_lookup_predicate
 # folds them into one SQL clause; per-request work scales linearly.
 BATCH_SIZE = 64
 REQ_BATCH = [
@@ -239,8 +237,8 @@ def _predicate_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=200_000,
     ))
     out.append(_time_one(
-        "CacheConfig.sql_match_by",
-        lambda: CFG_REMOTE_BY_PUBLIC.sql_match_by,
+        "CacheConfig.match_by_columns",
+        lambda: CFG_REMOTE_BY_PUBLIC.match_by_columns,
         repeat=repeat, inner=200_000,
     ))
     out.append(_time_one(
@@ -285,53 +283,7 @@ def _matching_scenarios(repeat: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# SQL builders
-# ---------------------------------------------------------------------------
-
-
-def _sql_scenarios(repeat: int) -> list[dict]:
-    out: list[dict] = []
-
-    out.append(_time_one(
-        "CacheConfig.sql_literal(str)",
-        lambda: CacheConfig.sql_literal("a'b'c"),
-        repeat=repeat, inner=200_000,
-    ))
-    out.append(_time_one(
-        "CacheConfig.sql_literal(int)",
-        lambda: CacheConfig.sql_literal(123456789),
-        repeat=repeat, inner=500_000,
-    ))
-    out.append(_time_one(
-        "CacheConfig.sql_request_clause(request)",
-        lambda: CFG_REMOTE_BY_PUBLIC.sql_request_clause(REQ),
-        repeat=repeat, inner=20_000,
-    ))
-    out.append(_time_one(
-        "CacheConfig.sql_clause(request, response)",
-        lambda: CFG_REMOTE_BY_PUBLIC.sql_clause(request=REQ, response=RESP),
-        repeat=repeat, inner=10_000,
-    ))
-    out.append(_time_one(
-        "CacheConfig.make_lookup_sql(single request)",
-        lambda: CFG_REMOTE_BY_PUBLIC.make_lookup_sql(
-            table_name="cache.response", request=REQ,
-        ),
-        repeat=repeat, inner=10_000,
-    ))
-    out.append(_time_one(
-        f"CacheConfig.make_batch_lookup_sql({BATCH_SIZE} requests)",
-        lambda: CFG_REMOTE_BY_PUBLIC.make_batch_lookup_sql(
-            table_name="cache.response", requests=REQ_BATCH,
-        ),
-        repeat=repeat, inner=1_000,
-    ))
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Predicate builders (Folder-cache lookup primitives)
+# Predicate builders — the single lookup surface for both backends
 # ---------------------------------------------------------------------------
 
 
@@ -612,7 +564,6 @@ def scenarios(repeat: int) -> list[dict]:
         *_check_arg_scenarios(repeat),
         *_predicate_scenarios(repeat),
         *_matching_scenarios(repeat),
-        *_sql_scenarios(repeat),
         *_predicate_builder_scenarios(repeat),
         *_local_folder_cache_scenarios(repeat),
         *_session_cache_scenarios(repeat),

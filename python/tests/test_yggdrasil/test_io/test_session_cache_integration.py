@@ -155,51 +155,26 @@ def _wait_for_local(cache: CacheConfig, *, count: int = 1, timeout: float = 5.0)
 # ---------------------------------------------------------------------------
 
 
-class _FakeStatementResult:
-    """Stand-in for :class:`StatementResult` — exposes ``read_arrow_batches``."""
-
-    def __init__(self, batches: list[pa.RecordBatch]) -> None:
-        self._batches = batches
-
-    def read_arrow_batches(self) -> Iterator[pa.RecordBatch]:
-        return iter(self._batches)
-
-
-class _FakeSql:
-    """SQL surface backing :class:`_FakeRemoteTabular`.
-
-    Each call records the query and optionally raises
-    ``TABLE_OR_VIEW_NOT_FOUND`` to exercise the create-on-first-miss
-    recovery in :meth:`Session._load_remote_cached_response`.
-    """
-
-    def __init__(self, parent: "_FakeRemoteTabular") -> None:
-        self._parent = parent
-
-    def execute(self, query: str, *, spark_session: Any = None) -> _FakeStatementResult:
-        self._parent.queries.append(query)
-        if self._parent.raise_table_not_found and not self._parent.created:
-            raise RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] table missing")
-        return _FakeStatementResult(list(self._parent.rows))
-
-
 class _FakeRemoteTabular:
     """In-memory Tabular double for the remote-cache flow.
 
-    Holds seeded rows (a list of :class:`pa.RecordBatch`) and records
-    every ``sql.execute`` query, every ``insert`` call, and whether
-    ``create`` was called. Insert appends new batches into ``rows``
-    so a subsequent lookup returns everything that was written.
+    Holds seeded rows (a list of :class:`pa.RecordBatch`) and
+    records every ``read_arrow_batches`` predicate, every ``insert``
+    call, and whether ``create`` was called. Insert appends new
+    batches into ``rows`` so a subsequent lookup returns everything
+    that was written. Read translates ``options.predicate`` into a
+    pyarrow row-level filter via
+    :meth:`Predicate.filter_arrow_batches` — same shape every real
+    :class:`Tabular` backend implements internally.
     """
 
     def __init__(self, name: str = "ws.cache.responses") -> None:
         self._name = name
         self.rows: list[pa.RecordBatch] = []
-        self.queries: list[str] = []
+        self.predicates: list[Any] = []
         self.inserts: list[dict[str, Any]] = []
         self.created = False
         self.raise_table_not_found = False
-        self.sql = _FakeSql(self)
         self.path = name  # dict-key proxy for ``Session._split_remote_cache``
 
     def full_name(self, safe: bool = False) -> str:
@@ -208,6 +183,19 @@ class _FakeRemoteTabular:
     def create(self, schema: pa.Schema, if_not_exists: bool = False) -> None:
         self.created = True
         self.raise_table_not_found = False
+
+    def read_arrow_batches(self, options: Any = None, **kwargs: Any) -> Iterator[pa.RecordBatch]:
+        predicate = getattr(options, "predicate", None)
+        # Record the predicate before the missing-table guard so the
+        # create-and-retry path's two attempts both leave a trail
+        # (the create-on-first-miss recovery test inspects the count).
+        self.predicates.append(predicate)
+        if self.raise_table_not_found and not self.created:
+            raise RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] table missing")
+        batches = list(self.rows)
+        if predicate is None:
+            return iter(batches)
+        return predicate.filter_arrow_batches(iter(batches))
 
     def insert(
         self,
@@ -523,7 +511,7 @@ class TestRemoteCacheSend:
 
         s.send(req, remote_cache=cfg)
         assert len(s.calls) == 1, "remote miss must touch the network"
-        assert tab.queries, "lookup query must run before the network fetch"
+        assert tab.predicates, "lookup query must run before the network fetch"
         assert tab.inserts, "successful response must write back via insert"
         # Insert call carries the configured knobs.
         i = tab.inserts[0]
@@ -558,7 +546,7 @@ class TestRemoteCacheSend:
         assert tab.created, "missing table must be created on first miss"
         # The lookup query was re-executed after ``create`` — first
         # call raised, second one came back empty so the network fired.
-        assert len(tab.queries) >= 2
+        assert len(tab.predicates) >= 2
         assert len(s.calls) == 1
 
     def test_upsert_skips_both_lookup_and_writeback(self) -> None:
@@ -576,7 +564,7 @@ class TestRemoteCacheSend:
 
         assert len(s.calls) == 1, "UPSERT must always go to the network"
         assert out.json() == {"v": "fresh"}
-        assert tab.queries == [], "UPSERT must not issue a lookup query"
+        assert tab.predicates == [], "UPSERT must not issue a lookup query"
         assert tab.inserts == [], "UPSERT short-circuits the writeback too"
 
     def test_per_request_override_routes_to_alt_table(self) -> None:
@@ -635,7 +623,7 @@ class TestRemoteCacheSendMany:
         assert len(s.calls) == 1, "only the miss touches the network"
         # ``_split_remote_cache`` issues one batched SQL lookup per
         # distinct table.
-        assert len(tab.queries) == 1
+        assert len(tab.predicates) == 1
         # Writeback fires for the network result.
         assert any(call["rows"] == 1 for call in tab.inserts)
 
@@ -659,8 +647,8 @@ class TestRemoteCacheSendMany:
         out = list(s.send_many(iter([req_a, req_b])))
         assert {r.json()["k"] for r in out} == {"a", "b"}
         assert len(s.calls) == 0, "both rows hit their respective tables"
-        assert len(tab_a.queries) == 1
-        assert len(tab_b.queries) == 1
+        assert len(tab_a.predicates) == 1
+        assert len(tab_b.predicates) == 1
 
     def test_writeback_groups_split_by_mode(self) -> None:
         # APPEND + UPSERT in the same batch — APPEND should write back,
@@ -711,7 +699,7 @@ class TestCombinedCacheIntegration:
         out = s.send(req, local_cache=local, remote_cache=remote)
         assert out.json() == {"v": "local"}
         assert len(s.calls) == 0
-        assert tab.queries == [], "local hit must short-circuit before remote"
+        assert tab.predicates == [], "local hit must short-circuit before remote"
 
     def test_remote_hit_backfills_local(self, tmp_path) -> None:
         # Local empty, remote populated → the remote hit is written
