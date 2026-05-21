@@ -84,6 +84,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
 
+from yggdrasil.data.constants import MEDIA_TYPE_METADATA_KEY
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.enums import MimeTypes, Mode
 from yggdrasil.data.enums.media_type import MediaType, MediaTypes
@@ -558,7 +559,12 @@ class FolderPath(IO[bytes, FolderOptions]):
         except Exception:
             return None
 
-    def _persist_schema(self, schema: Any) -> None:
+    def _persist_schema(
+        self,
+        schema: Any,
+        *,
+        media_type: "MediaType | None" = None,
+    ) -> None:
         """Cache *schema* in memory AND dump to ``.ygg/schema.arrow``.
 
         Overrides :meth:`Tabular._persist_schema` so writers that
@@ -567,18 +573,46 @@ class FolderPath(IO[bytes, FolderOptions]):
         comments) round-trips through the zero-row Arrow IPC file
         the next read picks up via :meth:`_collect_schema`.
 
+        ``media_type`` is the on-disk format the writer just landed
+        in (``options.child_media_type`` — Arrow IPC, Parquet, …).
+        When supplied, it's stamped onto the persisted arrow schema
+        under the ``b"media_type"`` metadata key as the canonical
+        mime string; :attr:`Field.media_type` reads it back so a
+        consumer loading the schema can tell which format the rows
+        live in without scanning the part files. Defaults to ``None``
+        (no stamp) for callers that don't carry a media-type — the
+        sidecar then only carries the structural schema, exactly
+        like before.
+
         The disk write is short-circuited when the in-memory cache
-        already holds an equal schema — the steady state of a hot
-        cache-write loop is "every batch carries the same shape",
-        so re-stamping ``.ygg/schema.arrow`` on every call would
-        burn IO for no observable change. Side-car I/O stays
-        best-effort: a failed write never poisons the data write
-        that just landed.
+        already holds an equal schema **and** the persisted media
+        type hasn't changed — the steady state of a hot cache-write
+        loop is "every batch carries the same shape", so re-stamping
+        ``.ygg/schema.arrow`` on every call would burn IO for no
+        observable change. Side-car I/O stays best-effort: a failed
+        write never poisons the data write that just landed.
         """
         if schema is None:
             return
+        # Stamp the media-type onto a copy of the schema so the
+        # in-memory cache, the sidecar bytes, and the next
+        # ``Field.media_type`` read all see the same value. Building
+        # a copy keeps the caller's Field untouched (it may be
+        # singleton-shared via ``_schema_for_arrow``'s ancestor walk
+        # or owned by an unrelated consumer). ``with_metadata``
+        # replaces the dict wholesale, so merge with the existing
+        # metadata first to preserve every schema-level tag
+        # (``primary_key``, ``partition_by``, ``comment``, …).
+        if media_type is not None and hasattr(schema, "with_metadata"):
+            merged_meta = dict(schema.metadata or {})
+            merged_meta[MEDIA_TYPE_METADATA_KEY] = (
+                media_type.mime_type.value.encode("utf-8")
+            )
+            stamped = schema.with_metadata(merged_meta, inplace=False)
+        else:
+            stamped = schema
         prior = self._schema_cache
-        super()._persist_schema(schema)
+        super()._persist_schema(stamped)
         # Invalidate the partition-KV cache: ``static_values`` casts
         # raw URL values through the schema's partition dtypes, so a
         # schema flip can change the cast result.
@@ -586,14 +620,15 @@ class FolderPath(IO[bytes, FolderOptions]):
         if not self._yggmeta_enabled:
             return
         # Skip the sidecar rewrite when the schema is unchanged from
-        # the in-memory cache. ``Schema.__eq__`` compares structure
-        # + tags so two ``Schema.from_arrow`` round trips of the
-        # same source compare equal.
-        if prior is not ... and prior == schema:
+        # the in-memory cache. ``Schema.__eq__`` compares structure +
+        # tags + metadata so two ``Schema.from_arrow`` round trips of
+        # the same source compare equal; the media_type lives in
+        # metadata so a flip there already invalidates the equality.
+        if prior is not ... and prior == stamped:
             return
         arrow_schema = (
-            schema.to_arrow_schema() if hasattr(schema, "to_arrow_schema")
-            else schema
+            stamped.to_arrow_schema() if hasattr(stamped, "to_arrow_schema")
+            else stamped
         )
         if arrow_schema is None:
             return
@@ -1210,7 +1245,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 child._write_arrow_batches(
                     iter(subset.to_batches()), options,
                 )
-            self._persist_schema(first_schema)
+            self._persist_schema(first_schema, media_type=options.child_media_type)
             return
 
         action = self._resolve_action(options.mode)
@@ -1225,7 +1260,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         if action is Mode.OVERWRITE:
             self._clear_tabular_children()
             self._write_parts(materialised, options)
-            self._persist_schema(first_schema)
+            self._persist_schema(first_schema, media_type=options.child_media_type)
             return
 
         match_by = list(options.match_by_keys or ())
@@ -1236,12 +1271,12 @@ class FolderPath(IO[bytes, FolderOptions]):
                 self._merge_upsert(materialised, match_by, options)
             else:
                 self._merge_append(materialised, match_by, options)
-            self._persist_schema(first_schema)
+            self._persist_schema(first_schema, media_type=options.child_media_type)
             return
 
         # Plain APPEND (or empty folder): mint a fresh part and drain.
         self._write_parts(materialised, options)
-        self._persist_schema(first_schema)
+        self._persist_schema(first_schema, media_type=options.child_media_type)
 
     def _write_parts(
         self,

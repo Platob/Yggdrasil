@@ -92,3 +92,40 @@ class TestRoundTrip:
         # And reading it back returns the same data.
         got = folder.read_arrow_table()
         assert got.column("id").to_pylist() == [1, 2, 3]
+
+
+class TestMediaTypeMetadata:
+    """``FolderPath._persist_schema`` stamps ``Field.media_type``."""
+
+    def test_in_memory_schema_carries_media_type(self, tmp_path) -> None:
+        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        batch = pa.record_batch([pa.array([1, 2])], names=["id"])
+        folder.write_arrow_batches((batch,), options=FolderOptions())
+        # Default child media type is Arrow IPC — schema should
+        # report it after a write.
+        assert folder.collect_schema().media_type == MediaTypes.ARROW_IPC
+
+    def test_sidecar_round_trips_media_type(self, tmp_path) -> None:
+        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        batch = pa.record_batch([pa.array([1, 2])], names=["id"])
+        folder.write_arrow_batches(
+            (batch,),
+            options=FolderOptions(child_media_type=MediaTypes.PARQUET),
+        )
+        # Drop the in-memory singleton so the next read forces a
+        # sidecar load, then confirm the media-type stamp survived.
+        FolderPath._INSTANCES.clear()
+        reopened = FolderPath(path=str(tmp_path))
+        assert reopened.collect_schema().media_type == MediaTypes.PARQUET
+
+    def test_no_media_type_when_never_persisted(self, tmp_path) -> None:
+        folder = FolderPath(path=str(tmp_path))
+        # No write — schema falls back to empty / inferred, no media
+        # type was ever stamped.
+        assert folder.collect_schema().media_type is None
