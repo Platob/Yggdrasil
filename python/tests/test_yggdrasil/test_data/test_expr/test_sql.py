@@ -1,9 +1,10 @@
 """Tests for the SQL backend.
 
 Pinned outputs by dialect — quoting, literal escaping, NULL-aware
-``IN`` expansion, ``LIKE`` / ``ILIKE`` keyword selection.
-:func:`from_sql` round-trips through ``sqlglot`` so the lifter
-test is gated on the optional dependency.
+``IN`` expansion, ``LIKE`` / ``ILIKE`` keyword selection. The
+:func:`from_sql` round-trip suite exercises the hand-rolled
+tokenizer + recursive-descent parser, so it has no optional
+dependency to guard.
 """
 
 from __future__ import annotations
@@ -106,17 +107,14 @@ class TestUnknownDialectRaises:
             (col("x") == 1).to_sql(dialect="oracle")
 
 
-sqlglot = pytest.importorskip("sqlglot")
-
-
 class TestFromSqlRoundtrip:
     def test_simple_predicate_round_trips(self):
         original = (col("price") >= 100) & (col("side") == "buy")
         sql = original.to_sql()
         back = from_sql(sql)
-        # sqlglot reorders commutative AND/OR — emit and compare
-        # the rendered SQL of the lifted tree, not the operand
-        # tuple.
+        # The parser keeps operand order — emit and compare the
+        # rendered SQL of the lifted tree, not the operand tuple,
+        # so the test stays portable across simplify rewrites.
         assert "`price` >= 100" in to_sql(back)
         assert "`side` = 'buy'" in to_sql(back)
 
@@ -172,9 +170,67 @@ class TestFromSqlRoundtrip:
 
     def test_typed_date_literal_round_trips(self):
         # ``DATE '2024-01-01'`` and ``CAST('2024-01-01' AS DATE)``
-        # both parse through the same Cast path in sqlglot.
+        # both fold to the same typed Literal.
         back = from_sql("d >= DATE '2024-01-01'")
         assert to_sql(back) == "`d` >= DATE '2024-01-01'"
 
         back = from_sql("d >= CAST('2024-01-01' AS DATE)")
         assert to_sql(back) == "`d` >= DATE '2024-01-01'"
+
+    def test_not_between_lifts_negated(self):
+        back = from_sql("x NOT BETWEEN 1 AND 10")
+        assert to_sql(back) == "`x` NOT BETWEEN 1 AND 10"
+
+    def test_not_in_lifts_negated(self):
+        back = from_sql("x NOT IN (1, 2, 3)")
+        assert to_sql(back) == "`x` NOT IN (1, 2, 3)"
+
+    def test_is_null_and_is_not_null(self):
+        assert to_sql(from_sql("c IS NULL")) == "`c` IS NULL"
+        assert to_sql(from_sql("c IS NOT NULL")) == "`c` IS NOT NULL"
+
+    def test_quoted_identifier_round_trips(self):
+        # Backticks (Databricks / MySQL) and double quotes (ANSI /
+        # Postgres / SQLite) both round-trip as identifiers.
+        assert to_sql(from_sql("`weird name` = 1")) == "`weird name` = 1"
+        assert to_sql(
+            from_sql('"col" = 1', dialect="postgres"),
+            dialect="postgres",
+        ) == '"col" = 1'
+
+    def test_double_quote_is_string_on_databricks(self):
+        # Databricks treats ``"…"`` as a string literal, matching
+        # the source SQL the call form ``TIMESTAMP("…")`` emits.
+        back = from_sql('s = "hello"')
+        assert to_sql(back) == "`s` = 'hello'"
+
+    def test_string_literal_doubled_quote_escape(self):
+        back = from_sql("c = 'O''Hara'")
+        assert to_sql(back) == "`c` = 'O''Hara'"
+
+    def test_negative_numeric_literal_folds(self):
+        back = from_sql("x = -5")
+        assert to_sql(back) == "`x` = -5"
+
+    def test_arithmetic_lifts_to_arithmetic_node(self):
+        back = from_sql("a + 1 > b * 2")
+        assert to_sql(back) == "`a` + 1 > `b` * 2"
+
+    def test_line_and_block_comments_are_skipped(self):
+        back = from_sql(
+            "x = 1 -- trailing comment\n  AND /* inline */ y = 2"
+        )
+        assert to_sql(back) == "`x` = 1 AND `y` = 2"
+
+    def test_compound_not_between_and_in_chained(self):
+        back = from_sql(
+            "content_id IN (1, 2) AND issue_date NOT BETWEEN "
+            "DATE('2024-01-01') AND DATE('2024-02-01')"
+        )
+        rendered = to_sql(back)
+        assert "`content_id` IN (1, 2)" in rendered
+        assert "`issue_date` NOT BETWEEN DATE '2024-01-01'" in rendered
+
+    def test_trailing_garbage_raises_with_position(self):
+        with pytest.raises(ValueError, match="trailing token"):
+            from_sql("x = 1 wibble")
