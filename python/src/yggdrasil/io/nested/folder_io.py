@@ -141,7 +141,7 @@ class FolderIO(IO[bytes, FolderOptions]):
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
 
-    __slots__ = ("path", "_yggmeta_enabled")
+    __slots__ = ("path", "_yggmeta_enabled", "_predicate_free_cols")
 
     #: Sidecar directory name under :attr:`path` where folder-level
     #: metadata (the dumped schema, future per-format hints) lives.
@@ -209,6 +209,12 @@ class FolderIO(IO[bytes, FolderOptions]):
         from yggdrasil.io.path.path import Path as _Path
         self.path: "Path" = raw if isinstance(raw, _Path) else _Path.from_(raw)
         self._yggmeta_enabled: bool = bool(yggmeta)
+        # Predicate-id-keyed cache of :func:`free_columns` results.
+        # Walks the AST once per predicate; the recursive child reads
+        # share the same predicate instance and walk the parent chain
+        # via :meth:`_free_cols_for` to find this slot — so a 64-OR
+        # batch lookup pays the walk once instead of 64+ times.
+        self._predicate_free_cols: "tuple[int, tuple[str, ...]] | None" = None
 
         # Don't forward ``data`` / ``path`` / ``binary`` — Holder
         # would try to seed bytes from the directory path. The folder
@@ -396,6 +402,16 @@ class FolderIO(IO[bytes, FolderOptions]):
                     return Schema.from_arrow(reader.schema)
                 except Exception:
                     pass  # corrupt sidecar — fall through to first-batch
+        # Missing-folder short-circuit: the base ``_collect_schema``
+        # would recurse through ``_read_arrow_batches`` →
+        # ``iter_children`` which itself stat's the path and returns
+        # empty; collapse that whole round trip into a single
+        # ``Schema.empty()`` here. Pays one ``exists`` syscall per
+        # cold cache miss but avoids the ``next(iter(batches), None)``
+        # detour the base fallback otherwise takes.
+        if not self.path.exists():
+            from yggdrasil.data.schema import Schema
+            return Schema.empty()
         return super()._collect_schema(options)
 
     def _schema_for_arrow(self, arrow_schema: Any) -> Any:
@@ -855,11 +871,20 @@ class FolderIO(IO[bytes, FolderOptions]):
         drops to the remaining partitions (or to a flat write when
         the schema's partition set is exhausted).
         """
-        if self._should_prune_by_predicate(options):
-            return
         predicate = options.predicate
+        # Mutualise the predicate AST walk across the whole read
+        # subtree. :meth:`_free_cols_for` checks this folder and
+        # every ``tabular_parent`` for a cached entry keyed by
+        # ``id(predicate)`` — the candidate-probe loop yields fresh
+        # child FolderIOs, but they all share the same root and the
+        # same predicate instance, so the walk happens exactly once
+        # per ``read_arrow_batches`` call instead of N times per
+        # iter_children iteration.
+        free_cols = self._free_cols_for(predicate)
+        if self._should_prune_by_predicate(options, free_cols=free_cols):
+            return
         for child in self.iter_children(options=options):
-            if child._should_prune_by_predicate(options):
+            if child._should_prune_by_predicate(options, free_cols=free_cols):
                 continue
             child_options = self._child_read_options(child, options)
             stream = child._read_arrow_batches(child_options)
@@ -875,6 +900,48 @@ class FolderIO(IO[bytes, FolderOptions]):
                 yield from predicate.filter_arrow_batches(stream)
             else:
                 yield from stream
+
+    def _free_cols_for(self, predicate: Any) -> "tuple[str, ...] | None":
+        """Memoised :func:`free_columns` lookup keyed by ``id(predicate)``.
+
+        Walks ``tabular_parent`` looking for an already-cached
+        ``(id(predicate), free_cols)`` tuple; on miss, computes the
+        free-column tuple once and stashes it on the *topmost*
+        :class:`FolderIO` ancestor so every recursive child read
+        finds it without re-walking the AST.
+
+        Predicate AST nodes are immutable and short-lived (their
+        lifetime is bounded by the read pipeline call stack), so
+        id-keying is safe: the cached entry can't outlive the
+        predicate instance that produced it.
+        """
+        if predicate is None:
+            return None
+        pid = id(predicate)
+        # Search self + ancestors for a cached entry. The top-level
+        # FolderIO is where we stash, but any ancestor along the way
+        # may already hold the cache.
+        node: Any = self
+        topmost: "FolderIO" = self
+        while node is not None:
+            cached = getattr(node, "_predicate_free_cols", None)
+            if cached is not None and cached[0] == pid:
+                return cached[1]
+            if isinstance(node, FolderIO):
+                topmost = node
+            node = getattr(node, "tabular_parent", None)
+        try:
+            from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+            cols = free_columns(predicate)
+        except Exception:
+            return None
+        # Stash on the topmost FolderIO so every recursive child read
+        # finds the cache on its first parent walk.
+        try:
+            topmost._predicate_free_cols = (pid, cols)
+        except Exception:
+            pass
+        return cols
 
     def _child_read_options(
         self, child: "Tabular", options: FolderOptions,

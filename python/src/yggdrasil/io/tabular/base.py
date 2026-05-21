@@ -202,7 +202,12 @@ class Tabular(ABC, Generic[O]):
         """
         return {}
 
-    def matches_static(self, predicate: "Any") -> bool:
+    def matches_static(
+        self,
+        predicate: "Any",
+        *,
+        free_cols: "tuple[str, ...] | None" = None,
+    ) -> bool:
         """True iff *predicate* could match any row given
         :attr:`static_values`. Conservative on undecidables (column
         not in static values, predicate evaluator failure) so the
@@ -213,19 +218,28 @@ class Tabular(ABC, Generic[O]):
         predicate against it — generalises the partition-only
         prune so any aggregator (folder read, future warehouse
         file skip) reuses the one helper.
+
+        ``free_cols`` lets a caller that's about to prune the same
+        predicate against N children precompute the free-column
+        tuple once and reuse it — :func:`free_columns` walks the
+        AST every call, so on a 64-OR predicate (the cache batch
+        lookup shape) the saving is N-1 full walks per
+        ``iter_children`` loop. Default ``None`` keeps the call
+        site short for one-off prune checks.
         """
         if predicate is None:
             return True
-        try:
-            from yggdrasil.io.tabular.execution.expr.nodes import free_columns
-            free = free_columns(predicate)
-        except Exception:
-            return True
-        if not free:
+        if free_cols is None:
+            try:
+                from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+                free_cols = free_columns(predicate)
+            except Exception:
+                return True
+        if not free_cols:
             return True
         sv = self.static_values
         relevant: "dict[str, Any]" = {}
-        for name in free:
+        for name in free_cols:
             if name not in sv:
                 # Predicate touches a column outside our static
                 # surface — can't decide, must read.
@@ -237,25 +251,33 @@ class Tabular(ABC, Generic[O]):
         except Exception:
             return True
 
-    def _should_prune_by_predicate(self, options: Any) -> bool:
+    def _should_prune_by_predicate(
+        self,
+        options: Any,
+        *,
+        free_cols: "tuple[str, ...] | None" = None,
+    ) -> bool:
         """Return ``True`` iff ``options.predicate`` is provably false
         against this Tabular's :attr:`static_values` — the caller may
         skip the read entirely.
 
-        Thin wrapper around :meth:`matches_static`: pulls the predicate
-        off *options* (any object that exposes a ``predicate``
-        attribute; absence and ``None`` both mean "no prune") and
-        inverts the sense so an aggregator's read loop reads as
-        ``if self._should_prune_by_predicate(options): return``.
+        Thin wrapper around :meth:`matches_static`: pulls the
+        predicate off *options* (any object that exposes a
+        ``predicate`` attribute; absence and ``None`` both mean "no
+        prune") and inverts the sense so an aggregator's read loop
+        reads as ``if self._should_prune_by_predicate(options):
+        return``. ``free_cols`` mutualises the AST walk across a
+        sibling loop — see :meth:`matches_static`.
 
         Conservative on undecidables: a predicate over a column we
-        have no static value for returns ``False`` (no prune) and the
-        caller still reads. Same contract as :meth:`matches_static`.
+        have no static value for returns ``False`` (no prune) and
+        the caller still reads. Same contract as
+        :meth:`matches_static`.
         """
         predicate = getattr(options, "predicate", None)
         if predicate is None:
             return False
-        return not self.matches_static(predicate)
+        return not self.matches_static(predicate, free_cols=free_cols)
 
     # ==================================================================
     # Coercion entry point — delegates to the format registry on Holder

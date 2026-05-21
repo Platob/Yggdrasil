@@ -709,13 +709,17 @@ class CacheConfig(_ConfigBase):
           third-party Tabular) — returned as-is.
         * :attr:`path` set (local case) — wrapped in a
           :class:`~yggdrasil.io.nested.folder_io.FolderIO` rooted at
-          that path. The folder is singleton-keyed on the path, so
-          repeat calls hand back the same live instance.
+          that path. The folder is memoised back onto :attr:`tabular`
+          on first call so repeated lookups (every ``send`` /
+          ``send_many`` cache scan) hand back the same instance —
+          its in-memory schema cache, predicate ``free_columns`` memo,
+          and yggmeta sidecar buffer all stay warm across calls.
         * Neither set but the cache is otherwise enabled
           (``received_*`` window) — the default
           ``~/.yggdrasil/cache/response/...`` :class:`FolderIO` is
           materialised via :meth:`local_cache_folder` and memoised
-          back on :attr:`path` so the next call short-circuits.
+          back on :attr:`path` + :attr:`tabular` so the next call
+          short-circuits.
 
         The on-disk layout is Hive-partitioned by whichever fields
         :meth:`partition_columns` reports (RESPONSE_SCHEMA's
@@ -733,7 +737,16 @@ class CacheConfig(_ConfigBase):
         folder_path = self.local_cache_folder(session=session)
         if self.path is None:
             object.__setattr__(self, "path", folder_path)
-        return FolderIO(path=folder_path)
+        tabular = FolderIO(path=folder_path)
+        # Stash the built folder back on the config so subsequent
+        # cache scans reuse the same instance — the schema cache and
+        # predicate ``free_columns`` memo only stay warm across
+        # calls if the FolderIO is itself reused. ``tabular`` is
+        # ``compare=False, hash=False``, and excluded from
+        # ``__getstate__``, so the mutation doesn't affect equality
+        # or pickling.
+        object.__setattr__(self, "tabular", tabular)
+        return tabular
 
     def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
         """Materialise :attr:`path` for local-cache configs.
