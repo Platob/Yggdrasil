@@ -101,13 +101,15 @@ def _is_valid_response_key(key: str) -> bool:
 
 
 def _request_column_sql_name(key: str) -> str:
-    """SQL column name for a request-side ``request_by`` key.
+    """Cache-table column name for a request-side ``request_by`` key.
 
-    The response-cache table stores requests as flattened
-    ``request_<col>`` columns (cf. :data:`RESPONSE_SCHEMA`), so a
-    user-supplied ``request_by`` key that names a bare request column
-    (``public_url_hash``, ``method`` …) needs the ``request_`` prefix
-    when emitted into SQL. Already-prefixed keys pass through.
+    The response cache stores requests as flattened ``request_<col>``
+    columns (cf. :data:`RESPONSE_SCHEMA`), so a user-supplied
+    ``request_by`` key that names a bare request column
+    (``public_url_hash``, ``method`` …) needs the ``request_``
+    prefix when used as a column reference (predicate match clause,
+    :meth:`Tabular.write_arrow_batches` match-by). Already-prefixed
+    keys pass through.
     """
     head, sep, tail = key.partition(".")
     if head in REQUEST_ARROW_SCHEMA.names:
@@ -325,12 +327,12 @@ class CacheConfig(_ConfigBase):
     # Default 1 day. Set to ``None`` to disable cleanup entirely
     # (cache grows unbounded).
     cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1)
-    # Lazy memo for derived predicates and SQL column lists
-    # (``match_by``, ``match_by_columns``, ``request_by_is_public``, the
-    # ``request_sql_column_names`` array, the partition_by SQL clause).
-    # Each is purely a function of the frozen fields above — caching
-    # turns a per-send (or per-batch-request) recomputation into a
-    # dict lookup. Excluded from pickle / equality / repr; rebuilt
+    # Lazy memo for derived predicate-pipeline values
+    # (``cache_enabled``, ``match_by``, ``match_by_columns``,
+    # ``request_match_columns``, ``request_by_is_public``). Each is
+    # purely a function of the frozen fields above — caching turns
+    # a per-send (or per-batch-request) recomputation into a dict
+    # lookup. Excluded from pickle / equality / repr; rebuilt
     # transparently after ``__setstate__``.
     _derived: Optional[dict] = field(
         default=None, init=False, hash=False, compare=False, repr=False,
@@ -667,9 +669,10 @@ class CacheConfig(_ConfigBase):
         int64 whether the caller looks them up on the original request or
         on the anonymized form stored in the cache. When this predicate
         holds the lookup paths can skip the per-request ``anonymize()``
-        pass before computing ``request_tuple`` / interpolating the SQL
-        clause — the saving is one URL parse + one header normalize per
-        request per lookup, which adds up on send_many bursts.
+        pass before computing ``request_tuple`` / building the lookup
+        :class:`Predicate` — the saving is one URL parse + one header
+        normalize per request per lookup, which adds up on send_many
+        bursts.
         """
         cache = self._derived_cache()
         out = cache.get("request_by_is_public", ...)
