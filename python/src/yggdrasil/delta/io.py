@@ -1,7 +1,7 @@
-"""Back-compat shim — :class:`DeltaIO` lives at :mod:`yggdrasil.io.nested.delta.delta_io`."""
+"""Back-compat shim — :class:`DeltaFolder` lives at :mod:`yggdrasil.io.nested.delta.delta_io`."""
 
 from __future__ import annotations
 
-from yggdrasil.io.nested.delta.delta_io import DeltaIO, DeltaOptions
+from yggdrasil.io.nested.delta.delta_io import DeltaFolder, DeltaOptions
 
-__all__ = ["DeltaIO", "DeltaOptions"]
+__all__ = ["DeltaFolder", "DeltaOptions"]

@@ -1,4 +1,4 @@
-"""DeltaIO — :class:`FolderIO` over a Delta Lake table.
+"""DeltaFolder — :class:`FolderIO` over a Delta Lake table.
 
 The leaf orchestrates four subsystems documented in this package:
 
@@ -43,7 +43,7 @@ What changes vs :class:`FolderIO`
 Caching
 -------
 
-Every :class:`DeltaIO` carries a :class:`DeltaLog` instance whose
+Every :class:`DeltaFolder` carries a :class:`DeltaLog` instance whose
 listing + ``_last_checkpoint`` reads are memoized. A read pass that
 includes a schema collect, a row count, and a batch scan does
 exactly **one** ``_delta_log`` listing and **one** ``_last_checkpoint``
@@ -53,12 +53,12 @@ table moved underneath them.
 Engine bridges
 --------------
 
-:class:`DeltaIO` inherits :class:`FolderIO` -> :class:`Tabular`, so
+:class:`DeltaFolder` inherits :class:`FolderIO` -> :class:`Tabular`, so
 ``read_polars_frame`` / ``read_pandas_frame`` / ``read_spark_frame``
 work without any per-engine plumbing here. The Arrow batch stream
 :meth:`_read_arrow_batches` produces routes through
 :mod:`yggdrasil.data.cast` for the engine the caller asked for —
-reads go Arrow → engine, writes go engine → Arrow → DeltaIO. That
+reads go Arrow → engine, writes go engine → Arrow → DeltaFolder. That
 keeps a single code path for partition pruning, DV masking, and
 checkpoint replay regardless of which engine the caller is using.
 """
@@ -108,7 +108,7 @@ from yggdrasil.io.nested.delta.schema_codec import (
 )
 from yggdrasil.io.nested.delta.snapshot import Snapshot
 
-__all__ = ["ConcurrentDeltaCommitError", "DeltaIO", "DeltaOptions"]
+__all__ = ["ConcurrentDeltaCommitError", "DeltaFolder", "DeltaOptions"]
 
 
 class ConcurrentDeltaCommitError(RuntimeError):
@@ -163,7 +163,7 @@ class DeltaOptions(FolderOptions):
     #: feature requires it (DV → reader 3 / writer 7).
     min_reader_version: int = 1
     min_writer_version: int = 2
-    #: When ``True``, :meth:`DeltaIO._delete` marks rows via a deletion
+    #: When ``True``, :meth:`DeltaFolder._delete` marks rows via a deletion
     #: vector on the existing parquet rather than rewriting the file.
     #: Forces the protocol to declare the ``deletionVectors`` feature.
     delete_via_dv: bool = False
@@ -174,21 +174,30 @@ class DeltaOptions(FolderOptions):
     #: action set against the new HEAD, and retry. Set to 0 to fail
     #: fast on the first conflict.
     commit_max_retries: int = 8
-    #: Base sleep (seconds) before the first retry; the actual delay
-    #: is ``base * 2**attempt + jitter``. Keeps tight conflict loops
-    #: from amplifying when many writers commit at once.
+    #: Base sleep (seconds) before the first *backed-off* retry; the
+    #: actual delay is ``base * 2**(attempt - 1) + jitter``. The first
+    #: conflict retries immediately (no sleep) — the race is usually
+    #: just two writers landing in the same millisecond, so an extra
+    #: round trip is cheaper than a 50 ms idle. Subsequent retries
+    #: back off exponentially to stop a tight contention loop from
+    #: amplifying.
     commit_retry_backoff: float = 0.05
     #: Upper bound (seconds) on the per-attempt random jitter added to
     #: the backoff. Stays small so the retry pause stays predictable.
     commit_retry_jitter: float = 0.05
+    #: Hard cap on the per-attempt backoff before jitter. Stops the
+    #: exponential from blowing up under sustained contention — once
+    #: the delay hits this ceiling, every further retry waits at most
+    #: this long (still with jitter on top).
+    commit_retry_max_delay: float = 1.0
 
 
 # ---------------------------------------------------------------------------
-# DeltaIO
+# DeltaFolder
 # ---------------------------------------------------------------------------
 
 
-class DeltaIO(FolderIO):
+class DeltaFolder(FolderIO):
     """:class:`FolderIO` over a Delta Lake table at a :class:`Path`."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.DELTA_FOLDER
@@ -221,13 +230,13 @@ class DeltaIO(FolderIO):
         self._snapshot: "Optional[Snapshot]" = None
 
     def __repr__(self) -> str:
-        return f"DeltaIO(path={self.path!r})"
+        return f"DeltaFolder(path={self.path!r})"
 
     # ==================================================================
     # Cache control
     # ==================================================================
 
-    def refresh(self) -> "DeltaIO":
+    def refresh(self) -> "DeltaFolder":
         """Drop cached log + snapshot. Next read re-fetches everything."""
         self._log.invalidate()
         self._snapshot = None
@@ -288,8 +297,13 @@ class DeltaIO(FolderIO):
         Pipeline:
 
         1. Resolve snapshot at ``options.version`` (HEAD by default).
-        2. Filter active files via ``options.prune_values`` (partition
-           pruning) before any parquet open.
+        2. Filter active files via partition pruning before any
+           parquet open. The accepted-value sets come from
+           ``options.prune_values`` directly *and* from
+           :func:`extract_partition_filters` walking
+           ``options.predicate`` for the partition columns — so a
+           caller who passes only a ``Predicate`` still gets file-
+           level skipping for free.
         3. Read each parquet through :class:`ParquetFile` so codec /
            memory-map / native pushdown all work as usual.
         4. Mask rows with the file's :class:`DeletionVector` when one
@@ -313,7 +327,9 @@ class DeltaIO(FolderIO):
         # reference the same DV sidecar collapse to one window read.
         sidecar_cache: dict[str, bytes] = {}
 
-        prune = options.prune_values
+        prune = _merge_prune_with_predicate(
+            options.prune_values, options.predicate, partition_columns,
+        )
         for add in snap.prune_files(prune_values=prune):
             try:
                 yield from self._read_one_add(
@@ -363,6 +379,18 @@ class DeltaIO(FolderIO):
             mode=Mode.READ_ONLY,
         )
 
+        # Row-level filter — applied after partition stamping so the
+        # predicate can reference both partition columns (carried on
+        # the AddFile, not in the parquet payload) and data columns.
+        # The partition-pruning extractor already dropped files whose
+        # partition value was rejected; this is the residual non-
+        # partition filter (the ``id > 1`` in
+        # ``region == "us" AND id > 1``) plus the partition predicate
+        # re-run as a sanity pass.
+        row_filter = _arrow_row_filter_for(
+            options.predicate, partition_columns, target_schema,
+        )
+
         base_offset = 0
         with leaf as opened:
             for batch in opened._read_arrow_batches(leaf_options):
@@ -370,12 +398,17 @@ class DeltaIO(FolderIO):
                 base_offset += batch.num_rows
                 if masked.num_rows == 0:
                     continue
-                yield self._stamp_partitions(
+                stamped = self._stamp_partitions(
                     masked,
                     add.partition_values,
                     partition_columns,
                     target_schema,
                 )
+                if row_filter is not None:
+                    stamped = row_filter(stamped)
+                    if stamped.num_rows == 0:
+                        continue
+                yield stamped
 
     @staticmethod
     def _stamp_partitions(
@@ -756,6 +789,9 @@ class DeltaIO(FolderIO):
         ``None`` because their adds are valid at any version.
         """
         max_retries = max(0, int(options.commit_max_retries or 0))
+        backoff = float(options.commit_retry_backoff or 0.0)
+        jitter = float(options.commit_retry_jitter or 0.0)
+        max_delay = float(options.commit_retry_max_delay or 0.0)
         last_exc: "Optional[FileExistsError]" = None
         for attempt in range(max_retries + 1):
             snap = initial_snap if attempt == 0 else self.snapshot(fresh=True)
@@ -779,10 +815,20 @@ class DeltaIO(FolderIO):
                         f"{max_retries}) if your contention level is "
                         f"genuinely this high."
                     ) from last_exc
-                # Exponential backoff with jitter so coordinated retries
-                # don't lock-step against each other.
-                delay = float(options.commit_retry_backoff or 0.0) * (2**attempt)
-                jitter = float(options.commit_retry_jitter or 0.0)
+                # First conflict retries immediately — the race is
+                # usually two writers landing in the same ms, the
+                # winning version is already visible on the next log
+                # listing, and an idle 50ms throws away the speedup
+                # from refreshing the snapshot right away. Subsequent
+                # retries back off exponentially, capped at
+                # ``max_delay`` so sustained contention doesn't blow
+                # the budget.
+                if attempt == 0 or backoff <= 0:
+                    delay = 0.0
+                else:
+                    delay = backoff * (2 ** (attempt - 1))
+                    if max_delay > 0 and delay > max_delay:
+                        delay = max_delay
                 if jitter > 0:
                     delay += random.uniform(0, jitter)
                 if delay > 0:
@@ -1539,6 +1585,121 @@ def _reinterpret_unsigned_as_signed(batch: pa.RecordBatch) -> pa.RecordBatch:
             new_arrays.append(batch.column(i))
             new_fields.append(field)
     return pa.RecordBatch.from_arrays(new_arrays, schema=pa.schema(new_fields))
+
+
+def _arrow_row_filter_for(
+    predicate: "Any",
+    partition_columns: "List[str]",
+    target_schema: "Optional[pa.Schema]",
+) -> "Optional[Callable[[pa.RecordBatch], pa.RecordBatch]]":
+    """Compile ``predicate`` to a per-batch pyarrow filter, or ``None``.
+
+    Returns ``None`` (caller skips filtering) when:
+
+    - ``predicate`` is ``None`` — nothing to filter.
+    - One of the predicate's free columns is missing from the
+      stamped batch schema (partition columns + ``target_schema``
+      columns). Matches the documented contract on
+      :attr:`CastOptions.predicate`: "missing inputs can't yield a
+      coherent boolean, and the alternative ('drop everything') is
+      almost always wrong for heterogeneous-source folders."
+
+    Otherwise compiles the predicate to a
+    :class:`pyarrow.compute.Expression` once and returns a closure
+    that runs the C++ filter on each :class:`pa.RecordBatch`.
+    Compiled once per :meth:`_read_arrow_batches` invocation so the
+    per-batch work is just the kernel call.
+    """
+    if predicate is None:
+        return None
+    try:
+        from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+    except ImportError:
+        return None
+
+    referenced = set(free_columns(predicate))
+    if target_schema is not None:
+        available = set(target_schema.names) | set(partition_columns)
+    else:
+        available = set(partition_columns)
+    if not referenced.issubset(available):
+        # Predicate touches a column the snapshot's schema doesn't
+        # carry. Degrade to "accept everything" rather than raise —
+        # heterogeneous-source folders need that contract.
+        return None
+
+    try:
+        arrow_expr = predicate.to_arrow()
+    except Exception:
+        # Predicate compiles to a shape pyarrow can't lift (rare:
+        # custom node types, unsupported dtype). Degrade gracefully.
+        return None
+
+    import pyarrow.dataset as pds
+
+    def _filter(batch: "pa.RecordBatch") -> "pa.RecordBatch":
+        if batch.num_rows == 0:
+            return batch
+        filtered = pds.dataset(pa.Table.from_batches([batch])).to_table(
+            filter=arrow_expr,
+        )
+        if filtered.num_rows == 0:
+            return pa.RecordBatch.from_pylist([], schema=batch.schema)
+        # ``combine_chunks`` re-materialises into a single chunk so
+        # ``to_batches`` yields exactly one batch — saves the caller
+        # from re-stitching when filter survival is partial.
+        rebuilt = filtered.combine_chunks().to_batches()
+        return rebuilt[0] if rebuilt else pa.RecordBatch.from_pylist(
+            [], schema=batch.schema,
+        )
+
+    return _filter
+
+
+def _merge_prune_with_predicate(
+    explicit: "Optional[dict]",
+    predicate: "Any",
+    partition_columns: "List[str]",
+) -> "Optional[dict]":
+    """Combine caller-supplied ``prune_values`` with predicate-extracted hints.
+
+    The result is what :meth:`Snapshot.prune_files` consumes — a
+    ``Mapping[str, Iterable]`` of accepted values per partition
+    column, or ``None`` when nothing constrains the file set.
+    Sources are AND'd: a file matches iff its partition value lies
+    in *both* the explicit set (when given) and the predicate's
+    extracted set (when extractable).
+
+    Predicate extraction routes through
+    :func:`yggdrasil.io.tabular.execution.expr.extract_partition_filters`,
+    which over-approximates and only reports columns it can pin to
+    a finite set — comparisons, ``IN`` lists, ``IS NULL``, and their
+    ``AND`` / ``OR`` composition. Ranges, ``NOT``, and arithmetic
+    return no constraint for those columns — the row-level filter
+    still runs on every surviving file, so the soundness contract
+    is preserved.
+    """
+    if predicate is None or not partition_columns:
+        return explicit
+    from yggdrasil.io.tabular.execution.expr import extract_partition_filters
+
+    derived = extract_partition_filters(predicate, partition_columns)
+    if not derived:
+        return explicit
+    if not explicit:
+        # ``prune_files`` accepts any ``Mapping[str, Iterable]`` —
+        # frozensets satisfy that contract directly.
+        return derived
+    # Intersect column-by-column. Columns constrained on only one
+    # side keep that side's set.
+    merged: dict = dict(explicit)
+    for col_name, derived_set in derived.items():
+        if col_name in merged:
+            existing = frozenset(merged[col_name])
+            merged[col_name] = existing & derived_set
+        else:
+            merged[col_name] = derived_set
+    return merged
 
 
 def _split_batch(

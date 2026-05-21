@@ -291,7 +291,7 @@ class CastOptions:
     spark_options: dict[str, Any] | None = None
 
     # --- Folder-write knob ----------------------------------------------
-    # Used by folder-shaped writers (FolderIO, ZipFile, DeltaIO).
+    # Used by folder-shaped writers (FolderIO, ZipFile, DeltaFolder).
     # ``max_workers`` is the thread-pool size for naturally-parallel
     # folder operations (clearing children, per-child schema collection,
     # per-leaf reads behind partition merges, per-partition writes);

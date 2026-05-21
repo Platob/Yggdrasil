@@ -72,7 +72,7 @@ class S3Service(AWSService):
     and the convenience :meth:`path` factory.
 
     The :attr:`ls_cache` is keyed on ``(bucket, prefix)`` tuples
-    with a short TTL, so a DeltaIO replay that hits the same prefix
+    with a short TTL, so a DeltaFolder replay that hits the same prefix
     5–10 times pays one ListObjectsV2 instead of N.
     """
 

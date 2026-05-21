@@ -4,7 +4,7 @@ Focuses on the features that distinguish this implementation from a
 plain folder-of-parquets:
 
 - DV write (inline + sidecar) and read round-trip
-- ``DeltaIO.delete`` with the rewrite strategy and the DV strategy
+- ``DeltaFolder.delete`` with the rewrite strategy and the DV strategy
 - :class:`yggdrasil.data.Schema` ↔ Spark JSON schema bridges
 - The canonical import path (``yggdrasil.io.nested.delta``) lights up
   the same class registered against ``MimeTypes.DELTA_FOLDER`` as the
@@ -30,7 +30,7 @@ from yggdrasil.io.nested.delta.deletion_vector import (
 )
 from yggdrasil.io.nested.delta.tests import DeltaTestCase
 
-# ``DeltaIO.delete(predicate_string)`` lifts the predicate via
+# ``DeltaFolder.delete(predicate_string)`` lifts the predicate via
 # :func:`Expression.from_sql`, which depends on the optional ``sqlglot``
 # package. The DV / rewrite suites that pass SQL strings can only run
 # when that extra is installed — skip them cleanly when it isn't.
@@ -53,17 +53,17 @@ _requires_sqlglot = unittest.skipUnless(
 
 class TestImportSurface(DeltaTestCase):
     def test_canonical_path_resolves_same_class_as_shim(self) -> None:
-        from yggdrasil.delta import DeltaIO as Shim
-        from yggdrasil.io.nested.delta import DeltaIO as Canonical
+        from yggdrasil.delta import DeltaFolder as Shim
+        from yggdrasil.io.nested.delta import DeltaFolder as Canonical
 
         self.assertIs(Shim, Canonical)
 
     def test_io_nested_reexports_deltaio(self) -> None:
-        from yggdrasil.io.nested import DeltaIO, DeltaOptions
-        from yggdrasil.io.nested.delta import DeltaIO as Canonical
+        from yggdrasil.io.nested import DeltaFolder, DeltaOptions
+        from yggdrasil.io.nested.delta import DeltaFolder as Canonical
         from yggdrasil.io.nested.delta import DeltaOptions as CanonicalOpts
 
-        self.assertIs(DeltaIO, Canonical)
+        self.assertIs(DeltaFolder, Canonical)
         self.assertIs(DeltaOptions, CanonicalOpts)
 
 
@@ -126,7 +126,7 @@ class TestDecodeUnknownEnvelope(DeltaTestCase):
 
 
 # ---------------------------------------------------------------------------
-# DeltaIO.delete — rewrite strategy
+# DeltaFolder.delete — rewrite strategy
 # ---------------------------------------------------------------------------
 
 
@@ -157,7 +157,7 @@ class TestDeleteByRewrite(DeltaTestCase):
 
 
 # ---------------------------------------------------------------------------
-# DeltaIO.delete — DV strategy
+# DeltaFolder.delete — DV strategy
 # ---------------------------------------------------------------------------
 
 

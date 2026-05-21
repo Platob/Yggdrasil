@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.delta.io.DeltaIO` end-to-end."""
+"""Tests for :class:`yggdrasil.delta.io.DeltaFolder` end-to-end."""
 from __future__ import annotations
 
 import os
@@ -169,6 +169,109 @@ class TestPartitionPruning(DeltaTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Predicate-driven partition pruning — same file-skip behavior as
+# explicit ``prune_values``, but derived from the row-level
+# ``options.predicate``. Lets callers ship one Predicate that drives
+# both the partition prune *and* the row-level filter downstream.
+# ---------------------------------------------------------------------------
+
+
+class TestPredicatePartitionPruning(DeltaTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.d = self.delta_io()
+        self.d.write_arrow_table(
+            self.pa.table({
+                "id": [1, 2, 3, 4, 5],
+                "region": ["us", "us", "eu", "ap", "br"],
+                "val": ["a", "b", "c", "d", "e"],
+            }),
+            options=DeltaOptions(target=_partition_schema()),
+        )
+
+    def _files_read(self, options: DeltaOptions) -> int:
+        """Count partition files surviving the prune (pre-parquet open)."""
+        from yggdrasil.io.nested.delta.delta_io import _merge_prune_with_predicate
+
+        snap = self.d.snapshot(fresh=False)
+        prune = _merge_prune_with_predicate(
+            options.prune_values, options.predicate, snap.partition_columns,
+        )
+        return sum(1 for _ in snap.prune_files(prune_values=prune))
+
+    def test_eq_predicate_prunes_to_one_file(self) -> None:
+        from yggdrasil.io.tabular.execution.expr import col as expr_col
+
+        opts = DeltaOptions(predicate=(expr_col("region") == "us"))
+        # Four partitions exist (us, us is one file because the writer
+        # groups by partition value), only one matches.
+        self.assertEqual(self._files_read(opts), 1)
+        out = self.d.read_arrow_table(options=opts)
+        self.assertEqual(out.num_rows, 2)
+        self.assertEqual(set(out.column("region").to_pylist()), {"us"})
+
+    def test_or_predicate_collapses_to_in_set(self) -> None:
+        from yggdrasil.io.tabular.execution.expr import col as expr_col
+
+        opts = DeltaOptions(
+            predicate=(expr_col("region") == "us")
+            | (expr_col("region") == "eu"),
+        )
+        # Simplify turns the OR into ``region IN ('us', 'eu')`` →
+        # two partition files match.
+        self.assertEqual(self._files_read(opts), 2)
+        out = self.d.read_arrow_table(options=opts)
+        self.assertEqual(set(out.column("region").to_pylist()), {"us", "eu"})
+
+    def test_predicate_with_non_partition_column_still_prunes_files(self) -> None:
+        # The ``id > 1`` half can't drive partition pruning, but the
+        # ``region == "us"`` half still picks one file. The row-level
+        # filter takes care of the ``id > 1`` rejection downstream.
+        from yggdrasil.io.tabular.execution.expr import col as expr_col
+
+        opts = DeltaOptions(
+            predicate=(expr_col("region") == "us") & (expr_col("id") > 1),
+        )
+        self.assertEqual(self._files_read(opts), 1)
+        out = self.d.read_arrow_table(options=opts)
+        self.assertEqual(out.num_rows, 1)
+        self.assertEqual(out.column("id").to_pylist(), [2])
+
+    def test_predicate_intersects_with_explicit_prune_values(self) -> None:
+        # ``prune_values=us|eu`` AND ``predicate region == us`` →
+        # intersection is just ``us``.
+        from yggdrasil.io.tabular.execution.expr import col as expr_col
+
+        opts = DeltaOptions(
+            prune_values={"region": ("us", "eu")},
+            predicate=(expr_col("region") == "us"),
+        )
+        self.assertEqual(self._files_read(opts), 1)
+        out = self.d.read_arrow_table(options=opts)
+        self.assertEqual(set(out.column("region").to_pylist()), {"us"})
+
+    def test_predicate_alone_with_unknown_value_returns_empty(self) -> None:
+        from yggdrasil.io.tabular.execution.expr import col as expr_col
+
+        opts = DeltaOptions(predicate=(expr_col("region") == "antarctica"))
+        self.assertEqual(self._files_read(opts), 0)
+        out = self.d.read_arrow_table(options=opts)
+        self.assertEqual(out.num_rows, 0)
+
+    def test_range_predicate_does_not_drive_file_prune(self) -> None:
+        # ``id > 1`` is not extractable for partition pruning (range,
+        # not partition column anyway) — every file survives the
+        # prune, then the row-level filter strips the rejected rows.
+        from yggdrasil.io.tabular.execution.expr import col as expr_col
+
+        opts = DeltaOptions(predicate=(expr_col("id") > 3))
+        self.assertEqual(self._files_read(opts), 4)
+        out = self.d.read_arrow_table(options=opts)
+        self.assertEqual(out.num_rows, 2)
+        self.assertEqual(sorted(out.column("id").to_pylist()), [4, 5])
+
+
+# ---------------------------------------------------------------------------
 # Checkpoints
 # ---------------------------------------------------------------------------
 
@@ -200,8 +303,8 @@ class TestCheckpoints(DeltaTestCase):
         # Re-open with a fresh log so the checkpoint is the only way
         # the snapshot can recover the active set up to the
         # checkpoint version.
-        from yggdrasil.delta.io import DeltaIO
-        d2 = DeltaIO(path=str(d.path))
+        from yggdrasil.delta.io import DeltaFolder
+        d2 = DeltaFolder(path=str(d.path))
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(6)))
 
@@ -214,8 +317,8 @@ class TestCheckpoints(DeltaTestCase):
         self.assertTrue(any(
             n.endswith(".parquet") for n in os.listdir(sidecar_dir)
         ))
-        from yggdrasil.delta.io import DeltaIO
-        d2 = DeltaIO(path=str(d.path))
+        from yggdrasil.delta.io import DeltaFolder
+        d2 = DeltaFolder(path=str(d.path))
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(6)))
 

@@ -61,7 +61,15 @@ from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ParquetFile
 from yggdrasil.io.tabular import Tabular, O
-from yggdrasil.io.tabular.execution.expr import Predicate, col as expr_col
+from yggdrasil.io.tabular.execution.expr import (
+    Expression,
+    InList,
+    Logical,
+    LogicalOp,
+    Predicate,
+    col as expr_col,
+    simplify,
+)
 from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 
 from ..fs import VolumePath
@@ -306,37 +314,68 @@ def _build_match_condition(
     return " AND ".join(clauses)
 
 
-def _build_prune_predicates(
-    prune_values: Mapping[str, Iterable[Any]],
+def _build_prune_predicate(
+    prune_values: Mapping[str, Iterable[Any]] | None,
+    where: Predicate | None,
     *,
     target_alias: str,
 ) -> list[str]:
-    """Convert ``{column: [values]}`` into target-side ``IN`` predicates."""
-    predicates: list[str] = []
-    for column_name, vals in prune_values.items():
-        materialized = tuple(vals)
-        if not materialized:
-            continue
-        pred = expr_col(column_name, alias=target_alias).is_in(materialized)
-        sql = expr_to_sql(pred, dialect=Dialect.DATABRICKS)
-        # Compound predicates get wrapped so they don't bleed into
-        # the surrounding AND/OR structure when concatenated by
-        # the caller. The new ``InList`` is always a single leaf,
-        # but empty / null-aware variants render to a compound
-        # ``... OR ... IS NULL`` form — wrap defensively.
-        if " OR " in sql or " AND " in sql:
-            sql = f"({sql})"
-        predicates.append(sql)
-    return predicates
+    """Combine ``prune_values`` + ``where`` into a single target-side SQL clause.
 
+    Builds one AST: per-column ``InList`` from ``prune_values`` AND'd
+    with the user's ``where``, target-aliased, and routed through
+    :func:`yggdrasil.io.tabular.execution.expr.simplify` so:
 
-def _wrap_user_predicate(pred: Predicate, *, target_alias: str) -> str:
-    """Render a user predicate aliased to ``target_alias`` (parens if compound)."""
-    aliased = _alias_columns(pred, target_alias)
-    sql = expr_to_sql(aliased, dialect=Dialect.DATABRICKS)
-    if " OR " in sql or " AND " in sql:
+    * Duplicate values inside any one column's ``IN`` list collapse
+      (``{"region": ["us", "us", "eu"]}`` → ``IN ('us', 'eu')``) —
+      :func:`_collect_prune_values_polars` already calls ``.unique()``
+      on collected frames, but the user-passed dict path may carry
+      duplicates and would otherwise emit a bloated ``IN`` list.
+    * OR-of-equalities inside ``where`` on the same column collapse
+      to an ``IN`` list (``col("date") == d1 | col("date") == d2``
+      → ``IN (d1, d2)``), matching the canonical shape the rest of
+      the prune clause produces.
+    * Nested ``Logical`` (the left-leaning chain Python's ``|``
+      builds) flattens, so the rendered SQL has the minimum
+      parenthesisation.
+
+    Return shape stays ``list[str]`` (0 or 1 elements) so the
+    downstream :func:`_build_dml_statements` / :func:`_build_merge_statement`
+    / :func:`_build_delete_insert_statements` / :func:`_build_anti_join_insert`
+    contract — *list of clauses AND'd together by the consumer* —
+    is unchanged. A top-level ``OR`` in the final SQL gets a paren
+    wrap so callers can splice it into an AND chain without
+    precedence bleed.
+    """
+    parts: list[Expression] = []
+    if prune_values:
+        for column_name, vals in prune_values.items():
+            materialized = tuple(vals)
+            if not materialized:
+                continue
+            parts.append(expr_col(column_name).is_in(materialized))
+    if where is not None:
+        parts.append(where)
+    if not parts:
+        return []
+    if len(parts) == 1:
+        combined: Expression = parts[0]
+    else:
+        combined = Logical(LogicalOp.AND, tuple(parts))
+    # Alias once over the combined tree — single walk instead of one
+    # per part.
+    aliased = _alias_columns(combined, target_alias)
+    normalized = simplify(aliased)
+    sql = expr_to_sql(normalized, dialect=Dialect.DATABRICKS)
+    # Top-level OR (e.g. a single ``InList`` with ``includes_null=True``
+    # renders as ``T.x IN (...) OR T.x IS NULL``) needs parens before
+    # the consumer concatenates it with AND. A top-level AND is
+    # already what the consumer would build anyway, so no wrap.
+    if isinstance(normalized, Logical) and normalized.op is LogicalOp.OR:
         sql = f"({sql})"
-    return sql
+    elif isinstance(normalized, InList) and normalized.includes_null:
+        sql = f"({sql})"
+    return [sql]
 
 
 def _alias_columns(expr, alias: str):
@@ -3395,9 +3434,9 @@ class Table(DatabricksPath):
         if return_data:
             output_data = staging.read_arrow_table()
 
-        prune_predicates = _build_prune_predicates(prune_values, target_alias="T") if prune_values else []
-        if where is not None:
-            prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
+        prune_predicates = _build_prune_predicate(
+            prune_values, where, target_alias="T",
+        )
 
         columns = list(existing_schema.field_names())
         # Plain column projection — the staged Parquet was already
@@ -3552,9 +3591,9 @@ class Table(DatabricksPath):
                 prune_by, {k: len(v) for k, v in prune_values.items()},
             )
 
-        prune_predicates = _build_prune_predicates(prune_values, target_alias="T") if prune_values else []
-        if where is not None:
-            prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
+        prune_predicates = _build_prune_predicate(
+            prune_values, where, target_alias="T",
+        )
 
         # Spark fast path for keyed APPEND under ``safe_merge=True``
         # (see :func:`_spark_filter_existing_keys`). Catalyst's
@@ -3810,9 +3849,9 @@ class Table(DatabricksPath):
             f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS raw_src"
         )
 
-        prune_predicates: list[str] = []
-        if where is not None:
-            prune_predicates.append(_wrap_user_predicate(where, target_alias="T"))
+        prune_predicates = _build_prune_predicate(
+            None, where, target_alias="T",
+        )
         if prune_by:
             logger.debug(
                 "prune_by %s ignored on warehouse-fallback sql_insert "

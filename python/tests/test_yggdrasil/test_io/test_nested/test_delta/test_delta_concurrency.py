@@ -29,7 +29,7 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.data.types.primitive import Int64Type
 from yggdrasil.io.nested.delta import (
     ConcurrentDeltaCommitError,
-    DeltaIO,
+    DeltaFolder,
     DeltaOptions,
 )
 from yggdrasil.io.nested.delta.tests import DeltaTestCase
@@ -133,7 +133,7 @@ class TestConcurrentRetry(DeltaTestCase):
     def _smuggle_commit(
         self,
         *,
-        target: DeltaIO,
+        target: DeltaFolder,
         version: int,
         rival_table: list[Any],
         rival_path_name: str = "rival",
@@ -195,6 +195,134 @@ class TestConcurrentRetry(DeltaTestCase):
             d._commit_atomic(
                 0, [d._build_commit_info(options=DeltaOptions(), mode=Mode.APPEND)]
             )
+
+    def test_first_conflict_retries_immediately_without_sleep(self) -> None:
+        # The first conflict is the canonical "two writers landed in
+        # the same millisecond" race; sleeping a fixed backoff before
+        # the rebase costs latency for nothing. Pin the "no sleep on
+        # first attempt" contract so a future tweak doesn't silently
+        # reintroduce the idle.
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({"id": [1]}))
+
+        attempts = {"n": 0}
+        # First attempt fails (race), second succeeds.
+        orig_commit = d._commit_atomic
+
+        def _flaky(version, actions):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise FileExistsError(f"simulated race at v{version}")
+            return orig_commit(version, actions)
+
+        d._commit_atomic = _flaky  # type: ignore[assignment]
+
+        sleeps: list[float] = []
+        import yggdrasil.io.nested.delta.delta_io as _dio
+        orig_sleep = _dio.time.sleep
+        _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
+        try:
+            d.write_arrow_batches(
+                self.pa.table({"id": [2]}).to_batches(),
+                options=DeltaOptions(
+                    mode=Mode.APPEND,
+                    commit_max_retries=4,
+                    # Non-zero backoff so a regression that *did*
+                    # sleep would show up loudly.
+                    commit_retry_backoff=0.1,
+                    commit_retry_jitter=0,
+                ),
+            )
+        finally:
+            _dio.time.sleep = orig_sleep  # type: ignore[attr-defined]
+
+        self.assertEqual(attempts["n"], 2)
+        # No sleep on the first conflict — the race shows up
+        # immediately on the next listing.
+        self.assertEqual(sleeps, [])
+
+    def test_second_conflict_backs_off_exponentially(self) -> None:
+        # Second + subsequent conflicts back off so a tight
+        # contention loop doesn't burn CPU. The exponent starts at 0
+        # for the second conflict so the delay is the base, not
+        # double-base.
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({"id": [1]}))
+
+        attempts = {"n": 0}
+        orig_commit = d._commit_atomic
+
+        def _flaky_twice(version, actions):
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                raise FileExistsError(f"simulated race at v{version}")
+            return orig_commit(version, actions)
+
+        d._commit_atomic = _flaky_twice  # type: ignore[assignment]
+
+        sleeps: list[float] = []
+        import yggdrasil.io.nested.delta.delta_io as _dio
+        orig_sleep = _dio.time.sleep
+        _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
+        try:
+            d.write_arrow_batches(
+                self.pa.table({"id": [2]}).to_batches(),
+                options=DeltaOptions(
+                    mode=Mode.APPEND,
+                    commit_max_retries=4,
+                    commit_retry_backoff=0.1,
+                    commit_retry_jitter=0,
+                    commit_retry_max_delay=10.0,
+                ),
+            )
+        finally:
+            _dio.time.sleep = orig_sleep  # type: ignore[attr-defined]
+
+        self.assertEqual(attempts["n"], 3)
+        # First conflict: 0 sleep. Second conflict: base * 2**0 = 0.1.
+        self.assertEqual(sleeps, [0.1])
+
+    def test_retry_delay_caps_at_max_delay(self) -> None:
+        # After enough exponential bumps the delay must clamp to the
+        # configured cap — guards against the doubling running away
+        # under sustained contention.
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({"id": [1]}))
+
+        attempts = {"n": 0}
+        # First 5 attempts fail, sixth succeeds — drives 5 sleeps
+        # (attempts 2..5 add backoff, attempt 1 sleeps 0).
+        orig_commit = d._commit_atomic
+
+        def _flaky(version, actions):
+            attempts["n"] += 1
+            if attempts["n"] <= 5:
+                raise FileExistsError(f"simulated race at v{version}")
+            return orig_commit(version, actions)
+
+        d._commit_atomic = _flaky  # type: ignore[assignment]
+
+        sleeps: list[float] = []
+        import yggdrasil.io.nested.delta.delta_io as _dio
+        orig_sleep = _dio.time.sleep
+        _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
+        try:
+            d.write_arrow_batches(
+                self.pa.table({"id": [2]}).to_batches(),
+                options=DeltaOptions(
+                    mode=Mode.APPEND,
+                    commit_max_retries=8,
+                    commit_retry_backoff=0.5,
+                    commit_retry_jitter=0,
+                    commit_retry_max_delay=1.0,
+                ),
+            )
+        finally:
+            _dio.time.sleep = orig_sleep  # type: ignore[attr-defined]
+
+        # Sleeps: first conflict=0 (not recorded), then 0.5, 1.0, 1.0,
+        # 1.0 (capped). Five conflicts → 4 non-zero sleeps recorded.
+        self.assertEqual(sleeps, [0.5, 1.0, 1.0, 1.0])
 
     def test_exhaustion_raises_concurrent_commit_error(self) -> None:
         # Force every commit attempt to fail so the budget is the

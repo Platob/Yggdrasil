@@ -47,7 +47,9 @@ from .nodes import (
     LogicalOp,
     Not,
     Predicate,
+    extract_partition_filters,
     lit,
+    simplify,
 )
 
 __all__ = [
@@ -70,6 +72,8 @@ __all__ = [
     "all_of",
     "any_of",
     "col",
+    "extract_partition_filters",
     "lit",
     "neg",
+    "simplify",
 ]
