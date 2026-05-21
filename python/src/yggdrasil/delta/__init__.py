@@ -1,7 +1,7 @@
 """Back-compat shim — Delta support lives at :mod:`yggdrasil.io.nested.delta`.
 
 The whole package was relocated under ``yggdrasil.io.nested`` to sit
-alongside the other :class:`FolderIO` leaves (folders, zip archives,
+alongside the other :class:`FolderPath` leaves (folders, zip archives,
 ygg folders). This module keeps the old import paths
 (``yggdrasil.delta``, ``yggdrasil.delta.io``, ``yggdrasil.delta.log``,
 …) working so existing callers don't break — every name here is just

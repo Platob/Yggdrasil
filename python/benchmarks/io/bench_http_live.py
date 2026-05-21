@@ -265,7 +265,7 @@ def _send_many_scenarios(base_url: str, repeat: int) -> list[dict]:
     try:
         from yggdrasil.io.send_config import CacheConfig
 
-        cfg_many = CacheConfig(path=tmp_cache_many)
+        cfg_many = CacheConfig(tabular=tmp_cache_many)
         cache_reqs = [
             PreparedRequest.prepare("GET", f"{base_url}/tiny?x={i}")
             for i in range(cache_n)
@@ -320,7 +320,7 @@ def _local_cache_scenarios(base_url: str, repeat: int) -> list[dict]:
     try:
         from yggdrasil.io.send_config import CacheConfig
 
-        cfg = CacheConfig(path=tmp)
+        cfg = CacheConfig(tabular=tmp)
         # First call seeds the cache, subsequent calls hit it.
         cold_req = PreparedRequest.prepare("GET", f"{base_url}/tiny")
         sess.send(cold_req, local_cache=cfg, raise_error=False)

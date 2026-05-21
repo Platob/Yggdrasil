@@ -543,12 +543,12 @@ def _arrow_scenarios(repeat: int) -> list[dict]:
       request row for ``request_tuple`` matching.
     * ``Response.to_arrow_batch`` / ``.to_arrow_table`` — fires once per
       successful network fetch on the writeback path (``_persist_remote``,
-      ``_store_local_cached_response``).
+      ``_store_cached_response``).
     * Bulk ``pa.Table.from_batches([r.to_arrow_batch(...) for r in N])``
       — the shape ``_persist_remote`` builds before handing off to
-      ``cfg.tabular.insert``. Measures the per-row build amortised over
-      a 64-row batch, which is the relevant cost for "batched insert"
-      vs. "row-at-a-time insert".
+      ``Tabular.write_arrow_batches``. Measures the per-row build
+      amortised over a 64-row batch, which is the relevant cost for
+      "batched insert" vs. "row-at-a-time insert".
     * ``PreparedRequest.from_arrow`` / ``Response.from_arrow_tabular``
       / ``Response.from_records`` — fires on every cache *read* (remote
       lookup → :class:`Response` reconstruction, local fast-path read).

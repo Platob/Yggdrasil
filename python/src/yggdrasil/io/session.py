@@ -6,9 +6,7 @@ import datetime as dt
 import itertools
 import logging
 import os
-import pathlib
 import pickle
-import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -39,6 +37,7 @@ from .authorization.base import Authorization
 from .bytes_io import BytesIO
 from .headers import Headers
 from .memory import Memory
+from .path import Path
 from .request import PreparedRequest
 from .response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from .response_batch import ResponseBatch
@@ -69,95 +68,16 @@ LOGGER = logging.getLogger(__name__)
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
-# Local cache is a flat URL-mirrored tree of Arrow IPC files —
-# ``<root>/<METHOD>/<host>/<seg>/.../<public_hash>.arrow`` (see
-# :func:`_local_fast_path_relative`). One file per request identity,
-# resolved by ``stat`` + IPC decode; no partitioned reader, no
-# schema sidecar, no Hive layout. Stale-file sweep is a TTL walker
-# (see :func:`_cleanup_local_fast_path`) the writer fires after a
-# successful insert; throttled by a sentinel file so a hot batch
-# only walks the tree once per cleanup window.
-
-
-# Per-segment cap when mirroring URL paths into the on-disk fast-path
-# tree. Most filesystems allow 255 bytes per filename, but URL segments
-# can carry tokens (signed query payloads, opaque ids, base64 blobs)
-# that blow past that limit on their own. 80 bytes is a conservative
-# upper bound that still leaves plenty of headroom for the ``<hex>``
-# suffix appended when a segment has to be folded into its xxh3 digest.
-_FAST_PATH_SEGMENT_MAX_BYTES: int = 80
-
-# Filesystem-hostile chars in a single segment: NUL + control chars,
-# the path separators on every OS we ship to, and the Windows-reserved
-# set. Everything else (incl. unicode, ``.``, ``-``, ``_``, ``%``) is
-# kept as-is so an operator browsing the cache can read the URL back.
-_FAST_PATH_UNSAFE_RE = re.compile(r'[\x00-\x1f/\\:*?"<>|]+')
-
-
-def _safe_fast_path_segment(
-    seg: str, *, max_bytes: int = _FAST_PATH_SEGMENT_MAX_BYTES,
-) -> str:
-    """Sanitize one URL segment for use as a cache directory name.
-
-    Replaces NUL / control chars and the filesystem-reserved set with
-    a single ``_`` so the result is a legal directory entry on every
-    supported OS. When the sanitized segment's UTF-8 length exceeds
-    *max_bytes* the segment is folded to a short readable prefix plus
-    the xxh3_64 hex of the *original* token — the prefix stays human
-    grep-able while the digest restores uniqueness for the directory.
-    The leaf ``<public_hash>.arrow`` filename still carries the full
-    request identity, so collisions on a sanitized segment only group
-    sibling entries under the same parent, never overwrite them.
-    """
-    import xxhash
-
-    if not seg:
-        return "_"
-    safe = _FAST_PATH_UNSAFE_RE.sub("_", seg).strip(" .")
-    if not safe:
-        safe = "_"
-    encoded = safe.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return safe
-    digest = xxhash.xxh3_64(seg.encode("utf-8")).hexdigest()  # 16 hex chars
-    # Reserve room for ``-<digest>``; clip on a byte boundary so we
-    # never split a multi-byte UTF-8 character mid-encoding.
-    head_budget = max_bytes - len(digest) - 1
-    if head_budget <= 0:
-        return digest
-    head = encoded[:head_budget].decode("utf-8", errors="ignore").rstrip(" .")
-    return f"{head}-{digest}" if head else digest
-
-
-def _local_fast_path_relative(
-    method: "str | None",
-    url: "URL | None",
-    public_hash: int,
-) -> str:
-    """Build the per-request fast-path file location under the cache root.
-
-    Mirrors the request's URL structure on disk — ``<METHOD>/<host>/<seg>/.../<hex>.arrow``
-    — so an operator can ``ls`` the cache tree and see which endpoints are
-    populated, while still keying the leaf file by the full request
-    ``public_hash`` (xxh3_64 over anonymized method+url+headers+body) so
-    requests that share a path but differ on query / body / headers
-    don't overwrite each other. Each directory segment is sanitized via
-    :func:`_safe_fast_path_segment`, which folds segments longer than
-    ``_FAST_PATH_SEGMENT_MAX_BYTES`` to ``<prefix>-<xxh3_64hex>`` so a
-    rogue token can't bust the 255-byte filename limit on any FS.
-    Returns a relative ``os.sep``-joined string so the fire-and-forget
-    :class:`Job` payload stays a plain string across worker boundaries.
-    """
-    parts: list[str] = [_safe_fast_path_segment((method or "GET").upper())]
-    if url is not None:
-        host = (url.host or "").lower()
-        if host:
-            parts.append(_safe_fast_path_segment(host))
-        for raw in (url.path or "").strip("/").split("/"):
-            if raw:
-                parts.append(_safe_fast_path_segment(raw))
-    parts.append(f"{public_hash & 0xFFFFFFFFFFFFFFFF:016x}.arrow")
-    return os.path.join(*parts)
+# Local cache is a partitioned tabular tree backed by
+# :class:`yggdrasil.io.nested.folder_path.FolderPath`:
+# ``<root>/partition_key=<int>/part-{epoch_ms}-{seed}.<ext>``.
+# Same Hive-style partition shape the remote :class:`Tabular` cache
+# uses, so the same lookup primitives — :meth:`CacheConfig.make_lookup_predicate`
+# / :meth:`CacheConfig.make_batch_lookup_predicate` — prune both
+# backends identically. The predicate's ``partition_key IN (...)``
+# clause flows through :meth:`FolderPath.iter_children`'s candidate
+# probe, so a batch lookup ``stat``s only the partition directories
+# its requests touch instead of walking the whole tree.
 
 
 # Minimum body size (bytes) before the cache-persist auto-compress
@@ -240,136 +160,107 @@ def _maybe_autocompress_body_for_cache(
     response.set_media_type(MediaType.from_mime(mime_type=mime, codec=codec))
 
 
-def _store_fast_path_arrow_batch(
-    cache_root_str: str,
-    rel_path: str,
-    batch: pa.RecordBatch,
-) -> None:
-    """Persist *batch* to the per-request fast-path file under *cache_root_str*.
-
-    *rel_path* is the precomputed URL-mirrored location (see
-    :func:`_local_fast_path_relative`) — strings only, so the
-    fire-and-forget :class:`Job` pickles cheaply. Bypasses
-    :class:`FolderIO` entirely: one Arrow IPC stream per request
-    ``public_hash``, parent dirs created on demand. Tmp + atomic
-    ``os.replace`` keeps a partial write from being read mid-flush by
-    a concurrent fast-path reader.
-    """
-    final = pathlib.Path(cache_root_str) / rel_path
-    try:
-        final.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return
-
-    tmp = final.parent / f".{final.name}.{os.urandom(4).hex()}.tmp"
-    try:
-        sink = pa.BufferOutputStream()
-        with pa.ipc.new_stream(sink, batch.schema) as writer:
-            writer.write_batch(batch)
-        tmp.write_bytes(sink.getvalue().to_pybytes())
-        os.replace(tmp, final)
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-def _read_fast_path_arrow_batch(
-    cache_root: Any, rel_path: str,
-) -> "pa.RecordBatch | None":
-    """Read the per-request fast-path file at *rel_path* under *cache_root*.
-
-    Returns ``None`` when the file is missing, empty, or otherwise
-    unreadable so the caller can fall through to the bulk-lookup
-    path without a special error case (corrupt entry, race with a
-    concurrent rewrite, schema drift, …).
-    """
-    file_path = pathlib.Path(os.fspath(cache_root)) / rel_path
-    try:
-        payload = file_path.read_bytes()
-    except OSError:
-        return None
-    if not payload:
-        return None
-    try:
-        reader = pa.ipc.open_stream(pa.BufferReader(payload))
-        batches = [b for b in reader if b.num_rows > 0]
-    except Exception:
-        return None
-    if not batches:
-        return None
-    if len(batches) == 1:
-        return batches[0]
-    chunks = pa.Table.from_batches(batches).combine_chunks().to_batches()
-    return chunks[0] if chunks else None
-
-
-# Sentinel filename written under the cache root after each cleanup
-# pass. Its mtime drives the throttle so concurrent writers and
-# repeat batches don't fan out into a full-tree walk every time.
-_FAST_PATH_CLEANUP_SENTINEL: str = ".last_cleanup"
-
-
-def _cleanup_local_fast_path(
-    cache_root_str: str,
+def _insert_cache(
+    tabular: Any,
+    cache_cfg: CacheConfig,
+    data: "pa.RecordBatch | pa.Table | SparkDataFrame",
     *,
-    ttl_seconds: float,
-    throttle_seconds: float = 60.0,
-) -> int:
-    """Walk the URL-mirrored fast-path tree and unlink ``.arrow`` files older than *ttl_seconds*.
+    mode: "Mode | None" = None,
+    spark_session: Optional["SparkSession"] = None,
+    prune_values: "Mapping[str, Any] | None" = None,
+    raise_error: bool = False,
+) -> None:
+    """Write *data* to any cache backend through the unified surface.
 
-    Throttled by the ``.last_cleanup`` sentinel under *cache_root_str*
-    — a write within ``throttle_seconds`` of the last successful
-    pass short-circuits, so a hot batch of 10k requests only walks
-    the tree once. Tmp / hidden files (leading ``.``) are skipped so
-    a partial fast-path write in flight isn't yanked out from under
-    the writer. Best-effort: any per-file ``OSError`` is logged and
-    the walk continues. Returns the number of files unlinked.
+    Both local :class:`FolderPath` and remote
+    :class:`~yggdrasil.databricks.table.Table` implement the
+    :class:`Tabular` write protocol, so the Session never has to
+    branch on which backend it's talking to — same call shape for
+    the single-response store, the bulk backfill, the bulk
+    persist, and the Spark persist.
+
+    Dispatches on input type:
+
+    * :class:`pa.RecordBatch` / :class:`pa.Table` →
+      :meth:`Tabular.write_arrow_batches` (the Arrow-native path
+      both backends implement).
+    * :class:`pyspark.sql.DataFrame` →
+      :meth:`Tabular.write_spark_frame` (Databricks Table routes
+      this through its Spark-native MERGE / append plan; the local
+      :class:`FolderPath` falls through to ``toArrow()`` then the
+      Arrow path on the rare local-+-Spark mix).
+
+    ``cache_cfg.match_by_columns`` rides through
+    :attr:`CastOptions.match_by` so MERGE-mode writes dedup on the
+    right keys. ``prune_values`` rides through
+    :attr:`CastOptions.prune_values` and is **caller-supplied** —
+    the remote MERGE turns it into a narrow-target predicate
+    (partition pruning + IN-set narrowing); the local
+    :class:`FolderPath` ignores it on writes. Default ``None``
+    keeps the local hot path free of the dict-build the local
+    backend wouldn't use anyway. Spark inserts also skip the
+    ``prune_values`` knob — :meth:`_spark_persist_remote`
+    pre-dedups via a ``left_anti`` join before reaching here.
+
+    Errors are caught and logged by default — a failed cache write
+    must not poison the request flow that just produced the
+    response. ``raise_error=True`` flips that for the bulk-persist
+    paths where the caller wants to surface failures.
     """
-    if ttl_seconds <= 0:
-        return 0
-    root = pathlib.Path(cache_root_str)
-    if not root.is_dir():
-        return 0
-
-    sentinel = root / _FAST_PATH_CLEANUP_SENTINEL
-    now = time.time()
+    if data is None:
+        return
+    from yggdrasil.data.options import CastOptions
+    opts = CastOptions(
+        mode=mode if mode is not None else cache_cfg.mode,
+        match_by=cache_cfg.match_by_columns or None,
+        wait=cache_cfg.wait,
+        spark_session=spark_session,
+        prune_values=prune_values,
+    )
     try:
-        last = sentinel.stat().st_mtime
-    except OSError:
-        last = 0.0
-    if last and now - last < throttle_seconds:
-        return 0
+        # Spark frames go through ``write_spark_frame``; everything
+        # else (RecordBatch, Table) through ``write_arrow_batches``.
+        # The Spark detection is duck-typed via ``toArrow`` /
+        # ``toPandas`` so we don't import pyspark at module load
+        # for the common arrow-only path.
+        if not isinstance(data, (pa.RecordBatch, pa.Table)) and (
+            hasattr(data, "toArrow") or hasattr(data, "toPandas")
+        ):
+            tabular.write_spark_frame(data, options=opts)
+            return
+        if isinstance(data, pa.RecordBatch):
+            if data.num_rows == 0:
+                return
+            batches: "Iterable[pa.RecordBatch]" = (data,)
+        elif isinstance(data, pa.Table):
+            if data.num_rows == 0:
+                return
+            batches = data.to_batches()
+        else:
+            # Unknown shape — let the backend decide / fail loudly.
+            batches = data
+        tabular.write_arrow_batches(batches, options=opts)
+    except Exception as exc:
+        if raise_error:
+            raise
+        LOGGER.debug(
+            "Cache write failed for %r: %s", tabular, exc,
+        )
 
-    cutoff = now - ttl_seconds
-    removed = 0
-    try:
-        for entry in root.rglob("*.arrow"):
-            if entry.name.startswith("."):
-                continue
-            try:
-                mtime = entry.stat().st_mtime
-            except OSError:
-                continue
-            if mtime >= cutoff:
-                continue
-            try:
-                entry.unlink()
-                removed += 1
-            except OSError as exc:
-                LOGGER.debug("Cache cleanup: failed to unlink %s: %s", entry, exc)
-    except OSError as exc:
-        LOGGER.debug("Cache cleanup: walk under %s aborted: %s", root, exc)
-        return removed
 
-    # Refresh the sentinel even when nothing was unlinked — that's
-    # what the throttle is checking for, not the unlink count.
-    try:
-        sentinel.touch()
-    except OSError:
-        pass
-    return removed
+def _cache_prune_values_for(batch: "pa.RecordBatch | pa.Table") -> "dict[str, Any]":
+    """Return the MERGE narrow-target prune set for *batch*.
+
+    ``{"partition_key": <column>, "public_hash": <column>}`` — both
+    int64 so the IN-set literal stays compact. The columns are read
+    straight off the batch (zero-copy reference to the data we're
+    about to insert), so the caller doesn't materialise anything new
+    — they're naming the columns the remote MERGE should narrow on.
+    """
+    return {
+        "partition_key": batch["partition_key"],
+        "public_hash":   batch["public_hash"],
+    }
 
 
 def _encode_request_data(
@@ -680,183 +571,184 @@ class Session(Singleton, ABC):
         except Exception:
             return request.url.to_string()
 
-    def _load_local_cached_response(
+    def _cache_tabular_for_source(
         self,
-        request: PreparedRequest,
         cache_cfg: CacheConfig,
-    ) -> Optional[Response]:
-        """Resolve a single request against the URL-mirrored fast-path cache.
+        source: str,
+    ) -> Any:
+        """Resolve the :class:`Tabular` backend for a cache *source*.
 
-        One ``stat`` + Arrow IPC decode keyed off the request's
-        ``public_hash`` (xxh3_64 over anonymized
-        method+url+headers+body). Returns ``None`` when the file is
-        missing, the row's identity tuple disagrees with the request,
-        or the row falls outside the configured ``received_*`` window.
+        ``"local"`` materialises the disk-backed :class:`FolderPath`
+        via :meth:`CacheConfig.cache_tabular` (memoised so repeat
+        calls hand back the same instance); ``"remote"`` reads
+        :attr:`CacheConfig.tabular` directly, which the
+        config-builder has already populated. Returns ``None`` when
+        the requested backend isn't configured — both the loader
+        and the storer treat that as "cache miss, do nothing".
+        """
+        if source == "local":
+            return cache_cfg.cache_tabular(session=self)
+        return cache_cfg.tabular
+
+    def _read_cache_batches(
+        self,
+        tabular: Any,
+        options: Any,
+    ) -> list:
+        """Read with optional ``TABLE_OR_VIEW_NOT_FOUND`` recovery.
+
+        :class:`FolderPath` yields an empty stream when the cache
+        folder hasn't been written to yet (``Path.iterdir``'s
+        missing-dir → empty contract). Remote Databricks tables
+        raise ``[TABLE_OR_VIEW_NOT_FOUND]`` instead — catch that one
+        case and lazily create the table before retrying. Any other
+        backend exception propagates.
         """
         try:
-            public_hash = request.public_hash
-        except Exception:
-            return None
+            return list(tabular.read_arrow_batches(options=options))
+        except Exception as exc:
+            if "TABLE_OR_VIEW_NOT_FOUND" in str(exc) and hasattr(tabular, "create"):
+                tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                return list(tabular.read_arrow_batches(options=options))
+            raise
 
-        root = cache_cfg.local_cache_path(session=self)
-        rel_path = _local_fast_path_relative(
-            request.method, request.url, public_hash,
-        )
-        batch = _read_fast_path_arrow_batch(root, rel_path)
-        if batch is None:
-            return None
-
-        received_from = cache_cfg.received_from
-        received_to = cache_cfg.received_to
-        for resp in Response.from_arrow_tabular(batch):
-            ts = resp.received_at
-            if received_from is not None and ts is not None and ts < received_from:
-                continue
-            if received_to is not None and ts is not None and ts >= received_to:
-                continue
-            if not cache_cfg.filter_response(resp, request=request):
-                continue
-            LOGGER.debug(
-                "Found local %s %s under %s (fast path)",
-                request.method, request.url, root,
-            )
-            # Stamp the origin so downstream consumers (and the next
-            # arrow projection) see "this came from the local cache".
-            # ``_state_token`` folds both cache flags in, so the
-            # projection cache invalidates without an explicit reset.
-            resp.local_cached = True
-            resp.remote_cached = False
-            return resp
-        return None
-
-    def _store_local_cached_response(
-        self,
-        response: Response,
-        cache_cfg: CacheConfig,
-        *,
-        root: "str | None" = None,
-    ) -> None:
-        """Persist one response to the URL-mirrored fast-path cache.
-
-        Builds the Arrow batch synchronously on the caller's thread
-        (the response buffer is still live here) and fires the
-        actual write through the job pool so the caller doesn't
-        block on disk IO. The original response is persisted as-is
-        — userinfo and sensitive headers stay in the row; cache
-        matching on the read side keys off the ``public_*`` hash
-        columns which already use the anonymize='remove' projection.
-
-        ``root`` lets a hot-loop caller pass the resolved cache root
-        once instead of re-resolving it per response.
-        """
-        if not response.ok:
-            return
-        req = response.request
-        if req is None:
-            return
-        try:
-            public_hash = req.public_hash
-        except Exception:
-            return
-
-        root = root or cache_cfg.local_cache_path(session=self)
-        rel_path = _local_fast_path_relative(req.method, req.url, public_hash)
-        _maybe_autocompress_body_for_cache(response)
-        batch = response.to_arrow_batch(parse=False)
-        Job.make(
-            _store_fast_path_arrow_batch,
-            root, rel_path, batch,
-        ).fire_and_forget()
-
-    def _load_remote_cached_response(
+    def _load_cached_response(
         self,
         request: PreparedRequest,
         cache_cfg: CacheConfig,
         *,
+        source: str,
         spark_session: Optional["SparkSession"] = None,
     ) -> Optional[Response]:
-        if not cache_cfg.remote_cache_enabled:
+        """Resolve one request against a cache backend (local or remote).
+
+        Same call shape for both sides: build
+        :meth:`CacheConfig.make_lookup_predicate`, push it through
+        :meth:`Tabular.read_arrow_batches`, client-side dedup by
+        ``received_at`` (APPEND-mode caches can hold multiple rows
+        per identity), filter on
+        :meth:`CacheConfig.filter_response`, and stamp the matching
+        ``local_cached`` / ``remote_cached`` flag for downstream
+        provenance.
+
+        Skips the per-request :meth:`PreparedRequest.anonymize` pass
+        when ``cache_cfg.request_by_is_public`` holds — the
+        predicate and the row's match keys collapse to the same
+        ``public_*`` columns either way.
+        """
+        if source == "remote" and not cache_cfg.remote_cache_enabled:
+            return None
+        tabular = self._cache_tabular_for_source(cache_cfg, source)
+        if tabular is None:
             return None
 
-        # Skip the per-request ``anonymize()`` when the match keys are
-        # all ``public_*`` — the SQL clause and the response-side
-        # join key both come out identical without it.
+        from yggdrasil.data.options import CastOptions
+
+        # Local cache stores responses as-is (the writer never
+        # anonymises before persist), so the lookup tuple matches
+        # the row's original ``request_*`` columns straight from
+        # the request — no per-call URL parse + header normalise.
+        # Remote stores remove user-info too, but only paths keyed
+        # on private ``request_by`` columns need to anonymise the
+        # lookup; ``request_by_is_public`` collapses to the same
+        # ``public_*`` hash on both projections, so anonymisation
+        # is a no-op there either way.
         lookup_request = (
             request
-            if cache_cfg.request_by_is_public
+            if source == "local" or cache_cfg.request_by_is_public
             else request.anonymize(mode=cache_cfg.anonymize)
         )
-        query = cache_cfg.make_batch_lookup_sql(
-            table_name=cache_cfg.tabular.full_name(safe=True),
-            requests=[lookup_request],
-        )
+        predicate = cache_cfg.make_lookup_predicate(request=lookup_request)
+        opts = CastOptions(predicate=predicate, spark_session=spark_session)
+        batches = self._read_cache_batches(tabular, opts)
 
-        try:
-            cache_result = cache_cfg.tabular.sql.execute(
-                query,
-                spark_session=spark_session,
+        best: Optional[Response] = None
+        for response in Response.from_arrow_tabular(iter(batches)):
+            if not cache_cfg.filter_response(response, request=request):
+                continue
+            if best is None or response.received_at >= best.received_at:
+                best = response
+        if best is not None:
+            LOGGER.debug(
+                "Found %s %s %s in %r",
+                source, request.method, request.url, tabular,
             )
-        except Exception as exc:
-            if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cache_cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cache_cfg.tabular.sql.execute(
-                    query,
-                    spark_session=spark_session,
-                )
-            else:
-                raise
+            best.local_cached = (source == "local")
+            best.remote_cached = (source == "remote")
+        return best
 
-        for response in Response.from_arrow_tabular(cache_result.read_arrow_batches()):
-            if cache_cfg.filter_response(response, request=request):
-                LOGGER.debug(
-                    "Found remote %s %s in %s",
-                    request.method,
-                    request.url,
-                    cache_cfg.tabular,
-                )
-                response.remote_cached = True
-                response.local_cached = False
-                return response
-
-        return None
-
-    def _store_remote_cached_response(
+    def _store_cached_response(
         self,
         response: Response,
         cache_cfg: CacheConfig,
         *,
+        source: str,
+        tabular: Any = None,
         spark_session: Optional["SparkSession"] = None,
         mode: Optional[Mode] = None,
+        async_write: "bool | None" = None,
     ) -> None:
+        """Persist one response to a cache backend (local or remote).
+
+        Both backends go through :func:`_insert_cache` — the
+        canonical :meth:`Tabular.write_arrow_batches` adapter that
+        also carries ``prune_values`` for the MERGE narrow-target
+        path. The Session never branches on backend type for the
+        write itself.
+
+        ``async_write`` controls the dispatch policy: ``True`` queues
+        the write through the :class:`Job` fire-and-forget pool so
+        the caller doesn't block on disk / network IO; ``False`` runs
+        inline. Default ``None`` picks per-source — local cache
+        writes are fire-and-forget (the response buffer is still
+        live, so we drain it inline but ship the actual write off
+        the request hot path), remote writes run synchronously (the
+        bulk persist path :meth:`_persist_remote` already
+        parallelises across write groups).
+        """
         if not response.ok:
             return
+        if source == "local" and response.request is None:
+            return
 
-        # Persist the response as-is; cache lookups match on the
-        # ``public_*`` hash columns which already collapse to the
-        # anonymize='remove' projection, so writing the original
-        # row keeps the userinfo/headers available for replay
-        # without breaking deduplication.
+        tabular = (
+            tabular if tabular is not None
+            else self._cache_tabular_for_source(cache_cfg, source)
+        )
+        if tabular is None:
+            return
         _maybe_autocompress_body_for_cache(response)
         batch = response.to_arrow_batch(parse=False)
-
-        cache_cfg.tabular.insert(
-            batch,
-            mode=mode if mode is not None else cache_cfg.mode,
-            match_by=cache_cfg.sql_match_by or None,
-            wait=cache_cfg.wait,
-            # Two-level prune: ``partition_key`` triggers Delta file
-            # pruning (partition column on RESPONSE_SCHEMA);
-            # ``public_hash`` narrows the merge's target side to the
-            # exact row identities being upserted, so the MERGE join
-            # can short-circuit on the int64 equality before
-            # touching anything else. Both keys are int64 so the IN
-            # literals stay compact.
-            prune_values={
-                "partition_key": batch["partition_key"],
-                "public_hash":   batch["public_hash"],
-            },
-            spark_session=spark_session,
+        # Prune values matter for the remote MERGE narrow-target
+        # path; the local FolderPath ignores them on writes (it
+        # splits by partition automatically from the batch's
+        # ``t:partition_by`` schema metadata). Skip the build for
+        # local so the cache hot path doesn't pay the dict-build
+        # the local backend wouldn't use.
+        prune_values = (
+            _cache_prune_values_for(batch) if source == "remote" else None
         )
+        if async_write is None:
+            async_write = (source == "local")
+        if async_write:
+            Job.make(
+                _insert_cache,
+                tabular,
+                cache_cfg,
+                batch,
+                mode=mode,
+                spark_session=spark_session,
+                prune_values=prune_values,
+            ).fire_and_forget()
+        else:
+            _insert_cache(
+                tabular,
+                cache_cfg,
+                batch,
+                mode=mode,
+                spark_session=spark_session,
+                prune_values=prune_values,
+            )
 
     @classmethod
     def from_url(
@@ -1085,38 +977,40 @@ class Session(Singleton, ABC):
 
         # --- 1. Check local cache first (fast, disk-based) ---
         # UPSERT mode skips the lookup outright — the fresh fetch
-        # below will overwrite the on-disk entry on its way through
-        # ``_store_fast_path_arrow_batch``'s atomic ``os.replace``.
-        local_cache_root: "str | None" = None
+        # below will overwrite the on-disk entry through the same
+        # ``Tabular.write_arrow_batches`` surface both backends use.
+        local_cache_tabular: Any = None
         if effective_local_cfg.local_cache_enabled:
-            local_cache_root = effective_local_cfg.local_cache_path(session=self)
+            local_cache_tabular = effective_local_cfg.cache_tabular(session=self)
             if effective_local_cfg.mode != Mode.UPSERT:
-                local_response = self._load_local_cached_response(
-                    request, effective_local_cfg
+                local_response = self._load_cached_response(
+                    request, effective_local_cfg, source="local",
                 )
                 if local_response is not None:
                     if config.raise_error:
                         local_response.raise_for_status()
                     return local_response
 
-        # --- 2. Check remote cache (slower, SQL-based) ---
+        # --- 2. Check remote cache (slower, network-based) ---
         # Skip when the effective config demands a forced refresh (UPSERT).
         if (
             effective_remote_cfg.remote_cache_enabled
             and effective_remote_cfg.mode != Mode.UPSERT
         ):
-            remote_response = self._load_remote_cached_response(
+            remote_response = self._load_cached_response(
                 request,
                 effective_remote_cfg,
+                source="remote",
                 spark_session=config.spark_session,
             )
             if remote_response is not None:
                 # Backfill local cache with the remote hit
-                if local_cache_root is not None:
-                    self._store_local_cached_response(
+                if local_cache_tabular is not None:
+                    self._store_cached_response(
                         remote_response,
                         effective_local_cfg,
-                        root=local_cache_root,
+                        source="local",
+                        tabular=local_cache_tabular,
                     )
                 if config.raise_error:
                     remote_response.raise_for_status()
@@ -1141,19 +1035,21 @@ class Session(Singleton, ABC):
         response = self.prepare_response_after_received(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
-        if local_cache_root is not None:
-            self._store_local_cached_response(
+        if local_cache_tabular is not None:
+            self._store_cached_response(
                 response,
                 effective_local_cfg,
-                root=local_cache_root,
+                source="local",
+                tabular=local_cache_tabular,
             )
 
         if effective_remote_cfg.remote_cache_enabled:
-            # Pass the effective config so that its mode (UPSERT or APPEND)
-            # is used directly by _store_remote_cached_response.
-            self._store_remote_cached_response(
+            # Pass the effective config so its mode (UPSERT or APPEND)
+            # is used directly by the remote write.
+            self._store_cached_response(
                 response,
                 effective_remote_cfg,
+                source="remote",
                 spark_session=config.spark_session,
             )
 
@@ -1246,7 +1142,7 @@ class Session(Singleton, ABC):
         # Prebuild the per-request override the same way
         # :meth:`_send_many_batches` prebuilds the session-level
         # config — so the downstream code can reach ``eff.path``
-        # uniformly without a ``local_cache_path(session=...)``
+        # uniformly without a ``local_cache_folder(session=...)``
         # dance. ``prebuild`` is idempotent and skips remote-only /
         # disabled configs.
         cfg = request.local_cache_config or session_cfg
@@ -1283,21 +1179,29 @@ class Session(Singleton, ABC):
         session_local_cfg: CacheConfig,
         *,
         key_to_local_cfg: Optional[Mapping[int, CacheConfig]] = None,
-    ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
+    ) -> tuple[dict[Path, list[Response]], list[PreparedRequest]]:
         """Stage 1: scan the local cache.
 
-        Returns ``(hits_by_path, misses)``. UPSERT entries are evicted
-        on the way through so the eventual fresh response can be
-        written in their place. Each request is evaluated against its
-        own effective local cache config (per-request override or
-        session-level fallback) via the per-``public_hash`` fast-path
-        file — one ``stat`` + IPC decode per request, no folder walk.
+        Returns ``(hits_by_path, misses)``. UPSERT entries bypass the
+        read entirely (always miss, refetch). Non-UPSERT requests are
+        grouped by their effective cache :class:`FolderPath` so we
+        execute exactly **one** partition-pruned folder read per
+        cache root — mirrors :meth:`_split_remote_cache`'s
+        "one SQL per table" shape so the lookup cost scales with
+        backend, not with request count.
 
-        Hits are grouped by the effective config's resolved cache root
-        — :attr:`CacheConfig.path` after :meth:`prebuild` filled in
-        the default ``~/.yggdrasil/cache/response`` suffix — so the
+        Each per-folder read builds its predicate via
+        :meth:`CacheConfig.make_batch_lookup_predicate`. The
+        partition ``IN (...)`` clause flows through
+        :meth:`FolderPath.iter_children`'s candidate probe so the
+        listing stays at one ``stat`` per distinct ``partition_key``
+        — no ``iterdir`` over the full cache tree.
+
+        Hits are grouped by the resolved cache :class:`Path` so the
         per-config split survives all the way to
-        :class:`ResponseBatch.local_hits`.
+        :class:`ResponseBatch.local_hits`. The dict key is the live
+        :class:`Path` (hashable, singleton-keyed) so two distinct
+        backends with the same ``full_path()`` string don't collide.
 
         ``key_to_local_cfg`` is the per-request effective-config map
         :meth:`_send_many_batches` builds once at the top of a chunk.
@@ -1305,7 +1209,7 @@ class Session(Singleton, ABC):
         dict lookup; otherwise we resolve on the fly (used by callers
         that don't precompute, e.g. unit tests).
         """
-        hits: dict[str, list[Response]] = {}
+        hits: dict[Path, list[Response]] = {}
         misses: list[PreparedRequest] = []
 
         if not session_local_cfg.local_cache_enabled and not any(
@@ -1313,6 +1217,11 @@ class Session(Singleton, ABC):
         ):
             # Cheap path: no local cache anywhere in this batch.
             return hits, list(batch)
+
+        # Single-pass classify: UPSERT → miss, APPEND with local cache
+        # → bucket by cache folder root, anything else → miss.
+        path_to_cfg: dict[Path, CacheConfig] = {}
+        path_to_reqs: dict[Path, list[PreparedRequest]] = {}
 
         for req in batch:
             eff = (
@@ -1323,11 +1232,19 @@ class Session(Singleton, ABC):
             if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
-            cached = self._load_local_cached_response(req, eff)
-            if cached is None:
-                misses.append(req)
-                continue
-            hits.setdefault(eff.local_cache_path(session=self), []).append(cached)
+            root = eff.local_cache_folder(session=self)
+            bucket = path_to_reqs.get(root)
+            if bucket is None:
+                path_to_cfg[root] = eff
+                path_to_reqs[root] = bucket = []
+            bucket.append(req)
+
+        for root, reqs in path_to_reqs.items():
+            eff = path_to_cfg[root]
+            r_hits, r_misses = self._lookup_cached(eff, reqs, source="local")
+            if r_hits:
+                hits[root] = r_hits
+            misses.extend(r_misses)
 
         if hits:
             total = sum(len(v) for v in hits.values())
@@ -1393,8 +1310,8 @@ class Session(Singleton, ABC):
         total_hits = 0
         for tkey, t_reqs in table_to_reqs.items():
             t_cfg = table_to_cfg[tkey]
-            t_hits, t_misses = self._lookup_remote_table(
-                t_cfg, t_reqs, spark_session=spark_session,
+            t_hits, t_misses = self._lookup_cached(
+                t_cfg, t_reqs, source="remote", spark_session=spark_session,
             )
             if t_hits:
                 hits[tkey] = t_hits
@@ -1408,51 +1325,78 @@ class Session(Singleton, ABC):
             )
         return hits, misses
 
-    def _lookup_remote_table(
+    def _lookup_cached(
         self,
         cfg: CacheConfig,
         requests: list[PreparedRequest],
         *,
+        source: str,
         spark_session: Optional["SparkSession"] = None,
     ) -> tuple[list[Response], list[PreparedRequest]]:
-        """Execute one batch SQL lookup against a single cache table.
+        """Batch-lookup *requests* against any cache backend.
 
-        When ``cfg.request_by_is_public`` holds, the per-request
-        ``anonymize()`` pass is skipped — ``public_*`` match keys hash
-        to the same value on the original and the anonymized request,
-        so the lookup tuple and SQL clause both come out identical
-        without paying for one URL parse + header normalize per
-        request.
+        Same call shape for local :class:`FolderPath` and remote
+        :class:`~yggdrasil.databricks.table.Table`: build
+        :meth:`CacheConfig.make_batch_lookup_predicate`, push it
+        through :meth:`Tabular.read_arrow_batches`, client-side
+        dedup by ``received_at`` (APPEND-mode caches can hold
+        multiple rows per identity), and stamp the matching
+        ``local_cached`` / ``remote_cached`` flag per hit.
+
+        Returns ``(hits, misses)`` paired with the input
+        ``requests`` order — ``hits`` carry the cached response,
+        ``misses`` carry the original :class:`PreparedRequest` for
+        the next stage. Skips the per-request
+        :meth:`PreparedRequest.anonymize` pass when
+        ``cfg.request_by_is_public`` holds — ``public_*`` match
+        keys collapse to the same value on the original and
+        anonymised request, so the lookup tuple and the predicate
+        match clause come out identical without paying for one URL
+        parse + header normalise per request.
         """
-        if cfg.request_by_is_public:
+        tabular = self._cache_tabular_for_source(cfg, source)
+        if tabular is None:
+            return [], list(requests)
+
+        from yggdrasil.data.options import CastOptions
+
+        # Same anonymise-or-skip rule as :meth:`_load_cached_response`:
+        # local cache stores rows as-is so the lookup uses originals;
+        # public ``request_by`` keys collapse on both projections so
+        # anonymising is a no-op there. Only remote + private
+        # ``request_by`` pays for the per-request rebuild.
+        if source == "local" or cfg.request_by_is_public:
             lookup_batch: list[PreparedRequest] = list(requests)
         else:
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
 
-        query = cfg.make_batch_lookup_sql(
-            table_name=cfg.tabular.full_name(safe=True),
-            requests=lookup_batch,
-        )
-        try:
-            cache_result = cfg.tabular.sql.execute(query, spark_session=spark_session)
-        except Exception as exc:
-            if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cfg.tabular.sql.execute(query, spark_session=spark_session)
-            else:
-                raise
+        predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
+        opts = CastOptions(predicate=predicate, spark_session=spark_session)
+        batches = self._read_cache_batches(tabular, opts)
 
+        # Client-side dedup: keep the latest ``received_at`` per
+        # request-tuple. APPEND-mode caches (both backends) may hold
+        # multiple rows per identity.
         result_map: dict[tuple, Response] = {}
-        for response in Response.from_arrow_tabular(cache_result.read_arrow_batches()):
-            result_map[cfg.request_tuple(response.request)] = response
+        for response in Response.from_arrow_tabular(iter(batches)):
+            request = response.request
+            if request is None:
+                continue
+            key = cfg.request_tuple(request)
+            existing = result_map.get(key)
+            if existing is None or response.received_at >= existing.received_at:
+                result_map[key] = response
 
         hits: list[Response] = []
         misses: list[PreparedRequest] = []
+        is_local = (source == "local")
         for req, lookup in zip(requests, lookup_batch):
             candidate = result_map.get(cfg.request_tuple(lookup))
-            if candidate is not None and cfg.filter_response(candidate, request=req):
-                candidate.remote_cached = True
-                candidate.local_cached = False
+            if candidate is not None and cfg.filter_response(
+                candidate, request=req,
+            ):
+                candidate.local_cached = is_local
+                candidate.remote_cached = not is_local
                 hits.append(candidate)
             else:
                 misses.append(req)
@@ -1613,7 +1557,7 @@ class Session(Singleton, ABC):
         *,
         spark: "SparkSession",
     ) -> tuple[Optional["SparkDataFrame"], list[PreparedRequest]]:
-        """Spark variant of :meth:`_lookup_remote_table`.
+        """Spark variant of :meth:`_lookup_cached` (source=``remote``).
 
         Runs the same batch lookup SQL, but keeps the result as a Spark
         DataFrame instead of materialising :class:`Response` objects on
@@ -1624,28 +1568,26 @@ class Session(Singleton, ABC):
 
         :meth:`CacheConfig.filter_response`'s per-row branch is skipped
         on the spark path: ``received_from`` / ``received_to`` are
-        already encoded in :meth:`CacheConfig.make_batch_lookup_sql`'s
-        ``WHERE`` clause, and the request-key check is what the
-        ``request_tuple`` diff already enforces.
+        already encoded in the predicate the backend pushed down,
+        and the request-key check is what the ``request_tuple`` diff
+        already enforces.
         """
+        from yggdrasil.data.options import CastOptions
+
         if cfg.request_by_is_public:
             lookup_batch: list[PreparedRequest] = list(requests)
         else:
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
-        query = cfg.make_batch_lookup_sql(
-            table_name=cfg.tabular.full_name(safe=True),
-            requests=lookup_batch,
-        )
+        predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
+        opts = CastOptions(predicate=predicate, spark_session=spark)
         try:
-            cache_result = cfg.tabular.sql.execute(query, spark_session=spark)
+            hits_df = cfg.tabular.read_spark_frame(options=opts)
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
                 cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
-                cache_result = cfg.tabular.sql.execute(query, spark_session=spark)
+                hits_df = cfg.tabular.read_spark_frame(options=opts)
             else:
                 raise
-
-        hits_df = cache_result.read_spark_frame()
         # Stamp the origin flags on the read side. Stored values may be
         # stale (``mirror_local_to_remote`` pushes local hits into the
         # remote table with ``local_cached=True``) — overwrite both so
@@ -1855,7 +1797,7 @@ class Session(Singleton, ABC):
         key_to_local_cfg: Mapping[int, CacheConfig],
         session_local_cfg: CacheConfig,
     ) -> None:
-        """Write remote-cache hits back to the local fast-path cache.
+        """Write remote-cache hits back to the partitioned local cache.
 
         Each response is stored against its originating request's
         effective local config (looked up by ``public_url_hash``) —
@@ -1866,17 +1808,18 @@ class Session(Singleton, ABC):
         string costs one cached attribute read per response in
         place of a full ``request.anonymize(mode="remove")`` rebuild.
 
-        Each response becomes one fire-and-forget fast-path write
-        keyed by ``public_hash``; concurrent writes against distinct
-        ``rel_path``s never contend, so no per-root serialization is
-        needed.
-
-        After the writes are queued, the per-root cleanup walker
-        runs once to unlink stale ``.arrow`` entries — throttled by
-        the in-tree sentinel so a hot batch only walks the tree once
-        per cleanup window.
+        Responses are bucketed by their effective cache folder; each
+        bucket fans out one Arrow batch built from
+        :meth:`Response.values_to_arrow_batch` and routed through
+        :meth:`FolderPath._write_arrow_batches` with
+        ``partition_columns=("partition_key",)`` — so a bucket of N
+        responses spread across K distinct ``partition_key`` values
+        lands K part files, one per partition directory, in a single
+        fire-and-forget job.
         """
-        cleanup_roots: dict[str, CacheConfig] = {}
+        from yggdrasil.io.response import Response as _Response
+
+        groups: dict[Path, tuple[CacheConfig, list[Response]]] = {}
         for response in responses:
             req = response.request
             cfg_key = req.public_url_hash if req is not None else None
@@ -1885,24 +1828,27 @@ class Session(Singleton, ABC):
                 eff = session_local_cfg
             if not eff.local_cache_enabled:
                 continue
-            root = eff.local_cache_path(session=self)
-            self._store_local_cached_response(response, eff, root=root)
-            cleanup_roots.setdefault(root, eff)
-
-        for root, eff in cleanup_roots.items():
-            ttl = eff.cleanup_ttl
-            if ttl is None:
-                continue
-            ttl_seconds = ttl.total_seconds()
-            if ttl_seconds <= 0:
-                continue
-            if eff.wait:
-                _cleanup_local_fast_path(root, ttl_seconds=ttl_seconds)
+            root = eff.local_cache_folder(session=self)
+            bucket = groups.get(root)
+            if bucket is None:
+                groups[root] = (eff, [response])
             else:
-                Job.make(
-                    _cleanup_local_fast_path,
-                    root, ttl_seconds=ttl_seconds,
-                ).fire_and_forget()
+                bucket[1].append(response)
+
+        for root, (eff, group_responses) in groups.items():
+            tabular = eff.cache_tabular(session=self)
+            # One C++ struct walk per bucket beats N per-response
+            # writes — same shape :meth:`_persist_remote` uses on
+            # the SQL side. The folder's ``_write_arrow_batches``
+            # splits the batch back out by ``partition_key`` so each
+            # response still lands under its own
+            # ``partition_key=<v>/`` directory.
+            for response in group_responses:
+                _maybe_autocompress_body_for_cache(response)
+            batch = _Response.values_to_arrow_batch(group_responses)
+            Job.make(
+                _insert_cache, tabular, eff, batch,
+            ).fire_and_forget()
 
     def _persist_remote(
         self,
@@ -1963,16 +1909,11 @@ class Session(Singleton, ABC):
             batches = pa.Table.from_batches(
                 [Response.values_to_arrow_batch(group_responses)]
             )
-
-            cfg.tabular.insert(
-                batches,
+            _insert_cache(
+                cfg.tabular, cfg, batches,
                 mode=mode,
-                match_by=cfg.sql_match_by or None,
-                wait=cfg.wait,
-                prune_values={
-                    "partition_key": batches["partition_key"],
-                    "public_hash":   batches["public_hash"],
-                },
+                prune_values=_cache_prune_values_for(batches),
+                raise_error=True,
             )
 
         self._run_concurrently(
@@ -1985,7 +1926,7 @@ class Session(Singleton, ABC):
 
     def _mirror_local_hits_to_remote(
         self,
-        local_hits_by_path: Mapping[str, "list[Response]"],
+        local_hits_by_path: Mapping[Path, "list[Response]"],
         key_to_remote_cfg: Mapping[int, CacheConfig],
         session_remote_cfg: CacheConfig,
     ) -> None:
@@ -2560,12 +2501,13 @@ class Session(Singleton, ABC):
 
             # --- Stage 4: bulk remote writeback ---
             if is_spark:
-                # `cfg.tabular.insert` accepts the Spark DataFrame
-                # directly, so we hand off the lazy DF without
-                # materialising on the driver. Per-request overrides
-                # ride through ``key_to_remote_cfg`` — mirrors the
-                # non-Spark ``_persist_remote`` so a chunk targeting
-                # multiple remote tables fans out instead of collapsing
+                # ``_insert_cache`` routes the Spark DataFrame through
+                # :meth:`Tabular.write_spark_frame` so the lazy DF
+                # crosses straight to the backend without materialising
+                # on the driver. Per-request overrides ride through
+                # ``key_to_remote_cfg`` — mirrors the non-Spark
+                # ``_persist_remote`` so a chunk targeting multiple
+                # remote tables fans out instead of collapsing
                 # onto the session-level cfg.
                 if new_hits is not None:
                     self._spark_persist_remote(
@@ -2788,12 +2730,15 @@ class Session(Singleton, ABC):
                 "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
                 cfg.tabular,
             )
-            cfg.tabular.insert(
-                df,
-                mode=cfg.mode,
-                match_by=cfg.sql_match_by or None,
-                wait=cfg.wait,
+            # Same unified surface every other cache write path
+            # uses — ``_insert_cache`` dispatches the SparkDataFrame
+            # through :meth:`Tabular.write_spark_frame`. The
+            # ``left_anti`` dedup above already narrowed the frame
+            # so ``prune_values`` would be redundant here.
+            _insert_cache(
+                cfg.tabular, cfg, df,
                 spark_session=spark,
+                raise_error=True,
             )
 
         try:

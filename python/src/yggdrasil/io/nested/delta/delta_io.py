@@ -1,4 +1,4 @@
-"""DeltaFolder — :class:`FolderIO` over a Delta Lake table.
+"""DeltaFolder — :class:`FolderPath` over a Delta Lake table.
 
 The leaf orchestrates four subsystems documented in this package:
 
@@ -14,7 +14,7 @@ The leaf orchestrates four subsystems documented in this package:
 - :mod:`yggdrasil.io.nested.delta.checkpoint` writes V1 and V2
   checkpoints and updates ``_last_checkpoint``.
 
-What changes vs :class:`FolderIO`
+What changes vs :class:`FolderPath`
 ---------------------------------
 
 - **Children** come from the snapshot, not :func:`Path.iterdir`. We
@@ -53,7 +53,7 @@ table moved underneath them.
 Engine bridges
 --------------
 
-:class:`DeltaFolder` inherits :class:`FolderIO` -> :class:`Tabular`, so
+:class:`DeltaFolder` inherits :class:`FolderPath` -> :class:`Tabular`, so
 ``read_polars_frame`` / ``read_pandas_frame`` / ``read_spark_frame``
 work without any per-engine plumbing here. The Arrow batch stream
 :meth:`_read_arrow_batches` produces routes through
@@ -75,7 +75,7 @@ from typing import Any, Callable, ClassVar, Iterable, Iterator, List, Optional
 import pyarrow as pa
 
 from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.io.nested.folder_io import FolderIO, FolderOptions
+from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
 from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 from yggdrasil.pickle import json as ygg_json
 
@@ -197,8 +197,8 @@ class DeltaOptions(FolderOptions):
 # ---------------------------------------------------------------------------
 
 
-class DeltaFolder(FolderIO):
-    """:class:`FolderIO` over a Delta Lake table at a :class:`Path`."""
+class DeltaFolder(FolderPath):
+    """:class:`FolderPath` over a Delta Lake table at a :class:`Path`."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.DELTA_FOLDER
 
@@ -455,7 +455,7 @@ class DeltaFolder(FolderIO):
     def _resolve_action(self, mode: Mode) -> Mode:
         """Pick the disposition for a write call.
 
-        Overrides :meth:`FolderIO._resolve_action` to keep
+        Overrides :meth:`FolderPath._resolve_action` to keep
         :data:`Mode.UPSERT` / :data:`Mode.MERGE` as distinct actions —
         the parent collapses both to ``APPEND`` because plain folders
         don't have row-level identity, but Delta does (via
@@ -691,7 +691,7 @@ class DeltaFolder(FolderIO):
         # invariant across retries (we don't re-evaluate the predicate
         # against a different snapshot — we evaluate it against the
         # incoming rows, which don't change).
-        incoming_keys = FolderIO._collect_keys_from_batches(materialized, match_by)
+        incoming_keys = FolderPath._collect_keys_from_batches(materialized, match_by)
 
         # Each retry attempt may produce a different rewrite set if a
         # concurrent writer landed an add/remove in between. Track the
@@ -1485,13 +1485,13 @@ class DeltaFolder(FolderIO):
         return write_uuid_deletion_vector(deleted_rows, table_root=self.path)
 
     # ==================================================================
-    # FolderIO surface — children = active files
+    # FolderPath surface — children = active files
     # ==================================================================
 
     def iter_children(self) -> "Iterator":
         """Yield one :class:`ParquetFile` per active file in the snapshot.
 
-        Override of :meth:`FolderIO.iter_children`: we never list the
+        Override of :meth:`FolderPath.iter_children`: we never list the
         physical folder. The snapshot is the source of truth.
         """
         snap = self.snapshot()
@@ -1710,8 +1710,8 @@ def _split_batch(
         yield ((), batch)
         return
     if not all(c in batch.schema.names for c in partition_columns):
-        # Mismatch → emit whole batch under all-None keys; same fallback
-        # YGGFolderIO uses so the row data isn't silently dropped.
+        # Mismatch → emit whole batch under all-None keys so the row
+        # data isn't silently dropped.
         yield (tuple(None for _ in partition_columns), batch)
         return
     table = pa.Table.from_batches([batch])

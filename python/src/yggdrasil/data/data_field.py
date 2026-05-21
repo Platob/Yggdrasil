@@ -32,6 +32,7 @@ from yggdrasil.data.constants import (
     ALIAS_KEY,
     DEFAULT_VALUE_KEY,
     DEFAULT_FIELD_NAME,
+    MEDIA_TYPE_METADATA_KEY,
     POSITION_KEY,
     TAG_PREFIX,
 )
@@ -1447,6 +1448,47 @@ class Field(BaseChildrenFields):
         if raw:
             return raw.decode("utf-8")
         return None
+
+    @property
+    def media_type(self) -> "Any | None":
+        """:class:`MediaType` describing how this field's data is stored.
+
+        Decodes the ``b"media_type"`` metadata key — the mime-string
+        canonical form (``"application/vnd.apache.arrow.file"``,
+        ``"application/vnd.apache.parquet"``, …) round-tripped through
+        :meth:`MediaType.from_`. ``None`` when no media-type hint has
+        been stamped.
+
+        Populated by :class:`FolderPath._persist_schema` so a schema
+        loaded from a folder's ``.ygg/schema.arrow`` sidecar tells the
+        reader which on-disk format the rows were last written in
+        (Arrow IPC, Parquet, …) without walking the part files.
+        Schema-level (top-level :class:`StructField`) is the canonical
+        slot, but the accessor lives on :class:`Field` so per-column
+        hints (e.g. the response-body field's HTTP ``Content-Type``)
+        can use the same property.
+        """
+        md = self.metadata
+        if not md:
+            return None
+        raw = md.get(MEDIA_TYPE_METADATA_KEY)
+        if not raw:
+            return None
+        from yggdrasil.data.enums.media_type import MediaType
+        # ``raw.decode`` can raise ``UnicodeDecodeError`` on a
+        # corrupted metadata byte payload; ``MediaType.from_`` with
+        # ``default=None`` already short-circuits unknown mime
+        # strings without raising, but the underlying parser can
+        # still surface ``ValueError`` / ``TypeError`` on truly
+        # malformed input. Catch the narrow trio and degrade to
+        # "no media type known".
+        try:
+            return MediaType.from_(
+                raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw,
+                default=None,
+            )
+        except (UnicodeDecodeError, ValueError, TypeError):
+            return None
 
     # ==================================================================
     # Schema-shaped views — meaningful when ``self.dtype`` is a struct;

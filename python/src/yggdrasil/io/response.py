@@ -1277,20 +1277,24 @@ class Response(Tabular["ResponseOptions"]):
                     )
             return cursor
 
-        # Top-level response columns win, including the unnested
-        # ``request_*`` ones served by :meth:`_arrow_value`. Bare
-        # request-side keys (``method``, ``url``, ``public_url_hash``, …)
-        # still fall through to the embedded request so the cache layer
-        # can match-by request identity without rewriting every
-        # ``request_by`` list with the ``request_`` prefix.
+        # Bare request-side keys (``method``, ``url``,
+        # ``public_url_hash``, ``public_hash``, ``body_hash``, …) route
+        # through the embedded request first so the cache layer's
+        # ``request_by`` match-by-request-identity check lines up with
+        # the SQL ``request_<col>`` predicate the same config emits
+        # via :meth:`CacheConfig.sql_request_clause`. Without this,
+        # collision keys (``public_hash`` / ``body_hash`` exist on
+        # both schemas) would return the response's own value and
+        # ``filter_response`` would reject every match. Response-only
+        # keys still resolve through :meth:`_arrow_value` below.
+        if key in REQUEST_SCHEMA.names:
+            return self.request.match_value(key)
         try:
             return self._arrow_value(key)
         except KeyError:
             pass
-        if hasattr(self, key) and key not in REQUEST_SCHEMA.names:
+        if hasattr(self, key):
             return getattr(self, key)
-        if key in REQUEST_SCHEMA.names:
-            return self.request.match_value(key)
         raise ValueError(
             f"Unsupported response match key: {key!r}. "
             f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"

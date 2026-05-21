@@ -3,10 +3,16 @@
 These pin the contracts of the small, side-effect-free helpers the
 :class:`Session` pipeline relies on:
 
-* ``_safe_fast_path_segment`` / ``_local_fast_path_relative`` — the
-  URL-mirrored on-disk layout used by the local fast-path cache.
-* ``_cleanup_local_fast_path`` — TTL-based cleanup walker, throttled
-  by an in-tree sentinel.
+* ``CacheConfig.make_lookup_predicate`` / ``.make_batch_lookup_predicate``
+  — the per-request and batch :class:`Predicate` shape the partitioned
+  local cache pushes through :meth:`FolderPath._read_arrow_batches`.
+  Mirrors the SQL the remote cache uses, so the partition prune fires
+  on both backends with the same logical clause.
+* The unified :meth:`CacheConfig.cache_tabular` surface — both
+  local (FolderPath) and remote (Databricks Table) plug into the
+  Session through :meth:`Tabular.read_arrow_batches` +
+  :meth:`Tabular.insert`, so the cache pipeline is backend-
+  agnostic.
 * ``_maybe_autocompress_body_for_cache`` — pre-persistence gzip
   heuristic (threshold, MIME gate, ratio bailout, header sync).
 * ``Session._remote_write_group_key`` — the bucket key used to fan
@@ -33,11 +39,7 @@ from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import (
     Session,
     _BODY_AUTOCOMPRESS_MIN_SIZE,
-    _FAST_PATH_SEGMENT_MAX_BYTES,
-    _cleanup_local_fast_path,
-    _local_fast_path_relative,
     _maybe_autocompress_body_for_cache,
-    _safe_fast_path_segment,
 )
 
 from ._helpers import make_request, make_response
@@ -116,173 +118,205 @@ class TestRemoteWriteGroupKey:
 
 
 # ---------------------------------------------------------------------------
-# Fast-path URL-mirrored layout (_local_fast_path_relative)
+# CacheConfig predicate builders — the only lookup surface
 # ---------------------------------------------------------------------------
 
 
-class TestFastPathLocalLayout:
+class TestCacheLookupPredicates:
+    """:meth:`CacheConfig.make_lookup_predicate` /
+    :meth:`CacheConfig.make_batch_lookup_predicate` build the
+    :class:`Predicate` the Session pushes through
+    :meth:`Tabular.read_arrow_batches` — same call shape for both
+    the local :class:`FolderPath` cache and remote :class:`Tabular`
+    backends (Databricks Table, …). Asserted shape: partition key
+    prune + per-request match + response time window.
+    """
 
-    def test_layout_mirrors_method_host_and_path(self) -> None:
-        req = make_request("https://api.example.com/v1/users/42", method="GET")
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        parts = rel.split(os.sep)
-        # Expected: GET / api.example.com / v1 / users / 42 / <16hex>.arrow
-        assert parts[:5] == ["GET", "api.example.com", "v1", "users", "42"]
-        assert parts[-1].endswith(".arrow")
-        assert len(parts[-1]) == len("0123456789abcdef.arrow")
+    def _cfg(self, **overrides: Any) -> CacheConfig:
+        return CacheConfig(
+            request_by=overrides.pop("request_by", ["public_url_hash"]),
+            **overrides,
+        )
 
-    def test_leaf_filename_is_public_hash_hex(self) -> None:
+    def _free_columns(self, pred):
+        from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+        return free_columns(pred)
+
+    def test_single_request_predicate_partitions_and_matches(self) -> None:
+        cfg = self._cfg()
         req = make_request("https://example.com/x")
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        leaf = rel.rsplit(os.sep, 1)[-1]
-        expected = f"{req.public_hash & 0xFFFFFFFFFFFFFFFF:016x}.arrow"
-        assert leaf == expected
+        pred = cfg.make_lookup_predicate(request=req)
+        # Both the partition column and the per-request match key
+        # show up as free columns in the AST.
+        free = self._free_columns(pred)
+        assert "partition_key" in free
+        assert "request_public_url_hash" in free
 
-    def test_root_path_yields_method_and_host_only(self) -> None:
-        req = make_request("https://example.com/", method="POST")
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        parts = rel.split(os.sep)
-        # No real path segments between host and the .arrow leaf.
-        assert parts[0] == "POST"
-        assert parts[1] == "example.com"
-        assert parts[-1].endswith(".arrow")
-        assert len(parts) == 3
+    def test_batch_predicate_emits_partition_in_clause(self) -> None:
+        from yggdrasil.io.tabular.execution.expr import extract_partition_filters
 
-    def test_distinct_paths_land_in_distinct_dirs(self) -> None:
-        a = make_request("https://example.com/api/users")
-        b = make_request("https://example.com/api/orders")
-        rel_a = _local_fast_path_relative(a.method, a.url, a.public_hash)
-        rel_b = _local_fast_path_relative(b.method, b.url, b.public_hash)
-        assert rel_a.rsplit(os.sep, 1)[0] != rel_b.rsplit(os.sep, 1)[0]
+        cfg = self._cfg()
+        reqs = [
+            make_request("https://example.com/a"),
+            make_request("https://example.com/b"),
+        ]
+        pred = cfg.make_batch_lookup_predicate(requests=reqs)
+        # Distinct partition_keys collapse into an IN-list the
+        # extractor surfaces as a finite accepted-value set.
+        extracted = extract_partition_filters(pred, ("partition_key",))
+        assert extracted["partition_key"] == frozenset(
+            r.partition_key for r in reqs
+        )
 
-    def test_same_path_different_query_share_dir_not_file(self) -> None:
-        a = make_request("https://example.com/api/items?id=1")
-        b = make_request("https://example.com/api/items?id=2")
-        rel_a = _local_fast_path_relative(a.method, a.url, a.public_hash)
-        rel_b = _local_fast_path_relative(b.method, b.url, b.public_hash)
-        # Same directory tree (URL path mirrors), distinct leaf files
-        # because public_hash mixes query string in.
-        assert rel_a.rsplit(os.sep, 1)[0] == rel_b.rsplit(os.sep, 1)[0]
-        assert rel_a != rel_b
+    def test_predicate_extracts_partition_filters(self) -> None:
+        from yggdrasil.io.tabular.execution.expr import (
+            extract_partition_filters,
+        )
 
-    def test_long_segment_is_hashed(self) -> None:
-        long_seg = "x" * 256
-        req = make_request(f"https://example.com/api/{long_seg}/end")
-        rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-        parts = rel.split(os.sep)
-        # The "api", "end", and method/host parts stay short; the rogue
-        # segment should be folded under the per-segment byte cap.
-        for p in parts:
-            assert len(p.encode("utf-8")) <= max(
-                _FAST_PATH_SEGMENT_MAX_BYTES, len("0123456789abcdef.arrow"),
+        cfg = self._cfg()
+        reqs = [
+            make_request("https://example.com/a"),
+            make_request("https://example.com/b"),
+        ]
+        pred = cfg.make_batch_lookup_predicate(requests=reqs)
+        # The partition pruner walks the predicate and returns the
+        # finite accepted-value set — that's what
+        # FolderPath.iter_children probes against.
+        extracted = extract_partition_filters(pred, ("partition_key",))
+        assert "partition_key" in extracted
+        assert extracted["partition_key"] == frozenset(
+            r.partition_key for r in reqs
+        )
+
+    def test_received_window_lands_in_predicate(self) -> None:
+        import datetime as dt
+
+        from_ts = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        to_ts = dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc)
+        cfg = self._cfg(received_from=from_ts, received_to=to_ts)
+        req = make_request("https://example.com/x")
+        pred = cfg.make_lookup_predicate(request=req)
+        # The ``received_at`` time-window clauses survive into the
+        # predicate's free-column set; the actual bounds round-trip
+        # via the predicate's AST nodes.
+        assert "received_at" in self._free_columns(pred)
+
+    def test_empty_batch_predicate_is_none(self) -> None:
+        cfg = self._cfg()
+        assert cfg.make_batch_lookup_predicate(requests=[]) is None
+
+
+# ---------------------------------------------------------------------------
+# Partitioned local-cache layout (FolderPath under CacheConfig)
+# ---------------------------------------------------------------------------
+
+
+class TestPartitionedLocalCache:
+    """Round-trip a real ``Response`` through the unified
+    :meth:`CacheConfig.cache_tabular` surface.
+
+    The asserted contract is the on-disk shape — Hive-style
+    ``partition_key=<int>/part-*.<ext>`` under the cache root —
+    plus the listing-time partition prune on
+    :meth:`FolderPath.iter_children` shrinking the read to only the
+    matching directories. Both write and read go through the same
+    :meth:`Tabular.write_arrow_batches` /
+    :meth:`Tabular.read_arrow_batches` calls the Session uses, so
+    the test stays representative of the production path.
+    """
+
+    def _seed(self, tmp_path: Path, *requests) -> tuple[CacheConfig, "Any"]:
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        cfg = CacheConfig(tabular=str(tmp_path))
+        tabular = cfg.cache_tabular()
+        opts = FolderOptions(mode=cfg.mode)
+        # Partition layout is auto-detected from the response batch's
+        # per-field metadata — no explicit ``partition_columns`` on
+        # the FolderOptions: Response.to_arrow_batch stamps
+        # ``t:partition_by=true`` on ``partition_key`` straight from
+        # RESPONSE_SCHEMA, and the FolderPath reads that to drive the
+        # Hive layout.
+        for req in requests:
+            resp = make_response(request=req, body=b'{"ok":true}')
+            tabular.write_arrow_batches(
+                (resp.to_arrow_batch(parse=False),), options=opts,
             )
-        # And the folded segment must still distinguish two long but
-        # different tokens at the same position.
-        other = make_request(f"https://example.com/api/{'y' * 256}/end")
-        rel_other = _local_fast_path_relative(
-            other.method, other.url, other.public_hash,
+        return cfg, tabular
+
+    def _read(self, tabular, predicate):
+        from yggdrasil.io.nested.folder_path import FolderOptions
+        # No explicit partition hint: the folder's ``collect_schema``
+        # reads ``.ygg/schema.arrow`` (persisted on prior writes),
+        # ``Field.partition_by`` flags the partition columns, and
+        # ``_resolve_partition_columns`` picks them up automatically.
+        return list(tabular.read_arrow_batches(
+            options=FolderOptions(predicate=predicate),
+        ))
+
+    def test_writes_land_under_partition_key_directory(self, tmp_path) -> None:
+        req = make_request("https://example.com/x")
+        cfg, tabular = self._seed(tmp_path, req)
+        # Hive-encoded directory name: partition_key=<int>
+        expected_dir = tmp_path / f"partition_key={req.partition_key}"
+        assert expected_dir.is_dir()
+        # One part file per write (mode=APPEND mints a fresh leaf).
+        part_files = list(expected_dir.glob("part-*"))
+        assert len(part_files) == 1
+
+    def test_lookup_predicate_round_trip(self, tmp_path) -> None:
+        req = make_request("https://example.com/x")
+        cfg, tabular = self._seed(tmp_path, req)
+
+        predicate = cfg.make_lookup_predicate(request=req)
+        batches = self._read(tabular, predicate)
+        assert batches, "expected one batch back from the partitioned read"
+        rows = sum(b.num_rows for b in batches)
+        assert rows == 1
+
+    def test_batch_predicate_only_probes_matching_partitions(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """The candidate-probe path stat()s only the partitions the
+        predicate accepts — never calls ``iterdir`` on the cache root.
+        """
+        wanted = make_request("https://example.com/wanted")
+        other = make_request("https://example.com/other")
+        cfg, tabular = self._seed(tmp_path, wanted, other)
+        assert wanted.partition_key != other.partition_key
+
+        # Spy on the root path's iterdir — the candidate-probe path
+        # should NOT call it because the predicate pins partition_key.
+        root_path = tabular.path
+        calls = {"iterdir": 0}
+        original = root_path.iterdir
+
+        def _count(*args, **kwargs):
+            calls["iterdir"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(root_path, "iterdir", _count)
+
+        predicate = cfg.make_batch_lookup_predicate(requests=[wanted])
+        batches = self._read(tabular, predicate)
+        rows = sum(b.num_rows for b in batches)
+        assert rows == 1
+        assert calls["iterdir"] == 0, (
+            "partition pushdown should skip iterdir() on the cache root"
         )
-        assert rel != rel_other
 
-    def test_unsafe_chars_are_replaced(self) -> None:
-        # Backslashes and reserved chars should never appear as path
-        # separators in the result — they must be sanitized.
-        out = _safe_fast_path_segment('a\\b:c*d?e"f<g>h|i')
-        assert "\\" not in out
-        assert ":" not in out
-        assert "*" not in out
-        assert "?" not in out
-        assert '"' not in out
-        assert "<" not in out
-        assert ">" not in out
-        assert "|" not in out
-
-    def test_empty_segment_normalizes_to_placeholder(self) -> None:
-        # ``""`` and ``"   "`` would otherwise produce an empty
-        # directory name; the helper has to fall back to a sentinel.
-        assert _safe_fast_path_segment("") == "_"
-        assert _safe_fast_path_segment("   ") in {"_", " "}  # rstrip→empty→"_"
-
-    def test_method_defaults_when_missing(self) -> None:
-        # Defensive: a request without an explicit method should still
-        # produce a valid relative path (the leaf hex tells uniqueness).
-        url = make_request("https://example.com/x").url
-        rel = _local_fast_path_relative(None, url, 0xDEADBEEF)
-        assert rel.split(os.sep)[0] == "GET"
-
-
-# ---------------------------------------------------------------------------
-# Fast-path TTL cleanup walker (_cleanup_local_fast_path)
-# ---------------------------------------------------------------------------
-
-
-class TestCleanupLocalFastPath:
-
-    def _write_arrow(self, path: Path, mtime_offset: float = 0.0) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Minimal Arrow IPC payload — just an empty batch, contents
-        # don't matter for the cleanup walker.
-        sink = pa.BufferOutputStream()
-        schema = pa.schema([("x", pa.int64())])
-        with pa.ipc.new_stream(sink, schema):
-            pass
-        path.write_bytes(sink.getvalue().to_pybytes())
-        if mtime_offset:
-            now = time.time()
-            os.utime(path, (now + mtime_offset, now + mtime_offset))
-
-    def test_unlinks_files_older_than_ttl(self, tmp_path) -> None:
-        old = tmp_path / "GET" / "host" / "stale.arrow"
-        fresh = tmp_path / "GET" / "host" / "fresh.arrow"
-        # Backdate ``old`` so its mtime sits an hour outside the TTL.
-        self._write_arrow(old, mtime_offset=-3600)
-        self._write_arrow(fresh)
-
-        removed = _cleanup_local_fast_path(
-            str(tmp_path), ttl_seconds=60.0, throttle_seconds=0.0,
-        )
-        assert removed == 1
-        assert not old.exists()
-        assert fresh.exists()
-
-    def test_throttled_by_sentinel(self, tmp_path) -> None:
-        # Two back-to-back calls inside the throttle window: the
-        # second must short-circuit (return 0) even though there's a
-        # fresh stale file to unlink.
-        first_stale = tmp_path / "GET" / "host" / "a.arrow"
-        self._write_arrow(first_stale, mtime_offset=-3600)
-        first_removed = _cleanup_local_fast_path(
-            str(tmp_path), ttl_seconds=60.0, throttle_seconds=60.0,
-        )
-        assert first_removed == 1
-
-        second_stale = tmp_path / "GET" / "host" / "b.arrow"
-        self._write_arrow(second_stale, mtime_offset=-3600)
-        second_removed = _cleanup_local_fast_path(
-            str(tmp_path), ttl_seconds=60.0, throttle_seconds=60.0,
-        )
-        # Throttled: walker doesn't even look, so b.arrow stays.
-        assert second_removed == 0
-        assert second_stale.exists()
-
-    def test_missing_root_is_no_op(self, tmp_path) -> None:
-        ghost = tmp_path / "no-such-dir"
-        assert _cleanup_local_fast_path(str(ghost), ttl_seconds=60.0) == 0
-
-    def test_skips_hidden_tmp_files(self, tmp_path) -> None:
-        # Tmp files written by _store_fast_path_arrow_batch start with
-        # a dot — the cleanup walker must not touch them or it'd race
-        # with concurrent writes.
-        live = tmp_path / "GET" / "host" / ".x.tmp.arrow"
-        live.parent.mkdir(parents=True, exist_ok=True)
-        live.write_bytes(b"in-flight")
-        os.utime(live, (time.time() - 3600, time.time() - 3600))
-
-        removed = _cleanup_local_fast_path(
-            str(tmp_path), ttl_seconds=60.0, throttle_seconds=0.0,
-        )
-        assert removed == 0
-        assert live.exists()
+    def test_lookup_misses_when_partition_directory_empty(self, tmp_path) -> None:
+        # Empty cache → predicate yields no rows, no exceptions.
+        cfg = CacheConfig(tabular=str(tmp_path))
+        tabular = cfg.cache_tabular()
+        req = make_request("https://example.com/x")
+        predicate = cfg.make_lookup_predicate(request=req)
+        # Folder doesn't exist on disk yet → empty stream.
+        if tabular.path.exists():
+            assert self._read(tabular, predicate) == []
+        else:
+            # Match the Session's defensive guard.
+            assert list(tabular.read_arrow_batches()) == []
 
 
 # ---------------------------------------------------------------------------

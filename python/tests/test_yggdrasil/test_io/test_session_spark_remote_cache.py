@@ -67,10 +67,12 @@ def scratch(tmp_path: Path) -> Path:
 class _SparkAwareFakeTabular:
     """Tabular double that records Spark-mode inserts.
 
-    ``cfg.tabular.insert(df, ..., spark_session=spark)`` is the wire
-    contract on the Spark path. The fake collects the frame to a
-    pyarrow table so assertions can pinpoint exactly which rows landed
-    where without depending on the live Spark plan.
+    ``_insert_cache`` routes a SparkDataFrame through
+    :meth:`Tabular.write_spark_frame`, so the fake mirrors that
+    contract and reads its knobs (``mode``, ``match_by``, ``wait``)
+    off :class:`CastOptions`. The frame is collected to pandas so
+    assertions can pinpoint exactly which rows landed where without
+    depending on the live Spark plan.
     """
 
     def __init__(self, name: str) -> None:
@@ -80,21 +82,22 @@ class _SparkAwareFakeTabular:
     def full_name(self, safe: bool = False) -> str:
         return self._name
 
-    def insert(
+    def write_spark_frame(
         self,
         df: Any,
-        *,
-        mode: Mode = Mode.APPEND,
-        match_by: Any = None,
-        wait: bool = False,
-        spark_session: Any = None,
+        options: Any = None,
         **_: Any,
     ) -> None:
         rows = df.toPandas()
+        match_by_fields = getattr(options, "match_by", None)
+        match_by = (
+            tuple(f.name for f in match_by_fields)
+            if match_by_fields else None
+        )
         self.inserts.append({
-            "mode": mode,
-            "match_by": tuple(match_by) if match_by else None,
-            "wait": bool(wait),
+            "mode": getattr(options, "mode", None),
+            "match_by": match_by,
+            "wait": bool(getattr(options, "wait", False)),
             "url_hashes": [
                 int(h) for h in rows["request_public_url_hash"].tolist()
             ],

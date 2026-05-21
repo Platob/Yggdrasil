@@ -54,11 +54,7 @@ import pytest
 from yggdrasil.data.enums import Mode
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
-from yggdrasil.io.session import (
-    Session,
-    _local_fast_path_relative,
-    _store_fast_path_arrow_batch,
-)
+from yggdrasil.io.session import Session
 
 from ._helpers import StubSession, make_request, make_response
 
@@ -89,7 +85,7 @@ def _clear_session_singleton_cache():
 
 def _local_cfg(root: Path | str, **overrides: Any) -> CacheConfig:
     overrides.setdefault("mode", Mode.APPEND)
-    return CacheConfig(path=str(root), **overrides)
+    return CacheConfig(tabular=str(root), **overrides)
 
 
 def _remote_cfg(tab: "_FakeRemoteTabular", **overrides: Any) -> CacheConfig:
@@ -105,15 +101,22 @@ def _remote_cfg(tab: "_FakeRemoteTabular", **overrides: Any) -> CacheConfig:
 
 
 def _seed_local(cache: CacheConfig, response: Response) -> None:
-    """Synchronously plant *response* in the URL-mirrored fast-path tree.
+    """Synchronously plant *response* in the partitioned cache tree.
 
     Bypasses the session's fire-and-forget writeback so a test can
     assert read-side behaviour without racing the daemon writer.
+    Goes through :meth:`Tabular.insert` on the cache's backend —
+    the same call the production writeback uses — so the on-disk
+    layout (``<root>/partition_key=<int>/part-*.<ext>``) matches
+    exactly. Skips the ``response.ok`` guard the production path
+    enforces so fixtures can seed 4xx / 5xx rows.
     """
-    req = response.request
-    rel = _local_fast_path_relative(req.method, req.url, req.public_hash)
-    _store_fast_path_arrow_batch(
-        cache.path, rel, response.to_arrow_batch(parse=False),
+    from yggdrasil.io.nested.folder_path import FolderOptions
+
+    tabular = cache.cache_tabular()
+    tabular.write_arrow_batches(
+        (response.to_arrow_batch(parse=False),),
+        options=FolderOptions(mode=cache.mode),
     )
 
 
@@ -123,19 +126,20 @@ def _seed_remote(tab: "_FakeRemoteTabular", response: Response) -> None:
 
 
 def _wait_for_local(cache: CacheConfig, *, count: int = 1, timeout: float = 5.0) -> int:
-    """Poll until at least *count* live ``.arrow`` files land in *cache*.
+    """Poll until at least *count* partitioned part files land in *cache*.
 
     The local writeback is fire-and-forget on the job pool. A polling
     helper beats a fixed ``sleep`` — slow CI machines get the time
-    they need; fast ones don't pay it.
+    they need; fast ones don't pay it. Counts ``part-*`` leaves under
+    any ``partition_key=*/`` sub-directory (the partitioned layout).
     """
     deadline = time.monotonic() + timeout
-    root = Path(cache.path)
+    root = Path(str(cache.tabular.path))
     last = 0
     while time.monotonic() < deadline:
         try:
             last = sum(
-                1 for p in root.rglob("*.arrow")
+                1 for p in root.rglob("partition_key=*/part-*")
                 if p.is_file() and not p.name.startswith(".")
             )
         except OSError:
@@ -151,51 +155,26 @@ def _wait_for_local(cache: CacheConfig, *, count: int = 1, timeout: float = 5.0)
 # ---------------------------------------------------------------------------
 
 
-class _FakeStatementResult:
-    """Stand-in for :class:`StatementResult` — exposes ``read_arrow_batches``."""
-
-    def __init__(self, batches: list[pa.RecordBatch]) -> None:
-        self._batches = batches
-
-    def read_arrow_batches(self) -> Iterator[pa.RecordBatch]:
-        return iter(self._batches)
-
-
-class _FakeSql:
-    """SQL surface backing :class:`_FakeRemoteTabular`.
-
-    Each call records the query and optionally raises
-    ``TABLE_OR_VIEW_NOT_FOUND`` to exercise the create-on-first-miss
-    recovery in :meth:`Session._load_remote_cached_response`.
-    """
-
-    def __init__(self, parent: "_FakeRemoteTabular") -> None:
-        self._parent = parent
-
-    def execute(self, query: str, *, spark_session: Any = None) -> _FakeStatementResult:
-        self._parent.queries.append(query)
-        if self._parent.raise_table_not_found and not self._parent.created:
-            raise RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] table missing")
-        return _FakeStatementResult(list(self._parent.rows))
-
-
 class _FakeRemoteTabular:
     """In-memory Tabular double for the remote-cache flow.
 
-    Holds seeded rows (a list of :class:`pa.RecordBatch`) and records
-    every ``sql.execute`` query, every ``insert`` call, and whether
-    ``create`` was called. Insert appends new batches into ``rows``
-    so a subsequent lookup returns everything that was written.
+    Holds seeded rows (a list of :class:`pa.RecordBatch`) and
+    records every ``read_arrow_batches`` predicate, every ``insert``
+    call, and whether ``create`` was called. Insert appends new
+    batches into ``rows`` so a subsequent lookup returns everything
+    that was written. Read translates ``options.predicate`` into a
+    pyarrow row-level filter via
+    :meth:`Predicate.filter_arrow_batches` — same shape every real
+    :class:`Tabular` backend implements internally.
     """
 
     def __init__(self, name: str = "ws.cache.responses") -> None:
         self._name = name
         self.rows: list[pa.RecordBatch] = []
-        self.queries: list[str] = []
+        self.predicates: list[Any] = []
         self.inserts: list[dict[str, Any]] = []
         self.created = False
         self.raise_table_not_found = False
-        self.sql = _FakeSql(self)
         self.path = name  # dict-key proxy for ``Session._split_remote_cache``
 
     def full_name(self, safe: bool = False) -> str:
@@ -205,29 +184,55 @@ class _FakeRemoteTabular:
         self.created = True
         self.raise_table_not_found = False
 
-    def insert(
+    def read_arrow_batches(self, options: Any = None, **kwargs: Any) -> Iterator[pa.RecordBatch]:
+        predicate = getattr(options, "predicate", None)
+        # Record the predicate before the missing-table guard so the
+        # create-and-retry path's two attempts both leave a trail
+        # (the create-on-first-miss recovery test inspects the count).
+        self.predicates.append(predicate)
+        if self.raise_table_not_found and not self.created:
+            raise RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] table missing")
+        batches = list(self.rows)
+        if predicate is None:
+            return iter(batches)
+        return predicate.filter_arrow_batches(iter(batches))
+
+    def write_arrow_batches(
         self,
-        batch: Any,
-        *,
-        mode: Mode = Mode.APPEND,
-        match_by: Any = None,
-        wait: bool = False,
-        prune_values: Any = None,
-        prune_by: Any = None,
-        spark_session: Any = None,
+        batches: Any,
+        options: Any = None,
+        **kwargs: Any,
     ) -> None:
-        if isinstance(batch, pa.Table):
-            new_batches = batch.to_batches()
-        elif isinstance(batch, pa.RecordBatch):
-            new_batches = [batch]
-        else:
-            new_batches = []
+        """Unified write surface — what ``Session._insert_cache`` calls.
+
+        Mirrors the real :class:`Tabular.write_arrow_batches` contract:
+        accepts an iterable of :class:`pa.RecordBatch`, reads write
+        knobs (``mode``, ``match_by``, ``wait``, ``prune_values``)
+        from :class:`CastOptions`. Records the call in ``self.inserts``
+        so existing test assertions continue to work.
+        """
+        new_batches: list[pa.RecordBatch] = []
+        for entry in batches:
+            if isinstance(entry, pa.Table):
+                new_batches.extend(entry.to_batches())
+            elif isinstance(entry, pa.RecordBatch):
+                new_batches.append(entry)
+        mode = getattr(options, "mode", None)
+        match_by_fields = getattr(options, "match_by", None)
+        match_by = (
+            tuple(f.name for f in match_by_fields)
+            if match_by_fields else None
+        )
+        wait = getattr(options, "wait", False)
+        prune_values = getattr(options, "prune_values", None)
         self.inserts.append({
             "mode": mode,
-            "match_by": tuple(match_by) if match_by else None,
+            "match_by": match_by,
             "wait": wait,
             "rows": sum(b.num_rows for b in new_batches),
-            "prune_keys": tuple(sorted(prune_values.keys())) if prune_values else (),
+            "prune_keys": (
+                tuple(sorted(prune_values.keys())) if prune_values else ()
+            ),
         })
         self.rows.extend(new_batches)
 
@@ -280,7 +285,7 @@ class TestLocalCacheSend:
         s.queue(make_response(request=req, status_code=500, body=b"boom"))
 
         # ``raise_error=False`` so the test owns the assertions —
-        # ``_store_local_cached_response`` early-exits on
+        # ``_store_cached_response`` early-exits on
         # ``response.ok=False`` so the writeback never fires.
         s.send(req, local_cache=cache, raise_error=False)
 
@@ -363,9 +368,16 @@ class TestLocalCacheSend:
         assert out.json() == {"v": "network"}
 
     def test_distinct_post_bodies_do_not_alias(self, tmp_path) -> None:
-        # ``public_hash`` mixes the body in, so two POSTs to the same
-        # URL with different bytes hash to distinct ``.arrow`` leaves.
-        cache = _local_cfg(tmp_path)
+        # ``public_hash`` folds the body bytes into the request
+        # identity, so two POSTs to the same URL with different bytes
+        # match against distinct rows in the partitioned cache. They
+        # share a ``partition_key`` (URL-derived) so they land in the
+        # same partition directory — the row-level match-by predicate
+        # is what distinguishes them. Passing ``request_by=["public_hash"]``
+        # explicitly opts into body-aware identity (the default
+        # ``public_url_hash`` is URL-only by design — see
+        # :data:`_DEFAULT_REQUEST_BY`).
+        cache = _local_cfg(tmp_path, request_by=["public_hash"])
         url = "https://example.com/echo"
         req_a = make_request(url, method="POST", body=b"payload-A")
         req_b = make_request(url, method="POST", body=b"payload-B")
@@ -512,7 +524,7 @@ class TestRemoteCacheSend:
 
         s.send(req, remote_cache=cfg)
         assert len(s.calls) == 1, "remote miss must touch the network"
-        assert tab.queries, "lookup query must run before the network fetch"
+        assert tab.predicates, "lookup query must run before the network fetch"
         assert tab.inserts, "successful response must write back via insert"
         # Insert call carries the configured knobs.
         i = tab.inserts[0]
@@ -547,7 +559,7 @@ class TestRemoteCacheSend:
         assert tab.created, "missing table must be created on first miss"
         # The lookup query was re-executed after ``create`` — first
         # call raised, second one came back empty so the network fired.
-        assert len(tab.queries) >= 2
+        assert len(tab.predicates) >= 2
         assert len(s.calls) == 1
 
     def test_upsert_skips_both_lookup_and_writeback(self) -> None:
@@ -565,7 +577,7 @@ class TestRemoteCacheSend:
 
         assert len(s.calls) == 1, "UPSERT must always go to the network"
         assert out.json() == {"v": "fresh"}
-        assert tab.queries == [], "UPSERT must not issue a lookup query"
+        assert tab.predicates == [], "UPSERT must not issue a lookup query"
         assert tab.inserts == [], "UPSERT short-circuits the writeback too"
 
     def test_per_request_override_routes_to_alt_table(self) -> None:
@@ -624,7 +636,7 @@ class TestRemoteCacheSendMany:
         assert len(s.calls) == 1, "only the miss touches the network"
         # ``_split_remote_cache`` issues one batched SQL lookup per
         # distinct table.
-        assert len(tab.queries) == 1
+        assert len(tab.predicates) == 1
         # Writeback fires for the network result.
         assert any(call["rows"] == 1 for call in tab.inserts)
 
@@ -648,8 +660,8 @@ class TestRemoteCacheSendMany:
         out = list(s.send_many(iter([req_a, req_b])))
         assert {r.json()["k"] for r in out} == {"a", "b"}
         assert len(s.calls) == 0, "both rows hit their respective tables"
-        assert len(tab_a.queries) == 1
-        assert len(tab_b.queries) == 1
+        assert len(tab_a.predicates) == 1
+        assert len(tab_b.predicates) == 1
 
     def test_writeback_groups_split_by_mode(self) -> None:
         # APPEND + UPSERT in the same batch — APPEND should write back,
@@ -700,7 +712,7 @@ class TestCombinedCacheIntegration:
         out = s.send(req, local_cache=local, remote_cache=remote)
         assert out.json() == {"v": "local"}
         assert len(s.calls) == 0
-        assert tab.queries == [], "local hit must short-circuit before remote"
+        assert tab.predicates == [], "local hit must short-circuit before remote"
 
     def test_remote_hit_backfills_local(self, tmp_path) -> None:
         # Local empty, remote populated → the remote hit is written

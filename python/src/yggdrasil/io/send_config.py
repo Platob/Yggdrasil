@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import pathlib
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
@@ -12,6 +12,7 @@ from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.data.enums import Mode
 from yggdrasil.environ import PyEnv
+from yggdrasil.io.path import Path
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
 
@@ -38,7 +39,6 @@ _DEFAULT_REQUEST_BY: tuple[str, ...] = (
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
         "tabular",
-        "path",
         "request_by",
         "response_by",
         "mode",
@@ -101,13 +101,15 @@ def _is_valid_response_key(key: str) -> bool:
 
 
 def _request_column_sql_name(key: str) -> str:
-    """SQL column name for a request-side ``request_by`` key.
+    """Cache-table column name for a request-side ``request_by`` key.
 
-    The response-cache table stores requests as flattened
-    ``request_<col>`` columns (cf. :data:`RESPONSE_SCHEMA`), so a
-    user-supplied ``request_by`` key that names a bare request column
-    (``public_url_hash``, ``method`` …) needs the ``request_`` prefix
-    when emitted into SQL. Already-prefixed keys pass through.
+    The response cache stores requests as flattened ``request_<col>``
+    columns (cf. :data:`RESPONSE_SCHEMA`), so a user-supplied
+    ``request_by`` key that names a bare request column
+    (``public_url_hash``, ``method`` …) needs the ``request_``
+    prefix when used as a column reference (predicate match clause,
+    :meth:`Tabular.write_arrow_batches` match-by). Already-prefixed
+    keys pass through.
     """
     head, sep, tail = key.partition(".")
     if head in REQUEST_ARROW_SCHEMA.names:
@@ -151,7 +153,7 @@ def _is_tabular_io(arg: Any) -> bool:
     in :class:`Tabular` (and its transitive ``yggdrasil.io.buffer``
     imports) at config-construction time. Anything that exposes
     both ``read_arrow_batches`` and ``write_arrow_batches`` qualifies
-    — covers :class:`FolderIO`, :class:`Table`, and any third-party
+    — covers :class:`FolderPath`, :class:`Table`, and any third-party
     adapter following the same surface.
     """
     return (
@@ -280,16 +282,29 @@ class _ConfigBase:
 class CacheConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
-    # Local cache root directory. When set, the session writes each
-    # successful response as one Arrow IPC file at
-    # ``<path>/<METHOD>/<host>/<seg>/.../<public_hash>.arrow`` (see
-    # :mod:`yggdrasil.io.session._local_fast_path_relative`). Stored
-    # as a string so the frozen-dataclass instance pickles cleanly
-    # across worker boundaries (Spark, multiprocessing, Power Query).
-    path: Optional[str] = field(default=None, hash=False, compare=False)
-    # Remote cache backend — a :class:`Tabular` subclass (Databricks
-    # Table, …). Mutually exclusive with :attr:`path`: a single
-    # config is either local *or* remote, not both.
+    # Cache backend — any :class:`Tabular` subclass:
+    #
+    #   - :class:`~yggdrasil.io.nested.folder_path.FolderPath` for the
+    #     on-disk fast-path local cache (string / pathlib /
+    #     :class:`~yggdrasil.io.path.Path` constructor arguments are
+    #     auto-coerced to a :class:`FolderPath` by :meth:`check_arg`);
+    #   - :class:`~yggdrasil.databricks.table.table.Table` (or any
+    #     third-party adapter exposing ``read_arrow_batches`` /
+    #     ``write_arrow_batches``) for the remote / network-backed
+    #     cache.
+    #
+    # The Session-level read / write helpers
+    # (:meth:`Session._load_cached_response`,
+    # :meth:`Session._lookup_cached`,
+    # :meth:`Session._store_cached_response`,
+    # :func:`Session._insert_cache`) dispatch entirely through this
+    # one slot — local vs. remote is determined by the backend type,
+    # not by a parallel ``path`` field. :meth:`__getstate__` projects
+    # a local FolderPath down to its URL string so the frozen-
+    # dataclass instance survives Spark / multiprocessing /
+    # Power Query worker boundaries without dragging bound backend
+    # handles; remote backends are dropped on pickle and the
+    # receiver rebuilds them from session-level config.
     tabular: Optional["Tabular"] = field(default=None, hash=False, compare=False)
     request_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
     response_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
@@ -309,15 +324,15 @@ class CacheConfig(_ConfigBase):
     mirror_local_to_remote: bool = False
     # TTL after which orphaned fast-path ``.arrow`` files in the
     # local cache tree are unlinked by the writer-side cleanup pass.
-    # Default 1 day mirrors the previous YGGFolderIO behaviour. Set
-    # to ``None`` to disable cleanup entirely (cache grows unbounded).
+    # Default 1 day. Set to ``None`` to disable cleanup entirely
+    # (cache grows unbounded).
     cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1)
-    # Lazy memo for derived predicates and SQL column lists
-    # (``match_by``, ``sql_match_by``, ``request_by_is_public``, the
-    # ``request_sql_column_names`` array, the partition_by SQL clause).
-    # Each is purely a function of the frozen fields above — caching
-    # turns a per-send (or per-batch-request) recomputation into a
-    # dict lookup. Excluded from pickle / equality / repr; rebuilt
+    # Lazy memo for derived predicate-pipeline values
+    # (``cache_enabled``, ``match_by``, ``match_by_columns``,
+    # ``request_match_columns``, ``request_by_is_public``). Each is
+    # purely a function of the frozen fields above — caching turns
+    # a per-send (or per-batch-request) recomputation into a dict
+    # lookup. Excluded from pickle / equality / repr; rebuilt
     # transparently after ``__setstate__``.
     _derived: Optional[dict] = field(
         default=None, init=False, hash=False, compare=False, repr=False,
@@ -345,9 +360,10 @@ class CacheConfig(_ConfigBase):
         if received_to is not None:
             values["received_to"] = _coerce_optional_datetime(received_to)
 
-        path = values.get("path")
-        if path is not None and not isinstance(path, str):
-            values["path"] = str(path)
+        # ``tabular`` accepts a live Tabular or a path-shaped sugar;
+        # ``__post_init__`` resolves the sugar to a FolderPath. We
+        # don't pre-coerce here so the canonical normalisation lives
+        # in one place.
 
         return values
 
@@ -384,20 +400,42 @@ class CacheConfig(_ConfigBase):
             if not self.received_from:
                 object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
 
-        if self.path is not None and not isinstance(self.path, str):
-            object.__setattr__(self, "path", str(self.path))
-
-        if self.path is not None and self.tabular is not None:
-            raise ValueError(
-                "CacheConfig accepts either ``path`` (local cache) or "
-                "``tabular`` (remote cache), not both."
+        # Path-shaped inputs to ``tabular`` are local-cache sugar:
+        # ``CacheConfig(tabular="/cache")`` builds a FolderPath under
+        # the hood so callers don't have to import the class. Live
+        # Tabular instances (FolderPath, Databricks Table, third-
+        # party adapters) pass through unchanged — recognised by the
+        # ``read_arrow_batches`` / ``write_arrow_batches`` duck-test
+        # so test doubles that only stub the bits a particular path
+        # exercises (``_StubTabular.full_name``, …) still flow
+        # through without being mis-coerced to a FolderPath.
+        tab = self.tabular
+        if isinstance(tab, (Path, pathlib.PurePath, str)):
+            from yggdrasil.io.nested.folder_path import FolderPath
+            object.__setattr__(
+                self, "tabular", FolderPath(path=Path.from_(tab)),
             )
 
     def __getstate__(self):
+        # Project local FolderPath caches down to their URL string for
+        # transport — keeps the payload free of bound backend handles
+        # (Databricks client on a :class:`VolumePath`, boto3 client on
+        # an :class:`S3Path`, …) so the dataclass survives Spark /
+        # multiprocessing / Power Query worker boundaries without
+        # dragging unpicklable live state. :meth:`__setstate__`
+        # rehydrates by rebuilding the FolderPath, which is
+        # Singleton-cached so the receiving side coalesces onto the
+        # same live instance as any other config pointing there.
+        #
+        # Remote :class:`Tabular` backends (Databricks Table, …) are
+        # dropped on pickle — they wrap live SDK clients that don't
+        # cross process boundaries; the receiver rebuilds them from
+        # session-level config.
+        local_url = self._local_cache_url()
         return {
             "mode": self.mode,
             "wait": self.wait,
-            "path": self.path,
+            "tabular_url": local_url,
             "request_by": self.request_by,
             "response_by": self.response_by,
             "received_from": self.received_from,
@@ -415,13 +453,18 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "received_from", state["received_from"])
         object.__setattr__(self, "received_to", state["received_to"])
         object.__setattr__(self, "received_ttl", state["received_ttl"])
-        object.__setattr__(self, "path", state.get("path"))
-        # ``tabular`` is intentionally excluded from __getstate__ —
-        # remote :class:`Tabular` handles wrap a live Databricks
-        # client and don't survive process boundaries. Init to None
-        # so attribute access on the deserialized side doesn't
-        # AttributeError.
-        object.__setattr__(self, "tabular", state.get("tabular"))
+        # Rehydrate local FolderPath from its URL string; remote
+        # backends are reattached out-of-band by the receiver.
+        # Accept the legacy ``path`` key from snapshots taken before
+        # the unification so old pickled payloads still load.
+        tabular_url = state.get("tabular_url", state.get("path"))
+        if tabular_url is not None:
+            from yggdrasil.io.nested.folder_path import FolderPath
+            object.__setattr__(
+                self, "tabular", FolderPath(path=Path.from_(tabular_url)),
+            )
+        else:
+            object.__setattr__(self, "tabular", None)
         object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
         object.__setattr__(
             self, "mirror_local_to_remote",
@@ -432,6 +475,23 @@ class CacheConfig(_ConfigBase):
             state.get("cleanup_ttl", dt.timedelta(days=1)),
         )
         object.__setattr__(self, "_derived", None)
+
+    def _local_cache_url(self) -> "str | None":
+        """URL string of the local cache root, or ``None`` for non-local.
+
+        Local cache (FolderPath) carries an addressable path; remote
+        backends are dropped from the pickle wire format.
+        """
+        tab = self.tabular
+        if tab is None:
+            return None
+        try:
+            from yggdrasil.io.nested.folder_path import FolderPath
+        except ImportError:
+            return None
+        if isinstance(tab, FolderPath):
+            return str(tab.path.url)
+        return None
 
     @classmethod
     def check_arg(
@@ -452,11 +512,11 @@ class CacheConfig(_ConfigBase):
         if isinstance(arg, Mapping):
             return cls.parse_mapping(arg, **overrides)
 
-        if isinstance(arg, Path):
-            overrides["path"] = str(arg)
-
-        elif isinstance(arg, str):
-            overrides["path"] = arg
+        if isinstance(arg, (Path, pathlib.PurePath, str)):
+            # Path-shaped → local cache backend. ``__post_init__``
+            # wraps it in a :class:`FolderPath` so the stored
+            # ``tabular`` is always a live :class:`Tabular`.
+            overrides["tabular"] = arg
 
         elif _is_tabular_io(arg):
             overrides["tabular"] = arg
@@ -505,23 +565,38 @@ class CacheConfig(_ConfigBase):
 
     @property
     def is_local(self) -> bool:
-        """True when this config drives the on-disk fast-path cache."""
-        # ``path`` may be lazy-filled by :meth:`local_cache_path`, so
-        # don't cache this one — read straight from the field.
-        return self.path is not None
+        """True when the bound :attr:`tabular` is a :class:`FolderPath`.
+
+        The local-cache fast path keys on this — it's the on-disk
+        backend that supports the partitioned write directly. Lazy
+        import keeps the property cheap for the no-cache default.
+        """
+        tab = self.tabular
+        if tab is None:
+            return False
+        from yggdrasil.io.nested.folder_path import FolderPath
+        return isinstance(tab, FolderPath)
 
     @property
     def is_remote(self) -> bool:
-        """True when this config drives a remote :class:`Tabular`-backed cache."""
-        return self.tabular is not None
+        """True when the bound :attr:`tabular` is a remote backend.
+
+        Any :class:`Tabular` that isn't a :class:`FolderPath` —
+        Databricks Table, third-party adapters — drives the remote
+        cache pipeline (predicate→SQL translation, MERGE writes,
+        spark-frame dispatch).
+        """
+        return self.tabular is not None and not self.is_local
 
     @property
     def local_cache_enabled(self):
         # Two ways to opt into a local cache layer:
-        #   1) ``path`` is set to a directory (explicit local backend);
+        #   1) ``tabular`` is a :class:`FolderPath` (explicit local
+        #      backend, either constructor-supplied or sugar-coerced
+        #      from a path-shaped argument);
         #   2) a ``received_from`` / ``received_to`` window is set,
-        #      in which case ``local_cache_path()`` lazy-fills the
-        #      default ``~/.yggdrasil/cache/response/...`` root.
+        #      in which case :meth:`cache_tabular` lazy-fills the
+        #      default ``~/.yggdrasil/cache/response/...`` FolderPath.
         if not self.cache_enabled:
             return False
         if self.is_local:
@@ -545,38 +620,43 @@ class CacheConfig(_ConfigBase):
         return out
 
     @property
-    def sql_match_by(self) -> list[str]:
-        # Cache-table column names for the merge join. Request-side keys
-        # are stored on the response table under the flattened
-        # ``request_<col>`` form (cf. :data:`RESPONSE_SCHEMA`), so a
-        # bare ``public_url_hash`` / ``method`` / etc. needs the
-        # ``request_`` prefix before it can be referenced as a target
-        # column in a Delta MERGE. Response-side keys map 1:1 already.
+    def match_by_columns(self) -> list[str]:
+        """Flattened column names for keyed cache operations.
+
+        Request-side keys are stored on the response table under the
+        flattened ``request_<col>`` form (cf. :data:`RESPONSE_SCHEMA`),
+        so a bare ``public_url_hash`` / ``method`` / etc. needs the
+        ``request_`` prefix before it can be referenced as a target
+        column in :meth:`Tabular.insert(match_by=...)` /
+        :meth:`Tabular.write_arrow_batches`. Response-side keys map
+        1:1 already.
+        """
         cache = self._derived_cache()
-        out = cache.get("sql_match_by", ...)
+        out = cache.get("match_by_columns", ...)
         if out is ...:
             out = [
                 *(_request_column_sql_name(k) for k in (self.request_by or ())),
                 *(self.response_by or ()),
             ]
-            cache["sql_match_by"] = out
+            cache["match_by_columns"] = out
         return out
 
     @property
-    def request_sql_columns(self) -> list[str]:
-        """Cached ``_request_column_sql_name`` mapping for every ``request_by`` key.
+    def request_match_columns(self) -> list[str]:
+        """Flattened column names for every ``request_by`` key.
 
-        ``make_batch_lookup_sql`` walks N requests and emits the same
-        column name for each (it depends only on the config), so
-        precomputing the list cuts the per-request loop's cost — at
-        ``BATCH_SIZE=64`` requests that is 64 ``_request_column_sql_name``
-        calls replaced by one shared list of strings.
+        :meth:`make_batch_lookup_predicate` walks N requests and
+        emits the same column name for each (it depends only on
+        the config), so precomputing the list cuts the per-request
+        loop's cost — at ``BATCH_SIZE=64`` requests that is 64
+        ``_request_column_sql_name`` calls replaced by one shared
+        list of strings.
         """
         cache = self._derived_cache()
-        out = cache.get("request_sql_columns", ...)
+        out = cache.get("request_match_columns", ...)
         if out is ...:
             out = [_request_column_sql_name(k) for k in (self.request_by or ())]
-            cache["request_sql_columns"] = out
+            cache["request_match_columns"] = out
         return out
 
     @property
@@ -589,9 +669,10 @@ class CacheConfig(_ConfigBase):
         int64 whether the caller looks them up on the original request or
         on the anonymized form stored in the cache. When this predicate
         holds the lookup paths can skip the per-request ``anonymize()``
-        pass before computing ``request_tuple`` / interpolating the SQL
-        clause — the saving is one URL parse + one header normalize per
-        request per lookup, which adds up on send_many bursts.
+        pass before computing ``request_tuple`` / building the lookup
+        :class:`Predicate` — the saving is one URL parse + one header
+        normalize per request per lookup, which adds up on send_many
+        bursts.
         """
         cache = self._derived_cache()
         out = cache.get("request_by_is_public", ...)
@@ -621,31 +702,17 @@ class CacheConfig(_ConfigBase):
             tz=dt.timezone.utc,
         )
 
-    @staticmethod
-    def sql_literal(value: Any) -> str:
-        if value is None:
-            return "null"
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if isinstance(value, (int, float)):
-            return str(value)
-        if isinstance(value, dt.datetime):
-            return f"timestamp '{value.isoformat(sep=' ', timespec='microseconds')}'"
-        if isinstance(value, bytes):
-            import base64
-            value = base64.b64encode(value).decode("ascii")
-        else:
-            value = str(value)
-        return f"'{value.replace(chr(39), chr(39) * 2)}'"
-
     def local_cache_folder(self, session: "Session | None" = None) -> Path:
-        """Filesystem root for the local cache.
+        """Backend-agnostic root for the local cache.
 
-        Returns :attr:`path` when explicitly set, otherwise builds
-        the default path under ``~/.yggdrasil/cache/response``,
-        suffixed with the session's ``base_url`` host + path when
-        one is available so different APIs sharing the same machine
-        don't collide on disk:
+        Returns the bound :class:`FolderPath`'s :attr:`path` when
+        :attr:`tabular` is local (any :class:`yggdrasil.io.path.Path`
+        subclass — LocalPath on disk, VolumePath on a Databricks
+        Volume, S3Path on a bucket, …); otherwise builds the default
+        LocalPath under ``~/.yggdrasil/cache/response``, suffixed
+        with the session's ``base_url`` host + path when one is
+        available so different APIs sharing the same machine don't
+        collide on disk:
 
         * ``base_url=https://api.example.com/v1/`` → ``…/response/api.example.com/v1``
         * ``base_url`` unset → ``…/response/default``
@@ -653,59 +720,81 @@ class CacheConfig(_ConfigBase):
         Used as the per-config key for grouping cache hits in
         :class:`yggdrasil.io.response_batch.ResponseBatch`.
         """
-        if self.path is not None:
-            return Path(self.path)
-        root = Path.home() / ".yggdrasil" / "cache" / "response"
+        if self.is_local:
+            return self.tabular.path
+        root = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
         base_url = getattr(session, "base_url", None) if session is not None else None
         host = getattr(base_url, "host", None) if base_url is not None else None
         if not host:
-            return root / "default"
-        path = (getattr(base_url, "path", "") or "").strip("/")
-        return root / host / path if path else root / host
+            folder = root / "default"
+        else:
+            url_path = (getattr(base_url, "path", "") or "").strip("/")
+            folder = root / host / url_path if url_path else root / host
+        return Path.from_(folder)
 
-    def local_cache_path(self, session: "Session | None" = None) -> str:
-        """Return the local-cache root as a string and memoize it on :attr:`path`.
+    def cache_tabular(
+        self, session: "Session | None" = None,
+    ) -> "Any":
+        """Return the active cache backend as a :class:`Tabular`.
 
-        Wraps :meth:`local_cache_folder` and stores the resolved
-        directory back onto the frozen dataclass via
-        ``object.__setattr__`` so repeat calls (per-batch lookups,
-        per-response writes) don't keep recomputing the default-path
-        suffix from the session's ``base_url``. The string form is
-        what every downstream caller needs (Job pickle payloads,
-        ``str(...)`` group keys, ``os.path.join`` callers).
+        Single entry point both the local and remote pipelines call
+        through:
+
+        * :attr:`tabular` already set (constructor-supplied: live
+          :class:`FolderPath` for local, Databricks Table or any
+          third-party adapter for remote) — returned as-is.
+        * Unset but the cache is otherwise enabled (``received_*``
+          window) — the default
+          ``~/.yggdrasil/cache/response/...`` :class:`FolderPath`
+          is materialised via :meth:`local_cache_folder` and
+          memoised back on :attr:`tabular` so the next call
+          short-circuits.
+
+        The on-disk layout is Hive-partitioned by whichever fields
+        :meth:`partition_columns` reports (RESPONSE_SCHEMA's
+        ``partition_by`` set — ``partition_key`` today), so the
+        local Folder and the remote Table accept the same logical
+        lookup primitive — the :class:`Predicate` built by
+        :meth:`make_lookup_predicate` /
+        :meth:`make_batch_lookup_predicate` — and the same
+        :meth:`Tabular.write_arrow_batches` write call.
         """
-        if self.path is not None:
-            return self.path
-        resolved = str(self.local_cache_folder(session=session))
-        object.__setattr__(self, "path", resolved)
-        return resolved
+        if self.tabular is not None:
+            return self.tabular
+        from yggdrasil.io.nested.folder_path import FolderPath
+
+        tabular = FolderPath(path=self.local_cache_folder(session=session))
+        # Stash the built folder back on the config so subsequent
+        # cache scans reuse the same instance — the schema cache and
+        # predicate ``free_columns`` memo only stay warm across calls
+        # if the FolderPath is itself reused. ``tabular`` is
+        # ``compare=False, hash=False`` and excluded from
+        # ``__getstate__``, so the mutation doesn't affect equality
+        # or pickling.
+        object.__setattr__(self, "tabular", tabular)
+        return tabular
 
     def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
-        """Materialise :attr:`path` for local-cache configs.
+        """Materialise :attr:`tabular` for local-cache configs.
 
         After this call the session-level cache flow can reach for
-        ``cfg.path`` directly without a ``local_cache_path(session)``
+        ``cfg.tabular`` directly without a ``cache_tabular(session)``
         dance. Symmetric to remote configs which always ship with a
         prebuilt :attr:`tabular`.
 
-        No-op when:
-
-        - :attr:`path` is already set;
-        - the cache is remote-only (:attr:`tabular` is set);
-        - :attr:`local_cache_enabled` is False (mode disables the
-          cache, no ``received_*`` window, etc).
+        No-op when :attr:`tabular` is already set or
+        :attr:`local_cache_enabled` is False (mode disables the
+        cache, no ``received_*`` window, etc).
 
         Returns ``self`` so callers can chain
         ``cfg.prebuild(session)`` at the entry of
         :meth:`Session._send_many_batches`.
         """
-        if self.path is not None:
-            return self
-        if self.is_remote:
+        if self.tabular is not None:
             return self
         if not self.local_cache_enabled:
             return self
-        self.local_cache_path(session=session)
+        self.cache_tabular(session=session)
         return self
 
     def request_values(
@@ -780,203 +869,158 @@ class CacheConfig(_ConfigBase):
         out.extend(self.response_tuple(response))
         return tuple(out)
 
-    def sql_request_clause(
+    # ------------------------------------------------------------------
+    # Predicate builders — single source of truth for cache lookups
+    # ------------------------------------------------------------------
+    #
+    # Both backends (local :class:`FolderPath` and remote
+    # :class:`~yggdrasil.databricks.table.table.Table`) read through
+    # :meth:`Tabular.read_arrow_batches` with the same ``options.predicate``
+    # — :class:`Field`-aware backends translate the predicate to whatever
+    # their engine speaks (Arrow ``RecordBatch.filter`` for the
+    # folder, SQL ``WHERE`` for Databricks Tables). No SQL is built
+    # here.
+
+    def request_predicate(
         self,
         request: PreparedRequest | None,
-    ) -> str:
-        if request is None:
-            return "1=1"
+    ) -> "Any | None":
+        """Build the per-request match predicate as an :class:`Expression`.
 
-        request_by = self.request_by
-        if not request_by:
-            return "1=1"
+        Walks ``request_by`` keys, builds ``col(request_<key>) ==
+        request.match_value(key)`` per entry, and ANDs them together.
+        ``None`` request → ``None`` (no per-request constraint).
+        """
+        if request is None or not self.request_by:
+            return None
+        from yggdrasil.io.tabular.execution.expr import all_of, col
 
-        # Walk the precomputed columns in parallel with the keys —
-        # ``make_batch_lookup_sql`` calls this once per request in a
-        # 100-1000-wide batch, and ``_request_column_sql_name`` is
-        # config-level (not request-level), so the per-request loop
-        # shouldn't repeat the prefix lookup.
-        columns = self.request_sql_columns
+        clauses: list[Any] = []
         match_value = request.match_value
-        sql_literal = self.sql_literal
-        clauses: list[str] = []
-        for column, key in zip(columns, request_by):
+        for column, key in zip(self.request_match_columns, self.request_by):
             value = match_value(key)
-            if value is None:
-                clauses.append(f"{column} IS NULL")
-            else:
-                clauses.append(f"{column} = {sql_literal(value)}")
+            clauses.append(
+                col(column).is_null() if value is None else col(column) == value
+            )
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return all_of(*clauses)
 
-        return " AND ".join(clauses) if clauses else "1=1"
-
-    def sql_response_clause(
+    def response_predicate(
         self,
         response: "Response | None" = None,
-    ) -> str:
-        clauses: list[str] = []
+    ) -> "Any | None":
+        """Build the response-side / time-window predicate as an :class:`Expression`.
 
+        Carries the response-side match keys (when *response* is
+        supplied) plus the configured ``received_*`` window. Returns
+        ``None`` when no clauses apply so callers can compose with
+        :func:`all_of` cleanly.
+        """
+        from yggdrasil.io.tabular.execution.expr import all_of, col
+
+        clauses: list[Any] = []
         if response is not None:
             for key, value in self.response_values(response).items():
-                if value is None:
-                    clauses.append(f"{key} IS NULL")
-                else:
-                    clauses.append(f"{key} = {self.sql_literal(value)}")
-
+                clauses.append(
+                    col(key).is_null() if value is None else col(key) == value
+                )
         if self.received_from is not None:
-            clauses.append(f"received_at >= {self.sql_literal(self.received_from)}")
-
+            clauses.append(col("received_at") >= self.received_from)
         if self.received_to is not None:
-            clauses.append(f"received_at < {self.sql_literal(self.received_to)}")
-
-        return " AND ".join(clauses) if clauses else "1=1"
-
-    def sql_clause(
-        self,
-        request: PreparedRequest | None = None,
-        response: "Response | None" = None,
-    ) -> str:
-        clauses: list[str] = []
-
-        request_clause = self.sql_request_clause(request)
-        if request_clause != "1=1":
-            clauses.append(f"({request_clause})")
-
-        response_clause = self.sql_response_clause(response)
-        if response_clause != "1=1":
-            clauses.append(f"({response_clause})")
-
-        return " AND ".join(clauses) if clauses else "1=1"
-
-    def make_lookup_sql(
-        self,
-        table_name: str,
-        request: PreparedRequest | None = None,
-        response: "Response | None" = None,
-        *,
-        identity_by: Optional[Iterable[str]] = None,
-    ) -> str:
-        where_clause = self.sql_clause(request=request, response=response)
-        # Single-request partition prune — narrows the SQL engine's
-        # data-file scan to one partition before any per-row predicate.
-        if request is not None:
-            partition_clause = (
-                f"partition_key = {self.sql_literal(request.partition_key)}"
-            )
-            where_clause = (
-                f"({partition_clause}) AND ({where_clause})"
-                if where_clause != "1=1"
-                else partition_clause
-            )
-        base_query = f"SELECT * FROM {table_name}"
-        if where_clause != "1=1":
-            base_query += f" WHERE {where_clause}"
-
-        partition_by = self._ranked_window_partition_by(identity_by)
-        if partition_by is not None:
-            return (
-                "SELECT * FROM ("
-                "  SELECT t.*, row_number() OVER ("
-                f"    PARTITION BY {partition_by} "
-                "    ORDER BY received_at DESC"
-                "  ) AS __rn "
-                f"  FROM ({base_query}) t"
-                ") ranked WHERE __rn = 1"
-            )
-
-        return base_query
-
-    def _ranked_window_partition_by(
-        self,
-        identity_by: Optional[Iterable[str]],
-    ) -> Optional[str]:
-        """Build the ``PARTITION BY`` clause for the ranked-row window.
-
-        When *identity_by* is ``None`` the result depends only on the
-        config — memoize it on ``_derived`` so a 100-wide
-        ``send_many`` batch doesn't rebuild the same string per
-        request. With an explicit *identity_by* the caller is opting
-        out of the default; recompute fresh each time.
-        """
-        if identity_by is None:
-            cache = self._derived_cache()
-            cached = cache.get("ranked_window_partition_by", ...)
-            if cached is not ...:
-                return cached
-            identity_cols = self.match_by
-            if not identity_cols:
-                cache["ranked_window_partition_by"] = None
-                return None
-            out = ", ".join(
-                _request_column_sql_name(col)
-                if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
-                else col
-                for col in identity_cols
-            )
-            cache["ranked_window_partition_by"] = out
-            return out
-
-        identity_cols = list(identity_by)
-        if not identity_cols:
+            clauses.append(col("received_at") < self.received_to)
+        if not clauses:
             return None
-        return ", ".join(
-            _request_column_sql_name(col)
-            if col.partition(".")[0] in REQUEST_ARROW_SCHEMA.names
-            else col
-            for col in identity_cols
-        )
+        if len(clauses) == 1:
+            return clauses[0]
+        return all_of(*clauses)
 
-    def make_batch_lookup_sql(
+    def make_lookup_predicate(
         self,
-        table_name: str,
-        requests: Iterable[PreparedRequest],
-        *,
-        identity_by: Optional[Iterable[str]] = None,
-    ) -> str:
-        request_list = list(requests)
-        request_clauses = " OR ".join(
-            f"({self.sql_request_clause(req)})"
-            for req in request_list
-        )
-        response_clause = self.sql_response_clause(None)
+        request: PreparedRequest | None = None,
+        response: "Response | None" = None,
+    ) -> "Any | None":
+        """Single-request :class:`Predicate` for the cache read.
 
-        # Partition prune: ``partition_key`` is the table's partition
-        # column (declared on RESPONSE_SCHEMA). An ``IN (…)`` clause
-        # over the request batch's distinct partition_keys lets the
-        # SQL engine skip every other partition before evaluating the
-        # per-request OR — turns a full-table scan into an N-partition
-        # read on a partition-pruned engine (Delta / Iceberg / etc.).
-        partition_clause = ""
+        Shape: ``partition_key == <req.partition_key>`` AND the
+        per-request match clause AND the response/time-window
+        clause. Returns ``None`` when no clauses apply (an
+        unconstrained :class:`Tabular` read).
+
+        The same predicate drives both backends: a :class:`FolderPath`
+        consumes it via :meth:`Predicate.filter_arrow_batches` (with
+        ``extract_partition_filters`` short-circuiting the
+        ``<col>=<val>/`` listing), and a remote
+        :class:`Tabular` (Databricks Table, …) translates it to its
+        engine's native filter (SQL ``WHERE``) inside
+        :meth:`Tabular.read_arrow_batches`.
+        """
+        from yggdrasil.io.tabular.execution.expr import all_of, col
+
+        clauses: list[Any] = []
+        if request is not None:
+            clauses.append(col("partition_key") == request.partition_key)
+        req_pred = self.request_predicate(request)
+        if req_pred is not None:
+            clauses.append(req_pred)
+        resp_pred = self.response_predicate(response)
+        if resp_pred is not None:
+            clauses.append(resp_pred)
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return all_of(*clauses)
+
+    def make_batch_lookup_predicate(
+        self,
+        requests: Iterable[PreparedRequest],
+    ) -> "Any | None":
+        """Batch :class:`Predicate` for the cache read.
+
+        Shape: ``partition_key IN (<distinct keys>)`` AND
+        ``(req1_match) OR (req2_match) OR …`` AND the
+        response/time-window clause. Returns ``None`` when the
+        batch is empty and no time window applies.
+
+        Drives both backends through :meth:`Tabular.read_arrow_batches`:
+        :class:`FolderPath` lets :meth:`iter_children` probe candidate
+        ``partition_key=<v>/`` sub-folders directly (one ``stat``
+        per accepted value, no ``iterdir`` over the full tree) and
+        :meth:`Predicate.filter_arrow_batches` keeps the matching
+        rows on the read side; remote Tabular backends translate the
+        same predicate into their engine's native filter.
+        """
+        from yggdrasil.io.tabular.execution.expr import all_of, any_of, col
+
+        request_list = list(requests)
+        clauses: list[Any] = []
+
         if request_list:
             partition_keys = sorted({r.partition_key for r in request_list})
-            if partition_keys:
-                literals = ", ".join(self.sql_literal(v) for v in partition_keys)
-                partition_clause = f"partition_key IN ({literals})"
+            clauses.append(col("partition_key").is_in(partition_keys))
 
-        where_parts: list[str] = []
-        if partition_clause:
-            where_parts.append(f"({partition_clause})")
-        if request_clauses:
-            where_parts.append(f"({request_clauses})")
-        if response_clause != "1=1":
-            where_parts.append(f"({response_clause})")
+            request_preds = [
+                pred
+                for pred in (self.request_predicate(r) for r in request_list)
+                if pred is not None
+            ]
+            if len(request_preds) == 1:
+                clauses.append(request_preds[0])
+            elif request_preds:
+                clauses.append(any_of(*request_preds))
 
-        base_query = f"SELECT * FROM {table_name}"
-        if where_parts:
-            base_query += " WHERE " + " AND ".join(where_parts)
+        resp_pred = self.response_predicate(None)
+        if resp_pred is not None:
+            clauses.append(resp_pred)
 
-        partition_by = self._ranked_window_partition_by(identity_by)
-        if partition_by is not None:
-            return (
-                "SELECT * FROM ("
-                "  SELECT t.*, row_number() OVER ("
-                f"    PARTITION BY {partition_by} "
-                "    ORDER BY received_at DESC"
-                "  ) AS __rn "
-                f"  FROM ({base_query}) t"
-                ") ranked WHERE __rn = 1"
-            )
-
-        return base_query
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return all_of(*clauses)
 
     def copy(
         self,

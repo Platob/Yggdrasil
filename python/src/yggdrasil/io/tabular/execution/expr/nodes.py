@@ -631,22 +631,20 @@ class Predicate(Expression):
         are skipped (no zero-row pass-through), so consumers can
         treat the output as "non-empty rows that match" without an
         extra guard.
-        """
-        import pyarrow as pa
-        import pyarrow.dataset as pds
 
+        Routes through :meth:`pa.RecordBatch.filter` directly so
+        the per-batch cost stays C++-native — the previous shape
+        wrapped each batch in a fresh
+        :class:`pa.dataset.Dataset` + Table.from_batches before
+        the kernel ran, which dominated on small batches.
+        """
         expr = self.to_arrow()
         for batch in batches:
             if batch.num_rows == 0:
                 continue
-            kept = pds.dataset(pa.Table.from_batches([batch])).to_table(
-                filter=expr,
-            )
-            if kept.num_rows == 0:
-                continue
-            for inner in kept.combine_chunks().to_batches():
-                if inner.num_rows > 0:
-                    yield inner
+            kept = batch.filter(expr)
+            if kept.num_rows > 0:
+                yield kept
 
 
 # ---------------------------------------------------------------------------
