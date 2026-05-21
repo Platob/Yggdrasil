@@ -455,12 +455,27 @@ class FolderIO(IO[bytes, FolderOptions]):
         call the standard hook automatically also stamp the sidecar
         — every :class:`Field` tag (``partition_by``, primary keys,
         comments) round-trips through the zero-row Arrow IPC file
-        the next read picks up via :meth:`_collect_schema`. Sidecar
-        I/O is best-effort: a failed write never poisons the data
-        write that just landed.
+        the next read picks up via :meth:`_collect_schema`.
+
+        The disk write is short-circuited when the in-memory cache
+        already holds an equal schema — the steady state of a hot
+        cache-write loop is "every batch carries the same shape",
+        so re-stamping ``.ygg/schema.arrow`` on every call would
+        burn IO for no observable change. Side-car I/O stays
+        best-effort: a failed write never poisons the data write
+        that just landed.
         """
+        if schema is None:
+            return
+        prior = self._schema_cache
         super()._persist_schema(schema)
-        if not self._yggmeta_enabled or schema is None:
+        if not self._yggmeta_enabled:
+            return
+        # Skip the sidecar rewrite when the schema is unchanged from
+        # the in-memory cache. ``Schema.__eq__`` compares structure
+        # + tags so two ``Schema.from_arrow`` round trips of the
+        # same source compare equal.
+        if prior is not ... and prior == schema:
             return
         arrow_schema = (
             schema.to_arrow_schema() if hasattr(schema, "to_arrow_schema")
