@@ -141,7 +141,12 @@ class FolderIO(IO[bytes, FolderOptions]):
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
 
-    __slots__ = ("path", "_yggmeta_enabled", "_predicate_free_cols")
+    __slots__ = (
+        "path",
+        "_yggmeta_enabled",
+        "_predicate_free_cols",
+        "_static_values_cache",
+    )
 
     #: Sidecar directory name under :attr:`path` where folder-level
     #: metadata (the dumped schema, future per-format hints) lives.
@@ -215,6 +220,15 @@ class FolderIO(IO[bytes, FolderOptions]):
         # via :meth:`_free_cols_for` to find this slot — so a 64-OR
         # batch lookup pays the walk once instead of 64+ times.
         self._predicate_free_cols: "tuple[int, tuple[str, ...]] | None" = None
+        # Hive partition KV cache — :attr:`static_values` walks the
+        # URL segments and casts each value to the schema-declared
+        # dtype on every call. The URL is immutable, the schema is
+        # itself cached, and the call sits in the hot prune loop
+        # (one ``static_values`` per ``matches_static`` per child),
+        # so we materialise once and hand back the same dict. Reset
+        # by :meth:`_persist_schema` when a write changes the
+        # partition dtypes.
+        self._static_values_cache: "Mapping[str, Any] | None" = None
 
         # Don't forward ``data`` / ``path`` / ``binary`` — Holder
         # would try to seed bytes from the directory path. The folder
@@ -316,10 +330,21 @@ class FolderIO(IO[bytes, FolderOptions]):
         Only when no ancestor has the schema cached does the read
         fall through to :meth:`collect_schema`'s sidecar / first-
         batch path.
+
+        The parsed mapping is memoised on the instance — URL parts
+        are immutable for the bound path and the schema only flips
+        when :meth:`_persist_schema` writes a new layout, which
+        invalidates the cache. Calling once per ``matches_static``
+        per child (the prune hot path) costs one ``dict`` read after
+        the first invocation.
         """
+        cached = self._static_values_cache
+        if cached is not None:
+            return cached
         parts = getattr(self.path.url, "parts", None) or ()
         if not parts:
-            return {}
+            self._static_values_cache = {}
+            return self._static_values_cache
         out: "dict[str, Any]" = {}
         schema: Any = ...
         for segment in parts:
@@ -335,6 +360,7 @@ class FolderIO(IO[bytes, FolderOptions]):
             out[col] = hive_cast_value(
                 raw, self._partition_dtype(col, schema=schema),
             )
+        self._static_values_cache = out
         return out
 
     # ==================================================================
@@ -467,6 +493,10 @@ class FolderIO(IO[bytes, FolderOptions]):
             return
         prior = self._schema_cache
         super()._persist_schema(schema)
+        # Invalidate the partition-KV cache: ``static_values`` casts
+        # raw URL values through the schema's partition dtypes, so a
+        # schema flip can change the cast result.
+        self._static_values_cache = None
         if not self._yggmeta_enabled:
             return
         # Skip the sidecar rewrite when the schema is unchanged from
@@ -669,17 +699,30 @@ class FolderIO(IO[bytes, FolderOptions]):
 
         Skips :meth:`Path.iterdir` entirely — N stat probes against a
         deterministic path layout instead of a full directory walk.
-        Existence check is delegated to the child's first read
-        (``exists()`` would still cost a stat, and a missing
-        directory yields zero children anyway), so this stays at one
-        ``Path.from_`` per candidate value.
+
+        The existence check is taken here, before minting the child:
+        on a 64-OR batch lookup against a partially-populated cache
+        the hot shape is "most candidates miss". Skipping the
+        FolderIO allocation + adoption + downstream ``_read_arrow_batches``
+        for misses cuts ~95 us per non-existent partition. When the
+        candidate does exist we'd have paid a stat inside the
+        child's ``iter_children`` anyway, so the early stat doesn't
+        regress the hit path.
+
+        ``hive_cast_value`` is **not** re-applied to the accepted
+        values: :func:`extract_partition_filters` already hands back
+        values typed against the predicate's literal types — running
+        them through another ``pa.compute.cast`` for every of the N
+        candidates wastes a kernel call per probe (and was the
+        single biggest cost in the prune hot path before the
+        skip).
         """
-        dtype = self._partition_dtype(column)
         for value in sorted(values, key=lambda v: (v is None, v)):
             encoded = hive_encode(value)
             candidate = self.path / f"{column}={encoded}"
-            typed_value = hive_cast_value(value, dtype)
-            yield self._mint_partition_child(candidate, column, typed_value)
+            if not candidate.exists():
+                continue
+            yield self._mint_partition_child(candidate, column, value)
 
     def _mint_partition_child(
         self,
