@@ -1075,7 +1075,7 @@ class Response(Tabular["ResponseOptions"]):
 
     def error(self) -> Optional[Exception]:
         if not self.ok:
-            from .errors import make_for_status
+            from yggdrasil.exceptions import make_for_status
             return make_for_status(self)
         return None
 

@@ -1,8 +1,8 @@
-"""Yggdrasil-wide exception types.
+"""Cast-related exception types.
 
-Subclasses live here so any module can import them without pulling in
-``data`` or ``arrow`` first — exceptions need to be importable from the
-hot path without ordering surprises.
+Lives under :mod:`yggdrasil.exceptions` so any module can import these
+without pulling :mod:`yggdrasil.data` or :mod:`yggdrasil.arrow` first —
+exceptions are reachable from the hot path without ordering surprises.
 """
 from __future__ import annotations
 
@@ -10,18 +10,13 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from .base import YGGException
+
 if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
 
 
-__all__ = [
-    "YGGException",
-    "CastError",
-]
-
-
-class YGGException(Exception):
-    pass
+__all__ = ["CastError"]
 
 
 class CastError(YGGException, pa.ArrowInvalid):
@@ -32,7 +27,8 @@ class CastError(YGGException, pa.ArrowInvalid):
     write meant guessing which child raised. Subclassing
     :class:`pyarrow.ArrowInvalid` keeps every existing
     ``except pa.ArrowInvalid`` handler in the wider codebase catching
-    these unchanged.
+    these unchanged; subclassing :class:`YGGException` lets a generic
+    ``except YGGException`` catch every error this library raises.
 
     Message shape (single line so logs stay readable):
 
