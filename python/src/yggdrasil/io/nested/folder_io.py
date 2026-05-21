@@ -69,7 +69,6 @@ from __future__ import annotations
 import dataclasses
 import os
 import time
-import urllib.parse
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator
 
@@ -81,78 +80,13 @@ from yggdrasil.data.enums.media_type import MediaType, MediaTypes
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
+from yggdrasil.io.url import hive_cast_value, hive_encode, hive_split
 
 if TYPE_CHECKING:
     from yggdrasil.io.path import Path
 
 
 __all__ = ["FolderIO", "FolderOptions"]
-
-
-# ---------------------------------------------------------------------------
-# Hive partition layout helpers — ``<col>=<val>/`` directory encoding
-# ---------------------------------------------------------------------------
-
-
-def _hive_encode(value: Any) -> str:
-    """Encode *value* as a filesystem-safe Hive partition value.
-
-    ``None`` → ``"__HIVE_DEFAULT_PARTITION__"`` matching the Hive /
-    Spark / Delta convention. Everything else is ``str(value)`` URL-
-    quoted with the path-separator + ``=`` characters reserved so
-    the encoded value can be split back unambiguously on a single
-    ``=`` and never collides with a directory boundary.
-    """
-    if value is None:
-        return "__HIVE_DEFAULT_PARTITION__"
-    return urllib.parse.quote(str(value), safe="")
-
-
-def _hive_decode(raw: str) -> Any:
-    """Inverse of :func:`_hive_encode` — returns the URL-decoded string.
-
-    The caller is responsible for casting the result to the partition
-    column's declared dtype (the folder layer doesn't know the schema
-    at parse time; the read pipeline casts once the batch lands).
-    """
-    if raw == "__HIVE_DEFAULT_PARTITION__":
-        return None
-    return urllib.parse.unquote(raw)
-
-
-def _hive_split_name(name: str) -> "tuple[str, Any] | None":
-    """Parse a Hive-encoded directory name into ``(column, value)``.
-
-    Returns ``None`` when *name* doesn't match the ``<col>=<val>``
-    convention so the caller can treat the entry as a plain (non-
-    Hive) sub-folder.
-    """
-    if "=" not in name:
-        return None
-    col, _, raw = name.partition("=")
-    if not col:
-        return None
-    return col, _hive_decode(raw)
-
-
-def _cast_partition_value(value: Any, dtype: "pa.DataType | None") -> Any:
-    """Cast a decoded Hive value to *dtype*, falling back to the raw string.
-
-    Used when the folder is read with a typed schema in scope (cache
-    layouts where ``partition_key`` is ``int64``, time partitions
-    encoded as strings need to land as :class:`datetime`, …). When
-    *dtype* is ``None`` or the cast raises (un-castable value), the
-    decoded string passes through unchanged — the static-value prune
-    is conservative on undecidable predicates so a no-op cast just
-    forces the row-level filter to run.
-    """
-    if value is None or dtype is None:
-        return value
-    try:
-        arr = pa.array([value]).cast(dtype, safe=False)
-    except (pa.ArrowInvalid, pa.ArrowTypeError, NotImplementedError):
-        return value
-    return arr[0].as_py()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -381,7 +315,7 @@ class FolderIO(IO[bytes, FolderOptions]):
         out: "dict[str, Any]" = {}
         schema: Any = ...
         for segment in parts:
-            parsed = _hive_split_name(segment)
+            parsed = hive_split(segment)
             if parsed is None:
                 continue
             col, raw = parsed
@@ -390,7 +324,7 @@ class FolderIO(IO[bytes, FolderOptions]):
                     schema = self.collect_schema()
                 except Exception:
                     schema = None
-            out[col] = _cast_partition_value(
+            out[col] = hive_cast_value(
                 raw, self._partition_dtype(col, schema=schema),
             )
         return out
@@ -635,9 +569,9 @@ class FolderIO(IO[bytes, FolderOptions]):
             except Exception:
                 continue
             if is_dir:
-                parsed = _hive_split_name(entry.name)
+                parsed = hive_split(entry.name)
                 if parsed is not None and parsed[0] == head:
-                    value = _cast_partition_value(
+                    value = hive_cast_value(
                         parsed[1], self._partition_dtype(head),
                     )
                     yield self._mint_partition_child(entry, head, value)
@@ -671,9 +605,9 @@ class FolderIO(IO[bytes, FolderOptions]):
         """
         dtype = self._partition_dtype(column)
         for value in sorted(values, key=lambda v: (v is None, v)):
-            encoded = _hive_encode(value)
+            encoded = hive_encode(value)
             candidate = self.path / f"{column}={encoded}"
-            typed_value = _cast_partition_value(value, dtype)
+            typed_value = hive_cast_value(value, dtype)
             yield self._mint_partition_child(candidate, column, typed_value)
 
     def _mint_partition_child(
@@ -1022,7 +956,7 @@ class FolderIO(IO[bytes, FolderOptions]):
                 subset = table.filter(mask)
                 if subset.num_rows == 0:
                     continue
-                encoded = _hive_encode(value)
+                encoded = hive_encode(value)
                 child = type(self)(path=self.path / f"{head}={encoded}")
                 self.adopt_child(child)
                 child._write_arrow_batches(
