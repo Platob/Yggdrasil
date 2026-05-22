@@ -46,12 +46,61 @@ from typing import Any, ClassVar, Iterator, Mapping, get_origin, get_type_hints
 
 from yggdrasil.data.cast import convert
 
-__all__ = ["SystemParameters", "WidgetType", "ALL_VALUES_TAG"]
+__all__ = ["SystemParameters", "WidgetType", "ALL_VALUES_TAG", "LABEL_ACRONYMS", "nice_label"]
 
 #: Sentinel surfaced on Databricks ``multiselect`` widgets when the user
 #: hasn't picked anything — split out of the resolved value so callers get
 #: an empty list instead of a list containing the literal ``"**all**"``.
 ALL_VALUES_TAG = "**all**"
+
+#: Tokens that stay upper-case when :func:`nice_label` prettifies a snake_case
+#: field name into a Databricks widget label. Domain acronyms the codebase
+#: actually uses — currency / standards / protocols / Databricks / data shapes.
+#: Override per subclass by setting :attr:`SystemParameters._LABEL_ACRONYMS`.
+LABEL_ACRONYMS: frozenset[str] = frozenset({
+    # Time / dates
+    "UTC", "TZ", "IANA", "ISO", "DST",
+    # Currency / finance
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "CNY", "FX", "OHLCV",
+    # Identifiers / standards
+    "ID", "UUID", "URL", "URI", "EIC", "MIC", "PK", "FK",
+    # Protocols / formats
+    "HTTP", "HTTPS", "JSON", "XML", "CSV", "PDF", "SQL", "IO", "TLS", "SSL",
+    "TCP", "UDP", "FTP", "SFTP", "SMTP", "DNS", "IP",
+    # Cloud / platform
+    "AWS", "GCP", "S3", "GCS", "EC2", "IAM", "VPC", "DBFS", "UC",
+    # Tech / ML
+    "API", "SDK", "CLI", "UI", "DB", "ML", "AI", "BI", "KPI", "GPU", "CPU",
+    # Org / energy
+    "ENTSO",
+})
+
+
+def nice_label(name: str) -> str:
+    """Prettify a snake_case identifier into a Title Case widget label.
+
+    Splits on ``_`` / ``-``, title-cases each piece, and keeps tokens in
+    :data:`LABEL_ACRONYMS` upper-case. Empty / all-separator input round-trips.
+
+    Examples::
+
+        nice_label("start_date_utc")    # "Start Date UTC"
+        nice_label("user_id")           # "User ID"
+        nice_label("api_url")           # "API URL"
+        nice_label("bidding_zone_eic")  # "Bidding Zone EIC"
+        nice_label("verbose")           # "Verbose"
+    """
+    parts = [p for p in name.replace("-", "_").split("_") if p]
+    if not parts:
+        return name
+    out: list[str] = []
+    for part in parts:
+        upper = part.upper()
+        if upper in LABEL_ACRONYMS:
+            out.append(upper)
+        else:
+            out.append(part[:1].upper() + part[1:].lower())
+    return " ".join(out)
 
 
 class WidgetType(Enum):
@@ -523,17 +572,18 @@ class SystemParameters(MappingABC):
         if not options:
             options = [ALL_VALUES_TAG]
 
+        label = nice_label(name)
         if widget_type is WidgetType.DROPDOWN:
-            dbutils.widgets.dropdown(name, options[0], options, name)
+            dbutils.widgets.dropdown(name, options[0], options, label)
         elif widget_type is WidgetType.COMBOBOX:
-            dbutils.widgets.combobox(name, options[0], options, name)
+            dbutils.widgets.combobox(name, options[0], options, label)
         elif widget_type is WidgetType.MULTISELECT:
-            dbutils.widgets.multiselect(name, options[0], options, name)
+            dbutils.widgets.multiselect(name, options[0], options, label)
         else:  # TEXT and DATETIME both use text widgets.
             dbutils.widgets.text(
                 name,
                 cls._format_widget_default(default, widget_type),
-                name,
+                label,
             )
 
     # ---------------------------------------------------------------------

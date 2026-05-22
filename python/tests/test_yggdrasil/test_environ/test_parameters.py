@@ -636,6 +636,51 @@ class TestInitWidgets:
             Config.init_widgets()  # no raise
 
 
+class TestNiceLabel:
+    def test_snake_case_title_cased(self) -> None:
+        from yggdrasil.environ import nice_label
+        assert nice_label("start_date") == "Start Date"
+
+    def test_acronyms_preserved(self) -> None:
+        from yggdrasil.environ import nice_label
+        assert nice_label("start_date_utc") == "Start Date UTC"
+        assert nice_label("user_id") == "User ID"
+        assert nice_label("api_url") == "API URL"
+        assert nice_label("bidding_zone_eic") == "Bidding Zone EIC"
+
+    def test_single_word(self) -> None:
+        from yggdrasil.environ import nice_label
+        assert nice_label("verbose") == "Verbose"
+
+    def test_single_acronym(self) -> None:
+        from yggdrasil.environ import nice_label
+        assert nice_label("url") == "URL"
+
+    def test_hyphen_treated_as_separator(self) -> None:
+        from yggdrasil.environ import nice_label
+        assert nice_label("data-dir") == "Data Dir"
+
+    def test_empty_round_trips(self) -> None:
+        from yggdrasil.environ import nice_label
+        assert nice_label("") == ""
+        assert nice_label("__") == "__"
+
+    def test_widget_label_uses_nice_label(self) -> None:
+        class Config(SystemParameters):
+            start_date_utc: str = ""
+            user_id: int = 0
+            verbose: bool = False
+
+        dbutils = _RecordingDBUtils()
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        labels = {c[1][0]: c[1][-1] for c in dbutils.widgets.calls}
+        assert labels["start_date_utc"] == "Start Date UTC"
+        assert labels["user_id"] == "User ID"
+        assert labels["verbose"] == "Verbose"
+
+
 class TestFromEnvironment:
     def test_from_environment_returns_instance(self) -> None:
         class Config(SystemParameters):
