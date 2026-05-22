@@ -636,6 +636,105 @@ class TestInitWidgets:
             Config.init_widgets()  # no raise
 
 
+class TestInitJobLogging:
+    """``init_job(logging=...)`` activates the yggdrasil logger without
+    double-installing a handler when one is already reachable upstream."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_logger(self) -> Any:
+        import logging
+
+        ygg_logger = logging.getLogger("yggdrasil")
+        saved_level = ygg_logger.level
+        saved_handlers = list(ygg_logger.handlers)
+        try:
+            yield
+        finally:
+            ygg_logger.setLevel(saved_level)
+            ygg_logger.handlers[:] = saved_handlers
+
+    def test_default_sets_info_level(self) -> None:
+        import logging
+
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None):
+            SystemParameters.init_job()
+
+        ygg_logger = logging.getLogger("yggdrasil")
+        assert ygg_logger.level == logging.INFO
+
+    def test_explicit_level_sets_that_level(self) -> None:
+        import logging
+
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None):
+            SystemParameters.init_job(logging=logging.DEBUG)
+
+        ygg_logger = logging.getLogger("yggdrasil")
+        assert ygg_logger.level == logging.DEBUG
+
+    def test_true_is_alias_for_info(self) -> None:
+        import logging
+
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None):
+            SystemParameters.init_job(logging=True)
+
+        ygg_logger = logging.getLogger("yggdrasil")
+        assert ygg_logger.level == logging.INFO
+
+    def test_false_leaves_logger_untouched(self) -> None:
+        import logging
+
+        ygg_logger = logging.getLogger("yggdrasil")
+        ygg_logger.setLevel(logging.WARNING)
+
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None):
+            SystemParameters.init_job(logging=False)
+
+        assert ygg_logger.level == logging.WARNING
+
+    def test_none_leaves_logger_untouched(self) -> None:
+        import logging
+
+        ygg_logger = logging.getLogger("yggdrasil")
+        ygg_logger.setLevel(logging.WARNING)
+
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None):
+            SystemParameters.init_job(logging=None)
+
+        assert ygg_logger.level == logging.WARNING
+
+    def test_does_not_add_handler_when_one_reachable(self) -> None:
+        # The conftest already wired a handler on the yggdrasil logger.
+        # ``hasHandlers()`` returns True → init_job must skip adding one.
+        import logging
+
+        ygg_logger = logging.getLogger("yggdrasil")
+        before = len(ygg_logger.handlers)
+        assert before >= 1, "conftest should have installed a handler"
+
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None):
+            SystemParameters.init_job()
+
+        assert len(ygg_logger.handlers) == before
+
+    def test_adds_handler_when_none_reachable(self) -> None:
+        import logging
+
+        ygg_logger = logging.getLogger("yggdrasil")
+        # Strip every handler from the propagation chain so
+        # ``hasHandlers()`` returns False.
+        ygg_logger.handlers.clear()
+        root = logging.getLogger()
+        saved_root = list(root.handlers)
+        root.handlers.clear()
+        try:
+            with mock.patch.object(SystemParameters, "_get_dbutils", return_value=None):
+                SystemParameters.init_job()
+            assert len(ygg_logger.handlers) == 1
+            assert isinstance(ygg_logger.handlers[0], logging.StreamHandler)
+        finally:
+            root.handlers[:] = saved_root
+
+
 class TestNiceLabel:
     def test_snake_case_title_cased(self) -> None:
         from yggdrasil.environ import nice_label

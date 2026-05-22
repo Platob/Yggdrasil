@@ -481,14 +481,47 @@ class SystemParameters(MappingABC):
             cls._create_widget(dbutils, name, type_, default, widget_type)
 
     @classmethod
-    def init_job(cls) -> SystemParameters:
+    def init_job(
+        cls,
+        logging: bool | int | None = logging.INFO,
+    ) -> SystemParameters:
         """Initialize widgets, tweak the active Spark session, return the populated config.
 
         Mirrors the historical ``NotebookConfig.init_job()`` entry point.
         Spark tweaks are silently skipped when PySpark isn't importable or
         no session is active.
+
+        ``logging`` controls runtime log activation on the ``yggdrasil``
+        logger:
+
+        * ``int`` (default ``logging.INFO``) — set the level to that
+          numeric value;
+        * ``True`` — alias for ``logging.INFO``;
+        * ``False`` / ``None`` — leave the logger untouched.
+
+        A :class:`logging.StreamHandler` is attached only when nothing
+        upstream is already going to render records (checked via
+        :meth:`logging.Logger.hasHandlers`, which walks the propagation
+        chain). The Databricks job runtime (and pytest harnesses) usually
+        wire the root logger at startup; in those cases propagation alone
+        carries the messages to the existing handler, so adding our own
+        would double-log.
         """
+        import logging as _logging
+
         cls.init_widgets()
+
+        if logging is not None and logging is not False:
+            level = _logging.INFO if logging is True else int(logging)
+            ygg_logger = _logging.getLogger("yggdrasil")
+            ygg_logger.setLevel(level)
+            if not ygg_logger.hasHandlers():
+                handler = _logging.StreamHandler()
+                handler.setFormatter(_logging.Formatter(
+                    "%(asctime)s %(levelname)s %(name)s: %(message)s"
+                ))
+                ygg_logger.addHandler(handler)
+
         try:
             from pyspark.sql import SparkSession
         except ImportError:
