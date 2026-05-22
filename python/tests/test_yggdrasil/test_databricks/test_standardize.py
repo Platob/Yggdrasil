@@ -371,7 +371,7 @@ class TestSparkConvertUnit(SparkTestCase):
 
     def test_per_row_unit_via_column(self) -> None:
         df = self.spark.createDataFrame(
-            [(1.0, "MWh"), (1.0, "GWh"), (1.0, "kWh")],
+            [(1.0, "MWh"), (1.0, "GWh"), (1.0, "TWh")],
             ["v", "u"],
         )
         out = df.withColumn(
