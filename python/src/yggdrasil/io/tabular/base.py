@@ -982,7 +982,7 @@ class Tabular(ABC, Generic[O]):
                 type(self).__name__,
                 n_batches,
                 n_rows,
-                options.mode,
+                options.mode.name,
             )
         if options.sync_metadata:
             self._commit_metadata()

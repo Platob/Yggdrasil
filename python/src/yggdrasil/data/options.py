@@ -1155,52 +1155,22 @@ class CastOptions:
     ) -> "Iterator[pa.RecordBatch]":
         """Collapse duplicate rows on the columns flagged ``unique``.
 
-        Wraps a batch iterator with a client-side dedup pass when
-        :meth:`dedup_columns_on_read` returns a non-empty list.
-        Identity short-circuit otherwise — no buffering, no
-        allocation.
-
-        The dedup pass materialises every batch (necessary: a
-        duplicate's first occurrence and its last occurrence can
-        straddle the chunk boundary), tags each row with its source
-        index, group-by'es on the unique columns to pick the first
-        occurrence index per key, and ``Table.take`` s those rows.
-        Order is preserved within the deduped result.
+        Resolves the dedup column set via
+        :meth:`dedup_columns_on_read`, then delegates to
+        :func:`yggdrasil.arrow.ops.dedup_arrow_batches` for the
+        pure-Arrow group-by + take pass. Identity short-circuit when
+        no column needs collapsing keeps the read path zero-cost on
+        the common case (no target / no unique column / source
+        already unique).
         """
         cols = self.dedup_columns_on_read()
         if not cols:
             yield from batches
             return
-
-        materialised = list(batches)
-        if not materialised:
-            return
-
-        table = pa.Table.from_batches(materialised)
-        if table.num_rows == 0:
-            yield from materialised
-            return
-
-        # Tag each row with its index, group by the unique cols, pick
-        # the first occurrence per key. ``__ygg_idx__`` is unique by
-        # construction so the group_by output's row count equals the
-        # number of distinct keys; ``Table.take`` rebuilds the table
-        # at those indices.
-        idx_col = "__ygg_idx__"
-        indexed = table.append_column(idx_col, pa.array(range(table.num_rows)))
-        grouped = indexed.group_by(list(cols)).aggregate([(idx_col, "min")])
-        keep = grouped.column(f"{idx_col}_min")
-        # Sort the kept indices so the deduped output preserves the
-        # original row order — group_by doesn't promise any ordering
-        # on its rows.
-        keep = keep.sort()
-        deduped = table.take(keep)
-
-        # Re-batch using the original schema. ``to_batches`` chunks
-        # along pyarrow's natural boundaries; that's fine for the
-        # downstream pipeline since the consumer doesn't rely on
-        # specific chunk sizes once dedup ran.
-        yield from deduped.to_batches()
+        # Local import to avoid the top-of-module cycle (arrow.ops
+        # imports back into ``yggdrasil.data`` for the cast helpers).
+        from yggdrasil.arrow.ops import dedup_arrow_batches as _dedup
+        yield from _dedup(batches, cols)
 
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
         """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.

@@ -2665,7 +2665,7 @@ class Table(DatabricksPath):
 
         logger.debug(
             "Creating view %r (or_replace=%s, missing_ok=%s, mode=%s)",
-            self, bool(or_replace), bool(missing_ok), parsed_mode,
+            self, bool(or_replace), bool(missing_ok), parsed_mode.name,
         )
         try:
             self.sql.execute(statement, wait=wait_result)
@@ -3676,7 +3676,7 @@ class Table(DatabricksPath):
         logger.debug(
             "Inserting via Spark into table %r (mode=%s, match_by=%s, prune_by=%s, "
             "statements=%d, retry=%s, anti_join=%s)",
-            target_location, mode_enum, match_by, prune_by, len(prepared),
+            target_location, mode_enum.name, match_by, prune_by, len(prepared),
             retry_cfg is not None, anti_join_handled,
         )
 
@@ -3695,7 +3695,7 @@ class Table(DatabricksPath):
             logger.info(
                 "Inserted via Spark into table %r (mode=%s, match_by=%s, "
                 "prune_by=%s, statements=%d, anti_join=%s)",
-                target_location, mode_enum, match_by, prune_by, len(prepared),
+                target_location, mode_enum.name, match_by, prune_by, len(prepared),
                 anti_join_handled,
             )
         finally:
@@ -3892,7 +3892,7 @@ class Table(DatabricksPath):
 
         logger.info(
             "SQL insert into table %r (mode=%s, match_by=%s, statements=%d, retry=%s)",
-            target_location, mode_enum, match_by, len(prepared), retry_active,
+            target_location, mode_enum.name, match_by, len(prepared), retry_active,
         )
 
         if not prepared:

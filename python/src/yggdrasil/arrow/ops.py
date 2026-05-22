@@ -35,7 +35,78 @@ from .cast import rechunk_arrow_batches, rechunk_arrow_table
 if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
 
-__all__ = ["upsert_arrow_batches", "upsert_arrow_tabular"]
+__all__ = [
+    "dedup_arrow_batches",
+    "dedup_arrow_table",
+    "upsert_arrow_batches",
+    "upsert_arrow_tabular",
+]
+
+
+def dedup_arrow_table(
+    table: pa.Table,
+    keys: Sequence[str],
+) -> pa.Table:
+    """Drop duplicate rows on the *keys* columns, keep the first occurrence.
+
+    Implementation runs entirely in pyarrow's C++ kernels:
+
+    1. Append a synthetic ``__ygg_idx__`` column carrying the row
+       index (one ``pa.array`` allocation, no row walk).
+    2. ``group_by(keys).aggregate([(__ygg_idx__, "min")])`` collapses
+       the table to one row per key tuple, picking the first
+       occurrence's row index.
+    3. Sort those indices so the output preserves the input order
+       (``group_by`` makes no ordering promise on its output rows),
+       then ``Table.take`` rebuilds the deduped table.
+
+    Empty input / empty key list short-circuits to the input
+    unchanged so the caller can call this unconditionally on every
+    read pass.
+    """
+    if not keys or table.num_rows == 0:
+        return table
+
+    idx_col = "__ygg_idx__"
+    indexed = table.append_column(idx_col, pa.array(range(table.num_rows)))
+    grouped = indexed.group_by(list(keys)).aggregate([(idx_col, "min")])
+    keep = grouped.column(f"{idx_col}_min").sort()
+    return table.take(keep)
+
+
+def dedup_arrow_batches(
+    batches: "Iterable[pa.RecordBatch]",
+    keys: Sequence[str],
+) -> "Iterator[pa.RecordBatch]":
+    """Iterator-shaped wrapper around :func:`dedup_arrow_table`.
+
+    An iterator dedup is fundamentally a stop-the-world op: a
+    duplicate's first occurrence can straddle any chunk boundary, so
+    we have to materialise every batch before deciding which rows
+    survive. Pre-materialise into a :class:`pa.Table`, hand that to
+    :func:`dedup_arrow_table`, and re-batch the result with pyarrow's
+    natural chunk boundaries on the way out.
+
+    Empty key list short-circuits to the input iterator unchanged so
+    the read pipeline can call this unconditionally — the common
+    case (no ``unique`` columns in the target schema) stays
+    zero-cost.
+    """
+    if not keys:
+        yield from batches
+        return
+
+    materialised = [b for b in batches if b is not None]
+    if not materialised:
+        return
+
+    table = pa.Table.from_batches(materialised)
+    if table.num_rows == 0:
+        yield from materialised
+        return
+
+    deduped = dedup_arrow_table(table, keys)
+    yield from deduped.to_batches()
 
 
 def _resolve_match_by_keys(
