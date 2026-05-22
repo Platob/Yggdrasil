@@ -48,7 +48,7 @@ from typing import (
 
 from yggdrasil.data.cast import convert
 from yggdrasil.data.enums.currency import Currency
-from yggdrasil.io.http_.session import HTTPSession
+from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.url import URL
 
 from .backends import Backend, BackendError, DEFAULT_BACKENDS

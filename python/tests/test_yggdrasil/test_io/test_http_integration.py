@@ -767,7 +767,7 @@ class TestFromPool:
     def test_from_pool_stamps_media_on_holder_for_json(self) -> None:
         import datetime as dt
         from yggdrasil.io.holder import Holder
-        from yggdrasil.io.http_.response import HTTPResponse
+        from yggdrasil.http_.response import HTTPResponse
         from yggdrasil.io.primitive.json_file import JSONFile
 
         raw = self._make_raw(
@@ -793,7 +793,7 @@ class TestFromPool:
     def test_from_pool_falls_back_to_holder_on_unknown_media(self) -> None:
         import datetime as dt
         from yggdrasil.io.holder import Holder
-        from yggdrasil.io.http_.response import HTTPResponse
+        from yggdrasil.http_.response import HTTPResponse
 
         raw = self._make_raw(
             body=b"binary blob",

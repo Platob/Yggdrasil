@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from yggdrasil.io.http_ import ErrorNotifyingHTTPSession, smtp_email_notifier
+from yggdrasil.http_ import ErrorNotifyingHTTPSession, smtp_email_notifier
 from yggdrasil.io.session import Session
 
 from ._helpers import make_request, make_response

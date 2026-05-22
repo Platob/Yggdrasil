@@ -1,7 +1,12 @@
-"""Concrete HTTP/HTTPS session backed by :mod:`yggdrasil._http_pool`.
+"""Concrete HTTP/HTTPS session — the single public entry point of :mod:`yggdrasil.http_`.
 
-The pool, retry, and timeout primitives are urllib3-shaped but stdlib-backed
-(see :mod:`yggdrasil._http_pool`) — no third-party HTTP dependency.
+Construct one :class:`HTTPSession` per host (singleton-cached by config), drive
+verb methods (``get`` / ``post`` / ``put`` / ``patch`` / ``delete`` / ``head``
+/ ``options`` / ``request``) inherited from
+:class:`yggdrasil.io.session.Session`, and read the returned
+:class:`HTTPResponse`. The pool, retry, and timeout primitives live in
+:mod:`yggdrasil.http_._pool` (stdlib-backed, urllib3-shaped) — feature code
+should not import them directly.
 """
 from __future__ import annotations
 
@@ -10,20 +15,19 @@ import logging
 from itertools import takewhile
 from typing import Any, Optional
 
-from yggdrasil._http_pool import PoolManager, Retry
-
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import DEFAULT_WAITING_CONFIG
 from yggdrasil.data.enums import MediaTypes
+from yggdrasil.io.authorization.base import Authorization
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCFile
+from yggdrasil.io.request import PreparedRequest
+from yggdrasil.io.send_config import SendConfig
+from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
 
-from ..authorization.base import Authorization
-from ..request import PreparedRequest
-from ..send_config import SendConfig
-from ..session import Session
+from ._pool import PoolManager, Retry
 from .response import HTTPResponse
 
 __all__ = ["HTTPSession"]
@@ -101,7 +105,7 @@ class _TieredRetry(Retry):
 
 
 class HTTPSession(Session):
-    """HTTP/HTTPS session backed by :class:`yggdrasil._http_pool.PoolManager`.
+    """HTTP/HTTPS session backed by :class:`yggdrasil.http_._pool.PoolManager`.
 
     Inherits the verb methods (``get`` / ``post`` / ``put`` / ``patch`` /
     ``delete`` / ``head`` / ``options`` / ``request``) from

@@ -107,7 +107,7 @@ convert("19,95", Decimal)   # Decimal('19.95')
 ## 7. HTTP
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 print(http.get("https://httpbin.org/get").json())

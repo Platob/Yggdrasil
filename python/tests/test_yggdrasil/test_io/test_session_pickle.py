@@ -18,7 +18,7 @@ import threading
 
 import pytest
 
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
 

@@ -3,12 +3,11 @@ from __future__ import annotations
 import datetime as dt
 from typing import TYPE_CHECKING, Mapping, Optional
 
-from yggdrasil._http_pool import BaseHTTPResponse
-
-from ..holder import Holder
-from ..memory import Memory
-from ..request import PreparedRequest
-from ..response import Response, _media_type_from_headers
+from yggdrasil.http_._pool import BaseHTTPResponse
+from yggdrasil.io.holder import Holder
+from yggdrasil.io.memory import Memory
+from yggdrasil.io.request import PreparedRequest
+from yggdrasil.io.response import Response, _media_type_from_headers
 
 if TYPE_CHECKING:
     from .path import HTTPPath

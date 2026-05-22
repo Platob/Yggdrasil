@@ -169,7 +169,7 @@ nav:
           - dataclasses: modules/dataclasses/README.md
       - IO & HTTP:
           - io: modules/io/README.md
-          - io.http_: modules/io/http_/README.md
+          - http_: modules/http_/README.md
       - Databricks:
           - Overview: modules/databricks/README.md
           - sql: modules/databricks/sql/README.md

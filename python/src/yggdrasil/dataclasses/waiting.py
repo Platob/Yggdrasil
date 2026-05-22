@@ -60,7 +60,7 @@ class WaitingConfig:
 
     @property
     def timeout_pool(self):
-        from yggdrasil._http_pool import Timeout
+        from yggdrasil.http_._pool import Timeout
 
         if not self.timeout:
             return Timeout(

@@ -12,7 +12,7 @@ Hand-written, copy-paste-friendly pages for the most-used surfaces. The auto-gen
 ## IO and HTTP
 
 - [io](io/README.md) — `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`.
-- [io.http_](io/http_/README.md) — `HTTPSession`, prepared requests, batch dispatch.
+- [http_](http_/README.md) — `HTTPSession`, prepared requests, batch dispatch.
 
 ## Databricks
 

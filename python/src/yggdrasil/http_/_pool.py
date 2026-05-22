@@ -12,7 +12,7 @@ Surface (urllib3-shaped, by design — keeps the call sites readable):
 * :class:`HTTPResponse` exposing ``.status`` / ``.headers`` / ``.read`` /
   ``.stream`` / ``.release_conn`` / ``.drain_conn``
 * :class:`Retry` (subclassable; ``history`` carries :class:`RequestHistory`
-  entries so :class:`yggdrasil.io.http_.session._TieredRetry` works unchanged)
+  entries so :class:`yggdrasil.http_.session._TieredRetry` works unchanged)
 * :class:`Timeout` carrying ``connect`` / ``read`` / ``total``
 * :class:`HTTPHeaderDict` case-insensitive multi-value header dict
 * :func:`disable_warnings`

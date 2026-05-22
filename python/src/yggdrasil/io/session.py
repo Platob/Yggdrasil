@@ -762,7 +762,7 @@ class Session(Singleton, ABC):
         parsed = URL.from_(url, normalize=normalize)
 
         if parsed.scheme.startswith("http"):
-            from .http_ import HTTPSession
+            from yggdrasil.http_ import HTTPSession
 
             return HTTPSession(
                 base_url=parsed,

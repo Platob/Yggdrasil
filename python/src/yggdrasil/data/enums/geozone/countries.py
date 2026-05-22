@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 from .base import GeoZone, GeoZoneType, normalize_geozone_name
 

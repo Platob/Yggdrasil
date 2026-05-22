@@ -78,8 +78,8 @@ _PATH_CLASS_TARGETS: dict[str, tuple[str, str]] = {
     "dbks+serverless-cluster":
                       ("yggdrasil.databricks.cluster.serverless", "ServerlessCluster"),
     "s3":             ("yggdrasil.aws.fs.path", "S3Path"),
-    "http":           ("yggdrasil.io.http_.path", "HTTPPath"),
-    "https":          ("yggdrasil.io.http_.path", "HTTPPath"),
+    "http":           ("yggdrasil.http_.path", "HTTPPath"),
+    "https":          ("yggdrasil.http_.path", "HTTPPath"),
 }
 
 

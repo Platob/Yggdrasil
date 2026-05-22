@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 from .base import GeoZone, GeoZoneType, normalize_geozone_name, normalize_geozone_token
 from .countries import fetch_country_geozones

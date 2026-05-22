@@ -79,7 +79,7 @@ results = parallelize(
 
 ```python
 from yggdrasil.concurrent import Job, JobPoolExecutor
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 
@@ -107,7 +107,7 @@ from yggdrasil.pyutils import retry
 
 @retry(max_attempts=3, backoff=2.0)
 def fetch_with_retry(url: str) -> bytes:
-    from yggdrasil.io.http_ import HTTPSession
+    from yggdrasil.http_ import HTTPSession
     return HTTPSession().get(url).content
 
 jobs = [Job.make(fetch_with_retry, url) for url in urls]

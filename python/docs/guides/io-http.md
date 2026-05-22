@@ -5,7 +5,7 @@
 ## Preferred HTTP client: `HTTPSession`
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 print(http.get("https://httpbin.org/get").json())
@@ -88,7 +88,7 @@ resp.ok
 ## Resilient paged pull (recipe)
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 from yggdrasil.io import SendManyConfig
 
 http = HTTPSession()

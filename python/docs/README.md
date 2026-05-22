@@ -97,7 +97,7 @@ out = cast_polars_dataframe(df, CastOptions(target_field=target))
 ## 7. HTTP with `HTTPSession`
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 print(http.get("https://httpbin.org/get").json())
@@ -151,7 +151,7 @@ def normalize_options(options=None, *, target_field=None) -> CastOptions:
 
 - **Casting:** `yggdrasil.data.cast`, `yggdrasil.arrow`, `yggdrasil.dataclasses`
 - **Engines:** `yggdrasil.polars`, `yggdrasil.pandas`, `yggdrasil.spark`
-- **IO / HTTP:** `yggdrasil.io`, `yggdrasil.io.http_`
+- **IO / HTTP:** `yggdrasil.io`, `yggdrasil.http_`
 - **Databricks:** `yggdrasil.databricks.*`
 - **Utilities:** `yggdrasil.pyutils`, `yggdrasil.concurrent`, `yggdrasil.environ`, `yggdrasil.pickle`, `yggdrasil.mongo`, `yggdrasil.mongoengine`, `yggdrasil.fastapi`
 

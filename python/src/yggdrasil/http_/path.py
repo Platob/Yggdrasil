@@ -27,7 +27,7 @@ from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.url import URL
-from ...dataclasses import WaitingConfig
+from yggdrasil.dataclasses import WaitingConfig
 
 if TYPE_CHECKING:
     from .session import HTTPSession

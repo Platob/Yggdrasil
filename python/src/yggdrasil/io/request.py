@@ -575,7 +575,7 @@ class PreparedRequest:
                     "call request.attach_session(session) first, or use "
                     "session.send(request) directly."
                 )
-            from .http_ import HTTPSession
+            from yggdrasil.http_ import HTTPSession
             self.attach_session(HTTPSession())
         return self._session.send(self, config, **kwargs)
 
@@ -613,7 +613,7 @@ class PreparedRequest:
 
         if cls is PreparedRequest:
             if url.is_http:
-                from .http_ import HTTPRequest
+                from yggdrasil.http_ import HTTPRequest
 
                 return HTTPRequest(
                     method=method,
@@ -764,7 +764,7 @@ class PreparedRequest:
 
         if cls is PreparedRequest:
             if parsed_url.is_http:
-                from .http_ import HTTPRequest
+                from yggdrasil.http_ import HTTPRequest
                 out_class = HTTPRequest
 
         return out_class(

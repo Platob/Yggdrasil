@@ -13,7 +13,7 @@ pulling :mod:`yggdrasil.io` first; see ``AGENTS.md`` →
 The hierarchy also:
 
 1. Inherits from the stdlib-backed pool exceptions in
-   :mod:`yggdrasil._http_pool` (urllib3-shaped, but stdlib-only) so
+   :mod:`yggdrasil.http_._pool` (urllib3-shaped, but stdlib-only) so
    transport-level ``except`` blocks still match across the
    transport/business boundary.
 2. Carries a bound ``Response`` (and/or ``PreparedRequest``) on every
@@ -23,7 +23,7 @@ The hierarchy also:
    adding typed ``response`` / ``request`` attributes where applicable.
 
 Hierarchy (transport exceptions sourced from
-:mod:`yggdrasil._http_pool.exceptions`; additions marked with *):
+:mod:`yggdrasil.http_._pool.exceptions`; additions marked with *):
 ─────────────────────────────────────────────────────
 HTTPError                           ← _http_pool.HTTPError
   ├── RequestError *                ← request-bound base
@@ -73,7 +73,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from yggdrasil._http_pool import exceptions as _u3
+from yggdrasil.http_._pool import exceptions as _u3
 
 from .base import YGGException
 
@@ -417,7 +417,7 @@ class ResponseError(HTTPError):
             return cached
 
         import io
-        from yggdrasil._http_pool import HTTPResponse as _U3R, HTTPHeaderDict
+        from yggdrasil.http_._pool import HTTPResponse as _U3R, HTTPHeaderDict
 
         body_bytes = self.response.buffer.to_bytes() if self.response.buffer else b""
         shim = _U3R(
