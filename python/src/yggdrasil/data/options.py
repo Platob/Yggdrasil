@@ -1250,8 +1250,8 @@ class CastOptions:
         from yggdrasil.arrow.ops import dedup_arrow_batches as _dedup
         yield from _dedup(batches, cols)
 
-    def resample_on_read(self) -> "tuple[str, int] | None":
-        """Return ``(time_column, sampling_seconds)`` to resample to.
+    def resample_on_read(self) -> "tuple[str, int, list[str]] | None":
+        """Return ``(time_column, sampling_seconds, partition_by)`` to resample.
 
         Picks the first entry of :attr:`time_sample_by` whose
         ``time_sampling`` metadata carries a positive ISO-8601
@@ -1267,8 +1267,17 @@ class CastOptions:
         tag registry (it's a per-call option, not a contract that
         rides with the data on disk).
 
-        Returns ``None`` when :attr:`time_sample_by` is unset / empty
-        or every listed Field's metadata fails to parse.
+        ``partition_by`` is derived from the target schema's
+        :attr:`Field.primary_key` set, *minus* the resample column
+        itself if it's also primary. The rationale: on a per-entity
+        time series (one symbol per row, partitioned by symbol),
+        each entity's timeline should bucket independently — without
+        ``partition_by`` the resample would collapse rows across
+        instruments. Schemas with no primary keys (or where the
+        only primary is the timestamp) fall back to a flat resample.
+
+        Returns ``None`` when :attr:`time_sample_by` is unset /
+        empty or every listed Field's metadata fails to parse.
         """
         if not self.time_sample_by:
             return None
@@ -1276,15 +1285,39 @@ class CastOptions:
             seconds = _field_time_sampling_seconds(child)
             if seconds <= 0:
                 continue
-            return child.name, seconds
+            partition_by = self._resample_partition_by(child.name)
+            return child.name, seconds, partition_by
         return None
+
+    def _resample_partition_by(self, time_column: str) -> "list[str]":
+        """Default ``partition_by`` for :meth:`resample_on_read`.
+
+        Walks the target schema's children for ``primary_key=True``
+        fields (excluding ``time_column`` itself). Returns ``[]`` when
+        no target / no primary keys are declared, or when the only
+        primary is the resample column.
+        """
+        target = self.target
+        if target is None:
+            return []
+        children = getattr(target, "children", None)
+        if not children:
+            return []
+        out: list[str] = []
+        for child in children:
+            if not getattr(child, "primary_key", False):
+                continue
+            if child.name == time_column:
+                continue
+            out.append(child.name)
+        return out
 
     def resample_arrow_batches(
         self, batches: "Iterator[pa.RecordBatch]",
     ) -> "Iterator[pa.RecordBatch]":
         """Snap rows to the target's ``time_sampling`` grid.
 
-        Resolves the resample column / interval via
+        Resolves the resample column / interval / partition keys via
         :meth:`resample_on_read`, then delegates to
         :func:`yggdrasil.arrow.ops.resample_arrow_batches`. Identity
         short-circuit when no field is flagged keeps the read path
@@ -1295,11 +1328,12 @@ class CastOptions:
             yield from batches
             return
         from yggdrasil.arrow.ops import resample_arrow_batches as _resample
-        time_column, sampling_seconds = target
+        time_column, sampling_seconds, partition_by = target
         yield from _resample(
             batches,
             time_column=time_column,
             sampling_seconds=sampling_seconds,
+            partition_by=partition_by or None,
         )
 
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:

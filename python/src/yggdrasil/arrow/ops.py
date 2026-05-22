@@ -62,6 +62,7 @@ def resample_arrow_table(
     *,
     time_column: str,
     sampling_seconds: int,
+    partition_by: "Sequence[str] | None" = None,
 ) -> pa.Table:
     """Align *table* to a fixed sampling grid on *time_column*.
 
@@ -71,6 +72,15 @@ def resample_arrow_table(
     bucket collapse via ``"first"`` aggregation (matches the
     :func:`dedup_arrow_table` semantics: pick the first occurrence per
     group). Pure pyarrow compute, no Python row walk.
+
+    ``partition_by`` carries the entity columns the resample is
+    independent on — passing ``["symbol"]`` on a multi-instrument
+    price feed groups by ``(symbol, bucket)`` so each instrument's
+    rows bucket on their own timeline instead of getting collapsed
+    across instruments. Default ``None`` runs a flat resample (one
+    global timeline). The caller / :meth:`CastOptions.resample_on_read`
+    auto-derives this list from the target schema's
+    :attr:`Field.primary_key` set, minus ``time_column`` itself.
 
     The contract is **aggregate (downsample) or identity**. When the
     source already lives on a coarser grid than the target, every
@@ -97,6 +107,20 @@ def resample_arrow_table(
         return table
     if table.num_rows == 0:
         return table
+
+    # Filter partition_by to the columns that actually exist in the
+    # batch; a stale primary-key reference (column dropped on the
+    # source side) shouldn't crash the resample, just degrade to a
+    # flatter grouping. Strip the time column out too — grouping by
+    # ``(time_column, bucket)`` is a no-op since both move in lock-step.
+    schema_names = set(table.schema.names)
+    part_cols: list[str] = []
+    if partition_by:
+        for c in partition_by:
+            if c == time_column:
+                continue
+            if c in schema_names and c not in part_cols:
+                part_cols.append(c)
 
     # Convert the timestamp to int64 microseconds. ``us`` is the
     # canonical internal unit yggdrasil leans on (it's the default
@@ -127,7 +151,8 @@ def resample_arrow_table(
     indexed = table.append_column(bucket_col, bucket).append_column(
         idx_col, pa.array(range(table.num_rows)),
     )
-    grouped = indexed.group_by([bucket_col], use_threads=False).aggregate(
+    group_keys = [*part_cols, bucket_col]
+    grouped = indexed.group_by(group_keys, use_threads=False).aggregate(
         [(idx_col, "first")],
     )
     keep = grouped.column(f"{idx_col}_first").sort()
@@ -162,6 +187,7 @@ def resample_arrow_batches(
     *,
     time_column: str,
     sampling_seconds: int,
+    partition_by: "Sequence[str] | None" = None,
 ) -> "Iterator[pa.RecordBatch]":
     """Iterator-shaped wrapper around :func:`resample_arrow_table`.
 
@@ -169,6 +195,10 @@ def resample_arrow_batches(
     duplicate's bucket-mates can straddle any chunk boundary, just
     like dedup), runs the resample, and re-batches on pyarrow's
     natural chunk boundaries.
+
+    ``partition_by`` carries the entity columns the resample is
+    independent on — see :func:`resample_arrow_table` for the
+    semantics.
 
     Empty / zero-budget short-circuits to the input iterator
     unchanged so the caller can route every read through this
@@ -191,6 +221,7 @@ def resample_arrow_batches(
         table,
         time_column=time_column,
         sampling_seconds=sampling_seconds,
+        partition_by=partition_by,
     )
     yield from resampled.to_batches()
 

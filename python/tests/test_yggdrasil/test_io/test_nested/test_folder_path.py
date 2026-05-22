@@ -460,7 +460,8 @@ class TestTimeSampleByResample:
         import datetime as dt
 
         # Field with no ``time_sampling`` metadata is skipped; the
-        # second entry's PT1H wins.
+        # second entry's PT1H wins. ``partition_by`` falls back to ``[]``
+        # because no target schema is bound.
         bare = field("ts1", pa.timestamp("us", "UTC"))
         tagged = field(
             "ts2", pa.timestamp("us", "UTC"),
@@ -469,7 +470,7 @@ class TestTimeSampleByResample:
             ).encode()},
         )
         opts = CastOptions(time_sample_by=[bare, tagged])
-        assert opts.resample_on_read() == ("ts2", 3600)
+        assert opts.resample_on_read() == ("ts2", 3600, [])
 
     def test_timedelta_to_iso_duration_round_trip(self) -> None:
         from yggdrasil.data.options import timedelta_to_iso_duration
@@ -502,3 +503,102 @@ class TestTimeSampleByResample:
             unique_by=[field("ts", pa.timestamp("us", "UTC"))],
         ))
         assert out.num_rows == 3
+
+    def test_partition_by_derived_from_target_primary_keys(self) -> None:
+        # ``resample_on_read`` defaults ``partition_by`` to the
+        # target schema's :attr:`primary_key` fields, minus the
+        # time column when it's also primary.
+        from yggdrasil.data import field, schema
+        from yggdrasil.data.options import CastOptions, timedelta_to_iso_duration
+        import datetime as dt
+
+        target = schema(fields=[
+            field("symbol", pa.string(), tags={"primary_key": True}),
+            field("ts", pa.timestamp("us", "UTC"), tags={"primary_key": True}),
+            field("price", pa.float64()),
+        ])
+        opts = CastOptions(
+            target=target,
+            time_sample_by=[field(
+                "ts", pa.timestamp("us", "UTC"),
+                metadata={b"time_sampling": timedelta_to_iso_duration(
+                    dt.timedelta(hours=1),
+                ).encode()},
+            )],
+        )
+        assert opts.resample_on_read() == ("ts", 3600, ["symbol"])
+
+    def test_partition_by_skips_when_only_time_is_primary(self) -> None:
+        # When the only primary key IS the time column, there's
+        # nothing to partition on — fall back to a flat resample.
+        from yggdrasil.data import field, schema
+        from yggdrasil.data.options import CastOptions, timedelta_to_iso_duration
+        import datetime as dt
+
+        target = schema(fields=[
+            field("ts", pa.timestamp("us", "UTC"), tags={"primary_key": True}),
+            field("v", pa.int64()),
+        ])
+        opts = CastOptions(
+            target=target,
+            time_sample_by=[field(
+                "ts", pa.timestamp("us", "UTC"),
+                metadata={b"time_sampling": timedelta_to_iso_duration(
+                    dt.timedelta(hours=1),
+                ).encode()},
+            )],
+        )
+        assert opts.resample_on_read() == ("ts", 3600, [])
+
+    def test_partition_by_buckets_each_entity_independently(
+        self, tmp_path,
+    ) -> None:
+        # End-to-end: two symbols, each with quarter-hour rows. The
+        # resample partitions on ``symbol`` so each symbol's timeline
+        # buckets independently — both yield 3 hourly rows.
+        import datetime as dt
+        from yggdrasil.data import field, schema
+        from yggdrasil.data.options import timedelta_to_iso_duration
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        epoch = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        # 12 rows per symbol, interleaved on disk.
+        rows: list[tuple[str, dt.datetime, int]] = []
+        for i in range(12):
+            t = epoch + dt.timedelta(minutes=15 * i)
+            rows.append(("A", t, i))
+            rows.append(("B", t, 100 + i))
+        symbols = pa.array([r[0] for r in rows])
+        ts = pa.array([r[1] for r in rows], type=pa.timestamp("us", "UTC"))
+        vals = pa.array([r[2] for r in rows])
+        batch = pa.record_batch([symbols, ts, vals], names=["symbol", "ts", "v"])
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches((batch,))
+
+        target = schema(fields=[
+            field("symbol", pa.string(), tags={"primary_key": True}),
+            field("ts", pa.timestamp("us", "UTC"), tags={"primary_key": True}),
+            field("v", pa.int64()),
+        ])
+        ts_field = field(
+            "ts", pa.timestamp("us", "UTC"),
+            metadata={b"time_sampling": timedelta_to_iso_duration(
+                dt.timedelta(hours=1),
+            ).encode()},
+        )
+        out = folder.read_arrow_table(options=FolderOptions(
+            target=target, time_sample_by=[ts_field],
+        ))
+        # 3 hourly rows × 2 symbols = 6 rows total.
+        assert out.num_rows == 6
+        rows_out = out.to_pylist()
+        per_symbol = {"A": [], "B": []}
+        for r in rows_out:
+            per_symbol[r["symbol"]].append(r["ts"])
+        expected = [
+            dt.datetime(2024, 1, 1, h, 0, tzinfo=dt.timezone.utc)
+            for h in range(3)
+        ]
+        assert sorted(per_symbol["A"]) == expected
+        assert sorted(per_symbol["B"]) == expected
