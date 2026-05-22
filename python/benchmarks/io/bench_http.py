@@ -19,7 +19,7 @@ overhead rather than the OS network stack.
   projection), ``media_type``, and ``content`` / ``text``.
 * :class:`HTTPSession` — singleton lookup (``HTTPSession(base_url=…)``),
   ``prepare_request_before_send`` (per-send hot path), and
-  ``SendConfig.check_arg`` (every ``session.send`` builds one).
+  ``SendConfig.from_`` (every ``session.send`` builds one).
 
 Usage::
 
@@ -384,19 +384,19 @@ def _session_scenarios(repeat: int) -> list[dict]:
 
     # --- Send/SendMany config validation -------------------------------
     out.append(_time_one(
-        "SendConfig.check_arg(None) (no-cache default)",
-        lambda: SendConfig.check_arg(None, wait=None, raise_error=True, stream=True),
+        "SendConfig.from_(None) (no-cache default)",
+        lambda: SendConfig.from_(None, wait=None, raise_error=True, stream=True),
         repeat=repeat, inner=20_000,
     ))
-    cached_cfg = SendConfig.check_arg(None)
+    cached_cfg = SendConfig.from_(None)
     out.append(_time_one(
-        "SendConfig.check_arg(SendConfig) (pass-through)",
-        lambda: SendConfig.check_arg(cached_cfg),
+        "SendConfig.from_(SendConfig) (pass-through)",
+        lambda: SendConfig.from_(cached_cfg),
         repeat=repeat, inner=50_000,
     ))
     out.append(_time_one(
-        "SendManyConfig.check_arg(None)",
-        lambda: SendManyConfig.check_arg(None),
+        "SendManyConfig.from_(None)",
+        lambda: SendManyConfig.from_(None),
         repeat=repeat, inner=20_000,
     ))
 
@@ -416,7 +416,9 @@ def _session_scenarios(repeat: int) -> list[dict]:
     # Stand-in auth handler that returns a static token; the real MSAL /
     # OAuth handlers go through the same property surface, so this
     # measures the per-send overhead, not the token refresh.
-    class _StaticAuth:
+    from yggdrasil.io.authorization.base import Authorization
+
+    class _StaticAuth(Authorization):
         scheme = "Bearer"
         token = "bench-token"
 
@@ -424,10 +426,13 @@ def _session_scenarios(repeat: int) -> list[dict]:
         def authorization(self) -> str:
             return f"Bearer {self.token}"
 
+        def refresh(self, *, force: bool = False) -> bool:
+            return False
+
     session_with_auth = HTTPSession(
         base_url="https://api.example.com/bench-auth",
         headers={"X-Tenant": "acme"},
-        auth=_StaticAuth(),  # type: ignore[arg-type]
+        auth=_StaticAuth(),
     )
 
     def _prepare_plain():
@@ -515,11 +520,11 @@ def _session_scenarios(repeat: int) -> list[dict]:
     # the caller sees per ``session.send(prepare(...))`` line.
     def _build_and_check():
         r = PreparedRequest.prepare("GET", HTTPS_STR, headers=dict(HEADERS_SMALL))
-        cfg = SendConfig.check_arg(None, wait=None, raise_error=True, stream=True)
+        cfg = SendConfig.from_(None, wait=None, raise_error=True, stream=True)
         SESSION.prepare_request_before_send(r)
         return r, cfg
     out.append(_time_one(
-        "build + SendConfig.check_arg + prepare_request",
+        "build + SendConfig.from_ + prepare_request",
         _build_and_check,
         repeat=repeat, inner=2_000,
     ))

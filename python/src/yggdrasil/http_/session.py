@@ -456,29 +456,36 @@ class HTTPSession(Session):
         # ``pool_maxsize``) collapses ``HTTPSession(pool_maxsize=20)`` and
         # ``HTTPSession()`` to one instance the way they always did.
         pool_maxsize = min(8, int(pool_maxsize)) if pool_maxsize else 8
-        super().__init__(pool_maxsize=pool_maxsize)
         self.base_url = URL.from_(base_url) if base_url else None
         self.verify = verify
         self.headers: Headers = Headers.from_(headers)
         self.waiting = waiting
         self.auth: Authorization | None = auth
+
+        # Singleton-key probe path bails here — :class:`Session._singleton_key`
+        # reads ``probe.__dict__`` and keeps only the keys whose names
+        # appear in ``__init__``'s parameter list (``base_url`` / ``verify``
+        # / ``pool_maxsize`` / ``headers`` / ``waiting`` / ``auth``), so
+        # the lock + connection cache + retry policy + ``_job_pool`` build
+        # below contribute nothing to identity. Skipping them on the probe
+        # halves the singleton-hit cost (the bench was paying for an RLock
+        # alloc + a ``_TieredRetry()`` per ``HTTPSession(base_url=…)`` call).
+        if getattr(self, "_in_probe", False):
+            self.pool_maxsize = pool_maxsize
+            return
+
+        super().__init__(pool_maxsize=pool_maxsize)
         # When a session-wide auth handler is bound at construction
         # time, pre-stamp ``self.headers["Authorization"]`` so anyone
         # inspecting the session sees the current credential without
         # going through a request first. :meth:`refresh_auth` keeps
         # the session header in sync on subsequent refreshes.
-        # Skipped on the singleton-key probe (see ``Session._singleton_key``)
-        # so rotating handlers don't tick a counter twice per
-        # constructor call.
-        if auth is not None and not getattr(self, "_in_probe", False):
+        if auth is not None:
             self.headers["Authorization"] = auth.authorization
         # Per-host idle-connection cache keyed by ``(scheme, host, port)``.
         # Sockets are recycled across requests so warm calls reuse the
         # existing TCP / TLS handshake instead of paying for a new one;
-        # capped at ``pool_maxsize`` entries per host. The dict is built
-        # lazily on first acquire so ``__init__`` stays side-effect-free
-        # and the singleton-key probe (see :meth:`Session._singleton_key`)
-        # runs the constructor without opening sockets.
+        # capped at ``pool_maxsize`` entries per host.
         self._connections: dict[tuple[str, str, int], "collections.deque[http.client.HTTPConnection]"] = {}
         # Retry policy is built once at init — same policy applies to
         # every wire send and the singleton key already pins
