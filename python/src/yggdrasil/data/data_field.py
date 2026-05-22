@@ -587,6 +587,7 @@ class Field(BaseChildrenFields):
     _TAG_KEY_FOREIGN_KEY: ClassVar[bytes] = TAG_PREFIX + b"foreign_key"
     _TAG_KEY_CONSTRAINT_KEY: ClassVar[bytes] = TAG_PREFIX + b"constraint_key"
     _TAG_KEY_SORTED: ClassVar[bytes] = TAG_PREFIX + b"sorted"
+    _TAG_KEY_UNIQUE: ClassVar[bytes] = TAG_PREFIX + b"unique"
 
     # Tag-flag → short token shown in pretty_format. Order is the
     # display order in the bracketed marker group; only flags whose
@@ -599,6 +600,7 @@ class Field(BaseChildrenFields):
         (b"partition_by", "partition"),
         (b"cluster_by", "cluster"),
         (b"sorted", "sorted"),
+        (b"unique", "unique"),
     )
     # Tag names handled by ``_PRETTY_TAG_FLAGS``. Anything stored under
     # ``TAG_PREFIX + <name>`` that isn't in this set is treated as a
@@ -1441,6 +1443,28 @@ class Field(BaseChildrenFields):
         return bool(md and md.get(self._TAG_KEY_SORTED))
 
     @property
+    def unique(self) -> bool:
+        """Are this field's values guaranteed unique across the column?
+
+        A schema-level contract — the writer promises that no two rows
+        will share the same value for this field (after the on-disk
+        merge, in the case of partitioned / upsert layouts).
+        :attr:`primary_key` implies it; standalone ``unique`` covers
+        non-key columns the producer pins (e.g. an opaque event id
+        that isn't part of the row identity).
+
+        Read paths consult this when their source isn't known to be
+        unique: a target with ``unique=True`` on a column whose
+        source declaration doesn't carry the same flag triggers a
+        client-side dedup pass before the row leaves the read
+        pipeline (latest-wins on the matching column tuple). Writes
+        forward the flag onto the sidecar / target schema so the next
+        read keeps the invariant.
+        """
+        md = self.metadata
+        return bool(md and md.get(self._TAG_KEY_UNIQUE))
+
+    @property
     def comment(self) -> str | None:
         if not self.metadata:
             return None
@@ -1638,6 +1662,9 @@ class Field(BaseChildrenFields):
 
     def with_sorted(self, value: bool = True, inplace: bool = False) -> "Field":
         return self._with_tag_flag(b"sorted", value, inplace)
+
+    def with_unique(self, value: bool = True, inplace: bool = False) -> "Field":
+        return self._with_tag_flag(b"unique", value, inplace)
 
     # ==================================================================
     # Builders — `with_*` mutators, `copy`, `merge_with`, `autotag`
@@ -2066,6 +2093,7 @@ class Field(BaseChildrenFields):
             primary_key_names = self._pop_field_name_list(b"primary_key")
             partition_by_names = self._pop_field_name_list(b"partition_by")
             cluster_by_names = self._pop_field_name_list(b"cluster_by")
+            unique_names = self._pop_field_name_list(b"unique")
 
             new_fields: list[Field] = []
             for f in self.children:
@@ -2075,6 +2103,8 @@ class Field(BaseChildrenFields):
                     f.with_partition_by(True, inplace=True)
                 if cluster_by_names and f.name in cluster_by_names:
                     f.with_cluster_by(True, inplace=True)
+                if unique_names and f.name in unique_names:
+                    f.with_unique(True, inplace=True)
                 new_fields.append(f.autotag())
 
             self.update_tags(tags)

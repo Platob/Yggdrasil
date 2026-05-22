@@ -750,16 +750,34 @@ class Tabular(ABC, Generic[O]):
     # Arrow surface
     # ==================================================================
 
+    def _read_arrow_batches_resolved(
+        self, options: O,
+    ) -> Iterator[pa.RecordBatch]:
+        """Inner read entry — applies the unique-tag dedup wrap once.
+
+        Every public read path (:meth:`read_arrow_batches`,
+        :meth:`_read_arrow_table`, :meth:`_read_arrow_batch_reader`)
+        funnels through this method so the
+        :meth:`CastOptions.dedup_arrow_batches` pass fires exactly
+        once regardless of which entry point the caller picks. The
+        pass itself is an identity short-circuit when no target
+        column is flagged ``unique`` (or when the source side
+        already guarantees uniqueness), so the common case stays
+        zero-cost.
+        """
+        return options.dedup_arrow_batches(self._read_arrow_batches(options))
+
     def read_arrow_batches(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
         resolved = self.check_options(options, overrides=locals())
+        stream = self._read_arrow_batches_resolved(resolved)
         if not logger.isEnabledFor(logging.DEBUG):
-            yield from self._read_arrow_batches(resolved)
+            yield from stream
             return
         n_batches = 0
         n_rows = 0
-        for batch in self._read_arrow_batches(resolved):
+        for batch in stream:
             n_batches += 1
             n_rows += batch.num_rows
             yield batch
@@ -776,7 +794,7 @@ class Tabular(ABC, Generic[O]):
         return self._read_arrow_table(self.check_options(options, overrides=locals()))
 
     def _read_arrow_table(self, options: O) -> pa.Table:
-        batches = list(self._read_arrow_batches(options))
+        batches = list(self._read_arrow_batches_resolved(options))
         if not batches:
             schema = (
                 getattr(options, "target_schema", None)
@@ -796,7 +814,8 @@ class Tabular(ABC, Generic[O]):
     def _read_arrow_batch_reader(self, options: O) -> "pa.RecordBatchReader":
         schema = options.check_target(obj=self.collect_schema).merged
         return pa.RecordBatchReader.from_batches(
-            schema.to_arrow_schema(), self._read_arrow_batches(options),
+            schema.to_arrow_schema(),
+            self._read_arrow_batches_resolved(options),
         )
 
     def read_arrow_dataset(

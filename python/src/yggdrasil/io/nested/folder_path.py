@@ -1482,14 +1482,14 @@ class FolderPath(IO[bytes, FolderOptions]):
 
         def _leaf_options(child: "Tabular") -> Any:
             base = child.options_class()()
-            # Single in-place stamp on the freshly minted (frozen)
-            # options object via ``object.__setattr__`` — calling
-            # ``dataclasses.replace`` per child would rerun
-            # ``__post_init__`` and allocate a fresh slot layout,
+            # In-place stamps on the freshly minted (frozen) options
+            # via the named ``with_*`` helpers — calling
+            # ``dataclasses.replace`` per child reruns
+            # ``__post_init__`` and allocates a fresh slot layout,
             # which the bench (Session._store_cached_response) flagged
             # as a 500 us / write regression.
             if checked_cast and hasattr(base, "checked_cast"):
-                object.__setattr__(base, "checked_cast", True)
+                base.with_checked_cast(True, copy=False)
             if source_schema is not None:
                 try:
                     base.with_source(source_schema, copy=False)

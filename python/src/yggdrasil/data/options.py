@@ -75,7 +75,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any, Iterable, Mapping, TypeVar, Union, TYPE_CHECKING
+from typing import Any, Iterable, Iterator, Mapping, TypeVar, Union, TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -910,6 +910,27 @@ class CastOptions:
         setattr_(self, "_merged_cache", ...)
         return self
 
+    def with_checked_cast(self: T, value: bool = True, copy: bool = False) -> T:
+        """Return a copy (or in-place) with :attr:`checked_cast` set.
+
+        Mirror of :meth:`with_source` / :meth:`with_target` — keeps
+        the per-call mutation behind a named method instead of having
+        every writer-side caller reach for
+        :func:`dataclasses.replace` / :func:`object.__setattr__`. Set
+        when the caller knows every batch already matches the target
+        (came from a :class:`pa.Table`, a :class:`pa.RecordBatchReader`,
+        a polars / pandas frame, or another writer that just emitted
+        the same schema); the leaf's :meth:`check_source` /
+        :meth:`cast_arrow_tabular` then short-circuit straight to the
+        write path.
+        """
+        if bool(value) == self.checked_cast:
+            return self
+        if copy:
+            return dataclasses.replace(self, checked_cast=bool(value))
+        object.__setattr__(self, "checked_cast", bool(value))
+        return self
+
     # ==================================================================
     # Cast-need inspection
     # ==================================================================
@@ -1085,6 +1106,101 @@ class CastOptions:
         if self.target is None or self.checked_cast:
             return table
         return self.target.cast_arrow_tabular(table, options=self)
+
+    def dedup_columns_on_read(self) -> "list[str]":
+        """Return the column names that need client-side dedup at read time.
+
+        A column ends up in the returned list when:
+
+        * the **target** :class:`Field` declares it ``unique`` (the
+          schema-level contract — see :attr:`Field.unique`), and
+        * the **source** :class:`Field` for the same column does
+          *not* declare it unique (so the on-disk bytes may carry
+          duplicates we have to collapse before the rows leave the
+          read pipeline).
+
+        Returns an empty list when either side is missing, when no
+        target column is marked unique, or when every unique target
+        column is also unique on the source (the source already
+        guarantees the invariant — no client-side pass needed).
+        """
+        target = self.target
+        if target is None:
+            return []
+        target_children = getattr(target, "children", None)
+        if not target_children:
+            return []
+        source = self.source
+
+        def _source_unique(name: str) -> bool:
+            if source is None:
+                return False
+            try:
+                src_field = source.field(name=name, raise_error=False)
+            except TypeError:
+                src_field = None
+            return bool(src_field is not None and getattr(src_field, "unique", False))
+
+        cols: "list[str]" = []
+        for child in target_children:
+            if not getattr(child, "unique", False):
+                continue
+            if _source_unique(child.name):
+                continue
+            cols.append(child.name)
+        return cols
+
+    def dedup_arrow_batches(
+        self, batches: "Iterator[pa.RecordBatch]",
+    ) -> "Iterator[pa.RecordBatch]":
+        """Collapse duplicate rows on the columns flagged ``unique``.
+
+        Wraps a batch iterator with a client-side dedup pass when
+        :meth:`dedup_columns_on_read` returns a non-empty list.
+        Identity short-circuit otherwise — no buffering, no
+        allocation.
+
+        The dedup pass materialises every batch (necessary: a
+        duplicate's first occurrence and its last occurrence can
+        straddle the chunk boundary), tags each row with its source
+        index, group-by'es on the unique columns to pick the first
+        occurrence index per key, and ``Table.take`` s those rows.
+        Order is preserved within the deduped result.
+        """
+        cols = self.dedup_columns_on_read()
+        if not cols:
+            yield from batches
+            return
+
+        materialised = list(batches)
+        if not materialised:
+            return
+
+        table = pa.Table.from_batches(materialised)
+        if table.num_rows == 0:
+            yield from materialised
+            return
+
+        # Tag each row with its index, group by the unique cols, pick
+        # the first occurrence per key. ``__ygg_idx__`` is unique by
+        # construction so the group_by output's row count equals the
+        # number of distinct keys; ``Table.take`` rebuilds the table
+        # at those indices.
+        idx_col = "__ygg_idx__"
+        indexed = table.append_column(idx_col, pa.array(range(table.num_rows)))
+        grouped = indexed.group_by(list(cols)).aggregate([(idx_col, "min")])
+        keep = grouped.column(f"{idx_col}_min")
+        # Sort the kept indices so the deduped output preserves the
+        # original row order — group_by doesn't promise any ordering
+        # on its rows.
+        keep = keep.sort()
+        deduped = table.take(keep)
+
+        # Re-batch using the original schema. ``to_batches`` chunks
+        # along pyarrow's natural boundaries; that's fine for the
+        # downstream pipeline since the consumer doesn't rely on
+        # specific chunk sizes once dedup ran.
+        yield from deduped.to_batches()
 
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
         """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.
