@@ -3714,7 +3714,7 @@ class Table(DatabricksPath):
                     logger.debug("Failed to unpersist cached source; continuing.", exc_info=True)
 
         if return_data:
-            from yggdrasil.io.tabular.spark import Dataset
+            from yggdrasil.spark.tabular import Dataset
             return Dataset(data_df)
         return primary_batch
 

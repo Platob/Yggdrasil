@@ -353,6 +353,33 @@ class ResponseBatch:
     # Spark interop
     # ------------------------------------------------------------------
 
+    def to_tabular(
+        self,
+        spark: Optional["SparkSession"] = None,
+    ) -> Tabular:
+        """Concat every non-empty bucket into one :class:`Tabular`.
+
+        Engine-agnostic counterpart to :meth:`to_dataframe`: returns a
+        :class:`Dataset` wrapping the unioned Spark frame when any
+        holder is Spark-backed (or *spark* / ``self.spark`` is set),
+        otherwise an :class:`ArrowTabular` carrying every Arrow batch
+        across local / remote / new buckets. Empty batch in Python mode
+        returns a schema-bearing empty :class:`ArrowTabular`.
+        """
+        target_spark = spark or self.spark
+        if self.is_spark or target_spark is not None:
+            return spark_to_tabular(self.to_dataframe(target_spark))
+        holders = self._holders()
+        if not holders:
+            return ArrowTabular(
+                RESPONSE_ARROW_SCHEMA.empty_table(),
+                schema=RESPONSE_ARROW_SCHEMA,
+            )
+        batches = []
+        for holder in holders:
+            batches.extend(holder.read_arrow_batches())
+        return ArrowTabular(batches, schema=RESPONSE_ARROW_SCHEMA)
+
     def to_dataframe(
         self,
         spark: Optional["SparkSession"] = None,

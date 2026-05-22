@@ -177,6 +177,47 @@ class TestSessionSend:
         assert sorted(r.json()["i"] for r in out) == [0, 1, 2]
         assert len(s.calls) == 3
 
+    def test_send_many_as_tabular_returns_arrow_tabular(self) -> None:
+        from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
+        from yggdrasil.io.tabular import ArrowTabular
+
+        s = StubSession()
+        s.queue(*[
+            make_response(body=f'{{"i":{i}}}'.encode())
+            for i in range(3)
+        ])
+        reqs = (make_request(f"https://example.com/tab/{i}") for i in range(3))
+        result = s.send_many(reqs, as_tabular=True)
+
+        assert isinstance(result, ArrowTabular)
+        table = result.read_arrow_table()
+        assert table.schema == RESPONSE_ARROW_SCHEMA
+        assert table.num_rows == 3
+        assert len(s.calls) == 3
+
+    def test_send_many_as_tabular_empty_iter(self) -> None:
+        from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
+        from yggdrasil.io.tabular import ArrowTabular
+
+        s = StubSession()
+        result = s.send_many(iter([]), as_tabular=True)
+        assert isinstance(result, ArrowTabular)
+        # Schema is preserved on the empty tabular so downstream
+        # consumers can read columns without a probe.
+        assert result.schema == RESPONSE_ARROW_SCHEMA
+        assert result.num_rows == 0
+
+    def test_send_many_default_still_yields_responses(self) -> None:
+        from collections.abc import Iterator as IteratorABC
+
+        s = StubSession()
+        s.queue(*[make_response() for _ in range(2)])
+        reqs = (make_request(f"https://example.com/iter/{i}") for i in range(2))
+        out = s.send_many(reqs)
+        # Default (as_tabular=False) keeps the streaming-iterator contract.
+        assert isinstance(out, IteratorABC)
+        assert len(list(out)) == 2
+
 
 class TestRequestsCompat:
     """``requests.Session``-style call shapes route through ``request()``."""
@@ -266,6 +307,41 @@ class TestRequestsCompat:
         seen = s.calls[0]
         assert "q=yggdrasil" in seen.url.query
         assert "n=10" in seen.url.query
+
+    def test_send_false_returns_prepared_request(self) -> None:
+        from yggdrasil.io.request import PreparedRequest
+
+        s = StubSession()
+        prepared = s.get("https://example.com/x", params={"q": "1"}, send=False)
+        assert isinstance(prepared, PreparedRequest)
+        assert prepared.method == "GET"
+        assert "q=1" in prepared.url.query
+        # _local_send was never invoked.
+        assert s.calls == []
+
+    def test_send_false_post_carries_body_and_headers(self) -> None:
+        from yggdrasil.io.request import PreparedRequest
+
+        s = StubSession()
+        prepared = s.post(
+            "https://example.com/login",
+            data={"user": "alice"},
+            send=False,
+        )
+        assert isinstance(prepared, PreparedRequest)
+        assert prepared.method == "POST"
+        assert prepared.buffer.to_bytes() == b"user=alice"
+        assert prepared.headers.get("Content-Type") == "application/x-www-form-urlencoded"
+        assert s.calls == []
+
+    def test_send_true_default_still_sends(self) -> None:
+        from yggdrasil.io.response import Response
+
+        s = StubSession()
+        s.queue(make_response())
+        result = s.get("https://example.com/x")
+        assert isinstance(result, Response)
+        assert len(s.calls) == 1
 
 
 # ---------------------------------------------------------------------------

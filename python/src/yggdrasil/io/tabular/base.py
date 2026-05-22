@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
     from yggdrasil.io.holder import Holder
-    from yggdrasil.io.tabular.spark import Dataset
+    from yggdrasil.spark.tabular import Dataset
 
 
 __all__ = ["Tabular", "is_tabular_source"]
@@ -1193,7 +1193,7 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _read_spark_dataset(self, options: O) -> "Dataset":
-        from yggdrasil.io.tabular.spark import Dataset
+        from yggdrasil.spark.tabular import Dataset
 
         return Dataset.from_spark_frame(
             self._read_spark_frame(options),

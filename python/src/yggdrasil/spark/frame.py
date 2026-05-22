@@ -285,7 +285,7 @@ def _install_modules_on_executors(
 # Historically :class:`Dataset` lived here as a standalone Spark-DataFrame
 # wrapper while :class:`yggdrasil.io.tabular.SparkTabular` carried the
 # :class:`Tabular` contract. They've been merged into one class,
-# :class:`yggdrasil.io.tabular.spark.Dataset`, so:
+# :class:`yggdrasil.spark.tabular.Dataset`, so:
 #
 # * the Tabular surface (read_arrow_batches / write_arrow_batches /
 #   read_spark_frame / write_spark_frame) and
@@ -306,7 +306,7 @@ def __getattr__(name: str) -> Any:
     """Lazy ``Dataset`` accessor — defers the import to break the cycle.
 
     Importing :class:`Dataset` at module top-level would form a cycle:
-    ``yggdrasil.io.tabular.spark`` (where :class:`Dataset` lives) imports
+    ``yggdrasil.spark.tabular`` (where :class:`Dataset` lives) imports
     :class:`yggdrasil.io.tabular.Tabular`, whose package ``__init__``
     re-imports :class:`Dataset` — and our module is only half-loaded at
     that point. Resolving the attribute on first access (PEP 562) breaks
@@ -314,7 +314,7 @@ def __getattr__(name: str) -> Any:
     path. ``SparkTabular`` lands on the same class for back-compat.
     """
     if name in ("Dataset", "SparkTabular"):
-        from yggdrasil.io.tabular.spark import Dataset as _Dataset
+        from yggdrasil.spark.tabular import Dataset as _Dataset
 
         # Cache on the module so subsequent lookups skip the resolver.
         globals()[name] = _Dataset

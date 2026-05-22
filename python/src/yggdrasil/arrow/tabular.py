@@ -87,7 +87,7 @@ from typing import Any, ClassVar, Iterable, Iterator, Optional, Union
 import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.tabular import Tabular
+from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.data.enums import MimeType, Mode
 from yggdrasil.pickle.serde import ObjectSerde
 

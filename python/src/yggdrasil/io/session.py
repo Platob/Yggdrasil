@@ -789,6 +789,12 @@ class Session(Singleton, ABC):
     ) -> Response:
         """Prepare, dispatch, and (optionally) await the response.
 
+        Single-request entry point — always returns a :class:`Response`.
+        :class:`SendConfig.as_tabular` is accepted for API symmetry with
+        :meth:`send_many` but ignored here: a one-row tabular is what
+        :meth:`send_many` already produces, so wrapping a single send
+        adds no value.
+
         ``start=True`` (default) fires the wire call. ``start=False``
         builds the prepared request + response shell without crossing
         the wire — the :class:`StatementExecutor` override uses the
@@ -1078,23 +1084,33 @@ class Session(Singleton, ABC):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         cache_only: bool = False,
+        as_tabular: bool = False,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
         max_batch_ttl: float | None = None,
         spark_session: Optional["SparkSession"] = None,
         **options,
-    ) -> Iterator[Response]:
+    ) -> "Iterator[Response] | Tabular":
         """Stream responses one at a time, in both Python and Spark modes.
 
-        Spark-backed buckets are drained via the holder's
-        :meth:`Tabular.read_records`, which for :class:`Dataset`
-        uses ``df.toLocalIterator()`` — rows stream from the executors
-        one at a time, so the driver memory footprint stays bounded
-        even for large network-fetch batches. Callers that want a
-        :class:`SparkDataFrame` (or the per-bucket origin breakdown)
-        should consume :meth:`send_many_batches` and call
-        ``ResponseBatch.to_dataframe()`` themselves.
+        Default (``as_tabular=False``) yields :class:`Response` objects
+        one at a time. Spark-backed buckets stream through the holder's
+        :meth:`Tabular.read_records`, which for :class:`Dataset` uses
+        ``df.toLocalIterator()`` — rows leave the executors one at a
+        time, so the driver memory footprint stays bounded even for
+        large network-fetch batches.
+
+        ``as_tabular=True`` drains the same staged pipeline via
+        :meth:`send_many_batches` and concatenates every per-chunk
+        :class:`ResponseBatch` into one :class:`Tabular`:
+        :class:`ArrowTabular` in Python mode, a :class:`Dataset`
+        wrapping a lazy union of per-chunk Spark frames when
+        ``spark_session`` is bound (set the latter to ``True`` /
+        ``...`` to auto-discover the active session via
+        :meth:`PyEnv.spark_session`). Callers that want the per-bucket
+        origin breakdown should consume :meth:`send_many_batches`
+        directly.
 
         ``max_batch_ttl`` (default :data:`DEFAULT_MAX_BATCH_TTL`,
         300 s) caps how long the batcher will wait for ``requests`` to
@@ -1112,6 +1128,7 @@ class Session(Singleton, ABC):
             remote_cache=remote_cache,
             local_cache=local_cache,
             cache_only=cache_only,
+            as_tabular=as_tabular,
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
@@ -1119,7 +1136,40 @@ class Session(Singleton, ABC):
             spark_session=spark_session,
             **options,
         )
+        if cfg.as_tabular:
+            return self._send_many_as_tabular(requests, config=cfg)
         return self._send_many(requests, config=cfg)
+
+    def _send_many_as_tabular(
+        self,
+        requests: Iterator[PreparedRequest],
+        config: SendManyConfig,
+    ) -> "Tabular":
+        """Drain :meth:`_send_many_batches` and concat into one :class:`Tabular`.
+
+        Spark mode unions per-chunk :class:`SparkDataFrame` lazily via
+        :meth:`ResponseBatch.extend` then wraps the result through
+        :meth:`ResponseBatch.to_tabular`, so no executor job fires
+        until the caller triggers an action. Python mode concatenates
+        Arrow record batches at the end of the stream.
+        """
+        spark = config.spark_session
+        accumulator: ResponseBatch | None = None
+        for batch in self._send_many_batches(requests, config):
+            if accumulator is None:
+                accumulator = batch
+            else:
+                accumulator.extend(batch)
+        if accumulator is None:
+            if spark is not None:
+                from .response_batch import spark_to_tabular
+                return spark_to_tabular(self._cached_empty_spark_frame(spark))
+            from yggdrasil.io.tabular import ArrowTabular
+            return ArrowTabular(
+                RESPONSE_ARROW_SCHEMA.empty_table(),
+                schema=RESPONSE_ARROW_SCHEMA,
+            )
+        return accumulator.to_tabular(spark)
 
     # ------------------------------------------------------------------ #
     # send_many — staged pipeline                                         #
@@ -2006,10 +2056,23 @@ class Session(Singleton, ABC):
         :class:`ResponseBatch.__iter__` rejects Spark mode (it would
         force a ``df.toArrow()`` collect); going through the holders
         sidesteps that guard.
+
+        In Spark mode the executor-side fetch runs with
+        ``raise_error=False`` so a single failure can't poison a whole
+        ``mapInArrow`` partition — the failing rows ride back to the
+        driver as ordinary :class:`Response` objects. ``raise_error``
+        is applied here at the driver-iteration boundary instead, so
+        the first non-OK row surfaces as a real
+        :exc:`HTTPError` to the caller without losing the rest of the
+        batch to a partial-collect.
         """
+        is_spark = config.spark_session is not None
         for batch in self._send_many_batches(requests, config):
             for holder in batch.parts():
-                yield from Response.from_records(holder.read_records())
+                for response in Response.from_records(holder.read_records()):
+                    if is_spark and config.raise_error and not response.ok:
+                        response.raise_for_status()
+                    yield response
 
     def send_many_batches(
         self,
@@ -2023,6 +2086,7 @@ class Session(Singleton, ABC):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         cache_only: bool = False,
+        as_tabular: bool = False,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
@@ -2053,6 +2117,7 @@ class Session(Singleton, ABC):
             remote_cache=remote_cache,
             local_cache=local_cache,
             cache_only=cache_only,
+            as_tabular=as_tabular,
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
@@ -2061,123 +2126,6 @@ class Session(Singleton, ABC):
             **options,
         )
         yield from self._send_many_batches(requests, cfg)
-
-    def spark_send(
-        self,
-        request: PreparedRequest,
-        config: SendConfig | Mapping[str, Any] | None = None,
-        *,
-        spark_session: "SparkSession",
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        stream: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        cache_only: bool = False,
-        **options,
-    ) -> "SparkDataFrame":
-        """Send one request via Spark and return a lazy ``DataFrame[Response]``.
-
-        Thin wrapper over :meth:`spark_send_many` for the single-request
-        case. The returned Spark DataFrame carries :data:`RESPONSE_SCHEMA`
-        and stays unmaterialised on the driver — no executor job fires
-        until the caller triggers an action (``.collect()``,
-        ``.write...``, ``.count()``, …) — so callers can chain additional
-        lazy Spark transforms on top before pulling rows.
-        """
-        return self.spark_send_many(
-            iter([request]),
-            config,
-            spark_session=spark_session,
-            wait=wait,
-            raise_error=raise_error,
-            stream=stream,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            cache_only=cache_only,
-            **options,
-        )
-
-    def spark_send_many(
-        self,
-        requests: Iterator[PreparedRequest],
-        config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
-        *,
-        spark_session: "SparkSession",
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        normalize: bool | None = None,
-        stream: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        cache_only: bool = False,
-        batch_size: int | None = None,
-        ordered: bool = False,
-        max_in_flight: int | None = None,
-        max_batch_ttl: float | None = None,
-        **options,
-    ) -> "SparkDataFrame":
-        """Send many requests via Spark and return a lazy ``DataFrame[Response]``.
-
-        Drives the same staged ``send_many`` pipeline as :meth:`send_many`
-        but in Spark mode (cf. :meth:`_send_many_batches`): every bucket
-        — local hits, remote hits, network responses — stays
-        frame-resident on the executors, the network fetch fans out via
-        ``mapInArrow``, and the per-chunk :class:`ResponseBatch` frames
-        are stitched into a single union via
-        ``unionByName(allowMissingColumns=True)``.
-        Schema matches :data:`RESPONSE_SCHEMA`.
-        The returned DataFrame is lazy — driver-side cache lookups and
-        the ``mapInArrow`` plan are built eagerly, but no executor job
-        fires until the caller triggers a Spark action.
-        Pass an explicit ``batch_size`` larger than the request count to
-        collapse the pipeline into a single ``mapInArrow`` scatter (one
-        big chunk, one frame); the default chunks at
-        ``min(SendManyConfig.max_batch_size, 1024)`` so an unbounded
-        upstream iterator can't pin every request on the driver before
-        any work scatters.
-        """
-        cfg = SendManyConfig.check_arg(
-            config,
-            wait=wait,
-            raise_error=raise_error,
-            normalize=normalize,
-            stream=stream,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            cache_only=cache_only,
-            batch_size=batch_size,
-            ordered=ordered,
-            max_in_flight=max_in_flight,
-            max_batch_ttl=max_batch_ttl,
-            spark_session=spark_session,
-            **options,
-        )
-        if cfg.spark_session is None or cfg.spark_session is ...:
-            raise ValueError(
-                "spark_send_many requires a live SparkSession — got "
-                f"{cfg.spark_session!r}. Pass `spark_session=...` (or set it "
-                "on the SendManyConfig) so the staged pipeline can keep its "
-                "buckets frame-resident."
-            )
-        spark = cfg.spark_session
-
-        # Drive the staged pipeline; ``_send_many_batches`` already
-        # picks the Spark path from ``cfg.spark_session`` and yields
-        # one Spark-backed :class:`ResponseBatch` per chunk. Union the
-        # per-chunk frames lazily — ``unionByName`` builds a plan
-        # without firing an action — so the caller gets a single
-        # ``DataFrame[Response]`` to compose with.
-        frames: list["SparkDataFrame"] = []
-        for batch in self._send_many_batches(requests, cfg):
-            frames.append(batch.to_dataframe(spark))
-
-        if not frames:
-            return self._cached_empty_spark_frame(spark)
-        result = frames[0]
-        for part in frames[1:]:
-            result = result.unionByName(part, allowMissingColumns=True)
-        return result
 
     def _send_many_batches(
         self,
@@ -2202,8 +2150,12 @@ class Session(Singleton, ABC):
         fully short-circuited on local cache still advertises the
         response schema for ``remote_hits`` / ``new_hits``.
         """
-        is_spark = config.spark_session is not None and config.spark_session is not ...
-        spark = config.spark_session if is_spark else None
+        # ``SendManyConfig.__post_init__`` already resolved ``True`` /
+        # ``...`` to a live :class:`SparkSession` (or ``None``) via
+        # :meth:`PyEnv.spark_session`, so a simple non-None check is
+        # enough to pick the engine.
+        spark = config.spark_session
+        is_spark = spark is not None
 
         session_remote_cfg = config.remote_cache
         # Build the session-level local cache's :class:`Tabular` once
@@ -2659,7 +2611,7 @@ class Session(Singleton, ABC):
         # Persist only when more than one group will read ``ok_df`` —
         # otherwise the single insert action is the one and only
         # evaluation and we save the storage round trip. Route the
-        # cache through :class:`yggdrasil.io.tabular.spark.Dataset`
+        # cache through :class:`yggdrasil.spark.tabular.Dataset`
         # so backends that reject ``persist`` (Databricks Connect
         # serverless raises ``[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST
         # TABLE``) fall through to the un-cached frame instead of
@@ -2668,7 +2620,7 @@ class Session(Singleton, ABC):
         multi_group = len(groups) > 1
         ok_dataset: "Dataset | None" = None
         if multi_group:
-            from yggdrasil.io.tabular.spark import Dataset
+            from yggdrasil.spark.tabular import Dataset
 
             ok_dataset = Dataset(frame=ok_df).cache()
             ok_df = ok_dataset.frame
@@ -2898,7 +2850,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "GET",
             url,
@@ -2916,6 +2869,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def post(
@@ -2937,7 +2891,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "POST",
             url,
@@ -2956,6 +2911,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def put(
@@ -2977,7 +2933,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "PUT",
             url,
@@ -2996,6 +2953,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def patch(
@@ -3017,7 +2975,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "PATCH",
             url,
@@ -3036,6 +2995,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def delete(
@@ -3057,7 +3017,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "DELETE",
             url,
@@ -3076,6 +3037,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def head(
@@ -3096,7 +3058,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "HEAD",
             url,
@@ -3114,6 +3077,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def options(
@@ -3135,7 +3099,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "OPTIONS",
             url,
@@ -3154,6 +3119,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def request(
@@ -3176,7 +3142,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
         # form-urlencoding for mappings/sequences), ``timeout=`` becomes
         # ``wait=``, and ``cookies=`` joins ``headers={'Cookie': ...}``.
@@ -3222,6 +3189,9 @@ class Session(Singleton, ABC):
             json=json,
             normalize=normalize,
         )
+
+        if not send:
+            return prepared
 
         return self.send(
             prepared,

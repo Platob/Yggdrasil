@@ -60,6 +60,7 @@ _SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
         "local_cache",
         "cache_only",
         "spark_session",
+        "as_tabular",
     }
 )
 
@@ -1057,6 +1058,13 @@ class SendConfig(_ConfigBase):
     # warm cache offline (or after an outage) without an unintended
     # upstream fetch.
     cache_only: bool = False
+    # ``True`` flips the public ``Session.send_many`` return type from
+    # ``Iterator[Response]`` to a single concatenated :class:`Tabular`
+    # (an :class:`ArrowTabular` in Python mode, a :class:`Dataset`
+    # wrapping a Spark frame when a session is bound). Single-request
+    # ``Session.send`` ignores this flag — it always returns
+    # :class:`Response`.
+    as_tabular: bool = False
     spark_session: Optional["SparkSession"] = field(
         default=None,
         hash=False,
@@ -1068,6 +1076,13 @@ class SendConfig(_ConfigBase):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
         object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
         object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
+        # ``True`` / ``...`` → resolve the live SparkSession via
+        # :meth:`PyEnv.spark_session` so callers don't have to thread
+        # one through every layer. ``None`` stays ``None`` (Python mode).
+        spark = self.spark_session
+        if spark is True or spark is ...:
+            spark = PyEnv.spark_session()
+        object.__setattr__(self, "spark_session", spark)
 
     def __getstate__(self):
         return {
@@ -1077,6 +1092,7 @@ class SendConfig(_ConfigBase):
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
             "cache_only": self.cache_only,
+            "as_tabular": self.as_tabular,
             "spark_session": None,
         }
 
@@ -1087,6 +1103,7 @@ class SendConfig(_ConfigBase):
         object.__setattr__(self, "remote_cache", state["remote_cache"])
         object.__setattr__(self, "local_cache", state["local_cache"])
         object.__setattr__(self, "cache_only", state.get("cache_only", False))
+        object.__setattr__(self, "as_tabular", state.get("as_tabular", False))
         object.__setattr__(self, "spark_session", None)
 
     @classmethod
@@ -1119,6 +1136,10 @@ class SendManyConfig(_ConfigBase):
     remote_cache: CacheConfig = field(default_factory=CacheConfig)
     local_cache: CacheConfig = field(default_factory=CacheConfig)
     cache_only: bool = False
+    # See :class:`SendConfig.as_tabular` — controls whether
+    # ``Session.send_many`` returns an ``Iterator[Response]`` (False)
+    # or one concatenated :class:`Tabular` (True).
+    as_tabular: bool = False
     spark_session: Optional["SparkSession"] = field(
         default=None,
         hash=False,
@@ -1137,6 +1158,10 @@ class SendManyConfig(_ConfigBase):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
         object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
         object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
+        spark = self.spark_session
+        if spark is True or spark is ...:
+            spark = PyEnv.spark_session()
+        object.__setattr__(self, "spark_session", spark)
 
     def __getstate__(self):
         return {
@@ -1146,6 +1171,7 @@ class SendManyConfig(_ConfigBase):
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
             "cache_only": self.cache_only,
+            "as_tabular": self.as_tabular,
             "normalize": self.normalize,
             "batch_size": self.batch_size,
             "ordered": self.ordered,
@@ -1162,6 +1188,7 @@ class SendManyConfig(_ConfigBase):
         object.__setattr__(self, "remote_cache", state["remote_cache"])
         object.__setattr__(self, "local_cache", state["local_cache"])
         object.__setattr__(self, "cache_only", state.get("cache_only", False))
+        object.__setattr__(self, "as_tabular", state.get("as_tabular", False))
         object.__setattr__(self, "normalize", state["normalize"])
         object.__setattr__(self, "batch_size", state["batch_size"])
         object.__setattr__(self, "ordered", state["ordered"])
@@ -1192,6 +1219,7 @@ class SendManyConfig(_ConfigBase):
                 "remote_cache": arg.remote_cache,
                 "local_cache": arg.local_cache,
                 "cache_only": arg.cache_only,
+                "as_tabular": arg.as_tabular,
                 "spark_session": arg.spark_session,
             }
             # Overrides win, but a None override means "no opinion" — fall back
@@ -1221,5 +1249,6 @@ class SendManyConfig(_ConfigBase):
             remote_cache=self.remote_cache if with_remote_cache else CacheConfig(),
             local_cache=self.local_cache if with_local_cache else CacheConfig(),
             cache_only=self.cache_only,
+            as_tabular=self.as_tabular,
             spark_session=self.spark_session if with_spark else None,
         )

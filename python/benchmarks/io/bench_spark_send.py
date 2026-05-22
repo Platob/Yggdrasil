@@ -1,21 +1,22 @@
-"""Benchmarks for :meth:`Session.spark_send` / :meth:`Session.spark_send_many`.
+"""Benchmarks for :meth:`Session.send_many` in tabular Spark mode.
 
 What this covers
 ----------------
 
-``spark_send_many`` is the lazy ``DataFrame[Response]`` counterpart to
+``Session.send_many(..., as_tabular=True, spark_session=spark)`` is the
+lazy :class:`Tabular`-of-Response counterpart to the iterator-returning
 ``send_many``: cache lookups stay on the driver, the network fetch
 fans out via ``mapInArrow``, and per-chunk
 :class:`yggdrasil.io.response_batch.ResponseBatch` frames are
-``unionByName``-stitched into one DataFrame. The interesting numbers
-are split between two phases:
+``unionByName``-stitched into one DataFrame wrapped as a
+:class:`Dataset`. The interesting numbers split between two phases:
 
 * **Plan build** — how much work the driver does before any Spark
   action fires. Drives the ``_send_many_batches`` chunking loop,
   scatters the requests through ``spark.createDataFrame`` +
   ``repartition``, and unions the per-chunk frames. No executor work
-  yet. This is the cost callers pay even if they bail out before
-  collecting; small N here is what makes ``spark_send_many``
+  yet — this is the cost callers pay even if they bail out before
+  collecting; small N here is what makes the tabular Spark mode
   composable as a planner step.
 * **Plan + collect** — the same plan, plus the executor round-trip:
   one ``mapInArrow`` job per chunk that runs the in-process
@@ -25,13 +26,13 @@ are split between two phases:
 
 The reference points alongside:
 
-* **Python ``send_many``** — the driver-side path that this method
-  exists to replace when callers want frame composition instead of an
-  iterator. Helps see when ``spark_send_many`` is paying its own
-  scheduler tax vs. when it's a clear win.
+* **Python ``send_many``** — the driver-side iterator path that the
+  tabular mode replaces when callers want frame composition instead
+  of one ``Response`` at a time. Helps see when the Spark mode is
+  paying its own scheduler tax vs. when it's a clear win.
 * **``Session._responses_to_spark(N)``** — the underlying per-chunk
-  lift; the bulk of ``spark_send_many``'s plan-time cost reduces to
-  one call of this per chunk. Already covered in
+  lift; the bulk of the Spark mode's plan-time cost reduces to one
+  call of this per chunk. Already covered in
   ``bench_session_cache_spark.py``; we re-run a small variant here so
   the cross-bench comparison reads in one file.
 
@@ -151,7 +152,7 @@ def scenarios(repeat: int, n: int) -> list[dict]:
         import pyspark  # noqa: F401
     except ImportError:
         return [{
-            "label": "spark_send: SKIPPED (pyspark not installed)",
+            "label": "send_many(as_tabular=True): SKIPPED (pyspark not installed)",
             "best": 0.0, "median": 0.0, "mean": 0.0,
         }]
 
@@ -162,7 +163,7 @@ def scenarios(repeat: int, n: int) -> list[dict]:
             raise RuntimeError("spark_session returned None")
     except Exception as exc:
         return [{
-            "label": f"spark_send: SKIPPED ({type(exc).__name__}: {exc})",
+            "label": f"send_many(as_tabular=True): SKIPPED ({type(exc).__name__}: {exc})",
             "best": 0.0, "median": 0.0, "mean": 0.0,
         }]
 
@@ -171,46 +172,54 @@ def scenarios(repeat: int, n: int) -> list[dict]:
     one_req = _build_requests(1)[0]
     requests = _build_requests(n)
 
-    # ---- spark_send (single request) ----
+    # ---- send_many(as_tabular=True, spark_session=spark): single request ----
     out.append(_time_one(
-        "spark_send(req) plan build (no .count())",
-        lambda: session.spark_send(one_req, spark_session=spark),
+        "send_many([req], as_tabular=True) plan build (no .count())",
+        lambda: session.send_many(
+            iter([one_req]), as_tabular=True, spark_session=spark,
+        ),
         repeat=repeat, inner=5,
     ))
     out.append(_time_one(
-        "spark_send(req).count() (plan + 1-row collect)",
-        lambda: session.spark_send(one_req, spark_session=spark).count(),
-        repeat=repeat, inner=5,
-    ))
-
-    # ---- spark_send_many: plan build only (no Spark action) ----
-    out.append(_time_one(
-        f"spark_send_many({n}) plan build (no .count())",
-        lambda: session.spark_send_many(iter(requests), spark_session=spark),
+        "send_many([req], as_tabular=True).frame.count() (plan + 1-row collect)",
+        lambda: session.send_many(
+            iter([one_req]), as_tabular=True, spark_session=spark,
+        ).frame.count(),
         repeat=repeat, inner=5,
     ))
 
-    # ---- spark_send_many: plan + collect, single chunk ----
+    # ---- send_many(as_tabular=True): plan build only (no Spark action) ----
     out.append(_time_one(
-        f"spark_send_many({n}).count() — one chunk",
-        lambda: session.spark_send_many(
+        f"send_many({n}, as_tabular=True) plan build (no .count())",
+        lambda: session.send_many(
+            iter(requests), as_tabular=True, spark_session=spark,
+        ),
+        repeat=repeat, inner=5,
+    ))
+
+    # ---- send_many(as_tabular=True): plan + collect, single chunk ----
+    out.append(_time_one(
+        f"send_many({n}, as_tabular=True).frame.count() — one chunk",
+        lambda: session.send_many(
             iter(requests),
+            as_tabular=True,
             batch_size=n * 2,  # ensures a single chunk
             spark_session=spark,
-        ).count(),
+        ).frame.count(),
         repeat=repeat, inner=3,
     ))
 
-    # ---- spark_send_many: plan + collect, multi-chunk union ----
+    # ---- send_many(as_tabular=True): plan + collect, multi-chunk union ----
     if n >= 4:
         chunk = max(1, n // 4)
         out.append(_time_one(
-            f"spark_send_many({n}).count() — {n // chunk} chunks of {chunk}",
-            lambda: session.spark_send_many(
+            f"send_many({n}, as_tabular=True).frame.count() — {n // chunk} chunks of {chunk}",
+            lambda: session.send_many(
                 iter(requests),
+                as_tabular=True,
                 batch_size=chunk,
                 spark_session=spark,
-            ).count(),
+            ).frame.count(),
             repeat=repeat, inner=3,
         ))
 

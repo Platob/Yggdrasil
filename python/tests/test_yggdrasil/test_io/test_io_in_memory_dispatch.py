@@ -18,7 +18,7 @@ import pyarrow as pa
 
 from yggdrasil.io.holder import IO, _resolve_in_memory_tabular
 from yggdrasil.io.tabular import SparkTabular
-from yggdrasil.io.tabular.arrow import ArrowTabular
+from yggdrasil.arrow.tabular import ArrowTabular
 
 
 class TestIOInMemoryDispatch(unittest.TestCase):
