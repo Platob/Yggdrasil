@@ -304,203 +304,80 @@ class TestCheckedCast:
         assert reread.column_names == ["a", "b"]
 
 
-class TestUniqueTagDedup:
-    """``Field.unique`` triggers a client-side dedup on read.
+class TestUniqueByDedup:
+    """``CastOptions.unique_by`` triggers a client-side dedup on read.
 
     Contract:
 
-    * Target column flagged ``unique=True`` and the source side
-      doesn't carry the same flag → :meth:`Tabular.read_arrow_batches`
-      collapses duplicate rows on that column before yielding.
-    * Both sides flagged unique → no dedup runs (source already
-      guarantees the invariant on disk).
-    * Neither side flagged → no dedup runs (no contract to enforce).
+    * ``unique_by`` set → :meth:`Tabular.read_arrow_batches` collapses
+      duplicate rows on the listed columns before yielding (first
+      occurrence wins, original row order preserved).
+    * Unset / empty → no dedup runs.
 
-    Verifies the contract holds across :meth:`read_arrow_table`,
-    :meth:`read_arrow_batches`, :meth:`read_arrow_batch_reader`,
-    and on the upsert / merge rewrite path so a writer maintaining
-    the invariant via ``match_by`` doesn't get a redundant dedup
-    pass on subsequent reads.
+    The option carries the dedup keys as Fields — same shape as
+    :attr:`CastOptions.match_by` — so the public API stays uniform
+    across all "list of columns to act on" knobs.
     """
 
-    def _target(self):
-        from yggdrasil.data import field, schema
-
-        return schema(fields=[
-            field("id", pa.int64(), nullable=False, tags={"unique": True}),
-            field("v", pa.int64(), nullable=False),
-        ])
-
     def _duplicate_batch(self) -> "pa.RecordBatch":
-        # 5 rows with id ∈ {1, 2, 3} — 2 duplicates.
         return pa.record_batch(
             [pa.array([1, 2, 1, 3, 2]), pa.array([10, 20, 11, 30, 21])],
             names=["id", "v"],
         )
 
-    def test_read_dedups_when_only_target_marks_unique(self, tmp_path) -> None:
+    def test_read_dedups_when_unique_by_set(self, tmp_path) -> None:
+        from yggdrasil.data import field
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
         folder.write_arrow_batches((self._duplicate_batch(),))
 
-        # No options → no dedup (no target with unique).
         plain = folder.read_arrow_table()
         assert plain.num_rows == 5
 
-        # Target carries unique → dedup pass runs.
-        deduped = folder.read_arrow_table(options=FolderOptions(target=self._target()))
-        assert deduped.num_rows == 3
-        assert set(deduped.column("id").to_pylist()) == {1, 2, 3}
+        out = folder.read_arrow_table(options=FolderOptions(
+            unique_by=[field("id", pa.int64())],
+        ))
+        assert out.num_rows == 3
+        assert set(out.column("id").to_pylist()) == {1, 2, 3}
 
     def test_read_dedup_via_arrow_batches(self, tmp_path) -> None:
+        from yggdrasil.data import field
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
         folder.write_arrow_batches((self._duplicate_batch(),))
 
         batches = list(folder.read_arrow_batches(
-            options=FolderOptions(target=self._target()),
+            options=FolderOptions(unique_by=[field("id", pa.int64())]),
         ))
-        total = sum(b.num_rows for b in batches)
-        assert total == 3
+        assert sum(b.num_rows for b in batches) == 3
 
-    def test_read_dedup_via_arrow_batch_reader(self, tmp_path) -> None:
-        from yggdrasil.data import field, schema
-        from yggdrasil.io.nested.folder_path import FolderOptions
-
-        # ``read_arrow_batch_reader`` strict-checks each yielded batch
-        # against ``options.merged`` — use a nullable target so the
-        # cast plane matches whatever the on-disk source carries
-        # (the dedup contract is about column identity, not nullability).
-        target = schema(fields=[
-            field("id", pa.int64(), nullable=True, tags={"unique": True}),
-            field("v", pa.int64(), nullable=True),
-        ])
-
-        folder = FolderPath(path=str(tmp_path))
-        folder.write_arrow_batches((self._duplicate_batch(),))
-
-        reader = folder.read_arrow_batch_reader(options=FolderOptions(target=target))
-        table = reader.read_all()
-        assert table.num_rows == 3
-
-    def test_dedup_short_circuits_when_source_also_unique(self, tmp_path) -> None:
-        # When the on-disk schema *also* declares the column unique,
-        # the dedup pass is a no-op — we still get every row back.
-        # The bench-side concern: the dedup wraps yields the original
-        # iterator unchanged in this branch (no materialisation).
-        from yggdrasil.io.nested.folder_path import FolderOptions
-
-        # Build the batch off the target's arrow schema so the
-        # ``t:unique`` metadata round-trips onto disk.
-        target = self._target()
-        arrow_schema = target.to_arrow_schema()
-        batch = pa.record_batch(
-            [pa.array([1, 2, 3]), pa.array([10, 20, 30])],
-            schema=arrow_schema,
-        )
-
-        folder = FolderPath(path=str(tmp_path))
-        folder.write_arrow_batches((batch,))
-
-        # The on-disk part file carries the ``t:unique`` metadata, so
-        # the dedup short-circuits and every distinct row comes back.
-        out = folder.read_arrow_table(options=FolderOptions(target=target))
-        assert out.num_rows == 3
-
-    def test_dedup_columns_on_read_skips_when_source_unique(self) -> None:
-        from yggdrasil.data import field, schema
+    def test_unique_by_accepts_strings_normalised_to_fields(self) -> None:
         from yggdrasil.data.options import CastOptions
 
-        target = schema(fields=[
-            field("id", pa.int64(), tags={"unique": True}),
-            field("v", pa.int64()),
-        ])
-        # Source already carries ``unique`` → dedup is the writer's
-        # job (or already guaranteed), so the reader does nothing.
-        source = schema(fields=[
-            field("id", pa.int64(), tags={"unique": True}),
-            field("v", pa.int64()),
-        ])
-        opts = CastOptions(source=source, target=target)
+        # Plain string keys get coerced to Fields in ``__post_init__``,
+        # mirroring the ``match_by`` shape so the rest of the
+        # cast machinery sees a uniform ``list[Field]`` surface.
+        opts = CastOptions(unique_by=["id", "name"])
+        assert opts.dedup_columns_on_read() == ["id", "name"]
+        assert all(hasattr(f, "name") for f in opts.unique_by or [])
+
+    def test_unique_by_unset_short_circuits(self) -> None:
+        from yggdrasil.data.options import CastOptions
+
+        opts = CastOptions()
         assert opts.dedup_columns_on_read() == []
 
-    def test_dedup_columns_on_read_picks_only_target_unique_fields(self) -> None:
-        from yggdrasil.data import field, schema
-        from yggdrasil.data.options import CastOptions
-
-        target = schema(fields=[
-            field("id", pa.int64(), tags={"unique": True}),
-            field("alt", pa.int64(), tags={"unique": True}),
-            field("v", pa.int64()),
-        ])
-        # Source declares ``id`` unique but not ``alt``.
-        source = schema(fields=[
-            field("id", pa.int64(), tags={"unique": True}),
-            field("alt", pa.int64()),
-            field("v", pa.int64()),
-        ])
-        opts = CastOptions(source=source, target=target)
-        assert opts.dedup_columns_on_read() == ["alt"]
-
-    def test_upsert_match_by_keeps_unique_invariant(self, tmp_path) -> None:
-        from yggdrasil.data import field, schema
-        from yggdrasil.data.enums import Mode
-        from yggdrasil.io.nested.folder_path import FolderOptions
-
-        target = self._target()
-        arrow_schema = target.to_arrow_schema()
-
-        # Round 1: APPEND lands 3 distinct rows.
-        first = pa.record_batch(
-            [pa.array([1, 2, 3]), pa.array([10, 20, 30])],
-            schema=arrow_schema,
-        )
-        folder = FolderPath(path=str(tmp_path))
-        folder.write_arrow_batches((first,), options=FolderOptions(mode=Mode.APPEND))
-
-        # Round 2: UPSERT with match_by=["id"] updates id=2 and adds id=4.
-        second = pa.record_batch(
-            [pa.array([2, 4]), pa.array([99, 40])],
-            schema=arrow_schema,
-        )
-        folder.write_arrow_batches(
-            (second,),
-            options=FolderOptions(
-                mode=Mode.UPSERT,
-                match_by=[field("id", pa.int64())],
-            ),
-        )
-
-        # Read back through the same unique-tagged target: the on-disk
-        # rows are id ∈ {1, 2, 3, 4} after the merge rewrite. The
-        # ``unique`` round-trip on the source schema makes the read-side
-        # dedup a no-op (source declares it too), so every row survives.
-        out = folder.read_arrow_table(options=FolderOptions(target=target))
-        assert out.num_rows == 4
-        assert sorted(out.column("id").to_pylist()) == [1, 2, 3, 4]
-        # id=2's value must reflect the UPSERT (99, not 20).
-        rows_by_id = {
-            row["id"]: row["v"] for row in out.to_pylist()
-        }
-        assert rows_by_id[2] == 99
-        assert rows_by_id[4] == 40
-
-    def test_upsert_match_by_collapses_duplicates_within_incoming(
-        self, tmp_path,
-    ) -> None:
-        # ``unique`` is a schema-level contract; the read-time dedup
-        # protects against duplicates landed by an APPEND that never
-        # set match_by. Verify the path: write duplicates with APPEND,
-        # then a unique-tagged read collapses them.
+    def test_upsert_match_by_then_unique_by_read(self, tmp_path) -> None:
+        # End-to-end: APPEND lands duplicates, UPSERT with match_by
+        # collapses them on disk, then a unique_by read returns one
+        # row per id even if the on-disk shape still carries dupes.
         from yggdrasil.data import field
         from yggdrasil.data.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
-        # Two writes against id=1 with different ``v`` values — would
-        # leave duplicate id=1 rows on disk under plain APPEND.
         folder.write_arrow_batches(
             (pa.record_batch([pa.array([1, 2]), pa.array([10, 20])], names=["id", "v"]),),
             options=FolderOptions(mode=Mode.APPEND),
@@ -509,35 +386,24 @@ class TestUniqueTagDedup:
             (pa.record_batch([pa.array([1, 3]), pa.array([11, 30])], names=["id", "v"]),),
             options=FolderOptions(mode=Mode.APPEND),
         )
+        # Two id=1 rows on disk pre-dedup.
+        assert folder.read_arrow_table().column("id").to_pylist().count(1) == 2
 
-        # Sanity: both id=1 rows are on disk before dedup.
-        raw = folder.read_arrow_table()
-        assert raw.column("id").to_pylist().count(1) == 2
-
-        # With unique target → read collapses the duplicate.
-        out = folder.read_arrow_table(options=FolderOptions(target=self._target()))
+        out = folder.read_arrow_table(options=FolderOptions(
+            unique_by=[field("id", pa.int64())],
+        ))
         assert set(out.column("id").to_pylist()) == {1, 2, 3}
 
 
-class TestTimeSamplingResample:
-    """``Field.time_sampling`` triggers a client-side resample on read.
+class TestTimeSampleByResample:
+    """``CastOptions.time_sample_by`` triggers a client-side resample on read.
 
-    Contract:
-
-    * Target timestamp column flagged with ``time_sampling=PT1H`` and
-      source side carries finer-grained rows → reader buckets every
-      row to the hour boundary, collapses bucket-mates via
-      ``"first"``, snaps the timestamp column to the bucket value.
-    * Source already declares the same sampling → no resample
-      (the writer enforced the invariant on the way in).
-    * No timestamp field carries the tag → no resample.
-
-    Combined with ``unique`` semantics: resample runs before dedup
-    so the smaller post-resample input drives the dedup walk.
+    Each entry's :attr:`Field.metadata` carries a non-tag
+    ``b"time_sampling"`` key whose value is the ISO-8601 duration the
+    column should be snapped to. Unset → no resample.
     """
 
     def _make_quarter_hour_batch(self) -> "pa.RecordBatch":
-        # 12 rows at :00, :15, :30, :45 across 3 hours.
         import datetime as dt
         epoch = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
         ts = pa.array(
@@ -547,16 +413,16 @@ class TestTimeSamplingResample:
         v = pa.array(list(range(12)))
         return pa.record_batch([ts, v], names=["ts", "v"])
 
-    def _hourly_target(self):
-        from yggdrasil.data import field, schema
+    def _hourly_field(self):
+        from yggdrasil.data import field
+        from yggdrasil.data.options import timedelta_to_iso_duration
         import datetime as dt
 
-        return schema(fields=[
-            field("ts", pa.timestamp("us", "UTC")).with_time_sampling(
-                dt.timedelta(hours=1), inplace=True,
-            ),
-            field("v", pa.int64()),
-        ])
+        iso = timedelta_to_iso_duration(dt.timedelta(hours=1))
+        return field(
+            "ts", pa.timestamp("us", "UTC"),
+            metadata={b"time_sampling": iso.encode()},
+        )
 
     def test_read_resamples_to_target_grid(self, tmp_path) -> None:
         import datetime as dt
@@ -565,12 +431,12 @@ class TestTimeSamplingResample:
         folder = FolderPath(path=str(tmp_path))
         folder.write_arrow_batches((self._make_quarter_hour_batch(),))
 
-        # No target → no resample.
         plain = folder.read_arrow_table()
         assert plain.num_rows == 12
 
-        # PT1H target → 3 hourly buckets.
-        out = folder.read_arrow_table(options=FolderOptions(target=self._hourly_target()))
+        out = folder.read_arrow_table(options=FolderOptions(
+            time_sample_by=[self._hourly_field()],
+        ))
         assert out.num_rows == 3
         expected = [
             dt.datetime(2024, 1, 1, h, 0, tzinfo=dt.timezone.utc)
@@ -580,93 +446,59 @@ class TestTimeSamplingResample:
         # ``first`` per bucket — the :00-minute row of each hour wins.
         assert out.column("v").to_pylist() == [0, 4, 8]
 
-    def test_resample_skips_when_no_timestamp_field_flagged(
-        self, tmp_path,
-    ) -> None:
-        # Target has no ``time_sampling`` tag → read returns as-is.
-        from yggdrasil.data import field, schema
+    def test_resample_unset_short_circuits(self, tmp_path) -> None:
         from yggdrasil.io.nested.folder_path import FolderOptions
 
-        plain_target = schema(fields=[
-            field("ts", pa.timestamp("us", "UTC")),
-            field("v", pa.int64()),
-        ])
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches((self._make_quarter_hour_batch(),))
+        out = folder.read_arrow_table(options=FolderOptions())
+        assert out.num_rows == 12
+
+    def test_resample_on_read_picks_first_valid_entry(self) -> None:
+        from yggdrasil.data import field
+        from yggdrasil.data.options import CastOptions, timedelta_to_iso_duration
+        import datetime as dt
+
+        # Field with no ``time_sampling`` metadata is skipped; the
+        # second entry's PT1H wins.
+        bare = field("ts1", pa.timestamp("us", "UTC"))
+        tagged = field(
+            "ts2", pa.timestamp("us", "UTC"),
+            metadata={b"time_sampling": timedelta_to_iso_duration(
+                dt.timedelta(hours=1),
+            ).encode()},
+        )
+        opts = CastOptions(time_sample_by=[bare, tagged])
+        assert opts.resample_on_read() == ("ts2", 3600)
+
+    def test_timedelta_to_iso_duration_round_trip(self) -> None:
+        from yggdrasil.data.options import timedelta_to_iso_duration
+        from yggdrasil.data.types.primitive.temporal import _parse_iso_duration
+        import datetime as dt
+
+        cases = [
+            dt.timedelta(hours=1),
+            dt.timedelta(days=1),
+            dt.timedelta(minutes=5, seconds=30),
+            dt.timedelta(0),
+        ]
+        for td in cases:
+            iso = timedelta_to_iso_duration(td)
+            assert _parse_iso_duration(iso) == td
+
+    def test_unique_by_and_time_sample_by_chain(self, tmp_path) -> None:
+        # Both passes run in sequence: resample first (downsample to
+        # hourly), then dedup on the resampled column. The hourly grid
+        # already gives one row per hour so the dedup is effectively a
+        # no-op here, but the chain has to compose.
+        from yggdrasil.data import field
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
         folder = FolderPath(path=str(tmp_path))
         folder.write_arrow_batches((self._make_quarter_hour_batch(),))
 
-        out = folder.read_arrow_table(options=FolderOptions(target=plain_target))
-        assert out.num_rows == 12
-
-    def test_resample_short_circuits_when_source_grid_matches(self) -> None:
-        # Source and target both declare ``time_sampling=PT1H`` → no
-        # resample (the writer enforced the invariant).
-        import datetime as dt
-        from yggdrasil.data import field, schema
-        from yggdrasil.data.options import CastOptions
-
-        hourly = schema(fields=[
-            field("ts", pa.timestamp("us", "UTC")).with_time_sampling(
-                dt.timedelta(hours=1), inplace=True,
-            ),
-            field("v", pa.int64()),
-        ])
-        opts = CastOptions(source=hourly, target=hourly)
-        assert opts.resample_on_read() is None
-
-    def test_resample_picks_only_timestamp_typed_fields(self) -> None:
-        # Tag on a non-timestamp column is ignored — the resample
-        # path needs a time axis to floor against.
-        import datetime as dt
-        from yggdrasil.data import field, schema
-        from yggdrasil.data.options import CastOptions
-
-        bogus = schema(fields=[
-            field("v", pa.int64()).with_time_sampling(
-                dt.timedelta(hours=1), inplace=True,
-            ),
-        ])
-        opts = CastOptions(target=bogus)
-        assert opts.resample_on_read() is None
-
-    def test_time_sampling_tag_round_trips_through_metadata(self) -> None:
-        # Round trip: set timedelta → ISO string in metadata → parsed
-        # timedelta on read.
-        import datetime as dt
-        from yggdrasil.data import field
-
-        f = field("ts", pa.timestamp("us", "UTC"))
-        f = f.with_time_sampling(dt.timedelta(hours=2, minutes=30))
-        assert f.metadata[f._TAG_KEY_TIME_SAMPLING] == b"PT2H30M"
-        assert f.time_sampling == dt.timedelta(hours=2, minutes=30)
-        assert f.total_time_sampling_seconds == 2 * 3600 + 30 * 60
-
-    def test_time_sampling_accepts_iso_str_and_seconds(self) -> None:
-        # ``with_time_sampling`` accepts ISO strings, seconds counts,
-        # and timedeltas, normalising to a single on-disk shape so
-        # ``"PT60M"`` and ``"PT1H"`` land identically.
-        import datetime as dt
-        from yggdrasil.data import field
-
-        from_iso = field("ts", pa.timestamp("us", "UTC")).with_time_sampling("PT1H")
-        from_td = field("ts", pa.timestamp("us", "UTC")).with_time_sampling(
-            dt.timedelta(hours=1),
-        )
-        from_sec = field("ts", pa.timestamp("us", "UTC")).with_time_sampling(3600)
-        assert from_iso.time_sampling == from_td.time_sampling == from_sec.time_sampling
-        assert (
-            from_iso.metadata[from_iso._TAG_KEY_TIME_SAMPLING]
-            == from_td.metadata[from_td._TAG_KEY_TIME_SAMPLING]
-            == from_sec.metadata[from_sec._TAG_KEY_TIME_SAMPLING]
-            == b"PT1H"
-        )
-
-    def test_with_time_sampling_none_clears_tag(self) -> None:
-        import datetime as dt
-        from yggdrasil.data import field
-
-        f = field("ts", pa.timestamp("us", "UTC")).with_time_sampling(
-            dt.timedelta(hours=1),
-        )
-        cleared = f.with_time_sampling(None)
-        assert cleared.time_sampling is None
-        assert cleared.total_time_sampling_seconds == 0
+        out = folder.read_arrow_table(options=FolderOptions(
+            time_sample_by=[self._hourly_field()],
+            unique_by=[field("ts", pa.timestamp("us", "UTC"))],
+        ))
+        assert out.num_rows == 3

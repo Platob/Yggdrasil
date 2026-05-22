@@ -74,6 +74,7 @@ is a one-site edit in :class:`Field`.
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import functools
 from typing import Any, Iterable, Iterator, Mapping, TypeVar, Union, TYPE_CHECKING
 
@@ -119,8 +120,82 @@ __all__ = [
 # (``safe``, ``row_size``, ``mode`` *already as* a Mode enum, …) can
 # skip ``__post_init__`` entirely.
 _NORMALIZED_KEYS = frozenset({
-    "source", "target", "match_by", "mode", "schema_mode",
+    "source", "target", "match_by", "unique_by", "time_sample_by",
+    "mode", "schema_mode",
 })
+
+
+# Field metadata key (non-prefixed — *not* a yggdrasil schema-level
+# tag) carrying the ISO-8601 sampling interval for entries in
+# :attr:`CastOptions.time_sample_by`. Kept off the ``t:`` prefix
+# registry so the value doesn't get auto-propagated through
+# :meth:`Field.autotag` / arrow round-trips — it's a per-call option,
+# not a schema-level contract.
+_TIME_SAMPLING_METADATA_KEY: bytes = b"time_sampling"
+
+
+def _field_time_sampling_seconds(field: Any) -> int:
+    """Decode the ISO-8601 sampling stored on a :class:`Field`.
+
+    Returns ``0`` when the field carries no ``b"time_sampling"`` key
+    or the stored value fails to parse — callers treat ``0`` as the
+    "no sampling requested" sentinel. Local import of
+    :func:`yggdrasil.data.types.primitive.temporal._parse_iso_duration`
+    keeps the options module free of the temporal import chain on
+    the common construction path.
+    """
+    md = getattr(field, "metadata", None)
+    if not md:
+        return 0
+    raw = md.get(_TIME_SAMPLING_METADATA_KEY)
+    if raw is None:
+        return 0
+    text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    from yggdrasil.data.types.primitive.temporal import _parse_iso_duration
+    td = _parse_iso_duration(text)
+    if td is None:
+        return 0
+    return max(0, int(td.total_seconds()))
+
+
+def timedelta_to_iso_duration(td: dt.timedelta) -> str:
+    """Render a :class:`datetime.timedelta` as an ISO-8601 duration string.
+
+    Inverse of
+    :func:`yggdrasil.data.types.primitive.temporal._parse_iso_duration`,
+    minus the calendar units (Y/M/W) that the parser collapses on
+    the way in. Useful for stamping ``b"time_sampling"`` metadata on
+    a :class:`Field` before handing it to
+    :attr:`CastOptions.time_sample_by`::
+
+        from yggdrasil.data import field
+        from yggdrasil.data.options import timedelta_to_iso_duration
+        import datetime as dt, pyarrow as pa
+
+        f = field("ts", pa.timestamp("us", "UTC"),
+                  metadata={b"time_sampling":
+                            timedelta_to_iso_duration(dt.timedelta(hours=1)).encode()})
+    """
+    total = td.total_seconds()
+    sign = "-" if total < 0 else ""
+    total = abs(total)
+    days, rem = divmod(int(total), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    parts = ["P"]
+    if days:
+        parts.append(f"{days}D")
+    time_parts: list[str] = []
+    if hours:
+        time_parts.append(f"{hours}H")
+    if minutes:
+        time_parts.append(f"{minutes}M")
+    if seconds or (not days and not hours and not minutes):
+        time_parts.append(f"{seconds}S")
+    if time_parts:
+        parts.append("T" + "".join(time_parts))
+    return sign + "".join(parts)
 
 
 def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
@@ -260,6 +335,26 @@ class CastOptions:
     #: :meth:`__post_init__` so callers can still pass plain key
     #: names — the Field-typed shape is the canonical surface.
     match_by: list["Field"] | None = None
+    #: Field-typed column references to dedup on at read time. Same
+    #: shape as :attr:`match_by` — each entry's :attr:`Field.name`
+    #: names the column whose values must be distinct in the read
+    #: output. :meth:`dedup_arrow_batches` collapses duplicates on
+    #: these columns via :func:`yggdrasil.arrow.ops.dedup_arrow_table`
+    #: (first occurrence wins). Unset → no dedup pass; the read
+    #: pipeline yields rows unchanged.
+    unique_by: list["Field"] | None = None
+    #: Field-typed timestamp references to resample on at read time.
+    #: Each entry's :attr:`Field.metadata` carries a non-tag
+    #: ``b"time_sampling"`` key whose value is the ISO-8601 duration
+    #: (``"PT1H"``, ``"P1D"``, etc.) that
+    #: :func:`yggdrasil.arrow.ops.resample_arrow_table` snaps the
+    #: column to. Unset → no resample pass; the read pipeline yields
+    #: rows unchanged. Plain ``list[Field]`` keeps the API shape
+    #: parallel to :attr:`match_by` / :attr:`unique_by` — the
+    #: sampling rides on the Field itself rather than a separate
+    #: ``dict`` so the bundle is a single round-trippable Field
+    #: collection.
+    time_sample_by: list["Field"] | None = None
     read_seek: int | None = None
     write_seek: int | None = None
     #: Row-level predicate. Evaluated by every IO that reads tabular
@@ -411,31 +506,45 @@ class CastOptions:
         src = self.source
         tgt = self.target
         match_by = self.match_by
-        if src is not None or tgt is not None or match_by:
+        unique_by = self.unique_by
+        time_sample_by = self.time_sample_by
+        if (
+            src is not None or tgt is not None
+            or match_by or unique_by or time_sample_by
+        ):
             Field = field_class()
             if src is not None and not isinstance(src, Field):
                 setattr_(self, "source", Field.from_(src))
             if tgt is not None and not isinstance(tgt, Field):
                 setattr_(self, "target", Field.from_(tgt))
-            # match_by normalization — accept list[Field | str | dict |
-            # pa.Field]. Plain strings become a default-typed Field so
-            # the selector machinery (alias / position lookup) has a
-            # Field to drive.
+            # match_by / unique_by / time_sample_by normalization —
+            # each entry accepts the same shapes (Field | str |
+            # dict | pa.Field). Plain strings become a default-typed
+            # Field so the selector machinery (alias / position
+            # lookup) has a Field to drive.
+            def _to_fields(items):
+                return [
+                    item if isinstance(item, Field)
+                    else Field.default(name=item) if isinstance(item, str)
+                    else Field.from_(item)
+                    for item in items
+                ]
             if match_by:
-                setattr_(
-                    self, "match_by",
-                    [
-                        item if isinstance(item, Field)
-                        else Field.default(name=item) if isinstance(item, str)
-                        else Field.from_(item)
-                        for item in match_by
-                    ],
-                )
-        # Empty match_by list collapses to ``None`` so consumers can
-        # branch on truthiness. Lives outside the field-lookup gate
-        # since it doesn't need the Field type.
+                setattr_(self, "match_by", _to_fields(match_by))
+            if unique_by:
+                setattr_(self, "unique_by", _to_fields(unique_by))
+            if time_sample_by:
+                setattr_(self, "time_sample_by", _to_fields(time_sample_by))
+        # Empty match_by / unique_by / time_sample_by collapses to
+        # ``None`` so consumers can branch on truthiness. Lives
+        # outside the field-lookup gate since it doesn't need the
+        # Field type.
         if match_by is not None and not match_by:
             setattr_(self, "match_by", None)
+        if unique_by is not None and not unique_by:
+            setattr_(self, "unique_by", None)
+        if time_sample_by is not None and not time_sample_by:
+            setattr_(self, "time_sample_by", None)
 
         # Mode normalization — accept Mode, string ("overwrite"),
         # or None (→ AUTO). Already a Mode instance is the overwhelmingly
@@ -1110,45 +1219,14 @@ class CastOptions:
     def dedup_columns_on_read(self) -> "list[str]":
         """Return the column names that need client-side dedup at read time.
 
-        A column ends up in the returned list when:
-
-        * the **target** :class:`Field` declares it ``unique`` (the
-          schema-level contract — see :attr:`Field.unique`), and
-        * the **source** :class:`Field` for the same column does
-          *not* declare it unique (so the on-disk bytes may carry
-          duplicates we have to collapse before the rows leave the
-          read pipeline).
-
-        Returns an empty list when either side is missing, when no
-        target column is marked unique, or when every unique target
-        column is also unique on the source (the source already
-        guarantees the invariant — no client-side pass needed).
+        Sourced from :attr:`unique_by` — each Field's
+        :attr:`Field.name` is the column the read pass must
+        deduplicate on. Returns an empty list when :attr:`unique_by`
+        is unset / empty.
         """
-        target = self.target
-        if target is None:
+        if not self.unique_by:
             return []
-        target_children = getattr(target, "children", None)
-        if not target_children:
-            return []
-        source = self.source
-
-        def _source_unique(name: str) -> bool:
-            if source is None:
-                return False
-            try:
-                src_field = source.field(name=name, raise_error=False)
-            except TypeError:
-                src_field = None
-            return bool(src_field is not None and getattr(src_field, "unique", False))
-
-        cols: "list[str]" = []
-        for child in target_children:
-            if not getattr(child, "unique", False):
-                continue
-            if _source_unique(child.name):
-                continue
-            cols.append(child.name)
-        return cols
+        return [f.name for f in self.unique_by]
 
     def dedup_arrow_batches(
         self, batches: "Iterator[pa.RecordBatch]",
@@ -1175,57 +1253,30 @@ class CastOptions:
     def resample_on_read(self) -> "tuple[str, int] | None":
         """Return ``(time_column, sampling_seconds)`` to resample to.
 
-        Walks the target's children and picks the first timestamp
-        field whose :attr:`Field.time_sampling` tag is set and the
-        source side doesn't already declare the *same* sampling. The
-        result drives :func:`yggdrasil.arrow.ops.resample_arrow_table`
-        — a single (column, interval) is all that op consumes (you
-        can only have one time axis per table to resample on).
+        Picks the first entry of :attr:`time_sample_by` whose
+        ``time_sampling`` metadata carries a positive ISO-8601
+        duration. The result drives
+        :func:`yggdrasil.arrow.ops.resample_arrow_table` — a single
+        (column, interval) is all that op consumes (you can only
+        have one time axis per table to resample on at a time).
 
-        Returns ``None`` when:
+        Each Field's sampling lives under its
+        :attr:`Field.metadata`'s non-prefixed ``b"time_sampling"``
+        key as an ISO-8601 duration string (``"PT1H"`` / ``"P1D"``).
+        The non-prefixed key keeps the value off the schema-level
+        tag registry (it's a per-call option, not a contract that
+        rides with the data on disk).
 
-        * no target / no timestamp field carries ``time_sampling``,
-        * the matching source field already declares the same
-          ``total_time_sampling_seconds`` (the rows are already on
-          the requested grid),
-        * the resolved budget is ``0`` (the inverse-parse failed —
-          treated as "no tag").
+        Returns ``None`` when :attr:`time_sample_by` is unset / empty
+        or every listed Field's metadata fails to parse.
         """
-        target = self.target
-        if target is None:
+        if not self.time_sample_by:
             return None
-        target_children = getattr(target, "children", None)
-        if not target_children:
-            return None
-        source = self.source
-
-        for child in target_children:
-            sampling = getattr(child, "total_time_sampling_seconds", 0)
-            if sampling <= 0:
+        for child in self.time_sample_by:
+            seconds = _field_time_sampling_seconds(child)
+            if seconds <= 0:
                 continue
-            # Only the timestamp/duration-typed columns make sense
-            # as a resample axis. Use Arrow inspection so we don't
-            # have to special-case the yggdrasil :class:`DataType`
-            # hierarchy.
-            try:
-                arrow_field = child.to_arrow_field()
-            except Exception:
-                continue
-            if not pa.types.is_timestamp(arrow_field.type):
-                continue
-            if source is not None:
-                try:
-                    src = source.field(name=child.name, raise_error=False)
-                except TypeError:
-                    src = None
-                if src is not None and getattr(
-                    src, "total_time_sampling_seconds", 0,
-                ) == sampling:
-                    # Source already lives on the target grid — the
-                    # writer enforced the invariant on the way in, no
-                    # client-side resample needed.
-                    continue
-            return child.name, sampling
+            return child.name, seconds
         return None
 
     def resample_arrow_batches(
