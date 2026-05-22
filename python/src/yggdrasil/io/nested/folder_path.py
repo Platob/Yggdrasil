@@ -117,46 +117,6 @@ __all__ = ["FolderPath", "FolderOptions"]
 _FOLDER_PATH_SINGLETON_TTL: float = 15.0 * 60.0
 
 
-# Extension-keyed leaf-class cache. :meth:`FolderPath._leaf_for` is
-# called once per child during every :meth:`iter_children`; without a
-# cache, each call walks ``MediaType.from_(url) → class_for_media_type``
-# (URL parse + media-type registry walk + extensions tuple build), and
-# the answer is fully determined by the URL's lowercased extension
-# tuple. Memoising on that tuple collapses the per-child work to a
-# single dict probe in the steady state. ``None`` is a legitimate
-# sentinel for "no registered leaf" — cached either way so a folder
-# with non-tabular siblings doesn't re-walk the registry for each
-# sibling on every read.
-_LEAF_CLASS_CACHE: dict[tuple[str, ...], "type | None"] = {}
-
-
-def _extensions_key(path: str) -> tuple[str, ...]:
-    """Lowercased extension tuple for the URL/path string.
-
-    Mirrors :attr:`URL.extensions` but skips the :class:`URL`
-    indirection — :meth:`FolderPath._leaf_for` runs this once per
-    iter_children entry, and the URL property allocates a fresh
-    list every call. Same outer-to-inner ordering
-    (``"archive.csv.zst"`` → ``("csv", "zst")``).
-    """
-    if not path or path == "/":
-        return ()
-    if path[-1] == "/":
-        path = path[:-1]
-        if not path:
-            return ()
-    idx = path.rfind("/")
-    name = path[idx + 1:] if idx != -1 else path
-    if not name:
-        return ()
-    if name[0] == ".":
-        name = name[1:]
-        if "." not in name:
-            return ()
-    if "." not in name:
-        return ()
-    parts = name.split(".")
-    return tuple(s.lower() for s in parts[1:])
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1024,33 +984,22 @@ class FolderPath(IO[bytes, FolderOptions]):
         :meth:`_read_arrow_batches` relies on to ignore non-tabular
         siblings without forcing the user to clean the directory.
 
-        Memoises the ``(extensions tuple) → leaf class`` mapping on
-        :data:`_LEAF_CLASS_CACHE`. The format registry only keys off
-        the URL's lowercased extension tuple, so a folder of 500
-        ``part-*.parquet`` files pays one :meth:`MediaType.from_`
-        walk instead of 500. The extension tuple is built by an
-        inline string-level split on the URL path so we skip the
-        :attr:`URL.extensions` list allocation per call.
+        Both lookups are cached upstream — :attr:`URL.media_type`
+        memoises the codec / mime inference on the URL itself, and
+        :meth:`IO.class_for_media_type` is a dict probe on
+        :data:`_HOLDER_FORMAT_REGISTRY`. The per-child cost in the
+        steady state collapses to two cached attribute reads.
         """
         url = entry.url
-        url_path = url.path if url is not None else ""
-        key = _extensions_key(url_path)
-
-        cls = _LEAF_CLASS_CACHE.get(key, ...)
-        if cls is ...:
-            try:
-                mt = MediaType.from_(url, default=None)
-            except Exception:
-                mt = None
-            if mt is None:
-                cls = None
-            else:
-                try:
-                    cls = IO.class_for_media_type(mt, default=None)
-                except Exception:
-                    cls = None
-            _LEAF_CLASS_CACHE[key] = cls
-
+        if url is None:
+            return None
+        mt = url.media_type
+        if mt is None:
+            return None
+        try:
+            cls = IO.class_for_media_type(mt, default=None)
+        except Exception:
+            cls = None
         if cls is None:
             return None
         return cls(holder=entry, owns_holder=False)
