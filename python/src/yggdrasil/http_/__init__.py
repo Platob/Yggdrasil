@@ -3,9 +3,8 @@
 Construct an :class:`HTTPSession` (singleton-cached per config) and drive HTTP
 through its inherited verb methods; the returned :class:`HTTPResponse` carries
 the body, headers, status, and request bound on a single object. The
-supporting types (:class:`HTTPRequest`, :class:`HTTPPath`, :class:`Cookies`,
-:class:`ErrorNotifyingHTTPSession`) round out the surface for paths, cookie
-jars, and failure notifications.
+supporting types (:class:`HTTPRequest`, :class:`HTTPPath`, :class:`Cookies`)
+round out the surface for paths and cookie jars.
 
 The pool / retry / timeout primitives live in :mod:`yggdrasil.http_._pool`
 (stdlib-only, urllib3-shaped) — feature code should not import them directly.
@@ -25,9 +24,6 @@ __all__ = [
     "HTTPRequest",
     "HTTPPath",
     "Cookies",
-    "ErrorNotifyingHTTPSession",
-    "Notifier",
-    "smtp_email_notifier",
 ]
 
 _LAZY_NAMES = {
@@ -36,9 +32,6 @@ _LAZY_NAMES = {
     "HTTPRequest": (".request", "HTTPRequest"),
     "HTTPPath": (".path", "HTTPPath"),
     "Cookies": (".cookies", "Cookies"),
-    "ErrorNotifyingHTTPSession": (".notifying_session", "ErrorNotifyingHTTPSession"),
-    "Notifier": (".notifying_session", "Notifier"),
-    "smtp_email_notifier": (".notifying_session", "smtp_email_notifier"),
 }
 
 
@@ -63,8 +56,3 @@ if TYPE_CHECKING:
     from .request import HTTPRequest
     from .path import HTTPPath
     from .cookies import Cookies
-    from .notifying_session import (
-        ErrorNotifyingHTTPSession,
-        Notifier,
-        smtp_email_notifier,
-    )

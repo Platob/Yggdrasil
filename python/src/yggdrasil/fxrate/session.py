@@ -390,7 +390,7 @@ class FxRate(HTTPSession):
     # ``backends`` is runtime config, not identity. List it transient
     # so the singleton-key probe + pickle round-trip skip it and a
     # caller passing a different chain doesn't fragment the connection
-    # pool. (Same shape :class:`ErrorNotifyingHTTPSession` uses.)
+    # pool.
     _TRANSIENT_STATE_ATTRS = HTTPSession._TRANSIENT_STATE_ATTRS | {"backends"}
 
     # ------------------------------------------------------------------ #
