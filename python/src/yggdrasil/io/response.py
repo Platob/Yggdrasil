@@ -575,7 +575,32 @@ class Response(Tabular["ResponseOptions"]):
     def options_class(cls) -> "type[ResponseOptions]":
         return ResponseOptions
 
-    __slots__ = (
+    # ``Response`` deliberately runs without ``__slots__``: the
+    # high-level :class:`yggdrasil.http_.HTTPResponse` subclass mixes
+    # the API in with :class:`yggdrasil.io.holder.IO` (which has its
+    # own slot layout) so a slot-backed :class:`Response` would raise
+    # the "multiple bases have instance lay-out conflict" :class:`TypeError`
+    # at class creation. The per-instance ``__dict__`` overhead is
+    # paid back by the merged HTTPResponse being a real
+    # :class:`Tabular` + cursor in one object — no wrapper layer.
+    #
+    # Slot-style field set (kept here as the source of truth for
+    # :meth:`__getstate__` / :meth:`__setstate__`):
+    #   request, status_code, headers, tags, buffer, received_at,
+    #   local_cached, remote_cached, _receiver, _session, _cache,
+    #   _cache_token.
+
+    # Instance attributes that don't survive pickling — excluded by
+    # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {"_session", "_cache", "_cache_token"}
+    )
+
+    # Persisted slot-style field set — :meth:`__getstate__` reads
+    # these off ``self.__dict__`` to keep the pickle payload free of
+    # IO-mixin transients (``_pos``, ``_mode``, ``_parent``, …) when
+    # subclasses bring those along.
+    _PERSISTED_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
         "request",
         "status_code",
         "headers",
@@ -585,16 +610,7 @@ class Response(Tabular["ResponseOptions"]):
         "local_cached",
         "remote_cached",
         "_receiver",
-        "_session",
-        "_cache",
-        "_cache_token",
-    )
-
-    # Instance attributes that don't survive pickling — excluded by
-    # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
-        {"_session", "_cache", "_cache_token"}
-    )
+    })
 
     def __init__(
         self,
@@ -731,20 +747,18 @@ class Response(Tabular["ResponseOptions"]):
         return self.__repr__()
 
     def __getstate__(self) -> dict[str, Any]:
-        # Walk every ``__slots__`` declaration in the MRO so subclasses
-        # like :class:`HTTPResponse` (own slots ``()``) still emit the
-        # parent's fields. Skip the transient set and any slot the
-        # instance never assigned.
-        transients = self._TRANSIENT_STATE_ATTRS
+        # Pick the persisted-field set off ``self.__dict__`` — subclasses
+        # like :class:`HTTPResponse` (which mixes in :class:`IO`) carry
+        # extra cursor/transport attributes (``_pos``, ``_mode``,
+        # ``_parent``, ``_url``, …) that have no place in the response
+        # pickle payload. Sticking to ``_PERSISTED_STATE_ATTRS`` keeps
+        # the wire format stable as the mixin set evolves.
         state: dict[str, Any] = {}
-        for cls in type(self).__mro__:
-            for name in getattr(cls, "__slots__", ()):
-                if name in transients or name in state:
-                    continue
-                try:
-                    state[name] = getattr(self, name)
-                except AttributeError:
-                    continue
+        for name in self._PERSISTED_STATE_ATTRS:
+            try:
+                state[name] = getattr(self, name)
+            except AttributeError:
+                continue
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:

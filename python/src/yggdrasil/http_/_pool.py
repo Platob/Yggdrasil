@@ -52,7 +52,6 @@ __all__ = [
     "PoolManager",
     "Retry",
     "Timeout",
-    "BaseHTTPResponse",
     "HTTPResponse",
     "HTTPHeaderDict",
     "disable_warnings",
@@ -431,7 +430,7 @@ class Retry:
         backoff = self.backoff_factor * (2 ** (len(consecutive_errors) - 1))
         return float(min(self.BACKOFF_MAX, backoff))
 
-    def get_retry_after(self, response: "BaseHTTPResponse") -> Optional[float]:
+    def get_retry_after(self, response: "HTTPResponse") -> Optional[float]:
         if not self.respect_retry_after_header:
             return None
         value = response.headers.get("Retry-After") if response.headers else None
@@ -449,7 +448,7 @@ class Retry:
         except Exception:
             return None
 
-    def sleep(self, response: Optional["BaseHTTPResponse"] = None) -> None:
+    def sleep(self, response: Optional["HTTPResponse"] = None) -> None:
         wait = 0.0
         if response is not None:
             after = self.get_retry_after(response)
@@ -475,7 +474,7 @@ class Retry:
         self,
         method: Optional[str] = None,
         url: Optional[str] = None,
-        response: Optional["BaseHTTPResponse"] = None,
+        response: Optional["HTTPResponse"] = None,
         error: Optional[Exception] = None,
         _pool: Any = None,
         _stacktrace: Any = None,
@@ -532,33 +531,6 @@ class Retry:
 # Response
 # ---------------------------------------------------------------------------
 
-class BaseHTTPResponse(io.IOBase):
-    """ABC marker — every concrete shim response inherits from this.
-
-    Subclassing :class:`io.IOBase` mirrors urllib3's own
-    ``BaseHTTPResponse`` and is the contract :func:`pyarrow.input_stream`
-    relies on to wrap a streaming HTTP body without buffering it first
-    (the Databricks warehouse external-link reader at
-    :func:`yggdrasil.databricks.warehouse.statement.fetch_batches`
-    feeds a ``preload_content=False`` response straight into
-    :func:`pyarrow.ipc.open_stream`). Plain ``hasattr(..., "read")``
-    isn't enough — ``pa.input_stream`` rejects anything that isn't an
-    :class:`io.IOBase` subclass with a ``TypeError``.
-    """
-
-    status: int
-    headers: HTTPHeaderDict
-
-    def readable(self) -> bool:  # noqa: D401 — IOBase protocol
-        return True
-
-    def writable(self) -> bool:
-        return False
-
-    def seekable(self) -> bool:
-        return False
-
-
 class _DecodingReader:
     """Wraps a chunked source iterator and decodes gzip/deflate on the fly."""
 
@@ -584,19 +556,38 @@ class _DecodingReader:
         return chunk
 
 
-class HTTPResponse(BaseHTTPResponse):
-    """Stdlib-backed urllib3-shaped HTTP response.
+class HTTPResponse(io.IOBase):
+    """Stdlib-backed urllib3-shaped HTTP response, single access point.
+
+    Subclassing :class:`io.IOBase` is what lets :func:`pyarrow.input_stream`
+    wrap a streaming HTTP body without buffering it first — the
+    Databricks warehouse external-link reader at
+    :func:`yggdrasil.databricks.warehouse.statement.fetch_batches`
+    feeds a ``preload_content=False`` response straight into
+    :func:`pyarrow.ipc.open_stream`, and ``pa.input_stream`` rejects
+    anything that isn't an :class:`io.IOBase` subclass with a bare
+    ``TypeError``.
 
     Wraps :class:`http.client.HTTPResponse` and exposes:
 
     * ``.status`` — int status code
     * ``.headers`` — :class:`HTTPHeaderDict`
+    * ``.buffer`` — :class:`~yggdrasil.io.memory_stream.MemoryStream`
+      that lazily pulls from the decoded raw source. Starts in
+      *streaming* mode (``buffer.eof is False``) and mutates to
+      *collected* (``buffer.eof is True``) once the underlying source
+      is drained. The high-level :class:`yggdrasil.http_.HTTPResponse`
+      borrows this holder directly via :meth:`from_pool`, so no
+      extra copy is paid on the response → record transition.
     * ``.read([amt])`` — body bytes (decodes Content-Encoding when
-      ``decode_content=True``)
-    * ``.stream(amt=...)`` — iterator yielding chunks
-    * ``.release_conn()`` — returns the underlying connection to the pool
-    * ``.drain_conn()`` — read remaining bytes so the connection is reusable
+      ``decode_content=True``); advances the buffer's internal cursor.
+    * ``.stream(amt=...)`` — iterator yielding chunks.
+    * ``.release_conn()`` — returns the underlying connection to the pool.
+    * ``.drain_conn()`` — read remaining bytes so the connection is reusable.
     """
+
+    status: int
+    headers: HTTPHeaderDict
 
     def __init__(
         self,
@@ -644,59 +635,52 @@ class HTTPResponse(BaseHTTPResponse):
         self._pool_key = pool_key
         self._released = False
 
-        # Pre-buffered body (BytesIO / bytes) bypasses the decoder entirely.
-        self._body: Optional[bytes]
+        # Single inner holder for every body shape — the MemoryStream
+        # lazily pulls bytes from its source callable and accumulates
+        # them into an in-memory window (with optional spill to disk
+        # for multi-GB payloads). ``preload_content=True`` drains it
+        # to EOF in __init__; ``preload_content=False`` leaves it
+        # streaming and ``.read`` / ``.stream`` pull on demand.
+        from yggdrasil.io.memory_stream import MemoryStream
+
+        source: Any
         if self._raw is not None:
-            self._body = None
-            self._decoder = _DecodingReader(
+            source = _DecodingReader(
                 self._raw.read,
                 self.headers.get("Content-Encoding") if decode_content else None,
-            )
+            ).read
         elif isinstance(body, (bytes, bytearray)):
-            self._body = bytes(body)
-            self._decoder = _DecodingReader(lambda *_: b"", None)
+            source = bytes(body)
         elif body is None:
-            self._body = b""
-            self._decoder = _DecodingReader(lambda *_: b"", None)
+            source = None
         else:
             # file-like (BytesIO, etc.) — read lazily.
-            self._body = None
-            self._decoder = _DecodingReader(body.read, None)
+            source = body.read
 
-        if preload_content and self._body is None:
-            self._body = self._read_all()
+        self.buffer: MemoryStream = MemoryStream(source=source)
+
+        if preload_content:
+            # Drain to EOF. The MemoryStream then sits in its "collected"
+            # state (``buffer.eof is True``) with every byte in the
+            # in-memory window (or spilled). The connection is released
+            # immediately since there's nothing left to pull.
+            self.buffer.read_mv(-1, 0)
             self.release_conn()
 
     # ---- core API ----------------------------------------------------------
     def read(self, amt: Optional[int] = None) -> bytes:
-        if self._body is not None:
-            if amt is None:
-                data, self._body = self._body, b""
-                return data
-            data, self._body = self._body[:amt], self._body[amt:]
+        # Advance the buffer's internal cursor so repeated ``.read(n)``
+        # calls drain the body forward, matching urllib3 semantics.
+        if amt is None:
+            data = bytes(self.buffer.read_mv(-1, cursor=True))
+            self.release_conn()
             return data
-        return self._decoder.read(amt)
-
-    def _read_all(self) -> bytes:
-        chunks: list[bytes] = []
-        while True:
-            chunk = self._decoder.read(1 << 16)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks)
+        return bytes(self.buffer.read_mv(amt, cursor=True))
 
     def stream(self, amt: int = 65536, decode_content: Optional[bool] = None) -> Iterator[bytes]:
-        if self._body is not None:
-            # Already buffered (preload_content=True path).
-            data = self._body
-            self._body = b""
-            for i in range(0, len(data), amt):
-                yield data[i:i + amt]
-            return
         try:
             while True:
-                chunk = self._decoder.read(amt)
+                chunk = bytes(self.buffer.read_mv(amt, cursor=True))
                 if not chunk:
                     return
                 yield chunk
@@ -716,11 +700,12 @@ class HTTPResponse(BaseHTTPResponse):
                 pass
 
     def drain_conn(self) -> None:
-        if self._body is not None or self._released:
+        if self.buffer.eof or self._released:
             return
         try:
-            while self._decoder.read(1 << 16):
-                pass
+            # Pull to EOF so the underlying socket reaches its terminator
+            # and the connection is reusable.
+            self.buffer._pull_to_eof()
         except Exception:
             pass
 
@@ -737,10 +722,22 @@ class HTTPResponse(BaseHTTPResponse):
 
     @property
     def data(self) -> bytes:
-        if self._body is None:
-            self._body = self._read_all()
+        if not self.buffer.eof:
+            self.buffer._pull_to_eof()
             self.release_conn()
-        return self._body
+        # Return every byte the stream collected, from offset 0 — the
+        # caller-visible "data" snapshot is independent of where the
+        # internal cursor sits.
+        return bytes(self.buffer.read_mv(-1, 0))
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
 
 
 # ---------------------------------------------------------------------------

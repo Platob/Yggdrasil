@@ -819,7 +819,7 @@ class TestPoolResponsePyarrowStream:
     straight into :func:`pyarrow.input_stream` so Arrow IPC chunks can
     stream without buffering the (potentially hundreds of MB) payload.
     ``pa.input_stream`` rejects anything that isn't an :class:`io.IOBase`
-    subclass with a bare ``TypeError`` — the shim's ``BaseHTTPResponse``
+    subclass with a bare ``TypeError`` — the pool :class:`HTTPResponse`
     must therefore inherit from :class:`io.IOBase` and implement the
     minimum protocol (``readable() == True``).
     """
