@@ -1147,7 +1147,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         if cache_key is not None:
             cached = self._PARTITION_DATA_CACHE.get(cache_key)
             if cached is not None:
-                yield from self._yield_filtered(cached, arrow_expr)
+                yield from self._yield_filtered(cached, arrow_expr, predicate)
                 return
 
         accumulated: "list[pa.RecordBatch] | None" = (
@@ -1162,10 +1162,13 @@ class FolderPath(IO[bytes, FolderOptions]):
             # Sub-folders recurse and apply the predicate at their
             # own leaf level; flat-format leaves (parquet / arrow IPC
             # / csv) don't filter rows themselves, so we run the
-            # row-level predicate here in pyarrow's C++ kernels. The
-            # static-value prune above already eliminated whole sub-trees
-            # the predicate rejects on a partition column; this is the
-            # residual non-partition filter.
+            # row-level predicate here in pyarrow's C++ kernels (or
+            # the hashset fast path when the predicate decomposes
+            # into ``InList`` /``AND-of-InList`` — the typical cache
+            # lookup shape). The static-value prune above already
+            # eliminated whole sub-trees the predicate rejects on a
+            # partition column; this is the residual non-partition
+            # filter.
             if isinstance(child, FolderPath):
                 # Recursive sub-folder branch: any inner partition
                 # leaf populates its own cache entry via the same
@@ -1181,6 +1184,12 @@ class FolderPath(IO[bytes, FolderOptions]):
                 if arrow_expr is None:
                     yield batch
                     continue
+                if predicate is not None:
+                    fast = predicate.filter_arrow_batch_via_hashset(batch)
+                    if fast is not None:
+                        if fast.num_rows > 0:
+                            yield fast
+                        continue
                 kept = batch.filter(arrow_expr)
                 if kept.num_rows > 0:
                     yield kept
@@ -1235,6 +1244,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     def _yield_filtered(
         batches: "Iterable[pa.RecordBatch]",
         arrow_expr: "Any | None",
+        predicate: "Any | None" = None,
     ) -> "Iterator[pa.RecordBatch]":
         """Yield ``batches`` through ``arrow_expr`` (pass-through if ``None``).
 
@@ -1242,6 +1252,15 @@ class FolderPath(IO[bytes, FolderOptions]):
         in :meth:`_read_arrow_batches`. Empty / fully-dropped batches
         are skipped so consumers can treat the output as
         "non-empty rows that match".
+
+        When *predicate* is supplied and decomposes into an
+        ``InList`` / ``AND-of-InList`` shape (the cache lookup
+        predicate is exactly that after ``simplify``), each batch
+        first tries
+        :meth:`Predicate.filter_arrow_batch_via_hashset` — a Python
+        hashset probe that drops the per-call pyarrow filter compile
+        + scan overhead on tiny batches. Anything else falls back to
+        ``arrow_expr`` directly.
         """
         if arrow_expr is None:
             for batch in batches:
@@ -1251,6 +1270,12 @@ class FolderPath(IO[bytes, FolderOptions]):
         for batch in batches:
             if batch.num_rows == 0:
                 continue
+            if predicate is not None:
+                fast = predicate.filter_arrow_batch_via_hashset(batch)
+                if fast is not None:
+                    if fast.num_rows > 0:
+                        yield fast
+                    continue
             kept = batch.filter(arrow_expr)
             if kept.num_rows > 0:
                 yield kept

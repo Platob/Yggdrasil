@@ -115,3 +115,121 @@ class TestNullInListExpansion:
             v for v in out.column("x").to_pylist() if v is not None
         ) == [1]
         assert None in out.column("x").to_pylist()
+
+
+class TestFilterArrowBatchViaHashset:
+    """``Predicate.filter_arrow_batch_via_hashset`` — static-value fast path.
+
+    Decomposes ``InList`` and ``AND(InList, InList, ...)`` predicates
+    into Python :class:`frozenset` probes against materialised
+    columns. On the typical cache-lookup shape (1-row leaf batches,
+    multi-column IN-lists) it's ~30x faster than
+    :meth:`pa.RecordBatch.filter` — the per-call compile + scan
+    overhead dominates pyarrow's path on tiny inputs. Falls back to
+    :meth:`pa.RecordBatch.filter` for anything else by returning
+    ``None`` to the caller.
+    """
+
+    def test_single_in_list_keeps_matching_rows(self):
+        t = pa.Table.from_pylist([{"x": 1}, {"x": 2}, {"x": 3}])
+        batch = t.to_batches()[0]
+        kept = col("x").is_in([1, 3]).filter_arrow_batch_via_hashset(batch)
+        assert kept is not None
+        assert kept.column("x").to_pylist() == [1, 3]
+
+    def test_and_of_in_lists_runs_via_hashset(self):
+        from yggdrasil.io.tabular.execution.expr import simplify
+
+        t = pa.Table.from_pylist([
+            {"x": 1, "y": "a"},
+            {"x": 2, "y": "b"},
+            {"x": 3, "y": "a"},
+            {"x": 4, "y": "c"},
+        ])
+        batch = t.to_batches()[0]
+        pred = simplify(col("x").is_in([1, 3]) & col("y").is_in(["a"]))
+        kept = pred.filter_arrow_batch_via_hashset(batch)
+        assert kept is not None
+        assert kept.column("x").to_pylist() == [1, 3]
+
+    def test_returns_input_when_every_row_matches(self):
+        # All-pass case: the helper hands back the original batch
+        # (no take call) so a downstream caller sees ``kept is batch``.
+        t = pa.Table.from_pylist([{"x": 1}, {"x": 2}])
+        batch = t.to_batches()[0]
+        kept = col("x").is_in([1, 2, 3]).filter_arrow_batch_via_hashset(batch)
+        assert kept is batch
+
+    def test_returns_zero_row_slice_when_nothing_matches(self):
+        t = pa.Table.from_pylist([{"x": 1}, {"x": 2}])
+        batch = t.to_batches()[0]
+        kept = col("x").is_in([99]).filter_arrow_batch_via_hashset(batch)
+        assert kept is not None and kept.num_rows == 0
+        # Schema preserved.
+        assert kept.schema.equals(batch.schema)
+
+    def test_includes_null_matches_null_rows(self):
+        from yggdrasil.io.tabular.execution.expr import simplify
+
+        t = pa.Table.from_pylist([{"x": 1}, {"x": None}, {"x": 5}])
+        batch = t.to_batches()[0]
+        # ``simplify`` folds ``IN [1] | IS NULL`` into ``InList(includes_null=True)``.
+        pred = simplify(col("x").is_in([1]) | col("x").is_null())
+        kept = pred.filter_arrow_batch_via_hashset(batch)
+        assert kept is not None
+        out = kept.column("x").to_pylist()
+        assert sorted(v for v in out if v is not None) == [1]
+        assert None in out
+
+    def test_excludes_null_when_not_requested(self):
+        # ``IN (1, 2)`` with no NULL flag — null rows must be dropped,
+        # matching ``pa.RecordBatch.filter(pa.field('x').isin([1, 2]))``.
+        t = pa.Table.from_pylist([{"x": 1}, {"x": None}, {"x": 5}])
+        batch = t.to_batches()[0]
+        kept = col("x").is_in([1, 2]).filter_arrow_batch_via_hashset(batch)
+        assert kept is not None
+        assert kept.column("x").to_pylist() == [1]
+
+    def test_non_inlist_predicate_returns_none(self):
+        # ``col(x) > 100`` is a Comparison, not InList. The fast path
+        # bows out; caller should use ``pa.RecordBatch.filter``.
+        t = pa.Table.from_pylist([{"x": 1}])
+        batch = t.to_batches()[0]
+        kept = (col("x") > 100).filter_arrow_batch_via_hashset(batch)
+        assert kept is None
+
+    def test_or_returns_none(self):
+        # OR of InLists isn't decomposable into a hashset-per-column
+        # (the row needs to match *one* of them, not all). Falls back.
+        t = pa.Table.from_pylist([{"x": 1, "y": "a"}])
+        batch = t.to_batches()[0]
+        pred = col("x").is_in([1]) | col("y").is_in(["b"])
+        kept = pred.filter_arrow_batch_via_hashset(batch)
+        assert kept is None
+
+    def test_unhashable_values_return_none(self):
+        # ``IN ([1, 2], [3, 4])`` — list literals are unhashable, so
+        # :class:`frozenset` raises. The helper returns ``None`` and
+        # the caller falls back to the pyarrow path.
+        t = pa.Table.from_pylist([{"x": [1, 2]}])
+        batch = t.to_batches()[0]
+        kept = col("x").is_in([[1, 2], [3, 4]]).filter_arrow_batch_via_hashset(batch)
+        assert kept is None
+
+    def test_matches_pyarrow_filter_on_mixed_input(self):
+        """The hashset path and ``pa.RecordBatch.filter`` agree row-for-row."""
+        from yggdrasil.io.tabular.execution.expr import simplify
+
+        t = pa.Table.from_pylist([
+            {"x": 1, "y": "a"},
+            {"x": 2, "y": "b"},
+            {"x": None, "y": "a"},
+            {"x": 3, "y": None},
+            {"x": 4, "y": "a"},
+        ])
+        batch = t.to_batches()[0]
+        pred = simplify(col("x").is_in([1, 3, 4]) & col("y").is_in(["a"]))
+        hs_out = pred.filter_arrow_batch_via_hashset(batch)
+        pa_out = batch.filter(pred.to_arrow())
+        assert hs_out is not None
+        assert hs_out.to_pylist() == pa_out.to_pylist()

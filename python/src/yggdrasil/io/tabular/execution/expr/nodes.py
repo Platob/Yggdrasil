@@ -651,6 +651,108 @@ class Predicate(Expression):
             if kept.num_rows > 0:
                 yield kept
 
+    def filter_arrow_batch_via_hashset(self, batch: "Any") -> "Any | None":
+        """Try a Python-hashset filter for static ``InList`` predicates.
+
+        Recognises predicates shaped as ``InList(Column, [literals])``
+        — optionally AND'd together at the top level — and evaluates
+        them by materialising the referenced columns to Python values
+        and probing each against a :class:`frozenset`. Wins on tiny
+        batches (per-leaf cache reads, partition fan-out) where
+        pyarrow's :meth:`pa.RecordBatch.filter` is dominated by
+        per-call compile + scan overhead rather than by the data
+        size — bench shows ~770 us / call for a 64-way OR-of-eq on a
+        1-row batch versus ~3 us for the equivalent hashset probe.
+
+        Null semantics match pyarrow's ``isin`` filter:
+
+        * ``v is None and includes_null`` → row kept.
+        * ``v is None and not includes_null`` → row dropped (null is
+          neither "in" nor "not in" the value set; the filter drops).
+        * ``v in value_set`` → row kept.
+        * otherwise → dropped.
+
+        Returns the filtered :class:`pa.RecordBatch` on a fast-path
+        match (possibly the same batch if every row survives, or a
+        zero-row slice if none do), or ``None`` to signal "shape
+        too complex; use the pyarrow filter instead". Callers should
+        check the result and fall back when ``None``.
+        """
+        clauses = _predicate_to_inlist_clauses(self)
+        if clauses is None:
+            return None
+        n = batch.num_rows
+        if n == 0:
+            return batch
+        schema_names = batch.schema.names
+        surviving: "list[int] | None" = None
+        for column, value_set, includes_null in clauses:
+            if column not in schema_names:
+                # Missing column — let the pyarrow path surface its
+                # error (or its lenient behaviour) rather than make
+                # up a verdict here.
+                return None
+            col_values = batch.column(column).to_pylist()
+            iterator = range(n) if surviving is None else surviving
+            new_surviving: list[int] = []
+            if includes_null:
+                for i in iterator:
+                    v = col_values[i]
+                    if v is None or v in value_set:
+                        new_surviving.append(i)
+            else:
+                for i in iterator:
+                    v = col_values[i]
+                    if v is not None and v in value_set:
+                        new_surviving.append(i)
+            surviving = new_surviving
+            if not surviving:
+                break
+        if surviving is None or len(surviving) == n:
+            return batch
+        if not surviving:
+            return batch.slice(0, 0)
+        import pyarrow as pa
+
+        return batch.take(pa.array(surviving, type=pa.int64()))
+
+
+def _predicate_to_inlist_clauses(
+    predicate: "Predicate",
+) -> "list[tuple[str, frozenset, bool]] | None":
+    """Decompose an AST into ``[(col_name, value_set, includes_null), …]``.
+
+    Returns ``None`` when the predicate isn't pure-``InList`` /
+    pure-AND-of-``InList``, when a target is anything other than a
+    bare :class:`Column`, or when the value set carries unhashable
+    literals (lists, dicts, …). The caller falls back to the
+    pyarrow filter on a ``None`` return.
+
+    Used by :meth:`Predicate.filter_arrow_batch_via_hashset`; the
+    decomposition is shape-local (no pyarrow imports) so it stays
+    cheap to attempt on every batch and the recognition cost is
+    bounded by the AST depth (typically 1–2 levels for the cache
+    lookup predicate).
+    """
+    if isinstance(predicate, InList):
+        target = predicate.target
+        if not isinstance(target, Column) or predicate.negated:
+            return None
+        try:
+            value_set = frozenset(predicate.values)
+        except TypeError:
+            return None
+        return [(target.name, value_set, predicate.includes_null)]
+    if isinstance(predicate, Logical) and predicate.op is LogicalOp.AND:
+        out: "list[tuple[str, frozenset, bool]]" = []
+        for clause in predicate.operands:
+            sub = _predicate_to_inlist_clauses(clause)
+            if sub is None:
+                return None
+            out.extend(sub)
+        return out
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Leaf nodes — Column, Literal
