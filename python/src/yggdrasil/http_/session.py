@@ -919,7 +919,7 @@ class HTTPSession(Session):
             if best is None or response.received_at >= best.received_at:
                 best = response
         if best is not None:
-            LOGGER.debug(
+            LOGGER.info(
                 "Cache hit %s %s %s in %r (status=%d, received_at=%s) "
                 "— skipping network",
                 source, request.method, request.url, tabular,
@@ -1766,7 +1766,7 @@ class HTTPSession(Session):
 
         if hits:
             total = sum(len(v) for v in hits.values())
-            LOGGER.debug(
+            LOGGER.info(
                 "Batch local cache: %d/%d hit(s) across %d path(s) — "
                 "skipping network for %d request(s); breakdown: %s",
                 total, len(batch), len(hits), total,
@@ -1839,7 +1839,7 @@ class HTTPSession(Session):
             misses.extend(t_misses)
 
         if total_hits:
-            LOGGER.debug(
+            LOGGER.info(
                 "Batch remote cache: %d/%d hit(s) across %d table(s) — "
                 "skipping network for %d request(s); breakdown: %s",
                 total_hits, len(requests), len(table_to_cfg), total_hits,
@@ -2216,7 +2216,7 @@ class HTTPSession(Session):
         )
 
         pool = self.job_pool
-        LOGGER.debug(
+        LOGGER.info(
             "Fetching %d send_many miss(es) through job pool "
             "(max_in_flight=%d, ordered=%s)",
             len(misses),
@@ -2416,8 +2416,8 @@ class HTTPSession(Session):
             cfg: "CacheConfig",
             group_responses: "list[Response]",
         ) -> None:
-            LOGGER.debug(
-                "%s %s response(s) in remote cache %s",
+            LOGGER.info(
+                "%s %d response(s) in remote cache %r",
                 "Upserting" if mode == Mode.UPSERT else "Persisting",
                 len(group_responses),
                 cfg.tabular,
@@ -2502,8 +2502,8 @@ class HTTPSession(Session):
         if not keep:
             return
 
-        LOGGER.debug(
-            "Mirroring %s local-cache hit(s) to remote cache",
+        LOGGER.info(
+            "Mirroring %d local-cache hit(s) to remote cache",
             len(keep),
         )
         self._persist_remote(keep, key_to_remote_cfg, session_remote_cfg)
@@ -2794,7 +2794,7 @@ class HTTPSession(Session):
                     )
                 local_count = len(local_flat)
                 total_local += local_count
-                LOGGER.debug(
+                LOGGER.info(
                     "Completed send_many chunk #%d (requests=%d, "
                     "local_hits=%d, remote_hits=0, network=0, failed=0) "
                     "— fully short-circuited on local cache; "
@@ -2888,7 +2888,7 @@ class HTTPSession(Session):
                         f"{tkey}={len(v)}"
                         for tkey, v in remote_hits_by_table.items()  # type: ignore[union-attr]
                     )
-                LOGGER.debug(
+                LOGGER.info(
                     "Completed send_many chunk #%d (requests=%d, "
                     "local_hits=%d, remote_hits=%s, network=0, failed=0) "
                     "— short-circuited on remote cache; no requests sent "
@@ -2916,7 +2916,7 @@ class HTTPSession(Session):
             # new hits to persist.
             failed: list[Response] = []
             if config.cache_only:
-                LOGGER.debug(
+                LOGGER.info(
                     "send_many chunk #%d: cache_only=True, dropping "
                     "%d miss(es) without fetching",
                     chunk_index, len(after_remote),
@@ -3014,7 +3014,7 @@ class HTTPSession(Session):
                 network_count_log = net_count
             failed_count = len(failed)
             total_failed += failed_count
-            LOGGER.debug(
+            LOGGER.info(
                 "Completed send_many chunk #%d (requests=%d, "
                 "local_hits=%d, remote_hits=%s, network=%s, failed=%d)",
                 chunk_index, len(chunk), local_count,
@@ -3032,13 +3032,13 @@ class HTTPSession(Session):
                 failed[-1].raise_for_status()
 
         if is_spark:
-            LOGGER.debug(
+            LOGGER.info(
                 "Finished send_many pipeline (chunks=%d, mode=spark) "
                 "— per-bucket counts deferred to Spark action",
                 chunk_index,
             )
         else:
-            LOGGER.debug(
+            LOGGER.info(
                 "Finished send_many pipeline (chunks=%d, local_hits=%d, "
                 "remote_hits=%d, network=%d, failed=%d)",
                 chunk_index, total_local, total_remote,
@@ -3169,8 +3169,8 @@ class HTTPSession(Session):
                         how="left_anti",
                     )
 
-            LOGGER.debug(
-                "%s ok response(s) into remote cache %s (spark insert)",
+            LOGGER.info(
+                "%s ok response(s) into remote cache %r (spark insert)",
                 "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
                 cfg.tabular,
             )
@@ -3277,7 +3277,7 @@ class HTTPSession(Session):
         except Exception:
             default_par = 8
         n_parts = max(1, min(len(misses), default_par * 8))
-        LOGGER.debug(
+        LOGGER.info(
             "Scattering %d send_many miss(es) across %d Spark partition(s) "
             "via mapInArrow (default_parallelism=%d)",
             len(misses), n_parts, default_par,
