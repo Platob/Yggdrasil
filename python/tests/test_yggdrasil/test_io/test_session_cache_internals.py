@@ -205,10 +205,11 @@ class TestCacheLookupPredicates:
         assert cfg.make_batch_lookup_predicate(requests=[]) is None
 
     def test_batch_predicate_emits_in_list_per_match_column(self) -> None:
-        """``make_batch_lookup_predicate`` pivots per-request OR-of-ANDs
-        into per-column IN-lists. Verifies the AST shape is "partition_key
-        IN (...) AND <col> IN (...)" rather than an N-way OR — the
-        IN-list compiles faster inside pyarrow's filter kernel.
+        """``make_batch_lookup_predicate`` runs the result through
+        :func:`yggdrasil.io.tabular.execution.expr.simplify` so a chain
+        of ``col == v_i`` per request collapses into one
+        ``col IN (v_1, ..., v_N)`` — the IN-list compiles faster inside
+        pyarrow's filter kernel than an N-way ``OR``.
         """
         from yggdrasil.io.tabular.execution.expr import InList, Logical, LogicalOp
 
@@ -223,6 +224,25 @@ class TestCacheLookupPredicates:
             assert isinstance(clause, InList), (
                 f"Expected InList, got {type(clause).__name__}: {clause!r}"
             )
+
+    def test_or_of_eq_with_null_collapses_to_in_with_includes_null(self) -> None:
+        """The AST simplifier folds ``col == v1 | col == v2 | col IS NULL``
+        into one ``InList(includes_null=True)`` — verified through the
+        public ``Expression`` builders so the predicate parser path stays
+        the source of truth.
+        """
+        from yggdrasil.io.tabular.execution.expr import (
+            InList,
+            any_of,
+            col,
+            simplify,
+        )
+
+        raw = any_of(col("x") == 1, col("x") == 2, col("x").is_null())
+        simplified = simplify(raw)
+        assert isinstance(simplified, InList)
+        assert simplified.values == (1, 2)
+        assert simplified.includes_null is True
 
     def test_batch_predicate_dedups_repeated_match_values(self) -> None:
         """Multiple requests sharing a match value collapse to one IN-list entry."""

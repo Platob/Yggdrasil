@@ -950,3 +950,93 @@ class TestComplexNestedTypeDedupResample:
             {"sku": "sku-0-1", "qty": 1},
             {"sku": "sku-0-2", "qty": 2},
         ]
+
+
+class TestPartitionDataCache:
+    """``FolderPath._PARTITION_DATA_CACHE`` short-circuits leaf reads.
+
+    The cache lives on :class:`FolderPath` (process-wide ExpiringDict)
+    and stores the unfiltered batches for any partition-leaf folder
+    (one whose ``static_values`` were populated by Hive parsing). A
+    second read of the same partition skips the file open + IPC parse
+    entirely; the row-level predicate filter still runs on the cached
+    batches in pyarrow's C++ kernel.
+    """
+
+    def _seed_partitioned_folder(self, tmp_path, *, n: int = 6):
+        from yggdrasil.data import field, schema
+        epoch = pa.array(list(range(n)))
+        part = pa.array([f"p{i % 3}" for i in range(n)])
+        sch = schema(fields=[
+            field("part", pa.string(), tags={"partition_by": True}),
+            field("v", pa.int64()),
+        ])
+        folder = FolderPath(path=str(tmp_path))
+        folder._persist_schema(sch)
+        batch = pa.record_batch([part, epoch], names=["part", "v"])
+        folder.write_arrow_batches([batch])
+        return folder
+
+    def test_partition_cache_populates_on_first_read(self, tmp_path) -> None:
+        folder = self._seed_partitioned_folder(tmp_path)
+        FolderPath._PARTITION_DATA_CACHE.clear()
+        # First read: populates cache for each existing partition leaf.
+        assert folder.read_arrow_table().num_rows == 6
+        # 3 distinct ``part=`` values → 3 leaf entries.
+        assert len(FolderPath._PARTITION_DATA_CACHE._store) == 3
+
+    def test_partition_cache_hit_skips_file_open(self, tmp_path) -> None:
+        """A cached partition leaf never opens its leaf files again.
+
+        Wraps :class:`ArrowIPCFile._read_arrow_batches` with a counter
+        so the second read can prove every leaf was answered from
+        memory: count rises by one per file on the first (cold) read
+        and stays put on the second.
+        """
+        from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+
+        folder = self._seed_partitioned_folder(tmp_path)
+        FolderPath._PARTITION_DATA_CACHE.clear()
+        _ = folder.read_arrow_table()  # warm — opens 3 leaf files
+
+        orig = ArrowIPCFile._read_arrow_batches
+        opened = [0]
+
+        def counting(self, options):
+            opened[0] += 1
+            return orig(self, options)
+
+        ArrowIPCFile._read_arrow_batches = counting
+        try:
+            out = folder.read_arrow_table()
+        finally:
+            ArrowIPCFile._read_arrow_batches = orig
+        assert out.num_rows == 6
+        assert opened[0] == 0, (
+            f"expected 0 leaf-file reads on cached path, got {opened[0]}"
+        )
+
+        # Predicate-bearing reads still hit the cache; the row-level
+        # filter runs on the cached batches in pyarrow's C++ kernel.
+        from yggdrasil.io.tabular.execution.expr import col
+        filtered = folder.filter(col("v") >= 3).read_arrow_table()
+        assert sorted(filtered.column("v").to_pylist()) == [3, 4, 5]
+
+    def test_partition_cache_invalidates_on_write(self, tmp_path) -> None:
+        folder = self._seed_partitioned_folder(tmp_path)
+        FolderPath._PARTITION_DATA_CACHE.clear()
+        _ = folder.read_arrow_table()  # warm
+        assert len(FolderPath._PARTITION_DATA_CACHE._store) == 3
+
+        # A write into one of the partitions invalidates its cache
+        # entry on the way in (the partition leaf's
+        # ``_write_arrow_batches`` calls ``_invalidate_partition_cache``).
+        extra = pa.record_batch(
+            [pa.array(["p0"]), pa.array([99])], names=["part", "v"],
+        )
+        folder.write_arrow_batches([extra])
+        # The next read of ``part=p0`` re-populates the entry with
+        # the freshly-written row included.
+        out = folder.read_arrow_table()
+        assert out.num_rows == 7
+        assert 99 in out.column("v").to_pylist()
