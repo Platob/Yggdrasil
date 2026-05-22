@@ -1045,6 +1045,12 @@ class HTTPSession(Session):
         :meth:`send_many` already produces, so wrapping a single send
         adds no value.
 
+        When ``spark_session`` is bound (or ``True`` / ``...`` resolved
+        via :meth:`PyEnv.spark_session`), the wire send is fanned out
+        to an executor through the same ``mapInArrow`` path
+        :meth:`send_many` uses — the driver does not cross the wire.
+        Otherwise the call runs synchronously on the local pool.
+
         ``start=True`` (default) fires the wire call. ``start=False``
         builds the prepared request + response shell without crossing
         the wire — the :class:`StatementExecutor` override uses the
@@ -1055,7 +1061,7 @@ class HTTPSession(Session):
         synchronous), so the base raises a clean
         ``NotImplementedError`` via :meth:`_build_idle_response`.
         """
-        cfg = SendConfig.check_arg(
+        cfg = SendConfig.from_(
             config,
             wait=wait,
             raise_error=raise_error,
@@ -1068,6 +1074,22 @@ class HTTPSession(Session):
         )
         if not start:
             return self._build_idle_response(request, cfg)
+        if cfg.spark_session is not None:
+            # Fan the wire send out to an executor via the same
+            # ``mapInArrow`` path :meth:`send_many` uses, so the
+            # network call doesn't silently fall back to the driver
+            # when the caller explicitly bound a ``SparkSession``.
+            # ``_send_many`` already drains the per-chunk Spark frame
+            # row-by-row and re-applies ``raise_error`` at the driver
+            # boundary, so the contract of ``send`` (one Response,
+            # ``raise_for_status`` on failure) is preserved.
+            many_cfg = SendManyConfig.from_(cfg)
+            for response in self._send_many(iter([request]), many_cfg):
+                return response
+            # The fan-out yielded nothing — ``cache_only`` with a miss
+            # or a fully short-circuited pipeline. Fall back to the
+            # driver-side send so ``send`` still honours its
+            # single-Response contract.
         return self._send(request, cfg)
 
     def _build_idle_response(
@@ -1221,7 +1243,7 @@ class HTTPSession(Session):
         """Core send pipeline: local cache → remote cache → network → writeback.
 
         Assumes `config` is already a fully-resolved `SendConfig` (no kwargs
-        merging, no `check_arg`). Intended to be called by `send`, `_send_many`,
+        merging, no `from_`). Intended to be called by `send`, `_send_many`,
         and any other path that has already built its effective config.
         """
         remote_cfg = config.remote_cache
@@ -1563,7 +1585,7 @@ class HTTPSession(Session):
         the time cap; the batch only closes when ``batch_size`` is
         reached or the iterator is exhausted.
         """
-        cfg = SendManyConfig.check_arg(
+        cfg = SendManyConfig.from_(
             config,
             wait=wait,
             raise_error=raise_error,
@@ -2552,7 +2574,7 @@ class HTTPSession(Session):
         downstream stages moving when the upstream iterator is slow.
         ``None`` disables the time cap.
         """
-        cfg = SendManyConfig.check_arg(
+        cfg = SendManyConfig.from_(
             config,
             wait=wait,
             raise_error=raise_error,
