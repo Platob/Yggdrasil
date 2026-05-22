@@ -2898,7 +2898,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "GET",
             url,
@@ -2916,6 +2917,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def post(
@@ -2937,7 +2939,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "POST",
             url,
@@ -2956,6 +2959,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def put(
@@ -2977,7 +2981,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "PUT",
             url,
@@ -2996,6 +3001,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def patch(
@@ -3017,7 +3023,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "PATCH",
             url,
@@ -3036,6 +3043,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def delete(
@@ -3057,7 +3065,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "DELETE",
             url,
@@ -3076,6 +3085,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def head(
@@ -3096,7 +3106,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "HEAD",
             url,
@@ -3114,6 +3125,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def options(
@@ -3135,7 +3147,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         return self.request(
             "OPTIONS",
             url,
@@ -3154,6 +3167,7 @@ class Session(Singleton, ABC):
             normalize=normalize,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            send=send,
         )
 
     def request(
@@ -3176,7 +3190,8 @@ class Session(Singleton, ABC):
         normalize: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
-    ) -> Response:
+        send: bool = True,
+    ) -> Response | PreparedRequest:
         # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
         # form-urlencoding for mappings/sequences), ``timeout=`` becomes
         # ``wait=``, and ``cookies=`` joins ``headers={'Cookie': ...}``.
@@ -3222,6 +3237,9 @@ class Session(Singleton, ABC):
             json=json,
             normalize=normalize,
         )
+
+        if not send:
+            return prepared
 
         return self.send(
             prepared,

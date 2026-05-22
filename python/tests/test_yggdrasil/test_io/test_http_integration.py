@@ -267,6 +267,41 @@ class TestRequestsCompat:
         assert "q=yggdrasil" in seen.url.query
         assert "n=10" in seen.url.query
 
+    def test_send_false_returns_prepared_request(self) -> None:
+        from yggdrasil.io.request import PreparedRequest
+
+        s = StubSession()
+        prepared = s.get("https://example.com/x", params={"q": "1"}, send=False)
+        assert isinstance(prepared, PreparedRequest)
+        assert prepared.method == "GET"
+        assert "q=1" in prepared.url.query
+        # _local_send was never invoked.
+        assert s.calls == []
+
+    def test_send_false_post_carries_body_and_headers(self) -> None:
+        from yggdrasil.io.request import PreparedRequest
+
+        s = StubSession()
+        prepared = s.post(
+            "https://example.com/login",
+            data={"user": "alice"},
+            send=False,
+        )
+        assert isinstance(prepared, PreparedRequest)
+        assert prepared.method == "POST"
+        assert prepared.buffer.to_bytes() == b"user=alice"
+        assert prepared.headers.get("Content-Type") == "application/x-www-form-urlencoded"
+        assert s.calls == []
+
+    def test_send_true_default_still_sends(self) -> None:
+        from yggdrasil.io.response import Response
+
+        s = StubSession()
+        s.queue(make_response())
+        result = s.get("https://example.com/x")
+        assert isinstance(result, Response)
+        assert len(s.calls) == 1
+
 
 # ---------------------------------------------------------------------------
 # Local cache integration via the URL-mirrored fast-path tree
