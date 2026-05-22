@@ -147,22 +147,6 @@ def _validate_response_by(
     return keys
 
 
-def _is_tabular_io(arg: Any) -> bool:
-    """Duck-test ``arg`` for a :class:`Tabular`-shaped object.
-
-    Used by :meth:`CacheConfig.from_` so the test doesn't pull
-    in :class:`Tabular` (and its transitive ``yggdrasil.io.buffer``
-    imports) at config-construction time. Anything that exposes
-    both ``read_arrow_batches`` and ``write_arrow_batches`` qualifies
-    — covers :class:`FolderPath`, :class:`Table`, and any third-party
-    adapter following the same surface.
-    """
-    return (
-        callable(getattr(arg, "read_arrow_batches", None))
-        and callable(getattr(arg, "write_arrow_batches", None))
-    )
-
-
 def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
     if value in (None, ""):
         return None
@@ -513,23 +497,14 @@ class CacheConfig(_ConfigBase):
         if isinstance(arg, Mapping):
             return cls.parse_mapping(arg, **overrides)
 
-        if isinstance(arg, (Path, pathlib.PurePath, str)):
-            # Path-shaped → local cache backend. ``__post_init__``
-            # wraps it in a :class:`FolderPath` so the stored
-            # ``tabular`` is always a live :class:`Tabular`.
-            overrides["tabular"] = arg
-
-        elif _is_tabular_io(arg):
-            overrides["tabular"] = arg
-
-        elif isinstance(arg, dt.datetime):
+        if isinstance(arg, dt.datetime):
             overrides["received_from"] = arg
         elif isinstance(arg, dt.date):
             overrides["received_from"] = dt.datetime.combine(arg, dt.time.min, tzinfo=dt.timezone.utc)
 
         elif isinstance(arg, dt.timedelta) or (
             # Bare number → TTL in seconds. Same shape as the timedelta
-            # branch below; the ``bool`` exclusion mirrors
+            # branch; the ``bool`` exclusion mirrors
             # :func:`any_to_timedelta`, which refuses to treat a bool as
             # a seconds value.
             isinstance(arg, (int, float)) and not isinstance(arg, bool)
@@ -545,6 +520,18 @@ class CacheConfig(_ConfigBase):
             received_from = overrides.get("received_from")
             if not received_from:
                 overrides["received_from"] = received_to - ttl
+
+        else:
+            # Non-temporal arg → cache backend. ``Holder.from_`` is the
+            # canonical IO dispatch parser: bytes → :class:`Memory`,
+            # path-like str / ``pathlib`` / :class:`URL` → the
+            # scheme-matched storage class, an already-built IO /
+            # :class:`Tabular` (FolderPath, Databricks Table, …) →
+            # identity passthrough. ``__post_init__`` still wraps a
+            # bare :class:`Path` into a :class:`FolderPath` so the
+            # stored ``tabular`` is always a live :class:`Tabular`.
+            from yggdrasil.io.holder import Holder
+            overrides["tabular"] = Holder.from_(arg)
 
         return cls.parse_mapping(overrides) if overrides else cls.default()
 
