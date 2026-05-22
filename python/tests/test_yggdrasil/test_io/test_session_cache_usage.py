@@ -241,3 +241,144 @@ class TestCombinedCacheNetworkCount:
         # Now served by local — the backfill landed.
         assert out2.local_cached is True
         assert out2.remote_cached is False
+
+
+# ===========================================================================
+# Local cache — vectorisation proofs
+# ===========================================================================
+
+
+class TestLocalCacheVectorization:
+    """Strict proofs that the local-cache layer batches every
+    :meth:`FolderPath.read_arrow_batches` /
+    :meth:`FolderPath.write_arrow_batches` call across a whole
+    :meth:`Session.send_many` chunk.
+
+    The cache layer's whole reason for being is that it amortises
+    backend overhead (file open, predicate compile, schema rebuild)
+    across the chunk. A regression that drops to a per-request
+    read / write would silently 10x the cache-hit latency. These
+    tests pin the call counts so a future refactor that breaks
+    vectorisation fails loud instead of quiet.
+    """
+
+    def _patch_counter(self, monkeypatch, method_name: str) -> "list[int]":
+        from yggdrasil.io.nested.folder_path import FolderPath
+
+        calls: list[int] = []
+        original = getattr(FolderPath, method_name)
+
+        def wrapper(self, *args, **kwargs):
+            calls.append(1)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(FolderPath, method_name, wrapper)
+        return calls
+
+    def test_send_many_local_hits_use_single_batched_read(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """64 seeded requests → ONE `FolderPath.read_arrow_batches`."""
+        cache = _local_cfg(tmp_path)
+        n = 64
+        reqs = [make_request(f"https://example.com/v/{i:04d}") for i in range(n)]
+        for i, r in enumerate(reqs):
+            _seed_local(cache, make_response(request=r, body=f'{{"i":{i}}}'.encode()))
+
+        s = StubSession()
+        # Counter has to start AFTER seeding (each ``_seed_local`` calls
+        # ``write_arrow_batches`` once — those aren't the ones we measure).
+        read_calls = self._patch_counter(monkeypatch, "read_arrow_batches")
+
+        out = list(s.send_many(iter(reqs), local_cache=cache))
+
+        assert len(out) == n
+        assert all(r.local_cached is True for r in out)
+        assert len(s.calls) == 0, "all-hit chunk must not touch the network"
+        # One folder root, one chunk → exactly one batched read across
+        # all 64 partition_key values. Any per-request read would show
+        # 64 here.
+        assert len(read_calls) == 1, (
+            f"local cache should serve {n} hits with ONE batched read; "
+            f"saw {len(read_calls)} read(s) — vectorisation regressed."
+        )
+
+    def test_send_many_misses_use_single_batched_writeback(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """64 cache-miss writebacks → ONE `FolderPath.write_arrow_batches`."""
+        cache = _local_cfg(tmp_path)
+        n = 64
+        reqs = [make_request(f"https://example.com/w/{i:04d}") for i in range(n)]
+
+        s = StubSession()
+        for r in reqs:
+            s.queue(make_response(request=r, body=b'{"ok":true}'))
+
+        # Counter starts BEFORE send_many so the writebacks land in the
+        # counted window. We also need the read counter to confirm the
+        # initial miss-scan ran exactly once.
+        write_calls = self._patch_counter(monkeypatch, "write_arrow_batches")
+        read_calls = self._patch_counter(monkeypatch, "read_arrow_batches")
+
+        out = list(s.send_many(iter(reqs), local_cache=cache))
+
+        assert len(out) == n
+        assert len(s.calls) == n, "every miss must hit the network exactly once"
+        # One root, one chunk: one batched miss-scan read, then one
+        # batched writeback that drains every fetched response in a
+        # single ``values_to_arrow_batch`` walk + one ``_insert_cache``.
+        # Wait for the fire-and-forget writeback to drain before
+        # asserting.
+        _wait_for_local(cache, count=n)
+        assert len(read_calls) == 1, (
+            f"miss-scan must be ONE batched read across {n} requests; "
+            f"saw {len(read_calls)}."
+        )
+        assert len(write_calls) == 1, (
+            f"writeback must be ONE batched write across {n} responses; "
+            f"saw {len(write_calls)} — vectorisation regressed."
+        )
+
+    def test_send_many_mixed_hits_misses_uses_one_read_one_write(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Mixed batch: 1 read for the lookup + 1 write for the misses' writeback."""
+        cache = _local_cfg(tmp_path)
+        n_hit, n_miss = 32, 32
+        hit_reqs = [
+            make_request(f"https://example.com/mh/{i:04d}") for i in range(n_hit)
+        ]
+        miss_reqs = [
+            make_request(f"https://example.com/mm/{i:04d}") for i in range(n_miss)
+        ]
+        for i, r in enumerate(hit_reqs):
+            _seed_local(cache, make_response(request=r, body=f'{{"h":{i}}}'.encode()))
+
+        s = StubSession()
+        for r in miss_reqs:
+            s.queue(make_response(request=r, body=b'{"ok":true}'))
+
+        write_calls = self._patch_counter(monkeypatch, "write_arrow_batches")
+        read_calls = self._patch_counter(monkeypatch, "read_arrow_batches")
+
+        # Pre-shuffle so the lookup predicate covers a non-trivial mix.
+        all_reqs = []
+        for h, m in zip(hit_reqs, miss_reqs):
+            all_reqs.extend((h, m))
+        out = list(s.send_many(iter(all_reqs), local_cache=cache))
+
+        assert len(out) == n_hit + n_miss
+        assert len(s.calls) == n_miss, "only misses should hit the network"
+
+        # Wait for the writeback of the misses to drain.
+        _wait_for_local(cache, count=n_hit + n_miss)
+
+        assert len(read_calls) == 1, (
+            f"split_local_cache must scan with ONE batched read; "
+            f"saw {len(read_calls)}."
+        )
+        assert len(write_calls) == 1, (
+            f"writeback must be ONE batched write across {n_miss} new responses; "
+            f"saw {len(write_calls)}."
+        )
