@@ -527,8 +527,15 @@ class CacheConfig(_ConfigBase):
         elif isinstance(arg, dt.date):
             overrides["received_from"] = dt.datetime.combine(arg, dt.time.min, tzinfo=dt.timezone.utc)
 
-        elif isinstance(arg, dt.timedelta):
-            overrides["received_ttl"] = arg
+        elif isinstance(arg, dt.timedelta) or (
+            # Bare number → TTL in seconds. Same shape as the timedelta
+            # branch below; the ``bool`` exclusion mirrors
+            # :func:`any_to_timedelta`, which refuses to treat a bool as
+            # a seconds value.
+            isinstance(arg, (int, float)) and not isinstance(arg, bool)
+        ):
+            ttl = arg if isinstance(arg, dt.timedelta) else any_to_timedelta(arg)
+            overrides["received_ttl"] = ttl
 
             # fill received_from and received_to if not exists
             received_to = overrides.get("received_to")
@@ -537,7 +544,7 @@ class CacheConfig(_ConfigBase):
 
             received_from = overrides.get("received_from")
             if not received_from:
-                overrides["received_from"] = received_to - arg
+                overrides["received_from"] = received_to - ttl
 
         return cls.parse_mapping(overrides) if overrides else cls.default()
 
