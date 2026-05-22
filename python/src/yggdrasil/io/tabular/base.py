@@ -1192,6 +1192,7 @@ class Tabular(ABC, Generic[O]):
             frame, self.check_options(options, overrides=locals()),
         )
 
+    write_spark = write_spark_frame
     def _write_spark_frame(self, frame: "SparkDataFrame", options: O) -> None:
         to_arrow = getattr(frame, "toArrow", None)
         if to_arrow is not None:
