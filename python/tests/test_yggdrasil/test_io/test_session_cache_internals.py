@@ -204,6 +204,51 @@ class TestCacheLookupPredicates:
         cfg = self._cfg()
         assert cfg.make_batch_lookup_predicate(requests=[]) is None
 
+    def test_batch_predicate_emits_in_list_per_match_column(self) -> None:
+        """``make_batch_lookup_predicate`` pivots per-request OR-of-ANDs
+        into per-column IN-lists. Verifies the AST shape is "partition_key
+        IN (...) AND <col> IN (...)" rather than an N-way OR — the
+        IN-list compiles faster inside pyarrow's filter kernel.
+        """
+        from yggdrasil.io.tabular.execution.expr import InList, Logical, LogicalOp
+
+        cfg = self._cfg()
+        reqs = [make_request(f"https://example.com/r{i}") for i in range(32)]
+        pred = cfg.make_batch_lookup_predicate(requests=reqs)
+        # Top-level: AND of (partition_key IN ...) and (<match_col> IN ...).
+        assert isinstance(pred, Logical)
+        assert pred.op is LogicalOp.AND
+        # Every leaf clause is an IN-list — no OR-of-equalities nesting.
+        for clause in pred.operands:
+            assert isinstance(clause, InList), (
+                f"Expected InList, got {type(clause).__name__}: {clause!r}"
+            )
+
+    def test_batch_predicate_dedups_repeated_match_values(self) -> None:
+        """Multiple requests sharing a match value collapse to one IN-list entry."""
+        from yggdrasil.io.tabular.execution.expr import InList
+
+        cfg = self._cfg()
+        # Two requests with the same URL → same match value. The IN-list
+        # should carry one occurrence, not two.
+        reqs = [
+            make_request("https://example.com/dup"),
+            make_request("https://example.com/dup"),
+            make_request("https://example.com/other"),
+        ]
+        pred = cfg.make_batch_lookup_predicate(requests=reqs)
+        # Find the match-column IN-list (the partition_key one comes first).
+        match_in_lists = [
+            c for c in pred.operands
+            if isinstance(c, InList)
+            and getattr(c.target, "name", None) != "partition_key"
+        ]
+        assert match_in_lists, "expected at least one match-column IN-list"
+        for in_list in match_in_lists:
+            assert len(in_list.values) == len(set(in_list.values)), (
+                f"InList {in_list!r} carries duplicate values"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Partitioned local-cache layout (FolderPath under CacheConfig)
