@@ -482,58 +482,65 @@ class CacheConfig(_ConfigBase):
     def from_(
         cls,
         arg: "CacheConfig | Mapping[str, Any] | None",
+        *,
+        default: Any = ...,
         **overrides: Any,
     ) -> "CacheConfig":
-        if arg is None:
-            # Don't reuse :meth:`_ConfigBase._matches_default` here:
-            # :meth:`CacheConfig._check_mapping` intentionally does
-            # *not* drop None — passing ``cleanup_ttl=None`` is the
-            # documented way to disable cache cleanup — so collapsing
-            # ``CacheConfig.from_(None, cleanup_ttl=None)`` back to
-            # the default singleton would silently re-enable cleanup.
+        try:
+            if arg is None:
+                # Don't reuse :meth:`_ConfigBase._matches_default` here:
+                # :meth:`CacheConfig._check_mapping` intentionally does
+                # *not* drop None — passing ``cleanup_ttl=None`` is the
+                # documented way to disable cache cleanup — so collapsing
+                # ``CacheConfig.from_(None, cleanup_ttl=None)`` back to
+                # the default singleton would silently re-enable cleanup.
+                return cls.parse_mapping(overrides) if overrides else cls.default()
+            if isinstance(arg, cls):
+                return arg.merge(**overrides) if overrides else arg
+            if isinstance(arg, Mapping):
+                return cls.parse_mapping(arg, **overrides)
+
+            if isinstance(arg, dt.datetime):
+                overrides["received_from"] = arg
+            elif isinstance(arg, dt.date):
+                overrides["received_from"] = dt.datetime.combine(arg, dt.time.min, tzinfo=dt.timezone.utc)
+
+            elif isinstance(arg, dt.timedelta) or (
+                # Bare number → TTL in seconds. Same shape as the timedelta
+                # branch; the ``bool`` exclusion mirrors
+                # :func:`any_to_timedelta`, which refuses to treat a bool as
+                # a seconds value.
+                isinstance(arg, (int, float)) and not isinstance(arg, bool)
+            ):
+                ttl = arg if isinstance(arg, dt.timedelta) else any_to_timedelta(arg)
+                overrides["received_ttl"] = ttl
+
+                # fill received_from and received_to if not exists
+                received_to = overrides.get("received_to")
+                received_to = dt.datetime.now(dt.timezone.utc) if received_to is None else any_to_datetime(received_to)
+                overrides["received_to"] = received_to
+
+                received_from = overrides.get("received_from")
+                if not received_from:
+                    overrides["received_from"] = received_to - ttl
+
+            else:
+                # Non-temporal arg → cache backend. ``Holder.from_`` is the
+                # canonical IO dispatch parser: bytes → :class:`Memory`,
+                # path-like str / ``pathlib`` / :class:`URL` → the
+                # scheme-matched storage class, an already-built IO /
+                # :class:`Tabular` (FolderPath, Databricks Table, …) →
+                # identity passthrough. ``__post_init__`` still wraps a
+                # bare :class:`Path` into a :class:`FolderPath` so the
+                # stored ``tabular`` is always a live :class:`Tabular`.
+                from yggdrasil.io.holder import Holder
+                overrides["tabular"] = Holder.from_(arg)
+
             return cls.parse_mapping(overrides) if overrides else cls.default()
-        if isinstance(arg, cls):
-            return arg.merge(**overrides) if overrides else arg
-        if isinstance(arg, Mapping):
-            return cls.parse_mapping(arg, **overrides)
-
-        if isinstance(arg, dt.datetime):
-            overrides["received_from"] = arg
-        elif isinstance(arg, dt.date):
-            overrides["received_from"] = dt.datetime.combine(arg, dt.time.min, tzinfo=dt.timezone.utc)
-
-        elif isinstance(arg, dt.timedelta) or (
-            # Bare number → TTL in seconds. Same shape as the timedelta
-            # branch; the ``bool`` exclusion mirrors
-            # :func:`any_to_timedelta`, which refuses to treat a bool as
-            # a seconds value.
-            isinstance(arg, (int, float)) and not isinstance(arg, bool)
-        ):
-            ttl = arg if isinstance(arg, dt.timedelta) else any_to_timedelta(arg)
-            overrides["received_ttl"] = ttl
-
-            # fill received_from and received_to if not exists
-            received_to = overrides.get("received_to")
-            received_to = dt.datetime.now(dt.timezone.utc) if received_to is None else any_to_datetime(received_to)
-            overrides["received_to"] = received_to
-
-            received_from = overrides.get("received_from")
-            if not received_from:
-                overrides["received_from"] = received_to - ttl
-
-        else:
-            # Non-temporal arg → cache backend. ``Holder.from_`` is the
-            # canonical IO dispatch parser: bytes → :class:`Memory`,
-            # path-like str / ``pathlib`` / :class:`URL` → the
-            # scheme-matched storage class, an already-built IO /
-            # :class:`Tabular` (FolderPath, Databricks Table, …) →
-            # identity passthrough. ``__post_init__`` still wraps a
-            # bare :class:`Path` into a :class:`FolderPath` so the
-            # stored ``tabular`` is always a live :class:`Tabular`.
-            from yggdrasil.io.holder import Holder
-            overrides["tabular"] = Holder.from_(arg)
-
-        return cls.parse_mapping(overrides) if overrides else cls.default()
+        except (TypeError, ValueError):
+            if default is ...:
+                raise
+            return default
 
     def _derived_cache(self) -> dict:
         """Lazy-initialised dict for memoized derived properties.
@@ -1104,20 +1111,27 @@ class SendConfig(_ConfigBase):
     def from_(
         cls,
         arg: "SendConfig | Mapping[str, Any] | None",
+        *,
+        default: Any = ...,
         **overrides: Any,
     ) -> "SendConfig":
-        if arg is None:
-            if not overrides or cls._matches_default(overrides):
-                return cls.default()
-            return cls.parse_mapping(overrides)
-        if isinstance(arg, cls):
-            return arg.merge(**overrides) if overrides else arg
-        if isinstance(arg, Mapping):
-            return cls.parse_mapping(arg, **overrides)
-        raise TypeError(
-            f"{cls.__name__}.from_ expects a {cls.__name__}, Mapping, or None; "
-            f"got {type(arg).__name__!r}"
-        )
+        try:
+            if arg is None:
+                if not overrides or cls._matches_default(overrides):
+                    return cls.default()
+                return cls.parse_mapping(overrides)
+            if isinstance(arg, cls):
+                return arg.merge(**overrides) if overrides else arg
+            if isinstance(arg, Mapping):
+                return cls.parse_mapping(arg, **overrides)
+            raise TypeError(
+                f"{cls.__name__}.from_ expects a {cls.__name__}, Mapping, or None; "
+                f"got {type(arg).__name__!r}"
+            )
+        except (TypeError, ValueError):
+            if default is ...:
+                raise
+            return default
 
 
 @dataclass(frozen=True, slots=True)
@@ -1197,37 +1211,44 @@ class SendManyConfig(_ConfigBase):
     def from_(
         cls,
         arg: "SendManyConfig | SendConfig | Mapping[str, Any] | None",
+        *,
+        default: Any = ...,
         **overrides: Any,
     ) -> "SendManyConfig":
-        if arg is None:
-            if not overrides or cls._matches_default(overrides):
-                return cls.default()
-            return cls(**overrides)
-        if isinstance(arg, cls):
-            return arg.merge(**overrides) if overrides else arg
-        if isinstance(arg, SendConfig):
-            base = {
-                "wait": arg.wait,
-                "raise_error": arg.raise_error,
-                "stream": arg.stream,
-                "remote_cache": arg.remote_cache,
-                "local_cache": arg.local_cache,
-                "cache_only": arg.cache_only,
-                "as_tabular": arg.as_tabular,
-                "spark_session": arg.spark_session,
-            }
-            # Overrides win, but a None override means "no opinion" — fall back
-            # to the base value so we don't silently clobber the parent config.
-            for key, value in overrides.items():
-                if value is not None:
-                    base[key] = value
-            return cls.parse_mapping(base)
-        if isinstance(arg, Mapping):
-            return cls.parse_mapping(arg, **overrides)
-        raise TypeError(
-            f"{cls.__name__}.from_ expects a {cls.__name__}, SendConfig, "
-            f"Mapping, or None; got {type(arg).__name__!r}"
-        )
+        try:
+            if arg is None:
+                if not overrides or cls._matches_default(overrides):
+                    return cls.default()
+                return cls(**overrides)
+            if isinstance(arg, cls):
+                return arg.merge(**overrides) if overrides else arg
+            if isinstance(arg, SendConfig):
+                base = {
+                    "wait": arg.wait,
+                    "raise_error": arg.raise_error,
+                    "stream": arg.stream,
+                    "remote_cache": arg.remote_cache,
+                    "local_cache": arg.local_cache,
+                    "cache_only": arg.cache_only,
+                    "as_tabular": arg.as_tabular,
+                    "spark_session": arg.spark_session,
+                }
+                # Overrides win, but a None override means "no opinion" — fall back
+                # to the base value so we don't silently clobber the parent config.
+                for key, value in overrides.items():
+                    if value is not None:
+                        base[key] = value
+                return cls.parse_mapping(base)
+            if isinstance(arg, Mapping):
+                return cls.parse_mapping(arg, **overrides)
+            raise TypeError(
+                f"{cls.__name__}.from_ expects a {cls.__name__}, SendConfig, "
+                f"Mapping, or None; got {type(arg).__name__!r}"
+            )
+        except (TypeError, ValueError):
+            if default is ...:
+                raise
+            return default
 
     def to_send_config(
         self,
