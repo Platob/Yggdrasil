@@ -150,7 +150,7 @@ def _validate_response_by(
 def _is_tabular_io(arg: Any) -> bool:
     """Duck-test ``arg`` for a :class:`Tabular`-shaped object.
 
-    Used by :meth:`CacheConfig.check_arg` so the test doesn't pull
+    Used by :meth:`CacheConfig.from_` so the test doesn't pull
     in :class:`Tabular` (and its transitive ``yggdrasil.io.buffer``
     imports) at config-construction time. Anything that exposes
     both ``read_arrow_batches`` and ``write_arrow_batches`` qualifies
@@ -209,7 +209,7 @@ class _ConfigBase:
         field default — i.e. the resulting instance would be
         value-equal to :meth:`default`.
 
-        Lets ``check_arg`` / ``parse_mapping`` skip the constructor +
+        Lets ``from_`` / ``parse_mapping`` skip the constructor +
         ``__post_init__`` round trip on the steady-state shape that
         ``Session.send`` produces (every kwarg either ``None`` or the
         field default). Any non-None override that diverges from
@@ -258,11 +258,11 @@ class _ConfigBase:
 
         remote_cache = values.get("remote_cache")
         if remote_cache is not None:
-            values["remote_cache"] = CacheConfig.check_arg(remote_cache)
+            values["remote_cache"] = CacheConfig.from_(remote_cache)
 
         local_cache = values.get("local_cache")
         if local_cache is not None:
-            values["local_cache"] = CacheConfig.check_arg(local_cache)
+            values["local_cache"] = CacheConfig.from_(local_cache)
 
         return {
             k: v
@@ -288,7 +288,7 @@ class CacheConfig(_ConfigBase):
     #   - :class:`~yggdrasil.io.nested.folder_path.FolderPath` for the
     #     on-disk fast-path local cache (string / pathlib /
     #     :class:`~yggdrasil.io.path.Path` constructor arguments are
-    #     auto-coerced to a :class:`FolderPath` by :meth:`check_arg`);
+    #     auto-coerced to a :class:`FolderPath` by :meth:`from_`);
     #   - :class:`~yggdrasil.databricks.table.table.Table` (or any
     #     third-party adapter exposing ``read_arrow_batches`` /
     #     ``write_arrow_batches``) for the remote / network-backed
@@ -495,7 +495,7 @@ class CacheConfig(_ConfigBase):
         return None
 
     @classmethod
-    def check_arg(
+    def from_(
         cls,
         arg: "CacheConfig | Mapping[str, Any] | None",
         **overrides: Any,
@@ -505,7 +505,7 @@ class CacheConfig(_ConfigBase):
             # :meth:`CacheConfig._check_mapping` intentionally does
             # *not* drop None — passing ``cleanup_ttl=None`` is the
             # documented way to disable cache cleanup — so collapsing
-            # ``CacheConfig.check_arg(None, cleanup_ttl=None)`` back to
+            # ``CacheConfig.from_(None, cleanup_ttl=None)`` back to
             # the default singleton would silently re-enable cleanup.
             return cls.parse_mapping(overrides) if overrides else cls.default()
         if isinstance(arg, cls):
@@ -1081,8 +1081,8 @@ class SendConfig(_ConfigBase):
 
     def __post_init__(self):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
-        object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
-        object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
+        object.__setattr__(self, "remote_cache", CacheConfig.from_(self.remote_cache))
+        object.__setattr__(self, "local_cache", CacheConfig.from_(self.local_cache))
         # ``True`` / ``...`` → resolve the live SparkSession via
         # :meth:`PyEnv.spark_session` so callers don't have to thread
         # one through every layer. ``None`` stays ``None`` (Python mode).
@@ -1114,7 +1114,7 @@ class SendConfig(_ConfigBase):
         object.__setattr__(self, "spark_session", None)
 
     @classmethod
-    def check_arg(
+    def from_(
         cls,
         arg: "SendConfig | Mapping[str, Any] | None",
         **overrides: Any,
@@ -1128,7 +1128,7 @@ class SendConfig(_ConfigBase):
         if isinstance(arg, Mapping):
             return cls.parse_mapping(arg, **overrides)
         raise TypeError(
-            f"{cls.__name__}.check_arg expects a {cls.__name__}, Mapping, or None; "
+            f"{cls.__name__}.from_ expects a {cls.__name__}, Mapping, or None; "
             f"got {type(arg).__name__!r}"
         )
 
@@ -1163,8 +1163,8 @@ class SendManyConfig(_ConfigBase):
 
     def __post_init__(self):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
-        object.__setattr__(self, "remote_cache", CacheConfig.check_arg(self.remote_cache))
-        object.__setattr__(self, "local_cache", CacheConfig.check_arg(self.local_cache))
+        object.__setattr__(self, "remote_cache", CacheConfig.from_(self.remote_cache))
+        object.__setattr__(self, "local_cache", CacheConfig.from_(self.local_cache))
         spark = self.spark_session
         if spark is True or spark is ...:
             spark = PyEnv.spark_session()
@@ -1207,7 +1207,7 @@ class SendManyConfig(_ConfigBase):
         object.__setattr__(self, "spark_session", state["spark_session"])
 
     @classmethod
-    def check_arg(
+    def from_(
         cls,
         arg: "SendManyConfig | SendConfig | Mapping[str, Any] | None",
         **overrides: Any,
@@ -1238,7 +1238,7 @@ class SendManyConfig(_ConfigBase):
         if isinstance(arg, Mapping):
             return cls.parse_mapping(arg, **overrides)
         raise TypeError(
-            f"{cls.__name__}.check_arg expects a {cls.__name__}, SendConfig, "
+            f"{cls.__name__}.from_ expects a {cls.__name__}, SendConfig, "
             f"Mapping, or None; got {type(arg).__name__!r}"
         )
 

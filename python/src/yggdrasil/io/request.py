@@ -355,18 +355,18 @@ class PreparedRequest:
             else dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
         )
         self.buffer: Optional[Holder] = _coerce_request_buffer(buffer)
-        # Coerce the per-request cache configs through ``CacheConfig.check_arg``
+        # Coerce the per-request cache configs through ``CacheConfig.from_``
         # so callers can pass shorthand — a number of seconds (TTL window),
         # a ``timedelta``, a path string, a live ``Tabular`` — instead of
         # constructing the dataclass by hand. ``None`` stays ``None`` so the
         # session-level fallback still wins.
         from .send_config import CacheConfig as _CacheConfig
         self.local_cache_config = (
-            _CacheConfig.check_arg(local_cache_config)
+            _CacheConfig.from_(local_cache_config)
             if local_cache_config is not None else None
         )
         self.remote_cache_config = (
-            _CacheConfig.check_arg(remote_cache_config)
+            _CacheConfig.from_(remote_cache_config)
             if remote_cache_config is not None else None
         )
         self._sender: UserInfo | None = (

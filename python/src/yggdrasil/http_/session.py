@@ -1062,7 +1062,7 @@ class HTTPSession(Session):
         synchronous), so the base raises a clean
         ``NotImplementedError`` via :meth:`_build_idle_response`.
         """
-        cfg = SendConfig.check_arg(
+        cfg = SendConfig.from_(
             config,
             wait=wait,
             raise_error=raise_error,
@@ -1084,7 +1084,7 @@ class HTTPSession(Session):
             # row-by-row and re-applies ``raise_error`` at the driver
             # boundary, so the contract of ``send`` (one Response,
             # ``raise_for_status`` on failure) is preserved.
-            many_cfg = SendManyConfig.check_arg(cfg)
+            many_cfg = SendManyConfig.from_(cfg)
             for response in self._send_many(iter([request]), many_cfg):
                 return response
             raise YGGException(
@@ -1244,7 +1244,7 @@ class HTTPSession(Session):
         """Core send pipeline: local cache → remote cache → network → writeback.
 
         Assumes `config` is already a fully-resolved `SendConfig` (no kwargs
-        merging, no `check_arg`). Intended to be called by `send`, `_send_many`,
+        merging, no `from_`). Intended to be called by `send`, `_send_many`,
         and any other path that has already built its effective config.
         """
         remote_cfg = config.remote_cache
@@ -1586,7 +1586,7 @@ class HTTPSession(Session):
         the time cap; the batch only closes when ``batch_size`` is
         reached or the iterator is exhausted.
         """
-        cfg = SendManyConfig.check_arg(
+        cfg = SendManyConfig.from_(
             config,
             wait=wait,
             raise_error=raise_error,
@@ -2575,7 +2575,7 @@ class HTTPSession(Session):
         downstream stages moving when the upstream iterator is slow.
         ``None`` disables the time cap.
         """
-        cfg = SendManyConfig.check_arg(
+        cfg = SendManyConfig.from_(
             config,
             wait=wait,
             raise_error=raise_error,

@@ -553,13 +553,13 @@ class TestLocalCacheIntegration:
 
 
 class TestCacheConfigCoercion:
-    """``CacheConfig.check_arg`` accepts a few convenience shapes."""
+    """``CacheConfig.from_`` accepts a few convenience shapes."""
 
-    def test_check_arg_path_sets_local_tabular(self, tmp_path) -> None:
+    def test_from__path_sets_local_tabular(self, tmp_path) -> None:
         from yggdrasil.io.nested.folder_path import FolderPath
         from yggdrasil.io.path import LocalPath, Path as YggPath
 
-        cfg = CacheConfig.check_arg(tmp_path)
+        cfg = CacheConfig.from_(tmp_path)
         assert cfg.is_local is True
         assert cfg.is_remote is False
         # Path-shaped sugar is wrapped in a :class:`FolderPath`; the
@@ -571,40 +571,40 @@ class TestCacheConfigCoercion:
         assert cfg.local_cache_enabled is True
         assert str(cfg.local_cache_folder()) == str(tmp_path)
 
-    def test_check_arg_abstract_path_is_held_as_is(self, tmp_path) -> None:
-        # Passing a live :class:`Path` round-trips through ``check_arg``
+    def test_from__abstract_path_is_held_as_is(self, tmp_path) -> None:
+        # Passing a live :class:`Path` round-trips through ``from_``
         # via a FolderPath wrap; the underlying Path singleton identity
         # is preserved so the bound backend handle survives.
         from yggdrasil.io.nested.folder_path import FolderPath
         from yggdrasil.io.path import LocalPath
 
         target = LocalPath(str(tmp_path))
-        cfg = CacheConfig.check_arg(target)
+        cfg = CacheConfig.from_(target)
         assert isinstance(cfg.tabular, FolderPath)
         assert cfg.tabular.path is target
         assert cfg.local_cache_folder() is target
 
-    def test_check_arg_str_path_coerces_to_localpath(self, tmp_path) -> None:
+    def test_from__str_path_coerces_to_localpath(self, tmp_path) -> None:
         from yggdrasil.io.nested.folder_path import FolderPath
         from yggdrasil.io.path import LocalPath
 
-        cfg = CacheConfig.check_arg(str(tmp_path))
+        cfg = CacheConfig.from_(str(tmp_path))
         assert isinstance(cfg.tabular, FolderPath)
         assert isinstance(cfg.tabular.path, LocalPath)
         assert cfg.tabular.path == str(tmp_path)
 
-    def test_check_arg_timedelta_sets_window(self) -> None:
+    def test_from__timedelta_sets_window(self) -> None:
         import datetime as dt
 
-        cfg = CacheConfig.check_arg(dt.timedelta(hours=6))
-        # ``check_arg`` resolves a timedelta into a concrete window
+        cfg = CacheConfig.from_(dt.timedelta(hours=6))
+        # ``from_`` resolves a timedelta into a concrete window
         # (received_to defaults to now, received_from = now - delta).
         assert cfg.received_from is not None
         assert cfg.received_to is not None
         assert cfg.received_to - cfg.received_from == dt.timedelta(hours=6)
 
-    def test_check_arg_dict_round_trip(self) -> None:
-        cfg = CacheConfig.check_arg({"mode": "APPEND"})
+    def test_from__dict_round_trip(self) -> None:
+        cfg = CacheConfig.from_({"mode": "APPEND"})
         assert cfg.mode is Mode.APPEND
 
     def test_pickle_round_trip_preserves_local_cache(self, tmp_path) -> None:
@@ -687,14 +687,14 @@ class TestLocalCacheFolderPerHost:
 
 class TestSendConfig:
 
-    def test_check_arg_accepts_dict(self) -> None:
-        cfg = SendConfig.check_arg({"raise_error": False, "stream": False})
+    def test_from__accepts_dict(self) -> None:
+        cfg = SendConfig.from_({"raise_error": False, "stream": False})
         assert cfg.raise_error is False
         assert cfg.stream is False
 
-    def test_check_arg_accepts_send_config(self) -> None:
+    def test_from__accepts_send_config(self) -> None:
         base = SendConfig(raise_error=False)
-        merged = SendConfig.check_arg(base, stream=False)
+        merged = SendConfig.from_(base, stream=False)
         assert merged.raise_error is False
         assert merged.stream is False
 
