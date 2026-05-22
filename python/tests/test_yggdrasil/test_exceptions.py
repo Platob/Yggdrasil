@@ -5,9 +5,9 @@ Verifies:
 1. ``YGGException`` is the single library-wide root — every exception
    yggdrasil deliberately raises subclasses it.
 2. HTTP exceptions live at :mod:`yggdrasil.exceptions` (not
-   ``yggdrasil.io.errors``) and double-subclass
-   :class:`urllib3.exceptions.HTTPError` so existing
-   urllib3-aware ``except`` blocks still catch them.
+   ``yggdrasil.io.errors``) and double-subclass the transport
+   :class:`yggdrasil._http_pool.exceptions.HTTPError` so transport-level
+   ``except`` blocks still catch them.
 3. ``make_for_status`` dispatches to the right subclass for each
    status code and the produced exception is catchable as both
    ``YGGException`` and the specific subclass.
@@ -22,7 +22,8 @@ import importlib
 
 import pyarrow as pa
 import pytest
-import urllib3.exceptions as _u3
+
+from yggdrasil._http_pool import exceptions as _u3
 
 from yggdrasil.exceptions import (
     BadRequest,
@@ -60,8 +61,8 @@ class TestHierarchy:
             assert issubclass(cls, YGGException), cls.__name__
             assert issubclass(cls, HTTPError), cls.__name__
 
-    def test_http_errors_keep_urllib3_compatibility(self):
-        # urllib3-aware retry / catch blocks must still match.
+    def test_http_errors_keep_pool_compatibility(self):
+        # Transport-level retry / catch blocks must still match.
         assert issubclass(HTTPError, _u3.HTTPError)
         assert issubclass(NotFoundError, _u3.HTTPError)
 
@@ -114,7 +115,7 @@ class TestMakeForStatus:
 
 
 # ---------------------------------------------------------------------------
-# Catch shape — both the library-wide and urllib3-wide branches catch.
+# Catch shape — both the library-wide and transport-wide branches catch.
 # ---------------------------------------------------------------------------
 
 
@@ -131,7 +132,7 @@ class TestCatchShape:
         else:  # pragma: no cover — branch above must take the catch
             pytest.fail("YGGException did not catch HTTP error")
 
-    def test_except_urllib3_httperror_still_catches(self):
+    def test_except_pool_httperror_still_catches(self):
         req = make_request("https://api.example.com/x")
         resp = make_response(request=req, status_code=500, body=b"oops")
         exc = make_for_status(resp)

@@ -59,17 +59,17 @@ class WaitingConfig:
         return dt.timedelta(seconds=self.timeout)
 
     @property
-    def timeout_urllib3(self):
-        import urllib3
+    def timeout_pool(self):
+        from yggdrasil._http_pool import Timeout
 
         if not self.timeout:
-            return urllib3.Timeout(
+            return Timeout(
                 total=None,
                 connect=None,
                 read=None
             )
 
-        return urllib3.Timeout(
+        return Timeout(
             total=self.timeout * 2,
             connect=self.timeout,
             read=self.timeout

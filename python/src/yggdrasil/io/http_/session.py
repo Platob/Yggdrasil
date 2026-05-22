@@ -1,19 +1,16 @@
-"""Concrete HTTP/HTTPS session backed by ``urllib3``.
+"""Concrete HTTP/HTTPS session backed by :mod:`yggdrasil._http_pool`.
 
-Supports urllib3 ``>=1.26`` and ``>=2.0`` on the same code path —
-the two version-shaped knobs are isolated to module-level probes
-(:data:`_RETRY_ACCEPTS_BACKOFF_MAX`) so the rest of the file reads
-the same on either install.
+The pool, retry, and timeout primitives are urllib3-shaped but stdlib-backed
+(see :mod:`yggdrasil._http_pool`) — no third-party HTTP dependency.
 """
 from __future__ import annotations
 
 import datetime as dt
-import inspect
 import logging
 from itertools import takewhile
 from typing import Any, Optional
 
-import urllib3
+from yggdrasil._http_pool import PoolManager, Retry
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.dataclasses import WaitingConfig
@@ -33,15 +30,6 @@ __all__ = ["HTTPSession"]
 
 
 LOGGER = logging.getLogger(__name__)
-
-# urllib3 ``Retry`` gained ``backoff_max`` as a constructor kwarg in 2.0.
-# On 1.x the cap lives as the ``Retry.BACKOFF_MAX`` class attribute (we
-# pin it via ``_TieredRetry.BACKOFF_MAX`` below so both versions honor
-# the same ceiling).
-_RETRY_ACCEPTS_BACKOFF_MAX: bool = (
-    "backoff_max" in inspect.signature(urllib3.Retry.__init__).parameters
-)
-
 
 # Backoff tuning. 429s still get a longer schedule than 5xx because rate
 # limits need wall-clock time to clear, but both schedules are tight:
@@ -64,8 +52,8 @@ _BACKOFF_429_MAX = 5.0
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
-class _TieredRetry(urllib3.Retry):
-    """``urllib3.Retry`` variant with status-aware backoff.
+class _TieredRetry(Retry):
+    """:class:`Retry` variant with status-aware backoff.
 
     Standard ``Retry`` exposes a single ``backoff_factor`` shared by every
     retry, so 429 (rate limit) and 503 (transient outage) get the same
@@ -77,14 +65,9 @@ class _TieredRetry(urllib3.Retry):
     * **Everything else** (5xx, transport errors) uses a shorter schedule.
     * The server's ``Retry-After`` header — when present and respected via
       ``respect_retry_after_header=True`` — always overrides this, because
-      ``urllib3`` checks ``get_retry_after`` before ``get_backoff_time``.
+      the pool checks ``get_retry_after`` before ``get_backoff_time``.
     """
 
-    # urllib3 1.x reads the backoff ceiling from this class attribute
-    # (there is no constructor kwarg). urllib3 2.x still consults the
-    # attribute as the default when ``backoff_max`` is not passed, so
-    # pinning it here keeps the ceiling consistent across versions even
-    # if a future call site drops the explicit kwarg.
     BACKOFF_MAX = _BACKOFF_429_MAX
 
     def get_backoff_time(self) -> float:  # type: ignore[override]
@@ -118,7 +101,7 @@ class _TieredRetry(urllib3.Retry):
 
 
 class HTTPSession(Session):
-    """HTTP/HTTPS session backed by a ``urllib3`` connection pool.
+    """HTTP/HTTPS session backed by :class:`yggdrasil._http_pool.PoolManager`.
 
     Inherits the verb methods (``get`` / ``post`` / ``put`` / ``patch`` /
     ``delete`` / ``head`` / ``options`` / ``request``) from
@@ -142,13 +125,10 @@ class HTTPSession(Session):
     ) -> None:
         if getattr(self, "_initialized", False):
             return
-        # ``urllib3`` connection pools cap out at 8 hosts comfortably for
-        # our typical workloads; clamp here so a caller passing the legacy
-        # default (10) does not blow past the urllib3 sweet spot. The
-        # clamped value flows into ``self.pool_maxsize`` via
-        # ``Session.__init__`` and therefore into the singleton key, so
-        # ``HTTPSession(pool_maxsize=20)`` and ``HTTPSession()`` collapse
-        # to one instance the way they always did.
+        # The pool caps idle sockets per host; 8 is plenty for our typical
+        # workloads. Clamping here means the singleton key (built from
+        # ``pool_maxsize``) collapses ``HTTPSession(pool_maxsize=20)`` and
+        # ``HTTPSession()`` to one instance the way they always did.
         pool_maxsize = min(8, int(pool_maxsize)) if pool_maxsize else 8
         super().__init__(
             base_url=base_url,
@@ -162,13 +142,13 @@ class HTTPSession(Session):
         # access. Keeping ``__init__`` side-effect-free lets the
         # singleton-key probe (see :meth:`Session._singleton_key`) run
         # the constructor without opening sockets.
-        self._http_pool: Optional[urllib3.PoolManager] = None
+        self._http_pool: Optional[PoolManager] = None
 
     _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_http_pool"}
 
 
-    def _build_retry(self) -> urllib3.Retry:
-        """Build the :class:`urllib3.Retry` policy used by the connection pool.
+    def _build_retry(self) -> Retry:
+        """Build the :class:`Retry` policy used by the connection pool.
 
         Subclasses can override to swap the policy entirely, or call
         ``super()._build_retry().new(...)`` to tweak a single field.
@@ -189,16 +169,12 @@ class HTTPSession(Session):
             # fallback path (e.g. .new() that drops back to base behavior) is
             # still well-behaved.
             backoff_factor=_BACKOFF_5XX_FACTOR,
+            backoff_max=_BACKOFF_429_MAX,
         )
-        if _RETRY_ACCEPTS_BACKOFF_MAX:
-            # urllib3 2.x — explicit kwarg. urllib3 1.x has no such kwarg;
-            # the ceiling is enforced via ``_TieredRetry.BACKOFF_MAX``
-            # (class attribute) on that branch instead.
-            kwargs["backoff_max"] = _BACKOFF_429_MAX
         return _TieredRetry(**kwargs)
 
-    def _build_http_pool(self) -> urllib3.PoolManager:
-        return urllib3.PoolManager(
+    def _build_http_pool(self) -> PoolManager:
+        return PoolManager(
             num_pools=self.pool_maxsize,
             maxsize=self.pool_maxsize,
             block=True,
@@ -228,7 +204,7 @@ class HTTPSession(Session):
 
         raw_resp, result = self._wire_send(request, wait_cfg)
 
-        # 403 → refresh auth and retry once. urllib3's _RETRY_STATUSES
+        # 403 → refresh auth and retry once. The pool's status_forcelist
         # covers 5xx / 429 transients; 403 is a deliberate auth signal
         # some vendors (Salesforce, M365 SharePoint, …) emit instead
         # of 401 when a previously-valid token has been silently
@@ -270,23 +246,23 @@ class HTTPSession(Session):
     ) -> tuple[Any, HTTPResponse]:
         """Single wire-level send.
 
-        Returns the raw urllib3 response (kept around so the caller
-        can read pagination headers like ``X-Current-Page`` without a
-        second round trip) alongside the drained :class:`HTTPResponse`.
-        Extracted from :meth:`_local_send` so the 403-retry branch
-        re-uses the exact same transport call.
+        Returns the raw pool response (kept around so the caller can read
+        pagination headers like ``X-Current-Page`` without a second round
+        trip) alongside the drained :class:`HTTPResponse`. Extracted from
+        :meth:`_local_send` so the 403-retry branch re-uses the exact same
+        transport call.
         """
         raw_resp = self.http_pool.request(
             method=request.method,
             url=request.url.to_string(),
             body=request.buffer.to_bytes() if request.buffer is not None else None,
             headers=request.headers,
-            timeout=wait_cfg.timeout_urllib3,
+            timeout=wait_cfg.timeout_pool,
             preload_content=False,
             decode_content=False,
             redirect=True,
         )
-        result = HTTPResponse.from_urllib3(
+        result = HTTPResponse.from_pool(
             request=request,
             response=raw_resp,
             tags=None,
@@ -318,13 +294,13 @@ class HTTPSession(Session):
             url=page_url.to_string(),
             body=page_request.buffer.to_bytes() if page_request.buffer is not None else None,
             headers=page_request.headers,
-            timeout=wait_cfg.timeout_urllib3,
+            timeout=wait_cfg.timeout_pool,
             preload_content=not stream,
             decode_content=False,
             redirect=True,
         )
 
-        page_result = HTTPResponse.from_urllib3(
+        page_result = HTTPResponse.from_pool(
             request=page_request,
             response=raw_resp,
             tags=None,

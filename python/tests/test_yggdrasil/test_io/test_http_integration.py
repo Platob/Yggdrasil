@@ -735,11 +735,11 @@ class TestBodyParity:
         assert r.buffer.to_bytes() == b"abc"
 
 
-class TestFromUrllib3:
-    """Regression cover for ``HTTPResponse.from_urllib3``.
+class TestFromPool:
+    """Regression cover for ``HTTPResponse.from_pool``.
 
     The stubbed ``StubSession`` path bypasses this method entirely,
-    so we drive it with a duck-typed urllib3 response. The test is
+    so we drive it with a duck-typed pool response. The test is
     here to pin: (a) the buffer class is resolved via the Tabular
     registry, (b) the body is drained into the buffer in one pass,
     (c) callers can read JSON / bytes back out.
@@ -764,7 +764,7 @@ class TestFromUrllib3:
 
         return _RawResp()
 
-    def test_from_urllib3_stamps_media_on_holder_for_json(self) -> None:
+    def test_from_pool_stamps_media_on_holder_for_json(self) -> None:
         import datetime as dt
         from yggdrasil.io.holder import Holder
         from yggdrasil.io.http_.response import HTTPResponse
@@ -774,7 +774,7 @@ class TestFromUrllib3:
             body=b'{"ok":true}',
             headers={"Content-Type": "application/json"},
         )
-        resp = HTTPResponse.from_urllib3(
+        resp = HTTPResponse.from_pool(
             request=make_request("https://example.com/x"),
             response=raw,
             tags=None,
@@ -790,7 +790,7 @@ class TestFromUrllib3:
         assert resp.buffer.to_bytes() == b'{"ok":true}'
         assert resp.json() == {"ok": True}
 
-    def test_from_urllib3_falls_back_to_holder_on_unknown_media(self) -> None:
+    def test_from_pool_falls_back_to_holder_on_unknown_media(self) -> None:
         import datetime as dt
         from yggdrasil.io.holder import Holder
         from yggdrasil.io.http_.response import HTTPResponse
@@ -799,7 +799,7 @@ class TestFromUrllib3:
             body=b"binary blob",
             headers={"Content-Type": "application/x-not-registered"},
         )
-        resp = HTTPResponse.from_urllib3(
+        resp = HTTPResponse.from_pool(
             request=make_request("https://example.com/x"),
             response=raw,
             tags=None,
