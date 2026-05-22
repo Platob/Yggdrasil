@@ -33,7 +33,7 @@ I primarily work in Python notebooks on Databricks against
 - **Lifecycle ops:** Call the resource singleton's own method
   (`volume.create(...)`, `schema.delete(...)`, `table.read_info()`),
   not `ws.volumes.create(...)` directly — the singleton method wraps
-  retries, cache warm-up, and `if_not_exists` / `missing_ok` ergonomics.
+  retries, cache warm-up, and `missing_ok` ergonomics.
 
 ## Style
 

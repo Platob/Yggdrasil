@@ -158,7 +158,7 @@ class MongoEngine(MongoExecutor):
         size: Optional[int] = None,
         max_documents: Optional[int] = None,
         validator: Optional[Mapping[str, Any]] = None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
     ) -> "MongoCollection":
         target = self.collection(
             location=location,
@@ -170,7 +170,7 @@ class MongoEngine(MongoExecutor):
             size=size,
             max_documents=max_documents,
             validator=validator,
-            if_not_exists=if_not_exists,
+            missing_ok=missing_ok,
         )
 
     def drop_collection(

@@ -71,7 +71,7 @@ dbc.volume("main.default.v").ensure_created()
 
 The singleton method wraps retries, cache warm-up, defaults
 (managed-volume-type, owner / comment normalization), and
-`if_not_exists` / `missing_ok` ergonomics.
+`missing_ok` ergonomics.
 
 ### 5. Hand-rolled JSON
 

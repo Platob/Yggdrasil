@@ -582,16 +582,16 @@ class TestTableCloneIntegration(_TableFixture):
         with self.assertRaises(ValueError):
             self.table.clone(self.table.full_name())
 
-    def test_clone_if_not_exists_skips_when_target_present(self) -> None:
+    def test_clone_missing_ok_skips_when_target_present(self) -> None:
         target_name = self._clone_target_name()
         try:
             first = self.table.clone(target_name)
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(f"Cannot clone table: {exc}.")
         self.assertTrue(first.exists)
-        # Second call with if_not_exists must not raise even though the
+        # Second call with missing_ok must not raise even though the
         # target is already there.
-        self.table.clone(target_name, if_not_exists=True)
+        self.table.clone(target_name, missing_ok=True)
 
 
 @pytest.mark.integration

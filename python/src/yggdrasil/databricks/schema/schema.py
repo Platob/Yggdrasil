@@ -322,7 +322,7 @@ class Schema(DatabricksPath, Singleton):
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents
-        self.ensure_created() if exist_ok else self.create(if_not_exists=False)
+        self.ensure_created() if exist_ok else self.create(missing_ok=False)
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         self.delete(wait=wait, raise_error=not missing_ok)
@@ -524,7 +524,7 @@ class Schema(DatabricksPath, Singleton):
         comment: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
     ) -> "Schema":
         """Create this schema in Unity Catalog.
 
@@ -532,12 +532,12 @@ class Schema(DatabricksPath, Singleton):
             comment:      Human-readable description.
             properties:   Extra key/value properties.
             storage_root: External storage root URI.
-            if_not_exists: Silently succeed if the schema already exists.
+            missing_ok: Silently succeed if the schema already exists.
         """
         uc = self.client.workspace_client().schemas
         logger.debug(
-            "Creating schema %r (storage_root=%s, if_not_exists=%s)",
-            self, storage_root, if_not_exists,
+            "Creating schema %r (storage_root=%s, missing_ok=%s)",
+            self, storage_root, missing_ok,
         )
         try:
             info = uc.create(
@@ -550,7 +550,7 @@ class Schema(DatabricksPath, Singleton):
             object.__setattr__(self, "_infos", info)
             object.__setattr__(self, "_infos_fetched_at", time.time())
         except DatabricksError as exc:
-            if if_not_exists and "already exists" in str(exc).lower():
+            if missing_ok and "already exists" in str(exc).lower():
                 logger.debug(
                     "Schema %r already exists — soft-resetting cache", self,
                 )
@@ -572,7 +572,7 @@ class Schema(DatabricksPath, Singleton):
                 comment=comment,
                 properties=properties,
                 storage_root=storage_root,
-                if_not_exists=True,
+                missing_ok=True,
             )
         return self
 

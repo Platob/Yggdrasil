@@ -858,7 +858,7 @@ class HTTPSession(Session):
             return list(tabular.read_arrow_batches(options=options))
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc) and hasattr(tabular, "create"):
-                tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                tabular.create(RESPONSE_ARROW_SCHEMA, missing_ok=True)
                 return list(tabular.read_arrow_batches(options=options))
             raise
 
@@ -919,9 +919,11 @@ class HTTPSession(Session):
             if best is None or response.received_at >= best.received_at:
                 best = response
         if best is not None:
-            LOGGER.debug(
-                "Found %s %s %s in %r",
+            LOGGER.info(
+                "Cache hit %s %s %s in %r (status=%d, received_at=%s) "
+                "— skipping network",
                 source, request.method, request.url, tabular,
+                best.status_code, best.received_at,
             )
             best.local_cached = (source == "local")
             best.remote_cached = (source == "remote")
@@ -1764,9 +1766,11 @@ class HTTPSession(Session):
 
         if hits:
             total = sum(len(v) for v in hits.values())
-            LOGGER.debug(
-                "Batch local cache: %s/%s hits across %s path(s)",
-                total, len(batch), len(hits),
+            LOGGER.info(
+                "Batch local cache: %d/%d hit(s) across %d path(s) — "
+                "skipping network for %d request(s); breakdown: %s",
+                total, len(batch), len(hits), total,
+                ", ".join(f"{p!r}={len(v)}" for p, v in hits.items()),
             )
         return hits, misses
 
@@ -1835,9 +1839,11 @@ class HTTPSession(Session):
             misses.extend(t_misses)
 
         if total_hits:
-            LOGGER.debug(
-                "Batch remote cache: %s/%s hits across %s table(s)",
-                total_hits, len(requests), len(table_to_cfg),
+            LOGGER.info(
+                "Batch remote cache: %d/%d hit(s) across %d table(s) — "
+                "skipping network for %d request(s); breakdown: %s",
+                total_hits, len(requests), len(table_to_cfg), total_hits,
+                ", ".join(f"{tkey}={len(v)}" for tkey, v in hits.items()),
             )
         return hits, misses
 
@@ -2100,7 +2106,7 @@ class HTTPSession(Session):
             hits_df = cfg.tabular.read_spark_frame(options=opts)
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, missing_ok=True)
                 hits_df = cfg.tabular.read_spark_frame(options=opts)
             else:
                 raise
@@ -2210,7 +2216,7 @@ class HTTPSession(Session):
         )
 
         pool = self.job_pool
-        LOGGER.debug(
+        LOGGER.info(
             "Fetching %d send_many miss(es) through job pool "
             "(max_in_flight=%d, ordered=%s)",
             len(misses),
@@ -2410,8 +2416,8 @@ class HTTPSession(Session):
             cfg: "CacheConfig",
             group_responses: "list[Response]",
         ) -> None:
-            LOGGER.debug(
-                "%s %s response(s) in remote cache %s",
+            LOGGER.info(
+                "%s %d response(s) in remote cache %r",
                 "Upserting" if mode == Mode.UPSERT else "Persisting",
                 len(group_responses),
                 cfg.tabular,
@@ -2496,8 +2502,8 @@ class HTTPSession(Session):
         if not keep:
             return
 
-        LOGGER.debug(
-            "Mirroring %s local-cache hit(s) to remote cache",
+        LOGGER.info(
+            "Mirroring %d local-cache hit(s) to remote cache",
             len(keep),
         )
         self._persist_remote(keep, key_to_remote_cfg, session_remote_cfg)
@@ -2788,11 +2794,16 @@ class HTTPSession(Session):
                     )
                 local_count = len(local_flat)
                 total_local += local_count
-                LOGGER.debug(
+                LOGGER.info(
                     "Completed send_many chunk #%d (requests=%d, "
                     "local_hits=%d, remote_hits=0, network=0, failed=0) "
-                    "— fully short-circuited on local cache",
+                    "— fully short-circuited on local cache; "
+                    "no requests sent (local_paths=%s)",
                     chunk_index, len(chunk), local_count,
+                    ", ".join(
+                        f"{p!r}={len(v)}"
+                        for p, v in local_hits_by_path.items()
+                    ),
                 )
                 yield HTTPResponseBatch(
                     local_hits=local_hits,
@@ -2868,12 +2879,27 @@ class HTTPSession(Session):
                     )
                     total_remote += remote_count
                 total_local += local_count
-                LOGGER.debug(
+                if is_spark:
+                    remote_breakdown = ", ".join(
+                        f"{tkey}=<spark>" for tkey in remote_hits_by_table
+                    )
+                else:
+                    remote_breakdown = ", ".join(
+                        f"{tkey}={len(v)}"
+                        for tkey, v in remote_hits_by_table.items()  # type: ignore[union-attr]
+                    )
+                LOGGER.info(
                     "Completed send_many chunk #%d (requests=%d, "
                     "local_hits=%d, remote_hits=%s, network=0, failed=0) "
-                    "— short-circuited on remote cache",
+                    "— short-circuited on remote cache; no requests sent "
+                    "(local_paths=%s, remote_tables=%s)",
                     chunk_index, len(chunk), local_count,
                     "<spark>" if remote_count < 0 else remote_count,
+                    ", ".join(
+                        f"{p!r}={len(v)}"
+                        for p, v in local_hits_by_path.items()
+                    ) or "none",
+                    remote_breakdown or "none",
                 )
                 yield HTTPResponseBatch(
                     local_hits=local_hits,
@@ -2890,7 +2916,7 @@ class HTTPSession(Session):
             # new hits to persist.
             failed: list[Response] = []
             if config.cache_only:
-                LOGGER.debug(
+                LOGGER.info(
                     "send_many chunk #%d: cache_only=True, dropping "
                     "%d miss(es) without fetching",
                     chunk_index, len(after_remote),
@@ -2988,7 +3014,7 @@ class HTTPSession(Session):
                 network_count_log = net_count
             failed_count = len(failed)
             total_failed += failed_count
-            LOGGER.debug(
+            LOGGER.info(
                 "Completed send_many chunk #%d (requests=%d, "
                 "local_hits=%d, remote_hits=%s, network=%s, failed=%d)",
                 chunk_index, len(chunk), local_count,
@@ -3006,13 +3032,13 @@ class HTTPSession(Session):
                 failed[-1].raise_for_status()
 
         if is_spark:
-            LOGGER.debug(
+            LOGGER.info(
                 "Finished send_many pipeline (chunks=%d, mode=spark) "
                 "— per-bucket counts deferred to Spark action",
                 chunk_index,
             )
         else:
-            LOGGER.debug(
+            LOGGER.info(
                 "Finished send_many pipeline (chunks=%d, local_hits=%d, "
                 "remote_hits=%d, network=%d, failed=%d)",
                 chunk_index, total_local, total_remote,
@@ -3143,8 +3169,8 @@ class HTTPSession(Session):
                         how="left_anti",
                     )
 
-            LOGGER.debug(
-                "%s ok response(s) into remote cache %s (spark insert)",
+            LOGGER.info(
+                "%s ok response(s) into remote cache %r (spark insert)",
                 "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
                 cfg.tabular,
             )
@@ -3208,6 +3234,26 @@ class HTTPSession(Session):
         if not misses:
             return self._cached_empty_spark_frame(spark)
 
+        # Driver-side prepare before the mapInArrow scatter. Subclasses
+        # use :meth:`prepare_request_before_send` for URL normalisation,
+        # session-wide header injection, auth refresh, request signing
+        # — applying it here means the wire payload, the Arrow row,
+        # and any signed Authorization header all reflect the driver's
+        # view before crossing executors. Workers re-prepare inside
+        # :meth:`send_many` → :meth:`_send` (double-prepare) so
+        # per-executor concerns — stale token refresh on a long-running
+        # partition, executor-local correlation IDs — still apply.
+        # The default hook (session-header merge + cached-token auth
+        # refresh) is idempotent under double-call; subclasses that
+        # mutate non-idempotently should guard on their own state.
+        for req in misses:
+            self.prepare_request_before_send(req)
+        LOGGER.debug(
+            "Driver-prepared %d send_many miss(es) before mapInArrow "
+            "scatter (workers re-prepare via send_many)",
+            len(misses),
+        )
+
         # One C++-side struct walk turns the request list into a single
         # Arrow table that matches REQUEST_SCHEMA column-for-column.
         # No per-row pickle, no closure capture of ``self``.
@@ -3231,7 +3277,7 @@ class HTTPSession(Session):
         except Exception:
             default_par = 8
         n_parts = max(1, min(len(misses), default_par * 8))
-        LOGGER.debug(
+        LOGGER.info(
             "Scattering %d send_many miss(es) across %d Spark partition(s) "
             "via mapInArrow (default_parallelism=%d)",
             len(misses), n_parts, default_par,

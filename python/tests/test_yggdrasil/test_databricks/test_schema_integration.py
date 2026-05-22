@@ -140,9 +140,9 @@ class TestSchemaLifecycleIntegration(_SchemaFixture):
         self.assertIs(result, self.schema)
         self.assertTrue(self.schema.exists)
 
-    def test_create_if_not_exists_false_raises_on_existing(self) -> None:
+    def test_create_missing_ok_false_raises_on_existing(self) -> None:
         with self.assertRaises(DatabricksError):
-            self.schema.create(if_not_exists=False)
+            self.schema.create(missing_ok=False)
 
     def test_update_comment_round_trip(self) -> None:
         new_comment = f"updated-{secrets.token_hex(3)}"

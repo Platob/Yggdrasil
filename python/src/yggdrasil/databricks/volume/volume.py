@@ -408,13 +408,13 @@ class Volume(DatabricksResource, Singleton):
         Routes the volume create through :meth:`create` so the
         managed-volume-type default (``VolumeType.MANAGED`` enum, not
         a bare ``"MANAGED"`` string the SDK rejects) lives in one
-        place. ``AlreadyExists`` is swallowed by ``if_not_exists=True``;
+        place. ``AlreadyExists`` is swallowed by ``missing_ok=True``;
         on NotFound the parents are materialised via
         :func:`_ensure_parents_for` and the volume create is retried
         once.
         """
         try:
-            self.create(if_not_exists=True)
+            self.create(missing_ok=True)
             return
         except Exception as exc:
             if _looks_like_already_exists(exc):
@@ -429,7 +429,7 @@ class Volume(DatabricksResource, Singleton):
             schema_name=self.schema_name,
         )
         try:
-            self.create(if_not_exists=True)
+            self.create(missing_ok=True)
         except Exception as exc:
             if not _looks_like_already_exists(exc):
                 raise
@@ -647,7 +647,7 @@ class Volume(DatabricksResource, Singleton):
         comment: str | None = None,
         storage_location: str | None = None,
         volume_type: Any = None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
     ) -> "Volume":
         """Create this volume in Unity Catalog.
 
@@ -671,7 +671,7 @@ class Volume(DatabricksResource, Singleton):
             info = uc.create(**kwargs)
             self._store_infos(info)
         except DatabricksError as exc:
-            if if_not_exists and "already exists" in str(exc).lower():
+            if missing_ok and "already exists" in str(exc).lower():
                 self._reset_cache()
             else:
                 raise
@@ -690,7 +690,7 @@ class Volume(DatabricksResource, Singleton):
                 comment=comment,
                 storage_location=storage_location,
                 volume_type=volume_type,
-                if_not_exists=True,
+                missing_ok=True,
             )
         return self
 

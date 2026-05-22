@@ -235,7 +235,7 @@ class Volumes(DatabricksService):
         comment: str | None = None,
         storage_location: str | None = None,
         volume_type=None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
     ) -> Volume:
         """Create a volume by name, auto-creating missing schema / catalog.
 
@@ -259,7 +259,7 @@ class Volumes(DatabricksService):
             volume_type=volume_type,
         )
         try:
-            return volume.create(**create_kwargs, if_not_exists=if_not_exists)
+            return volume.create(**create_kwargs, missing_ok=missing_ok)
         except Exception as exc:
             if not _looks_like_not_found(exc):
                 raise
@@ -271,7 +271,7 @@ class Volumes(DatabricksService):
                 catalog_name=volume.catalog_name,
                 schema_name=volume.schema_name,
             )
-        return volume.create(**create_kwargs, if_not_exists=True)
+        return volume.create(**create_kwargs, missing_ok=True)
 
     # ── remote fetch ──────────────────────────────────────────────────────────
 

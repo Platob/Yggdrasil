@@ -370,7 +370,7 @@ class VectorSearchEndpoint(DatabricksResource):
         budget_policy_id: Optional[str] = None,
         target_qps: Optional[int] = None,
         wait: WaitingConfigArg = None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
     ) -> "VectorSearchEndpoint":
         """Create this endpoint.
 
@@ -392,7 +392,7 @@ class VectorSearchEndpoint(DatabricksResource):
             :attr:`VectorSearchDefaults.wait`, or anything
             :meth:`WaitingConfig.from_` accepts (seconds, timedelta,
             deadline, dict, full ``WaitingConfig``).
-        if_not_exists
+        missing_ok
             When ``True`` (the default), an existing endpoint with
             the same name is treated as success and the cached
             :attr:`infos` is refreshed instead of raising.
@@ -415,7 +415,7 @@ class VectorSearchEndpoint(DatabricksResource):
                 target_qps=target_qps,
             ).response
         except AlreadyExists:
-            if not if_not_exists:
+            if not missing_ok:
                 raise
             LOGGER.debug(
                 "Vector-search endpoint %r already exists — refreshing infos",
@@ -423,7 +423,7 @@ class VectorSearchEndpoint(DatabricksResource):
             )
             self.refresh()
         except DatabricksError as exc:
-            if if_not_exists and "already exists" in str(exc).lower():
+            if missing_ok and "already exists" in str(exc).lower():
                 LOGGER.debug(
                     "Vector-search endpoint %r already exists — refreshing infos",
                     self,
@@ -453,7 +453,7 @@ class VectorSearchEndpoint(DatabricksResource):
             budget_policy_id=budget_policy_id,
             target_qps=target_qps,
             wait=wait,
-            if_not_exists=True,
+            missing_ok=True,
         )
 
     def delete(self, *, missing_ok: bool = False) -> None:
@@ -662,7 +662,7 @@ class VectorSearchIndex(DatabricksResource):
         embedding_writeback_table: Optional[str] = None,
         endpoint_name: Optional[str] = None,
         wait: WaitingConfigArg = None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
     ) -> "VectorSearchIndex":
         """Create a ``DELTA_SYNC`` index backed by a UC Delta source table.
 
@@ -773,12 +773,12 @@ class VectorSearchIndex(DatabricksResource):
             self._details = info
             self._endpoint_name = info.endpoint_name or ep_name
         except AlreadyExists:
-            if not if_not_exists:
+            if not missing_ok:
                 raise
             LOGGER.debug("Vector-search index %r already exists — refreshing", self)
             self.refresh()
         except DatabricksError as exc:
-            if if_not_exists and "already exists" in str(exc).lower():
+            if missing_ok and "already exists" in str(exc).lower():
                 LOGGER.debug("Vector-search index %r already exists — refreshing", self)
                 self.refresh()
             else:
@@ -800,7 +800,7 @@ class VectorSearchIndex(DatabricksResource):
         embedding_model_endpoint_name: Optional[str] = None,
         endpoint_name: Optional[str] = None,
         wait: WaitingConfigArg = None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
     ) -> "VectorSearchIndex":
         """Create a ``DIRECT_ACCESS`` index that the caller upserts into.
 
@@ -919,12 +919,12 @@ class VectorSearchIndex(DatabricksResource):
             self._details = info
             self._endpoint_name = info.endpoint_name or ep_name
         except AlreadyExists:
-            if not if_not_exists:
+            if not missing_ok:
                 raise
             LOGGER.debug("Vector-search index %r already exists — refreshing", self)
             self.refresh()
         except DatabricksError as exc:
-            if if_not_exists and "already exists" in str(exc).lower():
+            if missing_ok and "already exists" in str(exc).lower():
                 LOGGER.debug("Vector-search index %r already exists — refreshing", self)
                 self.refresh()
             else:

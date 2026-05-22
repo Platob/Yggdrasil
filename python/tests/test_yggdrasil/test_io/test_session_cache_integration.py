@@ -180,7 +180,7 @@ class _FakeRemoteTabular:
     def full_name(self, safe: bool = False) -> str:
         return self._name
 
-    def create(self, schema: pa.Schema, if_not_exists: bool = False) -> None:
+    def create(self, schema: pa.Schema, missing_ok: bool = False) -> None:
         self.created = True
         self.raise_table_not_found = False
 

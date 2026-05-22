@@ -171,10 +171,10 @@ class TestClone(unittest.TestCase):
             )
         )
 
-    def test_if_not_exists(self) -> None:
+    def test_missing_ok(self) -> None:
         t, sql = _table()
         with patch.object(Table, "sql", new_callable=lambda: property(lambda _s: sql)):
-            t.clone("backup.orders_copy", if_not_exists=True)
+            t.clone("backup.orders_copy", missing_ok=True)
 
         self.assertTrue(
             _normalize_ws(sql.executed[0]).startswith(
@@ -182,11 +182,11 @@ class TestClone(unittest.TestCase):
             )
         )
 
-    def test_replace_and_if_not_exists_conflict(self) -> None:
+    def test_replace_and_missing_ok_conflict(self) -> None:
         t, sql = _table()
         with patch.object(Table, "sql", new_callable=lambda: property(lambda _s: sql)):
             with self.assertRaises(ValueError):
-                t.clone("backup.orders_copy", replace=True, if_not_exists=True)
+                t.clone("backup.orders_copy", replace=True, missing_ok=True)
         self.assertEqual(sql.executed, [])
 
     def test_version_as_of(self) -> None:

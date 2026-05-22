@@ -201,7 +201,7 @@ class MongoCollection(Tabular):
         size: Optional[int] = None,
         max_documents: Optional[int] = None,
         validator: Optional[Mapping[str, Any]] = None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
         comment: Optional[str] = None,
     ) -> "MongoCollection":
         """``createCollection`` — collections are otherwise auto-materialised on first insert.
@@ -210,7 +210,7 @@ class MongoCollection(Tabular):
         validated / time-series collections, where MongoDB requires
         the create options up-front.
         """
-        if if_not_exists and self.exists:
+        if missing_ok and self.exists:
             return self
         kwargs: dict[str, Any] = {}
         if capped:
@@ -233,7 +233,7 @@ class MongoCollection(Tabular):
 
     def ensure_created(self, **kwargs: Any) -> "MongoCollection":
         if not self.exists:
-            self.create(if_not_exists=True, **kwargs)
+            self.create(missing_ok=True, **kwargs)
         return self
 
     def delete(self, *, if_exists: bool = True) -> "MongoCollection":

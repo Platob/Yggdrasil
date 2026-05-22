@@ -69,7 +69,7 @@ the existing cache.
 **their own** `.create(...)`, `.delete(...)`, `.read_info(...)`,
 `.ensure_created(...)`, `.exists` methods — they wrap the underlying
 SDK with project defaults (managed-volume-type, owner / comment
-normalization), the `_store_infos` cache warm-up, and `if_not_exists`
+normalization), the `_store_infos` cache warm-up, and `missing_ok`
 / `missing_ok` ergonomics.
 
 ```python

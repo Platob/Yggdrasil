@@ -56,7 +56,7 @@ client = DatabricksClient()
 vol    = client.volumes["main.raw.landing"]
 
 # Create if it doesn't exist
-vol.create(if_not_exists=True, comment="Raw landing area")
+vol.create(missing_ok=True, comment="Raw landing area")
 
 # Ensure with a single call (idempotent)
 vol.ensure_created(comment="Raw landing area")
