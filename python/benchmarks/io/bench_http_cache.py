@@ -6,7 +6,7 @@ What this covers
 The two caching layers that wrap :class:`yggdrasil.io.Session.send`
 plus their config plumbing:
 
-* :class:`CacheConfig` — ``check_arg`` (the polymorphic entry point
+* :class:`CacheConfig` — ``from_`` (the polymorphic entry point
   every ``send`` call funnels through), the predicate properties used
   to gate the cache pipeline (``cache_enabled``, ``local_cache_enabled``,
   ``remote_cache_enabled``, ``request_by_is_public``, ``match_by``,
@@ -164,7 +164,7 @@ def _fmt(r: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CacheConfig.check_arg dispatch scenarios
+# CacheConfig.from_ dispatch scenarios
 # ---------------------------------------------------------------------------
 
 
@@ -172,33 +172,33 @@ def _check_arg_scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
 
     out.append(_time_one(
-        "CacheConfig.check_arg(None)",
-        lambda: CacheConfig.check_arg(None),
+        "CacheConfig.from_(None)",
+        lambda: CacheConfig.from_(None),
         repeat=repeat, inner=100_000,
     ))
     out.append(_time_one(
-        "CacheConfig.check_arg(existing CacheConfig)",
-        lambda: CacheConfig.check_arg(CFG_LOCAL),
+        "CacheConfig.from_(existing CacheConfig)",
+        lambda: CacheConfig.from_(CFG_LOCAL),
         repeat=repeat, inner=200_000,
     ))
     out.append(_time_one(
-        "CacheConfig.check_arg(path str)",
-        lambda: CacheConfig.check_arg("/tmp/ygg-bench"),
+        "CacheConfig.from_(path str)",
+        lambda: CacheConfig.from_("/tmp/ygg-bench"),
         repeat=repeat, inner=20_000,
     ))
     out.append(_time_one(
-        "CacheConfig.check_arg(Path)",
-        lambda: CacheConfig.check_arg(Path("/tmp/ygg-bench")),
+        "CacheConfig.from_(Path)",
+        lambda: CacheConfig.from_(Path("/tmp/ygg-bench")),
         repeat=repeat, inner=20_000,
     ))
     out.append(_time_one(
-        "CacheConfig.check_arg(timedelta=1d)",
-        lambda: CacheConfig.check_arg(dt.timedelta(days=1)),
+        "CacheConfig.from_(timedelta=1d)",
+        lambda: CacheConfig.from_(dt.timedelta(days=1)),
         repeat=repeat, inner=10_000,
     ))
     out.append(_time_one(
-        "CacheConfig.check_arg(mapping)",
-        lambda: CacheConfig.check_arg({
+        "CacheConfig.from_(mapping)",
+        lambda: CacheConfig.from_({
             "path": "/tmp/ygg-bench",
             "mode": "APPEND",
             "request_by": ["public_hash"],
@@ -556,6 +556,248 @@ def _send_many_cache_scenarios(repeat: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# End-to-end Session.send / Session.send_many with local cache
+# ---------------------------------------------------------------------------
+
+
+class _StubBenchSession(HTTPSession):
+    """``HTTPSession`` double for end-to-end bench timing.
+
+    Returns a canned :class:`Response` from :meth:`_local_send` so the
+    wire transport drops out of the measurement and the cache pipeline
+    is what's being timed. Mirrors ``tests._helpers.StubSession`` but
+    skips the per-call recording (counter cost would noise the bench).
+    """
+
+    def __init__(self, *args, response: Response | None = None, **kwargs) -> None:
+        if getattr(self, "_initialized", False):
+            if response is not None:
+                self._response = response
+            return
+        super().__init__(*args, **kwargs)
+        self._response = response
+
+    def _local_send(self, request: PreparedRequest, config) -> Response:
+        # Hand back a fresh shallow copy so the caller can stamp
+        # ``response.request`` without mutating the bench template
+        # across iterations.
+        return Response(
+            request=request,
+            status_code=self._response.status_code,
+            headers=dict(self._response.headers),
+            tags={},
+            buffer=Memory(binary=b'{"ok":true}'),
+            received_at=dt.datetime.now(dt.timezone.utc),
+        )
+
+
+def _e2e_send_scenarios(repeat: int) -> list[dict]:
+    """End-to-end ``Session.send`` timing for the cache hot paths.
+
+    Measures the **full** ``send`` pipeline (effective-cfg resolve →
+    local lookup → optional remote lookup → optional ``_local_send``
+    → writeback dispatch), not the isolated ``_load_cached_response``
+    call covered above. Numbers here include every Python-side cost a
+    real caller pays per request — the only thing skipped is the
+    actual wire transport.
+    """
+    out: list[dict] = []
+
+    bench_url = "https://api.example.com/bench-send/x"
+    bench_req = PreparedRequest.prepare(
+        "GET", bench_url, headers={"Content-Type": "application/json"},
+    )
+    _ = bench_req.public_url_hash, bench_req.public_hash, bench_req.partition_key
+
+    bench_resp = Response(
+        request=bench_req, status_code=200,
+        headers={"Content-Type": "application/json"}, tags={},
+        buffer=Memory(binary=b'{"ok":true}'),
+        received_at=dt.datetime.now(dt.timezone.utc),
+    )
+
+    # Baseline: no cache configured. Pure ``send`` dispatch cost.
+    cold_root = tempfile.mkdtemp(prefix="ygg-bench-e2e-cold-")
+    cold_cache = CacheConfig(tabular=cold_root)
+    stub = _StubBenchSession(
+        base_url="https://api.example.com/bench-send",
+        response=bench_resp,
+    )
+    out.append(_time_one(
+        "Session.send (no cache, stub wire)",
+        lambda: stub.send(bench_req, raise_error=False),
+        repeat=repeat, inner=500,
+    ))
+
+    # Pre-seed one row matching ``bench_req`` so every ``send`` call
+    # in the inner loop short-circuits on the local cache.
+    hit_root = tempfile.mkdtemp(prefix="ygg-bench-e2e-hit-")
+    hit_cache = CacheConfig(tabular=hit_root)
+    hit_cache.cache_tabular().write_arrow_batches(
+        (bench_resp.to_arrow_batch(parse=False),),
+        options=FolderOptions(mode=hit_cache.mode),
+    )
+    out.append(_time_one(
+        "Session.send (local cache HIT, stub wire)",
+        lambda: stub.send(bench_req, local_cache=hit_cache, raise_error=False),
+        repeat=repeat, inner=200,
+    ))
+
+    # All-miss: distinct URL per call so neither the local cache nor
+    # the in-memory dedup catches it. Includes the fire-and-forget
+    # writeback to a temp folder; the writeback queue is drained by
+    # the job pool, so we're measuring the dispatch cost not the
+    # actual disk write.
+    miss_root = tempfile.mkdtemp(prefix="ygg-bench-e2e-miss-")
+    miss_cache = CacheConfig(tabular=miss_root)
+    miss_counter = [0]
+
+    def _miss_send() -> None:
+        i = miss_counter[0]
+        miss_counter[0] = i + 1
+        r = PreparedRequest.prepare(
+            "GET",
+            f"https://api.example.com/bench-miss/{i:09d}",
+            headers={"Content-Type": "application/json"},
+        )
+        stub.send(r, local_cache=miss_cache, raise_error=False)
+
+    out.append(_time_one(
+        "Session.send (local cache MISS + writeback, stub wire)",
+        _miss_send,
+        repeat=repeat, inner=200,
+    ))
+
+    return out
+
+
+def _e2e_send_many_scenarios(repeat: int) -> list[dict]:
+    """End-to-end ``Session.send_many`` timing for batch cache paths.
+
+    Three shapes, all with ``BATCH_SIZE`` requests per call:
+
+    * **all-hit** — every row pre-seeded; pipeline short-circuits on
+      stage 1 and never enters stage 3. The tight loop in the
+      ``not after_local`` branch is what's timed.
+    * **all-miss** — none seeded; stage 1 finds nothing, every row
+      drops to the stub wire + fire-and-forget writeback.
+    * **mixed (50/50)** — half seeded, half fresh; exercises both
+      branches plus the merge of hits + new responses in
+      :class:`HTTPResponseBatch`.
+    """
+    out: list[dict] = []
+
+    bench_resp_template = Response(
+        request=REQ, status_code=200,
+        headers={"Content-Type": "application/json"}, tags={},
+        buffer=Memory(binary=b'{"ok":true}'),
+        received_at=dt.datetime.now(dt.timezone.utc),
+    )
+    stub = _StubBenchSession(
+        base_url="https://api.example.com/bench-send-many",
+        response=bench_resp_template,
+    )
+
+    def _make_reqs(prefix: str, n: int = BATCH_SIZE) -> list[PreparedRequest]:
+        reqs = [
+            PreparedRequest.prepare(
+                "GET",
+                f"https://api.example.com/{prefix}/{i:06d}?p={i % 7}",
+                headers={"Content-Type": "application/json"},
+            )
+            for i in range(n)
+        ]
+        for r in reqs:
+            _ = r.public_url_hash, r.public_hash, r.partition_key
+        return reqs
+
+    def _seed(cache: CacheConfig, reqs: list[PreparedRequest]) -> None:
+        tab = cache.cache_tabular()
+        batches = []
+        for i, r in enumerate(reqs):
+            resp = Response(
+                request=r, status_code=200,
+                headers={"Content-Type": "application/json"}, tags={},
+                buffer=Memory(binary=f'{{"i":{i}}}'.encode()),
+                received_at=dt.datetime.now(dt.timezone.utc),
+            )
+            batches.append(resp.to_arrow_batch(parse=False))
+        tab.write_arrow_batches(batches, options=FolderOptions(mode=cache.mode))
+
+    # all-hit
+    hit_root = tempfile.mkdtemp(prefix="ygg-bench-many-hit-")
+    hit_cache = CacheConfig(tabular=hit_root)
+    hit_reqs = _make_reqs("many-hit")
+    _seed(hit_cache, hit_reqs)
+    out.append(_time_one(
+        f"Session.send_many (local cache ALL HIT, {BATCH_SIZE} req)",
+        lambda: list(stub.send_many(iter(hit_reqs), local_cache=hit_cache)),
+        repeat=repeat, inner=50,
+    ))
+
+    # all-miss — every call uses fresh URLs so the cache never catches.
+    miss_root = tempfile.mkdtemp(prefix="ygg-bench-many-miss-")
+    miss_cache = CacheConfig(tabular=miss_root)
+    miss_counter = [0]
+
+    def _miss_batch():
+        base = miss_counter[0]
+        miss_counter[0] = base + BATCH_SIZE
+        reqs = [
+            PreparedRequest.prepare(
+                "GET",
+                f"https://api.example.com/many-miss/{base + i:09d}",
+                headers={"Content-Type": "application/json"},
+            )
+            for i in range(BATCH_SIZE)
+        ]
+        list(stub.send_many(iter(reqs), local_cache=miss_cache))
+
+    out.append(_time_one(
+        f"Session.send_many (local cache ALL MISS + writeback, {BATCH_SIZE} req)",
+        _miss_batch,
+        repeat=repeat, inner=20,
+    ))
+
+    # mixed: half seeded, half fresh. Reuse seeded reqs across iterations
+    # but supply fresh misses each call so the misses don't write into
+    # the seeded folder and degrade the "half hit" balance.
+    mixed_root = tempfile.mkdtemp(prefix="ygg-bench-many-mixed-")
+    mixed_cache = CacheConfig(tabular=mixed_root)
+    half = BATCH_SIZE // 2
+    seeded_reqs = _make_reqs("many-mixed-hit", n=half)
+    _seed(mixed_cache, seeded_reqs)
+    mixed_counter = [0]
+
+    def _mixed_batch():
+        base = mixed_counter[0]
+        mixed_counter[0] = base + half
+        fresh = [
+            PreparedRequest.prepare(
+                "GET",
+                f"https://api.example.com/many-mixed-fresh/{base + i:09d}",
+                headers={"Content-Type": "application/json"},
+            )
+            for i in range(half)
+        ]
+        # Interleave so the implementation can't stripe the work by
+        # input position.
+        chunk: list[PreparedRequest] = []
+        for i in range(half):
+            chunk.append(seeded_reqs[i])
+            chunk.append(fresh[i])
+        list(stub.send_many(iter(chunk), local_cache=mixed_cache))
+
+    out.append(_time_one(
+        f"Session.send_many (local cache 50% HIT 50% MISS, {BATCH_SIZE} req)",
+        _mixed_batch,
+        repeat=repeat, inner=20,
+    ))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Aggregator + CLI
 # ---------------------------------------------------------------------------
 
@@ -569,6 +811,8 @@ def scenarios(repeat: int) -> list[dict]:
         *_local_folder_cache_scenarios(repeat),
         *_session_cache_scenarios(repeat),
         *_send_many_cache_scenarios(repeat),
+        *_e2e_send_scenarios(repeat),
+        *_e2e_send_many_scenarios(repeat),
     ]
 
 

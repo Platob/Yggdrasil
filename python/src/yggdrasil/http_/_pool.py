@@ -31,6 +31,7 @@ from __future__ import annotations
 import collections
 import collections.abc
 import http.client
+import io
 import logging
 import socket
 import ssl
@@ -531,11 +532,31 @@ class Retry:
 # Response
 # ---------------------------------------------------------------------------
 
-class BaseHTTPResponse:
-    """ABC marker — every concrete shim response inherits from this."""
+class BaseHTTPResponse(io.IOBase):
+    """ABC marker — every concrete shim response inherits from this.
+
+    Subclassing :class:`io.IOBase` mirrors urllib3's own
+    ``BaseHTTPResponse`` and is the contract :func:`pyarrow.input_stream`
+    relies on to wrap a streaming HTTP body without buffering it first
+    (the Databricks warehouse external-link reader at
+    :func:`yggdrasil.databricks.warehouse.statement.fetch_batches`
+    feeds a ``preload_content=False`` response straight into
+    :func:`pyarrow.ipc.open_stream`). Plain ``hasattr(..., "read")``
+    isn't enough — ``pa.input_stream`` rejects anything that isn't an
+    :class:`io.IOBase` subclass with a ``TypeError``.
+    """
 
     status: int
     headers: HTTPHeaderDict
+
+    def readable(self) -> bool:  # noqa: D401 — IOBase protocol
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
 
 
 class _DecodingReader:
@@ -709,6 +730,10 @@ class HTTPResponse(BaseHTTPResponse):
                 self._raw.close()
         finally:
             self.release_conn()
+            # Chain to :class:`io.IOBase` so ``closed`` flips to ``True``
+            # — pyarrow's ``input_stream`` wrapper checks this after
+            # streaming reads.
+            super().close()
 
     @property
     def data(self) -> bytes:

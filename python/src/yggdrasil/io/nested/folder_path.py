@@ -174,6 +174,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         "path",
         "_yggmeta_enabled",
         "_predicate_free_cols",
+        "_predicate_arrow_expr",
         "_static_values_cache",
         "_initialized",
     )
@@ -315,6 +316,21 @@ class FolderPath(IO[bytes, FolderOptions]):
         # via :meth:`_free_cols_for` to find this slot — so a 64-OR
         # batch lookup pays the walk once instead of 64+ times.
         self._predicate_free_cols: "tuple[int, tuple[str, ...]] | None" = None
+        # Compiled-predicate cache mirroring :attr:`_predicate_free_cols`.
+        # :meth:`Expression.to_arrow` walks the whole AST and rebuilds
+        # the pyarrow Expression on every call; the original
+        # :meth:`Expression.filter_arrow_batches` invokes it once per
+        # call, but :meth:`_read_arrow_batches` invokes it once *per
+        # leaf file* (each leaf gets its own ``filter_arrow_batches``
+        # wrap). On a partitioned cache batch lookup against 64
+        # partitions × 1 file that's 64 redundant rebuilds of the
+        # same AST per ``send_many`` chunk; cProfile flagged
+        # ``pa.compute`` Expression assembly as the dominant cost
+        # (~22% of one ``Session.send_many(all hit, 64 req)`` call).
+        # Same id-keyed walk-up-parents pattern as
+        # :meth:`_free_cols_for` so a batch lookup pays the compile
+        # exactly once across every recursive level + every leaf.
+        self._predicate_arrow_expr: "tuple[int, Any] | None" = None
         # Hive partition KV cache — :attr:`static_values` walks the
         # URL segments and casts each value to the schema-declared
         # dtype on every call. The URL is immutable, the schema is
@@ -1052,6 +1068,15 @@ class FolderPath(IO[bytes, FolderOptions]):
         free_cols = self._free_cols_for(predicate)
         if self._should_prune_by_predicate(options, free_cols=free_cols):
             return
+        # Compile the predicate to a :class:`pyarrow.compute.Expression`
+        # once for the whole read subtree (cached on the topmost
+        # FolderPath via :meth:`_arrow_expr_for`). Status-quo path went
+        # through :meth:`Expression.filter_arrow_batches` per leaf file,
+        # which rebuilt the same AST every call — cProfile flagged this
+        # as ~22% of an all-hit ``Session.send_many`` chunk. Calling
+        # :meth:`pa.RecordBatch.filter` inline below skips the wrapper
+        # while keeping the same "non-empty batches that match" contract.
+        arrow_expr = self._arrow_expr_for(predicate)
         for child in self.iter_children(options=options):
             if child._should_prune_by_predicate(options, free_cols=free_cols):
                 continue
@@ -1060,13 +1085,17 @@ class FolderPath(IO[bytes, FolderOptions]):
             # Sub-folders recurse and apply the predicate at their
             # own leaf level; flat-format leaves (parquet / arrow IPC
             # / csv) don't filter rows themselves, so we run the
-            # row-level predicate here in pyarrow's C++ kernels via
-            # :meth:`Predicate.filter_arrow_batches`. The static-value
-            # prune above already eliminated whole sub-trees the
-            # predicate rejects on a partition column; this is the
+            # row-level predicate here in pyarrow's C++ kernels. The
+            # static-value prune above already eliminated whole sub-trees
+            # the predicate rejects on a partition column; this is the
             # residual non-partition filter.
-            if predicate is not None and not isinstance(child, FolderPath):
-                yield from predicate.filter_arrow_batches(stream)
+            if arrow_expr is not None and not isinstance(child, FolderPath):
+                for batch in stream:
+                    if batch.num_rows == 0:
+                        continue
+                    kept = batch.filter(arrow_expr)
+                    if kept.num_rows > 0:
+                        yield kept
             else:
                 yield from stream
 
@@ -1111,6 +1140,35 @@ class FolderPath(IO[bytes, FolderOptions]):
         except Exception:
             pass
         return cols
+
+    def _arrow_expr_for(self, predicate: Any) -> Any:
+        """Memoised :meth:`Expression.to_arrow` lift keyed by ``id(predicate)``.
+
+        Same walk-up-parents shape as :meth:`_free_cols_for`. The
+        compiled :class:`pyarrow.compute.Expression` is the same object
+        every level of the recursive read can reuse via
+        :meth:`pa.RecordBatch.filter` — building it once collapses the
+        per-leaf-file recompile that cProfile flagged on the
+        ``Session.send_many(local cache ALL HIT)`` path.
+        """
+        if predicate is None:
+            return None
+        pid = id(predicate)
+        node: Any = self
+        topmost: "FolderPath" = self
+        while node is not None:
+            cached = getattr(node, "_predicate_arrow_expr", None)
+            if cached is not None and cached[0] == pid:
+                return cached[1]
+            if isinstance(node, FolderPath):
+                topmost = node
+            node = getattr(node, "tabular_parent", None)
+        expr = predicate.to_arrow()
+        try:
+            topmost._predicate_arrow_expr = (pid, expr)
+        except Exception:
+            pass
+        return expr
 
     def _child_read_options(
         self, child: "Tabular", options: FolderOptions,
