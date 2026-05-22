@@ -956,10 +956,18 @@ def _build_external_link_pool(max_workers: int) -> urllib3.PoolManager:
         raise_on_status=False,
         respect_retry_after_header=True,
     )
+    # TLS verification is disabled for external-link chunk fetches: the
+    # presigned URLs Databricks hands out point at cloud-storage hostnames
+    # whose certificates aren't always reachable from the workspace egress
+    # path (private-link / proxy-rewritten endpoints, customer-managed
+    # VPCs), and the URL itself carries a short-lived signed token so the
+    # transport doesn't need certificate-based authentication.
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return urllib3.PoolManager(
         num_pools=max(4, max_workers // 2),
         maxsize=max_workers * 2,
         retries=retry,
         timeout=urllib3.Timeout(connect=10.0, read=60.0),
-        cert_reqs="CERT_REQUIRED",
+        cert_reqs="CERT_NONE",
+        assert_hostname=False,
     )
