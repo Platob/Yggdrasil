@@ -265,13 +265,13 @@ class Table(Tabular):
         self,
         definition: pa.Schema | pa.Field | DataSchema | Any,
         *,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
         primary_key: Optional[Sequence[str]] = None,
         comment: Optional[str] = None,
     ) -> "Table":
         """``CREATE TABLE`` from a :class:`pyarrow.Schema` / yggdrasil schema.
 
-        Existing tables are left alone when ``if_not_exists=True``;
+        Existing tables are left alone when ``missing_ok=True``;
         otherwise the call raises if the target is taken.
         """
         if isinstance(definition, DataSchema):
@@ -290,7 +290,7 @@ class Table(Tabular):
             pk_cols = ", ".join(quote_ident(c) for c in primary_key)
             column_clauses.append(f"PRIMARY KEY ({pk_cols})")
 
-        head = "CREATE TABLE IF NOT EXISTS" if if_not_exists else "CREATE TABLE"
+        head = "CREATE TABLE IF NOT EXISTS" if missing_ok else "CREATE TABLE"
         ddl = (
             f"{head} {self.qualified_name()} (\n  "
             + ",\n  ".join(column_clauses)
@@ -313,7 +313,7 @@ class Table(Tabular):
         if not self.exists:
             self.create(
                 definition=definition,
-                if_not_exists=True,
+                missing_ok=True,
                 primary_key=primary_key,
                 comment=comment,
             )

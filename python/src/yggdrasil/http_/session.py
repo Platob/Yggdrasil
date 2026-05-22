@@ -858,7 +858,7 @@ class HTTPSession(Session):
             return list(tabular.read_arrow_batches(options=options))
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc) and hasattr(tabular, "create"):
-                tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                tabular.create(RESPONSE_ARROW_SCHEMA, missing_ok=True)
                 return list(tabular.read_arrow_batches(options=options))
             raise
 
@@ -2100,7 +2100,7 @@ class HTTPSession(Session):
             hits_df = cfg.tabular.read_spark_frame(options=opts)
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, if_not_exists=True)
+                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, missing_ok=True)
                 hits_df = cfg.tabular.read_spark_frame(options=opts)
             else:
                 raise

@@ -847,4 +847,4 @@ class SQLEngine(DatabricksService, StatementExecutor):
             location=full_name,
             catalog_name=catalog_name, schema_name=schema_name, table_name=table_name,
         )
-        return target.create(definition=definition, if_not_exists=True, **kwargs)
+        return target.create(definition=definition, missing_ok=True, **kwargs)

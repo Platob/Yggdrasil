@@ -441,7 +441,7 @@ job.pytask(
 - Don't fall back to `ws.vector_search_endpoints.create_endpoint(...)`
   / `ws.vector_search_indexes.query_index(...)` directly. The
   resource singleton (`vs.endpoint(...)` / `vs.index(...)`) wraps
-  the SDK with `if_not_exists` / `missing_ok` / waiting / cached
+  the SDK with `missing_ok` / waiting / cached
   infos / typed results — same rule as
   `Volume.create` / `Schema.create` in
   [`ygg-databricks-client`](ygg-databricks-client.md).

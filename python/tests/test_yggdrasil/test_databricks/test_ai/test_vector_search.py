@@ -249,19 +249,19 @@ class TestVectorSearchEndpoint(VectorSearchTestCase):
         call = self.endpoints_api.create_endpoint.call_args
         self.assertEqual(call.kwargs["endpoint_type"], EndpointType.STORAGE_OPTIMIZED)
 
-    def test_create_if_not_exists_swallows_already_exists(self):
+    def test_create_missing_ok_swallows_already_exists(self):
         self.endpoints_api.create_endpoint.side_effect = AlreadyExists("dup")
         existing = _build_endpoint_info()
         self.endpoints_api.get_endpoint.return_value = existing
 
-        ep = self.vs.endpoint("rag-endpoint").create(if_not_exists=True)
+        ep = self.vs.endpoint("rag-endpoint").create(missing_ok=True)
         self.assertIs(ep.infos, existing)
         self.endpoints_api.get_endpoint.assert_called_once()
 
-    def test_create_if_not_exists_false_propagates(self):
+    def test_create_missing_ok_false_propagates(self):
         self.endpoints_api.create_endpoint.side_effect = AlreadyExists("dup")
         with self.assertRaises(AlreadyExists):
-            self.vs.endpoint("rag-endpoint").create(if_not_exists=False)
+            self.vs.endpoint("rag-endpoint").create(missing_ok=False)
 
     def test_ensure_created_skips_when_exists(self):
         self.endpoints_api.get_endpoint.return_value = _build_endpoint_info()
@@ -466,7 +466,7 @@ class TestVectorSearchIndexCreate(VectorSearchTestCase):
                 embedding_source_columns=["text"],
             )
 
-    def test_create_delta_sync_if_not_exists_swallows_already_exists(self):
+    def test_create_delta_sync_missing_ok_swallows_already_exists(self):
         self.indexes_api.create_index.side_effect = AlreadyExists("dup")
         existing = _build_vector_index()
         self.indexes_api.get_index.return_value = existing

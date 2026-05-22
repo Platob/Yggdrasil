@@ -41,7 +41,7 @@ print(ep.explore_url)    # Databricks UI link
 
 # Create an endpoint and wait until online
 ep = vs.endpoint("my-endpoint")
-ep.create(endpoint_type="STANDARD", if_not_exists=True)
+ep.create(endpoint_type="STANDARD", missing_ok=True)
 ep.wait_online()
 
 # Delete
@@ -68,7 +68,7 @@ idx.create_delta_sync(
     embedding_dimension=1536,
     index_type="DELTA_SYNC",
     pipeline_type="TRIGGERED",                 # or "CONTINUOUS"
-    if_not_exists=True,
+    missing_ok=True,
 )
 idx.wait_online()
 print(idx.indexed_row_count)
@@ -90,7 +90,7 @@ idx.create_direct_access(
         pa.field("title",      pa.string()),
         pa.field("embedding",  pa.list_(pa.float32(), 768)),
     ]),
-    if_not_exists=True,
+    missing_ok=True,
 )
 
 # Upsert rows

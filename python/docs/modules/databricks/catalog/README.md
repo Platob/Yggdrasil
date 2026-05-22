@@ -38,7 +38,7 @@ for schema in main.schemas():
 # Create / ensure
 from yggdrasil.databricks.catalog import Catalog
 cat = Catalog(client=client, name="analytics")
-cat.create(if_not_exists=True, comment="Analytics catalog")
+cat.create(missing_ok=True, comment="Analytics catalog")
 
 # Check existence
 print(cat.exists)
@@ -65,7 +65,7 @@ for table in schema.tables():
     print(table.full_name())
 
 # Create / ensure
-schema.create(if_not_exists=True, comment="Raw landing zone")
+schema.create(missing_ok=True, comment="Raw landing zone")
 print(schema.exists)
 schema.delete(if_exists=True)
 ```
@@ -98,7 +98,7 @@ schema = pa.schema([
     pa.field("amount",   pa.float64()),
     pa.field("placed_at", pa.timestamp("us", tz="UTC")),
 ])
-orders.create(schema=schema, if_not_exists=True, comment="Sales orders")
+orders.create(schema=schema, missing_ok=True, comment="Sales orders")
 
 # Truncate / delete
 orders.truncate()

@@ -136,7 +136,7 @@ class PostgresTestCase(unittest.TestCase):
             return
         # Per-test scratch schema — parallel-safe.
         self.test_schema_name = f"{self.test_schema_prefix}_{uuid.uuid4().hex[:12]}"
-        self.engine.schema(self.test_schema_name).create(if_not_exists=True)
+        self.engine.schema(self.test_schema_name).create(missing_ok=True)
 
     def tearDown(self) -> None:
         if self.engine is not None and self.test_schema_name:

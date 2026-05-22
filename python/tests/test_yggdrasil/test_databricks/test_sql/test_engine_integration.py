@@ -263,7 +263,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         )
         self.assertTrue(created.exists)
 
-        # Idempotent: a second create_table call with if_not_exists=True
+        # Idempotent: a second create_table call with missing_ok=True
         # (the engine default) must not raise.
         again = self.engine.create_table(
             self._sample_schema(),

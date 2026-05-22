@@ -42,7 +42,7 @@ Default to:
 - adding the converter to `data/cast/registry.py` (or the engine `cast.py` that registers on import) instead of writing a one-off conversion at the call site
 - adding a flag to `CastOptions` instead of inventing a new options object
 - adding a method to `DataField` / `Schema` / `DataTable` / `StatementResult` instead of writing a sibling helper module
-- routing lifecycle calls through the resource singleton's public methods (`Volume.create` / `Volume.delete` / `Volume.read_info` / `Schema.create` / `Catalog.create` / `Table.create` / `Table.read_info` / `Warehouse.start` / `Cluster.terminate` / `Job.run` …) instead of re-issuing the underlying SDK call (`ws.volumes.create(...)` / `ws.schemas.create(...)` / `ws.tables.create(...)`). The resource method is the integration point: it carries the project-level defaults (managed-volume-type, owner/comment normalization), warms the per-singleton metadata cache (`_store_infos`), normalises `AlreadyExists`/`NotFound` handling via `if_not_exists` / `missing_ok`, and is what tests, IDE inspection, and the public docs target. Anything that opens an SDK service and calls `.create` / `.read` / `.delete` directly is duplicating that contract — extend the resource's own method if it's missing a knob.
+- routing lifecycle calls through the resource singleton's public methods (`Volume.create` / `Volume.delete` / `Volume.read_info` / `Schema.create` / `Catalog.create` / `Table.create` / `Table.read_info` / `Warehouse.start` / `Cluster.terminate` / `Job.run` …) instead of re-issuing the underlying SDK call (`ws.volumes.create(...)` / `ws.schemas.create(...)` / `ws.tables.create(...)`). The resource method is the integration point: it carries the project-level defaults (managed-volume-type, owner/comment normalization), warms the per-singleton metadata cache (`_store_infos`), normalises `AlreadyExists`/`NotFound` handling via `missing_ok`, and is what tests, IDE inspection, and the public docs target. Anything that opens an SDK service and calls `.create` / `.read` / `.delete` directly is duplicating that contract — extend the resource's own method if it's missing a knob.
 - using `HTTPSession` / `PreparedRequest` / `Response` instead of bypassing the modern HTTP stack
 - using `lib.py` guards already in the subsystem instead of writing a new guard pattern
 
@@ -58,7 +58,7 @@ Red flags that you are inventing instead of integrating:
 - a private utility that re-implements something already in `pyutils/` or `data/`
 - a "v2" of something with no migration path from "v1"
 - a private `_create_volume = lambda: ws.volumes.create(...)` (or `_create_schema`, `_create_table`, `_create_warehouse`, …) inside a recovery / `_ensure_X` path when `self.create(...)` on the resource class already wraps that exact SDK call with the right defaults and cache hooks
-- an `ensure_X` / `_ensure_X` that re-implements `if_not_exists=True` / `missing_ok=True` semantics already wired into the resource method — extend the existing `create(if_not_exists=...)` / `delete(missing_ok=...)` instead of branching at the call site
+- an `ensure_X` / `_ensure_X` that re-implements `missing_ok=True` semantics already wired into the resource method — extend the existing `create(missing_ok=...)` / `delete(missing_ok=...)` instead of branching at the call site
 
 ### Reach for `yggdrasil.data.enums` first
 
@@ -980,7 +980,7 @@ Every log message follows the same scannable shape:
 - **`%r`** — the resource itself; identity comes from its `__repr__`.
 - **Metadata** — extra fields go in `(...)` parens, `key=value` joined
   by `,` and a space. Keep keys short and consistent across files
-  (`wait=`, `if_not_exists=`, `recursive=`, `columns=`, `bytes=`).
+  (`wait=`, `missing_ok=`, `recursive=`, `columns=`, `bytes=`).
 
 Worked examples (good shape):
 

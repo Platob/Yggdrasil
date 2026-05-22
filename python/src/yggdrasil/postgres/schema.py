@@ -94,10 +94,10 @@ class Schema:
     def create(
         self,
         *,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
         owner: Optional[str] = None,
     ) -> "Schema":
-        head = "CREATE SCHEMA IF NOT EXISTS" if if_not_exists else "CREATE SCHEMA"
+        head = "CREATE SCHEMA IF NOT EXISTS" if missing_ok else "CREATE SCHEMA"
         ddl = f"{head} {quote_ident(self.schema_name)}"
         if owner:
             ddl += f" AUTHORIZATION {quote_ident(owner)}"
@@ -106,7 +106,7 @@ class Schema:
 
     def ensure_created(self, *, owner: Optional[str] = None) -> "Schema":
         if not self.exists:
-            self.create(if_not_exists=True, owner=owner)
+            self.create(missing_ok=True, owner=owner)
         return self
 
     def delete(self, *, if_exists: bool = True, cascade: bool = False) -> "Schema":

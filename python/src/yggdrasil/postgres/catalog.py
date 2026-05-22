@@ -96,7 +96,7 @@ class Catalog:
     def create(
         self,
         *,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
         owner: Optional[str] = None,
         encoding: Optional[str] = None,
         template: Optional[str] = None,
@@ -108,7 +108,7 @@ class Catalog:
         connection to autocommit. The flip is reverted on the way
         out.
         """
-        if if_not_exists and self.exists:
+        if missing_ok and self.exists:
             return self
         clauses: list[str] = []
         if owner:
@@ -125,7 +125,7 @@ class Catalog:
 
     def ensure_created(self, **kwargs: Any) -> "Catalog":
         if not self.exists:
-            self.create(if_not_exists=True, **kwargs)
+            self.create(missing_ok=True, **kwargs)
         return self
 
     def delete(self, *, if_exists: bool = True) -> "Catalog":

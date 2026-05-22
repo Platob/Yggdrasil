@@ -47,7 +47,7 @@ tbl.ensure_created(schema=schema, comment="orders v1")
 Route through `tbl.create(...)` / `tbl.delete(...)` /
 `tbl.ensure_created(...)`, **not** `ws.tables.create(...)` — the
 singleton method handles retries, cache warm-up, and
-`if_not_exists` / `missing_ok` ergonomics.
+`missing_ok` ergonomics.
 
 ## Insert frames
 

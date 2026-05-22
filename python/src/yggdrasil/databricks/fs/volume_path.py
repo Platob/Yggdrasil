@@ -504,7 +504,7 @@ class VolumePath(DatabricksPath):
         Routes the volume create through :meth:`Volume.create` so the
         managed-volume-type default (``VolumeType.MANAGED`` enum, not
         a bare ``"MANAGED"`` string the SDK rejects) lives in one
-        place. ``AlreadyExists`` is swallowed by ``if_not_exists=True``;
+        place. ``AlreadyExists`` is swallowed by ``missing_ok=True``;
         if the volume create NotFounds because schema (or catalog) is
         missing, falls through to :func:`_ensure_parents_for` to
         materialise the parents before a single retry.
@@ -514,7 +514,7 @@ class VolumePath(DatabricksPath):
         volume = self.volume
 
         try:
-            volume.create(if_not_exists=True)
+            volume.create(missing_ok=True)
             return True
         except Exception as exc:
             if _looks_like_already_exists(exc):
@@ -529,7 +529,7 @@ class VolumePath(DatabricksPath):
             schema_name=volume.schema_name,
         )
         try:
-            volume.create(if_not_exists=True)
+            volume.create(missing_ok=True)
         except Exception as exc:
             if not _looks_like_already_exists(exc):
                 raise

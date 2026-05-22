@@ -2016,7 +2016,7 @@ class Table(DatabricksPath):
         properties: Optional[dict[str, str]] = None,
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
         or_replace: bool = False,
         record_ygg_properties: bool = True,
     ) -> "Table":
@@ -2039,7 +2039,7 @@ class Table(DatabricksPath):
                 result = self.sql_create(
                     definition,
                     comment=comment,
-                    if_not_exists=False,
+                    missing_ok=False,
                     or_replace=True,
                     properties=properties,
                     data_source_format=data_source_format,
@@ -2065,7 +2065,7 @@ class Table(DatabricksPath):
             result = self.sql_create(
                 definition,
                 comment=comment,
-                if_not_exists=if_not_exists,
+                missing_ok=missing_ok,
                 properties=properties,
                 record_ygg_properties=record_ygg_properties,
             )
@@ -2082,7 +2082,7 @@ class Table(DatabricksPath):
                 properties=properties,
                 table_type=table_type,
                 data_source_format=data_source_format,
-                if_not_exists=if_not_exists,
+                missing_ok=missing_ok,
                 record_ygg_properties=record_ygg_properties,
             )
 
@@ -2095,7 +2095,7 @@ class Table(DatabricksPath):
         storage_location: str | None = None,
         comment: str | None = None,
         properties: Optional[dict[str, Any]] = None,
-        if_not_exists: bool = True,
+        missing_ok: bool = True,
         or_replace: bool = False,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         optimize_write: bool = True,
@@ -2138,12 +2138,12 @@ class Table(DatabricksPath):
 
         table_definitions = column_definitions + constraint_clauses
 
-        if or_replace and if_not_exists:
-            raise ValueError("Use either or_replace or if_not_exists, not both.")
+        if or_replace and missing_ok:
+            raise ValueError("Use either or_replace or missing_ok, not both.")
 
         if or_replace:
             create_kw = "CREATE OR REPLACE TABLE"
-        elif if_not_exists:
+        elif missing_ok:
             create_kw = "CREATE TABLE IF NOT EXISTS"
         else:
             create_kw = "CREATE TABLE"
@@ -2205,10 +2205,10 @@ class Table(DatabricksPath):
 
         statement = "\n".join(sql_parts)
         logger.debug(
-            "Creating table %r via SQL (or_replace=%s, if_not_exists=%s, "
+            "Creating table %r via SQL (or_replace=%s, missing_ok=%s, "
             "columns=%d, partition_by=%d, cluster_by=%d, primary_keys=%d, "
             "data_source_format=%s, column_mapping_mode=%s)",
-            self, or_replace, if_not_exists,
+            self, or_replace, missing_ok,
             len(column_definitions), len(partition_by or ()),
             len(cluster_by or ()), len(primary_keys or ()),
             data_source_format, column_mapping_mode,
@@ -2447,7 +2447,7 @@ class Table(DatabricksPath):
         properties: Optional[dict[str, str]] = None,
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
-        if_not_exists: bool = False,
+        missing_ok: bool = False,
         record_ygg_properties: bool = True,
     ) -> "Table":
         """Create the table via the Unity Catalog ``tables.create`` REST API.
@@ -2463,7 +2463,7 @@ class Table(DatabricksPath):
         columns + storage + properties — so the behaviour ends up
         symmetric with :meth:`sql_create`.
         """
-        if if_not_exists and self.exists:
+        if missing_ok and self.exists:
             return self
 
         schema_info = DataSchema.from_any(definition).autotag()
@@ -2511,7 +2511,7 @@ class Table(DatabricksPath):
                 properties=merged_properties or None,
             )
         except DatabricksError as exc:
-            if if_not_exists and "already exists" in str(exc).lower():
+            if missing_ok and "already exists" in str(exc).lower():
                 logger.debug(
                     "Table %r already exists — soft-resetting cache", self,
                 )
@@ -2568,7 +2568,7 @@ class Table(DatabricksPath):
         query: str,
         *,
         or_replace: bool = False,
-        if_not_exists: bool = False,
+        missing_ok: bool = False,
         columns: Iterable[str] | None = None,
         comment: str | None = None,
         properties: Optional[Mapping[str, Any]] = None,
@@ -2576,11 +2576,11 @@ class Table(DatabricksPath):
         """Render a ``CREATE [OR REPLACE] VIEW [IF NOT EXISTS]`` DDL statement.
 
         Mirrors the legacy :meth:`View.create_ddl` shape; ``or_replace``
-        and ``if_not_exists`` are mutually exclusive, and the SELECT
+        and ``missing_ok`` are mutually exclusive, and the SELECT
         text is required.
         """
-        if or_replace and if_not_exists:
-            raise ValueError("Use either or_replace or if_not_exists, not both.")
+        if or_replace and missing_ok:
+            raise ValueError("Use either or_replace or missing_ok, not both.")
 
         select_text = (query or "").strip().rstrip(";").strip()
         if not select_text:
@@ -2588,7 +2588,7 @@ class Table(DatabricksPath):
 
         if or_replace:
             create_kw = "CREATE OR REPLACE VIEW"
-        elif if_not_exists:
+        elif missing_ok:
             create_kw = "CREATE VIEW IF NOT EXISTS"
         else:
             create_kw = "CREATE VIEW"
@@ -2624,7 +2624,7 @@ class Table(DatabricksPath):
         *,
         mode: ModeLike = None,
         or_replace: bool | None = None,
-        if_not_exists: bool | None = None,
+        missing_ok: bool | None = None,
         columns: Iterable[str] | None = None,
         comment: str | None = None,
         properties: Optional[Mapping[str, Any]] = None,
@@ -2633,39 +2633,39 @@ class Table(DatabricksPath):
     ) -> "Table":
         """Create (or replace) this Table as a Unity Catalog view.
 
-        When neither ``or_replace`` nor ``if_not_exists`` is provided
+        When neither ``or_replace`` nor ``missing_ok`` is provided
         the keywords are derived from ``mode``:
 
         * :data:`Mode.OVERWRITE` → ``or_replace=True``
         * :data:`Mode.AUTO` / :data:`Mode.APPEND` / :data:`Mode.UPSERT`
-          / :data:`Mode.IGNORE` → ``if_not_exists=True``
+          / :data:`Mode.IGNORE` → ``missing_ok=True``
         * :data:`Mode.ERROR_IF_EXISTS` → plain ``CREATE VIEW``
         """
         parsed_mode = Mode.from_(mode, default=Mode.AUTO)
 
-        if or_replace is None and if_not_exists is None:
+        if or_replace is None and missing_ok is None:
             if parsed_mode == Mode.OVERWRITE:
                 or_replace = True
-                if_not_exists = False
+                missing_ok = False
             elif parsed_mode == Mode.ERROR_IF_EXISTS:
                 or_replace = False
-                if_not_exists = False
+                missing_ok = False
             else:
                 or_replace = False
-                if_not_exists = True
+                missing_ok = True
 
         statement = self.create_view_ddl(
             query,
             or_replace=bool(or_replace),
-            if_not_exists=bool(if_not_exists),
+            missing_ok=bool(missing_ok),
             columns=columns,
             comment=comment,
             properties=properties,
         )
 
         logger.debug(
-            "Creating view %r (or_replace=%s, if_not_exists=%s, mode=%s)",
-            self, bool(or_replace), bool(if_not_exists), parsed_mode,
+            "Creating view %r (or_replace=%s, missing_ok=%s, mode=%s)",
+            self, bool(or_replace), bool(missing_ok), parsed_mode,
         )
         try:
             self.sql.execute(statement, wait=wait_result)
@@ -2899,7 +2899,7 @@ class Table(DatabricksPath):
         table_name: str | None = None,
         deep: bool = True,
         replace: bool = False,
-        if_not_exists: bool = False,
+        missing_ok: bool = False,
         properties: Mapping[str, Any] | None = None,
         location: str | None = None,
         version: int | None = None,
@@ -2920,7 +2920,7 @@ class Table(DatabricksPath):
             deep:          ``True`` (default) → DEEP CLONE (independent copy);
                            ``False`` → SHALLOW CLONE (metadata only, shares files).
             replace:       Emit ``CREATE OR REPLACE TABLE``.
-            if_not_exists: Emit ``CREATE TABLE IF NOT EXISTS``. Mutually
+            missing_ok: Emit ``CREATE TABLE IF NOT EXISTS``. Mutually
                            exclusive with *replace*.
             properties:    Optional ``TBLPROPERTIES`` overrides.
             location:      External storage path for the target.
@@ -2930,8 +2930,8 @@ class Table(DatabricksPath):
         Returns:
             A :class:`Table` bound to this service pointing at the target.
         """
-        if replace and if_not_exists:
-            raise ValueError("Use either replace=True or if_not_exists=True, not both.")
+        if replace and missing_ok:
+            raise ValueError("Use either replace=True or missing_ok=True, not both.")
         if version is not None and timestamp is not None:
             raise ValueError(
                 "Pass either version or timestamp to clone, not both — Delta"
@@ -2988,13 +2988,13 @@ class Table(DatabricksPath):
             statement = cloned.create_view_ddl(
                 select_text,
                 or_replace=replace,
-                if_not_exists=if_not_exists,
+                missing_ok=missing_ok,
                 properties=properties,
             )
             logger.debug(
-                "Cloning view %r → %s.%s.%s (replace=%s, if_not_exists=%s)",
+                "Cloning view %r → %s.%s.%s (replace=%s, missing_ok=%s)",
                 self, target_catalog, target_schema, target_table,
-                replace, if_not_exists,
+                replace, missing_ok,
             )
             self.sql.execute(statement)
             return cloned
@@ -3006,7 +3006,7 @@ class Table(DatabricksPath):
 
         if replace:
             create_kw = "CREATE OR REPLACE TABLE"
-        elif if_not_exists:
+        elif missing_ok:
             create_kw = "CREATE TABLE IF NOT EXISTS"
         else:
             create_kw = "CREATE TABLE"
@@ -3041,9 +3041,9 @@ class Table(DatabricksPath):
 
         statement = " ".join(sql_parts)
         logger.debug(
-            "Cloning table %r → %s.%s.%s (deep=%s, replace=%s, if_not_exists=%s)",
+            "Cloning table %r → %s.%s.%s (deep=%s, replace=%s, missing_ok=%s)",
             self, target_catalog, target_schema, target_table,
-            deep, replace, if_not_exists,
+            deep, replace, missing_ok,
         )
         self.sql.execute(statement)
 

@@ -67,7 +67,7 @@ schema = pa.schema([
     pa.field("amount",    pa.float64()),
     pa.field("placed_at", pa.timestamp("us", tz="UTC")),
 ])
-table.create(schema=schema, if_not_exists=True)
+table.create(schema=schema, missing_ok=True)
 ```
 
 ## Read
