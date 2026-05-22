@@ -2,7 +2,7 @@
 
 Covers:
 
-- ``Session._run_concurrently`` runs tasks in parallel, propagates the
+- ``HTTPSession._run_concurrently`` runs tasks in parallel, propagates the
   first exception, and short-circuits the empty / single-task cases.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from yggdrasil.io.session import Session
+from yggdrasil.http_ import HTTPSession
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ from yggdrasil.io.session import Session
 class TestRunConcurrently:
 
     def test_empty_tasks_is_noop(self) -> None:
-        Session._run_concurrently([])
+        HTTPSession._run_concurrently([])
 
     def test_single_task_runs_inline(self) -> None:
         # Single task must execute on the calling thread — no pool
@@ -35,7 +35,7 @@ class TestRunConcurrently:
         def task() -> None:
             seen.append(threading.current_thread().name)
 
-        Session._run_concurrently([task])
+        HTTPSession._run_concurrently([task])
         assert seen == [caller]
 
     def test_runs_in_parallel(self) -> None:
@@ -51,7 +51,7 @@ class TestRunConcurrently:
             durations.append(time.monotonic() - t0)
 
         start = time.monotonic()
-        Session._run_concurrently([task] * n)
+        HTTPSession._run_concurrently([task] * n)
         elapsed = time.monotonic() - start
 
         # If they ran serially, total time would be roughly the sum
@@ -73,7 +73,7 @@ class TestRunConcurrently:
             raise RuntimeError("planned")
 
         with pytest.raises(RuntimeError, match="planned"):
-            Session._run_concurrently([
+            HTTPSession._run_concurrently([
                 lambda: good(0),
                 bad,
                 lambda: good(1),
@@ -96,7 +96,7 @@ class TestRunConcurrently:
             with lock:
                 names.add(threading.current_thread().name)
 
-        Session._run_concurrently(
+        HTTPSession._run_concurrently(
             [task, task],
             max_workers=8,
             thread_name_prefix="ygg-test",

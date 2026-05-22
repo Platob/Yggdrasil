@@ -5,10 +5,10 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
+from yggdrasil.http_ import HTTPSession
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import SendConfig
-from yggdrasil.io.session import Session
 
 
 EPOCH = dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
@@ -53,8 +53,8 @@ def make_response(
     )
 
 
-class StubSession(Session):
-    """Concrete Session double that returns canned responses.
+class StubSession(HTTPSession):
+    """Concrete HTTPSession double that returns canned responses.
 
     Each call to ``send`` is recorded in ``calls`` so tests can assert
     the network was — or was not — touched.

@@ -76,12 +76,16 @@ class TestExecutorInheritsSession:
     def test_statement_executor_is_session_subclass(self):
         assert issubclass(StatementExecutor, Session)
 
-    def test_session_classvars_lifted_onto_base(self):
-        """Session exposes the prepared / response / batch slots so
-        subclasses pin once instead of restating them per backend."""
-        assert hasattr(Session, "_PREPARED_CLASS")
-        assert hasattr(Session, "_RESPONSE_CLASS")
-        assert hasattr(Session, "_BATCH_CLASS")
+    def test_session_classvars_declared_on_base(self):
+        """Session declares the prepared / response / batch slots so each
+        transport pins them once instead of restating them per backend.
+        The abstract Session leaves them unset — every concrete subclass
+        (HTTPSession, StatementExecutor) sets them in turn — so we check
+        the annotation slot exists rather than a default value."""
+        annotations = Session.__annotations__
+        assert "_PREPARED_CLASS" in annotations
+        assert "_RESPONSE_CLASS" in annotations
+        assert "_BATCH_CLASS" in annotations
 
 
 class TestPrepareSend:

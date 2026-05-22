@@ -15,7 +15,7 @@ These pin the contracts of the small, side-effect-free helpers the
   agnostic.
 * ``_maybe_autocompress_body_for_cache`` — pre-persistence gzip
   heuristic (threshold, MIME gate, ratio bailout, header sync).
-* ``Session._remote_write_group_key`` — the bucket key used to fan
+* ``HTTPSession._remote_write_group_key`` — the bucket key used to fan
   one batch of remote-cache inserts into per-(table, mode, match_by,
   wait, anonymize) groups.
 
@@ -27,20 +27,19 @@ without dragging the whole pipeline in.
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
 import pytest
 
 from yggdrasil.data.enums import Mode
-from yggdrasil.io.send_config import CacheConfig
-from yggdrasil.io.session import (
-    Session,
+from yggdrasil.http_ import HTTPSession
+from yggdrasil.http_.session import (
     _BODY_AUTOCOMPRESS_MIN_SIZE,
     _maybe_autocompress_body_for_cache,
 )
+from yggdrasil.io.send_config import CacheConfig
+from yggdrasil.io.session import Session
 
 from ._helpers import make_request, make_response
 
@@ -89,32 +88,32 @@ class TestRemoteWriteGroupKey:
     def test_identical_configs_share_group(self) -> None:
         a = self._cfg()
         b = self._cfg()
-        assert Session._remote_write_group_key(a) == Session._remote_write_group_key(b)
+        assert HTTPSession._remote_write_group_key(a) == HTTPSession._remote_write_group_key(b)
 
     def test_distinct_table_splits(self) -> None:
         a = self._cfg(name="ws.a.responses")
         b = self._cfg(name="ws.b.responses")
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
+        assert HTTPSession._remote_write_group_key(a) != HTTPSession._remote_write_group_key(b)
 
     def test_distinct_mode_splits(self) -> None:
         a = self._cfg(mode=Mode.APPEND)
         b = self._cfg(mode=Mode.UPSERT)
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
+        assert HTTPSession._remote_write_group_key(a) != HTTPSession._remote_write_group_key(b)
 
     def test_distinct_match_by_splits(self) -> None:
         a = self._cfg(request_by=["public_url_hash"])
         b = self._cfg(request_by=["public_url_hash", "method"])
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
+        assert HTTPSession._remote_write_group_key(a) != HTTPSession._remote_write_group_key(b)
 
     def test_distinct_wait_splits(self) -> None:
         a = self._cfg(wait=False)
         b = self._cfg(wait=True)
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
+        assert HTTPSession._remote_write_group_key(a) != HTTPSession._remote_write_group_key(b)
 
     def test_distinct_anonymize_splits(self) -> None:
         a = self._cfg(anonymize="remove")
         b = self._cfg(anonymize="redact")
-        assert Session._remote_write_group_key(a) != Session._remote_write_group_key(b)
+        assert HTTPSession._remote_write_group_key(a) != HTTPSession._remote_write_group_key(b)
 
 
 # ---------------------------------------------------------------------------
