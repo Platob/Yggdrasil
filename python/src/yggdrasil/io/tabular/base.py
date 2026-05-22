@@ -590,6 +590,16 @@ class Tabular(ABC, Generic[O]):
     # Abstract batch hooks — the two things every implementer overrides
     # ==================================================================
 
+    def _native_spark_frame(self) -> "SparkDataFrame | None":
+        """Return the held :class:`pyspark.sql.DataFrame` when this
+        Tabular wraps one natively (no materialise cost).
+
+        Default ``None`` — only Spark-shaped holders override. Used by
+        :meth:`_write_table` to skip the Arrow round-trip when both
+        source and sink speak Spark.
+        """
+        return None
+
     @abstractmethod
     def _read_arrow_batches(self, options: O) -> Iterator[pa.RecordBatch]:
         """Yield Arrow record batches from the underlying source."""
@@ -836,6 +846,20 @@ class Tabular(ABC, Generic[O]):
         if obj is None:
             return
         if isinstance(obj, Tabular):
+            # Spark-native sources (``yggdrasil.spark.tabular.Dataset``)
+            # expose their held :class:`pyspark.sql.DataFrame` via
+            # :meth:`_native_spark_frame`. Skip the driver-side
+            # ``df.toArrow()`` collect that ``_read_arrow_batches`` would
+            # otherwise trigger and hand the frame straight to
+            # :meth:`_write_spark_frame` — Spark-aware sinks
+            # (:class:`databricks.table.Table`, another ``Dataset``) keep
+            # the data on the executors; non-Spark sinks fall through the
+            # base :meth:`_write_spark_frame` (``frame.toArrow()`` →
+            # ``_write_arrow_table``) so the cost matches the old path.
+            spark_frame = obj._native_spark_frame()
+            if spark_frame is not None:
+                self._write_spark_frame(spark_frame, options)
+                return
             self._write_arrow_batches(obj.read_arrow_batches(), options)
             return
         if isinstance(obj, pa.Table):
@@ -1168,6 +1192,7 @@ class Tabular(ABC, Generic[O]):
             frame, self.check_options(options, overrides=locals()),
         )
 
+    write_spark = write_spark_frame
     def _write_spark_frame(self, frame: "SparkDataFrame", options: O) -> None:
         to_arrow = getattr(frame, "toArrow", None)
         if to_arrow is not None:

@@ -364,6 +364,14 @@ class Dataset(Tabular[CastOptions]):
     # Spark read / write — no driver collect on the spark path
     # ------------------------------------------------------------------
 
+    def _native_spark_frame(self) -> "SparkDataFrame | None":
+        # Advertises the held frame so :meth:`Tabular._write_table` can
+        # skip the Arrow round-trip when writing this :class:`Dataset`
+        # into a Spark-aware sink (another :class:`Dataset`, a
+        # :class:`databricks.table.Table` — both override
+        # :meth:`_write_spark_frame` to keep the data on the executors).
+        return self._frame
+
     def _read_spark_frame(self, options: CastOptions) -> "SparkDataFrame":
         if self._frame is None:
             spark = self._require_spark()
