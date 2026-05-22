@@ -3,18 +3,17 @@
 Exercises the generic ``__getstate__`` / ``__setstate__`` contract:
 
 * every non-transient ``__dict__`` entry survives a pickle round-trip,
-* ``_lock`` / ``_job_pool`` (and ``_http_pool`` on HTTPSession) are
-  rebuilt on the unpickle side,
+* ``_lock`` / ``_job_pool`` (and ``_connections`` / ``_retry`` on
+  HTTPSession) are rebuilt on the unpickle side,
 * unpickling routes through ``__new__`` so a session reconstructed
   with the same constructor arguments collapses to the live in-process
-  singleton instead of cloning its connection pool / cookies — every
+  singleton instead of cloning its connection cache / cookies — every
   ``__init__`` argument participates in the singleton key, including
   ``base_url=None`` callers that share the same defaults.
 """
 from __future__ import annotations
 
 import pickle
-import threading
 
 import pytest
 
@@ -170,40 +169,42 @@ class TestSessionSingletonRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# HTTPSession — additional non-picklable handle (_http_pool) + bonus fields
+# HTTPSession — additional non-picklable handles (_connections + _retry) +
+# bonus fields
 # ---------------------------------------------------------------------------
 
 
 class TestHTTPSessionPickle:
 
     def test_transient_set_extends_base(self) -> None:
-        assert "_http_pool" in HTTPSession._TRANSIENT_STATE_ATTRS
-        # Base transients are still in the set
+        assert "_connections" in HTTPSession._TRANSIENT_STATE_ATTRS
+        assert "_retry" in HTTPSession._TRANSIENT_STATE_ATTRS
+        # Base transients are still in the set.
         assert Session._TRANSIENT_STATE_ATTRS.issubset(
             HTTPSession._TRANSIENT_STATE_ATTRS
         )
 
-    def test_http_pool_rebuilt_on_fresh_instance(self) -> None:
+    def test_connections_rebuilt_on_fresh_instance(self) -> None:
         s = HTTPSession(base_url="https://example.com/rebuild", headers={"X-Tag": "ua"})
-        # Touch the lazy pool so we have a live handle on the original.
-        original_pool = s.http_pool
+        # Seed the cache with a fake idle connection so we can tell the
+        # original from a freshly rebuilt one.
+        import collections as _c
+        s._connections[("https", "example.com", 443)] = _c.deque([object()])  # type: ignore[arg-type]
         blob = pickle.dumps(s)
         Session._INSTANCES.clear()
         clone = pickle.loads(blob)
         assert clone is not s
-        # Touching the property on the clone forces a fresh build —
-        # the transient attr is None on the unpickle side.
-        assert clone.http_pool is not None
-        assert clone.http_pool is not original_pool, (
-            "fresh unpickled session should get its own pool"
-        )
+        # Fresh instance: cache is empty, ready for first acquire to fill it.
+        assert clone._connections == {}
 
-    def test_http_pool_excluded_from_state(self) -> None:
+    def test_connections_excluded_from_state(self) -> None:
         s = HTTPSession(base_url="https://example.com")
-        # Build the pool so it's a real object, not None.
-        _ = s.http_pool
+        # Stash a fake idle entry so we can prove it's filtered out.
+        import collections as _c
+        s._connections[("https", "example.com", 443)] = _c.deque([object()])  # type: ignore[arg-type]
         state = s.__getstate__()
-        assert "_http_pool" not in state
+        assert "_connections" not in state
+        assert "_retry" not in state
 
     def test_headers_survive_pickle(self) -> None:
         s = HTTPSession(
@@ -216,14 +217,16 @@ class TestHTTPSessionPickle:
         assert clone is not s
         assert clone.headers == {"X-Tag": "v1", "Authorization": "Bearer x"}
 
-    def test_singleton_preserves_live_pool(self) -> None:
+    def test_singleton_preserves_live_connections(self) -> None:
         s1 = HTTPSession(base_url="https://example.com")
-        live_pool = s1.http_pool  # force lazy build
+        import collections as _c
+        marker = _c.deque([object()])  # type: ignore[var-annotated]
+        s1._connections[("https", "example.com", 443)] = marker
         blob = pickle.dumps(s1)
         s2 = pickle.loads(blob)
         assert s2 is s1
-        assert s2._http_pool is live_pool, (
-            "unpickle must not replace the live singleton's connection pool"
+        assert s2._connections[("https", "example.com", 443)] is marker, (
+            "unpickle must not replace the live singleton's connection cache"
         )
 
 
@@ -321,10 +324,11 @@ class TestSubclassInheritance:
         assert clone._contents_by_id == {}
         assert clone._credentials is None
         assert clone._token is None
-        # And lock + http_pool come back as functional handles.
+        # And lock + connection cache + retry come back as functional handles.
         assert clone._lock.acquire(blocking=False)
         clone._lock.release()
-        assert clone.http_pool is not None
+        assert clone._connections == {}
+        assert clone._retry is not None
 
     def test_subclass_key_excludes_transient_slots(self) -> None:
         # Two clients differing only on derived state still collapse —

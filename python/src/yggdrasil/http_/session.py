@@ -3,23 +3,32 @@
 Construct one :class:`HTTPSession` per host (singleton-cached by config), drive
 verb methods (``get`` / ``post`` / ``put`` / ``patch`` / ``delete`` / ``head``
 / ``options`` / ``request``), and read the returned :class:`HTTPResponse`. All
-the HTTP-specific machinery — pool / retry / timeout, send pipeline, local +
-remote cache, Spark fan-out, verb sugar — lives on this class; the abstract
-:class:`yggdrasil.io.session.Session` shell carries only the singleton + pickle
-+ ``job_pool`` plumbing that's common to every transport.
+the HTTP machinery lives on this class:
 
-The pool, retry, and timeout primitives are urllib3-shaped but stdlib-backed
-(see :mod:`yggdrasil.http_._pool`) — feature code should not import them
-directly.
+* connection cache + per-host keep-alive sockets,
+* status-aware retry (:class:`_TieredRetry`) + redirect handling,
+* the prepare → cache-lookup → wire-send → cache-writeback pipeline,
+* :meth:`send_many` with Spark fan-out,
+* verb sugar and cookie-header coercion.
+
+Wire calls go straight to :mod:`http.client` — no intermediate transport
+class wraps the send. The supporting types (:class:`Retry`,
+:class:`Timeout`, :class:`HTTPResponse`, :class:`HTTPHeaderDict`,
+:mod:`exceptions`) live in :mod:`yggdrasil.http_._pool`; feature code
+should not import them directly.
 """
 
 from __future__ import annotations
 
+import collections
 import datetime as dt
+import http.client
 import itertools
 import logging
 import os
 import pickle
+import socket
+import ssl
 import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import takewhile
@@ -34,6 +43,7 @@ from typing import (
     Optional,
     Sequence,
 )
+from urllib.parse import urlsplit, urlunsplit
 
 import pyarrow as pa
 
@@ -58,7 +68,17 @@ from yggdrasil.io.send_config import CacheConfig, SendConfig, SendManyConfig, _r
 from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
 
-from ._pool import PoolManager, Retry
+from ._pool import (
+    HTTPResponse as _PoolHTTPResponse,
+    LocationParseError,
+    LocationValueError,
+    MaxRetryError,
+    NewConnectionError,
+    ReadTimeoutError,
+    Retry,
+    SSLError,
+    _resolve_timeout,
+)
 from .response import HTTPResponse
 
 if TYPE_CHECKING:
@@ -402,7 +422,12 @@ class HTTPSession(Session):
     _RESPONSE_CLASS: ClassVar[type] = Response
     _BATCH_CLASS: ClassVar[type] = ResponseBatch
 
-    _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_http_pool"}
+    _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_connections", "_retry"}
+
+    # Status codes that trigger an automatic redirect when ``redirect=True``.
+    # 303 always falls back to GET (per RFC 7231); 307/308 preserve method.
+    _REDIRECT_STATUSES: ClassVar[frozenset[int]] = frozenset({301, 302, 303, 307, 308})
+    _MAX_REDIRECTS: ClassVar[int] = 10
 
     def __init__(
         self,
@@ -445,11 +470,19 @@ class HTTPSession(Session):
         # constructor call.
         if auth is not None and not getattr(self, "_in_probe", False):
             self.headers["Authorization"] = auth.authorization
-        # Connection pool is built lazily on first :attr:`http_pool`
-        # access. Keeping ``__init__`` side-effect-free lets the
-        # singleton-key probe (see :meth:`Session._singleton_key`) run
-        # the constructor without opening sockets.
-        self._http_pool: Optional[PoolManager] = None
+        # Per-host idle-connection cache keyed by ``(scheme, host, port)``.
+        # Sockets are recycled across requests so warm calls reuse the
+        # existing TCP / TLS handshake instead of paying for a new one;
+        # capped at ``pool_maxsize`` entries per host. The dict is built
+        # lazily on first acquire so ``__init__`` stays side-effect-free
+        # and the singleton-key probe (see :meth:`Session._singleton_key`)
+        # runs the constructor without opening sockets.
+        self._connections: dict[tuple[str, str, int], "collections.deque[http.client.HTTPConnection]"] = {}
+        # Retry policy is built once at init — same policy applies to
+        # every wire send and the singleton key already pins
+        # ``pool_maxsize`` / ``waiting`` / ``verify`` so two sessions
+        # with the same identity share the same policy by construction.
+        self._retry: Retry = self._build_retry()
 
     def __getnewargs_ex__(self):
         # Promote ``base_url`` to the positional arg slot so the receiver
@@ -464,17 +497,30 @@ class HTTPSession(Session):
         }
         return (self.base_url,), state
 
+    def __setstate__(self, state):
+        # Defer to :meth:`Session.__setstate__` for the live-singleton
+        # short-circuit + lock rebuild; then promote ``_connections`` and
+        # ``_retry`` from ``None`` (the transient default) to a usable
+        # value. ``_connections`` starts empty — the receiver opens its
+        # own sockets — and ``_retry`` is rebuilt fresh from the same
+        # policy the sender used (it's stateless config-shaped).
+        if getattr(self, "_initialized", False):
+            return
+        super().__setstate__(state)
+        self._connections = {}
+        self._retry = self._build_retry()
+
     # ------------------------------------------------------------------
-    # Connection pool / retry policy
+    # Retry policy + connection cache
     # ------------------------------------------------------------------
 
     def _build_retry(self) -> Retry:
-        """Build the :class:`Retry` policy used by the connection pool.
+        """Build the :class:`Retry` policy applied to every wire send.
 
         Subclasses can override to swap the policy entirely, or call
         ``super()._build_retry().new(...)`` to tweak a single field.
         """
-        kwargs: dict = dict(
+        return _TieredRetry(
             total=_RETRY_TOTAL,
             connect=_RETRY_CONNECT,
             read=_RETRY_READ,
@@ -492,25 +538,267 @@ class HTTPSession(Session):
             backoff_factor=_BACKOFF_5XX_FACTOR,
             backoff_max=_BACKOFF_429_MAX,
         )
-        return _TieredRetry(**kwargs)
 
-    def _build_http_pool(self) -> PoolManager:
-        return PoolManager(
-            num_pools=self.pool_maxsize,
-            maxsize=self.pool_maxsize,
-            block=True,
-            retries=self._build_retry(),
-            cert_reqs="CERT_REQUIRED" if self.verify else "CERT_NONE",
-            ca_certs=None,
+    def _build_connection(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        connect_timeout: Optional[float],
+    ) -> http.client.HTTPConnection:
+        """Open a fresh :class:`http.client.HTTPConnection` to *(scheme, host, port)*.
+
+        Honours ``self.verify``: when False the HTTPS context turns off
+        certificate verification and hostname checking, matching the
+        ``cert_reqs="CERT_NONE"`` shape urllib3 callers rely on (Databricks
+        external links, some private-link deployments).
+        """
+        if scheme == "https":
+            if self.verify:
+                ssl_ctx: ssl.SSLContext = ssl.create_default_context()
+            else:
+                ssl_ctx = ssl._create_unverified_context()  # type: ignore[attr-defined]
+                ssl_ctx.check_hostname = False
+            return http.client.HTTPSConnection(
+                host, port=port, timeout=connect_timeout, context=ssl_ctx,
+            )
+        return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
+
+    def _get_connection(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        connect_timeout: Optional[float],
+    ) -> http.client.HTTPConnection:
+        """Pop an idle connection for *(scheme, host, port)* or build one."""
+        key = (scheme, host, port)
+        with self._lock:
+            cached = self._connections.get(key)
+            if cached:
+                return cached.popleft()
+        return self._build_connection(scheme, host, port, connect_timeout)
+
+    def _release_connection(
+        self,
+        key: tuple[str, str, int],
+        conn: http.client.HTTPConnection,
+    ) -> None:
+        """Return ``conn`` to the per-host idle cache or close it.
+
+        Called by :meth:`HTTPResponse.release_conn` after a response is
+        fully drained — matches the ``_PoolHTTPResponse`` release contract
+        so the wrapper from :mod:`yggdrasil.http_._pool` is still usable
+        verbatim. Connections beyond ``pool_maxsize`` get closed instead
+        of cached so a runaway caller can't leak sockets.
+        """
+        with self._lock:
+            cached = self._connections.setdefault(key, collections.deque())
+            if len(cached) < self.pool_maxsize:
+                cached.append(conn)
+                return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def clear_connections(self) -> None:
+        """Close every cached idle connection.
+
+        Lifecycle convenience — closes the per-host sockets the session
+        accumulated. Not called automatically; explicit cleanup is the
+        caller's responsibility (or rely on process exit).
+        """
+        with self._lock:
+            cached, self._connections = self._connections, {}
+        for queue in cached.values():
+            while queue:
+                try:
+                    queue.popleft().close()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Direct HTTP send — no PoolManager indirection
+    # ------------------------------------------------------------------
+
+    def _send_http(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: Any = None,
+        headers: Optional[Mapping[str, str]] = None,
+        timeout: Any = None,
+        preload_content: bool = True,
+        decode_content: bool = True,
+        redirect: bool = True,
+    ) -> _PoolHTTPResponse:
+        """Drive one full HTTP request → response, retries + redirects included.
+
+        Mirrors what a PoolManager-shaped wrapper would expose but the
+        send happens directly through :mod:`http.client` — same retry
+        loop, same redirect handling, no intermediate transport class.
+        Each retry attempt acquires a connection from
+        :meth:`_get_connection`, fires ``conn.request`` + ``conn.getresponse``
+        once, and (on success) wraps the raw response in a
+        :class:`_PoolHTTPResponse` that releases the connection back to
+        :meth:`_release_connection` on drain.
+        """
+        retries: Retry = self._retry.new()  # fresh history per call
+        current_url = url
+        current_method = method
+        current_body = body
+        current_headers = dict(headers or {})
+        visited_redirects = 0
+
+        while True:
+            try:
+                response = self._send_once(
+                    method=current_method,
+                    url=current_url,
+                    body=current_body,
+                    headers=current_headers,
+                    timeout=timeout,
+                    preload_content=preload_content,
+                    decode_content=decode_content,
+                )
+            except (socket.timeout, TimeoutError) as exc:
+                wrapped: Exception = ReadTimeoutError(self, current_url, str(exc))
+                retries = retries.increment(
+                    method=current_method, url=current_url, error=wrapped, _pool=self,
+                )
+                retries.sleep()
+                continue
+            except ssl.SSLError as exc:
+                raise SSLError(str(exc)) from exc
+            except (OSError, http.client.HTTPException) as exc:
+                wrapped = NewConnectionError(self, str(exc))
+                retries = retries.increment(
+                    method=current_method, url=current_url, error=wrapped, _pool=self,
+                )
+                retries.sleep()
+                continue
+
+            # Redirect handling — drains the body, releases the socket,
+            # rewrites method/body for 301/302/303 per RFC 7231.
+            if redirect and response.status in self._REDIRECT_STATUSES:
+                location = response.headers.get("Location")
+                if location and visited_redirects < self._MAX_REDIRECTS:
+                    response.drain_conn()
+                    response.release_conn()
+                    visited_redirects += 1
+                    current_url = self._resolve_redirect(current_url, location)
+                    if response.status in (301, 302, 303) and current_method.upper() != "HEAD":
+                        current_method = "GET"
+                        current_body = None
+                        current_headers.pop("Content-Length", None)
+                        current_headers.pop("Content-Type", None)
+                    continue
+
+            # Retry on status_forcelist (5xx / 429 by default).
+            if retries.is_retry(
+                current_method,
+                response.status,
+                response.headers.get("Retry-After") is not None,
+            ):
+                try:
+                    next_retries = retries.increment(
+                        method=current_method, url=current_url, response=response, _pool=self,
+                    )
+                except MaxRetryError:
+                    if retries.raise_on_status:
+                        raise
+                    return response
+                response.drain_conn()
+                response.release_conn()
+                next_retries.sleep(response=response)
+                retries = next_retries
+                continue
+
+            return response
+
+    def _send_once(
+        self,
+        *,
+        method: str,
+        url: str,
+        body: Any,
+        headers: Mapping[str, str],
+        timeout: Any,
+        preload_content: bool,
+        decode_content: bool,
+    ) -> _PoolHTTPResponse:
+        """Single wire send — one connection, one ``conn.getresponse``."""
+        parts = urlsplit(url)
+        if not parts.scheme or not parts.netloc:
+            raise LocationParseError(url)
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise LocationValueError(f"Unsupported scheme: {scheme!r}")
+        host = parts.hostname or ""
+        port = parts.port or (443 if scheme == "https" else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path = f"{path}?{parts.query}"
+
+        connect_timeout, read_timeout = _resolve_timeout(timeout)
+        key = (scheme, host, port)
+        conn = self._get_connection(scheme, host, port, connect_timeout)
+        try:
+            if read_timeout is not None:
+                conn.timeout = read_timeout
+            send_headers = {k: str(v) for k, v in headers.items()}
+            send_headers.setdefault(
+                "Host", f"{host}:{port}" if port not in (80, 443) else host,
+            )
+            if (
+                body is not None
+                and "Content-Length" not in send_headers
+                and isinstance(body, (bytes, bytearray))
+            ):
+                send_headers["Content-Length"] = str(len(body))
+            conn.request(method, path, body=body, headers=send_headers)
+            raw = conn.getresponse()
+        except socket.timeout as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise ReadTimeoutError(self, url, str(exc)) from exc
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+
+        # ``_PoolHTTPResponse`` calls back into ``self._release_connection``
+        # on drain, so the keep-alive socket goes back to the per-host
+        # cache without HTTPSession having to thread the connection
+        # through every caller.
+        return _PoolHTTPResponse(
+            raw,
+            request_url=url,
+            request_method=method,
+            decode_content=decode_content,
+            preload_content=preload_content,
+            pool=self,
+            connection=conn,
+            pool_key=key,
         )
 
-    @property
-    def http_pool(self) -> PoolManager:
-        if self._http_pool is None:
-            with self._lock:
-                if self._http_pool is None:
-                    self._http_pool = self._build_http_pool()
-        return self._http_pool
+    @staticmethod
+    def _resolve_redirect(current_url: str, location: str) -> str:
+        """Resolve a redirect ``Location`` against the current URL."""
+        if "://" in location:
+            return location
+        parts = urlsplit(current_url)
+        if location.startswith("/"):
+            return urlunsplit((parts.scheme, parts.netloc, location, "", ""))
+        # Relative path — drop the trailing segment of the current path.
+        base = parts.path.rsplit("/", 1)[0] + "/"
+        return urlunsplit((parts.scheme, parts.netloc, base + location, "", ""))
 
     @property
     def x_api_key(self) -> Optional[str]:
@@ -1087,9 +1375,9 @@ class HTTPSession(Session):
         :meth:`_local_send` so the 403-retry branch re-uses the exact same
         transport call.
         """
-        raw_resp = self.http_pool.request(
-            method=request.method,
-            url=request.url.to_string(),
+        raw_resp = self._send_http(
+            request.method,
+            request.url.to_string(),
             body=request.buffer.to_bytes() if request.buffer is not None else None,
             headers=request.headers,
             timeout=wait_cfg.timeout_pool,
@@ -1124,9 +1412,9 @@ class HTTPSession(Session):
             buffer=Memory(binary=body_seed) if body_seed is not None else None,
         )
 
-        raw_resp = self.http_pool.request(
-            method=page_request.method,
-            url=page_url.to_string(),
+        raw_resp = self._send_http(
+            page_request.method,
+            page_url.to_string(),
             body=page_request.buffer.to_bytes() if page_request.buffer is not None else None,
             headers=page_request.headers,
             timeout=wait_cfg.timeout_pool,
