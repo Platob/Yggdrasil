@@ -12,23 +12,26 @@ pulling :mod:`yggdrasil.io` first; see ``AGENTS.md`` →
 
 The hierarchy also:
 
-1. Inherits from ``urllib3.exceptions`` so existing urllib3-aware retry
-   logic, catch blocks, and middleware work without modification.
+1. Inherits from the stdlib-backed pool exceptions in
+   :mod:`yggdrasil.http_._pool` (urllib3-shaped, but stdlib-only) so
+   transport-level ``except`` blocks still match across the
+   transport/business boundary.
 2. Carries a bound ``Response`` (and/or ``PreparedRequest``) on every
    exception so callers never need to thread response objects through
    manually.
-3. Mirrors every public urllib3 exception that has HTTP-level semantics,
+3. Mirrors the public transport exceptions that have HTTP-level semantics,
    adding typed ``response`` / ``request`` attributes where applicable.
 
-Hierarchy (mirrors urllib3, additions marked with *):
+Hierarchy (transport exceptions sourced from
+:mod:`yggdrasil.http_._pool.exceptions`; additions marked with *):
 ─────────────────────────────────────────────────────
-HTTPError                           ← urllib3.HTTPError
+HTTPError                           ← _http_pool.HTTPError
   ├── RequestError *                ← request-bound base
-  │     ├── ConnectionError        ← urllib3.NewConnectionError-ish
-  │     ├── TimeoutError           ← urllib3.TimeoutError
+  │     ├── ConnectionError        ← _http_pool.NewConnectionError
+  │     ├── TimeoutError           ← _http_pool.TimeoutError
   │     │     ├── ConnectTimeoutError
   │     │     └── ReadTimeoutError
-  │     └── ProxyError             ← urllib3.ProxyError
+  │     └── ProxyError             ← _http_pool.ProxyError
   │
   ├── ResponseError *              ← response-bound base
   │     ├── HTTPStatusError  *     ← 4xx / 5xx (was HTTPError in response.py)
@@ -47,22 +50,22 @@ HTTPError                           ← urllib3.HTTPError
   │     │           ├── BadGatewayError       (502)
   │     │           ├── ServiceUnavailable    (503)
   │     │           └── GatewayTimeout        (504)
-  │     ├── DecodeError            ← urllib3.DecodeError
-  │     ├── InvalidChunkLength     ← urllib3.InvalidChunkLength
-  │     └── IncompleteRead         ← urllib3.IncompleteRead
+  │     ├── DecodeError            ← _http_pool.DecodeError
+  │     ├── InvalidChunkLength     ← _http_pool.InvalidChunkLength
+  │     └── IncompleteRead         ← _http_pool.IncompleteRead
   │
-  ├── PoolError *                  ← urllib3.PoolError-ish
-  │     ├── ClosedPoolError        ← urllib3.ClosedPoolError
-  │     ├── EmptyPoolError         ← urllib3.EmptyPoolError
-  │     └── HostChangedError       ← urllib3.HostChangedError
+  ├── PoolError *                  ← _http_pool.PoolError
+  │     ├── ClosedPoolError        ← _http_pool.ClosedPoolError
+  │     ├── EmptyPoolError         ← _http_pool.EmptyPoolError
+  │     └── HostChangedError       ← _http_pool.HostChangedError
   │
   ├── LocationError *
-  │     ├── LocationValueError     ← urllib3.LocationValueError
-  │     └── LocationParseError     ← urllib3.LocationParseError
+  │     ├── LocationValueError     ← _http_pool.LocationValueError
+  │     └── LocationParseError     ← _http_pool.LocationParseError
   │
-  ├── SecurityWarning (Warning)    ← urllib3.SecurityWarning
-  ├── InsecureRequestWarning       ← urllib3.InsecureRequestWarning
-  ├── SSLError                     ← urllib3.SSLError
+  ├── SecurityWarning (Warning)    ← _http_pool.SecurityWarning
+  ├── InsecureRequestWarning       ← _http_pool.InsecureRequestWarning
+  ├── SSLError                     ← _http_pool.SSLError
   └── CacheError *                 ← cache backend failures
 """
 
@@ -70,7 +73,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-import urllib3.exceptions as _u3
+from yggdrasil.http_._pool import exceptions as _u3
 
 from .base import YGGException
 
@@ -414,8 +417,7 @@ class ResponseError(HTTPError):
             return cached
 
         import io
-        from urllib3.response import HTTPResponse as _U3R
-        from urllib3._collections import HTTPHeaderDict
+        from yggdrasil.http_._pool import HTTPResponse as _U3R, HTTPHeaderDict
 
         body_bytes = self.response.buffer.to_bytes() if self.response.buffer else b""
         shim = _U3R(

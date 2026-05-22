@@ -1172,7 +1172,7 @@ Changes here must preserve:
 
 ### Build the session subclass you need; don't fit every vendor through one mega-class
 
-The library ships the transport primitives (`HTTPSession`, `PreparedRequest`, `Response`, `SendConfig` / `SendManyConfig`, `_TieredRetry`, `ErrorNotifyingHTTPSession`, `CacheConfig`) and the Databricks resource singletons (`Schema`, `Table`, `Volume`, `Warehouse`, `Cluster`, `Job`, …). Application / integration code is **expected** to subclass or compose these into the session / service / resource class that fits its API contract.
+The library ships the transport primitives (`HTTPSession`, `PreparedRequest`, `Response`, `SendConfig` / `SendManyConfig`, `_TieredRetry`, `CacheConfig`) and the Databricks resource singletons (`Schema`, `Table`, `Volume`, `Warehouse`, `Cluster`, `Job`, …). Application / integration code is **expected** to subclass or compose these into the session / service / resource class that fits its API contract.
 
 Default to:
 - one small `HTTPSession` subclass per vendor — per-API auth handler, cache layout, time-window snap, pagination quirk, rate-limit policy

@@ -902,7 +902,7 @@ class Response(Tabular["ResponseOptions"]):
 
         if cls is Response:
             if request.url.is_http:
-                from .http_ import HTTPResponse
+                from yggdrasil.http_ import HTTPResponse
 
                 return HTTPResponse(
                     request=request,
@@ -1607,7 +1607,7 @@ class Response(Tabular["ResponseOptions"]):
 
         out_class = cls
         if cls is Response and request.url.is_http:
-            from .http_ import HTTPResponse
+            from yggdrasil.http_ import HTTPResponse
             out_class = HTTPResponse
 
         receiver_value = get("receiver")

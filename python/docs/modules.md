@@ -27,7 +27,7 @@ Engines register their converters **on import** — pull them in once at startup
 | Module | Purpose | Page |
 |---|---|---|
 | `yggdrasil.io` | `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`, codecs, media types | [io](modules/io/README.md) |
-| `yggdrasil.io.http_` | `HTTPSession` (preferred HTTP client), `ErrorNotifyingHTTPSession`, `_TieredRetry` | [http_](modules/io/http_/README.md) |
+| `yggdrasil.http_` | `HTTPSession` (preferred HTTP client) | [http_](modules/http_/README.md) |
 
 ## Serialization
 

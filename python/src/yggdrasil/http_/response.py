@@ -3,21 +3,11 @@ from __future__ import annotations
 import datetime as dt
 from typing import TYPE_CHECKING, Mapping, Optional
 
-try:
-    # urllib3 2.x — ``BaseHTTPResponse`` is the public ABC every concrete
-    # response type (including ``HTTPResponse``) inherits from.
-    from urllib3 import BaseHTTPResponse
-except ImportError:  # pragma: no cover — urllib3 1.x branch
-    # urllib3 1.x has no ``BaseHTTPResponse``; the concrete
-    # ``urllib3.response.HTTPResponse`` is the only response type and
-    # plays the same role here (we only ever call ``.status``,
-    # ``.headers``, ``.stream``, ``.read``, ``.release_conn``).
-    from urllib3.response import HTTPResponse as BaseHTTPResponse  # type: ignore[assignment]
-
-from ..holder import Holder
-from ..memory import Memory
-from ..request import PreparedRequest
-from ..response import Response, _media_type_from_headers
+from yggdrasil.http_._pool import BaseHTTPResponse
+from yggdrasil.io.holder import Holder
+from yggdrasil.io.memory import Memory
+from yggdrasil.io.request import PreparedRequest
+from yggdrasil.io.response import Response, _media_type_from_headers
 
 if TYPE_CHECKING:
     from .path import HTTPPath
@@ -49,7 +39,7 @@ class HTTPResponse(Response):
 
 
     @classmethod
-    def from_urllib3(
+    def from_pool(
         cls,
         request: "PreparedRequest",
         response: BaseHTTPResponse,

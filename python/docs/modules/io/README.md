@@ -7,7 +7,7 @@ Yggdrasil IO and transport layer for buffers, URLs, request/response models, med
 - `BytesIO` for spill-to-disk byte buffers with media/compression helpers
 - `URL` for immutable URL parsing and composition
 - `SendConfig` / `SendManyConfig` for request behavior and batching
-- `HTTPSession` (`yggdrasil.io.http_`) as the preferred HTTP client
+- `HTTPSession` (`yggdrasil.http_`) as the preferred HTTP client
 
 ---
 
@@ -40,7 +40,7 @@ print(u.with_query_items({"q": 2, "lang": "en"}).to_string())
 ## 3) Preferred HTTP client
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 resp = http.get("https://example.com")

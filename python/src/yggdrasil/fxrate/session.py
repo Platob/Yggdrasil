@@ -48,7 +48,7 @@ from typing import (
 
 from yggdrasil.data.cast import convert
 from yggdrasil.data.enums.currency import Currency
-from yggdrasil.io.http_.session import HTTPSession
+from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.url import URL
 
 from .backends import Backend, BackendError, DEFAULT_BACKENDS
@@ -390,7 +390,7 @@ class FxRate(HTTPSession):
     # ``backends`` is runtime config, not identity. List it transient
     # so the singleton-key probe + pickle round-trip skip it and a
     # caller passing a different chain doesn't fragment the connection
-    # pool. (Same shape :class:`ErrorNotifyingHTTPSession` uses.)
+    # pool.
     _TRANSIENT_STATE_ATTRS = HTTPSession._TRANSIENT_STATE_ATTRS | {"backends"}
 
     # ------------------------------------------------------------------ #

@@ -47,7 +47,8 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
 
-import urllib3
+from yggdrasil.http_._pool import PoolManager, Retry, Timeout, disable_warnings, exceptions as _http_exceptions
+
 from databricks.sdk.errors import InternalError, DeadlineExceeded, TemporarilyUnavailable
 from databricks.sdk.service.sql import (
     Disposition,
@@ -174,7 +175,7 @@ class SQLWarehouse(
     _BATCH_CLASS: ClassVar[type[WarehouseStatementBatch]] = WarehouseStatementBatch
 
     # Process-lifetime caching — warehouses are heavyweight (cached
-    # ``EndpointInfo``, urllib3 pool); we want the same id under the
+    # ``EndpointInfo``, HTTP pool); we want the same id under the
     # same service to share state.
     _SINGLETON_TTL: ClassVar[Any] = None
 
@@ -238,7 +239,7 @@ class SQLWarehouse(
     # ------------------------------------------------------------------
 
     # Live thread/socket handles that must NOT cross a pickle boundary.
-    # The lock is process-local; the urllib3 pool owns sockets bound to the
+    # The lock is process-local; the HTTP pool owns sockets bound to the
     # source process. Both are rebuilt fresh from the un-pickled state.
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
         "_external_link_pool_lock",
@@ -291,8 +292,8 @@ class SQLWarehouse(
     # External-link fetch pool
     # ------------------------------------------------------------------
 
-    def external_link_pool(self, max_workers: int = 8) -> "urllib3.PoolManager":
-        """Return the cached :class:`urllib3.PoolManager` for chunk reads.
+    def external_link_pool(self, max_workers: int = 8) -> "PoolManager":
+        """Return the cached :class:`PoolManager` for chunk reads.
 
         Built lazily on the first ``EXTERNAL_LINKS`` chunk read and
         reused across every :class:`WarehouseStatementResult` attached
@@ -332,7 +333,7 @@ class SQLWarehouse(
             # The pool slot can hold a bare ``object()`` placeholder during
             # pickle / fixture round-trips (see
             # ``test_warehouse_pickle.py``), so don't blindly call ``.clear``
-            # — that's a ``urllib3.PoolManager`` method, not a generic one.
+            # — that's a ``PoolManager`` method, not a generic one.
             clear = getattr(pool, "clear", None)
             if callable(clear):
                 try:
@@ -929,8 +930,8 @@ class SQLWarehouse(
 
 
 
-def _build_external_link_pool(max_workers: int) -> urllib3.PoolManager:
-    """Build a :class:`urllib3.PoolManager` for external-link fetches.
+def _build_external_link_pool(max_workers: int) -> PoolManager:
+    """Build a :class:`PoolManager` for external-link fetches.
 
     The pool is reused across every chunk read for the warehouse it's
     attached to (see :meth:`SQLWarehouse.external_link_pool`); pulling
@@ -946,7 +947,7 @@ def _build_external_link_pool(max_workers: int) -> urllib3.PoolManager:
     Timeouts are generous because external-link payloads are Arrow
     IPC streams from cloud storage that can run hundreds of MB.
     """
-    retry = urllib3.Retry(
+    retry = Retry(
         total=4,
         connect=4,
         read=4,
@@ -962,12 +963,12 @@ def _build_external_link_pool(max_workers: int) -> urllib3.PoolManager:
     # path (private-link / proxy-rewritten endpoints, customer-managed
     # VPCs), and the URL itself carries a short-lived signed token so the
     # transport doesn't need certificate-based authentication.
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    return urllib3.PoolManager(
+    disable_warnings(_http_exceptions.InsecureRequestWarning)
+    return PoolManager(
         num_pools=max(4, max_workers // 2),
         maxsize=max_workers * 2,
         retries=retry,
-        timeout=urllib3.Timeout(connect=10.0, read=60.0),
+        timeout=Timeout(connect=10.0, read=60.0),
         cert_reqs="CERT_NONE",
         assert_hostname=False,
     )

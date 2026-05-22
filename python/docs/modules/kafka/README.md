@@ -111,7 +111,7 @@ sink = KafkaIO(
 
 ```python
 from yggdrasil.kafka import KafkaIO
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 import pyarrow as pa
 
 http = HTTPSession()

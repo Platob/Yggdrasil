@@ -19,8 +19,8 @@ import pickle
 import pytest
 
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.http_.response import HTTPResponse
-from yggdrasil.io.http_.session import HTTPSession
+from yggdrasil.http_.response import HTTPResponse
+from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.session import Session

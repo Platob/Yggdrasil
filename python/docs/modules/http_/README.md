@@ -1,4 +1,4 @@
-# yggdrasil.io.http_
+# yggdrasil.http_
 
 `HTTPSession` is the preferred HTTP client in Yggdrasil for:
 
@@ -13,7 +13,7 @@
 ## 1) Fast start
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 resp = http.get("https://httpbin.org/get", params={"source": "docs"})
@@ -28,7 +28,7 @@ print(resp.json())
 ### GET / POST / PUT / PATCH / DELETE
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 print(http.get("https://httpbin.org/get").status)
@@ -41,7 +41,7 @@ print(http.delete("https://httpbin.org/delete").status)
 ### Headers and auth
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession(x_api_key="my-api-key")
 resp = http.get(
@@ -54,7 +54,7 @@ print(resp.json())
 ### Strict status handling
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 resp = http.get("https://httpbin.org/status/404")
@@ -68,7 +68,7 @@ resp.raise_for_status()  # raises on non-2xx
 Use this when you need explicit control over a request before transport.
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 prepared = http.prepare_request(
@@ -88,7 +88,7 @@ print(resp.json().get("json"))
 ## 4) Parallel/batch dispatch (`send_many`)
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 from yggdrasil.io import SendManyConfig
 
 http = HTTPSession()
@@ -107,7 +107,7 @@ print([r.status for r in responses])
 ## 6) Response handling and conversions
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 resp = HTTPSession().get("https://httpbin.org/json")
 
@@ -130,7 +130,7 @@ If your endpoint returns tabular JSON/Arrow-compatible payloads, you can project
 ## 7) Practical recipe: resilient paged pull + normalization
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 from yggdrasil.io import SendManyConfig
 
 http = HTTPSession()

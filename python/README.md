@@ -172,7 +172,7 @@ print(field)
 ### 8. HTTP: simple to advanced
 
 ```python
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 print(http.get("https://httpbin.org/get").json())
@@ -304,7 +304,7 @@ def normalize_options(options=None, *, target_field=None) -> CastOptions:
 | `yggdrasil.dataclasses` | `dataclass_to_arrow_field`, `WaitingConfig`, `Expiring`, `ExpiringDict` |
 | `yggdrasil.polars` / `yggdrasil.pandas` / `yggdrasil.spark` | Engine bridges (`cast.py`, `lib.py`, `tests.py` TestCase bases) |
 | `yggdrasil.io` | `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`, codecs, media types |
-| `yggdrasil.io.http_` | `HTTPSession` (preferred), `PreparedRequest`, `Response` |
+| `yggdrasil.http_` | `HTTPSession` (preferred), `PreparedRequest`, `Response` |
 | `yggdrasil.databricks` | `DatabricksClient` + `sql`/`compute`/`workspaces`/`fs`/`iam`/`secrets`/`jobs`/`account`/`genie` |
 | `yggdrasil.fastapi` | FastAPI service powering the Power Query connector |
 | `yggdrasil.pyutils` / `yggdrasil.concurrent` | `retry`, `parallelize`, `Job`, `JobPoolExecutor` |

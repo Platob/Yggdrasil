@@ -67,7 +67,7 @@ from yggdrasil.pyutils import retry, parallelize
 
 @retry(tries=3, delay=1.0, backoff=2)
 def fetch(url: str) -> bytes:
-    from yggdrasil.io.http_ import HTTPSession
+    from yggdrasil.http_ import HTTPSession
     return HTTPSession().get(url).content
 
 @parallelize(max_workers=10)
@@ -81,7 +81,7 @@ pages = list(fetch_all(urls))
 
 ```python
 from yggdrasil.pyutils import parallelize
-from yggdrasil.io.http_ import HTTPSession
+from yggdrasil.http_ import HTTPSession
 
 http = HTTPSession()
 

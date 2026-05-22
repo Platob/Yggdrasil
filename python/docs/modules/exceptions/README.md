@@ -127,11 +127,14 @@ from yggdrasil.exceptions import make_for_status, from_urllib3
 exc = make_for_status(404, message="item not found")   # NotFoundError
 exc = make_for_status(429, message="rate limited")     # TooManyRequests
 
-# Translate a urllib3 exception into a yggdrasil exception
-import urllib3.exceptions as u3
+# Translate a transport-layer exception into a yggdrasil exception.
+# The HTTP transport ships in :mod:`yggdrasil.http_._pool` (stdlib-backed,
+# urllib3-shaped); :func:`from_urllib3` accepts any exception in that
+# hierarchy and returns the matching :class:`HTTPError` subclass.
+from yggdrasil.http_._pool import exceptions as pool_exc
 try:
-    pass  # urllib3 call
-except u3.MaxRetryError as raw:
+    pass  # HTTP call
+except pool_exc.MaxRetryError as raw:
     raise from_urllib3(raw) from raw
 ```
 
