@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from yggdrasil.data.enums.jointype import JoinType
 from yggdrasil.data.enums.mode import Mode, ModeLike
@@ -38,9 +39,160 @@ if TYPE_CHECKING:
 __all__ = [
     "dedup_arrow_batches",
     "dedup_arrow_table",
+    "resample_arrow_batches",
+    "resample_arrow_table",
     "upsert_arrow_batches",
     "upsert_arrow_tabular",
 ]
+
+
+# Timestamp unit → microseconds-per-tick multiplier. Used by
+# :func:`resample_arrow_table` to convert a ``pa.timestamp`` column to
+# an int64 microsecond axis we can floor against the sampling grid.
+_TS_UNIT_TO_US: dict[str, int] = {
+    "s": 1_000_000,
+    "ms": 1_000,
+    "us": 1,
+    "ns": 1,  # ns is widened to int64 us via integer division; see below.
+}
+
+
+def resample_arrow_table(
+    table: pa.Table,
+    *,
+    time_column: str,
+    sampling_seconds: int,
+) -> pa.Table:
+    """Align *table* to a fixed sampling grid on *time_column*.
+
+    Every timestamp is floored to the largest multiple of
+    ``sampling_seconds`` that's <= the original — the column ends up
+    on the ``sampling_seconds`` grid and rows that landed in the same
+    bucket collapse via ``"first"`` aggregation (matches the
+    :func:`dedup_arrow_table` semantics: pick the first occurrence per
+    group). Pure pyarrow compute, no Python row walk.
+
+    The contract is **aggregate (downsample) or identity**. When the
+    source already lives on a coarser grid than the target, every
+    bucket has one row and the result equals the input modulo the
+    optional timestamp snap. When the source is finer, the dense
+    rows collapse into the coarser bucket. Expanding (upsample) a
+    coarse source to a finer grid is *not* in scope — gap-filling is
+    application-specific and best done explicitly.
+
+    Short-circuits in three cases (returns input by identity):
+
+    * ``time_column`` missing from the schema,
+    * the column isn't a timestamp,
+    * ``sampling_seconds <= 0`` (caller's "no resample requested" knob).
+    """
+    if sampling_seconds <= 0:
+        return table
+    if time_column not in table.schema.names:
+        return table
+
+    ts_col = table.column(time_column)
+    ts_type = ts_col.type
+    if not pa.types.is_timestamp(ts_type):
+        return table
+    if table.num_rows == 0:
+        return table
+
+    # Convert the timestamp to int64 microseconds. ``us`` is the
+    # canonical internal unit yggdrasil leans on (it's the default
+    # :class:`yggdrasil.data.types.primitive.TimestampType` unit and
+    # the precision the cache layer's :data:`RESPONSE_SCHEMA` uses).
+    # Nanosecond columns are floored to microseconds here — the
+    # ``sampling_seconds`` budget is already coarser than a us, so
+    # the precision loss is benign for this op.
+    unit = ts_type.unit
+    if unit == "ns":
+        ts_us = pc.divide_checked(pc.cast(ts_col, pa.int64()), 1000)
+    else:
+        ts_us = pc.cast(ts_col, pa.int64())
+        scale = _TS_UNIT_TO_US.get(unit, 1)
+        if scale != 1:
+            ts_us = pc.multiply(ts_us, scale)
+
+    bucket_us = sampling_seconds * 1_000_000
+    # Floor-divide then re-multiply to snap to the bucket boundary.
+    # pyarrow's ``divide_checked`` on int64 is truncating-toward-zero
+    # for non-negative timestamps (which is all we care about — the
+    # epoch is post-1970 for every real workload), so the floor
+    # collapses to one C++ kernel call per direction.
+    bucket = pc.multiply(pc.divide_checked(ts_us, bucket_us), bucket_us)
+
+    idx_col = "__ygg_idx__"
+    bucket_col = "__ygg_bucket__"
+    indexed = table.append_column(bucket_col, bucket).append_column(
+        idx_col, pa.array(range(table.num_rows)),
+    )
+    grouped = indexed.group_by([bucket_col], use_threads=False).aggregate(
+        [(idx_col, "first")],
+    )
+    keep = grouped.column(f"{idx_col}_first").sort()
+    selected = table.take(keep)
+
+    # Snap the time column itself to the bucket boundary — without
+    # this the rows carry their original timestamps, which is wrong
+    # for a "resampled to grid" output. Project the bucket value
+    # (which lives in microseconds in the indexed table) back into
+    # the original timestamp type, then swap it in.
+    bucket_keep = pa.compute.take(bucket, keep)
+    if unit == "ns":
+        bucket_native = pc.cast(pc.multiply(bucket_keep, 1000), ts_type)
+    else:
+        scale = _TS_UNIT_TO_US.get(unit, 1)
+        if scale != 1:
+            bucket_native = pc.cast(
+                pc.divide_checked(bucket_keep, scale), ts_type,
+            )
+        else:
+            bucket_native = pc.cast(bucket_keep, ts_type)
+
+    return selected.set_column(
+        selected.schema.get_field_index(time_column),
+        time_column,
+        bucket_native,
+    )
+
+
+def resample_arrow_batches(
+    batches: "Iterable[pa.RecordBatch]",
+    *,
+    time_column: str,
+    sampling_seconds: int,
+) -> "Iterator[pa.RecordBatch]":
+    """Iterator-shaped wrapper around :func:`resample_arrow_table`.
+
+    Materialises the stream into a single :class:`pa.Table` (a
+    duplicate's bucket-mates can straddle any chunk boundary, just
+    like dedup), runs the resample, and re-batches on pyarrow's
+    natural chunk boundaries.
+
+    Empty / zero-budget short-circuits to the input iterator
+    unchanged so the caller can route every read through this
+    without paying when there's nothing to resample.
+    """
+    if sampling_seconds <= 0:
+        yield from batches
+        return
+
+    materialised = [b for b in batches if b is not None]
+    if not materialised:
+        return
+
+    table = pa.Table.from_batches(materialised)
+    if table.num_rows == 0:
+        yield from materialised
+        return
+
+    resampled = resample_arrow_table(
+        table,
+        time_column=time_column,
+        sampling_seconds=sampling_seconds,
+    )
+    yield from resampled.to_batches()
 
 
 def dedup_arrow_table(
@@ -53,9 +205,15 @@ def dedup_arrow_table(
 
     1. Append a synthetic ``__ygg_idx__`` column carrying the row
        index (one ``pa.array`` allocation, no row walk).
-    2. ``group_by(keys).aggregate([(__ygg_idx__, "min")])`` collapses
-       the table to one row per key tuple, picking the first
-       occurrence's row index.
+    2. ``group_by(keys, use_threads=False).aggregate([(__ygg_idx__,
+       "first")])`` collapses the table to one row per key tuple,
+       picking the first occurrence's row index. ``"first"`` is an
+       ordered aggregator (pyarrow requires ``use_threads=False``);
+       ``"min"`` would coincide on monotonic row indices but
+       benched *slower* at every table size from 100 to 10 000 rows
+       (multi-threading overhead exceeds its benefit on dedup-shaped
+       work). ``"first"`` is also the semantic answer — pick the
+       first row, not the smallest synthetic index.
     3. Sort those indices so the output preserves the input order
        (``group_by`` makes no ordering promise on its output rows),
        then ``Table.take`` rebuilds the deduped table.
@@ -69,8 +227,10 @@ def dedup_arrow_table(
 
     idx_col = "__ygg_idx__"
     indexed = table.append_column(idx_col, pa.array(range(table.num_rows)))
-    grouped = indexed.group_by(list(keys)).aggregate([(idx_col, "min")])
-    keep = grouped.column(f"{idx_col}_min").sort()
+    grouped = indexed.group_by(list(keys), use_threads=False).aggregate(
+        [(idx_col, "first")],
+    )
+    keep = grouped.column(f"{idx_col}_first").sort()
     return table.take(keep)
 
 

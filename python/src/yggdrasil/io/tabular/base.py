@@ -753,19 +753,32 @@ class Tabular(ABC, Generic[O]):
     def _read_arrow_batches_resolved(
         self, options: O,
     ) -> Iterator[pa.RecordBatch]:
-        """Inner read entry — applies the unique-tag dedup wrap once.
+        """Inner read entry — applies the post-read tagged-schema passes.
 
         Every public read path (:meth:`read_arrow_batches`,
         :meth:`_read_arrow_table`, :meth:`_read_arrow_batch_reader`)
-        funnels through this method so the
-        :meth:`CastOptions.dedup_arrow_batches` pass fires exactly
-        once regardless of which entry point the caller picks. The
-        pass itself is an identity short-circuit when no target
-        column is flagged ``unique`` (or when the source side
-        already guarantees uniqueness), so the common case stays
-        zero-cost.
+        funnels through this method so the schema-driven post-passes
+        fire exactly once regardless of which entry point the caller
+        picks:
+
+        * :meth:`CastOptions.resample_arrow_batches` — snap rows to
+          the target's ``time_sampling`` grid (Field tag), aggregating
+          finer-grained sources via
+          :func:`yggdrasil.arrow.ops.resample_arrow_table`.
+        * :meth:`CastOptions.dedup_arrow_batches` — collapse duplicate
+          rows on columns flagged ``unique`` via
+          :func:`yggdrasil.arrow.ops.dedup_arrow_table`.
+
+        Resample runs **before** dedup: the resample's bucket collapse
+        already implicitly dedupes on the time column, so a downstream
+        unique-tagged column (typically the same time axis) sees a
+        much smaller input. Both passes identity-short-circuit when
+        no matching tag fires, so the common case stays zero-cost.
         """
-        return options.dedup_arrow_batches(self._read_arrow_batches(options))
+        stream = self._read_arrow_batches(options)
+        stream = options.resample_arrow_batches(stream)
+        stream = options.dedup_arrow_batches(stream)
+        return stream
 
     def read_arrow_batches(
         self, options: "O | None" = None, **kwargs: Any,

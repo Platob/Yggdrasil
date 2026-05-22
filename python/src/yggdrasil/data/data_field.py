@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import itertools
 import json
 import os
@@ -48,6 +49,7 @@ from .data_utils import get_cast_options_class, safe_constraint_name
 from .types import NullType, ObjectType
 from .types.base import DataType
 from .types.nested import StructType
+from .types.primitive.temporal import _parse_iso_duration
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -79,6 +81,49 @@ _TYPE_JSON_METADATA_KEY = b"type_json"
 #: ``.decode("utf-8")`` per call.
 _TYPE_JSON_METADATA_KEY_STR = _TYPE_JSON_METADATA_KEY.decode("utf-8")
 _NONE_TYPE = type(None)
+
+
+def _timedelta_to_iso_duration(td: dt.timedelta) -> str:
+    """Render a :class:`datetime.timedelta` as an ISO-8601 duration string.
+
+    Inverse of
+    :func:`yggdrasil.data.types.primitive.temporal._parse_iso_duration`,
+    minus the calendar units (Y/M/W) that the parser collapses on the
+    way in — round-tripping ``"P1Y"`` would yield ``"P365D"`` here
+    because :class:`timedelta` has no concept of calendar years. The
+    output is always normalised to ``P[D]T[H][M][S]``:
+
+    * ``timedelta(hours=1)`` → ``"PT1H"``
+    * ``timedelta(days=1)``  → ``"P1D"``
+    * ``timedelta(minutes=5, seconds=30)`` → ``"PT5M30S"``
+    * ``timedelta(0)`` → ``"PT0S"``
+
+    Negative durations get a leading ``"-"`` (``"-PT1H"``).
+    """
+    total = td.total_seconds()
+    sign = "-" if total < 0 else ""
+    total = abs(total)
+    # Truncate fractional seconds — the tag value lives on the
+    # second grid (Field cache stores ``int`` total_seconds).
+    days, rem = divmod(int(total), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    parts = ["P"]
+    if days:
+        parts.append(f"{days}D")
+    time_parts: list[str] = []
+    if hours:
+        time_parts.append(f"{hours}H")
+    if minutes:
+        time_parts.append(f"{minutes}M")
+    if seconds or (not days and not hours and not minutes):
+        # ``PT0S`` is the canonical zero rendering — anything shorter
+        # ("P", "PT") isn't valid ISO-8601.
+        time_parts.append(f"{seconds}S")
+    if time_parts:
+        parts.append("T" + "".join(time_parts))
+    return sign + "".join(parts)
 
 
 def _attach_type_json_metadata(
@@ -509,6 +554,17 @@ class Field(BaseChildrenFields):
     # for struct-shaped fields where the dtype hash recurses into
     # children.
     _hash: int | None = dataclasses.field(default=None, repr=False, compare=False)
+    # Cached :attr:`time_sampling` total-seconds count. ``time_sampling``
+    # is stored on disk as an ISO-8601 duration string (``"PT1H"`` /
+    # ``"P1D"``); the resample path needs the second count on every
+    # batch, so parse once and stash it here. ``-1`` means
+    # "not computed yet"; ``0`` means "no tag set" so the resample
+    # short-circuits in the same dict-lookup style as the other
+    # cached projections. Invalidated by :meth:`_invalidate_cache`
+    # on any metadata mutation.
+    _total_time_sampling_seconds: int = dataclasses.field(
+        default=-1, repr=False, compare=False,
+    )
 
     def __repr__(self):
         return self.pretty_format()
@@ -588,6 +644,7 @@ class Field(BaseChildrenFields):
     _TAG_KEY_CONSTRAINT_KEY: ClassVar[bytes] = TAG_PREFIX + b"constraint_key"
     _TAG_KEY_SORTED: ClassVar[bytes] = TAG_PREFIX + b"sorted"
     _TAG_KEY_UNIQUE: ClassVar[bytes] = TAG_PREFIX + b"unique"
+    _TAG_KEY_TIME_SAMPLING: ClassVar[bytes] = TAG_PREFIX + b"time_sampling"
 
     # Tag-flag → short token shown in pretty_format. Order is the
     # display order in the bracketed marker group; only flags whose
@@ -914,6 +971,7 @@ class Field(BaseChildrenFields):
         setattr_(self, "_field_name_map", None)
         setattr_(self, "_field_name_fold_map", None)
         setattr_(self, "_hash", None)
+        setattr_(self, "_total_time_sampling_seconds", -1)
         # Adopt children — set their ``parent`` so they bubble cache
         # invalidations back up to us when they mutate. Skip the call
         # entirely on primitive fields where ``dtype.children`` is
@@ -981,6 +1039,7 @@ class Field(BaseChildrenFields):
             and self._field_name_map is None
             and self._field_name_fold_map is None
             and self._hash is None
+            and self._total_time_sampling_seconds == -1
         ):
             # Already clean — still cascade so dirty ancestors clear too.
             if cascade and self.parent is not None:
@@ -995,6 +1054,7 @@ class Field(BaseChildrenFields):
         object.__setattr__(self, "_field_name_map", None)
         object.__setattr__(self, "_field_name_fold_map", None)
         object.__setattr__(self, "_hash", None)
+        object.__setattr__(self, "_total_time_sampling_seconds", -1)
         if cascade and self.parent is not None:
             self.parent._invalidate_cache(cascade=True)
 
@@ -1465,6 +1525,61 @@ class Field(BaseChildrenFields):
         return bool(md and md.get(self._TAG_KEY_UNIQUE))
 
     @property
+    def time_sampling(self) -> "dt.timedelta | None":
+        """Declared row-to-row sampling interval for this timestamp column.
+
+        Stored on disk as an ISO-8601 duration string (``"PT1H"`` /
+        ``"P1D"`` / ``"PT5M"`` / …) under ``t:time_sampling``;
+        decoded on the fly into a :class:`datetime.timedelta`.
+        ``None`` when the tag isn't set.
+
+        Set on a timestamp-typed :class:`Field` to declare "every row
+        in this column lives on the ``time_sampling`` grid". Read
+        paths consult :meth:`CastOptions.resample_arrow_table` to
+        align inbound rows to the target's grid:
+
+        * Source resolution finer than target — aggregate (downsample):
+          bucket timestamps by ``floor(t / sampling)``, collapse with
+          ``first`` on every other column.
+        * Source resolution coarser — leave as-is (the contract is
+          *at most* one row per bucket; expanding to fill gaps is
+          best-effort and not auto-applied).
+        """
+        seconds = self.total_time_sampling_seconds
+        if seconds <= 0:
+            return None
+        return dt.timedelta(seconds=seconds)
+
+    @property
+    def total_time_sampling_seconds(self) -> int:
+        """:attr:`time_sampling` as an integer second count.
+
+        Memoised on the ``_total_time_sampling_seconds`` slot so the
+        per-batch resample path pays one slot read instead of an
+        ISO-8601 reparse. ``0`` means "tag not set"; ``> 0`` is the
+        parsed value. Invalidated by :meth:`_invalidate_cache`.
+        """
+        cached = self._total_time_sampling_seconds
+        if cached >= 0:
+            return cached
+
+        md = self.metadata
+        raw = md.get(self._TAG_KEY_TIME_SAMPLING) if md else None
+        if raw is None:
+            object.__setattr__(self, "_total_time_sampling_seconds", 0)
+            return 0
+
+        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        td = _parse_iso_duration(text)
+        if td is None:
+            object.__setattr__(self, "_total_time_sampling_seconds", 0)
+            return 0
+
+        result = max(0, int(td.total_seconds()))
+        object.__setattr__(self, "_total_time_sampling_seconds", result)
+        return result
+
+    @property
     def comment(self) -> str | None:
         if not self.metadata:
             return None
@@ -1665,6 +1780,71 @@ class Field(BaseChildrenFields):
 
     def with_unique(self, value: bool = True, inplace: bool = False) -> "Field":
         return self._with_tag_flag(b"unique", value, inplace)
+
+    def with_time_sampling(
+        self,
+        value: "dt.timedelta | str | int | float | None",
+        inplace: bool = False,
+    ) -> "Field":
+        """Stamp the time-sampling interval onto this field.
+
+        Accepts:
+
+        * :class:`datetime.timedelta` — stored as ISO-8601 duration
+          via :func:`_timedelta_to_iso_duration`.
+        * :class:`str` — parsed through :func:`_parse_iso_duration`
+          so callers can pass ``"PT1H"`` / ``"P1D"`` directly. The
+          string is normalised before storage so two equivalent
+          inputs (``"PT60M"`` / ``"PT1H"``) round-trip to the same
+          on-disk shape.
+        * :class:`int` / :class:`float` — interpreted as a seconds
+          count, normalised through the timedelta path.
+        * ``None`` — clears the tag.
+
+        Returns ``self`` when ``inplace`` (or when the tag would be
+        unchanged); otherwise returns a fresh copy with the new tag.
+        """
+        if value is None:
+            iso: str | None = None
+        elif isinstance(value, dt.timedelta):
+            iso = _timedelta_to_iso_duration(value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            iso = _timedelta_to_iso_duration(dt.timedelta(seconds=float(value)))
+        elif isinstance(value, (bytes, bytearray)):
+            iso = bytes(value).decode("utf-8")
+        elif isinstance(value, str):
+            td = _parse_iso_duration(value)
+            if td is None:
+                raise ValueError(
+                    f"with_time_sampling: cannot parse {value!r} as an "
+                    "ISO-8601 duration. Expected forms like 'PT1H', 'P1D', "
+                    "'PT5M', '-PT30S', or a timedelta / seconds count."
+                )
+            iso = _timedelta_to_iso_duration(td)
+        else:
+            raise TypeError(
+                f"with_time_sampling: cannot coerce {type(value).__name__} "
+                "to a sampling interval. Pass a timedelta, an ISO-8601 "
+                "string, a seconds count, or None to clear."
+            )
+
+        current = self._tag_value(b"time_sampling")
+        current_str = (
+            current.decode("utf-8") if isinstance(current, (bytes, bytearray))
+            else (current if current is None else str(current))
+        )
+        if iso == current_str:
+            return self
+        if inplace:
+            if iso is None:
+                self._unset_tag_value(b"time_sampling")
+            else:
+                self._set_tag_value(b"time_sampling", iso)
+            # Invalidate the parsed-seconds cache so the next read of
+            # :attr:`time_sampling` reparses the new ISO string.
+            object.__setattr__(self, "_total_time_sampling_seconds", -1)
+            return self
+        return self.copy().with_time_sampling(value, inplace=True)
 
     # ==================================================================
     # Builders — `with_*` mutators, `copy`, `merge_with`, `autotag`

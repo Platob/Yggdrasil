@@ -1172,6 +1172,85 @@ class CastOptions:
         from yggdrasil.arrow.ops import dedup_arrow_batches as _dedup
         yield from _dedup(batches, cols)
 
+    def resample_on_read(self) -> "tuple[str, int] | None":
+        """Return ``(time_column, sampling_seconds)`` to resample to.
+
+        Walks the target's children and picks the first timestamp
+        field whose :attr:`Field.time_sampling` tag is set and the
+        source side doesn't already declare the *same* sampling. The
+        result drives :func:`yggdrasil.arrow.ops.resample_arrow_table`
+        — a single (column, interval) is all that op consumes (you
+        can only have one time axis per table to resample on).
+
+        Returns ``None`` when:
+
+        * no target / no timestamp field carries ``time_sampling``,
+        * the matching source field already declares the same
+          ``total_time_sampling_seconds`` (the rows are already on
+          the requested grid),
+        * the resolved budget is ``0`` (the inverse-parse failed —
+          treated as "no tag").
+        """
+        target = self.target
+        if target is None:
+            return None
+        target_children = getattr(target, "children", None)
+        if not target_children:
+            return None
+        source = self.source
+
+        for child in target_children:
+            sampling = getattr(child, "total_time_sampling_seconds", 0)
+            if sampling <= 0:
+                continue
+            # Only the timestamp/duration-typed columns make sense
+            # as a resample axis. Use Arrow inspection so we don't
+            # have to special-case the yggdrasil :class:`DataType`
+            # hierarchy.
+            try:
+                arrow_field = child.to_arrow_field()
+            except Exception:
+                continue
+            if not pa.types.is_timestamp(arrow_field.type):
+                continue
+            if source is not None:
+                try:
+                    src = source.field(name=child.name, raise_error=False)
+                except TypeError:
+                    src = None
+                if src is not None and getattr(
+                    src, "total_time_sampling_seconds", 0,
+                ) == sampling:
+                    # Source already lives on the target grid — the
+                    # writer enforced the invariant on the way in, no
+                    # client-side resample needed.
+                    continue
+            return child.name, sampling
+        return None
+
+    def resample_arrow_batches(
+        self, batches: "Iterator[pa.RecordBatch]",
+    ) -> "Iterator[pa.RecordBatch]":
+        """Snap rows to the target's ``time_sampling`` grid.
+
+        Resolves the resample column / interval via
+        :meth:`resample_on_read`, then delegates to
+        :func:`yggdrasil.arrow.ops.resample_arrow_batches`. Identity
+        short-circuit when no field is flagged keeps the read path
+        zero-cost on the common case.
+        """
+        target = self.resample_on_read()
+        if target is None:
+            yield from batches
+            return
+        from yggdrasil.arrow.ops import resample_arrow_batches as _resample
+        time_column, sampling_seconds = target
+        yield from _resample(
+            batches,
+            time_column=time_column,
+            sampling_seconds=sampling_seconds,
+        )
+
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
         """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.
 

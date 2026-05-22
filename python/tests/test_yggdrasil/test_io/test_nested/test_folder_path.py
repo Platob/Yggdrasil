@@ -517,3 +517,156 @@ class TestUniqueTagDedup:
         # With unique target → read collapses the duplicate.
         out = folder.read_arrow_table(options=FolderOptions(target=self._target()))
         assert set(out.column("id").to_pylist()) == {1, 2, 3}
+
+
+class TestTimeSamplingResample:
+    """``Field.time_sampling`` triggers a client-side resample on read.
+
+    Contract:
+
+    * Target timestamp column flagged with ``time_sampling=PT1H`` and
+      source side carries finer-grained rows → reader buckets every
+      row to the hour boundary, collapses bucket-mates via
+      ``"first"``, snaps the timestamp column to the bucket value.
+    * Source already declares the same sampling → no resample
+      (the writer enforced the invariant on the way in).
+    * No timestamp field carries the tag → no resample.
+
+    Combined with ``unique`` semantics: resample runs before dedup
+    so the smaller post-resample input drives the dedup walk.
+    """
+
+    def _make_quarter_hour_batch(self) -> "pa.RecordBatch":
+        # 12 rows at :00, :15, :30, :45 across 3 hours.
+        import datetime as dt
+        epoch = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        ts = pa.array(
+            [epoch + dt.timedelta(minutes=15 * i) for i in range(12)],
+            type=pa.timestamp("us", "UTC"),
+        )
+        v = pa.array(list(range(12)))
+        return pa.record_batch([ts, v], names=["ts", "v"])
+
+    def _hourly_target(self):
+        from yggdrasil.data import field, schema
+        import datetime as dt
+
+        return schema(fields=[
+            field("ts", pa.timestamp("us", "UTC")).with_time_sampling(
+                dt.timedelta(hours=1), inplace=True,
+            ),
+            field("v", pa.int64()),
+        ])
+
+    def test_read_resamples_to_target_grid(self, tmp_path) -> None:
+        import datetime as dt
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches((self._make_quarter_hour_batch(),))
+
+        # No target → no resample.
+        plain = folder.read_arrow_table()
+        assert plain.num_rows == 12
+
+        # PT1H target → 3 hourly buckets.
+        out = folder.read_arrow_table(options=FolderOptions(target=self._hourly_target()))
+        assert out.num_rows == 3
+        expected = [
+            dt.datetime(2024, 1, 1, h, 0, tzinfo=dt.timezone.utc)
+            for h in range(3)
+        ]
+        assert out.column("ts").to_pylist() == expected
+        # ``first`` per bucket — the :00-minute row of each hour wins.
+        assert out.column("v").to_pylist() == [0, 4, 8]
+
+    def test_resample_skips_when_no_timestamp_field_flagged(
+        self, tmp_path,
+    ) -> None:
+        # Target has no ``time_sampling`` tag → read returns as-is.
+        from yggdrasil.data import field, schema
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        plain_target = schema(fields=[
+            field("ts", pa.timestamp("us", "UTC")),
+            field("v", pa.int64()),
+        ])
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches((self._make_quarter_hour_batch(),))
+
+        out = folder.read_arrow_table(options=FolderOptions(target=plain_target))
+        assert out.num_rows == 12
+
+    def test_resample_short_circuits_when_source_grid_matches(self) -> None:
+        # Source and target both declare ``time_sampling=PT1H`` → no
+        # resample (the writer enforced the invariant).
+        import datetime as dt
+        from yggdrasil.data import field, schema
+        from yggdrasil.data.options import CastOptions
+
+        hourly = schema(fields=[
+            field("ts", pa.timestamp("us", "UTC")).with_time_sampling(
+                dt.timedelta(hours=1), inplace=True,
+            ),
+            field("v", pa.int64()),
+        ])
+        opts = CastOptions(source=hourly, target=hourly)
+        assert opts.resample_on_read() is None
+
+    def test_resample_picks_only_timestamp_typed_fields(self) -> None:
+        # Tag on a non-timestamp column is ignored — the resample
+        # path needs a time axis to floor against.
+        import datetime as dt
+        from yggdrasil.data import field, schema
+        from yggdrasil.data.options import CastOptions
+
+        bogus = schema(fields=[
+            field("v", pa.int64()).with_time_sampling(
+                dt.timedelta(hours=1), inplace=True,
+            ),
+        ])
+        opts = CastOptions(target=bogus)
+        assert opts.resample_on_read() is None
+
+    def test_time_sampling_tag_round_trips_through_metadata(self) -> None:
+        # Round trip: set timedelta → ISO string in metadata → parsed
+        # timedelta on read.
+        import datetime as dt
+        from yggdrasil.data import field
+
+        f = field("ts", pa.timestamp("us", "UTC"))
+        f = f.with_time_sampling(dt.timedelta(hours=2, minutes=30))
+        assert f.metadata[f._TAG_KEY_TIME_SAMPLING] == b"PT2H30M"
+        assert f.time_sampling == dt.timedelta(hours=2, minutes=30)
+        assert f.total_time_sampling_seconds == 2 * 3600 + 30 * 60
+
+    def test_time_sampling_accepts_iso_str_and_seconds(self) -> None:
+        # ``with_time_sampling`` accepts ISO strings, seconds counts,
+        # and timedeltas, normalising to a single on-disk shape so
+        # ``"PT60M"`` and ``"PT1H"`` land identically.
+        import datetime as dt
+        from yggdrasil.data import field
+
+        from_iso = field("ts", pa.timestamp("us", "UTC")).with_time_sampling("PT1H")
+        from_td = field("ts", pa.timestamp("us", "UTC")).with_time_sampling(
+            dt.timedelta(hours=1),
+        )
+        from_sec = field("ts", pa.timestamp("us", "UTC")).with_time_sampling(3600)
+        assert from_iso.time_sampling == from_td.time_sampling == from_sec.time_sampling
+        assert (
+            from_iso.metadata[from_iso._TAG_KEY_TIME_SAMPLING]
+            == from_td.metadata[from_td._TAG_KEY_TIME_SAMPLING]
+            == from_sec.metadata[from_sec._TAG_KEY_TIME_SAMPLING]
+            == b"PT1H"
+        )
+
+    def test_with_time_sampling_none_clears_tag(self) -> None:
+        import datetime as dt
+        from yggdrasil.data import field
+
+        f = field("ts", pa.timestamp("us", "UTC")).with_time_sampling(
+            dt.timedelta(hours=1),
+        )
+        cleared = f.with_time_sampling(None)
+        assert cleared.time_sampling is None
+        assert cleared.total_time_sampling_seconds == 0
