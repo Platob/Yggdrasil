@@ -863,22 +863,35 @@ class FolderPath(IO[bytes, FolderOptions]):
         Skips :meth:`Path.iterdir` entirely — N stat probes against a
         deterministic path layout instead of a full directory walk.
 
-        The existence check is taken here, before minting the child:
-        on a 64-OR batch lookup against a partially-populated cache
-        the hot shape is "most candidates miss". Skipping the
-        FolderPath allocation + adoption + downstream ``_read_arrow_batches``
-        for misses cuts ~95 us per non-existent partition. When the
-        candidate does exist we'd have paid a stat inside the
-        child's ``iter_children`` anyway, so the early stat doesn't
-        regress the hit path.
+        The existence check is taken **here, before** minting the
+        child. We tried the lazy variant (mint every candidate via
+        :meth:`child_folder` and let the child's own
+        :meth:`iter_children` short-circuit on a missing path); the
+        bench numbers (``benchmarks/io/bench_http_cache.py``) decide
+        against it:
+
+        * On a dense, hot cache the lazy variant cuts
+          :meth:`iter_children` itself by ~31 % (~4.3 ms → ~3.0 ms
+          on 64 hits) but the full Session.send_many time barely
+          moves — the read is I/O dominated.
+        * On a sparse cache (all-miss / cold) the lazy variant adds
+          a fresh :class:`FolderPath` allocation per non-existent
+          candidate. ``Session._split_local_cache (all miss, 64
+          req)`` regressed from 3.1 ms to 5.3 ms (+68 %), and
+          ``Session._store_cached_response`` from 3.8 ms to 4.3 ms
+          (+14 %). The mint cost dominates the saved-stat budget.
+
+        Eager :meth:`Path.exists` keeps the prune cheap for misses
+        and only pays one extra stat per real hit, which the child's
+        :meth:`iter_children` would have taken anyway. The
+        :meth:`child_folder` / :meth:`child_file` helpers remain
+        available for callers that genuinely want a lazy child.
 
         ``hive_cast_value`` is **not** re-applied to the accepted
         values: :func:`extract_partition_filters` already hands back
         values typed against the predicate's literal types — running
         them through another ``pa.compute.cast`` for every of the N
-        candidates wastes a kernel call per probe (and was the
-        single biggest cost in the prune hot path before the
-        skip).
+        candidates wastes a kernel call per probe.
         """
         for value in sorted(values, key=lambda v: (v is None, v)):
             encoded = hive_encode(value)
@@ -1003,6 +1016,61 @@ class FolderPath(IO[bytes, FolderOptions]):
         if cls is None:
             return None
         return cls(holder=entry, owns_holder=False)
+
+    # ==================================================================
+    # Children — direct (no iterdir)
+    # ==================================================================
+
+    def child_file(self, name: str) -> "Tabular":
+        """Mint the :class:`Tabular` leaf at ``self.path / name`` directly.
+
+        Skips :meth:`Path.iterdir` and the existence probe — useful
+        when the caller already knows the leaf name (Hive partition
+        candidate probing, deterministic part-file paths,
+        sidecar/yggmeta lookups). The leaf class is resolved from the
+        new URL's cached :attr:`URL.media_type`; falls back to
+        :class:`BytesIO` when no registered leaf claims the extension
+        so callers always get a usable holder.
+
+        The returned leaf is lazy in the same sense as the
+        :meth:`iter_children` yield: no I/O is performed at mint time.
+        A subsequent ``.read_arrow_batches()`` against a non-existent
+        path yields an empty stream (the underlying
+        :meth:`Path.iterdir` / open path silently handles missing).
+        """
+        child_path = self.path / name
+        url = child_path.url
+        mt = url.media_type if url is not None else None
+        if mt is not None:
+            try:
+                cls = IO.class_for_media_type(mt, default=None)
+            except Exception:
+                cls = None
+        else:
+            cls = None
+        if cls is None:
+            cls = BytesIO
+        leaf = cls(holder=child_path, owns_holder=False)
+        return self.adopt_child(leaf)
+
+    def child_folder(self, name: str) -> "FolderPath":
+        """Mint a child :class:`FolderPath` at ``self.path / name`` directly.
+
+        Skips :meth:`Path.iterdir` and the existence probe — the
+        bound child is lazy and a downstream read against a
+        non-existent directory short-circuits in
+        :meth:`iter_children` (which already stats once). Useful for
+        Hive-partition candidate probing when the accepted-value set
+        is fully defined by the predicate: the caller mints one
+        :class:`FolderPath` per value without paying a stat per
+        candidate up front, and the predicate-prune skips the
+        non-existent ones before any I/O fires.
+
+        Returns the same concrete class as ``self`` so a
+        :class:`DeltaFolder` or other subclass chains through
+        correctly.
+        """
+        return self.adopt_child(type(self)(path=self.path / name))
 
     # ==================================================================
     # Children — write

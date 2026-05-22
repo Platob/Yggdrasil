@@ -232,3 +232,69 @@ class TestClearTabularChildren:
         # ``.ygg/`` sidecar (dot-prefixed) survives — the persist
         # hook will overwrite it on the next write.
         assert (tmp_path / ".ygg").is_dir()
+
+
+class TestChildHelpers:
+    """Direct child constructors — ``child_file`` and ``child_folder``.
+
+    Both helpers mint a sub-:class:`Tabular` at ``self.path / name``
+    without calling :meth:`iter_children` / :meth:`Path.iterdir` and
+    without probing for existence on disk. They are the lazy
+    counterpart to the eager :meth:`iter_children` walk — useful when
+    the caller already knows the name (Hive partition probing,
+    deterministic part-file paths, sidecar lookups).
+    """
+
+    def test_child_file_resolves_leaf_class_by_extension(self, tmp_path) -> None:
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        folder = FolderPath(path=str(tmp_path))
+        leaf = folder.child_file("trades.parquet")
+
+        assert isinstance(leaf, ParquetFile)
+        assert leaf._parent.url == folder.path.url.joinpath("trades.parquet")
+        # No I/O at mint time: the file doesn't exist on disk yet.
+        assert not (tmp_path / "trades.parquet").exists()
+
+    def test_child_file_falls_back_to_bytes_io_for_unknown_extension(
+        self, tmp_path,
+    ) -> None:
+        from yggdrasil.io.bytes_io import BytesIO
+
+        folder = FolderPath(path=str(tmp_path))
+        leaf = folder.child_file("notes.unknown_extension")
+
+        # Unregistered extension → caller still gets a usable handle.
+        assert isinstance(leaf, BytesIO)
+
+    def test_child_folder_returns_lazy_subfolder(self, tmp_path) -> None:
+        folder = FolderPath(path=str(tmp_path))
+        sub = folder.child_folder("partition_key=42")
+
+        assert isinstance(sub, FolderPath)
+        assert sub.path.url == folder.path.url.joinpath("partition_key=42")
+        # No I/O at mint time — the sub-folder doesn't exist yet, and
+        # a downstream read against it must short-circuit to empty.
+        assert not (tmp_path / "partition_key=42").exists()
+        assert list(sub.iter_children()) == []
+
+    def test_child_folder_preserves_subclass(self, tmp_path) -> None:
+        # ``child_folder`` mints a child of the same concrete class so
+        # subclasses (e.g. DeltaFolder) chain through correctly. The
+        # ``mime_type = None`` opt-out keeps the subclass off the
+        # format registry so the test doesn't clash with the parent
+        # FolderPath slot.
+        class _SubFolder(FolderPath):
+            mime_type = None  # type: ignore[assignment]
+
+        sub_root = _SubFolder(path=str(tmp_path))
+        child = sub_root.child_folder("partition_key=0")
+        assert type(child) is _SubFolder
+
+    def test_child_folder_adopts_child(self, tmp_path) -> None:
+        # Adoption stamps tabular_parent so the child shares schema /
+        # free-cols caches with the parent (the same contract
+        # ``iter_children`` provides for yielded children).
+        folder = FolderPath(path=str(tmp_path))
+        sub = folder.child_folder("partition_key=0")
+        assert sub.tabular_parent is folder
