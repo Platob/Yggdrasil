@@ -24,13 +24,18 @@ whatever the real endpoint replies with.
 
 from __future__ import annotations
 
-from pyspark.sql import DataFrame as SparkDataFrame
+import pytest
 
-from yggdrasil.io.response import RESPONSE_SCHEMA
-from yggdrasil.io.tabular import Dataset
-from yggdrasil.spark.tests import SparkTestCase
+# Optional dependency — Spark-only test module.
+pytest.importorskip("pyspark")
 
-from ._helpers import StubSession, make_request
+from pyspark.sql import DataFrame as SparkDataFrame  # noqa: E402
+
+from yggdrasil.io.response import RESPONSE_SCHEMA  # noqa: E402
+from yggdrasil.io.tabular import Dataset  # noqa: E402
+from yggdrasil.spark.tests import SparkTestCase  # noqa: E402
+
+from ._helpers import StubSession, make_request  # noqa: E402
 
 
 class TestSparkSend(SparkTestCase):

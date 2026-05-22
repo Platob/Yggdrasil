@@ -812,37 +812,55 @@ class TestFromPool:
 
 
 class TestPoolResponsePyarrowStream:
-    """Regression: ``pa.input_stream`` must accept the urllib3 shim.
+    """Regression: ``pa.input_stream`` must accept the high-level :class:`HTTPResponse`.
 
-    The Databricks warehouse external-link reader feeds a
-    ``preload_content=False`` :class:`yggdrasil.http_._pool.HTTPResponse`
-    straight into :func:`pyarrow.input_stream` so Arrow IPC chunks can
-    stream without buffering the (potentially hundreds of MB) payload.
-    ``pa.input_stream`` rejects anything that isn't an :class:`io.IOBase`
-    subclass with a bare ``TypeError`` — the pool :class:`HTTPResponse`
-    must therefore inherit from :class:`io.IOBase` and implement the
-    minimum protocol (``readable() == True``).
+    The Databricks warehouse external-link reader feeds the
+    streaming-mode :class:`yggdrasil.http_.HTTPResponse` straight into
+    :func:`pyarrow.input_stream` so Arrow IPC chunks can stream
+    without buffering the (potentially hundreds of MB) payload. After
+    the pool / response merge the high-level :class:`HTTPResponse` is
+    itself an :class:`yggdrasil.io.holder.IO` cursor (so it satisfies
+    the ``pa.input_stream`` duck-type) and no urllib3-shim pool class
+    exists anymore — the module that hosted it was removed.
     """
 
-    def test_pa_input_stream_accepts_pool_response(self) -> None:
+    def test_pa_input_stream_accepts_response(self) -> None:
+        import datetime as dt
         import io
         import pyarrow as pa
         import pyarrow.ipc as pipc
-        from yggdrasil.http_._pool import HTTPResponse
+
+        from yggdrasil.http_.response import HTTPResponse
 
         buf = io.BytesIO()
         schema = pa.schema([("a", pa.int32())])
         with pipc.new_stream(buf, schema) as w:
             w.write_batch(pa.record_batch([[1, 2, 3]], schema=schema))
-        buf.seek(0)
-        resp = HTTPResponse(body=buf, preload_content=False)
+        ipc_bytes = buf.getvalue()
+
+        class _Raw:
+            status = 200
+            headers = {"Content-Type": "application/vnd.apache.arrow.stream"}
+
+            def read(self) -> bytes:
+                return ipc_bytes
+
+            def stream(self, amt: int = 65536):
+                yield ipc_bytes
+
+            def release_conn(self) -> None:
+                pass
+
+        resp = HTTPResponse.from_pool(
+            request=make_request("https://example.com/x"),
+            response=_Raw(),
+            tags=None,
+            received_at=dt.datetime.now(dt.timezone.utc),
+            stream=False,
+        )
         with pa.input_stream(resp) as src:
             reader = pipc.open_stream(src)
             batches = list(reader)
         assert sum(b.num_rows for b in batches) == 3
-        # ``close()`` chains through to :class:`io.IOBase` so the
-        # ``closed`` flag flips — pyarrow checks this after the stream
-        # ends.
-        assert resp.closed is True
 
 

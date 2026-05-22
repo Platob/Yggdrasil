@@ -15,12 +15,16 @@ or the session can't initialize).
 
 from __future__ import annotations
 
-import pyarrow as pa
-import pyspark.sql as pyspark_sql
+import pytest
 
-from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.data.cast import convert
-from yggdrasil.spark.tests import SparkTestCase
+pytest.importorskip("pyspark")
+
+import pyarrow as pa  # noqa: E402
+import pyspark.sql as pyspark_sql  # noqa: E402
+
+from yggdrasil.arrow.tests import ArrowTestCase  # noqa: E402
+from yggdrasil.data.cast import convert  # noqa: E402
+from yggdrasil.spark.tests import SparkTestCase  # noqa: E402
 
 
 class TestAnyToSparkLargeArrowTypes(SparkTestCase, ArrowTestCase):

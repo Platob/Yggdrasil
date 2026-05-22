@@ -306,9 +306,8 @@ class _Stub403HTTPSession(HTTPSession):
             request.headers.get("Authorization") if request.headers else None
         )
         if not self._queue:
-            return MagicMock(headers={}), make_response(request=request)
-        resp = self._queue.pop(0)
-        return MagicMock(headers={}), resp
+            return make_response(request=request)
+        return self._queue.pop(0)
 
 
 class TestForbiddenRetry:

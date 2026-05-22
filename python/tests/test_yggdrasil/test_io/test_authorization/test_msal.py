@@ -20,6 +20,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Optional dependency — the production module auto-installs ``msal``
+# on import, which can't happen in the locked-down test env. Skip the
+# whole module when the dep is missing instead of crashing collection.
+pytest.importorskip("msal")
+
 from yggdrasil.io.authorization import Authorization, MSALAuth
 from yggdrasil.io.authorization import msal as msal_module
 from yggdrasil.dataclasses.expiring import ExpiringDict

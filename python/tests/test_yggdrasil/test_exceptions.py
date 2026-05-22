@@ -6,7 +6,7 @@ Verifies:
    yggdrasil deliberately raises subclasses it.
 2. HTTP exceptions live at :mod:`yggdrasil.exceptions` (not
    ``yggdrasil.io.errors``) and double-subclass the transport
-   :class:`yggdrasil.http_._pool.exceptions.HTTPError` so transport-level
+   :class:`yggdrasil.http_.exceptions.exceptions.HTTPError` so transport-level
    ``except`` blocks still catch them.
 3. ``make_for_status`` dispatches to the right subclass for each
    status code and the produced exception is catchable as both
@@ -23,7 +23,7 @@ import importlib
 import pyarrow as pa
 import pytest
 
-from yggdrasil.http_._pool import exceptions as _u3
+from yggdrasil.http_.exceptions import exceptions as _u3
 
 from yggdrasil.exceptions import (
     BadRequest,

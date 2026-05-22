@@ -1061,11 +1061,12 @@ class WarehouseStatementResult(StatementResult):
         total_bytes = 0
 
         def fetch_batches(url: str) -> Iterator[pa.RecordBatch]:
-            # `preload_content=False` keeps urllib3 from buffering the
-            # full payload into a `bytes` object before we ever see it —
-            # critical for chunks that can run hundreds of MB.  We stream
-            # straight into Arrow's IPC reader instead.
-            resp = http.request(
+            # ``preload_content=False`` keeps the session's
+            # :class:`MemoryStream` lazy — bytes pull through the
+            # decoder pipeline on demand instead of buffering the full
+            # payload (chunks can run hundreds of MB) up front. We
+            # stream straight into Arrow's IPC reader instead.
+            resp = http.fetch(
                 "GET", url,
                 preload_content=False,
                 decode_content=True,
@@ -1079,8 +1080,9 @@ class WarehouseStatementResult(StatementResult):
                         yield batch
             finally:
                 # Drain anything Arrow didn't consume so the connection
-                # can return to the pool cleanly; `release_conn` alone
-                # won't recycle a partially-read response.
+                # can return to the session's idle cache cleanly;
+                # ``release_conn`` alone won't recycle a partially-read
+                # response.
                 try:
                     resp.drain_conn()
                 except Exception:

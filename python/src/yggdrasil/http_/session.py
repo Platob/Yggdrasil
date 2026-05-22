@@ -14,7 +14,9 @@ the HTTP machinery lives on this class:
 Wire calls go straight to :mod:`http.client` — no intermediate transport
 class wraps the send. The supporting types (:class:`Retry`,
 :class:`Timeout`, :class:`HTTPResponse`, :class:`HTTPHeaderDict`,
-:mod:`exceptions`) live in :mod:`yggdrasil.http_._pool`; feature code
+:mod:`exceptions`) live in the small side modules (:mod:`yggdrasil.http_.retry`,
+:mod:`yggdrasil.http_.timeout`, :mod:`yggdrasil.http_.exceptions`,
+:mod:`yggdrasil.http_.headers`); feature code
 should not import them directly.
 """
 
@@ -68,18 +70,17 @@ from yggdrasil.io.send_config import CacheConfig, SendConfig, SendManyConfig, _r
 from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
 
-from ._pool import (
-    HTTPResponse as _PoolHTTPResponse,
+from .exceptions import (
     LocationParseError,
     LocationValueError,
     MaxRetryError,
     NewConnectionError,
     ReadTimeoutError,
-    Retry,
     SSLError,
-    _resolve_timeout,
 )
 from .response import HTTPResponse
+from .retry import Retry
+from .timeout import _resolve_timeout
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
@@ -404,7 +405,8 @@ class HTTPSession(Session):
 
     Inherits the singleton + pickle + ``job_pool`` plumbing from
     :class:`~yggdrasil.io.session.Session` and adds every HTTP-specific
-    concern: a stdlib-backed :class:`~yggdrasil.http_._pool.PoolManager`
+    concern: a stdlib-backed connection pool (HTTPSession owns the per-host
+    socket cache directly — no separate ``PoolManager`` indirection)
     connection pool, the prepare → cache-lookup → wire-send → cache-writeback
     pipeline (both single-request :meth:`send` and bulk :meth:`send_many`),
     Spark fan-out via ``mapInArrow``, the verb sugar
@@ -587,10 +589,8 @@ class HTTPSession(Session):
         """Return ``conn`` to the per-host idle cache or close it.
 
         Called by :meth:`HTTPResponse.release_conn` after a response is
-        fully drained — matches the ``_PoolHTTPResponse`` release contract
-        so the wrapper from :mod:`yggdrasil.http_._pool` is still usable
-        verbatim. Connections beyond ``pool_maxsize`` get closed instead
-        of cached so a runaway caller can't leak sockets.
+        fully drained. Connections beyond ``pool_maxsize`` get closed
+        instead of cached so a runaway caller can't leak sockets.
         """
         with self._lock:
             cached = self._connections.setdefault(key, collections.deque())
@@ -622,39 +622,74 @@ class HTTPSession(Session):
     # Direct HTTP send — no PoolManager indirection
     # ------------------------------------------------------------------
 
-    def _send_http(
+    def fetch(
         self,
         method: str,
-        url: str,
+        url: URL | str,
         *,
-        body: Any = None,
         headers: Optional[Mapping[str, str]] = None,
+        body: Any = None,
+        timeout: Any = None,
+        preload_content: bool = False,
+        decode_content: bool = True,
+        redirect: bool = True,
+        tags: Optional[Mapping[str, str]] = None,
+    ) -> HTTPResponse:
+        """Low-level wire fetch — bypasses the cache / auth-refresh pipeline.
+
+        Build a synthetic :class:`PreparedRequest` from ``method`` /
+        ``url`` / ``headers`` / ``body`` and run it through the same
+        retry + redirect machinery :meth:`_send_http` does for the
+        regular :meth:`send` path. Useful when the caller just wants a
+        raw byte stream off a URL — Databricks external-link readers
+        feeding :func:`pa.input_stream` are the canonical case.
+        """
+        request = PreparedRequest.prepare(
+            method=method,
+            url=str(url) if isinstance(url, URL) else url,
+            headers=dict(headers) if headers is not None else None,
+            body=body,
+        )
+        return self._send_http(
+            request,
+            timeout=timeout,
+            preload_content=preload_content,
+            decode_content=decode_content,
+            redirect=redirect,
+            tags=tags,
+        )
+
+    def _send_http(
+        self,
+        request: PreparedRequest,
+        *,
         timeout: Any = None,
         preload_content: bool = True,
         decode_content: bool = True,
         redirect: bool = True,
-    ) -> _PoolHTTPResponse:
+        tags: Optional[Mapping[str, str]] = None,
+    ) -> HTTPResponse:
         """Drive one full HTTP request → response, retries + redirects included.
 
-        Mirrors what a PoolManager-shaped wrapper would expose but the
-        send happens directly through :mod:`http.client` — same retry
-        loop, same redirect handling, no intermediate transport class.
-        Each retry attempt acquires a connection from
-        :meth:`_get_connection`, fires ``conn.request`` + ``conn.getresponse``
-        once, and (on success) wraps the raw response in a
-        :class:`_PoolHTTPResponse` that releases the connection back to
-        :meth:`_release_connection` on drain.
+        :class:`HTTPSession` IS the connection pool — each retry attempt
+        acquires a socket from :meth:`_get_connection`, fires
+        ``conn.request`` + ``conn.getresponse`` once, and (on success)
+        wraps the raw response in a high-level :class:`HTTPResponse`
+        whose :meth:`release_conn` routes straight back into
+        :meth:`_release_connection`. No intermediate transport class.
         """
         retries: Retry = self._retry.new()  # fresh history per call
-        current_url = url
-        current_method = method
-        current_body = body
-        current_headers = dict(headers or {})
+        current_url = request.url.to_string()
+        current_method = request.method
+        current_body = request.buffer.to_bytes() if request.buffer is not None else None
+        current_headers = dict(request.headers or {})
+        current_request = request
         visited_redirects = 0
 
         while True:
             try:
                 response = self._send_once(
+                    request=current_request,
                     method=current_method,
                     url=current_url,
                     body=current_body,
@@ -662,6 +697,7 @@ class HTTPSession(Session):
                     timeout=timeout,
                     preload_content=preload_content,
                     decode_content=decode_content,
+                    tags=tags,
                 )
             except (socket.timeout, TimeoutError) as exc:
                 wrapped: Exception = ReadTimeoutError(self, current_url, str(exc))
@@ -694,6 +730,8 @@ class HTTPSession(Session):
                         current_body = None
                         current_headers.pop("Content-Length", None)
                         current_headers.pop("Content-Type", None)
+                    # Rebuild a synthetic request for the redirected hop.
+                    current_request = current_request.copy(url=current_url)
                     continue
 
             # Retry on status_forcelist (5xx / 429 by default).
@@ -721,6 +759,7 @@ class HTTPSession(Session):
     def _send_once(
         self,
         *,
+        request: PreparedRequest,
         method: str,
         url: str,
         body: Any,
@@ -728,7 +767,8 @@ class HTTPSession(Session):
         timeout: Any,
         preload_content: bool,
         decode_content: bool,
-    ) -> _PoolHTTPResponse:
+        tags: Optional[Mapping[str, str]] = None,
+    ) -> HTTPResponse:
         """Single wire send — one connection, one ``conn.getresponse``."""
         parts = urlsplit(url)
         if not parts.scheme or not parts.netloc:
@@ -773,19 +813,20 @@ class HTTPSession(Session):
                 pass
             raise
 
-        # ``_PoolHTTPResponse`` calls back into ``self._release_connection``
-        # on drain, so the keep-alive socket goes back to the per-host
-        # cache without HTTPSession having to thread the connection
-        # through every caller.
-        return _PoolHTTPResponse(
-            raw,
-            request_url=url,
-            request_method=method,
-            decode_content=decode_content,
-            preload_content=preload_content,
-            pool=self,
+        # Build the high-level :class:`HTTPResponse` directly off the
+        # raw socket. ``release_conn`` on the returned response calls
+        # back into ``self._release_connection`` so the keep-alive
+        # socket goes back to the per-host cache without HTTPSession
+        # having to thread the connection through every caller.
+        return HTTPResponse.from_wire(
+            request=request,
+            raw=raw,
+            session=self,
             connection=conn,
             pool_key=key,
+            decode_content=decode_content,
+            preload_content=preload_content,
+            tags=tags,
         )
 
     @staticmethod
@@ -1349,7 +1390,7 @@ class HTTPSession(Session):
     ) -> HTTPResponse:
         wait_cfg = self.waiting if config.wait is None else config.wait
 
-        raw_resp, result = self._wire_send(request, wait_cfg)
+        result = self._wire_send(request, wait_cfg)
 
         # 403 → refresh auth and retry once. The pool's status_forcelist
         # covers 5xx / 429 transients; 403 is a deliberate auth signal
@@ -1365,10 +1406,10 @@ class HTTPSession(Session):
             )
             _, refreshed = self.refresh_auth(request)  # force=True default
             if refreshed:
-                raw_resp, result = self._wire_send(request, wait_cfg)
+                result = self._wire_send(request, wait_cfg)
 
-        x_current_page = raw_resp.headers.get("X-Current-Page")
-        x_total_pages = raw_resp.headers.get("X-Last-Page")
+        x_current_page = result.headers.get("X-Current-Page")
+        x_total_pages = result.headers.get("X-Last-Page")
 
         if x_current_page and x_total_pages:
             result = self._combine_paginated_pages(
@@ -1390,34 +1431,22 @@ class HTTPSession(Session):
         self,
         request: PreparedRequest,
         wait_cfg: WaitingConfig,
-    ) -> tuple[Any, HTTPResponse]:
+    ) -> HTTPResponse:
         """Single wire-level send.
 
-        Returns the raw pool response (kept around so the caller can read
-        pagination headers like ``X-Current-Page`` without a second round
-        trip) alongside the drained :class:`HTTPResponse`. Extracted from
-        :meth:`_local_send` so the 403-retry branch re-uses the exact same
-        transport call.
+        :class:`HTTPSession` IS the pool now: :meth:`_send_http`
+        returns the drained :class:`HTTPResponse` directly, so callers
+        read ``X-Current-Page`` / ``X-Last-Page`` straight off
+        ``response.headers`` without a parallel raw-response object.
         """
-        raw_resp = self._send_http(
-            request.method,
-            request.url.to_string(),
-            body=request.buffer.to_bytes() if request.buffer is not None else None,
-            headers=request.headers,
+        result = self._send_http(
+            request,
             timeout=wait_cfg.timeout_pool,
-            preload_content=False,
+            preload_content=True,
             decode_content=False,
             redirect=True,
         )
-        result = HTTPResponse.from_pool(
-            request=request,
-            response=raw_resp,
-            tags=None,
-            received_at=dt.datetime.now(dt.timezone.utc),
-            stream=True,
-            release_conn=True,
-        )
-        return raw_resp, result
+        return result
 
     def _fetch_paginated_page(
         self,
@@ -1436,24 +1465,12 @@ class HTTPSession(Session):
             buffer=Memory(binary=body_seed) if body_seed is not None else None,
         )
 
-        raw_resp = self._send_http(
-            page_request.method,
-            page_url.to_string(),
-            body=page_request.buffer.to_bytes() if page_request.buffer is not None else None,
-            headers=page_request.headers,
+        page_result = self._send_http(
+            page_request,
             timeout=wait_cfg.timeout_pool,
-            preload_content=not stream,
+            preload_content=True,
             decode_content=False,
             redirect=True,
-        )
-
-        page_result = HTTPResponse.from_pool(
-            request=page_request,
-            response=raw_resp,
-            tags=None,
-            received_at=dt.datetime.now(tz=dt.timezone.utc),
-            stream=stream,
-            release_conn=True,
         )
 
         if raise_error:
