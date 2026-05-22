@@ -18,15 +18,15 @@ PySpark or Java isn't reachable.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from yggdrasil.data.enums import Mode
+from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.response import RESPONSE_SCHEMA, Response
 from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import Session
@@ -39,24 +39,16 @@ from pyspark.sql import SparkSession  # noqa: E402
 
 
 @pytest.fixture(scope="module")
-def spark() -> Iterator[SparkSession]:
-    # Bypass PyEnv.spark_session / databricks-connect entirely — those
-    # paths require either a Databricks workspace or the connect SDK.
-    os.environ.setdefault("PYSPARK_PYTHON", "python")
+def spark() -> SparkSession:
+    # Share the global test SparkSession with every other ``SparkTestCase``
+    # in the run — stopping it here would kill the process-wide JVM
+    # ``SparkContext`` and break any spark-touching test that ran after.
+    from yggdrasil.spark.tests import _get_test_spark
+
     try:
-        session = (
-            SparkSession.builder
-            .master("local[2]")
-            .appName("ygg-spark-remote-cache-test")
-            .config("spark.sql.session.timeZone", "UTC")
-            .getOrCreate()
-        )
+        return _get_test_spark(app_name="ygg-spark-remote-cache-test")
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"local SparkSession unavailable: {exc!r}")
-    try:
-        yield session
-    finally:
-        session.stop()
 
 
 @pytest.fixture
@@ -320,13 +312,13 @@ class TestPinSparkSnapshot:
     from. Without an eager snapshot, a later ``.count()`` on the lookup
     frame re-runs the SELECT and double-counts rows freshly inserted by
     stage 4 — the regression that surfaced as
-    ``ResponseBatch.counts == {'remote': N, 'new': N}`` for a cold
+    ``HTTPResponseBatch.counts == {'remote': N, 'new': N}`` for a cold
     cache where ``remote`` should have been 0.
     """
 
     def test_pin_caches_and_freezes_count(self, spark) -> None:
         df = spark.range(0, 5).toDF("v")
-        pinned = Session._pin_spark_snapshot(df)
+        pinned = HTTPSession._pin_spark_snapshot(df)
         assert getattr(pinned, "is_cached", False), (
             "_pin_spark_snapshot must register the frame with Spark's "
             "executor cache so subsequent actions don't re-execute"
@@ -347,5 +339,5 @@ class TestPinSparkSnapshot:
 
         monkeypatch.setattr(_SparkDataFrame, "cache", _reject_cache)
         df = spark.range(0, 3).toDF("v")
-        pinned = Session._pin_spark_snapshot(df)
+        pinned = HTTPSession._pin_spark_snapshot(df)
         assert pinned.count() == 3

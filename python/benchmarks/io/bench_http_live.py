@@ -170,7 +170,7 @@ def _send_many_scenarios(base_url: str, repeat: int) -> list[dict]:
     # send_many through a populated local cache — exercises the
     # staged pipeline's hot path (the snapshot loop above stage 1,
     # the single-pass classification in _split_remote_cache, the
-    # ResponseBatch flatten). Distinct URLs so the cache reads N
+    # HTTPResponseBatch flatten). Distinct URLs so the cache reads N
     # different rows per call rather than one row N times — that
     # surfaces the per-request resolution cost more honestly.
     cache_n = 128

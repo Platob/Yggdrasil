@@ -720,7 +720,7 @@ class CacheConfig(_ConfigBase):
         * ``base_url`` unset → ``…/response/default``
 
         Used as the per-config key for grouping cache hits in
-        :class:`yggdrasil.io.response_batch.ResponseBatch`.
+        :class:`yggdrasil.http_.response_batch.HTTPResponseBatch`.
         """
         if self.is_local:
             return self.tabular.path

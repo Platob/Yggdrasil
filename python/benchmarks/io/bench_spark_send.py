@@ -7,7 +7,7 @@ What this covers
 lazy :class:`Tabular`-of-Response counterpart to the iterator-returning
 ``send_many``: cache lookups stay on the driver, the network fetch
 fans out via ``mapInArrow``, and per-chunk
-:class:`yggdrasil.io.response_batch.ResponseBatch` frames are
+:class:`yggdrasil.http_.response_batch.HTTPResponseBatch` frames are
 ``unionByName``-stitched into one DataFrame wrapped as a
 :class:`Dataset`. The interesting numbers split between two phases:
 

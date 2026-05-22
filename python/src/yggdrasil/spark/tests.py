@@ -103,9 +103,10 @@ def _get_test_spark(
     """Return the shared test SparkSession, creating it on first call.
 
     Delegates to :meth:`PyEnv.spark_session` so the test base, the rest of
-    ``yggdrasil``, and downstream callers all read from one cache. Forces
-    ``connect=False`` so a stray ``DATABRICKS_HOST`` in the test environment
-    doesn't redirect tests to a remote workspace.
+    ``yggdrasil``, and downstream callers all read from one cache. Leaves
+    ``connect`` unset so :meth:`PyEnv.should_use_databricks_connect` picks
+    the flavor from the live environment — Connect when ``DATABRICKS_HOST``
+    is configured, pure local PySpark otherwise.
     """
     global _global_tmpdir
 
@@ -123,7 +124,6 @@ def _get_test_spark(
 
     session = PyEnv.spark_session(
         create=True,
-        connect=True,
         install_java=True,
         local_setup=True,
         extra_config=merged_config,
