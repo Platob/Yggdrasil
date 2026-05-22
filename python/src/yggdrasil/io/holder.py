@@ -154,7 +154,7 @@ def _resolve_in_memory_tabular(data: Any) -> "type | None":
     # with ``pa.ipc.open_stream`` and handing the reader to
     # :class:`IO` get back an in-memory holder rather than a TypeError.
     if isinstance(data, (pa.Table, pa.RecordBatch, pa.RecordBatchReader)):
-        from yggdrasil.io.tabular.arrow import ArrowTabular
+        from yggdrasil.arrow.tabular import ArrowTabular
         return ArrowTabular
 
     mod = (type(data).__module__ or "").split(".", 1)[0]
@@ -164,12 +164,12 @@ def _resolve_in_memory_tabular(data: Any) -> "type | None":
         # GroupedData, Window …) aren't tabular sources we know how
         # to wrap; route DataFrames only.
         if "DataFrame" in type(data).__name__:
-            from yggdrasil.io.tabular.spark import Dataset
+            from yggdrasil.spark.tabular import Dataset
             return Dataset
         return None
 
     if mod in ("polars", "pandas"):
-        from yggdrasil.io.tabular.arrow import ArrowTabular
+        from yggdrasil.arrow.tabular import ArrowTabular
         return ArrowTabular
 
     # Pure-Python row-list / column-dict shapes. Match the same
@@ -178,13 +178,13 @@ def _resolve_in_memory_tabular(data: Any) -> "type | None":
     if isinstance(data, list) and data and all(
         isinstance(r, dict) for r in data
     ):
-        from yggdrasil.io.tabular.arrow import ArrowTabular
+        from yggdrasil.arrow.tabular import ArrowTabular
         return ArrowTabular
     if (
         isinstance(data, dict) and data
         and all(isinstance(v, (list, tuple)) for v in data.values())
     ):
-        from yggdrasil.io.tabular.arrow import ArrowTabular
+        from yggdrasil.arrow.tabular import ArrowTabular
         return ArrowTabular
 
     return None

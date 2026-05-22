@@ -14,8 +14,8 @@ already have in memory and don't want to round-trip through IPC bytes.
 """
 
 from .base import O, Tabular, is_tabular_source
-from yggdrasil.io.tabular.arrow import ArrowTabular
-from yggdrasil.io.tabular.spark import Dataset, SparkTabular
+from yggdrasil.arrow.tabular import ArrowTabular
+from yggdrasil.spark.tabular import Dataset, SparkTabular
 from yggdrasil.io.tabular.lazy import LazyTabular
 from yggdrasil.io.tabular.union import UnionTabular
 from yggdrasil.io.tabular.engine import (

@@ -248,7 +248,7 @@ class TestSparkPersistRemote:
         # ``[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE ...`` when a
         # caller invokes ``DataFrame.persist`` against the unsupported
         # plan node. Stage 4 routes through
-        # :class:`yggdrasil.io.tabular.spark.Dataset`, whose ``persist``
+        # :class:`yggdrasil.spark.tabular.Dataset`, whose ``persist``
         # swallows the exception and continues with the un-cached
         # frame — both inserts must still land.
         tab_a = _SparkAwareFakeTabular("cache_a")

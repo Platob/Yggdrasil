@@ -38,7 +38,7 @@ from yggdrasil.data.types.primitive import (
     Int64Type,
     StringType,
 )
-from yggdrasil.io.tabular.spark import Dataset
+from yggdrasil.spark.tabular import Dataset
 
 
 def _local_spark():

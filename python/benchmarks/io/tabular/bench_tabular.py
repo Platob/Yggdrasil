@@ -42,7 +42,7 @@ from yggdrasil.arrow.cast import rechunk_arrow_batches, rechunk_arrow_table
 from yggdrasil.data import Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.io.tabular.arrow import ArrowTabular
+from yggdrasil.arrow.tabular import ArrowTabular
 
 
 # ---------------------------------------------------------------------------

@@ -75,7 +75,7 @@ from typing import (
 import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.tabular import Tabular
+from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.data.enums import MimeType, Mode
 
 if TYPE_CHECKING:
@@ -1464,7 +1464,7 @@ class _ProxiedCallable:
 
 
 # Pre-rename spelling. External callers that did
-# ``from yggdrasil.io.tabular.spark import SparkTabular`` (or
+# ``from yggdrasil.spark.tabular import SparkTabular`` (or
 # ``from yggdrasil.io.tabular import SparkTabular``) keep resolving
 # to the same class — the alias is the same object, not a subclass,
 # so ``isinstance(x, SparkTabular)`` and ``isinstance(x, Dataset)``

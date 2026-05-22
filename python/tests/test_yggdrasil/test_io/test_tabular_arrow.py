@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.tabular.arrow.ArrowTabular`.
+"""Tests for :class:`yggdrasil.arrow.tabular.ArrowTabular`.
 
 Covers the three areas that grew during the
 ``leverage-arrow-cast / ArrowIPCFile-spill`` optimization:
