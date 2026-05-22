@@ -169,6 +169,10 @@ nav:
           - dataclasses: modules/dataclasses/README.md
       - IO & HTTP:
           - io: modules/io/README.md
+          - io.path: modules/io/path/README.md
+          - io.tabular: modules/io/tabular/README.md
+          - io.primitive: modules/io/primitive/README.md
+          - io.nested (Delta / Zip / Folder): modules/io/nested/README.md
           - io.http_: modules/io/http_/README.md
       - Databricks:
           - Overview: modules/databricks/README.md
@@ -195,6 +199,7 @@ nav:
           - ai (Vector Search): modules/databricks/ai/README.md
       - Storage & Databases:
           - mongo: modules/mongo/README.md
+          - mongoengine: modules/mongoengine/README.md
           - postgres: modules/postgres/README.md
           - aws: modules/aws/README.md
           - delta: modules/delta/README.md
@@ -207,9 +212,12 @@ nav:
       - Utilities:
           - pyutils: modules/pyutils/README.md
           - concurrent: modules/concurrent/README.md
+          - environ: modules/environ/README.md
           - optional libs: modules/libs/README.md
           - extension helpers: modules/libs/extensions/README.md
           - deltalake (status): modules/deltalake/README.md
+      - Services:
+          - fastapi: modules/fastapi/README.md
   - API Reference:
       - Overview: api/index.md
       - Browse: reference/
