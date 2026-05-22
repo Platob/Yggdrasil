@@ -1336,6 +1336,55 @@ class CastOptions:
             partition_by=partition_by or None,
         )
 
+    # ------------------------------------------------------------------
+    # Post-read passes on a *materialised* table
+    #
+    # The streaming wraps above are the right shape for iterator-driven
+    # read paths (``read_arrow_batches`` / ``read_arrow_batch_reader``).
+    # When the caller has already built (or will immediately build) a
+    # single :class:`pa.Table` — :meth:`Tabular._read_arrow_table`,
+    # :meth:`read_polars_frame`, :meth:`read_pandas_frame`, the write
+    # side's ``cast_arrow_tabular`` entry point — applying the resample
+    # / dedup directly on the Table skips the materialise-then-rebatch
+    # dance the iterator wraps do internally (each op rebuilds a
+    # ``Table.from_batches`` to run group_by, then re-batches on the
+    # way out, only for the outer caller to ``Table.from_batches``
+    # them right back).
+    # ------------------------------------------------------------------
+
+    def apply_post_read_table(self, table: "pa.Table") -> "pa.Table":
+        """Run resample + dedup directly on a materialised :class:`pa.Table`.
+
+        Same operations and same order as the streaming wraps —
+        resample first (its bucket collapse trims rows before the
+        unique-tag walk), then dedup. Identity short-circuit when
+        neither pass is configured so the common case stays
+        zero-cost.
+
+        Pyarrow / polars / pandas read paths that already produce a
+        Table funnel through this method instead of the iterator
+        wraps; the result is one ``Table.from_batches`` + one
+        ``Table.take`` (per pass) instead of two ``Table.from_batches``
+        + a ``Table.to_batches`` rebatch sandwich.
+        """
+        resample = self.resample_on_read()
+        unique = self.dedup_columns_on_read()
+        if resample is None and not unique:
+            return table
+        if resample is not None:
+            from yggdrasil.arrow.ops import resample_arrow_table as _resample
+            time_column, sampling_seconds, partition_by = resample
+            table = _resample(
+                table,
+                time_column=time_column,
+                sampling_seconds=sampling_seconds,
+                partition_by=partition_by or None,
+            )
+        if unique:
+            from yggdrasil.arrow.ops import dedup_arrow_table as _dedup
+            table = _dedup(table, unique)
+        return table
+
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
         """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.
 

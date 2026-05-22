@@ -602,3 +602,238 @@ class TestTimeSampleByResample:
         ]
         assert sorted(per_symbol["A"]) == expected
         assert sorted(per_symbol["B"]) == expected
+
+
+class TestComplexNestedTypeDedupResample:
+    """Dedup / resample on tables with list, struct, list-of-struct columns.
+
+    pyarrow's ``group_by`` doesn't support nested types as group keys,
+    but it accepts them as non-key columns. The dedup / resample
+    contract holds as long as the keys / time column themselves are
+    scalar — the nested payload columns ride through ``take`` /
+    ``filter`` unchanged.
+
+    These tests stress the pure-arrow ops at the shapes :class:`Response`
+    / :class:`PreparedRequest` actually carry (headers as
+    ``map<string, string>``, request URL bits as ``struct<…>``,
+    user_info as a nested struct, body as ``binary``) so a regression
+    in the underlying group_by / take wiring shows up here.
+    """
+
+    @staticmethod
+    def _build_table_with_list(rows: int) -> "pa.Table":
+        """``id`` (int64) + ``items`` (list<int64>) — list payload."""
+        return pa.table({
+            "id": pa.array([i % (rows // 2 or 1) for i in range(rows)]),
+            "v": pa.array([i for i in range(rows)]),
+            "items": pa.array(
+                [[i, i + 1, i + 2] for i in range(rows)],
+                type=pa.list_(pa.int64()),
+            ),
+        })
+
+    @staticmethod
+    def _build_table_with_struct(rows: int) -> "pa.Table":
+        """``id`` (int64) + ``addr`` (struct<city, zip>) — struct payload."""
+        struct_type = pa.struct([("city", pa.string()), ("zip", pa.int32())])
+        return pa.table({
+            "id": pa.array([i % (rows // 2 or 1) for i in range(rows)]),
+            "v": pa.array([i for i in range(rows)]),
+            "addr": pa.array(
+                [{"city": f"city-{i}", "zip": i * 100} for i in range(rows)],
+                type=struct_type,
+            ),
+        })
+
+    @staticmethod
+    def _build_table_with_list_of_struct(rows: int) -> "pa.Table":
+        """``id`` (int64) + ``orders`` (list<struct<sku, qty>>) — nested payload."""
+        item_type = pa.struct([("sku", pa.string()), ("qty", pa.int32())])
+        return pa.table({
+            "id": pa.array([i % (rows // 2 or 1) for i in range(rows)]),
+            "orders": pa.array(
+                [
+                    [{"sku": f"sku-{i}-{k}", "qty": k} for k in range(3)]
+                    for i in range(rows)
+                ],
+                type=pa.list_(item_type),
+            ),
+        })
+
+    @staticmethod
+    def _build_table_with_map(rows: int) -> "pa.Table":
+        """``id`` (int64) + ``headers`` (map<string, string>) — map payload.
+
+        Matches the shape :class:`Response` uses for its headers
+        column; the cache layer's dedup walks tables with this exact
+        payload shape.
+        """
+        map_type = pa.map_(pa.string(), pa.string())
+        return pa.table({
+            "id": pa.array([i % (rows // 2 or 1) for i in range(rows)]),
+            "headers": pa.array(
+                [
+                    [(f"k{i}", f"v{i}"), ("type", "json")]
+                    for i in range(rows)
+                ],
+                type=map_type,
+            ),
+        })
+
+    def test_dedup_preserves_list_payload(self) -> None:
+        from yggdrasil.arrow.ops import dedup_arrow_table
+
+        t = self._build_table_with_list(rows=6)
+        # 6 rows → 3 distinct ids (i % 3) → dedup to 3 rows.
+        out = dedup_arrow_table(t, ["id"])
+        assert out.num_rows == 3
+        # Payload preserved — first occurrence per id wins.
+        assert out.column("items").to_pylist() == [
+            [0, 1, 2], [1, 2, 3], [2, 3, 4],
+        ]
+
+    def test_dedup_preserves_struct_payload(self) -> None:
+        from yggdrasil.arrow.ops import dedup_arrow_table
+
+        t = self._build_table_with_struct(rows=6)
+        out = dedup_arrow_table(t, ["id"])
+        assert out.num_rows == 3
+        addrs = out.column("addr").to_pylist()
+        # First occurrence's struct content rides through unchanged.
+        assert addrs == [
+            {"city": "city-0", "zip": 0},
+            {"city": "city-1", "zip": 100},
+            {"city": "city-2", "zip": 200},
+        ]
+
+    def test_dedup_preserves_list_of_struct_payload(self) -> None:
+        from yggdrasil.arrow.ops import dedup_arrow_table
+
+        t = self._build_table_with_list_of_struct(rows=6)
+        out = dedup_arrow_table(t, ["id"])
+        assert out.num_rows == 3
+        orders = out.column("orders").to_pylist()
+        assert orders[0] == [
+            {"sku": "sku-0-0", "qty": 0},
+            {"sku": "sku-0-1", "qty": 1},
+            {"sku": "sku-0-2", "qty": 2},
+        ]
+
+    def test_dedup_preserves_map_payload(self) -> None:
+        from yggdrasil.arrow.ops import dedup_arrow_table
+
+        t = self._build_table_with_map(rows=6)
+        out = dedup_arrow_table(t, ["id"])
+        assert out.num_rows == 3
+        # ``pa.array(...).to_pylist()`` for a map column returns
+        # ``list[tuple[K, V]]`` per row.
+        first_row_headers = dict(out.column("headers")[0].as_py())
+        assert first_row_headers == {"k0": "v0", "type": "json"}
+
+    def test_resample_preserves_list_of_struct_payload(self, tmp_path) -> None:
+        from yggdrasil.arrow.ops import resample_arrow_table
+        import datetime as dt
+
+        # Build a quarter-hour series with a list<struct> payload.
+        epoch = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        item_type = pa.struct([("sku", pa.string()), ("qty", pa.int32())])
+        ts = pa.array(
+            [epoch + dt.timedelta(minutes=15 * i) for i in range(12)],
+            type=pa.timestamp("us", "UTC"),
+        )
+        orders = pa.array(
+            [
+                [{"sku": f"row-{i}-{k}", "qty": k} for k in range(2)]
+                for i in range(12)
+            ],
+            type=pa.list_(item_type),
+        )
+        t = pa.table({"ts": ts, "orders": orders})
+
+        out = resample_arrow_table(t, time_column="ts", sampling_seconds=3600)
+        assert out.num_rows == 3
+        # The :00 row of each hour wins ("first" aggregator), so
+        # the surviving orders are i ∈ {0, 4, 8}.
+        survivors = out.column("orders").to_pylist()
+        assert survivors[0] == [
+            {"sku": "row-0-0", "qty": 0}, {"sku": "row-0-1", "qty": 1},
+        ]
+        assert survivors[1] == [
+            {"sku": "row-4-0", "qty": 0}, {"sku": "row-4-1", "qty": 1},
+        ]
+        assert survivors[2] == [
+            {"sku": "row-8-0", "qty": 0}, {"sku": "row-8-1", "qty": 1},
+        ]
+
+    def test_resample_with_partition_by_struct_payload(self) -> None:
+        # Per-entity resample with a struct payload column. The
+        # partition_by column ('symbol') is scalar; the struct rides
+        # through ``take`` unchanged.
+        from yggdrasil.arrow.ops import resample_arrow_table
+        import datetime as dt
+
+        epoch = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        struct_type = pa.struct([("price", pa.float64()), ("qty", pa.int32())])
+        rows: list[tuple[str, dt.datetime, dict]] = []
+        for i in range(12):
+            t = epoch + dt.timedelta(minutes=15 * i)
+            rows.append(("A", t, {"price": float(i), "qty": i}))
+            rows.append(("B", t, {"price": float(i * 2), "qty": i * 2}))
+        syms = pa.array([r[0] for r in rows])
+        ts = pa.array([r[1] for r in rows], type=pa.timestamp("us", "UTC"))
+        ticks = pa.array([r[2] for r in rows], type=struct_type)
+        table = pa.table({"symbol": syms, "ts": ts, "tick": ticks})
+
+        out = resample_arrow_table(
+            table,
+            time_column="ts",
+            sampling_seconds=3600,
+            partition_by=["symbol"],
+        )
+        # 3 hourly buckets × 2 symbols = 6 rows total.
+        assert out.num_rows == 6
+        rows_by_symbol = {"A": [], "B": []}
+        for row in out.to_pylist():
+            rows_by_symbol[row["symbol"]].append(row["tick"])
+        # First-occurrence row of each hour for "A" is i ∈ {0, 4, 8}.
+        assert rows_by_symbol["A"] == [
+            {"price": 0.0, "qty": 0},
+            {"price": 4.0, "qty": 4},
+            {"price": 8.0, "qty": 8},
+        ]
+        # And for "B" — multiplied by 2.
+        assert rows_by_symbol["B"] == [
+            {"price": 0.0, "qty": 0},
+            {"price": 8.0, "qty": 8},
+            {"price": 16.0, "qty": 16},
+        ]
+
+    def test_folder_round_trip_with_nested_payload_and_dedup(
+        self, tmp_path,
+    ) -> None:
+        # End-to-end: write a parquet folder with a list<struct>
+        # payload, then read back with ``unique_by`` set.
+        from yggdrasil.data import field
+        from yggdrasil.io.nested.folder_path import FolderOptions
+        from yggdrasil.data.enums import MediaTypes
+
+        t = self._build_table_with_list_of_struct(rows=8)
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (t.to_batches()[0],),
+            options=FolderOptions(child_media_type=MediaTypes.PARQUET),
+        )
+
+        # 8 rows on disk → dedup to 4 distinct ids.
+        out = folder.read_arrow_table(options=FolderOptions(
+            unique_by=[field("id", pa.int64())],
+        ))
+        assert out.num_rows == 4
+        # ``orders`` column survives the round trip (parquet preserves
+        # list<struct>) and the dedup ``take``.
+        orders = out.column("orders").to_pylist()
+        assert orders[0] == [
+            {"sku": "sku-0-0", "qty": 0},
+            {"sku": "sku-0-1", "qty": 1},
+            {"sku": "sku-0-2", "qty": 2},
+        ]
