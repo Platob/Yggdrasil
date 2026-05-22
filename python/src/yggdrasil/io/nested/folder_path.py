@@ -94,6 +94,14 @@ from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.io.url import hive_cast_value, hive_encode, hive_split
 
+# Side-effect import: ensures every primitive leaf (parquet / csv /
+# arrow / ndjson / json / xlsx) has registered itself in the
+# :data:`yggdrasil.io.holder._HOLDER_FORMAT_REGISTRY` so
+# :meth:`IO.class_for_media_type` actually finds them. Hoisted to
+# module-top so :meth:`FolderPath._leaf_for` (per-child during
+# :meth:`iter_children`) doesn't pay a dict lookup on every iter.
+import yggdrasil.io.primitive  # noqa: F401
+
 if TYPE_CHECKING:
     from yggdrasil.io.path import Path
 
@@ -107,6 +115,48 @@ __all__ = ["FolderPath", "FolderOptions"]
 # constructors onto one instance keeps those warm across calls
 # without leaking across the lifetime of long-running workers.
 _FOLDER_PATH_SINGLETON_TTL: float = 15.0 * 60.0
+
+
+# Extension-keyed leaf-class cache. :meth:`FolderPath._leaf_for` is
+# called once per child during every :meth:`iter_children`; without a
+# cache, each call walks ``MediaType.from_(url) → class_for_media_type``
+# (URL parse + media-type registry walk + extensions tuple build), and
+# the answer is fully determined by the URL's lowercased extension
+# tuple. Memoising on that tuple collapses the per-child work to a
+# single dict probe in the steady state. ``None`` is a legitimate
+# sentinel for "no registered leaf" — cached either way so a folder
+# with non-tabular siblings doesn't re-walk the registry for each
+# sibling on every read.
+_LEAF_CLASS_CACHE: dict[tuple[str, ...], "type | None"] = {}
+
+
+def _extensions_key(path: str) -> tuple[str, ...]:
+    """Lowercased extension tuple for the URL/path string.
+
+    Mirrors :attr:`URL.extensions` but skips the :class:`URL`
+    indirection — :meth:`FolderPath._leaf_for` runs this once per
+    iter_children entry, and the URL property allocates a fresh
+    list every call. Same outer-to-inner ordering
+    (``"archive.csv.zst"`` → ``("csv", "zst")``).
+    """
+    if not path or path == "/":
+        return ()
+    if path[-1] == "/":
+        path = path[:-1]
+        if not path:
+            return ()
+    idx = path.rfind("/")
+    name = path[idx + 1:] if idx != -1 else path
+    if not name:
+        return ()
+    if name[0] == ".":
+        name = name[1:]
+        if "." not in name:
+            return ()
+    if "." not in name:
+        return ()
+    parts = name.split(".")
+    return tuple(s.lower() for s in parts[1:])
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -767,12 +817,28 @@ class FolderPath(IO[bytes, FolderOptions]):
                 schema = None
         if schema is None or not getattr(schema, "children", None):
             schema = getattr(options, "target", None) if options is not None else None
+
+        # Cache the walk by ``(id(schema), id(static_values))``. The
+        # ``schema.children`` scan is called from both :meth:`iter_children`
+        # and :meth:`_read_arrow_batches`, runs over every field for the
+        # ``partition_by`` tag, and the answer is invariant for the
+        # lifetime of the resolved schema + static-values pair.
+        # RESPONSE_SCHEMA has 28 children — the bench was spending 11 ms
+        # / 500 reads on this walk before the cache.
+        static_values = self.static_values
+        cache_key = (id(schema), id(static_values))
+        cache = getattr(self, "_partition_columns_cache", None)
+        if cache is not None and cache[0] == cache_key:
+            return cache[1]
+
         children = getattr(schema, "children", None) or ()
-        consumed = set(self.static_values)
-        return tuple(
+        consumed = set(static_values) if static_values else ()
+        result = tuple(
             f.name for f in children
             if getattr(f, "partition_by", False) and f.name not in consumed
         )
+        self._partition_columns_cache = (cache_key, result)
+        return result
 
     def _iter_partition_children(
         self,
@@ -957,23 +1023,34 @@ class FolderPath(IO[bytes, FolderOptions]):
         media type — the caller skips it. This is the contract
         :meth:`_read_arrow_batches` relies on to ignore non-tabular
         siblings without forcing the user to clean the directory.
-        """
-        # Side-effect import: ensures every primitive leaf (parquet /
-        # csv / arrow / ndjson / json / xlsx) has registered itself
-        # in the Tabular registry, so ``class_for_media_type`` can
-        # actually find them.
-        import yggdrasil.io.primitive  # noqa: F401
 
-        try:
-            mt = MediaType.from_(entry.url, default=None)
-        except Exception:
-            mt = None
-        if mt is None:
-            return None
-        try:
-            cls = IO.class_for_media_type(mt, default=None)
-        except Exception:
-            cls = None
+        Memoises the ``(extensions tuple) → leaf class`` mapping on
+        :data:`_LEAF_CLASS_CACHE`. The format registry only keys off
+        the URL's lowercased extension tuple, so a folder of 500
+        ``part-*.parquet`` files pays one :meth:`MediaType.from_`
+        walk instead of 500. The extension tuple is built by an
+        inline string-level split on the URL path so we skip the
+        :attr:`URL.extensions` list allocation per call.
+        """
+        url = entry.url
+        url_path = url.path if url is not None else ""
+        key = _extensions_key(url_path)
+
+        cls = _LEAF_CLASS_CACHE.get(key, ...)
+        if cls is ...:
+            try:
+                mt = MediaType.from_(url, default=None)
+            except Exception:
+                mt = None
+            if mt is None:
+                cls = None
+            else:
+                try:
+                    cls = IO.class_for_media_type(mt, default=None)
+                except Exception:
+                    cls = None
+            _LEAF_CLASS_CACHE[key] = cls
+
         if cls is None:
             return None
         return cls(holder=entry, owns_holder=False)
@@ -1374,22 +1451,41 @@ class FolderPath(IO[bytes, FolderOptions]):
             return
 
         # Plain APPEND (or empty folder): mint a fresh part and drain.
-        self._write_parts(materialised, options)
+        self._write_parts(materialised, options, source_schema=first_schema)
         self._persist_schema(first_schema, media_type=options.child_media_type)
 
     def _write_parts(
         self,
         batches: Iterable[pa.RecordBatch],
         options: FolderOptions,
+        *,
+        source_schema: Any = None,
     ) -> None:
         """Mint one or more part files and drain *batches* into them.
 
         Honors ``options.byte_size`` / ``options.row_size`` for
         per-part rechunking; with neither set, drains the whole
         stream into a single part.
+
+        ``source_schema`` (the yggdrasil :class:`Schema` the caller
+        already resolved via :meth:`_schema_for_arrow`) is forwarded
+        as ``options.source`` on the leaf write so the leaf's
+        :meth:`CastOptions.check_source` short-circuits instead of
+        rebuilding every :class:`Field` from the batch's
+        :class:`pa.Schema`. RESPONSE_SCHEMA has 28 columns — the
+        rebuild was ~150 us per write before, now ~5 us.
         """
         byte_size = getattr(options, "byte_size", None) or 0
         row_size = getattr(options, "row_size", None) or 0
+
+        def _leaf_options(child: "Tabular") -> Any:
+            base = child.options_class()()
+            if source_schema is not None:
+                try:
+                    return base.with_source(source_schema, copy=False)
+                except Exception:
+                    return base
+            return base
 
         if byte_size > 0 or row_size > 0:
             from yggdrasil.arrow.cast import rechunk_arrow_batches
@@ -1403,9 +1499,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 if batch.num_rows == 0:
                     continue
                 child = self.make_child(options=options)
-                child.write_arrow_batches(
-                    [batch], options=child.options_class()(),
-                )
+                child.write_arrow_batches([batch], options=_leaf_options(child))
             return
 
         batch_iter = iter(batches)
@@ -1416,7 +1510,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         child = self.make_child(options=options)
         child.write_arrow_batches(
             _chain_first(first, batch_iter),
-            options=child.options_class()(),
+            options=_leaf_options(child),
         )
 
     # ==================================================================
