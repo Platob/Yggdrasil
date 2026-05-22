@@ -1628,7 +1628,7 @@ class HTTPSession(Session):
                 accumulator.extend(batch)
         if accumulator is None:
             if spark is not None:
-                from .response_batch import spark_to_tabular
+                from yggdrasil.io.response_batch import spark_to_tabular
                 return spark_to_tabular(self._cached_empty_spark_frame(spark))
             from yggdrasil.io.tabular import ArrowTabular
             return ArrowTabular(

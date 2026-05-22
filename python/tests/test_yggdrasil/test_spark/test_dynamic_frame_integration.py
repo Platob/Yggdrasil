@@ -82,7 +82,7 @@ class _Row:
 class _DatasetTestBase(SparkTestCase, ArrowTestCase):
     """Shared SIGALRM-guarded setUp/tearDown for the integration tests.
 
-    Also stubs out :meth:`Dataset._install_modules_on_executors`
+    Also stubs out :func:`yggdrasil.spark.frame._install_modules_on_executors`
     so the per-transform ``_ensure_installed`` scan doesn't build /
     ship real ``yggdrasil`` / ``pyarrow`` / ``polars`` archives for
     every test that calls ``.map`` / ``.filter`` / ``.apply``. The
@@ -104,16 +104,23 @@ class _DatasetTestBase(SparkTestCase, ArrowTestCase):
             )
             signal.alarm(_TEST_TIMEOUT_SECONDS)
 
-        # Stub: pretend every requested module installed cleanly.
-        self._orig_install = Dataset._install_modules_on_executors
+        # Stub: pretend every requested module installed cleanly. The shim
+        # lives at module scope in ``yggdrasil.spark.frame`` and is
+        # imported lazily inside ``Dataset._ensure_installed_on_session`` —
+        # patching the module attribute is enough for the `from … import`
+        # lookup to pick up the stub.
+        from yggdrasil.spark import frame as _spark_frame
 
-        def _stub(self_inner, modules):
+        self._spark_frame = _spark_frame
+        self._orig_install = _spark_frame._install_modules_on_executors
+
+        def _stub(session, modules):
             return set(modules)
 
-        Dataset._install_modules_on_executors = _stub  # type: ignore[assignment]
+        _spark_frame._install_modules_on_executors = _stub  # type: ignore[assignment]
 
     def tearDown(self) -> None:
-        Dataset._install_modules_on_executors = self._orig_install  # type: ignore[assignment]
+        self._spark_frame._install_modules_on_executors = self._orig_install  # type: ignore[assignment]
         if _has_alarm():
             signal.alarm(0)
             signal.signal(signal.SIGALRM, self._prev_handler)

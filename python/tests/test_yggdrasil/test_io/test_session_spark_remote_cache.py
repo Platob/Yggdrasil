@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from yggdrasil.data.enums import Mode
+from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.response import RESPONSE_SCHEMA, Response
 from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import Session
@@ -326,7 +327,7 @@ class TestPinSparkSnapshot:
 
     def test_pin_caches_and_freezes_count(self, spark) -> None:
         df = spark.range(0, 5).toDF("v")
-        pinned = Session._pin_spark_snapshot(df)
+        pinned = HTTPSession._pin_spark_snapshot(df)
         assert getattr(pinned, "is_cached", False), (
             "_pin_spark_snapshot must register the frame with Spark's "
             "executor cache so subsequent actions don't re-execute"
@@ -347,5 +348,5 @@ class TestPinSparkSnapshot:
 
         monkeypatch.setattr(_SparkDataFrame, "cache", _reject_cache)
         df = spark.range(0, 3).toDF("v")
-        pinned = Session._pin_spark_snapshot(df)
+        pinned = HTTPSession._pin_spark_snapshot(df)
         assert pinned.count() == 3
