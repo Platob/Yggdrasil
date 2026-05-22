@@ -244,6 +244,134 @@ class TestArrowTabularSpill(ArrowTestCase):
             import shutil
             shutil.rmtree(custom, ignore_errors=True)
 
+    def test_unique_returns_arrow_tabular_via_arrow_ops(self) -> None:
+        t = self.table({"id": [1, 2, 1, 3, 2], "v": ["a", "b", "c", "d", "e"]})
+        out = ArrowTabular(t).unique("id")
+        # Default engine is arrow → result is an ArrowTabular.
+        self.assertIs(type(out), ArrowTabular)
+        self.assertEqual(
+            out.read_arrow_table().to_pydict(),
+            {"id": [1, 2, 3], "v": ["a", "b", "d"]},
+        )
+
+    def test_unique_accepts_field_and_iterable(self) -> None:
+        t = self.table({"id": [1, 2, 1, 3, 2], "v": ["a", "b", "c", "d", "e"]})
+        io = ArrowTabular(t)
+        # bare string, list of strings, Field, and list-of-Field all
+        # resolve to the same dedup keys.
+        s1 = io.unique("id").read_arrow_table().to_pydict()
+        s2 = io.unique(["id"]).read_arrow_table().to_pydict()
+        s3 = io.unique(Field("id", "int64")).read_arrow_table().to_pydict()
+        s4 = io.unique([Field("id", "int64")]).read_arrow_table().to_pydict()
+        self.assertEqual(s1, s2)
+        self.assertEqual(s1, s3)
+        self.assertEqual(s1, s4)
+
+    def test_unique_empty_keys_short_circuits(self) -> None:
+        io = ArrowTabular(self.table({"x": [1, 2]}))
+        self.assertIs(io.unique([]), io)
+        self.assertIs(io.unique(None), io)
+
+    def test_resample_with_int_seconds(self) -> None:
+        import datetime as dt
+        import pyarrow as pa
+
+        ts = pa.array(
+            [dt.datetime(2024, 1, 1, h) for h in range(4)],
+            type=pa.timestamp("us"),
+        )
+        v = pa.array([1, None, None, 4])
+        io = ArrowTabular(pa.table({"ts": ts, "v": v}))
+        out = io.resample(on="ts", sampling=7200)
+        # 2-hour buckets: ts=00→1 (ffill→1), ts=02→None→ffill from 1.
+        self.assertIs(type(out), ArrowTabular)
+        rows = out.read_arrow_table().to_pydict()
+        self.assertEqual(rows["v"], [1, 1])
+
+    def test_resample_with_timedelta_and_iso_duration(self) -> None:
+        import datetime as dt
+        import pyarrow as pa
+
+        ts = pa.array(
+            [dt.datetime(2024, 1, 1, h) for h in range(4)],
+            type=pa.timestamp("us"),
+        )
+        v = pa.array([1, None, None, 4])
+        io = ArrowTabular(pa.table({"ts": ts, "v": v}))
+        td_rows = io.resample(on="ts", sampling=dt.timedelta(hours=2)).read_arrow_table()
+        iso_rows = io.resample(on="ts", sampling="PT2H").read_arrow_table()
+        self.assertEqual(td_rows.to_pydict(), iso_rows.to_pydict())
+
+    def test_resample_with_field_on_and_partition_by(self) -> None:
+        import datetime as dt
+        import pyarrow as pa
+
+        # Two symbols, each with 6 hourly observations. Interleaved
+        # rows force the partition_by branch to do real work — without
+        # it, the bucket collapse would cross symbols.
+        rows: list[tuple[str, dt.datetime, "int | None"]] = []
+        for h in range(6):
+            t = dt.datetime(2024, 1, 1, h)
+            rows.append(("A", t, 10 if h in (0, 3) else None))
+            rows.append(("B", t, 100 if h == 4 else None))
+        sym = pa.array([r[0] for r in rows])
+        ts = pa.array([r[1] for r in rows], type=pa.timestamp("us"))
+        v = pa.array([r[2] for r in rows])
+        io = ArrowTabular(pa.table({"ts": ts, "sym": sym, "v": v}))
+        out = io.resample(
+            on=Field("ts", "timestamp[us]"),
+            sampling="PT2H",
+            partition_by=Field("sym", "string"),
+        )
+        result = sorted(
+            out.read_arrow_table().to_pylist(),
+            key=lambda r: (r["sym"], r["ts"]),
+        )
+        per_sym: dict[str, list] = {"A": [], "B": []}
+        for r in result:
+            per_sym[r["sym"]].append(r["v"])
+        # A's 2h buckets: [10, None, None] (first rows at h=0,2,4)
+        #     ffill → [10, 10, 10].
+        # B's 2h buckets: [None, None, 100] (first rows at h=0,2,4)
+        #     leading nulls have no prior non-null in B → stay null.
+        self.assertEqual(per_sym["A"], [10, 10, 10])
+        self.assertEqual(per_sym["B"], [None, None, 100])
+
+    def test_resample_zero_or_negative_short_circuits(self) -> None:
+        import datetime as dt
+        import pyarrow as pa
+
+        io = ArrowTabular(pa.table({
+            "ts": pa.array([dt.datetime(2024, 1, 1)], type=pa.timestamp("us")),
+            "v": [1],
+        }))
+        self.assertIs(io.resample(on="ts", sampling=0), io)
+        self.assertIs(io.resample(on="ts", sampling=-1), io)
+
+    def test_resample_invalid_sampling_raises(self) -> None:
+        import datetime as dt
+        import pyarrow as pa
+
+        io = ArrowTabular(pa.table({
+            "ts": pa.array([dt.datetime(2024, 1, 1)], type=pa.timestamp("us")),
+            "v": [1],
+        }))
+        with self.assertRaises(ValueError):
+            io.resample(on="ts", sampling="not-a-duration")
+        with self.assertRaises(TypeError):
+            io.resample(on="ts", sampling=True)  # bool rejected explicitly
+        with self.assertRaises(TypeError):
+            io.resample(on="ts", sampling=object())
+
+    def test_unique_invalid_key_type_raises(self) -> None:
+        io = ArrowTabular(self.table({"x": [1, 2]}))
+        with self.assertRaises(TypeError):
+            io.unique(123)
+        with self.assertRaises(TypeError):
+            io.unique(b"x")
+        with self.assertRaises(TypeError):
+            io.unique([1, 2])
+
     def test_spilled_read_returns_cached_table_zero_copy(self) -> None:
         t = self.table({"x": list(range(200)), "y": ["s"] * 200})
         io = ArrowTabular(t, spill_bytes=1)

@@ -166,6 +166,50 @@ class TestSparkOps(unittest.TestCase):
         assert resample_spark_dataframe(df, time_column="ts", sampling_seconds=0) is df
         assert resample_spark_dataframe(df, time_column="missing", sampling_seconds=60) is df
 
+    def test_dataset_unique_returns_dataset(self) -> None:
+        """The cross-engine :meth:`Tabular.unique` routes via
+        :meth:`_native_spark_frame` and returns a fresh ``Dataset``
+        instead of collecting through Arrow."""
+        from yggdrasil.spark.tabular import Dataset
+
+        df = self.spark.createDataFrame(
+            [(1, "a"), (2, "b"), (1, "c"), (3, "d")],
+            schema="id long, v string",
+        )
+        ds = Dataset(frame=df)
+        out = ds.unique("id")
+        assert isinstance(out, Dataset)
+        assert out is not ds  # fresh holder
+        rows = sorted(out.frame.collect(), key=lambda r: r.id)
+        assert [(r.id, r.v) for r in rows] == [(1, "a"), (2, "b"), (3, "d")]
+
+    def test_dataset_resample_returns_dataset_with_ffill(self) -> None:
+        from yggdrasil.spark.tabular import Dataset
+
+        rows = [
+            ("A", dt.datetime(2024, 1, 1, h), (h + 1) * 10 if h in (0, 3) else None)
+            for h in range(6)
+        ]
+        ds = Dataset(frame=self._ts_frame(rows))
+        out = ds.resample(
+            on="ts",
+            sampling=dt.timedelta(hours=2),
+            partition_by="sym",
+        )
+        assert isinstance(out, Dataset)
+        collected = sorted(out.frame.collect(), key=lambda r: r.ts)
+        # 2h buckets, first per bucket: [10, None, None] → ffill → [10, 10, 10].
+        assert [r.v for r in collected] == [10, 10, 10]
+
+    def test_dataset_resample_accepts_iso_duration_string(self) -> None:
+        from yggdrasil.spark.tabular import Dataset
+
+        rows = [("A", dt.datetime(2024, 1, 1, h), h) for h in range(4)]
+        ds = Dataset(frame=self._ts_frame(rows))
+        out = ds.resample(on="ts", sampling="PT2H", partition_by=["sym"])
+        collected = sorted(out.frame.collect(), key=lambda r: r.ts)
+        assert [r.v for r in collected] == [0, 2]
+
     def test_fill_spark_dataframe_ffill_per_partition(self) -> None:
         from yggdrasil.spark.ops import fill_spark_dataframe
 

@@ -82,6 +82,191 @@ if TYPE_CHECKING:
 __all__ = ["Tabular", "is_tabular_source"]
 
 
+# ---------------------------------------------------------------------------
+# Coercion helpers — :meth:`Tabular.resample` / :meth:`Tabular.unique`
+# accept the same flexible argument shapes the rest of the codebase
+# offers (string names, :class:`yggdrasil.data.Field` objects,
+# iterables of either, :class:`int` / :class:`float` /
+# :class:`datetime.timedelta` / ISO-8601 strings for durations). The
+# coercion normalises everything to the canonical typed shape
+# (``list[str]`` / ``int seconds``) before the typed
+# :meth:`_unique` / :meth:`_resample` hook runs.
+# ---------------------------------------------------------------------------
+
+
+def _coerce_column_name(value: Any) -> str:
+    """Resolve *value* to a column name string.
+
+    Accepts a bare :class:`str`, or anything with a ``.name``
+    attribute (:class:`yggdrasil.data.Field` and friends). Raises
+    :class:`TypeError` for anything else so the caller gets a clear
+    error message at the public boundary rather than a cryptic
+    pyarrow / pyspark failure mid-pipeline.
+    """
+    if isinstance(value, str):
+        return value
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name
+    raise TypeError(
+        f"Column reference must be a string name or a Field-like with "
+        f"a ``.name`` attribute, got {type(value).__name__}: {value!r}."
+    )
+
+
+def _coerce_column_keys(value: Any) -> list[str]:
+    """Resolve *value* to a flat ``list[str]`` of column names.
+
+    Accepts a single name / Field, an iterable mixing the two, or
+    ``None`` / empty (which yields ``[]``). Duplicates inside the
+    iterable are preserved — the caller's order is the contract for
+    multi-key dedup / partitioning.
+
+    A :class:`yggdrasil.data.Field` is iterable (it yields its
+    children), so the scalar-vs-sequence dispatch has to check for
+    the scalar ``.name`` attribute *before* trying to iterate.
+    Strings and bytes also take the scalar path.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (bytes, bytearray)):
+        raise TypeError(
+            f"Column reference must be a string / Field / iterable of those, "
+            f"got {type(value).__name__}: {value!r}."
+        )
+    # Scalar Field-like (has a string ``.name``) → single-element list.
+    # Checked before the iterable branch because Field itself is iterable.
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return [name]
+    return [_coerce_column_name(item) for item in value]
+
+
+def _coerce_sampling_seconds(value: Any) -> int:
+    """Resolve *value* into an integer second count for resample.
+
+    Accepted shapes:
+
+    * :class:`int` — used verbatim (booleans are rejected even though
+      they're a subclass; ``True == 1`` would be a footgun here).
+    * :class:`float` — rounded to the nearest integer.
+    * :class:`datetime.timedelta` — ``td.total_seconds()`` rounded.
+    * :class:`str` — ISO-8601 duration parsed via
+      :func:`yggdrasil.data.types.primitive.temporal._parse_iso_duration`.
+
+    Anything else raises :class:`TypeError`.
+    """
+    import datetime as dt
+
+    if isinstance(value, bool):
+        raise TypeError(
+            f"sampling must be int / float / timedelta / str, got bool: {value!r}."
+        )
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value))
+    if isinstance(value, dt.timedelta):
+        return int(round(value.total_seconds()))
+    if isinstance(value, str):
+        from yggdrasil.data.types.primitive.temporal import _parse_iso_duration
+
+        td = _parse_iso_duration(value)
+        if td is None:
+            raise ValueError(
+                f"sampling={value!r} is not a recognised ISO-8601 duration. "
+                "Pass an integer second count, a ``datetime.timedelta``, "
+                "or a string like ``'PT1H'`` / ``'P1D'`` / ``'PT15M'``."
+            )
+        return int(round(td.total_seconds()))
+    raise TypeError(
+        f"sampling must be int / float / timedelta / str (ISO-8601 "
+        f"duration), got {type(value).__name__}: {value!r}."
+    )
+
+
+def _default_unique(self_: "Tabular", *, keys: list[str]) -> "Tabular":
+    """Engine-routing dedup — Spark-native if available, else Arrow.
+
+    Defined at module scope so :meth:`Tabular._unique` (and any
+    subclass's super-call) shares one implementation regardless of
+    where it's invoked from. Spark-shape detection goes through
+    :meth:`Tabular._native_spark_frame` so any holder that surfaces
+    a :class:`pyspark.sql.DataFrame` natively (the
+    :class:`Dataset` itself, a :class:`SparkStatementResult`) keeps
+    the work on the executors.
+    """
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        from yggdrasil.spark.ops import dedup_spark_dataframe
+        from yggdrasil.spark.tabular import Dataset
+
+        new_frame = dedup_spark_dataframe(spark_frame, keys)
+        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+
+    from yggdrasil.arrow.ops import dedup_arrow_table
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    out = dedup_arrow_table(table, keys)
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _default_resample(
+    self_: "Tabular",
+    *,
+    time_column: str,
+    sampling_seconds: int,
+    partition_by: list[str],
+    fill_strategy: "str | None",
+) -> "Tabular":
+    """Engine-routing resample — Spark-native if available, else Arrow."""
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        from yggdrasil.spark.ops import resample_spark_dataframe
+        from yggdrasil.spark.tabular import Dataset
+
+        new_frame = resample_spark_dataframe(
+            spark_frame,
+            time_column=time_column,
+            sampling_seconds=sampling_seconds,
+            partition_by=partition_by or None,
+            fill_strategy=fill_strategy,
+        )
+        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+
+    from yggdrasil.arrow.ops import resample_arrow_table
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    out = resample_arrow_table(
+        table,
+        time_column=time_column,
+        sampling_seconds=sampling_seconds,
+        partition_by=partition_by or None,
+        fill_strategy=fill_strategy,
+    )
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _schema_for_new_tabular(self_: "Tabular") -> "Schema | None":
+    """Return the source's declared schema, if one is set.
+
+    The :meth:`Tabular._schema_cache` slot holds the per-instance
+    schema (``...`` sentinel when none was declared). Reading the
+    raw slot avoids triggering :meth:`collect_schema`'s materialise
+    side-effect on the destination Tabular — the dedup / resample
+    op preserves the source's column layout, so propagating the
+    declared schema is correct without re-inferring.
+    """
+    cached = getattr(self_, "_schema_cache", ...)
+    if cached is ...:
+        return None
+    return cached
+
+
 def is_tabular_source(obj: Any) -> bool:
     """True iff *obj* is a shape :meth:`Tabular.from_` can coerce.
 
@@ -1392,6 +1577,150 @@ class Tabular(ABC, Generic[O]):
         _flush()
         if options.sync_metadata:
             self._commit_metadata()
+
+    # ==================================================================
+    # Cross-engine set / time transforms
+    #
+    # ``unique`` (dedup on keys) and ``resample`` (snap to a time grid)
+    # share one shape: a flexible public surface that coerces whatever
+    # the caller passed into the canonical typed shape, plus a typed
+    # private hook (:meth:`_unique` / :meth:`_resample`) that holders
+    # speaking a non-Arrow engine override to stay native.
+    #
+    # The default private implementations route on
+    # :meth:`_native_spark_frame` — a Spark-shaped holder
+    # (:class:`yggdrasil.spark.tabular.Dataset`,
+    # :class:`yggdrasil.spark.statement.SparkStatementResult`) returns
+    # a fresh :class:`Dataset`; everything else collects through Arrow
+    # and returns an :class:`yggdrasil.arrow.tabular.ArrowTabular`. No
+    # per-class overrides needed — the routing is the contract.
+    # ==================================================================
+
+    def unique(
+        self,
+        by: "str | Any | Iterable[Any]",
+    ) -> "Tabular":
+        """Drop duplicate rows on *by*; keep first occurrence per key tuple.
+
+        Parameters
+        ----------
+        by
+            One or more column references — :class:`str` column names,
+            :class:`yggdrasil.data.Field` instances (resolved via
+            :attr:`Field.name`), or any iterable mixing the two. Empty
+            / ``None`` is a no-op — returns ``self``.
+
+        Returns
+        -------
+        Tabular
+            A new holder carrying the deduped rows. Spark-shaped
+            inputs (anything whose :meth:`_native_spark_frame`
+            exposes a :class:`pyspark.sql.DataFrame`) return a fresh
+            :class:`yggdrasil.spark.tabular.Dataset` over the
+            spark-side dedup; everything else collects through Arrow
+            and returns an :class:`yggdrasil.arrow.tabular.ArrowTabular`.
+        """
+        keys = _coerce_column_keys(by)
+        if not keys:
+            return self
+        return self._unique(keys=keys)
+
+    def _unique(self, *, keys: list[str]) -> "Tabular":
+        """Typed-argument dedup hook.
+
+        Default routes on :meth:`_native_spark_frame`:
+
+        * holds a Spark frame → :func:`yggdrasil.spark.ops.dedup_spark_dataframe`
+          wrapped in a fresh :class:`Dataset`,
+        * otherwise → :meth:`read_arrow_table` →
+          :func:`yggdrasil.arrow.ops.dedup_arrow_table` →
+          :class:`ArrowTabular`.
+
+        Subclasses that already speak a typed engine path can override
+        to skip the round trip entirely; the default already handles
+        the two engines the codebase ships with.
+        """
+        return _default_unique(self, keys=keys)
+
+    def resample(
+        self,
+        on: "str | Any",
+        sampling: "int | float | Any",
+        *,
+        partition_by: "str | Any | Iterable[Any] | None" = None,
+        fill_strategy: "str | None" = "ffill",
+    ) -> "Tabular":
+        """Align rows to a fixed time grid on *on*; one row per bucket.
+
+        Parameters
+        ----------
+        on
+            The time column to resample on — column name
+            (:class:`str`) or :class:`yggdrasil.data.Field`.
+        sampling
+            Bucket size. Accepted shapes:
+
+            * :class:`int` / :class:`float` — seconds (floats are
+              rounded to the nearest integer second).
+            * :class:`datetime.timedelta` — total seconds.
+            * :class:`str` — ISO-8601 duration (``"PT1H"``,
+              ``"P1D"``, ``"PT15M"``) parsed via
+              :func:`yggdrasil.data.types.primitive.temporal._parse_iso_duration`.
+
+            ``sampling <= 0`` is a short-circuit — returns ``self``.
+        partition_by
+            Entity columns the resample is independent on. ``None`` /
+            empty → flat global timeline. Same coercion as
+            :meth:`unique`'s ``by``.
+        fill_strategy
+            How to fill nulls left by the bucket's "first" aggregation.
+            ``"ffill"`` (default), ``"bfill"``, or ``"none"`` /
+            ``None`` to disable. See
+            :func:`yggdrasil.arrow.ops.fill_arrow_table` for the
+            full semantics.
+
+        Returns
+        -------
+        Tabular
+            Spark-shaped holders return a :class:`Dataset` over the
+            spark-side resample; everything else returns an
+            :class:`ArrowTabular` over the arrow-side resample.
+        """
+        time_column = _coerce_column_name(on)
+        sampling_seconds = _coerce_sampling_seconds(sampling)
+        if sampling_seconds <= 0:
+            return self
+        part_cols = _coerce_column_keys(partition_by) if partition_by else []
+        return self._resample(
+            time_column=time_column,
+            sampling_seconds=sampling_seconds,
+            partition_by=part_cols,
+            fill_strategy=fill_strategy,
+        )
+
+    def _resample(
+        self,
+        *,
+        time_column: str,
+        sampling_seconds: int,
+        partition_by: list[str],
+        fill_strategy: "str | None",
+    ) -> "Tabular":
+        """Typed-argument resample hook.
+
+        Same routing model as :meth:`_unique` — Spark-shaped
+        holders run :func:`yggdrasil.spark.ops.resample_spark_dataframe`
+        and return a fresh :class:`Dataset`; everything else routes
+        through :func:`yggdrasil.arrow.ops.resample_arrow_table` and
+        returns an :class:`ArrowTabular`.
+        """
+        return _default_resample(
+            self,
+            time_column=time_column,
+            sampling_seconds=sampling_seconds,
+            partition_by=partition_by,
+            fill_strategy=fill_strategy,
+        )
 
     # ==================================================================
     # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.
