@@ -144,6 +144,51 @@ def _coerce_column_keys(value: Any) -> list[str]:
     return [_coerce_column_name(item) for item in value]
 
 
+def _coerce_predicate(value: Any) -> Any:
+    """Normalize *value* into a :class:`Predicate` AST node.
+
+    Accepts the same shapes :meth:`Expression.from_` does — SQL
+    strings, an existing :class:`Expression` (must mark as
+    :class:`Predicate`), or a pyarrow / polars / pyspark native
+    expression (lifted via the matching backend importer). The
+    result is always a yggdrasil :class:`Predicate` so the typed
+    :meth:`Tabular._filter` hook sees a single shape regardless of
+    where the predicate came from.
+    """
+    from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+
+    if isinstance(value, Predicate):
+        return value
+    if isinstance(value, Expression):
+        raise TypeError(
+            f"filter expected a boolean expression (predicate); "
+            f"got non-predicate {type(value).__name__}: {value!r}. "
+            "Use a comparison (col('x') > 1), is_in / between / "
+            "is_null, or a SQL predicate string."
+        )
+    if isinstance(value, str):
+        expr = Expression.from_sql(value)
+        if not isinstance(expr, Predicate):
+            raise TypeError(
+                f"filter expected a SQL predicate string; "
+                f"{value!r} parses to a non-predicate "
+                f"{type(expr).__name__}."
+            )
+        return expr
+    # Native engine expression — pyarrow / polars / pyspark. The
+    # ``Expression.from_`` dispatcher sniffs the source's module so
+    # the optional deps stay optional (we never import an engine
+    # we haven't seen).
+    expr = Expression.from_(value)
+    if not isinstance(expr, Predicate):
+        raise TypeError(
+            f"filter expected a boolean expression (predicate); "
+            f"{type(value).__name__} lifted to non-predicate "
+            f"{type(expr).__name__}."
+        )
+    return expr
+
+
 def _coerce_sampling_seconds(value: Any) -> int:
     """Resolve *value* into an integer second count for resample.
 
@@ -248,6 +293,108 @@ def _default_resample(
         partition_by=partition_by or None,
         fill_strategy=fill_strategy,
     )
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _flatten_column_args(args: "tuple[Any, ...]") -> list[str]:
+    """Flatten variadic select / drop column args to a ``list[str]``.
+
+    Accepts strings, :class:`Field`-like objects (resolved via
+    :attr:`.name`), and iterables mixing those (so callers can pass
+    ``select("a", "b")`` *or* ``select(["a", "b"])`` interchangeably,
+    matching the rest of the library's keyword conventions).
+    Preserves caller-given order; duplicates are kept on purpose —
+    deduping would silently mask a select-with-duplicate bug.
+    """
+    out: list[str] = []
+    for item in args:
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        if isinstance(item, (bytes, bytearray)):
+            raise TypeError(
+                f"Column reference must be a string / Field / iterable of "
+                f"those, got {type(item).__name__}: {item!r}."
+            )
+        name = getattr(item, "name", None)
+        if isinstance(name, str):
+            out.append(name)
+            continue
+        try:
+            iter(item)
+        except TypeError:
+            raise TypeError(
+                f"Column reference must be a string / Field / iterable of "
+                f"those, got {type(item).__name__}: {item!r}."
+            )
+        out.extend(_coerce_column_name(child) for child in item)
+    return out
+
+
+def _default_select(self_: "Tabular", *, columns: list[str]) -> "Tabular":
+    """Engine-routing select — Spark-native when available, else Arrow."""
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        # ``DataFrame.select`` raises on a missing column, so the
+        # public method's "preserve order" contract is the caller's
+        # problem to keep right. We don't filter missing names here —
+        # the Spark error is more informative than a silent drop.
+        from yggdrasil.spark.tabular import Dataset
+
+        new_frame = spark_frame.select(*columns)
+        return Dataset(frame=new_frame, schema=None)
+
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    # ``pa.Table.select`` raises ``KeyError`` on a missing column —
+    # match the Spark side's "fail loud" behavior so a typo in a
+    # select call doesn't silently return an unexpected shape.
+    out = table.select(columns)
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _default_drop(self_: "Tabular", *, columns: list[str]) -> "Tabular":
+    """Engine-routing drop — Spark-native when available, else Arrow.
+
+    Missing columns in the source are filtered out *before* the
+    underlying engine call — neither :meth:`pa.Table.drop_columns`
+    nor :meth:`DataFrame.drop` raise on a missing reference by
+    default in current versions, but pinning the contract here
+    means callers see consistent behavior even if those defaults
+    drift.
+    """
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        from yggdrasil.spark.tabular import Dataset
+
+        present = [c for c in columns if c in spark_frame.columns]
+        new_frame = spark_frame.drop(*present) if present else spark_frame
+        return Dataset(frame=new_frame, schema=None)
+
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    present = [c for c in columns if c in table.schema.names]
+    if not present:
+        return ArrowTabular(table, schema=table.schema)
+    out = table.drop_columns(present)
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _default_filter(self_: "Tabular", *, predicate: Any) -> "Tabular":
+    """Engine-routing row filter — Spark-native when available, else Arrow."""
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        from yggdrasil.spark.tabular import Dataset
+
+        new_frame = spark_frame.filter(predicate.to_pyspark())
+        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    out = predicate.filter_arrow_table(table)
     return ArrowTabular(out, schema=out.schema)
 
 
@@ -1721,6 +1868,120 @@ class Tabular(ABC, Generic[O]):
             partition_by=partition_by,
             fill_strategy=fill_strategy,
         )
+
+    # ==================================================================
+    # Projection / row filter
+    #
+    # Same public / typed-hook split as ``unique`` / ``resample``: the
+    # public method accepts flexible input and coerces, the private
+    # ``_select`` / ``_drop`` / ``_filter`` see canonical typed
+    # arguments and engine-route on :meth:`_native_spark_frame`.
+    # ==================================================================
+
+    def select(
+        self,
+        *columns: "str | Any",
+    ) -> "Tabular":
+        """Project to *columns* and return a new Tabular.
+
+        Each entry is a column reference — :class:`str`, a
+        :class:`yggdrasil.data.Field` (resolved via
+        :attr:`Field.name`), or an iterable mixing both. The result
+        preserves the caller's order, which matches both
+        :meth:`pyarrow.Table.select` and
+        :meth:`pyspark.sql.DataFrame.select` semantics.
+
+        Raises :class:`ValueError` on an empty selection — a zero-
+        column projection is almost always a caller mistake; pass
+        :class:`Schema.empty` projections through the cast surface
+        instead.
+        """
+        cols = _flatten_column_args(columns)
+        if not cols:
+            raise ValueError(
+                f"{type(self).__name__}.select needs at least one column; "
+                "pass column names ('a', 'b'), Field objects, or "
+                "iterables of either."
+            )
+        return self._select(columns=cols)
+
+    def _select(self, *, columns: list[str]) -> "Tabular":
+        """Typed-argument projection hook.
+
+        Spark-native holders return a fresh :class:`Dataset` carrying
+        ``frame.select(*columns)``; everything else collects through
+        :meth:`read_arrow_table`, projects via
+        :meth:`pa.Table.select`, and wraps the result in an
+        :class:`ArrowTabular`.
+        """
+        return _default_select(self, columns=columns)
+
+    def drop(
+        self,
+        *columns: "str | Any",
+    ) -> "Tabular":
+        """Return a new Tabular with the named columns removed.
+
+        Columns missing from the source are silently ignored —
+        matches Spark's :meth:`DataFrame.drop` and pyarrow's
+        :meth:`Table.drop_columns` (when filtered to existing
+        names). An empty argument list is a no-op that returns
+        ``self``.
+        """
+        cols = _flatten_column_args(columns)
+        if not cols:
+            return self
+        return self._drop(columns=cols)
+
+    def _drop(self, *, columns: list[str]) -> "Tabular":
+        """Typed-argument drop hook.
+
+        Same routing as :meth:`_select`. Missing columns in the
+        source are filtered out before the underlying engine's
+        ``drop`` runs so neither pyarrow nor pyspark raises on
+        an absent reference.
+        """
+        return _default_drop(self, columns=columns)
+
+    def filter(
+        self,
+        predicate: Any,
+    ) -> "Tabular":
+        """Drop rows where *predicate* is false.
+
+        ``predicate`` accepts every shape
+        :meth:`yggdrasil.io.tabular.execution.expr.Expression.from_`
+        recognises:
+
+        * a SQL predicate string (``"x > 0 AND y IS NOT NULL"``),
+          parsed by the in-tree SQL parser;
+        * a yggdrasil :class:`Predicate` node
+          (``col("x") > 0``, :func:`is_in`, :func:`between`, …);
+        * a native engine expression —
+          :class:`pyarrow.compute.Expression`,
+          :class:`polars.Expr`, or :class:`pyspark.sql.Column` —
+          lifted via the matching backend.
+
+        The predicate is parsed once and dispatched to the typed
+        :meth:`_filter` hook; the engine-side filter then runs in
+        its native kernel (Arrow C++, Spark Catalyst) so the row
+        scan stays vectorised.
+        """
+        pred = _coerce_predicate(predicate)
+        return self._filter(predicate=pred)
+
+    def _filter(self, *, predicate: Any) -> "Tabular":
+        """Typed-argument row-filter hook.
+
+        ``predicate`` is always a yggdrasil :class:`Predicate` at
+        this point (the public :meth:`filter` did the lift). Spark-
+        native holders compile to a :class:`pyspark.sql.Column` and
+        return a fresh :class:`Dataset` via
+        :meth:`DataFrame.filter`; everything else compiles to a
+        :class:`pyarrow.compute.Expression` and runs the C++
+        kernel via :meth:`Predicate.filter_arrow_table`.
+        """
+        return _default_filter(self, predicate=predicate)
 
     # ==================================================================
     # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.

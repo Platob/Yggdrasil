@@ -210,6 +210,74 @@ class TestSparkOps(unittest.TestCase):
         collected = sorted(out.frame.collect(), key=lambda r: r.ts)
         assert [r.v for r in collected] == [0, 2]
 
+    def test_dataset_select_returns_dataset(self) -> None:
+        from yggdrasil.spark.tabular import Dataset
+
+        df = self.spark.createDataFrame(
+            [(1, "x", 10), (2, "y", 20), (3, "z", 30)],
+            schema="a long, b string, c long",
+        )
+        out = Dataset(frame=df).select("a", "c")
+        assert isinstance(out, Dataset)
+        assert out.frame.columns == ["a", "c"]
+        rows = sorted(out.frame.collect(), key=lambda r: r.a)
+        assert [(r.a, r.c) for r in rows] == [(1, 10), (2, 20), (3, 30)]
+
+    def test_dataset_drop_returns_dataset(self) -> None:
+        from yggdrasil.spark.tabular import Dataset
+
+        df = self.spark.createDataFrame(
+            [(1, "x", 10), (2, "y", 20)],
+            schema="a long, b string, c long",
+        )
+        out = Dataset(frame=df).drop("b")
+        assert isinstance(out, Dataset)
+        assert out.frame.columns == ["a", "c"]
+
+    def test_dataset_drop_missing_column_is_no_op(self) -> None:
+        from yggdrasil.spark.tabular import Dataset
+        df = self.spark.createDataFrame([(1,)], schema="a long")
+        out = Dataset(frame=df).drop("nope")
+        assert out.frame.columns == ["a"]
+
+    def test_dataset_filter_sql_string_native_path(self) -> None:
+        from yggdrasil.spark.tabular import Dataset
+
+        df = self.spark.createDataFrame(
+            [(1,), (2,), (3,), (4,)], schema="a long",
+        )
+        out = Dataset(frame=df).filter("a > 2")
+        assert isinstance(out, Dataset)
+        rows = sorted(out.frame.collect(), key=lambda r: r.a)
+        assert [r.a for r in rows] == [3, 4]
+
+    def test_dataset_filter_yggdrasil_expression_native_path(self) -> None:
+        from yggdrasil.io.tabular.execution.expr import col
+        from yggdrasil.spark.tabular import Dataset
+
+        df = self.spark.createDataFrame(
+            [(1, "x"), (2, "y"), (3, "x")], schema="a long, b string",
+        )
+        out = Dataset(frame=df).filter(col("b") == "x")
+        rows = sorted(out.frame.collect(), key=lambda r: r.a)
+        assert [(r.a, r.b) for r in rows] == [(1, "x"), (3, "x")]
+
+    def test_dataset_filter_callable_still_works(self) -> None:
+        """Legacy callable filter path is preserved — ``Dataset.filter``
+        dispatches by argument type."""
+        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.data import field, schema
+        from yggdrasil.data.types.primitive import Int64Type
+
+        out_schema = schema([field("a", Int64Type, nullable=False)])
+        df = self.spark.createDataFrame([(1,), (2,), (3,)], schema=out_schema.to_spark_schema())
+        out = Dataset(frame=df, schema=out_schema).filter(
+            lambda r: r["a"] >= 2, schema=out_schema,
+        )
+        assert isinstance(out, Dataset)
+        rows = sorted(out.frame.collect(), key=lambda r: r.a)
+        assert [r.a for r in rows] == [2, 3]
+
     def test_fill_spark_dataframe_ffill_per_partition(self) -> None:
         from yggdrasil.spark.ops import fill_spark_dataframe
 
