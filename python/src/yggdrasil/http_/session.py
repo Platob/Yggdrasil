@@ -920,8 +920,10 @@ class HTTPSession(Session):
                 best = response
         if best is not None:
             LOGGER.debug(
-                "Found %s %s %s in %r",
+                "Cache hit %s %s %s in %r (status=%d, received_at=%s) "
+                "— skipping network",
                 source, request.method, request.url, tabular,
+                best.status_code, best.received_at,
             )
             best.local_cached = (source == "local")
             best.remote_cached = (source == "remote")
@@ -1765,8 +1767,10 @@ class HTTPSession(Session):
         if hits:
             total = sum(len(v) for v in hits.values())
             LOGGER.debug(
-                "Batch local cache: %s/%s hits across %s path(s)",
-                total, len(batch), len(hits),
+                "Batch local cache: %d/%d hit(s) across %d path(s) — "
+                "skipping network for %d request(s); breakdown: %s",
+                total, len(batch), len(hits), total,
+                ", ".join(f"{p!r}={len(v)}" for p, v in hits.items()),
             )
         return hits, misses
 
@@ -1836,8 +1840,10 @@ class HTTPSession(Session):
 
         if total_hits:
             LOGGER.debug(
-                "Batch remote cache: %s/%s hits across %s table(s)",
-                total_hits, len(requests), len(table_to_cfg),
+                "Batch remote cache: %d/%d hit(s) across %d table(s) — "
+                "skipping network for %d request(s); breakdown: %s",
+                total_hits, len(requests), len(table_to_cfg), total_hits,
+                ", ".join(f"{tkey}={len(v)}" for tkey, v in hits.items()),
             )
         return hits, misses
 
@@ -2791,8 +2797,13 @@ class HTTPSession(Session):
                 LOGGER.debug(
                     "Completed send_many chunk #%d (requests=%d, "
                     "local_hits=%d, remote_hits=0, network=0, failed=0) "
-                    "— fully short-circuited on local cache",
+                    "— fully short-circuited on local cache; "
+                    "no requests sent (local_paths=%s)",
                     chunk_index, len(chunk), local_count,
+                    ", ".join(
+                        f"{p!r}={len(v)}"
+                        for p, v in local_hits_by_path.items()
+                    ),
                 )
                 yield HTTPResponseBatch(
                     local_hits=local_hits,
@@ -2868,12 +2879,27 @@ class HTTPSession(Session):
                     )
                     total_remote += remote_count
                 total_local += local_count
+                if is_spark:
+                    remote_breakdown = ", ".join(
+                        f"{tkey}=<spark>" for tkey in remote_hits_by_table
+                    )
+                else:
+                    remote_breakdown = ", ".join(
+                        f"{tkey}={len(v)}"
+                        for tkey, v in remote_hits_by_table.items()  # type: ignore[union-attr]
+                    )
                 LOGGER.debug(
                     "Completed send_many chunk #%d (requests=%d, "
                     "local_hits=%d, remote_hits=%s, network=0, failed=0) "
-                    "— short-circuited on remote cache",
+                    "— short-circuited on remote cache; no requests sent "
+                    "(local_paths=%s, remote_tables=%s)",
                     chunk_index, len(chunk), local_count,
                     "<spark>" if remote_count < 0 else remote_count,
+                    ", ".join(
+                        f"{p!r}={len(v)}"
+                        for p, v in local_hits_by_path.items()
+                    ) or "none",
+                    remote_breakdown or "none",
                 )
                 yield HTTPResponseBatch(
                     local_hits=local_hits,
@@ -3207,6 +3233,26 @@ class HTTPSession(Session):
         """
         if not misses:
             return self._cached_empty_spark_frame(spark)
+
+        # Driver-side prepare before the mapInArrow scatter. Subclasses
+        # use :meth:`prepare_request_before_send` for URL normalisation,
+        # session-wide header injection, auth refresh, request signing
+        # — applying it here means the wire payload, the Arrow row,
+        # and any signed Authorization header all reflect the driver's
+        # view before crossing executors. Workers re-prepare inside
+        # :meth:`send_many` → :meth:`_send` (double-prepare) so
+        # per-executor concerns — stale token refresh on a long-running
+        # partition, executor-local correlation IDs — still apply.
+        # The default hook (session-header merge + cached-token auth
+        # refresh) is idempotent under double-call; subclasses that
+        # mutate non-idempotently should guard on their own state.
+        for req in misses:
+            self.prepare_request_before_send(req)
+        LOGGER.debug(
+            "Driver-prepared %d send_many miss(es) before mapInArrow "
+            "scatter (workers re-prepare via send_many)",
+            len(misses),
+        )
 
         # One C++-side struct walk turns the request list into a single
         # Arrow table that matches REQUEST_SCHEMA column-for-column.
