@@ -674,7 +674,7 @@ def _arrow_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=20,
     ))
 
-    # Records path used by `_send_many` to flatten ResponseBatch holders.
+    # Records path used by `_send_many` to flatten HTTPResponseBatch holders.
     resp_records = list(
         Response.from_arrow_tabular(resp_table_n, normalize=False)
     )

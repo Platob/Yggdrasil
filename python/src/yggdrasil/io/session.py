@@ -127,8 +127,8 @@ class Session(Singleton, ABC):
     # Prepared / response / batch types the prepare → send pipeline
     # emits. Each transport pins these to its own concrete types —
     # :class:`HTTPSession` to :class:`PreparedRequest` / :class:`Response`
-    # / :class:`ResponseBatch`; :class:`StatementExecutor` subclasses to
-    # :class:`PreparedStatement` / :class:`StatementResult` /
+    # / :class:`HTTPResponseBatch`; :class:`StatementExecutor` subclasses
+    # to :class:`PreparedStatement` / :class:`StatementResult` /
     # :class:`StatementBatch` — so the same vocabulary covers every
     # transport.
     _PREPARED_CLASS: ClassVar[type]

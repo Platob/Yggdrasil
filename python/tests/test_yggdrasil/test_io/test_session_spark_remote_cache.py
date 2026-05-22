@@ -321,7 +321,7 @@ class TestPinSparkSnapshot:
     from. Without an eager snapshot, a later ``.count()`` on the lookup
     frame re-runs the SELECT and double-counts rows freshly inserted by
     stage 4 — the regression that surfaced as
-    ``ResponseBatch.counts == {'remote': N, 'new': N}`` for a cold
+    ``HTTPResponseBatch.counts == {'remote': N, 'new': N}`` for a cold
     cache where ``remote`` should have been 0.
     """
 

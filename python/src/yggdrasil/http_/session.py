@@ -63,7 +63,7 @@ from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ArrowIPCFile
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
-from yggdrasil.io.response_batch import ResponseBatch
+from yggdrasil.http_.response_batch import HTTPResponseBatch
 from yggdrasil.io.send_config import CacheConfig, SendConfig, SendManyConfig, _request_column_sql_name
 from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
@@ -420,7 +420,7 @@ class HTTPSession(Session):
 
     _PREPARED_CLASS: ClassVar[type] = PreparedRequest
     _RESPONSE_CLASS: ClassVar[type] = Response
-    _BATCH_CLASS: ClassVar[type] = ResponseBatch
+    _BATCH_CLASS: ClassVar[type] = HTTPResponseBatch
 
     _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_connections", "_retry"}
 
@@ -1569,7 +1569,7 @@ class HTTPSession(Session):
 
         ``as_tabular=True`` drains the same staged pipeline via
         :meth:`send_many_batches` and concatenates every per-chunk
-        :class:`ResponseBatch` into one :class:`Tabular`:
+        :class:`HTTPResponseBatch` into one :class:`Tabular`:
         :class:`ArrowTabular` in Python mode, a :class:`Dataset`
         wrapping a lazy union of per-chunk Spark frames when
         ``spark_session`` is bound (set the latter to ``True`` /
@@ -1614,13 +1614,13 @@ class HTTPSession(Session):
         """Drain :meth:`_send_many_batches` and concat into one :class:`Tabular`.
 
         Spark mode unions per-chunk :class:`SparkDataFrame` lazily via
-        :meth:`ResponseBatch.extend` then wraps the result through
-        :meth:`ResponseBatch.to_tabular`, so no executor job fires
+        :meth:`HTTPResponseBatch.extend` then wraps the result through
+        :meth:`HTTPResponseBatch.to_tabular`, so no executor job fires
         until the caller triggers an action. Python mode concatenates
         Arrow record batches at the end of the stream.
         """
         spark = config.spark_session
-        accumulator: ResponseBatch | None = None
+        accumulator: HTTPResponseBatch | None = None
         for batch in self._send_many_batches(requests, config):
             if accumulator is None:
                 accumulator = batch
@@ -1628,7 +1628,7 @@ class HTTPSession(Session):
                 accumulator.extend(batch)
         if accumulator is None:
             if spark is not None:
-                from yggdrasil.io.response_batch import spark_to_tabular
+                from yggdrasil.http_.response_batch import spark_to_tabular
                 return spark_to_tabular(self._cached_empty_spark_frame(spark))
             from yggdrasil.io.tabular import ArrowTabular
             return ArrowTabular(
@@ -1715,7 +1715,7 @@ class HTTPSession(Session):
 
         Hits are grouped by the resolved cache :class:`Path` so the
         per-config split survives all the way to
-        :class:`ResponseBatch.local_hits`. The dict key is the live
+        :class:`HTTPResponseBatch.local_hits`. The dict key is the live
         :class:`Path` (hashable, singleton-keyed) so two distinct
         backends with the same ``full_path()`` string don't collide.
 
@@ -1786,7 +1786,7 @@ class HTTPSession(Session):
 
         Returns hits as a per-table mapping keyed by
         ``CacheConfig.table.full_name(safe=True)`` so the downstream
-        :class:`ResponseBatch` can preserve which table answered which
+        :class:`HTTPResponseBatch` can preserve which table answered which
         subset of the batch — collapsing them back into one bucket
         would lose that provenance.
 
@@ -2019,7 +2019,7 @@ class HTTPSession(Session):
 
         Returns ``(hits_by_table, misses)`` — hits stay as Spark
         DataFrames keyed by ``CacheConfig.table.full_name(safe=True)``
-        so the caller can hand them straight to :class:`ResponseBatch`
+        so the caller can hand them straight to :class:`HTTPResponseBatch`
         without ever materialising rows on the driver and without
         losing the per-table provenance to a premature
         ``unionByName``. Misses still come back as a Python list
@@ -2151,7 +2151,7 @@ class HTTPSession(Session):
         if not matched:
             # Cold-cache short-circuit: returning a still-bound
             # SparkDataFrame for the empty match would let any later
-            # action — e.g. :attr:`ResponseBatch.counts` — re-execute
+            # action — e.g. :attr:`HTTPResponseBatch.counts` — re-execute
             # the SELECT after stage 4 has inserted ``misses`` into the
             # same cache table, double-counting those rows as remote
             # hits. The bucket really is empty; let the consumer drop it.
@@ -2507,9 +2507,9 @@ class HTTPSession(Session):
         requests: Iterator[PreparedRequest],
         config: SendManyConfig,
     ) -> Iterator[Response]:
-        """Stream responses, flattening the per-chunk :class:`ResponseBatch`.
+        """Stream responses, flattening the per-chunk :class:`HTTPResponseBatch`.
 
-        Iteration order matches :class:`ResponseBatch.parts`: local hits
+        Iteration order matches :class:`HTTPResponseBatch.parts`: local hits
         first, then remote hits, then network fetches. Callers that need
         the origin breakdown should use :meth:`send_many_batches`
         instead.
@@ -2519,7 +2519,7 @@ class HTTPSession(Session):
         for :class:`Dataset` uses ``df.toLocalIterator()`` — rows
         stream from the executors one at a time, so the driver memory
         footprint stays bounded even for large network-fetch batches.
-        :class:`ResponseBatch.__iter__` rejects Spark mode (it would
+        :class:`HTTPResponseBatch.__iter__` rejects Spark mode (it would
         force a ``df.toArrow()`` collect); going through the holders
         sidesteps that guard.
 
@@ -2559,11 +2559,11 @@ class HTTPSession(Session):
         max_batch_ttl: float | None = None,
         spark_session: Optional["SparkSession"] = None,
         **options,
-    ) -> Iterator[ResponseBatch]:
-        """Yield one :class:`ResponseBatch` per processed chunk.
+    ) -> Iterator[HTTPResponseBatch]:
+        """Yield one :class:`HTTPResponseBatch` per processed chunk.
 
         Public entry point: both Python and Spark modes yield the same
-        ``Iterator[ResponseBatch]`` shape, chunked the same way, so
+        ``Iterator[HTTPResponseBatch]`` shape, chunked the same way, so
         downstream consumers can stream partial results uniformly. Each
         yielded batch carries schema-bearing holders even when a stage
         produced no rows — the schema is preserved for empty results.
@@ -2597,8 +2597,8 @@ class HTTPSession(Session):
         self,
         requests: Iterator[PreparedRequest],
         config: SendManyConfig,
-    ) -> Iterator[ResponseBatch]:
-        """Yield one :class:`ResponseBatch` per processed chunk.
+    ) -> Iterator[HTTPResponseBatch]:
+        """Yield one :class:`HTTPResponseBatch` per processed chunk.
 
         Single pipeline for both Python and Spark modes — the only
         differences are stage 3 (fetch misses through the local job
@@ -2607,7 +2607,7 @@ class HTTPSession(Session):
         ``config.spark_session``.
 
         Both modes chunk requests by ``batch_size`` and yield one
-        :class:`ResponseBatch` per chunk so callers see the same
+        :class:`HTTPResponseBatch` per chunk so callers see the same
         streaming shape regardless of engine. In Spark mode each chunk
         produces its own ``mapInArrow`` job — pass a larger
         ``batch_size`` (or ``max_batch_size``) when you'd rather
@@ -2749,7 +2749,7 @@ class HTTPSession(Session):
                 chunk, session_local_cfg, key_to_local_cfg=key_to_local_cfg,
             )
             # Flatten across cache-folder paths into a single bucket
-            # for :class:`ResponseBatch`. On the spark path, lift the
+            # for :class:`HTTPResponseBatch`. On the spark path, lift the
             # flat list to a Spark frame once so every bucket
             # downstream is frame-resident — matches stage 2/3 and
             # lets the caller union holders without a per-bucket type
@@ -2769,7 +2769,7 @@ class HTTPSession(Session):
             # Remote hits: dict keyed by ``CacheConfig.table.full_name``
             # internally so :meth:`_backfill_local_cache` knows which
             # rows came from which table; collapsed into one bucket at
-            # the :class:`ResponseBatch` boundary.
+            # the :class:`HTTPResponseBatch` boundary.
             remote_hits_by_table: (
                 "dict[str, list[Response]] | dict[str, SparkDataFrame]"
             ) = {}
@@ -2794,7 +2794,7 @@ class HTTPSession(Session):
                     "— fully short-circuited on local cache",
                     chunk_index, len(chunk), local_count,
                 )
-                yield ResponseBatch(
+                yield HTTPResponseBatch(
                     local_hits=local_hits,
                     remote_hits=None,
                     new_hits=new_hits,
@@ -2854,7 +2854,7 @@ class HTTPSession(Session):
                 )
 
             # Collapse the per-table remote split into one bucket for
-            # :class:`ResponseBatch`. Python lists chain; Spark frames
+            # :class:`HTTPResponseBatch`. Python lists chain; Spark frames
             # union via ``unionByName(allowMissingColumns=True)``.
             remote_hits = self._flatten_remote_hits(remote_hits_by_table)
 
@@ -2875,7 +2875,7 @@ class HTTPSession(Session):
                     chunk_index, len(chunk), local_count,
                     "<spark>" if remote_count < 0 else remote_count,
                 )
-                yield ResponseBatch(
+                yield HTTPResponseBatch(
                     local_hits=local_hits,
                     remote_hits=remote_hits,
                     new_hits=new_hits,
@@ -2895,7 +2895,7 @@ class HTTPSession(Session):
                     "%d miss(es) without fetching",
                     chunk_index, len(after_remote),
                 )
-                yield ResponseBatch(
+                yield HTTPResponseBatch(
                     local_hits=local_hits,
                     remote_hits=remote_hits,
                     new_hits=new_hits,
@@ -2995,7 +2995,7 @@ class HTTPSession(Session):
                 remote_count_log, network_count_log, failed_count,
             )
 
-            yield ResponseBatch(
+            yield HTTPResponseBatch(
                 local_hits=local_hits,
                 remote_hits=remote_hits,
                 new_hits=new_hits,
@@ -3283,7 +3283,7 @@ class HTTPSession(Session):
         )
         # Cache so stage 4's insert (the first action on this frame)
         # both materialises and caches it. Without the cache, every
-        # later action — including :attr:`ResponseBatch.counts` — would
+        # later action — including :attr:`HTTPResponseBatch.counts` — would
         # re-execute the ``mapInArrow``, re-issuing per-partition
         # network calls AND letting workers' ``send_many`` short-circuit
         # on the very rows stage 4 has just persisted to the remote

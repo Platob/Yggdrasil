@@ -1,12 +1,12 @@
-"""Origin-tagged carrier for batched ``Session.send_many`` results.
+"""Origin-tagged carrier for batched ``HTTPSession.send_many`` results.
 
 `send_many` historically returned an `Iterator[Response]` and the Spark
 variant returned a single fused DataFrame. Both lose the *origin* of every
 row — the caller can't tell whether a response came from the local
 on-disk cache, the remote SQL cache, or a fresh network fetch.
 
-:class:`ResponseBatch` keeps that split visible. Three buckets, each an
-``Optional[Tabular]``: ``local_hits`` (on-disk cache), ``remote_hits``
+:class:`HTTPResponseBatch` keeps that split visible. Three buckets, each
+an ``Optional[Tabular]``: ``local_hits`` (on-disk cache), ``remote_hits``
 (remote SQL cache), ``new_hits`` (network). ``None`` means "nothing
 landed in this bucket"; a non-None holder is the same :class:`Tabular`
 contract for Python (:class:`ArrowTabular`) and Spark
@@ -21,16 +21,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterator, Optional, Union
 
-from .tabular.base import Tabular
 from yggdrasil.io.tabular import ArrowTabular, Dataset
-from .response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
+from yggdrasil.io.tabular.base import Tabular
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
 
 
 __all__ = [
-    "ResponseBatch",
+    "HTTPResponseBatch",
     "BucketInput",
     "responses_to_tabular",
     "spark_to_tabular",
@@ -74,7 +74,7 @@ def spark_to_tabular(df: "SparkDataFrame") -> Dataset:
     :meth:`Tabular.read_spark_frame` returns it untouched. A
     subsequent :meth:`Tabular.read_arrow_batches` would force
     ``df.toArrow()`` — fine for small frames, but Spark-mode iteration
-    on the :class:`ResponseBatch` is disallowed precisely so callers
+    on the :class:`HTTPResponseBatch` is disallowed precisely so callers
     don't trip over that collect by accident.
     """
     return Dataset(df)
@@ -109,11 +109,11 @@ def _coerce_bucket(value: BucketInput) -> Optional[Tabular]:
 
 
 # ---------------------------------------------------------------------------
-# ResponseBatch
+# HTTPResponseBatch
 # ---------------------------------------------------------------------------
 
 
-class ResponseBatch:
+class HTTPResponseBatch:
     """Origin-tagged view of a batch of responses.
 
     Three optional buckets, in pipeline order:
@@ -157,7 +157,7 @@ class ResponseBatch:
 
     def __repr__(self) -> str:
         return (
-            f"ResponseBatch(local_hits={self._local!r}, "
+            f"HTTPResponseBatch(local_hits={self._local!r}, "
             f"remote_hits={self._remote!r}, "
             f"new_hits={self._new!r})"
         )
@@ -263,7 +263,7 @@ class ResponseBatch:
     def __len__(self) -> int:
         if self.is_spark:
             raise TypeError(
-                "len() is not defined for a Spark ResponseBatch — use "
+                "len() is not defined for a Spark HTTPResponseBatch — use "
                 "`.counts` (which calls `df.count()` per holder) or check "
                 "the individual DataFrames."
             )
@@ -305,7 +305,7 @@ class ResponseBatch:
     # Mutation / merge
     # ------------------------------------------------------------------
 
-    def extend(self, other: "ResponseBatch") -> "ResponseBatch":
+    def extend(self, other: "HTTPResponseBatch") -> "HTTPResponseBatch":
         """Merge another batch in place. Returns self for chaining.
 
         Per-bucket merges append the other side's rows into the
