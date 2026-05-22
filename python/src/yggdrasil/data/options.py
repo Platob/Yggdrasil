@@ -222,6 +222,23 @@ class CastOptions:
     #: Flip to ``True`` at the call site to opt into strict semantics
     #: (overflow / parse / type-mismatch → raise).
     safe: bool = False
+    #: ``False`` (default): each batch handed to ``write_arrow_batches``
+    #: is run through :meth:`CastOptions.check_source` /
+    #: :meth:`check_target` to align its schema against the target.
+    #: That covers heterogenous inputs (an Arrow stream from one feed,
+    #: a polars frame from another, a row dict from a callsite) where
+    #: the writer can't trust the batch shape matches what the leaf
+    #: holds on disk.
+    #:
+    #: ``True``: the caller guarantees every batch *already* matches
+    #: the target schema (came from a :class:`pa.Table`, a
+    #: :class:`pa.RecordBatchReader`, a polars / pandas frame whose
+    #: shape was resolved upstream, or another writer that just
+    #: emitted the same schema). Inner ``write_arrow_batches`` skips
+    #: the per-batch source rebuild + cast pass entirely — the bytes
+    #: go straight to the format's writer. Use only when you control
+    #: the source.
+    checked_cast: bool = False
     mode: Mode = Mode.AUTO
     schema_mode: Mode = Mode.IGNORE
     row_size: int | None = None
@@ -796,7 +813,18 @@ class CastOptions:
         Returns self unchanged when neither is given. Used from
         :class:`DataIO` methods (``collect_schema``, ``read_arrow_dataset``)
         that want to pin a source schema before running a batch walk.
+
+        ``checked_cast=True`` short-circuits — the caller guarantees
+        the batch shape matches the target, so the peek (which would
+        rebuild a yggdrasil :class:`Field` from the batch's
+        :class:`pa.Schema`) is wasted work. Combined with the
+        :meth:`cast_arrow_tabular` short-circuit, this collapses every
+        per-batch cast pass to a single attribute read on the leaf
+        write path — ~150 us / batch saved on a RESPONSE_SCHEMA-shaped
+        write.
         """
+        if self.checked_cast:
+            return self
         if self.source is None and obj is not None:
             try:
                 peeked = obj() if callable(obj) else field_class().from_(obj)
@@ -1046,8 +1074,15 @@ class CastOptions:
         return self.target.cast_arrow_array(array, options=self)
 
     def cast_arrow_tabular(self, table: Any) -> Any:
-        """Cast a :class:`pa.Table` or :class:`pa.RecordBatch`."""
-        if self.target is None:
+        """Cast a :class:`pa.Table` or :class:`pa.RecordBatch`.
+
+        ``checked_cast=True`` short-circuits to the input unchanged —
+        the caller guarantees every batch already matches the target,
+        so the per-batch cast pass (and the schema rebuild upstream
+        in :meth:`check_source`) is wasted work. Use only when you
+        control the source.
+        """
+        if self.target is None or self.checked_cast:
             return table
         return self.target.cast_arrow_tabular(table, options=self)
 

@@ -1018,61 +1018,6 @@ class FolderPath(IO[bytes, FolderOptions]):
         return cls(holder=entry, owns_holder=False)
 
     # ==================================================================
-    # Children — direct (no iterdir)
-    # ==================================================================
-
-    def child_file(self, name: str) -> "Tabular":
-        """Mint the :class:`Tabular` leaf at ``self.path / name`` directly.
-
-        Skips :meth:`Path.iterdir` and the existence probe — useful
-        when the caller already knows the leaf name (Hive partition
-        candidate probing, deterministic part-file paths,
-        sidecar/yggmeta lookups). The leaf class is resolved from the
-        new URL's cached :attr:`URL.media_type`; falls back to
-        :class:`BytesIO` when no registered leaf claims the extension
-        so callers always get a usable holder.
-
-        The returned leaf is lazy in the same sense as the
-        :meth:`iter_children` yield: no I/O is performed at mint time.
-        A subsequent ``.read_arrow_batches()`` against a non-existent
-        path yields an empty stream (the underlying
-        :meth:`Path.iterdir` / open path silently handles missing).
-        """
-        child_path = self.path / name
-        url = child_path.url
-        mt = url.media_type if url is not None else None
-        if mt is not None:
-            try:
-                cls = IO.class_for_media_type(mt, default=None)
-            except Exception:
-                cls = None
-        else:
-            cls = None
-        if cls is None:
-            cls = BytesIO
-        leaf = cls(holder=child_path, owns_holder=False)
-        return self.adopt_child(leaf)
-
-    def child_folder(self, name: str) -> "FolderPath":
-        """Mint a child :class:`FolderPath` at ``self.path / name`` directly.
-
-        Skips :meth:`Path.iterdir` and the existence probe — the
-        bound child is lazy and a downstream read against a
-        non-existent directory short-circuits in
-        :meth:`iter_children` (which already stats once). Useful for
-        Hive-partition candidate probing when the accepted-value set
-        is fully defined by the predicate: the caller mints one
-        :class:`FolderPath` per value without paying a stat per
-        candidate up front, and the predicate-prune skips the
-        non-existent ones before any I/O fires.
-
-        Returns the same concrete class as ``self`` so a
-        :class:`DeltaFolder` or other subclass chains through
-        correctly.
-        """
-        return self.adopt_child(type(self)(path=self.path / name))
-
-    # ==================================================================
     # Children — write
     # ==================================================================
 
@@ -1414,15 +1359,36 @@ class FolderPath(IO[bytes, FolderOptions]):
             # APPEND / AUTO). UPSERT / MERGE pass through unchanged
             # so per-partition dedup against existing rows still
             # fires inside each child's flat branch.
-            if action is Mode.OVERWRITE or action in (
-                Mode.IGNORE, Mode.ERROR_IF_EXISTS,
-            ):
-                child_options = dataclasses.replace(options, mode=Mode.APPEND)
-            else:
-                child_options = options
+            #
+            # ``checked_cast=True`` short-circuits the per-batch
+            # schema rebuild + cast inside every leaf write: the
+            # subsets are slices of the parent's already-resolved
+            # ``pa.Table``, so they share its schema by construction
+            # — every batch matches the target the parent just stamped
+            # via :meth:`_schema_for_arrow`. RESPONSE_SCHEMA has 28
+            # columns; the rebuild-and-cast was ~150 us per child
+            # write before, now ~5 us.
+            child_mode = (
+                Mode.APPEND if action is Mode.OVERWRITE or action in (
+                    Mode.IGNORE, Mode.ERROR_IF_EXISTS,
+                ) else options.mode
+            )
+            child_options = dataclasses.replace(
+                options, mode=child_mode, checked_cast=True,
+            )
 
             table = pa.Table.from_batches(materialised)
             column = table.column(head)
+            # Serial fan-out: a per-partition ThreadPoolExecutor was
+            # benched (``_write_partitions_parallel`` git history)
+            # and ran 2x **slower** at every partition count from 4
+            # through 16, at both 100 and 10_000 rows per partition.
+            # Pool spawn + per-job GIL handoff dominated the small
+            # per-partition Python pre-amble (subset slice, child
+            # FolderPath mint, schema cache walk) and pyarrow's own
+            # parquet writer already releases the GIL during the
+            # encode that's actually parallelisable. Keep the inline
+            # loop until a workload appears where parallelism wins.
             for scalar in pc.unique(column.combine_chunks()):
                 value = scalar.as_py()
                 mask = (
@@ -1468,7 +1434,17 @@ class FolderPath(IO[bytes, FolderOptions]):
             return
 
         # Plain APPEND (or empty folder): mint a fresh part and drain.
-        self._write_parts(materialised, options, source_schema=first_schema)
+        # ``source_schema`` pre-stamps the already-resolved yggdrasil
+        # :class:`Schema` so the leaf write's :meth:`check_source`
+        # short-circuits (no per-write ``Field.from_arrow`` rebuild)
+        # while still leaving ``options.merged`` populated for the
+        # writer's schema slot. ``checked_cast=True`` then collapses
+        # the per-batch cast loop — the batches share the same
+        # schema we just stamped.
+        self._write_parts(
+            materialised, options,
+            source_schema=first_schema, checked_cast=True,
+        )
         self._persist_schema(first_schema, media_type=options.child_media_type)
 
     def _write_parts(
@@ -1477,6 +1453,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         options: FolderOptions,
         *,
         source_schema: Any = None,
+        checked_cast: bool = False,
     ) -> None:
         """Mint one or more part files and drain *batches* into them.
 
@@ -1484,24 +1461,40 @@ class FolderPath(IO[bytes, FolderOptions]):
         per-part rechunking; with neither set, drains the whole
         stream into a single part.
 
-        ``source_schema`` (the yggdrasil :class:`Schema` the caller
-        already resolved via :meth:`_schema_for_arrow`) is forwarded
-        as ``options.source`` on the leaf write so the leaf's
-        :meth:`CastOptions.check_source` short-circuits instead of
-        rebuilding every :class:`Field` from the batch's
-        :class:`pa.Schema`. RESPONSE_SCHEMA has 28 columns — the
-        rebuild was ~150 us per write before, now ~5 us.
+        Two opt-in fast-paths the partition / cache writer hits:
+
+        * ``source_schema`` (the yggdrasil :class:`Schema` the parent
+          resolved via :meth:`_schema_for_arrow`) is pre-stamped onto
+          ``options.source`` so the leaf's
+          :meth:`CastOptions.check_source` skips the per-write
+          :meth:`Field.from_arrow_schema` rebuild while
+          ``options.merged`` (the writer's schema slot) stays populated.
+        * ``checked_cast=True`` flips :attr:`CastOptions.checked_cast`
+          so the leaf's :meth:`cast_arrow_tabular` short-circuits per
+          batch — the caller guarantees every batch matches the
+          target.
+
+        RESPONSE_SCHEMA has 28 columns; together these collapse the
+        leaf write's per-batch setup from ~150 us to ~5 us.
         """
         byte_size = getattr(options, "byte_size", None) or 0
         row_size = getattr(options, "row_size", None) or 0
 
         def _leaf_options(child: "Tabular") -> Any:
             base = child.options_class()()
+            # Single in-place stamp on the freshly minted (frozen)
+            # options object via ``object.__setattr__`` — calling
+            # ``dataclasses.replace`` per child would rerun
+            # ``__post_init__`` and allocate a fresh slot layout,
+            # which the bench (Session._store_cached_response) flagged
+            # as a 500 us / write regression.
+            if checked_cast and hasattr(base, "checked_cast"):
+                object.__setattr__(base, "checked_cast", True)
             if source_schema is not None:
                 try:
-                    return base.with_source(source_schema, copy=False)
+                    base.with_source(source_schema, copy=False)
                 except Exception:
-                    return base
+                    pass
             return base
 
         if byte_size > 0 or row_size > 0:

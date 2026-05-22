@@ -234,67 +234,71 @@ class TestClearTabularChildren:
         assert (tmp_path / ".ygg").is_dir()
 
 
-class TestChildHelpers:
-    """Direct child constructors — ``child_file`` and ``child_folder``.
 
-    Both helpers mint a sub-:class:`Tabular` at ``self.path / name``
-    without calling :meth:`iter_children` / :meth:`Path.iterdir` and
-    without probing for existence on disk. They are the lazy
-    counterpart to the eager :meth:`iter_children` walk — useful when
-    the caller already knows the name (Hive partition probing,
-    deterministic part-file paths, sidecar lookups).
+
+class TestCheckedCast:
+    """``CastOptions.checked_cast=True`` opts out of per-batch schema
+    re-binding and casts.
+
+    The folder partition / cache write path runs every batch through
+    :meth:`CastOptions.check_source` (rebuilds a yggdrasil :class:`Field`
+    from the batch's :class:`pa.Schema`) and :meth:`cast_arrow_tabular`
+    (per-batch cast) by default. ``checked_cast=True`` short-circuits
+    both — the caller guarantees the batch already matches the
+    target. Used by :meth:`FolderPath._write_parts` when the parent
+    already resolved the schema via :meth:`_schema_for_arrow`.
     """
 
-    def test_child_file_resolves_leaf_class_by_extension(self, tmp_path) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+    def test_check_source_short_circuits_when_checked(self) -> None:
+        from yggdrasil.data.options import CastOptions
+        import pyarrow as pa
 
-        folder = FolderPath(path=str(tmp_path))
-        leaf = folder.child_file("trades.parquet")
+        schema = pa.schema([("a", pa.int64()), ("b", pa.string())])
+        opts = CastOptions(checked_cast=True)
+        # With ``checked_cast=True`` the peek does not run — source
+        # stays None even though we passed a peekable schema.
+        result = opts.check_source(schema, copy=False)
+        assert result is opts
+        assert result.source is None
 
-        assert isinstance(leaf, ParquetFile)
-        assert leaf._parent.url == folder.path.url.joinpath("trades.parquet")
-        # No I/O at mint time: the file doesn't exist on disk yet.
-        assert not (tmp_path / "trades.parquet").exists()
+    def test_cast_arrow_tabular_short_circuits_when_checked(self) -> None:
+        from yggdrasil.data.options import CastOptions
+        import pyarrow as pa
 
-    def test_child_file_falls_back_to_bytes_io_for_unknown_extension(
+        # Build a target so ``cast_arrow_tabular`` would normally run.
+        opts = CastOptions(checked_cast=False).check_target(
+            pa.schema([("a", pa.int32())]),
+        )
+        batch = pa.record_batch([pa.array([1, 2, 3])], names=["a"])
+        # Without ``checked_cast`` the cast pass runs (no-op cast here
+        # but the dispatch fires); with it the input passes through
+        # by identity.
+        same_id = opts.copy(checked_cast=True).cast_arrow_tabular(batch)
+        assert same_id is batch
+
+    def test_write_arrow_batches_with_checked_cast_uses_first_batch_schema(
         self, tmp_path,
     ) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        # End-to-end: a caller that owns the source schema (an
+        # ``HTTPResponse.values_to_arrow_batch`` projection, a
+        # ``pa.RecordBatchReader``, etc.) writes with
+        # ``checked_cast=True`` and the leaf write succeeds without
+        # touching the cast machinery.
+        import pyarrow as pa
+        from yggdrasil.io.nested.folder_path import FolderOptions
 
-        folder = FolderPath(path=str(tmp_path))
-        leaf = folder.child_file("notes.unknown_extension")
+        batch = pa.record_batch(
+            [pa.array([1, 2, 3]), pa.array(["x", "y", "z"])],
+            names=["a", "b"],
+        )
 
-        # Unregistered extension → caller still gets a usable handle.
-        assert isinstance(leaf, BytesIO)
+        folder = FolderPath(path=str(tmp_path / "checked"))
+        folder.write_arrow_batches(
+            (batch,),
+            options=FolderOptions(checked_cast=True),
+        )
 
-    def test_child_folder_returns_lazy_subfolder(self, tmp_path) -> None:
-        folder = FolderPath(path=str(tmp_path))
-        sub = folder.child_folder("partition_key=42")
-
-        assert isinstance(sub, FolderPath)
-        assert sub.path.url == folder.path.url.joinpath("partition_key=42")
-        # No I/O at mint time — the sub-folder doesn't exist yet, and
-        # a downstream read against it must short-circuit to empty.
-        assert not (tmp_path / "partition_key=42").exists()
-        assert list(sub.iter_children()) == []
-
-    def test_child_folder_preserves_subclass(self, tmp_path) -> None:
-        # ``child_folder`` mints a child of the same concrete class so
-        # subclasses (e.g. DeltaFolder) chain through correctly. The
-        # ``mime_type = None`` opt-out keeps the subclass off the
-        # format registry so the test doesn't clash with the parent
-        # FolderPath slot.
-        class _SubFolder(FolderPath):
-            mime_type = None  # type: ignore[assignment]
-
-        sub_root = _SubFolder(path=str(tmp_path))
-        child = sub_root.child_folder("partition_key=0")
-        assert type(child) is _SubFolder
-
-    def test_child_folder_adopts_child(self, tmp_path) -> None:
-        # Adoption stamps tabular_parent so the child shares schema /
-        # free-cols caches with the parent (the same contract
-        # ``iter_children`` provides for yielded children).
-        folder = FolderPath(path=str(tmp_path))
-        sub = folder.child_folder("partition_key=0")
-        assert sub.tabular_parent is folder
+        # Round-trip: the bytes landed and read back match.
+        reread = folder.read_arrow_table()
+        assert reread.num_rows == 3
+        assert reread.column_names == ["a", "b"]
