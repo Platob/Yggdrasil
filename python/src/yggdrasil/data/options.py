@@ -355,6 +355,15 @@ class CastOptions:
     #: ``dict`` so the bundle is a single round-trippable Field
     #: collection.
     time_sample_by: list["Field"] | None = None
+    #: How to fill nulls left by the resample pass. ``"ffill"``
+    #: (default) propagates the last non-null value forward into
+    #: subsequent nulls within the same partition; ``"bfill"``
+    #: propagates the next non-null backward; ``"none"`` / ``None``
+    #: disables the pass so resample emits whatever the ``"first"``
+    #: aggregate picked. Same vocabulary on every engine — the
+    #: arrow / spark ops in :mod:`yggdrasil.arrow.ops` and
+    #: :mod:`yggdrasil.spark.ops` consume this verbatim.
+    fill_strategy: str = "ffill"
     read_seek: int | None = None
     write_seek: int | None = None
     #: Row-level predicate. Evaluated by every IO that reads tabular
@@ -1250,8 +1259,8 @@ class CastOptions:
         from yggdrasil.arrow.ops import dedup_arrow_batches as _dedup
         yield from _dedup(batches, cols)
 
-    def resample_on_read(self) -> "tuple[str, int, list[str]] | None":
-        """Return ``(time_column, sampling_seconds, partition_by)`` to resample.
+    def resample_on_read(self) -> "tuple[str, int, list[str], str] | None":
+        """Return ``(time_column, sampling_seconds, partition_by, fill_strategy)`` to resample.
 
         Picks the first entry of :attr:`time_sample_by` whose
         ``time_sampling`` metadata carries a positive ISO-8601
@@ -1286,7 +1295,7 @@ class CastOptions:
             if seconds <= 0:
                 continue
             partition_by = self._resample_partition_by(child.name)
-            return child.name, seconds, partition_by
+            return child.name, seconds, partition_by, self.fill_strategy
         return None
 
     def _resample_partition_by(self, time_column: str) -> "list[str]":
@@ -1328,12 +1337,13 @@ class CastOptions:
             yield from batches
             return
         from yggdrasil.arrow.ops import resample_arrow_batches as _resample
-        time_column, sampling_seconds, partition_by = target
+        time_column, sampling_seconds, partition_by, fill_strategy = target
         yield from _resample(
             batches,
             time_column=time_column,
             sampling_seconds=sampling_seconds,
             partition_by=partition_by or None,
+            fill_strategy=fill_strategy,
         )
 
     # ------------------------------------------------------------------
@@ -1373,17 +1383,53 @@ class CastOptions:
             return table
         if resample is not None:
             from yggdrasil.arrow.ops import resample_arrow_table as _resample
-            time_column, sampling_seconds, partition_by = resample
+            time_column, sampling_seconds, partition_by, fill_strategy = resample
             table = _resample(
                 table,
                 time_column=time_column,
                 sampling_seconds=sampling_seconds,
                 partition_by=partition_by or None,
+                fill_strategy=fill_strategy,
             )
         if unique:
             from yggdrasil.arrow.ops import dedup_arrow_table as _dedup
             table = _dedup(table, unique)
         return table
+
+    def apply_post_read_spark_frame(self, df: Any) -> Any:
+        """Run resample + dedup directly on a Spark DataFrame.
+
+        Spark-side mirror of :meth:`apply_post_read_table` — same
+        op order (resample first, dedup second), same identity
+        short-circuit when neither is configured. Routes through
+        :mod:`yggdrasil.spark.ops` so the heavy lifting stays on
+        the executors (``groupBy + applyInArrow`` for the
+        partitioned resample, SQL window functions otherwise)
+        instead of collecting the frame to the driver as Arrow.
+
+        Used by :meth:`yggdrasil.spark.tabular.Dataset._read_spark_frame`
+        to apply the read-time passes before handing the frame back
+        — saving a full ``df.toArrow → arrow.ops → createDataFrame``
+        round trip per configured op.
+        """
+        resample = self.resample_on_read()
+        unique = self.dedup_columns_on_read()
+        if resample is None and not unique:
+            return df
+        if resample is not None:
+            from yggdrasil.spark.ops import resample_spark_dataframe as _resample
+            time_column, sampling_seconds, partition_by, fill_strategy = resample
+            df = _resample(
+                df,
+                time_column=time_column,
+                sampling_seconds=sampling_seconds,
+                partition_by=partition_by or None,
+                fill_strategy=fill_strategy,
+            )
+        if unique:
+            from yggdrasil.spark.ops import dedup_spark_dataframe as _dedup
+            df = _dedup(df, unique)
+        return df
 
     def cast_arrow_batch_iterator(self, batches: Any) -> Any:
         """Cast a stream of :class:`pa.RecordBatch` and rechunk by ``byte_size`` / ``row_size``.

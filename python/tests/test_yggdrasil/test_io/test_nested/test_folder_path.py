@@ -470,7 +470,7 @@ class TestTimeSampleByResample:
             ).encode()},
         )
         opts = CastOptions(time_sample_by=[bare, tagged])
-        assert opts.resample_on_read() == ("ts2", 3600, [])
+        assert opts.resample_on_read() == ("ts2", 3600, [], "ffill")
 
     def test_timedelta_to_iso_duration_round_trip(self) -> None:
         from yggdrasil.data.options import timedelta_to_iso_duration
@@ -526,7 +526,7 @@ class TestTimeSampleByResample:
                 ).encode()},
             )],
         )
-        assert opts.resample_on_read() == ("ts", 3600, ["symbol"])
+        assert opts.resample_on_read() == ("ts", 3600, ["symbol"], "ffill")
 
     def test_partition_by_skips_when_only_time_is_primary(self) -> None:
         # When the only primary key IS the time column, there's
@@ -548,7 +548,7 @@ class TestTimeSampleByResample:
                 ).encode()},
             )],
         )
-        assert opts.resample_on_read() == ("ts", 3600, [])
+        assert opts.resample_on_read() == ("ts", 3600, [], "ffill")
 
     def test_partition_by_buckets_each_entity_independently(
         self, tmp_path,
@@ -602,6 +602,119 @@ class TestTimeSampleByResample:
         ]
         assert sorted(per_symbol["A"]) == expected
         assert sorted(per_symbol["B"]) == expected
+
+
+class TestFillStrategyOnResample:
+    """``fill_strategy`` controls how nulls left by resample's ``first`` agg are filled.
+
+    The resample's bucket collapse picks the first row per bucket
+    verbatim — null cells stay null. ``fill_strategy="ffill"``
+    (default) propagates the last non-null value forward into
+    subsequent nulls within the same partition; ``"bfill"`` does
+    the same backward; ``"none"`` is a no-op. Cross-partition
+    leaks are never allowed: a partition whose first non-null is
+    null stays null until a non-null arrives within that partition.
+    """
+
+    def test_ffill_flat_carries_last_non_null_forward(self) -> None:
+        import datetime as dt
+        from yggdrasil.arrow.ops import resample_arrow_table
+
+        ts = pa.array(
+            [dt.datetime(2024, 1, 1, h) for h in range(4)],
+            type=pa.timestamp("us"),
+        )
+        v = pa.array([1, None, None, 4])
+        t = pa.table({"ts": ts, "v": v})
+        out = resample_arrow_table(t, time_column="ts", sampling_seconds=3600)
+        assert out.column("v").to_pylist() == [1, 1, 1, 4]
+
+    def test_ffill_per_partition_does_not_leak(self) -> None:
+        import datetime as dt
+        from yggdrasil.arrow.ops import resample_arrow_table
+
+        # Symbol A: [1, None, None] — ffill within A yields [1, 1, 1].
+        # Symbol B: [None, 5, None] — the leading null has no prior
+        # non-null in B's partition, so it stays null; trailing null
+        # ffills from 5.
+        ts = pa.array(
+            [dt.datetime(2024, 1, 1, h) for h in range(6)],
+            type=pa.timestamp("us"),
+        )
+        sym = pa.array(["A", "A", "A", "B", "B", "B"])
+        v = pa.array([1, None, None, None, 5, None])
+        t = pa.table({"ts": ts, "sym": sym, "v": v})
+        out = resample_arrow_table(
+            t, time_column="ts", sampling_seconds=3600,
+            partition_by=["sym"],
+        )
+        rows = out.to_pylist()
+        rows.sort(key=lambda r: (r["sym"], r["ts"]))
+        assert [r["v"] for r in rows] == [1, 1, 1, None, 5, 5]
+
+    def test_bfill_propagates_next_non_null_backward(self) -> None:
+        import datetime as dt
+        from yggdrasil.arrow.ops import resample_arrow_table
+
+        ts = pa.array(
+            [dt.datetime(2024, 1, 1, h) for h in range(4)],
+            type=pa.timestamp("us"),
+        )
+        v = pa.array([None, None, 3, None])
+        t = pa.table({"ts": ts, "v": v})
+        out = resample_arrow_table(
+            t, time_column="ts", sampling_seconds=3600,
+            fill_strategy="bfill",
+        )
+        # Trailing null stays — nothing to bfill from.
+        assert out.column("v").to_pylist() == [3, 3, 3, None]
+
+    def test_none_strategy_leaves_nulls_in_place(self) -> None:
+        import datetime as dt
+        from yggdrasil.arrow.ops import resample_arrow_table
+
+        ts = pa.array(
+            [dt.datetime(2024, 1, 1, h) for h in range(4)],
+            type=pa.timestamp("us"),
+        )
+        v = pa.array([1, None, None, 4])
+        t = pa.table({"ts": ts, "v": v})
+        out = resample_arrow_table(
+            t, time_column="ts", sampling_seconds=3600,
+            fill_strategy="none",
+        )
+        assert out.column("v").to_pylist() == [1, None, None, 4]
+
+    def test_invalid_strategy_raises(self) -> None:
+        import datetime as dt
+        import pytest
+        from yggdrasil.arrow.ops import resample_arrow_table
+
+        ts = pa.array([dt.datetime(2024, 1, 1)], type=pa.timestamp("us"))
+        t = pa.table({"ts": ts, "v": pa.array([1])})
+        with pytest.raises(ValueError, match="fill_strategy"):
+            resample_arrow_table(
+                t, time_column="ts", sampling_seconds=3600,
+                fill_strategy="zfill",
+            )
+
+    def test_fill_arrow_table_nested_columns_skipped(self) -> None:
+        from yggdrasil.arrow.ops import fill_arrow_table
+
+        # Struct + list payload with nulls in a scalar column.
+        t = pa.table({
+            "sym": pa.array(["A", "A", "A"]),
+            "ts": pa.array([1, 2, 3]),
+            "v": pa.array([1, None, 3]),
+            "addr": pa.array(
+                [{"city": "x", "zip": 1}, {"city": "y", "zip": 2}, {"city": "z", "zip": 3}],
+                type=pa.struct([("city", pa.string()), ("zip", pa.int32())]),
+            ),
+        })
+        out = fill_arrow_table(t, sort_by="ts", partition_by=["sym"], fill_strategy="ffill")
+        # Scalar column gets filled; nested column rides through unchanged.
+        assert out.column("v").to_pylist() == [1, 1, 3]
+        assert out.column("addr").to_pylist() == t.column("addr").to_pylist()
 
 
 class TestComplexNestedTypeDedupResample:

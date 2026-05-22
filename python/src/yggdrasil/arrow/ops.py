@@ -59,11 +59,206 @@ if TYPE_CHECKING:
 __all__ = [
     "dedup_arrow_batches",
     "dedup_arrow_table",
+    "fill_arrow_table",
     "resample_arrow_batches",
     "resample_arrow_table",
     "upsert_arrow_batches",
     "upsert_arrow_tabular",
 ]
+
+
+# Accepted ``fill_strategy`` tokens. ``"ffill"`` / ``"bfill"`` mirror the
+# pandas / polars vocabulary; ``"none"`` / ``""`` / ``None`` disable the
+# pass. Anything else raises so a typo doesn't silently no-op.
+_FILL_STRATEGIES = frozenset({"ffill", "bfill", "none", ""})
+
+
+def _normalize_fill_strategy(fill_strategy: "str | None") -> str:
+    """Validate ``fill_strategy`` and return its canonical lowercase form.
+
+    ``None`` collapses to ``"none"`` so callers can pass ``None`` to opt
+    out without a separate branch. Empty string is also treated as
+    "no fill". Anything outside :data:`_FILL_STRATEGIES` raises
+    ``ValueError`` with the accepted vocabulary.
+    """
+    if fill_strategy is None:
+        return "none"
+    token = fill_strategy.lower()
+    if token not in _FILL_STRATEGIES:
+        raise ValueError(
+            f"fill_strategy={fill_strategy!r} is not supported. "
+            f"Pass one of {sorted(t for t in _FILL_STRATEGIES if t)} "
+            f"or ``None`` / ``\"none\"`` to disable the fill."
+        )
+    return token
+
+
+def fill_arrow_table(
+    table: pa.Table,
+    *,
+    sort_by: "str | None" = None,
+    partition_by: "Sequence[str] | None" = None,
+    fill_strategy: "str | None" = "ffill",
+    fill_columns: "Sequence[str] | None" = None,
+) -> pa.Table:
+    """Forward / backward fill nulls per partition.
+
+    Parameters
+    ----------
+    table
+        Input table. The fill is applied in-place on a copy — the
+        input is returned by identity when ``fill_strategy`` disables
+        the pass.
+    sort_by
+        Column to sort by *within* each partition before filling.
+        When given, the table is first sorted by
+        ``(*partition_by, sort_by)`` so ``ffill`` / ``bfill`` runs on
+        the time-ordered axis. When ``None``, the table is assumed to
+        be in the correct order already (the resample path already
+        emits sorted output).
+    partition_by
+        Columns that bound the fill — nulls don't carry across
+        partition boundaries. Each partition's fill is independent.
+        ``None`` / empty runs a flat global fill.
+    fill_strategy
+        ``"ffill"`` (default) propagates the last non-null value
+        forward into subsequent nulls; ``"bfill"`` propagates the
+        next non-null value backward. ``None`` / ``"none"`` / ``""``
+        is a no-op (returns the input by identity).
+    fill_columns
+        Restrict the fill to these columns. ``None`` runs the fill on
+        every non-partition / non-sort column. Nested types
+        (struct / list / map) are always skipped — pyarrow's
+        ``fill_null_forward`` kernel doesn't accept them.
+
+    Returns
+    -------
+    pa.Table
+        The filled table. The input is returned unchanged when the
+        strategy disables the pass, the table is empty, or no
+        fillable column remains after filtering.
+    """
+    strategy = _normalize_fill_strategy(fill_strategy)
+    if strategy in {"none", ""}:
+        return table
+    if table.num_rows == 0:
+        return table
+
+    part_cols = list(partition_by or ())
+    skip = set(part_cols)
+    if sort_by is not None:
+        skip.add(sort_by)
+
+    if fill_columns is None:
+        candidates = [c for c in table.schema.names if c not in skip]
+    else:
+        candidates = [c for c in fill_columns if c in table.schema.names and c not in skip]
+
+    # Drop nested types up front — ``pc.fill_null_forward`` rejects
+    # struct / list / map / union arrays. Filling those is ill-defined
+    # anyway (would a null inside a list element get filled? from
+    # where?), and the caller wants graceful degradation, not a
+    # surprise crash on a wide schema with one struct column.
+    fillable = [
+        c for c in candidates
+        if not pa.types.is_nested(table.schema.field(c).type)
+    ]
+    if not fillable:
+        return table
+
+    if sort_by is not None and sort_by in table.schema.names:
+        sort_keys = [(c, "ascending") for c in (part_cols + [sort_by])]
+        sort_idx = pc.sort_indices(table, sort_keys=sort_keys)
+        table = table.take(sort_idx)
+
+    partition_id = _partition_ids_for_sorted(table, part_cols)
+
+    fill_fn = pc.fill_null_forward if strategy == "ffill" else pc.fill_null_backward
+
+    for name in fillable:
+        col = table.column(name)
+        if isinstance(col, pa.ChunkedArray):
+            col = col.combine_chunks()
+        # When ``partition_by`` is empty, the whole table is one
+        # partition and the fill_null_forward result is already
+        # correct — skip the partition-leak masking.
+        if not part_cols:
+            filled = fill_fn(col)
+            table = table.set_column(table.schema.get_field_index(name), name, filled)
+            continue
+
+        nonnull_mask = pc.is_valid(col)
+        pid_marker = pc.if_else(
+            nonnull_mask, partition_id, pa.scalar(None, type=pa.int64()),
+        )
+        last_pid = fill_fn(pid_marker)
+        filled = fill_fn(col)
+        # ``last_pid`` is null only when no non-null value exists in
+        # the fill direction within the partition; mark those rows
+        # null. When ``last_pid`` is set, the row's partition_id must
+        # match — otherwise the fill leaked across a boundary.
+        same_partition = pc.equal(last_pid, partition_id)
+        same_partition = pc.fill_null(same_partition, False)
+        final = pc.if_else(
+            same_partition, filled, pa.scalar(None, type=col.type),
+        )
+        table = table.set_column(table.schema.get_field_index(name), name, final)
+    return table
+
+
+def _partition_ids_for_sorted(
+    table: pa.Table, partition_by: "Sequence[str]",
+) -> pa.Array:
+    """Return an int64 partition_id per row.
+
+    Assumes the table is already sorted by ``partition_by`` — rows
+    sharing a partition tuple are contiguous. Computes the running
+    sum of "first row of a new partition" indicators so each unique
+    partition tuple gets a 0-based identifier.
+
+    Pure pyarrow compute (no Python row walk):
+
+    * For each partition column, build a "previous value" view by
+      slicing one element off the head and prepending a null.
+    * The row starts a new partition when *any* column differs from
+      its previous row (treating ``null`` and a non-null as a
+      change, and ``null == null`` as no change so the boundary
+      detection survives nullable partition keys).
+    * Row 0 is unconditionally a partition boundary.
+    * Cumulative sum of the bool mask (cast to int64) gives a 1-based
+      counter; subtracting 1 makes it 0-based.
+    """
+    n = table.num_rows
+    if not partition_by or n == 0:
+        return pa.array(np.zeros(n, dtype=np.int64))
+
+    is_boundary: "pa.Array | None" = None
+    for c in partition_by:
+        col = table.column(c)
+        if isinstance(col, pa.ChunkedArray):
+            col = col.combine_chunks()
+        if n == 1:
+            changed = pa.array([True])
+        else:
+            prev = pa.concat_arrays([pa.nulls(1, type=col.type), col.slice(0, n - 1)])
+            eq = pc.equal(col, prev)
+            both_null = pc.and_(pc.is_null(col), pc.is_null(prev))
+            # ``equal`` returns null when either side is null;
+            # collapse that to False ("not equal") then OR with
+            # both_null so two consecutive nulls count as equal.
+            eq_norm = pc.or_(pc.fill_null(eq, False), both_null)
+            changed = pc.invert(eq_norm)
+        is_boundary = changed if is_boundary is None else pc.or_(is_boundary, changed)
+
+    # Row 0 is always a boundary — overwrite whatever the synthetic
+    # prev-null comparison decided so single-partition tables get a
+    # boundary at index 0 even when row 0's partition values are
+    # themselves null.
+    head_mask = pa.array(np.arange(n) == 0, type=pa.bool_())
+    is_boundary = pc.or_(is_boundary, head_mask)
+
+    pid_one_based = pc.cumulative_sum(pc.cast(is_boundary, pa.int64()))
+    return pc.subtract(pid_one_based, pa.scalar(1, type=pa.int64()))
 
 
 # Timestamp unit → microseconds-per-tick multiplier. Used by
@@ -83,6 +278,7 @@ def resample_arrow_table(
     time_column: str,
     sampling_seconds: int,
     partition_by: "Sequence[str] | None" = None,
+    fill_strategy: "str | None" = "ffill",
 ) -> pa.Table:
     """Align *table* to a fixed sampling grid on *time_column*.
 
@@ -109,6 +305,17 @@ def resample_arrow_table(
     rows collapse into the coarser bucket. Expanding (upsample) a
     coarse source to a finer grid is *not* in scope — gap-filling is
     application-specific and best done explicitly.
+
+    ``fill_strategy`` runs on the resampled output before return —
+    ``"ffill"`` (default) carries the last non-null value forward
+    into subsequent nulls *within the same partition*, ``"bfill"``
+    propagates the next non-null backward, ``None`` / ``"none"``
+    skips the pass. Buckets where the first row had a null column
+    inherit from neighbouring buckets on the same partition's
+    timeline; bucket "0" of a partition that has no prior non-null
+    in that column stays null (no cross-partition leak). The fill
+    sorts the resampled output by ``(*partition_by, time_column)``
+    so the result is canonically ordered on return.
 
     Short-circuits in three cases (returns input by identity):
 
@@ -195,10 +402,19 @@ def resample_arrow_table(
         else:
             bucket_native = pc.cast(bucket_keep, ts_type)
 
-    return selected.set_column(
+    resampled = selected.set_column(
         selected.schema.get_field_index(time_column),
         time_column,
         bucket_native,
+    )
+
+    if _normalize_fill_strategy(fill_strategy) in {"none", ""}:
+        return resampled
+    return fill_arrow_table(
+        resampled,
+        sort_by=time_column,
+        partition_by=part_cols or None,
+        fill_strategy=fill_strategy,
     )
 
 
@@ -208,6 +424,7 @@ def resample_arrow_batches(
     time_column: str,
     sampling_seconds: int,
     partition_by: "Sequence[str] | None" = None,
+    fill_strategy: "str | None" = "ffill",
 ) -> "Iterator[pa.RecordBatch]":
     """Iterator-shaped wrapper around :func:`resample_arrow_table`.
 
@@ -242,6 +459,7 @@ def resample_arrow_batches(
         time_column=time_column,
         sampling_seconds=sampling_seconds,
         partition_by=partition_by,
+        fill_strategy=fill_strategy,
     )
     yield from resampled.to_batches()
 

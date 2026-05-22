@@ -380,7 +380,15 @@ class Dataset(Tabular[CastOptions]):
                 schema.to_spark_schema() if schema is not None else None
             )
             return spark.createDataFrame([], schema=spark_schema)
-        return options.cast_spark_tabular(self._frame)
+        # Cast first (schema alignment), then apply the read-time
+        # passes (resample + dedup) natively on the Spark frame so
+        # the read path doesn't have to detour through
+        # ``df.toArrow → arrow.ops → createDataFrame`` to honor
+        # ``unique_by`` / ``time_sample_by``. The fast path runs
+        # entirely inside Spark — ``groupBy + applyInArrow`` for the
+        # partitioned resample, ``row_number() OVER (...)`` for dedup.
+        frame = options.cast_spark_tabular(self._frame)
+        return options.apply_post_read_spark_frame(frame)
 
     def _read_spark_dataset(self, options: CastOptions) -> "Dataset":
         # Source already speaks Spark — skip the
@@ -389,9 +397,13 @@ class Dataset(Tabular[CastOptions]):
         # stable across ``to_spark_dataset()`` round trips, which the
         # ``Dataset``-as-cache pattern relies on.
         target = options.target
-        if target is None:
+        if target is None and not options.unique_by and not options.time_sample_by:
             return self
-        frame = options.cast_spark_tabular(self._frame) if self._frame is not None else None
+        if self._frame is None:
+            frame = None
+        else:
+            frame = options.cast_spark_tabular(self._frame)
+            frame = options.apply_post_read_spark_frame(frame)
         return type(self)(frame=frame, schema=target)
 
     def _write_spark_frame(
