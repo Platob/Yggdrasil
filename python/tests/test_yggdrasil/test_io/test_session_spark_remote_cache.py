@@ -18,9 +18,8 @@ PySpark or Java isn't reachable.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -40,24 +39,16 @@ from pyspark.sql import SparkSession  # noqa: E402
 
 
 @pytest.fixture(scope="module")
-def spark() -> Iterator[SparkSession]:
-    # Bypass PyEnv.spark_session / databricks-connect entirely — those
-    # paths require either a Databricks workspace or the connect SDK.
-    os.environ.setdefault("PYSPARK_PYTHON", "python")
+def spark() -> SparkSession:
+    # Share the global test SparkSession with every other ``SparkTestCase``
+    # in the run — stopping it here would kill the process-wide JVM
+    # ``SparkContext`` and break any spark-touching test that ran after.
+    from yggdrasil.spark.tests import _get_test_spark
+
     try:
-        session = (
-            SparkSession.builder
-            .master("local[2]")
-            .appName("ygg-spark-remote-cache-test")
-            .config("spark.sql.session.timeZone", "UTC")
-            .getOrCreate()
-        )
+        return _get_test_spark(app_name="ygg-spark-remote-cache-test")
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"local SparkSession unavailable: {exc!r}")
-    try:
-        yield session
-    finally:
-        session.stop()
 
 
 @pytest.fixture
