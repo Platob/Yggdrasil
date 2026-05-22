@@ -811,3 +811,38 @@ class TestFromPool:
         assert resp.buffer.to_bytes() == b"binary blob"
 
 
+class TestPoolResponsePyarrowStream:
+    """Regression: ``pa.input_stream`` must accept the urllib3 shim.
+
+    The Databricks warehouse external-link reader feeds a
+    ``preload_content=False`` :class:`yggdrasil.http_._pool.HTTPResponse`
+    straight into :func:`pyarrow.input_stream` so Arrow IPC chunks can
+    stream without buffering the (potentially hundreds of MB) payload.
+    ``pa.input_stream`` rejects anything that isn't an :class:`io.IOBase`
+    subclass with a bare ``TypeError`` — the shim's ``BaseHTTPResponse``
+    must therefore inherit from :class:`io.IOBase` and implement the
+    minimum protocol (``readable() == True``).
+    """
+
+    def test_pa_input_stream_accepts_pool_response(self) -> None:
+        import io
+        import pyarrow as pa
+        import pyarrow.ipc as pipc
+        from yggdrasil.http_._pool import HTTPResponse
+
+        buf = io.BytesIO()
+        schema = pa.schema([("a", pa.int32())])
+        with pipc.new_stream(buf, schema) as w:
+            w.write_batch(pa.record_batch([[1, 2, 3]], schema=schema))
+        buf.seek(0)
+        resp = HTTPResponse(body=buf, preload_content=False)
+        with pa.input_stream(resp) as src:
+            reader = pipc.open_stream(src)
+            batches = list(reader)
+        assert sum(b.num_rows for b in batches) == 3
+        # ``close()`` chains through to :class:`io.IOBase` so the
+        # ``closed`` flag flips — pyarrow checks this after the stream
+        # ends.
+        assert resp.closed is True
+
+
