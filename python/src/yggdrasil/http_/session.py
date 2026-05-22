@@ -55,6 +55,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfigArg,
 )
 from yggdrasil.data.enums import Codec, Codecs, MediaType, MediaTypes, MimeType, MimeTypes, Mode
+from yggdrasil.exceptions import YGGException
 from yggdrasil.io.authorization.base import Authorization
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
@@ -1045,6 +1046,12 @@ class HTTPSession(Session):
         :meth:`send_many` already produces, so wrapping a single send
         adds no value.
 
+        When ``spark_session`` is bound (or ``True`` / ``...`` resolved
+        via :meth:`PyEnv.spark_session`), the wire send is fanned out
+        to an executor through the same ``mapInArrow`` path
+        :meth:`send_many` uses — the driver does not cross the wire.
+        Otherwise the call runs synchronously on the local pool.
+
         ``start=True`` (default) fires the wire call. ``start=False``
         builds the prepared request + response shell without crossing
         the wire — the :class:`StatementExecutor` override uses the
@@ -1068,6 +1075,22 @@ class HTTPSession(Session):
         )
         if not start:
             return self._build_idle_response(request, cfg)
+        if cfg.spark_session is not None:
+            # Fan the wire send out to an executor via the same
+            # ``mapInArrow`` path :meth:`send_many` uses, so the
+            # network call doesn't silently fall back to the driver
+            # when the caller explicitly bound a ``SparkSession``.
+            # ``_send_many`` already drains the per-chunk Spark frame
+            # row-by-row and re-applies ``raise_error`` at the driver
+            # boundary, so the contract of ``send`` (one Response,
+            # ``raise_for_status`` on failure) is preserved.
+            many_cfg = SendManyConfig.check_arg(cfg)
+            for response in self._send_many(iter([request]), many_cfg):
+                return response
+            raise YGGException(
+                f"Spark send returned no rows for {request.method} {request.url} — "
+                f"this is a bug in the send_many pipeline (one request in, zero out)."
+            )
         return self._send(request, cfg)
 
     def _build_idle_response(
