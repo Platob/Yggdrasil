@@ -37,8 +37,8 @@ the entire wire.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/bench_http_live.py
-    PYTHONPATH=src python benchmarks/io/bench_http_live.py --repeat 3
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_http_live.py
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_http_live.py --repeat 3
 """
 
 from __future__ import annotations
@@ -53,12 +53,12 @@ import time
 from pathlib import Path
 from typing import Callable
 
-# Make ``benchmarks.io._bench_http_server`` importable both when this
-# file is run as a script and when it's imported from another bench.
-# Matches the namespace-package shape ``bench_spark_send.py`` uses.
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_BENCH_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _BENCH_DIR.parent.parent.parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+if str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
 os.environ["PYTHONPATH"] = (
     str(_PROJECT_ROOT)
     + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
@@ -67,7 +67,7 @@ os.environ["PYTHONPATH"] = (
 from yggdrasil.http_ import HTTPSession  # noqa: E402
 from yggdrasil.io.request import PreparedRequest  # noqa: E402
 
-from benchmarks.io._bench_http_server import (  # noqa: E402
+from _bench_http_server import (  # noqa: E402
     start_bench_server as _start_server,
 )
 

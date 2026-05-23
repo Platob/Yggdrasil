@@ -41,8 +41,8 @@ fails to come up.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/bench_spark_send.py
-    PYTHONPATH=src python benchmarks/io/bench_spark_send.py --repeat 5 --n 64
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_spark_send.py
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_spark_send.py --repeat 5 --n 64
 """
 from __future__ import annotations
 
@@ -57,22 +57,26 @@ from typing import Callable, List
 # Spark workers unpickle the broadcast session by importing its
 # ``__module__``. Defining the stub inline in this script puts it under
 # ``__main__``, which workers can't resolve; instead we keep the class
-# in a sibling file (``_bench_stub_session.py``) and expose ``benchmarks``
-# as a namespace package by adding ``python/`` to ``sys.path`` and to
-# ``PYTHONPATH`` so the worker subprocesses inherit it.
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# in a sibling file (``_bench_stub_session.py``). Both ``python/`` and
+# this benchmark directory are added to ``sys.path`` / ``PYTHONPATH`` so
+# worker subprocesses can resolve the import.
+_BENCH_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _BENCH_DIR.parent.parent.parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
-os.environ["PYTHONPATH"] = (
-    str(_PROJECT_ROOT)
-    + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
-)
+if str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
+os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, [
+    str(_PROJECT_ROOT),
+    str(_BENCH_DIR),
+    os.environ.get("PYTHONPATH", ""),
+]))
 
 from yggdrasil.io.request import PreparedRequest  # noqa: E402
 from yggdrasil.io.send_config import SendConfig  # noqa: E402
 from yggdrasil.io.session import Session  # noqa: E402
 
-from benchmarks.io._bench_stub_session import _StubBenchSession  # noqa: E402
+from _bench_stub_session import _StubBenchSession  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

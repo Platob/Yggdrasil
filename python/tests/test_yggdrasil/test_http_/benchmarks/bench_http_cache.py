@@ -31,8 +31,8 @@ remote service.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/bench_http_cache.py
-    PYTHONPATH=src python benchmarks/io/bench_http_cache.py --repeat 7
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_http_cache.py
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_http_cache.py --repeat 7
 """
 from __future__ import annotations
 
