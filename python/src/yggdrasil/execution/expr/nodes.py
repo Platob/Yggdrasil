@@ -628,31 +628,26 @@ class Predicate(Expression):
     ) -> "Iterator[Any]":
         """Streaming filter — yield surviving batches one at a time.
 
-        Decomposition + pyarrow compile happen once outside the loop;
-        per-batch then picks the cheaper engine by row count (see
-        :meth:`_filter` for the threshold rationale). Empty /
+        Decomposition happens once outside the loop. ``InList`` /
+        ``AND(InList)`` shapes route through :func:`_apply_inlist`
+        per-batch (one ``pc.is_in`` kernel per clause); everything
+        else compiles a single ``pa.Expression`` on the first
+        non-empty batch (so a stream of empty batches doesn't pay
+        the compile cost) and reuses it across the stream. Empty /
         fully-dropped batches are skipped so consumers see only
         "non-empty rows that match".
-
-        The target-schema rewrite is lazy: ``_to_inlist_clauses``
-        only matches naked ``InList(Column, …)`` shapes that don't
-        benefit from the rewrite, so when the predicate decomposes
-        into clauses we keep the cheap hashset path and never walk
-        the rewrite. Mixed-shape predicates fall through to a
-        single ``to_arrow`` compile on the first non-empty batch.
         """
-        cutoff = _HASHSET_SHORTCUT_MAX_ROWS
         clauses = _to_inlist_clauses(self)
         effective_arrow: "Any" = None
         for batch in batches:
             if batch.num_rows == 0:
                 continue
-            if clauses is not None and batch.num_rows <= cutoff:
+            if clauses is not None:
                 kept = _apply_inlist(batch, clauses)
             else:
                 if effective_arrow is None:
                     effective = _rewrite_with_target_lookup(
-                        self, _arrow_tz_lookup(batch.schema),
+                        self, _arrow_field_lookup(batch.schema),
                     )
                     effective_arrow = effective.to_arrow()
                 kept = batch.filter(effective_arrow)
@@ -664,31 +659,26 @@ class Predicate(Expression):
 
         ``target`` may be a :class:`pa.RecordBatch` or :class:`pa.Table`
         — both expose ``num_rows`` / ``schema`` / ``column(name)`` /
-        ``slice`` / ``take``, so one method covers both.
+        ``filter`` (mask-shaped), so one method covers both.
 
-        Picks the cheapest backend by row count: the hashset shortcut
-        wins on tiny batches (≤ ``_HASHSET_SHORTCUT_MAX_ROWS`` rows)
-        where pyarrow's per-call compile + scan dominates, the
-        pyarrow C++ filter wins above that because the kernel
-        amortises over the larger row count. Bench numbers on a
-        5 000-row table show the kernel running ~10× faster than the
-        hashset; on a 1-row leaf the hashset runs ~30× faster.
+        Two paths:
 
-        Also runs :func:`_rewrite_with_target_lookup` against the
-        target's schema before the pyarrow kernel sees the predicate
-        — that's how the timezone pushdown fires when the
-        predicate's :class:`Column` carries no bound :class:`Field`
-        but the target Table / RecordBatch does. The rewrite is
-        skipped on the hashset-shortcut path: ``_to_inlist_clauses``
-        only matches naked ``InList(Column, …)`` shapes that the
-        rewrite has nothing to do with, so paying the walk on every
-        cache-lookup batch is pure overhead.
+        * ``InList(Column, …)`` / ``AND(InList, …)`` shapes route
+          through :func:`_apply_inlist` — one ``pc.is_in`` kernel
+          call per clause, then ``and_kleene`` to combine. Skips the
+          ``pa.Expression`` compile that ``target.filter(self.to_arrow())``
+          would pay. Fastest at every batch size for these shapes
+          and bypasses the target-schema rewrite (the rewrites
+          don't touch naked InLists).
+        * Everything else runs :func:`_rewrite_with_target_lookup`
+          first (so the timezone pushdown / literal coercion fire
+          against the target's actual schema) and then the standard
+          ``target.filter(pa.Expression)`` path.
         """
-        if target.num_rows <= _HASHSET_SHORTCUT_MAX_ROWS:
-            clauses = _to_inlist_clauses(self)
-            if clauses is not None:
-                return _apply_inlist(target, clauses)
-        effective = _rewrite_with_target_lookup(self, _arrow_tz_lookup(target.schema))
+        clauses = _to_inlist_clauses(self)
+        if clauses is not None:
+            return _apply_inlist(target, clauses)
+        effective = _rewrite_with_target_lookup(self, _arrow_field_lookup(target.schema))
         return target.filter(effective.to_arrow())
 
     # ------------------------------------------------------------------
@@ -709,7 +699,7 @@ class Predicate(Expression):
         predicate built with a Paris-tz Cast lands with the literal
         already in UTC by the time polars sees the expression.
         """
-        effective = _rewrite_with_target_lookup(self, _polars_tz_lookup(frame.schema))
+        effective = _rewrite_with_target_lookup(self, _polars_field_lookup(frame.schema))
         return frame.filter(effective.to_polars())
 
     def filter_pandas_frame(self, frame: "Any") -> "Any":
@@ -892,7 +882,7 @@ def _try_timezone_pushdown(
     left: "Any",
     op: "CompareOp",
     right: "Any",
-    column_tz_iana: "Callable[[Column], str | None] | None" = None,
+    column_field: "Callable[[Column], Any | None] | None" = None,
 ) -> "Expression | None":
     """Rewrite ``Cast(col_tz_X, ts_tz_Y) op lit_tz_Y`` to native filter.
 
@@ -950,8 +940,13 @@ def _try_timezone_pushdown(
     if not isinstance(cast_target, TimestampType) or cast_target.tz.is_naive():
         return None
     source_tz: "str | None" = None
-    if column_tz_iana is not None:
-        source_tz = column_tz_iana(cast_side.operand)
+    if column_field is not None:
+        field = column_field(cast_side.operand)
+        if field is not None:
+            import pyarrow as pa
+
+            if pa.types.is_timestamp(field.type) and field.type.tz:
+                source_tz = field.type.tz
     if source_tz is None:
         # Fall back to the Column's bound field — the construction-time
         # path (no target schema available) relies on this.
@@ -998,21 +993,31 @@ def _try_timezone_pushdown(
 
 def _rewrite_with_target_lookup(
     expr: "Expression",
-    column_tz_iana: "Callable[[Column], str | None]",
+    column_field: "Callable[[Column], Any | None]",
 ) -> "Expression":
     """Walk *expr* and apply target-schema-aware rewrites.
 
-    Two rewrites fire so the engine never has to do per-row work
-    the literal can absorb at constant cost:
+    ``column_field(column)`` returns a :class:`pyarrow.Field` for the
+    matching column in the target (or ``None`` if absent). The field
+    carries both the Arrow type (used for literal coercion + tz
+    pushdown) and ``nullable`` (used for null-skip preemption).
+
+    Rewrites fired per :class:`Comparison`, in order:
 
     1. **Cast-of-Column tz pushdown** —
        ``Cast(col_X, ts_tz_Y) op lit_Y`` with target column X in
-       tz_Z: convert the literal to tz_Z and drop the cast wrap.
+       tz_Z: convert the literal to tz_Z and drop the Cast wrap.
     2. **Bare-column tz pushdown** — ``Column op tz_aware_lit``
-       where the literal's tz differs from the target column's tz:
-       convert the literal to the column's tz. The predicate's
-       :attr:`Column.field` is ignored — the target schema is the
-       authoritative source.
+       where the literal's tz differs from the target column's tz.
+       Polars in particular refuses to compare two tz-aware
+       Datetime columns with different time zones, so this is the
+       difference between a working filter and a ``SchemaError``.
+    3. **Literal coercion** — ``Column op Literal(value)`` where
+       ``value``'s Python type doesn't match the target column's
+       Arrow type and ``pa.scalar(value).cast(target_type,
+       safe=True)`` succeeds: replace the literal with the cast
+       result. Covers string→int, int→string, naive date→timestamp
+       and any other lossless conversion ``pyarrow`` knows about.
 
     Returns *expr* unchanged when no rewrite triggers, so callers
     can use identity (``new is expr``) to skip downstream
@@ -1020,15 +1025,20 @@ def _rewrite_with_target_lookup(
     target" path.
     """
     if isinstance(expr, Comparison):
-        new_left = _rewrite_with_target_lookup(expr.left, column_tz_iana)
-        new_right = _rewrite_with_target_lookup(expr.right, column_tz_iana)
+        new_left = _rewrite_with_target_lookup(expr.left, column_field)
+        new_right = _rewrite_with_target_lookup(expr.right, column_field)
         rewrite = _try_timezone_pushdown(
-            new_left, expr.op, new_right, column_tz_iana=column_tz_iana,
+            new_left, expr.op, new_right, column_field=column_field,
         )
         if rewrite is not None:
             return rewrite
         rewrite = _try_bare_tz_rewrite(
-            new_left, expr.op, new_right, column_tz_iana,
+            new_left, expr.op, new_right, column_field,
+        )
+        if rewrite is not None:
+            return rewrite
+        rewrite = _try_literal_coercion(
+            new_left, expr.op, new_right, column_field,
         )
         if rewrite is not None:
             return rewrite
@@ -1037,21 +1047,21 @@ def _rewrite_with_target_lookup(
         return Comparison(new_left, expr.op, new_right)
     if isinstance(expr, Logical):
         new_ops = tuple(
-            _rewrite_with_target_lookup(o, column_tz_iana)
+            _rewrite_with_target_lookup(o, column_field)
             for o in expr.operands
         )
         if all(a is b for a, b in zip(new_ops, expr.operands)):
             return expr
         return Logical(expr.op, new_ops)
     if isinstance(expr, Not):
-        new_inner = _rewrite_with_target_lookup(expr.operand, column_tz_iana)
+        new_inner = _rewrite_with_target_lookup(expr.operand, column_field)
         if new_inner is expr.operand:
             return expr
         return Not(new_inner)
     if isinstance(expr, Between):
-        new_target = _rewrite_with_target_lookup(expr.target, column_tz_iana)
-        new_low = _rewrite_with_target_lookup(expr.low, column_tz_iana)
-        new_high = _rewrite_with_target_lookup(expr.high, column_tz_iana)
+        new_target = _rewrite_with_target_lookup(expr.target, column_field)
+        new_low = _rewrite_with_target_lookup(expr.low, column_field)
+        new_high = _rewrite_with_target_lookup(expr.high, column_field)
         if (
             new_target is expr.target
             and new_low is expr.low
@@ -1059,6 +1069,16 @@ def _rewrite_with_target_lookup(
         ):
             return expr
         return Between(new_target, new_low, new_high, negated=expr.negated)
+    if isinstance(expr, InList):
+        rewrite = _try_inlist_coercion(expr, column_field)
+        if rewrite is not None:
+            return rewrite
+        return expr
+    if isinstance(expr, IsNull):
+        new_target = _rewrite_with_target_lookup(expr.target, column_field)
+        if new_target is expr.target:
+            return expr
+        return IsNull(new_target, negated=expr.negated)
     return expr
 
 
@@ -1066,7 +1086,7 @@ def _try_bare_tz_rewrite(
     left: "Any",
     op: "CompareOp",
     right: "Any",
-    column_tz_iana: "Callable[[Column], str | None]",
+    column_field: "Callable[[Column], Any | None]",
 ) -> "Expression | None":
     """Rewrite ``Column op tz_aware_literal`` to the target column's tz.
 
@@ -1090,9 +1110,14 @@ def _try_bare_tz_rewrite(
 
     if not isinstance(value, _dt.datetime) or value.tzinfo is None:
         return None
-    target_tz = column_tz_iana(column)
-    if target_tz is None:
+    target_field = column_field(column)
+    if target_field is None:
         return None
+    import pyarrow as pa
+
+    if not pa.types.is_timestamp(target_field.type) or not target_field.type.tz:
+        return None
+    target_tz = target_field.type.tz
     # Already aligned — keep the comparison shape unchanged so the
     # outer walk's identity check can skip the rebuild.
     try:
@@ -1118,40 +1143,181 @@ def _try_bare_tz_rewrite(
     return Comparison(column, op, new_literal)
 
 
-def _arrow_tz_lookup(schema: "Any") -> "Callable[[Column], str | None]":
-    """Return a column → IANA-tz lookup over a :class:`pyarrow.Schema`."""
+def _try_literal_coercion(
+    left: "Any",
+    op: "CompareOp",
+    right: "Any",
+    column_field: "Callable[[Column], Any | None]",
+) -> "Expression | None":
+    """Rewrite ``Column op Literal(value)`` to match the target column's dtype.
+
+    When the literal's Python type doesn't match the target's Arrow
+    type and ``pyarrow.scalar(value).cast(target_type, safe=True)``
+    succeeds, replace the literal with the cast result. ``safe=True``
+    is what keeps the rewrite honest: pyarrow refuses lossy casts
+    (float → int truncation, out-of-range to narrow int, …) and we
+    keep the original predicate on refusal.
+
+    Headline shapes this rewrites:
+
+    * ``col(int_col) == "5"``  → ``col(int_col) == 5``
+    * ``col(str_col) == 5``    → ``col(str_col) == "5"``
+    * ``col(date_col) == "2026-01-01"`` → ``col(date_col) == date(2026,1,1)``
+    * ``col(float_col) == 5``  → ``col(float_col) == 5.0``
+
+    No-op when literal already matches (pyarrow scalar type ==
+    target type) or when the predicate's other side isn't a bare
+    :class:`Column`.
+    """
+    if isinstance(left, Column) and isinstance(right, Literal):
+        column, lit_side, flip = left, right, False
+    elif isinstance(right, Column) and isinstance(left, Literal):
+        column, lit_side, flip = right, left, True
+    else:
+        return None
+    field = column_field(column)
+    if field is None:
+        return None
+    target_type = field.type
+    converted = _safe_cast_literal(lit_side.value, target_type)
+    if converted is None:
+        return None
+    if converted is lit_side.value:
+        # Literal was already the right type — short-circuit so the
+        # outer walk's identity check skips the rebuild.
+        return None
+    new_literal = Literal(value=converted, dtype=lit_side.dtype)
+    if flip:
+        return Comparison(new_literal, op, column)
+    return Comparison(column, op, new_literal)
+
+
+def _try_inlist_coercion(
+    expr: "InList",
+    column_field: "Callable[[Column], Any | None]",
+) -> "InList | None":
+    """Rewrite ``col.is_in([v1, v2, ...])`` to match the target column's dtype.
+
+    Same logic as :func:`_try_literal_coercion` but applied per value
+    in the :class:`InList`. Refuses to rewrite when *any* value fails
+    to safe-cast — half-converted IN lists would change membership
+    semantics depending on row dtype, which is worse than leaving the
+    raw list and letting the engine coerce per row.
+    """
+    if not isinstance(expr.target, Column):
+        return None
+    field = column_field(expr.target)
+    if field is None:
+        return None
+    target_type = field.type
+    new_values: "list[Any]" = []
+    any_changed = False
+    for value in expr.values:
+        converted = _safe_cast_literal(value, target_type)
+        if converted is None:
+            return None
+        if converted is not value:
+            any_changed = True
+        new_values.append(converted)
+    if not any_changed:
+        return None
+    return InList(
+        target=expr.target,
+        values=tuple(new_values),
+        negated=expr.negated,
+        includes_null=expr.includes_null,
+    )
+
+
+def _safe_cast_literal(value: "Any", target_type: "Any") -> "Any | None":
+    """Try to cast *value* into *target_type* losslessly.
+
+    Returns the cast value when pyarrow accepts the conversion under
+    ``safe=True`` (no truncation, no out-of-range), the original
+    *value* unchanged when the value already matches the target type
+    (cheap short-circuit), or ``None`` when the conversion is unsafe
+    / unsupported. The caller treats ``None`` as "keep the original
+    predicate" and a returned value as "rewrite is safe".
+
+    ``None`` (Python ``None``) is never rewritten — its semantics
+    are SQL 3VL and depend on whether the comparison is EQ / IS NULL,
+    so we leave that to the engine and the upstream null-skip rule.
+    """
+    if value is None:
+        return None
     import pyarrow as pa
 
-    def lookup(column: Column) -> "str | None":
-        try:
-            ftype = schema.field(column.name).type
-        except (KeyError, ValueError):
-            return None
-        if pa.types.is_timestamp(ftype) and ftype.tz:
-            return ftype.tz
+    try:
+        scalar = pa.scalar(value)
+    except (pa.ArrowTypeError, pa.ArrowInvalid, TypeError, ValueError):
         return None
+    if scalar.type == target_type:
+        return value  # identity short-circuit
+    try:
+        cast_scalar = scalar.cast(target_type, safe=True)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+        return None
+    return cast_scalar.as_py()
 
-    return lookup
 
+def _arrow_field_lookup(schema: "Any") -> "Callable[[Column], Any | None]":
+    """Return a column → :class:`pyarrow.Field` lookup over a :class:`pyarrow.Schema`.
 
-def _polars_tz_lookup(schema: "Any") -> "Callable[[Column], str | None]":
-    """Return a column → IANA-tz lookup over a :class:`polars.Schema`.
-
-    Polars's ``Datetime`` dtype carries the tz as a string attribute;
-    we read it through the ``.time_zone`` field. ``schema`` may be a
-    polars Schema mapping (``frame.schema``) where the value is the
-    polars ``DataType`` instance for that column.
+    The Field carries both the Arrow type (used by tz pushdown +
+    literal coercion) and the ``nullable`` flag (reserved for the
+    null-skip preemption when a target column is non-nullable).
     """
 
-    def lookup(column: Column) -> "str | None":
+    def lookup(column: Column) -> "Any | None":
         try:
-            dtype = schema[column.name]
-        except (KeyError, TypeError):
+            return schema.field(column.name)
+        except (KeyError, ValueError):
             return None
-        tz = getattr(dtype, "time_zone", None)
-        return tz if tz else None
 
     return lookup
+
+
+def _polars_field_lookup(schema: "Any") -> "Callable[[Column], Any | None]":
+    """Return a column → :class:`pyarrow.Field` lookup over a :class:`polars.Schema`.
+
+    Maps each polars dtype to its pyarrow equivalent via polars's own
+    ``to_arrow`` machinery — pyarrow is the common currency the
+    rewrite reasoning is written against.
+    """
+    import pyarrow as pa
+    try:
+        import polars as pl
+    except ImportError:
+        # No polars available — empty lookup is the safe fallback.
+        return lambda _column: None
+
+    # Cache a per-schema mapping so the walk doesn't re-translate
+    # the polars dtype on every Column it visits.
+    cache: "dict[str, Any]" = {}
+
+    def lookup(column: Column) -> "Any | None":
+        cached = cache.get(column.name, _MISSING)
+        if cached is not _MISSING:
+            return cached
+        try:
+            pl_dtype = schema[column.name]
+        except (KeyError, TypeError):
+            cache[column.name] = None
+            return None
+        try:
+            arrow_type = pl.DataFrame({column.name: []}, schema={column.name: pl_dtype})\
+                .to_arrow().schema.field(column.name).type
+        except Exception:
+            cache[column.name] = None
+            return None
+        field = pa.field(column.name, arrow_type)
+        cache[column.name] = field
+        return field
+
+    return lookup
+
+
+_MISSING = object()
 
 
 def _try_collapse_or(
@@ -1278,18 +1444,6 @@ def _classify_or_operand(
     return None, (), False
 
 
-# Row count above which :meth:`Predicate._filter` stops using the
-# hashset shortcut and falls through to pyarrow's C++ filter. Tuned
-# from ``benchmarks/io/tabular/bench_predicate.py`` — the hashset
-# wins on tiny per-leaf cache batches (1-row lookups), the kernel
-# wins as soon as the per-call compile + scan overhead amortises
-# over enough rows. 256 is the bottom of the "kernel wins" range
-# across pyarrow 20.x; it lines up with the standard Delta /
-# parquet leaf-batch size so streaming consumers stay on the
-# fast path either way.
-_HASHSET_SHORTCUT_MAX_ROWS = 256
-
-
 def _to_inlist_clauses(
     predicate: "Predicate",
 ) -> "list[tuple[str, frozenset, bool]] | None":
@@ -1360,41 +1514,29 @@ def _apply_inlist(
 ) -> "Any":
     """Apply IN-list clauses to a :class:`pa.RecordBatch` or :class:`pa.Table`.
 
-    Hashset row filter — per clause, materialise the column once,
-    keep indices whose value is in ``value_set`` (plus nulls when
-    ``includes_null``). Identity-returns *target* when every row
-    matches, a zero-row slice when none do. Both Arrow types speak
-    the same ``num_rows`` / ``schema`` / ``column(name).to_pylist``
-    / ``slice`` / ``take`` surface, so the helper is duck-typed.
+    Vectorised via :func:`pyarrow.compute.is_in` — one kernel call
+    per clause, then ``and_kleene`` to combine masks. Faster than a
+    Python ``to_pylist`` loop for everything but single-row batches,
+    and crucially faster than ``target.filter(pa.compute.field(...).isin(...))``
+    across all sizes because we skip the ``pa.Expression`` compile
+    step.
+
+    Both :class:`pa.Table` and :class:`pa.RecordBatch` accept a
+    boolean mask in :meth:`filter`, so the helper is duck-typed.
     """
     import pyarrow as pa
+    import pyarrow.compute as pc
 
-    n = target.num_rows
-    schema_names = target.schema.names
-    surviving: "list[int] | None" = None
-    for column, value_set, includes_null in clauses:
-        if column not in schema_names:
-            # Defer the missing-column verdict to pyarrow so the
-            # caller sees a uniform error rather than a silently-
-            # empty answer.
-            return target.filter(pa.compute.field(column).isin(list(value_set)))
-        col_values = target.column(column).to_pylist()
-        iterator = range(n) if surviving is None else surviving
-        if includes_null:
-            surviving = [
-                i for i in iterator
-                if (v := col_values[i]) is None or v in value_set
-            ]
-        else:
-            surviving = [
-                i for i in iterator
-                if (v := col_values[i]) is not None and v in value_set
-            ]
-        if not surviving:
-            return target.slice(0, 0)
-    if surviving is None or len(surviving) == n:
+    if not clauses:
         return target
-    return target.take(pa.array(surviving, type=pa.int64()))
+    mask: "Any | None" = None
+    for column, value_set, includes_null in clauses:
+        col_arr = target.column(column)
+        m = pc.is_in(col_arr, value_set=pa.array(list(value_set)))
+        if includes_null:
+            m = pc.or_kleene(m, pc.is_null(col_arr))
+        mask = m if mask is None else pc.and_kleene(mask, m)
+    return target.filter(mask)
 
 
 # ---------------------------------------------------------------------------

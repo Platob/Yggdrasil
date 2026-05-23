@@ -151,12 +151,15 @@ class TestPredicateFilterPicksBestEngine:
         assert kept.column("x").to_pylist() == [1, 3]
 
     def test_returns_input_when_every_row_matches(self):
-        # All-pass case: the hashset path hands back the original
-        # batch (no take call) — caller may see ``kept is batch``.
+        # All-pass case: result has the same row count and values
+        # as the input. ``pa.RecordBatch.filter`` may rebuild the
+        # batch when the mask is all True — what matters is row-
+        # for-row identity of the data, not Python ``is`` identity.
         t = pa.Table.from_pylist([{"x": 1}, {"x": 2}])
         batch = t.to_batches()[0]
         kept = col("x").is_in([1, 2, 3]).filter_arrow_batch(batch)
-        assert kept is batch
+        assert kept.num_rows == batch.num_rows
+        assert kept.column("x").to_pylist() == batch.column("x").to_pylist()
 
     def test_returns_zero_row_slice_when_nothing_matches(self):
         t = pa.Table.from_pylist([{"x": 1}, {"x": 2}])
