@@ -473,6 +473,37 @@ class RemotePath(Path):
             )
         super()._release()
 
+    def truncate(self, n: int) -> int:
+        """Page-buffered truncate avoids the network round trip.
+
+        The base ``Path.truncate`` downloads the file, truncates in
+        memory, and re-uploads — two network calls for what is usually
+        a ``truncate(0)`` before an overwrite. When page buffering is
+        active, clear the pages and stamp the new logical size so the
+        subsequent writes + flush produce the correct payload in one
+        upload.
+        """
+        if n < 0:
+            raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        if self._page_size is not None:
+            if self._pages is not None:
+                self._discard_pages_past(n)
+            self._stamp_buffered_size(n)
+            self._touch_stat(size=n)
+            return n
+        return super().truncate(n)
+
+    def _write_all_bytes(self, data: "bytes | bytearray") -> int:
+        """Atomic whole-content write without a preceding truncate.
+
+        The base ``_write_all_bytes`` does ``truncate(0) + write_bytes``
+        which on remote backends costs a full download + re-upload of
+        nothing before the real payload goes out. ``write_mv`` with
+        ``overwrite=True`` at offset 0 achieves the same semantics in
+        one round trip — the atomic blob upload replaces the object.
+        """
+        return self.write_mv(memoryview(data), 0, overwrite=True)
+
     # ------------------------------------------------------------------
     # Page-level helpers
     # ------------------------------------------------------------------
