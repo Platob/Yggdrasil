@@ -1515,21 +1515,28 @@ def _apply_inlist(
 ) -> "Any":
     """Apply IN-list clauses to a :class:`pa.RecordBatch` or :class:`pa.Table`.
 
-    Vectorised via :func:`pyarrow.compute.is_in` — one kernel call
-    per clause, then ``and_kleene`` to combine masks. Faster than a
-    Python ``to_pylist`` loop for everything but single-row batches,
-    and crucially faster than ``target.filter(pa.compute.field(...).isin(...))``
-    across all sizes because we skip the ``pa.Expression`` compile
-    step.
+    Two paths, chosen by row count:
+
+    * **≤ 4 rows** — per-row Python probe. One ``column[i].as_py()``
+      + one ``frozenset`` membership check per clause per row. The
+      constant is tuned so cache-lookup-style 1-row batches pay
+      ~1.5 µs instead of the ~16 µs ``pc.is_in`` kernel dispatch
+      overhead.
+    * **> 4 rows** — vectorised ``pyarrow.compute.is_in`` + ``and_kleene``.
+      One kernel call per clause, no ``pa.Expression`` compile.
+      Faster than ``target.filter(pa.Expression)`` across all sizes.
 
     Both :class:`pa.Table` and :class:`pa.RecordBatch` accept a
     boolean mask in :meth:`filter`, so the helper is duck-typed.
     """
+    if not clauses:
+        return target
+    n = target.num_rows
+    if n <= 4:
+        return _apply_inlist_small(target, clauses, n)
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    if not clauses:
-        return target
     mask: "Any | None" = None
     for column, value_set, includes_null in clauses:
         col_arr = target.column(column)
@@ -1538,6 +1545,38 @@ def _apply_inlist(
             m = pc.or_kleene(m, pc.is_null(col_arr))
         mask = m if mask is None else pc.and_kleene(mask, m)
     return target.filter(mask)
+
+
+def _apply_inlist_small(
+    target: "Any",
+    clauses: "list[tuple[str, frozenset, bool]]",
+    n: int,
+) -> "Any":
+    """Fast path for tiny batches (≤ 4 rows).
+
+    One ``column[i].as_py()`` + ``frozenset`` probe per clause per
+    row. For a 1-row cache-lookup batch this runs in ~1.5 µs — the
+    ``pc.is_in`` kernel dispatch alone costs ~16 µs.
+    """
+    import pyarrow as pa
+
+    surviving: "list[int] | None" = None
+    for col_name, value_set, includes_null in clauses:
+        col_arr = target.column(col_name)
+        keep: "list[int]" = []
+        for i in (range(n) if surviving is None else surviving):
+            v = col_arr[i].as_py()
+            if v is None:
+                if includes_null:
+                    keep.append(i)
+            elif v in value_set:
+                keep.append(i)
+        surviving = keep
+        if not surviving:
+            return target.slice(0, 0)
+    if surviving is None or len(surviving) == n:
+        return target
+    return target.take(pa.array(surviving, type=pa.int64()))
 
 
 # ---------------------------------------------------------------------------

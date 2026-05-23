@@ -98,23 +98,18 @@ result = sc.execute_python("import pyspark; print(pyspark.__version__)")
 print(result.stdout)
 ```
 
-## Remote execution via `compute.remote`
+## Remote execution via `@databricks_remote_compute`
 
-The preferred high-level entry point for running a Python callable on a Databricks cluster is `DatabricksClient().compute.remote(...)` — it serializes the function and its arguments, ships them to the cluster, and deserializes the return value:
+The preferred high-level entry point for running a Python callable on a Databricks cluster is the `@databricks_remote_compute` decorator — it serializes the function and its arguments, ships them to the cluster, and deserializes the return value:
 
 ```python
-from yggdrasil.databricks import DatabricksClient
+from yggdrasil.databricks.compute.remote import databricks_remote_compute
 
-client = DatabricksClient()
-
+@databricks_remote_compute(cluster_name="etl")
 def heavy_computation(n: int) -> int:
     return sum(range(n))
 
-result = client.compute.remote(
-    heavy_computation,
-    1_000_000,
-    cluster_name="etl",
-)
+result = heavy_computation(1_000_000)
 print(result)   # 499999500000
 ```
 

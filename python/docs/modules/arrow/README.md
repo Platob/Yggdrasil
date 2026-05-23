@@ -5,30 +5,31 @@ Arrow utilities for type inference, schema normalization, and casting. The hard 
 ## One-liner
 
 ```python
-import yggdrasil.arrow as pa   # re-exports pyarrow + adds ygg helpers
+import pyarrow as pa
 
 raw = pa.table({"id": ["1", "2"], "score": ["9.1", "8.7"]})
 ```
 
 ## Infer Arrow fields from Python type hints
 
+Use `Field.from_pytype` to build Arrow-projectable fields from Python annotations:
+
 ```python
-from yggdrasil.arrow import arrow_field_from_hint
-import pyarrow as pa
+from yggdrasil.data import Field
 
 # Primitives
-print(arrow_field_from_hint(int,   name="id"))        # field('id', int64)
-print(arrow_field_from_hint(float, name="score"))     # field('score', double)
-print(arrow_field_from_hint(str,   name="label"))     # field('label', string)
-print(arrow_field_from_hint(bool,  name="active"))    # field('active', bool)
+print(Field.from_pytype("id",     int).to_arrow_field())      # field('id', int64)
+print(Field.from_pytype("score",  float).to_arrow_field())    # field('score', double)
+print(Field.from_pytype("label",  str).to_arrow_field())      # field('label', string)
+print(Field.from_pytype("active", bool).to_arrow_field())     # field('active', bool)
 
 # Optional (nullable)
 from typing import Optional
-print(arrow_field_from_hint(Optional[int], name="ref"))  # field('ref', int64, nullable=True)
+print(Field.from_pytype("ref", Optional[int]).to_arrow_field())  # field('ref', int64, nullable=True)
 
 # Collections
-print(arrow_field_from_hint(list[str],        name="tags"))     # list<string>
-print(arrow_field_from_hint(dict[str, float], name="metrics"))  # map<string, double>
+print(Field.from_pytype("tags",    list[str]).to_arrow_field())        # list<string>
+print(Field.from_pytype("metrics", dict[str, float]).to_arrow_field()) # map<string, double>
 
 # Dataclass → struct
 from dataclasses import dataclass
@@ -38,7 +39,7 @@ class Point:
     x: float
     y: float
 
-print(arrow_field_from_hint(Point, name="location"))
+print(Field.from_pytype("location", Point).to_arrow_field())
 # field('location', struct<x: double, y: double>)
 ```
 

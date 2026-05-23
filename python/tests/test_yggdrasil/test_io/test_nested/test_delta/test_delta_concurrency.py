@@ -218,7 +218,7 @@ class TestConcurrentRetry(DeltaTestCase):
         d._commit_atomic = _flaky  # type: ignore[assignment]
 
         sleeps: list[float] = []
-        import yggdrasil.io.nested.delta.delta_io as _dio
+        import yggdrasil.io.nested.delta.delta_folder as _dio
         orig_sleep = _dio.time.sleep
         _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
         try:
@@ -261,7 +261,7 @@ class TestConcurrentRetry(DeltaTestCase):
         d._commit_atomic = _flaky_twice  # type: ignore[assignment]
 
         sleeps: list[float] = []
-        import yggdrasil.io.nested.delta.delta_io as _dio
+        import yggdrasil.io.nested.delta.delta_folder as _dio
         orig_sleep = _dio.time.sleep
         _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
         try:
@@ -303,7 +303,7 @@ class TestConcurrentRetry(DeltaTestCase):
         d._commit_atomic = _flaky  # type: ignore[assignment]
 
         sleeps: list[float] = []
-        import yggdrasil.io.nested.delta.delta_io as _dio
+        import yggdrasil.io.nested.delta.delta_folder as _dio
         orig_sleep = _dio.time.sleep
         _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
         try:

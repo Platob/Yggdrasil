@@ -11,11 +11,10 @@ pip install ygg
 Add what you need:
 
 ```bash
-pip install "ygg[data]"        # pandas + numpy + sqlglot
-pip install "ygg[bigdata]"     # pyspark + delta-spark
+pip install "ygg[bigdata]"     # pyspark
 pip install "ygg[databricks]"  # databricks-sdk
 pip install "ygg[api]"         # fastapi + uvicorn + pydantic
-pip install "ygg[http]"        # urllib3 + xxhash
+pip install "ygg[http]"        # xxhash
 ```
 
 Editable dev install:
@@ -57,7 +56,7 @@ convert({"id": "7", "amount": "99.50", "paid": "yes"}, Order)
 ## 4. Arrow schema contract
 
 ```python
-import yggdrasil.arrow as pa
+import pyarrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
 from yggdrasil.data.cast.options import CastOptions
 
@@ -71,20 +70,20 @@ out = cast_arrow_tabular(raw, CastOptions(target_field=target, strict_match_name
 
 ## 5. Engine bridges
 
-Use the `lib.py` guards so base installs without an engine still work:
+Use the `lazy_imports` guard so base installs without an engine still work:
 
 ```python
-from yggdrasil.polars.lib import polars
-from yggdrasil.pandas.lib import pandas
+from yggdrasil.lazy_imports import polars
+from yggdrasil.lazy_imports import pandas
 ```
 
 Polars cast:
 
 ```python
-import yggdrasil.arrow as pa
+import pyarrow as pa
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.polars.cast import cast_polars_dataframe
-from yggdrasil.polars.lib import polars
+from yggdrasil.lazy_imports import polars
 
 df = polars.DataFrame({"id": ["1"], "value": ["4.2"]})
 target = pa.schema([pa.field("id", pa.int64()), pa.field("value", pa.float64())])

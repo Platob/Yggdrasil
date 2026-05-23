@@ -20,7 +20,7 @@ without pulling the whole stack:
 - :mod:`yggdrasil.io.nested.delta.checkpoint` — V1 + V2 checkpoint
   writers (single parquet vs manifest+sidecars) and the
   ``_last_checkpoint`` pointer updater.
-- :mod:`yggdrasil.io.nested.delta.delta_io` — :class:`DeltaFolder`, the
+- :mod:`yggdrasil.io.nested.delta.delta_folder` — :class:`DeltaFolder`, the
   :class:`yggdrasil.io.nested.FolderPath` that runs the snapshot and
   surfaces the active files as Arrow batches with predicate /
   partition pruning, deletion-vector masking, and a write path that
@@ -42,7 +42,7 @@ from yggdrasil.io.nested.delta.checkpoint import (
     update_last_checkpoint,
     write_checkpoint,
 )
-from yggdrasil.io.nested.delta.delta_io import (
+from yggdrasil.io.nested.delta.delta_folder import (
     ConcurrentDeltaCommitError,
     DeltaFolder,
     DeltaOptions,

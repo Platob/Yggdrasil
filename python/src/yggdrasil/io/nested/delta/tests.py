@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from yggdrasil.arrow.tests import ArrowTestCase
 
 if TYPE_CHECKING:
-    from yggdrasil.io.nested.delta.delta_io import DeltaFolder
+    from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
 
 
 __all__ = ["DeltaTestCase"]
@@ -33,7 +33,7 @@ class DeltaTestCase(ArrowTestCase):
     require_parquet: ClassVar[bool] = True
 
     def delta_io(self, name: str = "delta") -> "DeltaFolder":
-        from yggdrasil.io.nested.delta.delta_io import DeltaFolder
+        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
 
         sub = self.tmp_path / name
         sub.mkdir(parents=True, exist_ok=True)

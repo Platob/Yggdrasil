@@ -30,13 +30,11 @@ sql = DatabricksClient(host="https://<workspace>", token="<token>").sql
 ```python
 from yggdrasil.databricks import DatabricksClient
 import pyarrow as pa
-from yggdrasil.pandas.lib import pandas as pd
-from yggdrasil.polars.lib import polars as pl
+from yggdrasil.lazy_imports import pandas as pd
+from yggdrasil.lazy_imports import polars as pl
 
 client = DatabricksClient(host="https://<workspace>", token="<token>")
 sql = client.sql
-spark = client.spark_connect()  # Spark Connect session
-
 table_name = "main.default.demo_ingest_all_formats"
 
 # 1) Create a target Delta table (all examples write into this same table)

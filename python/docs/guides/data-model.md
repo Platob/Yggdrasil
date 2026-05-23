@@ -463,7 +463,7 @@ Each engine module registers its converters **on import**:
 Always reach the optional engines via their `lib.py` guard so base installs stay functional:
 
 ```python
-from yggdrasil.polars.lib import polars   # correct
+from yggdrasil.lazy_imports import polars   # correct
 import polars                             # wrong — breaks base installs
 ```
 
@@ -492,7 +492,7 @@ The benchmark is checked-in; quote before/after numbers when changing the regist
 
 ```python
 import dataclasses
-from yggdrasil.io.tabular.spark import Dataset
+from yggdrasil.spark.tabular import Dataset
 from yggdrasil.data import field, schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 

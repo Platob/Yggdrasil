@@ -210,8 +210,8 @@ Don't fork a per-call options object — extend `CastOptions` instead.
 Engine modules register their converters **on import**. Always import via the `lib.py` guard so base installs stay functional.
 
 ```python
-from yggdrasil.polars.lib import polars
-from yggdrasil.pandas.lib import pandas
+from yggdrasil.lazy_imports import polars
+from yggdrasil.lazy_imports import pandas
 ```
 
 | Engine | Cast helpers |

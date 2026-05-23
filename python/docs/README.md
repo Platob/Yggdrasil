@@ -19,11 +19,10 @@ The published site lives at **https://platob.github.io/Yggdrasil/** and is built
 
 ```bash
 pip install ygg
-pip install "ygg[data]"        # pandas + numpy + sqlglot
-pip install "ygg[bigdata]"     # pyspark + delta-spark
+pip install "ygg[bigdata]"     # pyspark
 pip install "ygg[databricks]"  # databricks-sdk
 pip install "ygg[api]"         # fastapi + uvicorn + pydantic
-pip install "ygg[http]"        # urllib3 + xxhash
+pip install "ygg[http]"        # xxhash
 ```
 
 ## 2. Cast a scalar
@@ -54,20 +53,17 @@ convert({"id": "7", "amount": "99.5", "paid": "yes"}, Order)
 ## 4. Infer Arrow schema from Python hints
 
 ```python
-import yggdrasil.arrow as pa
-from yggdrasil.arrow import arrow_field_from_hint
+from yggdrasil.data import Field
 
-pa.schema([
-    arrow_field_from_hint(int,                 name="id"),
-    arrow_field_from_hint(list[str],           name="tags"),
-    arrow_field_from_hint(dict[str, float],    name="metrics"),
-])
+Field.from_pytype("id",      int)
+Field.from_pytype("tags",    list[str])
+Field.from_pytype("metrics", dict[str, float])
 ```
 
 ## 5. Cast tabular Arrow data
 
 ```python
-import yggdrasil.arrow as pa
+import pyarrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
 from yggdrasil.data.cast.options import CastOptions
 
@@ -82,10 +78,10 @@ out = cast_arrow_tabular(raw, CastOptions(target_field=target, strict_match_name
 ## 6. Engine-specific casting
 
 ```python
-import yggdrasil.arrow as pa
+import pyarrow as pa
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.polars.cast import cast_polars_dataframe
-from yggdrasil.polars.lib import polars
+from yggdrasil.lazy_imports import polars
 
 df = polars.DataFrame({"id": ["1"], "value": ["4.2"]})
 target = pa.schema([pa.field("id", pa.int64()), pa.field("value", pa.float64())])

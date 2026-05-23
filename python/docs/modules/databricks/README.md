@@ -128,7 +128,7 @@ with ExecutionContext(cluster=cluster) as ctx:
 | `client.secrets` | Scope/secret CRUD helpers | `client.secrets.create_secret("scope/key", "value")` |
 | `client.iam` | Users/groups in workspace/account scope | `client.iam.users.current_user` |
 | `client.genie` | Conversational BI workflows | `client.genie.ask("<space-id>", "top customers")` |
-| `client.spark_connect()` | Spark Connect session bootstrapping | `spark = client.spark_connect()` |
+| `client.compute` | Cluster lifecycle / remote execution | `client.compute.clusters.all_purpose_cluster(name="etl")` |
 
 ---
 

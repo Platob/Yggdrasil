@@ -48,7 +48,7 @@ Source: [`python/src/yggdrasil/data/cast/options.py`](https://github.com/Platob/
 `CastOptions` is the **single normalized options carrier**. It threads through every cast helper and holds source hints, target field/schema, safety/memory/nullability behavior, and strictness flags.
 
 ```python
-import yggdrasil.arrow as pa
+import pyarrow as pa
 from yggdrasil.data.cast.options import CastOptions
 
 opts = CastOptions(
@@ -83,13 +83,13 @@ Only drop down to `polars` / `pandas` / `pyspark` / `pyarrow` when you actually 
 Subsystems that depend on optional packages expose a `lib.py` guard that does the import once and raises a helpful "install extra X" error on failure.
 
 ```python
-from yggdrasil.polars.lib import polars   # correct
-import polars                             # wrong — breaks base installs
+from yggdrasil.lazy_imports import polars   # correct
+import polars                               # wrong — breaks base installs
 ```
 
-Same applies to `yggdrasil.pandas.lib`, `yggdrasil.spark.lib`, and Databricks-related modules.
+Same applies to pandas, spark, and Databricks-related modules — always import via `yggdrasil.lazy_imports`.
 
-The only **hard** runtime deps are `pyarrow>=20` and `polars>=1.3`. Base installs must keep working without anything else.
+The only **hard** runtime deps are `pyarrow>=20`, `polars>=1.3`, `xxhash`, and `orjson>=3.10`. Base installs must keep working without anything else.
 
 ## Schema intent across boundaries
 

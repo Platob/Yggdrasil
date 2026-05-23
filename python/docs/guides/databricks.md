@@ -24,7 +24,7 @@ c = DatabricksClient(host="https://<workspace>", token="<token>")
 | `c.secrets` | Scope/secret CRUD | `c.secrets.create_secret("scope/key", "value")` |
 | `c.iam` | Users/groups (workspace or account) | `c.iam.users.current_user` |
 | `c.genie` | Conversational analytics | `c.genie.ask("<space-id>", "weekly revenue")` |
-| `c.spark_connect()` | Spark Connect session | `spark = c.spark_connect()` |
+| `c.compute` | Cluster lifecycle / runtime selection | `c.compute.clusters.all_purpose_cluster(name="etl")` |
 
 ## Authentication
 
@@ -57,12 +57,11 @@ stmt.to_pylist()
 ```python
 import pyarrow as pa
 from yggdrasil.databricks import DatabricksClient
-from yggdrasil.pandas.lib import pandas as pd
-from yggdrasil.polars.lib import polars as pl
+from yggdrasil.lazy_imports import pandas as pd
+from yggdrasil.lazy_imports import polars as pl
 
 c = DatabricksClient(host="https://<workspace>", token="<token>")
 sql = c.sql
-spark = c.spark_connect()
 
 table = "main.default.demo_ingest"
 

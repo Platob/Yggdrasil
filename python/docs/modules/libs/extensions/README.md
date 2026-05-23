@@ -5,15 +5,16 @@ Engine modules expose Arrow↔engine conversion helpers in their `cast.py` modul
 ## Polars examples
 
 ```python
-import yggdrasil.arrow as pa
-from yggdrasil.polars.cast import (
-    arrow_table_to_polars_dataframe,
-    polars_dataframe_to_arrow_table,
-)
-from yggdrasil.polars.lib import polars
+import pyarrow as pa
+import polars as pl
+from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
 
 arrow_table = pa.table({"id": [1, 2]})
-pl_df = arrow_table_to_polars_dataframe(arrow_table)
+
+# Arrow → Polars (use polars directly)
+pl_df = pl.from_arrow(arrow_table)
+
+# Polars → Arrow
 roundtrip = polars_dataframe_to_arrow_table(pl_df)
 ```
 
