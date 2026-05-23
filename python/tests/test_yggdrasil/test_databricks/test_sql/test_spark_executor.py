@@ -26,9 +26,10 @@ class TestDatabricksSparkStatementExecutor:
         client.spark.return_value = sentinel
 
         executor = DatabricksSparkStatementExecutor(client=client)
-        # No PySpark in this environment ⇒ ``getActiveSession()`` import
-        # raises ⇒ the executor falls through to ``client.spark()``.
-        session = executor.resolve_session(create=True)
+        with patch(
+            "pyspark.sql.SparkSession.getActiveSession", return_value=None,
+        ):
+            session = executor.resolve_session(create=True)
 
         assert session is sentinel
         client.spark.assert_called_once_with()
@@ -41,7 +42,10 @@ class TestDatabricksSparkStatementExecutor:
         client = MagicMock(name="client")
         executor = DatabricksSparkStatementExecutor(client=client)
 
-        assert executor.resolve_session(create=False) is None
+        with patch(
+            "pyspark.sql.SparkSession.getActiveSession", return_value=None,
+        ):
+            assert executor.resolve_session(create=False) is None
         client.spark.assert_not_called()
 
     def test_pinned_session_wins_over_client_spark(self) -> None:

@@ -150,7 +150,7 @@ class TestIAMUserParse(_IAMResourceTestCase):
 
     def test_parse_returns_iamuser_unchanged(self) -> None:
         original = IAMUser(service=self.users_service, id="u-1", name="Alice")
-        result = IAMUser.parse(original, service=self.users_service)
+        result = IAMUser.from_(original, service=self.users_service)
         self.assertIs(result, original)
 
     def test_parse_userv1_copies_fields_via_set_details(self) -> None:
@@ -162,7 +162,7 @@ class TestIAMUserParse(_IAMResourceTestCase):
             active=True,
             emails=[ComplexValue(value="alice@example.com")],
         )
-        user = IAMUser.parse(
+        user = IAMUser.from_(
             sdk_user,
             service=self.users_service,
             client_type=ClientType.WORKSPACE,
@@ -179,7 +179,7 @@ class TestIAMUserParse(_IAMResourceTestCase):
         # ``UserV1.active is None`` is interpreted as active (the SCIM
         # default) — anything else would silently disable real users.
         sdk_user = UserV1(id="u-1", display_name="X", user_name="x@x.com", active=None)
-        user = IAMUser.parse(sdk_user, service=self.users_service)
+        user = IAMUser.from_(sdk_user, service=self.users_service)
         self.assertTrue(user.active)
 
     def test_parse_userv2_maps_internal_id_and_username(self) -> None:
@@ -188,7 +188,7 @@ class TestIAMUserParse(_IAMResourceTestCase):
             username="bob@example.com",
             external_id="ext-2",
         )
-        user = IAMUser.parse(sdk_user, service=self.users_service)
+        user = IAMUser.from_(sdk_user, service=self.users_service)
         self.assertEqual(user.id, "u-2")
         # v2 has no display_name → name is cleared.
         self.assertIsNone(user.name)
@@ -198,13 +198,13 @@ class TestIAMUserParse(_IAMResourceTestCase):
 
     def test_parse_userv2_non_email_username_clears_emails(self) -> None:
         sdk_user = UserV2(internal_id="u-2", username="bob")
-        user = IAMUser.parse(sdk_user, service=self.users_service)
+        user = IAMUser.from_(sdk_user, service=self.users_service)
         self.assertEqual(user.username, "bob")
         self.assertIsNone(user.emails)
 
     def test_parse_complex_value_uses_display_as_name_and_username(self) -> None:
         cv = ComplexValue(value="u-3", display="alice@example.com", ref="Users/u-3")
-        user = IAMUser.parse(cv, service=self.users_service)
+        user = IAMUser.from_(cv, service=self.users_service)
         self.assertEqual(user.id, "u-3")
         self.assertEqual(user.name, "alice@example.com")
         self.assertEqual(user.username, "alice@example.com")
@@ -212,11 +212,11 @@ class TestIAMUserParse(_IAMResourceTestCase):
 
     def test_parse_complex_value_non_email_display_clears_emails(self) -> None:
         cv = ComplexValue(value="u-3", display="alice")
-        user = IAMUser.parse(cv, service=self.users_service)
+        user = IAMUser.from_(cv, service=self.users_service)
         self.assertIsNone(user.emails)
 
     def test_parse_mapping_uses_v1_fields(self) -> None:
-        user = IAMUser.parse(
+        user = IAMUser.from_(
             {
                 "id": "u-1",
                 "display_name": "Alice",
@@ -232,7 +232,7 @@ class TestIAMUserParse(_IAMResourceTestCase):
         self.assertEqual(user.external_id, "ext-1")
 
     def test_parse_mapping_uses_v2_fields(self) -> None:
-        user = IAMUser.parse(
+        user = IAMUser.from_(
             {"internal_id": "u-2", "username": "bob@example.com"},
             service=self.users_service,
         )
@@ -240,7 +240,7 @@ class TestIAMUserParse(_IAMResourceTestCase):
         self.assertEqual(user.username, "bob@example.com")
 
     def test_parse_mapping_uses_scim_fields(self) -> None:
-        user = IAMUser.parse(
+        user = IAMUser.from_(
             {"value": "u-3", "display": "Alice"},
             service=self.users_service,
         )
@@ -248,7 +248,7 @@ class TestIAMUserParse(_IAMResourceTestCase):
         self.assertEqual(user.name, "Alice")
 
     def test_parse_mapping_email_promoted_to_emails(self) -> None:
-        user = IAMUser.parse(
+        user = IAMUser.from_(
             {"id": "u-1", "email": "alice@example.com"},
             service=self.users_service,
         )
@@ -256,29 +256,29 @@ class TestIAMUserParse(_IAMResourceTestCase):
         self.assertEqual(user.emails, ["alice@example.com"])
 
     def test_parse_mapping_emails_string_normalized_to_list(self) -> None:
-        user = IAMUser.parse(
+        user = IAMUser.from_(
             {"id": "u-1", "emails": "alice@example.com"},
             service=self.users_service,
         )
         self.assertEqual(user.emails, ["alice@example.com"])
 
     def test_parse_string_email(self) -> None:
-        user = IAMUser.parse("alice@example.com", service=self.users_service)
+        user = IAMUser.from_("alice@example.com", service=self.users_service)
         self.assertEqual(user.username, "alice@example.com")
         self.assertEqual(user.emails, ["alice@example.com"])
 
     def test_parse_string_non_email(self) -> None:
-        user = IAMUser.parse("alice", service=self.users_service)
+        user = IAMUser.from_("alice", service=self.users_service)
         self.assertEqual(user.username, "alice")
         self.assertIsNone(user.emails)
 
     def test_parse_str_empty_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "Value cannot be empty"):
-            IAMUser.parse_str("", service=self.users_service)
+            IAMUser.from_str("", service=self.users_service)
 
     def test_parse_unsupported_type_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unsupported object type"):
-            IAMUser.parse(12345, service=self.users_service)
+            IAMUser.from_(12345, service=self.users_service)
 
 
 # =========================================================================
@@ -464,7 +464,7 @@ class TestIAMGroupParse(_IAMResourceTestCase):
 
     def test_parse_returns_iamgroup_unchanged(self) -> None:
         original = IAMGroup(service=self.groups_service, id="g-1", name="Admins")
-        result = IAMGroup.parse(original, service=self.groups_service)
+        result = IAMGroup.from_(original, service=self.groups_service)
         self.assertIs(result, original)
 
     def test_parse_groupv1_workspace_meta(self) -> None:
@@ -474,7 +474,7 @@ class TestIAMGroupParse(_IAMResourceTestCase):
             external_id="ext-g",
             meta=ResourceMeta(resource_type="WorkspaceGroup"),
         )
-        group = IAMGroup.parse(sdk_group, service=self.groups_service)
+        group = IAMGroup.from_(sdk_group, service=self.groups_service)
         self.assertEqual(group.id, "g-1")
         self.assertEqual(group.name, "Admins")
         self.assertEqual(group.external_id, "ext-g")
@@ -486,7 +486,7 @@ class TestIAMGroupParse(_IAMResourceTestCase):
             display_name="Admins",
             meta=ResourceMeta(resource_type="Group"),
         )
-        group = IAMGroup.parse(sdk_group, service=self.groups_service)
+        group = IAMGroup.from_(sdk_group, service=self.groups_service)
         self.assertEqual(group.client_type, ClientType.ACCOUNT)
 
     def test_parse_groupv1_members_converted_to_iamusers(self) -> None:
@@ -495,7 +495,7 @@ class TestIAMGroupParse(_IAMResourceTestCase):
             display_name="Admins",
             members=[ComplexValue(value="u-1", display="alice@x.com")],
         )
-        group = IAMGroup.parse(sdk_group, service=self.groups_service)
+        group = IAMGroup.from_(sdk_group, service=self.groups_service)
         self.assertEqual(len(group.members), 1)
         self.assertIsInstance(group.members[0], IAMUser)
         self.assertEqual(group.members[0].id, "u-1")
@@ -507,7 +507,7 @@ class TestIAMGroupParse(_IAMResourceTestCase):
             account_id="acct-1",
             external_id="ext-g",
         )
-        group = IAMGroup.parse(sdk_group, service=self.groups_service)
+        group = IAMGroup.from_(sdk_group, service=self.groups_service)
         self.assertEqual(group.id, "g-2")
         self.assertEqual(group.name, "Admins")
         self.assertEqual(group.account_id, "acct-1")
@@ -518,13 +518,13 @@ class TestIAMGroupParse(_IAMResourceTestCase):
 
     def test_parse_complex_value(self) -> None:
         cv = ComplexValue(value="g-3", display="Admins")
-        group = IAMGroup.parse(cv, service=self.groups_service)
+        group = IAMGroup.from_(cv, service=self.groups_service)
         self.assertEqual(group.id, "g-3")
         self.assertEqual(group.name, "Admins")
         self.assertIsNone(group.members)
 
     def test_parse_mapping_uses_scim_and_v1_v2_field_names(self) -> None:
-        group = IAMGroup.parse(
+        group = IAMGroup.from_(
             {
                 "id": "g-1",
                 "display_name": "Admins",
@@ -543,7 +543,7 @@ class TestIAMGroupParse(_IAMResourceTestCase):
         self.assertEqual(group.members[0].name, "Alice")
 
     def test_parse_mapping_empty_members_normalized_to_none(self) -> None:
-        group = IAMGroup.parse(
+        group = IAMGroup.from_(
             {"id": "g-1", "display_name": "Admins", "members": []},
             service=self.groups_service,
         )
@@ -551,7 +551,7 @@ class TestIAMGroupParse(_IAMResourceTestCase):
 
     def test_parse_unsupported_type_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unsupported object type"):
-            IAMGroup.parse(object(), service=self.groups_service)
+            IAMGroup.from_(object(), service=self.groups_service)
 
 
 class TestIAMGroupSetDetails(_IAMResourceTestCase):
