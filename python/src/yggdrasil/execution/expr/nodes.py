@@ -602,18 +602,24 @@ class Predicate(Expression):
     ) -> "Iterator[Any]":
         """Streaming filter — yield surviving batches one at a time.
 
-        Decomposition / pyarrow compile happens once outside the
-        loop; per-batch is then either a hashset probe or a single
-        :meth:`pa.RecordBatch.filter` call. Empty / fully-dropped
-        batches are skipped so consumers see only "non-empty rows
-        that match".
+        Decomposition + pyarrow compile happen once outside the loop;
+        per-batch then picks the cheaper engine by row count (see
+        :meth:`_filter` for the threshold rationale). Empty /
+        fully-dropped batches are skipped so consumers see only
+        "non-empty rows that match".
         """
         clauses = _to_inlist_clauses(self)
-        apply = (
-            (lambda b: _apply_inlist(b, clauses))
-            if clauses is not None
-            else (lambda b, _expr=self.to_arrow(): b.filter(_expr))
-        )
+        expr = self.to_arrow()
+        if clauses is not None:
+            cutoff = _HASHSET_SHORTCUT_MAX_ROWS
+
+            def apply(b: "Any", _c=clauses, _e=expr, _cut=cutoff) -> "Any":
+                if b.num_rows <= _cut:
+                    return _apply_inlist(b, _c)
+                return b.filter(_e)
+        else:
+            def apply(b: "Any", _e=expr) -> "Any":
+                return b.filter(_e)
         for batch in batches:
             if batch.num_rows == 0:
                 continue
@@ -627,10 +633,19 @@ class Predicate(Expression):
         ``target`` may be a :class:`pa.RecordBatch` or :class:`pa.Table`
         — both expose ``num_rows`` / ``schema`` / ``column(name)`` /
         ``slice`` / ``take``, so one method covers both.
+
+        Picks the cheapest backend by row count: the hashset shortcut
+        wins on tiny batches (≤ ``_HASHSET_SHORTCUT_MAX_ROWS`` rows)
+        where pyarrow's per-call compile + scan dominates, the
+        pyarrow C++ filter wins above that because the kernel
+        amortises over the larger row count. Bench numbers on a
+        5 000-row table show the kernel running ~10× faster than the
+        hashset; on a 1-row leaf the hashset runs ~30× faster.
         """
-        clauses = _to_inlist_clauses(self)
-        if clauses is not None:
-            return _apply_inlist(target, clauses)
+        if target.num_rows <= _HASHSET_SHORTCUT_MAX_ROWS:
+            clauses = _to_inlist_clauses(self)
+            if clauses is not None:
+                return _apply_inlist(target, clauses)
         return target.filter(self.to_arrow())
 
     # ------------------------------------------------------------------
@@ -650,17 +665,23 @@ class Predicate(Expression):
         return frame.filter(self.to_polars())
 
     def filter_pandas_frame(self, frame: "Any") -> "Any":
-        """Filter a :class:`pandas.DataFrame` row-wise.
+        """Filter a :class:`pandas.DataFrame` via the pyarrow kernel.
 
-        Compiles the predicate to a Python callable and applies it to
-        each row's ``to_dict()`` view — pandas has no first-class
-        predicate kernel so this is the canonical entry point.
+        Pandas has no first-class predicate kernel and ``df.apply``
+        row-wise costs ~20 ms / 5 k rows (the slowest path in
+        ``bench_predicate.py``). Round-trip through Arrow instead:
+        ``pa.Table.from_pandas`` → :meth:`filter_arrow_table` (which
+        already auto-tunes between the hashset shortcut and the
+        pyarrow filter kernel) → ``Table.to_pandas`` — the zero-copy
+        legs land at sub-millisecond range on the same fixture, and
+        downstream behaves identically (same row order, same dtype
+        per column) to the original frame.
         """
-        from .backends.python import to_python
+        import pyarrow as pa
 
-        fn = to_python(self)
-        mask = frame.apply(lambda row: bool(fn(row)), axis=1)
-        return frame[mask]
+        table = pa.Table.from_pandas(frame, preserve_index=True)
+        filtered = self.filter_arrow_table(table)
+        return filtered.to_pandas()
 
     def filter_spark_frame(self, frame: "Any") -> "Any":
         """Filter a :class:`pyspark.sql.DataFrame`."""
@@ -670,7 +691,18 @@ class Predicate(Expression):
         self, rows: "Iterable[Any]",
     ) -> "list[Any]":
         """Filter a list / iterable of ``Mapping`` rows (the
-        :meth:`Tabular.read_pylist` shape)."""
+        :meth:`Tabular.read_pylist` shape).
+
+        Uses the same ``InList`` / ``AND(InList, ...)`` hashset
+        shortcut as the arrow filter: when the predicate decomposes
+        into ``(col, value_set, includes_null)`` clauses, each row
+        becomes a dict-lookup + set-probe instead of compiling the
+        full AST to a callable. Speeds up the cache-key lookup
+        shape by ~2× on bench-sized inputs.
+        """
+        clauses = _to_inlist_clauses(self)
+        if clauses is not None:
+            return _apply_inlist_pylist(rows, clauses)
         from .backends.python import to_python
 
         fn = to_python(self)
@@ -702,7 +734,40 @@ class Predicate(Expression):
         rows (``Mapping[str, Any]``); pass ``key=`` to project the
         comparison target (e.g. ``key=attrgetter('payload')``) when
         the predicate columns address a sub-shape of each item.
-        Yields each item the predicate accepts."""
+        Yields each item the predicate accepts.
+
+        Uses the same hashset shortcut as :meth:`filter_pylist` when
+        the predicate decomposes into ``InList`` clauses — same
+        speedup, just lazy (yields one at a time) instead of
+        materialising into a list.
+        """
+        clauses = _to_inlist_clauses(self)
+        if clauses is not None:
+            cols = [c for c, _, _ in clauses]
+            sets = [s for _, s, _ in clauses]
+            nulls = [n for _, _, n in clauses]
+            n = len(clauses)
+
+            def _probe(row: "Any", _c=cols, _s=sets, _nl=nulls, _n=n) -> bool:
+                for i in range(_n):
+                    value = row.get(_c[i])
+                    if value is None:
+                        if not _nl[i]:
+                            return False
+                    elif value not in _s[i]:
+                        return False
+                return True
+
+            if key is None:
+                for item in items:
+                    if _probe(item):
+                        yield item
+                return
+            for item in items:
+                if _probe(key(item)):
+                    yield item
+            return
+
         from .backends.python import to_python
 
         fn = to_python(self)
@@ -755,6 +820,18 @@ class Predicate(Expression):
         return self.filter_iterable(target)
 
 
+# Row count above which :meth:`Predicate._filter` stops using the
+# hashset shortcut and falls through to pyarrow's C++ filter. Tuned
+# from ``benchmarks/io/tabular/bench_predicate.py`` — the hashset
+# wins on tiny per-leaf cache batches (1-row lookups), the kernel
+# wins as soon as the per-call compile + scan overhead amortises
+# over enough rows. 256 is the bottom of the "kernel wins" range
+# across pyarrow 20.x; it lines up with the standard Delta /
+# parquet leaf-batch size so streaming consumers stay on the
+# fast path either way.
+_HASHSET_SHORTCUT_MAX_ROWS = 256
+
+
 def _to_inlist_clauses(
     predicate: "Predicate",
 ) -> "list[tuple[str, frozenset, bool]] | None":
@@ -782,6 +859,41 @@ def _to_inlist_clauses(
             out.extend(sub)
         return out
     return None
+
+
+def _apply_inlist_pylist(
+    rows: "Iterable[Any]",
+    clauses: "list[tuple[str, frozenset, bool]]",
+) -> "list[Any]":
+    """Apply IN-list clauses to a stream of ``Mapping`` rows.
+
+    Per row, every clause is one ``dict.get`` + one ``frozenset``
+    membership check (or a null guard for ``includes_null=True``);
+    skips compiling the full AST to a callable, so dispatch +
+    closure overhead drops on tight ingest loops. Returns a list
+    in input order so the caller can index / slice it.
+    """
+    out: "list[Any]" = []
+    # Hoist clause tuples into parallel arrays so the per-row hot
+    # loop avoids unpacking three values N times.
+    cols = [c for c, _, _ in clauses]
+    sets = [s for _, s, _ in clauses]
+    nulls = [n for _, _, n in clauses]
+    n = len(clauses)
+    for row in rows:
+        keep = True
+        for i in range(n):
+            value = row.get(cols[i])
+            if value is None:
+                if not nulls[i]:
+                    keep = False
+                    break
+            elif value not in sets[i]:
+                keep = False
+                break
+        if keep:
+            out.append(row)
+    return out
 
 
 def _apply_inlist(
@@ -913,14 +1025,30 @@ class Logical(Predicate):
         # leaning regardless of how Python's left-associative ``|`` /
         # ``&`` built it. ``(a | b) | c`` and ``a | (b | c)`` both
         # land as ``Logical(OR, (a, b, c))``.
+        #
+        # Skip the rebuild when the operands are already canonical:
+        # the common case (every operand is a non-Logical leaf, plus
+        # the caller already handed us a tuple) costs one ``any(...)``
+        # pass and a type check. Reach for the full flatten + tuple
+        # rebuild only when there's an actual same-op child to inline.
         op = self.op
-        flat: "list[Expression]" = []
-        for operand in self.operands:
+        operands = self.operands
+        if not isinstance(operands, tuple):
+            operands = tuple(operands)
+            object.__setattr__(self, "operands", operands)
+        needs_flatten = False
+        for operand in operands:
             if isinstance(operand, Logical) and operand.op is op:
-                flat.extend(operand.operands)
-            else:
-                flat.append(operand)
-        object.__setattr__(self, "operands", tuple(flat))
+                needs_flatten = True
+                break
+        if needs_flatten:
+            flat: "list[Expression]" = []
+            for operand in operands:
+                if isinstance(operand, Logical) and operand.op is op:
+                    flat.extend(operand.operands)
+                else:
+                    flat.append(operand)
+            object.__setattr__(self, "operands", tuple(flat))
         if not self.operands:
             raise ValueError(
                 f"Logical {self.op.value} needs at least one operand."
@@ -969,18 +1097,38 @@ class InList(Predicate):
         # ``in out`` scan so dicts / lists still land deterministically.
         # The latter is O(n²) but only fires when the caller seeded
         # the InList with unhashable types — uncommon in practice.
+        #
+        # The dedup pass also normalises ``values`` into a tuple even
+        # when nothing duplicates, so do the scan with an early
+        # ``len(seen) == len(values)`` exit when the input was
+        # already unique and tuple-shaped — that avoids the
+        # ``tuple(deduped)`` rebuild on the steady-state "InList
+        # built from a deduped set" path.
+        values = self.values
+        is_tuple = isinstance(values, tuple)
         seen: "set[Any]" = set()
-        deduped: "list[Any]" = []
-        for v in self.values:
+        deduped: "list[Any] | None" = None
+        for i, v in enumerate(values):
             try:
                 if v in seen:
+                    if deduped is None:
+                        deduped = list(values[:i])
                     continue
                 seen.add(v)
             except TypeError:
+                # Unhashable — escape to the linear list scan.
+                if deduped is None:
+                    deduped = list(values[:i])
                 if v in deduped:
                     continue
-            deduped.append(v)
-        object.__setattr__(self, "values", tuple(deduped))
+                deduped.append(v)
+                continue
+            if deduped is not None:
+                deduped.append(v)
+        if deduped is not None:
+            object.__setattr__(self, "values", tuple(deduped))
+        elif not is_tuple:
+            object.__setattr__(self, "values", tuple(values))
 
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
