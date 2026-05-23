@@ -78,9 +78,9 @@ Reach for `yggdrasil.data` before raw engine APIs:
 
 Only drop down to `polars` / `pandas` / `pyspark` / `pyarrow` when you actually need something the abstraction doesn't cover. When you do, register the new behavior back into `yggdrasil.data` so the next caller gets it for free.
 
-## Optional dependencies — the `lib.py` pattern
+## Optional dependencies — the `lazy_imports` pattern
 
-Subsystems that depend on optional packages expose a `lib.py` guard that does the import once and raises a helpful "install extra X" error on failure.
+Subsystems that depend on optional packages are imported through `yggdrasil.lazy_imports`, which does the import once and raises a helpful "install extra X" error on failure.
 
 ```python
 from yggdrasil.lazy_imports import polars   # correct

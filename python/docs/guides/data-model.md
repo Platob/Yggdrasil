@@ -456,11 +456,11 @@ Each engine module registers its converters **on import**:
 | Module | Helpers |
 | --- | --- |
 | `yggdrasil.arrow.cast` | `any_to_arrow_table`, `cast_arrow_tabular`, `cast_arrow_record_batch_reader`, `rechunk_arrow_batches` |
-| `yggdrasil.polars.cast` | `cast_polars_dataframe`, `cast_polars_lazyframe`, `arrow_table_to_polars_dataframe`, `polars_dataframe_to_arrow_table` |
+| `yggdrasil.polars.cast` | `cast_polars_dataframe`, `cast_polars_lazyframe`, `polars_dataframe_to_arrow_table` |
 | `yggdrasil.pandas.cast` | `cast_pandas_dataframe` |
 | `yggdrasil.spark.cast` | `cast_spark_dataframe`, `any_to_spark_dataframe`, `spark_dataframe_to_arrow` |
 
-Always reach the optional engines via their `lib.py` guard so base installs stay functional:
+Always reach the optional engines via `yggdrasil.lazy_imports` so base installs stay functional:
 
 ```python
 from yggdrasil.lazy_imports import polars   # correct

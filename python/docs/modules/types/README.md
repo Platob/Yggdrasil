@@ -207,7 +207,7 @@ Don't fork a per-call options object — extend `CastOptions` instead.
 
 ## Engine bridges
 
-Engine modules register their converters **on import**. Always import via the `lib.py` guard so base installs stay functional.
+Engine modules register their converters **on import**. Always import via `yggdrasil.lazy_imports` so base installs stay functional.
 
 ```python
 from yggdrasil.lazy_imports import polars
