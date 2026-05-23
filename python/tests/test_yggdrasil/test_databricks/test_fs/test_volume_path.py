@@ -407,6 +407,101 @@ class TestWrite:
         assert sent.getvalue() == chunk * n_chunks
 
 
+class TestWriteFullBytes:
+
+    def test_single_upload_no_stat_no_truncate(self, workspace, client, service) -> None:
+        p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
+        p.write_full_bytes(b"hello-world")
+
+        workspace.files.upload.assert_called_once()
+        kwargs = workspace.files.upload.call_args.kwargs
+        assert kwargs["file_path"] == "/Volumes/c/s/v/data.bin"
+        assert kwargs["overwrite"] is True
+        sent = kwargs["contents"]
+        assert isinstance(sent, io.BytesIO)
+        assert sent.getvalue() == b"hello-world"
+        workspace.files.get_metadata.assert_not_called()
+        workspace.files.download.assert_not_called()
+
+    def test_stream_input(self, workspace, client, service) -> None:
+        p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
+        stream = io.BytesIO(b"streamed")
+        p.write_full_bytes(stream)
+
+        workspace.files.upload.assert_called_once()
+        workspace.files.get_metadata.assert_not_called()
+
+    def test_memoryview_input(self, workspace, client, service) -> None:
+        p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
+        p.write_full_bytes(memoryview(b"view"))
+
+        sent = workspace.files.upload.call_args.kwargs["contents"]
+        assert isinstance(sent, io.BytesIO)
+        assert sent.getvalue() == b"view"
+
+    def test_parquet_via_write_full_bytes(self, workspace, client, service) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.table({"id": pa.array([1, 2, 3], type=pa.int64())})
+        sink = io.BytesIO()
+        pq.write_table(table, sink)
+        parquet_bytes = sink.getvalue()
+
+        p = VolumePath("/Volumes/c/s/v/out.parquet", service=service)
+        n = p.write_full_bytes(parquet_bytes)
+
+        assert n == len(parquet_bytes)
+        workspace.files.upload.assert_called_once()
+        workspace.files.get_metadata.assert_not_called()
+        workspace.files.download.assert_not_called()
+
+        sent = workspace.files.upload.call_args.kwargs["contents"]
+        assert isinstance(sent, io.BytesIO)
+        roundtrip = pa.BufferReader(sent.getvalue())
+        assert pq.read_table(roundtrip).equals(table)
+
+    def test_auto_creates_parents(self, workspace, client, service) -> None:
+        uploads = [NotFound("does not exist"), None]
+
+        def upload(**_kwargs):
+            r = uploads.pop(0)
+            if isinstance(r, Exception):
+                raise r
+
+        workspace.files.upload.side_effect = upload
+        p = VolumePath("/Volumes/cat/sch/vol/sub/x.parquet", service=service)
+        p.write_full_bytes(b"data")
+
+        workspace.files.create_directory.assert_called_once_with(
+            "/Volumes/cat/sch/vol/sub",
+        )
+        assert workspace.files.upload.call_count == 2
+
+    def test_fewer_sdk_calls_than_write_bytes(self, workspace, client, service) -> None:
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+
+        p1 = VolumePath("/Volumes/c/s/v/a.bin", service=service)
+        p1.write_bytes(b"via-write-bytes")
+        wb_upload_count = workspace.files.upload.call_count
+        wb_meta_count = workspace.files.get_metadata.call_count
+
+        workspace.files.upload.reset_mock()
+        workspace.files.get_metadata.reset_mock()
+        workspace.files.get_metadata.side_effect = NotFound()
+
+        p2 = VolumePath("/Volumes/c/s/v/b.bin", service=service)
+        p2.write_full_bytes(b"via-write-full")
+        wfb_upload_count = workspace.files.upload.call_count
+        wfb_meta_count = workspace.files.get_metadata.call_count
+
+        assert wfb_upload_count == 1
+        assert wfb_meta_count == 0
+        assert wfb_upload_count <= wb_upload_count
+        assert wfb_meta_count < wb_meta_count
+
+
 class TestMutators:
 
     def test_unlink(self, workspace, client, service) -> None:
