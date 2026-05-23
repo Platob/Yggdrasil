@@ -179,12 +179,13 @@ class NDJSONFile(IO[bytes, NDJsonOptions]):
         else:
             action = Mode.OVERWRITE
 
+        _has_existing = self.size_known and self.size > 0
         if action is Mode.IGNORE:
-            if self.size > 0:
+            if _has_existing:
                 return
             action = Mode.OVERWRITE
         elif action is Mode.ERROR_IF_EXISTS:
-            if self.size > 0:
+            if _has_existing:
                 raise FileExistsError(
                     f"{type(self).__name__} buffer is non-empty "
                     f"({self.size} bytes); refusing to overwrite under "
@@ -194,18 +195,15 @@ class NDJSONFile(IO[bytes, NDJsonOptions]):
 
         codec = self._codec()
         match_by = list(options.match_by_keys or ())
-        # Byte-append is only safe for plain APPEND, uncompressed,
-        # without a key-aware merge. Anything else has to do the
-        # full read-modify-rewrite dance.
         is_append_uncompressed = (
             action is Mode.APPEND
-            and self.size > 0
+            and _has_existing
             and codec is None
             and not match_by
         )
         needs_rewrite = (
             action in _MERGE_MODES
-            and self.size > 0
+            and _has_existing
             and not is_append_uncompressed
         )
 
@@ -230,7 +228,7 @@ class NDJSONFile(IO[bytes, NDJsonOptions]):
         # appended batch starts on a fresh line.
         needs_newline_prefix = (
             is_append_uncompressed
-            and self.size > 0
+            and _has_existing
             and self.pread(1, self.size - 1) != b"\n"
         )
 

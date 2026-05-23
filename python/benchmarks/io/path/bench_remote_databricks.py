@@ -34,6 +34,9 @@ from yggdrasil.databricks.fs.dbfs_path import DBFSPath
 from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 from yggdrasil.io.path.remote_path import RemotePath
+from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.primitive.csv_file import CSVFile
+from yggdrasil.io.primitive.ndjson_file import NDJSONFile
 from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
@@ -504,6 +507,50 @@ def scenarios(repeat: int) -> list[dict]:
     )
     out.append({
         "label": "ParquetFile(VolumePath).write_arrow_table — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    _bench_table = pa.table({"id": pa.array(range(100), type=pa.int64())})
+
+    # ArrowIPCFile write → VolumePath
+    service, client, workspace = _stub_databricks_service(payload=b"")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/x.arrow", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    ArrowIPCFile(holder=p, owns_holder=False).write_arrow_table(_bench_table)
+    out.append({
+        "label": "ArrowIPCFile(VolumePath).write_arrow_table — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # CSVFile write → VolumePath
+    service, client, workspace = _stub_databricks_service(payload=b"")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/x.csv", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    CSVFile(holder=p, owns_holder=False).write_arrow_table(_bench_table)
+    out.append({
+        "label": "CSVFile(VolumePath).write_arrow_table — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # NDJSONFile write → VolumePath
+    service, client, workspace = _stub_databricks_service(payload=b"")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/x.ndjson", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    NDJSONFile(holder=p, owns_holder=False).write_arrow_table(_bench_table)
+    out.append({
+        "label": "NDJSONFile(VolumePath).write_arrow_table — SDK calls",
         "best": 0.0, "median": 0.0, "mean": 0.0,
         "calls": _total_sdk_calls(workspace),
     })
