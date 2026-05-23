@@ -290,7 +290,8 @@ class Dataset(Tabular[CastOptions]):
             # a best-effort cache cripple the caller.
             logger.warning(
                 "Caching %r failed; continuing without executor cache",
-                self, exc_info=True,
+                self,
+                exc_info=True,
             )
         return self
 
@@ -326,7 +327,8 @@ class Dataset(Tabular[CastOptions]):
             return self
         if getattr(frame, "is_cached", False):
             logger.debug(
-                "Skipping persist on %r — frame already cached", self,
+                "Skipping persist on %r — frame already cached",
+                self,
             )
             return self
         level = self._resolve_storage_level(storage_level)
@@ -336,7 +338,9 @@ class Dataset(Tabular[CastOptions]):
             return self.cache()
         else:
             logger.debug(
-                "Persisted %r (storage_level=%r)", self, level,
+                "Persisted %r (storage_level=%r)",
+                self,
+                level,
             )
         return self
 
@@ -357,7 +361,8 @@ class Dataset(Tabular[CastOptions]):
             except Exception:
                 logger.debug(
                     "Unpersist on %r failed; dropping local ref anyway",
-                    self, exc_info=True,
+                    self,
+                    exc_info=True,
                 )
         self._frame = None
 
@@ -377,9 +382,7 @@ class Dataset(Tabular[CastOptions]):
         if self._frame is None:
             spark = self._require_spark()
             schema = options.merged
-            spark_schema = (
-                schema.to_spark_schema() if schema is not None else None
-            )
+            spark_schema = schema.to_spark_schema() if schema is not None else None
             return spark.createDataFrame([], schema=spark_schema)
         # Cast first (schema alignment), then apply the read-time
         # passes (resample + dedup) natively on the Spark frame so
@@ -420,7 +423,8 @@ class Dataset(Tabular[CastOptions]):
             return
         if action is Mode.APPEND:
             self.frame = self._frame.unionByName(
-                frame, allowMissingColumns=True,
+                frame,
+                allowMissingColumns=True,
             )
             return
         raise NotImplementedError(
@@ -443,6 +447,7 @@ class Dataset(Tabular[CastOptions]):
         if self._frame is None:
             return
         from yggdrasil.spark.cast import spark_dataframe_to_arrow
+
         arrow_table = spark_dataframe_to_arrow(self._frame)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -556,7 +561,8 @@ class Dataset(Tabular[CastOptions]):
         instance = cls(frame=df, schema=schema)
         logger.debug(
             "Created Spark dataset %r from Spark frame (schema=%r)",
-            instance, schema,
+            instance,
+            schema,
         )
         return instance
 
@@ -584,7 +590,9 @@ class Dataset(Tabular[CastOptions]):
 
         if spark_session is None:
             spark_session = PyEnv.spark_session(
-                create=True, install_spark=False, import_error=True,
+                create=True,
+                install_spark=False,
+                import_error=True,
             )
 
         if schema is None:
@@ -604,7 +612,8 @@ class Dataset(Tabular[CastOptions]):
             instance = cls(frame=df, schema=None)
             logger.info(
                 "Created dynamic Spark dataset %r (rows=%d)",
-                instance, len(rows),
+                instance,
+                len(rows),
             )
             return instance
 
@@ -616,16 +625,96 @@ class Dataset(Tabular[CastOptions]):
         )
         logger.debug(
             "Creating typed Spark dataset from iterable (rows=%d, schema=%r)",
-            table.num_rows, schema,
+            table.num_rows,
+            schema,
         )
         instance = cls(
-            frame=spark_session.createDataFrame(table), schema=schema,
+            frame=spark_session.createDataFrame(table),
+            schema=schema,
         )
         logger.info(
             "Created typed Spark dataset %r (rows=%d)",
-            instance, table.num_rows,
+            instance,
+            table.num_rows,
         )
         return instance
+
+    @classmethod
+    def from_sql(
+        cls,
+        text: str,
+        *,
+        spark_session: Optional["SparkSession"] = None,
+        schema: "Schema | None" = None,
+    ) -> "Dataset":
+        """Execute SQL and wrap the resulting Spark frame as a :class:`Dataset`.
+
+        Resolves a :class:`SparkSession` through the environment when
+        none is passed — in a Databricks context this picks up the
+        active notebook / Connect / Job session automatically.
+        """
+        if spark_session is None:
+            from yggdrasil.environ import PyEnv
+
+            spark_session = PyEnv.spark_session(
+                create=True,
+                install_spark=False,
+                import_error=True,
+            )
+        df = spark_session.sql(text)
+        return cls.from_spark_frame(df, schema=schema)
+
+    @classmethod
+    def from_table(
+        cls,
+        name: str,
+        *,
+        spark_session: Optional["SparkSession"] = None,
+        schema: "Schema | None" = None,
+    ) -> "Dataset":
+        """Read a table by its fully-qualified name (``catalog.schema.table``).
+
+        Thin wrapper around ``spark.table(name)`` that auto-resolves
+        the session from the environment.
+        """
+        if spark_session is None:
+            from yggdrasil.environ import PyEnv
+
+            spark_session = PyEnv.spark_session(
+                create=True,
+                install_spark=False,
+                import_error=True,
+            )
+        df = spark_session.table(name)
+        return cls.from_spark_frame(df, schema=schema)
+
+    def to_table(
+        self,
+        name: str,
+        *,
+        mode: str = "overwrite",
+        format: str = "delta",
+        partition_by: "list[str] | None" = None,
+    ) -> "Dataset":
+        """Write the held frame to a Unity Catalog / Spark table.
+
+        Returns ``self`` so the call can be chained::
+
+            (Dataset.from_sql("SELECT ...")
+             .map(transform)
+             .to_table("main.curated.output"))
+        """
+        if self._frame is None:
+            raise ValueError(
+                "Cannot write an empty Dataset to table %r; "
+                "the underlying frame is None." % name
+            )
+        writer = self._frame.write.format(format).mode(mode)
+        if partition_by:
+            writer = writer.partitionBy(*partition_by)
+        writer.saveAsTable(name)
+        logger.info("Wrote dataset %r to table %r (mode=%s)", self, name, mode)
+        return self
 
     @classmethod
     def parallelize(
@@ -661,18 +750,23 @@ class Dataset(Tabular[CastOptions]):
 
         if spark_session is None:
             spark_session = PyEnv.spark_session(
-                create=True, install_spark=False, import_error=True,
+                create=True,
+                install_spark=False,
+                import_error=True,
             )
 
         installed_modules = cls._ensure_installed_on_session(
-            spark_session, function,
+            spark_session,
+            function,
         )
         dumped = [(dumps(x),) for x in inputs]
         function_pickle = dumps(function)
         logger.debug(
             "Creating Spark dataset via parallelize (inputs=%d, "
             "function=%r, schema=%r)",
-            len(dumped), function, schema,
+            len(dumped),
+            function,
+            schema,
         )
         input_df = spark_session.createDataFrame(
             dumped,
@@ -681,8 +775,12 @@ class Dataset(Tabular[CastOptions]):
         )
 
         if schema is None:
-            def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+
+            def _runner(
+                batches: "Iterator[pa.RecordBatch]",
+            ) -> "Iterator[pa.RecordBatch]":
                 from yggdrasil.pickle.ser import loads
+
                 invoke = build_row_invoker(loads(function_pickle))
                 yield from _emit_pickled(
                     (invoke(obj) for obj in _dynamic_rows(batches)),
@@ -690,17 +788,22 @@ class Dataset(Tabular[CastOptions]):
                 )
 
             result_df = input_df.mapInArrow(
-                _runner, schema=DYNAMIC_SCHEMA.to_spark_schema(),
+                _runner,
+                schema=DYNAMIC_SCHEMA.to_spark_schema(),
             )
             return cls(
-                frame=result_df, schema=None,
+                frame=result_df,
+                schema=None,
                 installed_modules=installed_modules,
             )
 
         schema = _Schema.from_any(schema)
 
-        def _typed_runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+        def _typed_runner(
+            batches: "Iterator[pa.RecordBatch]",
+        ) -> "Iterator[pa.RecordBatch]":
             from yggdrasil.pickle.ser import loads
+
             invoke = build_row_invoker(loads(function_pickle))
 
             def _groups() -> "Iterator[list[Any]]":
@@ -714,10 +817,12 @@ class Dataset(Tabular[CastOptions]):
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = input_df.mapInArrow(
-            _typed_runner, schema=schema.to_spark_schema(),
+            _typed_runner,
+            schema=schema.to_spark_schema(),
         )
         return cls(
-            frame=result_df, schema=schema,
+            frame=result_df,
+            schema=schema,
             installed_modules=installed_modules,
         )
 
@@ -765,14 +870,24 @@ class Dataset(Tabular[CastOptions]):
             if self.is_dynamic:
                 for row in df.toLocalIterator():
                     shape = _Schema.from_(loads(row[PICKLE_COLUMN_NAME]))
-                    merged = shape if merged is None else merged.merge_with(
-                        shape, mode=Mode.APPEND,
+                    merged = (
+                        shape
+                        if merged is None
+                        else merged.merge_with(
+                            shape,
+                            mode=Mode.APPEND,
+                        )
                     )
             else:
                 for row in df.toLocalIterator():
                     shape = _Schema.from_(row.asDict(recursive=True))
-                    merged = shape if merged is None else merged.merge_with(
-                        shape, mode=Mode.APPEND,
+                    merged = (
+                        shape
+                        if merged is None
+                        else merged.merge_with(
+                            shape,
+                            mode=Mode.APPEND,
+                        )
                     )
             if merged is None:
                 raise ValueError("Cannot infer schema from an empty frame.")
@@ -812,7 +927,8 @@ class Dataset(Tabular[CastOptions]):
                 )
 
         schemas_df = self._frame.mapInArrow(
-            _runner, schema=DYNAMIC_SCHEMA.to_spark_schema(),
+            _runner,
+            schema=DYNAMIC_SCHEMA.to_spark_schema(),
         )
 
         merged = None
@@ -862,14 +978,17 @@ class Dataset(Tabular[CastOptions]):
 
         logger.debug(
             "Installing modules on Spark executors %r (modules=%r)",
-            session, sorted(new_modules),
+            session,
+            sorted(new_modules),
         )
         try:
             installed = _install_modules_on_executors(session, new_modules)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
                 "%s: failed to install %s on executors: %s",
-                cls.__name__, sorted(new_modules), exc,
+                cls.__name__,
+                sorted(new_modules),
+                exc,
             )
             return set(cache)
 
@@ -877,14 +996,16 @@ class Dataset(Tabular[CastOptions]):
         if installed:
             logger.info(
                 "Installed modules on Spark executors %r (modules=%r)",
-                session, sorted(installed),
+                session,
+                sorted(installed),
             )
         return set(cache)
 
     def _ensure_installed(self, *functions: "Callable[..., Any]") -> "set[str]":
         """Per-frame wrapper around :meth:`_ensure_installed_on_session`."""
         installed = self._ensure_installed_on_session(
-            self.sparkSession, *functions,
+            self.sparkSession,
+            *functions,
         )
         new = installed - self.installed_modules
         self.installed_modules.update(installed)
@@ -937,24 +1058,32 @@ class Dataset(Tabular[CastOptions]):
         is_dynamic_in = self.is_dynamic
 
         if schema is None:
-            def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+
+            def _runner(
+                batches: "Iterator[pa.RecordBatch]",
+            ) -> "Iterator[pa.RecordBatch]":
                 invoke = build_row_invoker(loads(function_pickle))
                 rows = _dynamic_rows(batches) if is_dynamic_in else _typed_rows(batches)
                 yield from _emit_pickled(
-                    (invoke(row) for row in rows), byte_size=byte_size,
+                    (invoke(row) for row in rows),
+                    byte_size=byte_size,
                 )
 
             result_df = self._frame.mapInArrow(
-                _runner, schema=DYNAMIC_SCHEMA.to_spark_schema(),
+                _runner,
+                schema=DYNAMIC_SCHEMA.to_spark_schema(),
             )
             return type(self)(
-                frame=result_df, schema=None,
+                frame=result_df,
+                schema=None,
                 installed_modules=self.installed_modules,
             )
 
         schema = _Schema.from_any(schema)
 
-        def _typed_runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+        def _typed_runner(
+            batches: "Iterator[pa.RecordBatch]",
+        ) -> "Iterator[pa.RecordBatch]":
             func = loads(function_pickle)
 
             def _groups() -> "Iterator[list[Any]]":
@@ -976,10 +1105,12 @@ class Dataset(Tabular[CastOptions]):
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
-            _typed_runner, schema=schema.to_spark_schema(),
+            _typed_runner,
+            schema=schema.to_spark_schema(),
         )
         return type(self)(
-            frame=result_df, schema=schema,
+            frame=result_df,
+            schema=schema,
             installed_modules=self.installed_modules,
         )
 
@@ -1080,10 +1211,12 @@ class Dataset(Tabular[CastOptions]):
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
-            _runner, schema=schema.to_spark_schema(),
+            _runner,
+            schema=schema.to_spark_schema(),
         )
         return type(self)(
-            frame=result_df, schema=schema,
+            frame=result_df,
+            schema=schema,
             installed_modules=self.installed_modules,
         )
 
@@ -1128,10 +1261,11 @@ class Dataset(Tabular[CastOptions]):
         # callable can't be the legacy row-predicate path.
         if isinstance(predicate, (Expression, str)) or not callable(predicate):
             module = (type(predicate).__module__ or "").split(".", 1)[0]
-            if (
-                isinstance(predicate, (Expression, str))
-                or module in {"pyarrow", "polars", "pyspark"}
-            ):
+            if isinstance(predicate, (Expression, str)) or module in {
+                "pyarrow",
+                "polars",
+                "pyspark",
+            }:
                 return super().filter(predicate)
 
         from yggdrasil.data.schema import Schema as _Schema
@@ -1148,7 +1282,10 @@ class Dataset(Tabular[CastOptions]):
         is_dynamic_in = self.is_dynamic
 
         if is_dynamic_in and schema is None:
-            def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+
+            def _runner(
+                batches: "Iterator[pa.RecordBatch]",
+            ) -> "Iterator[pa.RecordBatch]":
                 pred = loads(predicate_pickle)
                 out: "list[dict[str, bytes]]" = []
                 out_bytes = 0
@@ -1160,7 +1297,8 @@ class Dataset(Tabular[CastOptions]):
                             continue
                         if out and out_bytes + len(ser) > byte_size:
                             yield pa.RecordBatch.from_pylist(
-                                out, schema=_ARROW_DYNAMIC_SCHEMA,
+                                out,
+                                schema=_ARROW_DYNAMIC_SCHEMA,
                             )
                             out = []
                             out_bytes = 0
@@ -1168,25 +1306,27 @@ class Dataset(Tabular[CastOptions]):
                         out_bytes += len(ser)
                 if out:
                     yield pa.RecordBatch.from_pylist(
-                        out, schema=_ARROW_DYNAMIC_SCHEMA,
+                        out,
+                        schema=_ARROW_DYNAMIC_SCHEMA,
                     )
 
             result_df = self._frame.mapInArrow(
-                _runner, schema=DYNAMIC_SCHEMA.to_spark_schema(),
+                _runner,
+                schema=DYNAMIC_SCHEMA.to_spark_schema(),
             )
             return type(self)(
-                frame=result_df, schema=None,
+                frame=result_df,
+                schema=None,
                 installed_modules=self.installed_modules,
             )
 
-        out_schema = (
-            _Schema.from_any(schema) if schema is not None
-            else self.schema
-        )
+        out_schema = _Schema.from_any(schema) if schema is not None else self.schema
         if out_schema is None:
             raise AssertionError("unreachable")
 
-        def _typed_runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+        def _typed_runner(
+            batches: "Iterator[pa.RecordBatch]",
+        ) -> "Iterator[pa.RecordBatch]":
             pred = loads(predicate_pickle)
 
             def _groups() -> "Iterator[list[Any]]":
@@ -1209,10 +1349,12 @@ class Dataset(Tabular[CastOptions]):
             return _typed_cast(_groups(), out_schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
-            _typed_runner, schema=out_schema.to_spark_schema(),
+            _typed_runner,
+            schema=out_schema.to_spark_schema(),
         )
         return type(self)(
-            frame=result_df, schema=out_schema,
+            frame=result_df,
+            schema=out_schema,
             installed_modules=self.installed_modules,
         )
 
@@ -1244,7 +1386,10 @@ class Dataset(Tabular[CastOptions]):
         self._ensure_installed()
 
         if schema is None:
-            def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+
+            def _runner(
+                batches: "Iterator[pa.RecordBatch]",
+            ) -> "Iterator[pa.RecordBatch]":
                 def _items() -> "Iterator[Any]":
                     for batch in batches:
                         col = batch.column(0)
@@ -1254,16 +1399,20 @@ class Dataset(Tabular[CastOptions]):
                 yield from _emit_pickled(_items(), byte_size=byte_size)
 
             result_df = self._frame.mapInArrow(
-                _runner, schema=DYNAMIC_SCHEMA.to_spark_schema(),
+                _runner,
+                schema=DYNAMIC_SCHEMA.to_spark_schema(),
             )
             return type(self)(
-                frame=result_df, schema=None,
+                frame=result_df,
+                schema=None,
                 installed_modules=self.installed_modules,
             )
 
         schema = _Schema.from_any(schema)
 
-        def _typed_runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+        def _typed_runner(
+            batches: "Iterator[pa.RecordBatch]",
+        ) -> "Iterator[pa.RecordBatch]":
             def _groups() -> "Iterator[list[Any]]":
                 for batch in batches:
                     col = batch.column(0)
@@ -1276,10 +1425,12 @@ class Dataset(Tabular[CastOptions]):
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
-            _typed_runner, schema=schema.to_spark_schema(),
+            _typed_runner,
+            schema=schema.to_spark_schema(),
         )
         return type(self)(
-            frame=result_df, schema=schema,
+            frame=result_df,
+            schema=schema,
             installed_modules=self.installed_modules,
         )
 
@@ -1316,15 +1467,19 @@ class Dataset(Tabular[CastOptions]):
             return _typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
-            _runner, schema=schema.to_spark_schema(),
+            _runner,
+            schema=schema.to_spark_schema(),
         )
         return type(self)(
-            frame=result_df, schema=schema,
+            frame=result_df,
+            schema=schema,
             installed_modules=self.installed_modules,
         )
 
     def to_dynamic(
-        self, *, byte_size: int = 128 * 1024 * 1024,
+        self,
+        *,
+        byte_size: int = 128 * 1024 * 1024,
     ) -> "Dataset":
         """Drop typing: re-pickle row-dicts back into a dynamic frame.
 
@@ -1345,10 +1500,12 @@ class Dataset(Tabular[CastOptions]):
             yield from _emit_pickled(_typed_rows(batches), byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
-            _runner, schema=DYNAMIC_SCHEMA.to_spark_schema(),
+            _runner,
+            schema=DYNAMIC_SCHEMA.to_spark_schema(),
         )
         return type(self)(
-            frame=result_df, schema=None,
+            frame=result_df,
+            schema=None,
             installed_modules=self.installed_modules,
         )
 
@@ -1363,10 +1520,7 @@ class Dataset(Tabular[CastOptions]):
         if self._frame is None:
             return []
         if self.is_dynamic:
-            return [
-                loads(row[PICKLE_COLUMN_NAME])
-                for row in self._frame.collect()
-            ]
+            return [loads(row[PICKLE_COLUMN_NAME]) for row in self._frame.collect()]
         return [row.asDict(recursive=True) for row in self._frame.collect()]
 
     def to_local_iterator(self) -> "Iterator[Any]":
@@ -1398,6 +1552,7 @@ class Dataset(Tabular[CastOptions]):
                 options=CastOptions(byte_size=byte_size, safe=False),
             )
         from yggdrasil.spark.cast import spark_dataframe_to_arrow
+
         if target is not None and target is not bound:
             return spark_dataframe_to_arrow(
                 self.cast(target, byte_size=byte_size)._frame,
@@ -1455,7 +1610,9 @@ class Dataset(Tabular[CastOptions]):
                 from yggdrasil.environ import PyEnv
 
                 self._spark = PyEnv.spark_session(
-                    create=True, install_spark=False, import_error=True,
+                    create=True,
+                    install_spark=False,
+                    import_error=True,
                 )
         return self._spark
 
@@ -1465,7 +1622,8 @@ class Dataset(Tabular[CastOptions]):
         return any_to_spark_dataframe(value)
 
     def _resolve_storage_level(
-        self, value: "StorageLevel | str | None",
+        self,
+        value: "StorageLevel | str | None",
     ) -> "StorageLevel | None":
         """Coerce a string / ``StorageLevel`` / ``None`` argument.
 
@@ -1521,13 +1679,17 @@ def _wrap(
         try:
             if out_schema is not None and out_schema.to_spark_schema() != value.schema:
                 from yggdrasil.data.schema import Schema as _Schema
+
                 out_schema = _Schema.from_any(value.schema)
         except Exception:
             from yggdrasil.data.schema import Schema as _Schema
+
             out_schema = _Schema.from_any(value.schema)
         installed = owner.installed_modules if owner is not None else None
         return Dataset(
-            frame=value, schema=out_schema, installed_modules=installed,
+            frame=value,
+            schema=out_schema,
+            installed_modules=installed,
         )
     return value
 
@@ -1556,7 +1718,9 @@ class _ProxiedCallable:
         owner = self._owner
         schema = owner.schema if owner is not None else None
         return _wrap(
-            self._callable(*args, **kwargs), schema=schema, owner=owner,
+            self._callable(*args, **kwargs),
+            schema=schema,
+            owner=owner,
         )
 
     def __repr__(self) -> str:

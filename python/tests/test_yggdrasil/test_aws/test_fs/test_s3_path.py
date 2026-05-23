@@ -6,6 +6,7 @@ boto3 S3 client. The Path implementation must call the boto methods
 through ``self.service.boto_client`` with the right arguments and
 translate responses + errors into the :class:`Holder` contract.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -16,7 +17,6 @@ import pytest
 from yggdrasil.aws.fs.path import S3Path
 from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.io.io_stats import IOKind
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -196,8 +196,8 @@ class TestReadMv:
         client.get_object.return_value = {"Body": _Body(b"abc")}
         # Disable the page buffer so the test asserts the narrow
         # ``Range`` shape the user requested instead of the page-aligned
-        # ``Range`` :class:`RemotePath` issues when buffersize is set.
-        p = S3Path("s3://b/k", service=service, buffersize=None)
+        # ``Range`` :class:`RemotePath` issues when page_size is set.
+        p = S3Path("s3://b/k", service=service, page_size=None)
         out = p.pread(3, 10)
         assert out == b"abc"
         assert client.get_object.call_args.kwargs["Range"] == "bytes=10-12"
@@ -281,6 +281,153 @@ class TestWrite:
         assert body == b""
 
 
+class TestWriteAll:
+
+    def test_single_put_no_stat_no_get(self, client, service) -> None:
+        p = S3Path("s3://b/data.bin", service=service)
+        n = p.write_all(b"hello-world")
+        assert n == 11
+        client.put_object.assert_called_once()
+        kwargs = client.put_object.call_args.kwargs
+        assert kwargs["Bucket"] == "b"
+        assert kwargs["Key"] == "data.bin"
+        assert kwargs["Body"] == b"hello-world"
+        client.head_object.assert_not_called()
+        client.get_object.assert_not_called()
+
+    def test_stream_input(self, client, service) -> None:
+        import io
+
+        p = S3Path("s3://b/data.bin", service=service)
+        p.write_all(io.BytesIO(b"streamed"))
+        assert client.put_object.call_args.kwargs["Body"] == b"streamed"
+        client.head_object.assert_not_called()
+
+    def test_memoryview_input(self, client, service) -> None:
+        p = S3Path("s3://b/data.bin", service=service)
+        p.write_all(memoryview(b"view"))
+        assert client.put_object.call_args.kwargs["Body"] == b"view"
+
+    def test_pyarrow_buffer_input(self, client, service) -> None:
+        import pyarrow as pa
+
+        buf = pa.BufferOutputStream()
+        buf.write(b"arrow-buffer-payload")
+        arrow_buf = buf.getvalue()
+
+        p = S3Path("s3://b/data.bin", service=service)
+        n = p.write_all(arrow_buf)
+        assert n == 20
+        assert client.put_object.call_args.kwargs["Body"] == b"arrow-buffer-payload"
+
+    def test_parquet_roundtrip(self, client, service) -> None:
+        import io
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.table({"id": pa.array([1, 2, 3], type=pa.int64())})
+        sink = io.BytesIO()
+        pq.write_table(table, sink)
+        parquet_bytes = sink.getvalue()
+
+        p = S3Path("s3://b/out.parquet", service=service)
+        n = p.write_all(parquet_bytes)
+
+        assert n == len(parquet_bytes)
+        client.put_object.assert_called_once()
+        client.head_object.assert_not_called()
+        client.get_object.assert_not_called()
+
+        sent = client.put_object.call_args.kwargs["Body"]
+        roundtrip = pa.BufferReader(sent)
+        assert pq.read_table(roundtrip).equals(table)
+
+    def test_seeds_stat_cache(self, client, service) -> None:
+        p = S3Path("s3://b/k", service=service)
+        p.write_all(b"12345")
+        assert p.size == 5
+        client.head_object.assert_not_called()
+
+    def test_fewer_sdk_calls_than_write_bytes(self, client, service) -> None:
+        client.head_object.side_effect = _client_error()
+        client.list_objects_v2.return_value = {"KeyCount": 0}
+
+        p1 = S3Path("s3://b/a.bin", service=service)
+        p1.write_bytes(b"via-write-bytes")
+        wb_put_count = client.put_object.call_count
+        wb_head_count = client.head_object.call_count
+
+        client.put_object.reset_mock()
+        client.head_object.reset_mock()
+        client.head_object.side_effect = _client_error()
+
+        p2 = S3Path("s3://b/b.bin", service=service)
+        p2.write_all(b"via-write-all")
+        wa_put_count = client.put_object.call_count
+        wa_head_count = client.head_object.call_count
+
+        assert wa_put_count == 1
+        assert wa_head_count == 0
+        assert wa_put_count <= wb_put_count
+        assert wa_head_count < wb_head_count
+
+    def test_parquetfile_write_arrow_table_uses_write_all(
+        self,
+        client,
+        service,
+    ) -> None:
+        """ParquetFile(holder=S3Path).write_arrow_table() routes through
+        write_all: 1 put_object, 0 get_object for the write itself."""
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        client.head_object.side_effect = _client_error()
+        client.get_object.side_effect = _client_error()
+        client.list_objects_v2.return_value = {"KeyCount": 0}
+
+        table = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "name": pa.array(["a", "b", "c"]),
+            }
+        )
+
+        p = S3Path("s3://b/out.parquet", service=service)
+        pf = ParquetFile(holder=p, owns_holder=False)
+        pf.write_arrow_table(table)
+
+        assert client.put_object.call_count == 1
+        assert client.get_object.call_count == 0
+
+    def test_parquetfile_write_single_put_object(
+        self,
+        client,
+        service,
+    ) -> None:
+        """write_arrow_table issues exactly 1 put_object.
+
+        Before: _commit_format_payload did seek(0) + truncate(0) +
+        write_bytes — on S3Path that's head_object (size) + get_object
+        (truncate) + put_object (truncate) + put_object (write).
+        After: 1 put_object, 0 get_object.
+        """
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        client.head_object.side_effect = _client_error()
+        client.get_object.side_effect = _client_error()
+        client.list_objects_v2.return_value = {"KeyCount": 0}
+
+        table = pa.table({"x": pa.array([10, 20, 30], type=pa.int32())})
+
+        p = S3Path("s3://b/metrics.parquet", service=service)
+        pf = ParquetFile(holder=p, owns_holder=False)
+        pf.write_arrow_table(table)
+
+        assert client.put_object.call_count == 1
+        assert client.get_object.call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # Listing
 # ---------------------------------------------------------------------------
@@ -289,18 +436,22 @@ class TestWrite:
 class TestListing:
 
     def test_iterdir_mixes_objects_and_prefixes(self, client, service) -> None:
-        pages = [{
-            "Contents": [
-                {"Key": "data/a.parquet", "Size": 100, "LastModified": None},
-                {"Key": "data/b.parquet", "Size": 200, "LastModified": None},
-            ],
-            "CommonPrefixes": [{"Prefix": "data/sub/"}],
-        }]
+        pages = [
+            {
+                "Contents": [
+                    {"Key": "data/a.parquet", "Size": 100, "LastModified": None},
+                    {"Key": "data/b.parquet", "Size": 200, "LastModified": None},
+                ],
+                "CommonPrefixes": [{"Prefix": "data/sub/"}],
+            }
+        ]
         client.get_paginator.return_value = _make_paginator(pages)
         p = S3Path("s3://b/data/", service=service)
         children = list(p.iterdir())
         assert sorted(c.key for c in children) == [
-            "data/a.parquet", "data/b.parquet", "data/sub/",
+            "data/a.parquet",
+            "data/b.parquet",
+            "data/sub/",
         ]
         # Non-recursive listing uses Delimiter='/'.
         client.get_paginator.return_value.paginate.assert_called_once()
@@ -317,12 +468,14 @@ class TestListing:
         assert "Delimiter" not in kwargs
 
     def test_iterdir_filters_zero_byte_placeholders(self, client, service) -> None:
-        pages = [{
-            "Contents": [
-                {"Key": "data/", "Size": 0},
-                {"Key": "data/real.parquet", "Size": 5},
-            ],
-        }]
+        pages = [
+            {
+                "Contents": [
+                    {"Key": "data/", "Size": 0},
+                    {"Key": "data/real.parquet", "Size": 5},
+                ],
+            }
+        ]
         client.get_paginator.return_value = _make_paginator(pages)
         p = S3Path("s3://b/data/", service=service)
         names = [c.key for c in p.iterdir()]
@@ -356,7 +509,9 @@ class TestRemove:
         kwargs = client.delete_objects.call_args.kwargs
         assert kwargs["Bucket"] == "b"
         assert [o["Key"] for o in kwargs["Delete"]["Objects"]] == [
-            "d/x0", "d/x1", "d/x2",
+            "d/x0",
+            "d/x1",
+            "d/x2",
         ]
 
 
@@ -440,6 +595,7 @@ class TestRetryPolicy:
 
         def spy(t: float) -> None:
             recorded.append(t)
+
         return recorded, spy
 
     def test_transient_eventually_succeeds(self, client, sleeps, service) -> None:
@@ -613,4 +769,3 @@ class TestArrowFilesystem:
         p = real_service.path("s3://b/k")
         fs = p.arrow_filesystem()
         assert isinstance(fs, pafs.S3FileSystem)
-

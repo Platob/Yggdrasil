@@ -198,6 +198,102 @@ The only hard runtime dependency of `ygg` is `pyarrow` (`>=20`). Base installs m
 - **Use Unity Catalog model registry**, not workspace-scoped. `mlflow.set_tracking_uri("databricks")` + `mlflow.set_registry_uri("databricks-uc")`; model name is a three-part UC identifier (`<catalog>.<source>.<model>`). UC's alias model (`@champion` / `@challenger`) replaces the deprecated `Staging` / `Production` stages.
 - **No `yggdrasil.databricks.mlops` service yet.** Until a dedicated service ships, training callables go through `mlflow.*` directly + `DatabricksClient.sql / .tables` for the artifact tables, scheduled via `dbc.jobs.create_or_update(...)` + `Job.pytask(train_func, ...)`. The conventions above are the contract a future service will implement.
 
+## Databricks scripting with `Dataset` (SparkTabular)
+
+`Dataset` (`yggdrasil.spark.tabular.Dataset`, aliased as `SparkTabular`) is the canonical surface for distributed scripting on Databricks. It wraps a Spark DataFrame with yggdrasil schema awareness, executor-side module shipping, and a rich transform API (`map`, `apply`, `filter`, `parallelize`, `cast`, `explode`). Prefer `Dataset` over raw `pyspark.sql.DataFrame` manipulation — it handles pickle/Arrow bridging, dependency auto-install on executors, and schema casting transparently.
+
+### Quick-start patterns
+
+```python
+from yggdrasil.databricks import DatabricksClient
+
+dbc = DatabricksClient()
+
+# Read from SQL or table name — auto-detected
+ds = dbc.dataset("SELECT * FROM main.sales.orders")
+ds = dbc.dataset("main.sales.orders")
+
+# Distribute a function over inputs via Spark executors
+results = dbc.parallelize(fetch_data, urls, schema=output_schema)
+
+# Transform chain → write back to Delta
+(dbc.dataset("main.raw.events")
+ .map(transform)
+ .filter(lambda row: row["status"] == "active")
+ .to_table("main.curated.events"))
+
+# Direct Dataset construction (no DatabricksClient needed)
+from yggdrasil.spark.tabular import Dataset
+
+ds = Dataset.from_sql("SELECT 1", spark_session=spark)
+ds = Dataset.from_table("main.sales.orders", spark_session=spark)
+ds = Dataset.from_iterable([{"a": 1}, {"a": 2}], schema=my_schema, spark_session=spark)
+ds = Dataset.parallelize(fn, inputs, schema=output, spark_session=spark)
+ds.to_table("main.out.result", mode="overwrite")
+```
+
+### Key `Dataset` methods
+
+| Method | Purpose |
+| --- | --- |
+| `from_sql(text)` | Execute SQL, wrap result |
+| `from_table(name)` | Read table by fully-qualified name |
+| `from_spark_frame(df, schema)` | Wrap an existing Spark DataFrame |
+| `from_iterable(items, schema)` | Build from Python objects |
+| `parallelize(fn, inputs, schema)` | Distribute function over inputs via `mapInArrow` |
+| `map(fn, schema)` | 1:1 row transform |
+| `apply(fn, schema)` | Map with batch-level vectorisation |
+| `filter(predicate)` | Row filter (callable or SQL expression) |
+| `cast(schema)` | Re-cast to a new schema |
+| `explode(schema)` | Flatten iterables into rows |
+| `to_table(name, mode, format)` | Write to Delta table |
+| `toArrow()` / `toPandas()` / `toPolars()` | Collect to driver |
+| `collect()` / `to_local_iterator()` | Collect as Python objects |
+| `persist()` / `unpersist()` | Executor cache management |
+| `infer_schema()` | Infer yggdrasil Schema from row contents |
+
+### `DatabricksClient` surface
+
+`DatabricksClient` exposes two direct `Dataset` methods that resolve the Spark session via Databricks Connect automatically:
+
+- **`dbc.dataset(sql_or_table, schema=None)`** — returns a `Dataset`. Auto-detects SQL vs table name.
+- **`dbc.parallelize(fn, inputs, schema=None)`** — returns a `Dataset`. Distributes `fn` across Spark executors.
+
+Both use `dbc.spark()` for session resolution (reuses active session in notebooks / jobs; creates Databricks Connect session otherwise).
+
+### `SQLEngine` surface
+
+`dbc.sql` also exposes `dataset()` and `parallelize()` with the same signatures. Use `dbc.sql` when you need the full engine (warehouse fallback, execute/execute_many, table CRUD).
+
+### Dynamic vs typed mode
+
+- **Dynamic** (`schema=None`) — rows are arbitrary pickled Python objects. Transforms see unpickled inner objects. Good for heterogeneous data or when the output shape isn't known ahead of time.
+- **Typed** (`schema=<Schema>`) — the underlying Spark frame matches the schema. Transforms receive row-dicts and outputs are cast through `mapInArrow`. Always prefer typed when the schema is known — it avoids the pickle round-trip and enables vectorised batch processing.
+
+### Executor dependency shipping
+
+`Dataset` auto-ships `yggdrasil` and any modules referenced by the user function to Spark executors via `addArtifacts`. The `installed_modules` set tracks what's been shipped per frame lineage so a chain like `ds.map(f).map(g).filter(h)` only installs each module once.
+
+### Workflow integration
+
+For scheduled pipelines, combine `Dataset` with the `@task` / `@flow` workflow decorators:
+
+```python
+from yggdrasil.databricks.workflow import flow, task
+
+@task
+def ingest(date: str) -> str:
+    dbc = DatabricksClient()
+    (dbc.dataset(f"SELECT * FROM vendor.raw WHERE date = '{date}'")
+     .map(clean)
+     .to_table(f"main.curated.events"))
+    return "main.curated.events"
+
+@flow(name="daily-ingest", schedule="0 2 * * *")
+def daily(date: str = "2025-01-01"):
+    ingest(date)
+```
+
 ## Release & CI
 
 - Version is the single source of truth in `python/pyproject.toml`. `.github/workflows/publish.yml` reads it, checks PyPI, and on `main` pushes that touch `python/src/**`, `pyproject.toml`, README, or LICENSE, it builds the sdist + pure-Python wheel and publishes `ygg`, then tags `vX.Y.Z` and cuts a GitHub Release.

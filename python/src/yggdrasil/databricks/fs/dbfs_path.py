@@ -22,10 +22,8 @@ from yggdrasil.io.url import URL
 from ..path import DatabricksPath
 from .service import DBFSService
 
-
 __all__ = ["DBFSPath"]
 from ...dataclasses import WaitingConfig
-
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +58,9 @@ class DBFSPath(DatabricksPath):
 
     def _stat_uncached(self) -> IOStats:
         try:
-            info = self._call(self.client.workspace_client().dbfs.get_status, self.api_path)
+            info = self._call(
+                self.client.workspace_client().dbfs.get_status, self.api_path
+            )
         except Exception:
             return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
 
@@ -88,12 +88,16 @@ class DBFSPath(DatabricksPath):
         singleton_ttl: Any = False,
     ) -> Iterator["DBFSPath"]:
         try:
-            entries = list(self._call(self.client.workspace_client().dbfs.list, self.api_path))
+            entries = list(
+                self._call(self.client.workspace_client().dbfs.list, self.api_path)
+            )
         except Exception:
             return
         logger.debug(
             "Listing DBFS directory %r -> %d entries (recursive=%s)",
-            self, len(entries), recursive,
+            self,
+            len(entries),
+            recursive,
         )
         for info in entries:
             api_path = getattr(info, "path", None)
@@ -113,11 +117,13 @@ class DBFSPath(DatabricksPath):
             # each fire a follow-up ``dbfs.get_status`` round trip.
             is_dir = bool(getattr(info, "is_dir", False))
             mtime_ms = getattr(info, "modification_time", None) or 0
-            child._persist_stat_cache(IOStats(
-                kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
-                size=0 if is_dir else int(getattr(info, "file_size", 0) or 0),
-                mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
-            ))
+            child._persist_stat_cache(
+                IOStats(
+                    kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
+                    size=0 if is_dir else int(getattr(info, "file_size", 0) or 0),
+                    mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
+                )
+            )
             yield child
             if recursive and is_dir:
                 yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
@@ -141,7 +147,9 @@ class DBFSPath(DatabricksPath):
         logger.debug("Deleting DBFS file %r", self)
         try:
             self._call(
-                self.client.workspace_client().dbfs.delete, self.api_path, recursive=False,
+                self.client.workspace_client().dbfs.delete,
+                self.api_path,
+                recursive=False,
             )
         except Exception:
             if not missing_ok:
@@ -150,15 +158,22 @@ class DBFSPath(DatabricksPath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
+        self,
+        recursive: bool,
+        missing_ok: bool,
+        wait: WaitingConfig,
     ) -> None:
         del wait
         logger.debug(
-            "Deleting DBFS directory %r (recursive=%s)", self, recursive,
+            "Deleting DBFS directory %r (recursive=%s)",
+            self,
+            recursive,
         )
         try:
             self._call(
-                self.client.workspace_client().dbfs.delete, self.api_path, recursive=recursive,
+                self.client.workspace_client().dbfs.delete,
+                self.api_path,
+                recursive=recursive,
             )
         except Exception:
             if not missing_ok:
@@ -225,11 +240,13 @@ class DBFSPath(DatabricksPath):
         # next ``size`` / ``exists`` / ``is_file`` lookup is local.
         if pos == 0 and hit_eof:
             if self._stat_cached is None:
-                self._persist_stat_cache(IOStats(
-                    size=offset,
-                    kind=IOKind.FILE,
-                    media_type=self.media_type,
-                ))
+                self._persist_stat_cache(
+                    IOStats(
+                        size=offset,
+                        kind=IOKind.FILE,
+                        media_type=self.media_type,
+                    )
+                )
             else:
                 self._stat_cached.size = offset
                 # Re-stamp the TTL — the data we just folded in is
@@ -238,12 +255,20 @@ class DBFSPath(DatabricksPath):
                 self._persist_stat_cache(self._stat_cached)
         logger.debug(
             "Read DBFS file %r pos=%d n=%s -> %d bytes",
-            self, pos, "EOF" if to_eof else n, len(out),
+            self,
+            pos,
+            "EOF" if to_eof else n,
+            len(out),
         )
         return memoryview(bytes(out))
 
     def _write_stream(
-        self, src: Any, *, offset: int, size: int = -1, **kwargs: Any,
+        self,
+        src: Any,
+        *,
+        offset: int,
+        size: int = -1,
+        **kwargs: Any,
     ) -> int:
         """Override the base chunked stream — one ``dbfs.open`` session.
 
@@ -283,7 +308,7 @@ class DBFSPath(DatabricksPath):
                 existing = b""
             if pos > len(existing):
                 existing = existing + b"\x00" * (pos - len(existing))
-            payload = existing[:pos] + bytes(data) + existing[pos + n:]
+            payload = existing[:pos] + bytes(data) + existing[pos + n :]
 
         self._stream_upload(payload)
         return n
@@ -305,7 +330,8 @@ class DBFSPath(DatabricksPath):
         size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
             "Uploading DBFS file %r (%s bytes)",
-            self, size if size >= 0 else "?",
+            self,
+            size if size >= 0 else "?",
         )
         api_path = self.api_path
         dbfs = self.client.workspace_client().dbfs
@@ -316,19 +342,26 @@ class DBFSPath(DatabricksPath):
             def _do_upload() -> None:
                 stream.seek(0)
                 with dbfs.open(
-                    path=api_path, read=False, write=True, overwrite=True,
+                    path=api_path,
+                    read=False,
+                    write=True,
+                    overwrite=True,
                 ) as fh:
                     while True:
                         chunk = stream.read(_DBFS_CHUNK)
                         if not chunk:
                             break
                         fh.write(chunk)
+
         else:
             payload = content
 
             def _do_upload() -> None:
                 with dbfs.open(
-                    path=api_path, read=False, write=True, overwrite=True,
+                    path=api_path,
+                    read=False,
+                    write=True,
+                    overwrite=True,
                 ) as fh:
                     offset = 0
                     n = len(payload)
@@ -342,12 +375,14 @@ class DBFSPath(DatabricksPath):
         # and any concurrent reader on the singleton path sees the
         # post-write metadata without a fresh ``dbfs.get_status``.
         if size >= 0:
-            self._persist_stat_cache(IOStats(
-                size=size,
-                kind=IOKind.FILE,
-                mtime=time.time(),
-                media_type=self.media_type,
-            ))
+            self._persist_stat_cache(
+                IOStats(
+                    size=size,
+                    kind=IOKind.FILE,
+                    mtime=time.time(),
+                    media_type=self.media_type,
+                )
+            )
             logger.info("Uploaded DBFS file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded DBFS file %r (size=stream)", self)
@@ -375,6 +410,9 @@ class DBFSPath(DatabricksPath):
         self._stream_upload(head)
         return n
 
+    def _upload_full(self, content: "Any") -> int:
+        return self._stream_upload(content)
+
     def _clear(self) -> None:
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
@@ -387,7 +425,9 @@ class DBFSPath(DatabricksPath):
 def _looks_like_not_found(exc: BaseException) -> bool:
     name = type(exc).__name__
     return name in (
-        "NotFound", "ResourceDoesNotExist", "FileNotFoundError",
+        "NotFound",
+        "ResourceDoesNotExist",
+        "FileNotFoundError",
     ) or isinstance(exc, FileNotFoundError)
 
 

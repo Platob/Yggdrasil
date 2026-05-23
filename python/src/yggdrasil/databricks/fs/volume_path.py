@@ -115,7 +115,9 @@ class VolumePath(DatabricksPath):
             service = volume.service
 
         super().__init__(
-            data=data, service=service, url=url,
+            data=data,
+            service=service,
+            url=url,
             **kwargs,
         )
 
@@ -393,7 +395,8 @@ class VolumePath(DatabricksPath):
         except PermissionDenied as e:
             logger.warning(
                 "Permission denied listing volume directory %r: %r",
-                self, e,
+                self,
+                e,
             )
             return
         except Exception:
@@ -402,7 +405,9 @@ class VolumePath(DatabricksPath):
             entries = list(entries)
             logger.debug(
                 "Listing volume directory %r -> %d entries (recursive=%s)",
-                self, len(entries), recursive,
+                self,
+                len(entries),
+                recursive,
             )
         for info in entries:
             child_path = getattr(info, "path", None)
@@ -433,13 +438,19 @@ class VolumePath(DatabricksPath):
             # API with N extra ``get_metadata`` round trips. (0.6.21
             # already did this; the rewrite dropped it.)
             is_directory = bool(getattr(info, "is_directory", False))
-            child._persist_stat_cache(IOStats(
-                kind=IOKind.DIRECTORY if is_directory else IOKind.FILE,
-                size=0 if is_directory else int(
-                    getattr(info, "file_size", 0) or 0,
-                ),
-                mtime=_mtime(info),
-            ))
+            child._persist_stat_cache(
+                IOStats(
+                    kind=IOKind.DIRECTORY if is_directory else IOKind.FILE,
+                    size=(
+                        0
+                        if is_directory
+                        else int(
+                            getattr(info, "file_size", 0) or 0,
+                        )
+                    ),
+                    mtime=_mtime(info),
+                )
+            )
             yield child
             if recursive and is_directory:
                 yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
@@ -464,9 +475,7 @@ class VolumePath(DatabricksPath):
             return False
 
         parent = self.parent
-        pparts = [
-            p for p in (parent.url.path or "/").lstrip("/").split("/") if p
-        ]
+        pparts = [p for p in (parent.url.path or "/").lstrip("/").split("/") if p]
         has_subdir = len(pparts) > 3  # parent strictly below ``/cat/sch/vol``
         volume_missing = exc is not None and _looks_like_volume_not_found(exc)
 
@@ -523,6 +532,7 @@ class VolumePath(DatabricksPath):
                 raise
 
         from yggdrasil.databricks.volume.volumes import _ensure_parents_for
+
         _ensure_parents_for(
             self.client.workspace_client(),
             catalog_name=volume.catalog_name,
@@ -543,11 +553,13 @@ class VolumePath(DatabricksPath):
         logger.debug("Creating volume directory %r", self)
         try:
             self._call_ensuring_parents(
-                self.client.workspace_client().files.create_directory, self.api_path,
+                self.client.workspace_client().files.create_directory,
+                self.api_path,
             )
             logger.info(
                 "Created volume directory %r (parents=%s)",
-                self, parents,
+                self,
+                parents,
             )
         except Exception as exc:
             if not exist_ok and _looks_like_already_exists(exc):
@@ -573,7 +585,8 @@ class VolumePath(DatabricksPath):
     ) -> None:
         logger.info(
             "Deleting volume directory %r (recursive=%s)",
-            self, recursive,
+            self,
+            recursive,
         )
         # ``files.delete_directory`` is non-recursive — its docstring is
         # explicit: "To delete a non-empty directory, first delete all
@@ -605,13 +618,19 @@ class VolumePath(DatabricksPath):
                     is_dir = cached is not None and cached.kind is IOKind.DIRECTORY
                     if is_dir:
                         child._remove_dir(
-                            recursive=True, missing_ok=missing_ok,
-                            wait=wait, pool=executor,
+                            recursive=True,
+                            missing_ok=missing_ok,
+                            wait=wait,
+                            pool=executor,
                         )
                     else:
-                        file_futures.append(executor.submit(
-                            child._remove_file, missing_ok=missing_ok, wait=wait,
-                        ))
+                        file_futures.append(
+                            executor.submit(
+                                child._remove_file,
+                                missing_ok=missing_ok,
+                                wait=wait,
+                            )
+                        )
                 for fut in file_futures:
                     fut.result()
             finally:
@@ -620,12 +639,15 @@ class VolumePath(DatabricksPath):
 
         logger.info(
             "files.delete_directory %s (recursive=%s)",
-            self.api_path, recursive,
+            self.api_path,
+            recursive,
         )
 
         if wait:
             try:
-                self._call(self.client.workspace_client().files.delete_directory, self.api_path)
+                self._call(
+                    self.client.workspace_client().files.delete_directory, self.api_path
+                )
             except Exception:
                 if not missing_ok:
                     raise
@@ -644,7 +666,9 @@ class VolumePath(DatabricksPath):
         if n == 0:
             return memoryview(b"")
         try:
-            response = self._call(self.client.workspace_client().files.download, self.api_path)
+            response = self._call(
+                self.client.workspace_client().files.download, self.api_path
+            )
         except Exception as exc:
             if _looks_like_not_found(exc):
                 raise FileNotFoundError(self.full_path()) from exc
@@ -657,22 +681,31 @@ class VolumePath(DatabricksPath):
             data = bytes(body)
         logger.debug(
             "Downloaded volume file %r -> %d bytes (slice pos=%d n=%s)",
-            self, len(data), pos, "EOF" if n < 0 else n,
+            self,
+            len(data),
+            pos,
+            "EOF" if n < 0 else n,
         )
 
         media_type = _media_type_from_response(response)
         try:
-            mtime = parse_http_date(response.last_modified) if response.last_modified else None
+            mtime = (
+                parse_http_date(response.last_modified)
+                if response.last_modified
+                else None
+            )
         except Exception:
             mtime = None
         mtime = mtime.timestamp() if mtime else time.time()
         if not self._stat_cached:
-            self._persist_stat_cache(stats=IOStats(
-                size=len(data),
-                kind=IOKind.FILE,
-                mtime=mtime,
-                media_type=media_type,
-            ))
+            self._persist_stat_cache(
+                stats=IOStats(
+                    size=len(data),
+                    kind=IOKind.FILE,
+                    mtime=mtime,
+                    media_type=media_type,
+                )
+            )
         else:
             self._stat_cached.size = len(data)
             self._stat_cached.mtime = mtime
@@ -690,7 +723,12 @@ class VolumePath(DatabricksPath):
         return memoryview(data)
 
     def _write_stream(
-        self, src: Any, *, offset: int, size: int = -1, **kwargs: Any,
+        self,
+        src: Any,
+        *,
+        offset: int,
+        size: int = -1,
+        **kwargs: Any,
     ) -> int:
         """Override the base chunked stream — Volumes wants one PUT.
 
@@ -725,7 +763,7 @@ class VolumePath(DatabricksPath):
                 existing = b""
             if pos > len(existing):
                 existing = existing + b"\x00" * (pos - len(existing))
-            payload = existing[:pos] + bytes(data) + existing[pos + n:]
+            payload = existing[:pos] + bytes(data) + existing[pos + n :]
         self._upload(payload)
         return n
 
@@ -746,7 +784,8 @@ class VolumePath(DatabricksPath):
         size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
             "Uploading volume file %r (%s bytes)",
-            self, size if size >= 0 else "?",
+            self,
+            size if size >= 0 else "?",
         )
         upload = self.client.workspace_client().files.upload
         api_path = self.api_path
@@ -765,6 +804,7 @@ class VolumePath(DatabricksPath):
             def _do_upload() -> None:
                 stream.seek(pos)
                 upload(file_path=api_path, contents=stream, overwrite=True)
+
         else:
             # ``FilesExt.upload`` calls ``contents.seekable()`` — wrap
             # raw bytes in a fresh ``BytesIO`` each attempt so retries
@@ -780,12 +820,14 @@ class VolumePath(DatabricksPath):
 
         self._call_ensuring_parents(_do_upload)
         if size >= 0:
-            self._persist_stat_cache(IOStats(
-                size=size,
-                kind=IOKind.FILE,
-                mtime=time.time(),
-                media_type=self.media_type,
-            ))
+            self._persist_stat_cache(
+                IOStats(
+                    size=size,
+                    kind=IOKind.FILE,
+                    mtime=time.time(),
+                    media_type=self.media_type,
+                )
+            )
             logger.info("Uploaded volume file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded volume file %r (size=stream)", self)
@@ -811,6 +853,9 @@ class VolumePath(DatabricksPath):
         self._upload(head)
         return n
 
+    def _upload_full(self, content: "Any") -> int:
+        return self._upload(content)
+
     def _clear(self) -> None:
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
@@ -830,17 +875,16 @@ def _media_type_from_response(info) -> "MediaType | None":
     """
     if info is None:
         return None
-    mime = (
-        getattr(info, "content_type", None)
-        or getattr(info, "mime_type", None)
-    )
+    mime = getattr(info, "content_type", None) or getattr(info, "mime_type", None)
     if not mime:
         return None
     return MediaType.from_(mime, default=None)
 
 
 def _mtime(info) -> float:
-    val = getattr(info, "last_modified", None) or getattr(info, "modification_time", None)
+    val = getattr(info, "last_modified", None) or getattr(
+        info, "modification_time", None
+    )
 
     if val is None:
         return 0.0
@@ -897,4 +941,5 @@ def _looks_like_already_exists(exc: BaseException) -> bool:
 # ``fs.volume_path → volume.volumes → volume.volume → fs.volume_path``
 # cycle by deferring the attribute set to module-load tail.
 from ..volume.volumes import Volumes as _Volumes  # noqa: E402
+
 VolumePath._SERVICE_CLASS = _Volumes

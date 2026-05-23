@@ -26,7 +26,6 @@ from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.path.path import Path
 
-
 __all__ = ["RemotePath"]
 
 
@@ -89,7 +88,8 @@ class RemotePath(Path):
     # dict without colliding.
     _SINGLETON_TTL: ClassVar[Any] = _STAT_CACHE_TTL
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
-        default_ttl=_STAT_CACHE_TTL, max_size=10_000,
+        default_ttl=_STAT_CACHE_TTL,
+        max_size=10_000,
     )
     _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
@@ -102,28 +102,36 @@ class RemotePath(Path):
     def __init__(
         self,
         *args: Any,
+        page_size: Any = ...,
         buffersize: Any = ...,
         **kwargs: Any,
     ) -> None:
         """Wire the page-buffer state alongside the standard :class:`Path` init.
 
-        ``buffersize`` accepts an int (bytes), a
+        ``page_size`` accepts an int (bytes), a
         :class:`~yggdrasil.data.enums.byteunit.ByteUnit` member, or a
         size string (``"4 MB"``). ``None`` disables paging and routes
         every read/write straight through to the subclass primitives.
         Omitting the kwarg uses :attr:`DEFAULT_BUFFER_SIZE`.
+
+        ``buffersize`` is a deprecated alias for ``page_size``. When
+        both are supplied, ``page_size`` wins.
 
         Singleton-aware: a re-init on a cached instance preserves the
         pages already in flight so a second constructor call doesn't
         silently lose dirty buffered writes from the first.
         """
         super().__init__(*args, **kwargs)
-        if hasattr(self, "_buffersize"):
+        if hasattr(self, "_page_size"):
             # Singleton re-init: keep pages + dirty markers from the
             # original construction so a second ``RemotePath(...)`` call
             # against the same key doesn't strand pending writes.
             return
-        self._buffersize: Optional[int] = self._normalize_buffersize(buffersize)
+        # Resolve deprecated ``buffersize`` alias: ``page_size`` wins
+        # when both are supplied; ``buffersize`` is accepted silently
+        # so existing callers keep working.
+        effective = page_size if page_size is not ... else buffersize
+        self._page_size: Optional[int] = self._normalize_page_size(effective)
         # Lazy: only allocate the dict when paging actually fires.
         self._pages: Optional[ExpiringDict[int, Memory]] = None
         self._dirty_pages: set[int] = set()
@@ -133,39 +141,40 @@ class RemotePath(Path):
         self._buffered_size: Optional[int] = None
 
     @classmethod
-    def _normalize_buffersize(cls, value: Any) -> Optional[int]:
+    def _normalize_page_size(cls, value: Any) -> Optional[int]:
         if value is ...:
             value = cls.DEFAULT_BUFFER_SIZE
         if value is None:
             return None
         # Plain non-negative ``int`` covers the default buffer size and
-        # every realistic caller (``buffersize=4 * 1024 * 1024``,
-        # ``buffersize=None``, ``buffersize=...``). Bypass the
+        # every realistic caller (``page_size=4 * 1024 * 1024``,
+        # ``page_size=None``, ``page_size=...``). Bypass the
         # ``ByteUnit.parse_size`` round trip — five isinstance probes
         # plus a function-call frame — when we already have the
         # canonical type. ``bool`` is an ``int`` subclass; reject it
-        # before the fast path so ``buffersize=True`` still raises.
+        # before the fast path so ``page_size=True`` still raises.
         if type(value) is int:
             if value < 0:
                 raise ValueError(
-                    f"buffersize must be a non-negative byte count "
+                    f"page_size must be a non-negative byte count "
                     f"(int / ByteUnit / size string / None), got {value!r}"
                 )
             return value if value > 0 else None
         from yggdrasil.data.enums.byteunit import ByteUnit
+
         try:
             n = ByteUnit.parse_size(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"buffersize must be a non-negative byte count "
+                f"page_size must be a non-negative byte count "
                 f"(int / ByteUnit / size string / None), got {value!r}"
             ) from exc
         return n if n > 0 else None
 
     @property
-    def buffersize(self) -> Optional[int]:
+    def page_size(self) -> Optional[int]:
         """Page size for buffered reads/writes, or ``None`` when disabled."""
-        return self._buffersize
+        return self._page_size
 
     def _ensure_pages(self) -> "ExpiringDict[int, Memory]":
         if self._pages is None:
@@ -269,7 +278,7 @@ class RemotePath(Path):
     # ==================================================================
     # Buffered read / write — page cache over backend ``_read_mv`` /
     # ``_write_mv``. Public ``read_mv`` / ``write_mv`` route through
-    # here when :attr:`buffersize` is set; subclass primitives still do
+    # here when :attr:`page_size` is set; subclass primitives still do
     # the actual network calls, just one per page miss instead of one
     # per logical access.
     # ==================================================================
@@ -299,12 +308,14 @@ class RemotePath(Path):
         cached = self._stat_cached
         now = time.time()
         if cached is None or cached.kind == IOKind.MISSING:
-            self._persist_stat_cache(IOStats(
-                size=new_total,
-                kind=IOKind.FILE,
-                mtime=now,
-                media_type=self.media_type,
-            ))
+            self._persist_stat_cache(
+                IOStats(
+                    size=new_total,
+                    kind=IOKind.FILE,
+                    mtime=now,
+                    media_type=self.media_type,
+                )
+            )
             return
         cached.size = new_total
         cached.mtime = now
@@ -317,9 +328,10 @@ class RemotePath(Path):
         *,
         cursor: bool = False,
     ) -> memoryview:
-        if self._buffersize is None or self._parent is not None:
+        if self._page_size is None or self._parent is not None:
             return super().read_mv(size, offset, cursor=cursor)
         from yggdrasil.io.holder import _resolve_pos
+
         if cursor:
             offset = self._pos
         total = self._effective_total()
@@ -351,12 +363,17 @@ class RemotePath(Path):
         update_stat: bool = True,
         cursor: bool = False,
     ) -> int:
-        if self._buffersize is None or self._parent is not None:
+        if self._page_size is None or self._parent is not None:
             return super().write_mv(
-                data, offset, size=size, overwrite=overwrite,
-                update_stat=update_stat, cursor=cursor,
+                data,
+                offset,
+                size=size,
+                overwrite=overwrite,
+                update_stat=update_stat,
+                cursor=cursor,
             )
         from yggdrasil.io.holder import _resolve_pos
+
         if cursor:
             offset = self._pos
         if size >= 0 and len(data) > size:
@@ -450,7 +467,9 @@ class RemotePath(Path):
             self.flush()
         except Exception as exc:
             logger.warning(
-                "Buffered flush failed during release of %r: %s", self, exc,
+                "Buffered flush failed during release of %r: %s",
+                self,
+                exc,
             )
         super()._release()
 
@@ -459,7 +478,7 @@ class RemotePath(Path):
     # ------------------------------------------------------------------
 
     def _paged_read(self, n: int, pos: int) -> memoryview:
-        page_size = self._buffersize
+        page_size = self._page_size
         pages = self._ensure_pages()
         first_page = pos // page_size
         last_page = (pos + n - 1) // page_size
@@ -495,7 +514,7 @@ class RemotePath(Path):
         return what they have; ranged backends (S3) cap at EOF on
         their own. A missing object surfaces as an empty page.
         """
-        page_size = self._buffersize
+        page_size = self._page_size
         page_offset = page_idx * page_size
         try:
             chunk = bytes(self._read_mv(page_size, page_offset))
@@ -509,7 +528,7 @@ class RemotePath(Path):
         return Memory.view(buf, size=n)
 
     def _paged_write(self, data: memoryview, offset: int) -> None:
-        page_size = self._buffersize
+        page_size = self._page_size
         pages = self._ensure_pages()
         n = len(data)
         end = offset + n
@@ -524,7 +543,8 @@ class RemotePath(Path):
             slice_end = min(end, page_start + page_size) - page_start
             take = slice_end - slice_start
             page_backend_len = min(
-                page_size, max(0, backend_total - page_start),
+                page_size,
+                max(0, backend_total - page_start),
             )
             if page is None:
                 # Avoid the backend hit when the write fully covers
@@ -556,7 +576,7 @@ class RemotePath(Path):
         """
         if self._pages is None:
             return 0
-        page_size = self._buffersize
+        page_size = self._page_size
         tail = 0
         for key in list(self._pages.keys()):
             page = self._pages.get(key)
@@ -570,7 +590,7 @@ class RemotePath(Path):
     def _discard_pages_past(self, end: int) -> None:
         if self._pages is None:
             return
-        page_size = self._buffersize
+        page_size = self._page_size
         # Index of the first page that lies entirely past ``end``.
         cutoff = (end + page_size - 1) // page_size
         for key in list(self._pages.keys()):

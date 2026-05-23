@@ -26,7 +26,6 @@ The DML write logic (arrow / spark / sql) lives on :class:`Table`
 ``Table`` method.
 """
 
-
 from __future__ import annotations
 
 import logging
@@ -76,10 +75,14 @@ from ..client import DatabricksService
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
     import pandas
     import polars
     import pyspark
     from pyspark.sql import SparkSession
+
+    from yggdrasil.spark.tabular import Dataset
 
 __all__ = ["SQLEngine"]
 
@@ -124,7 +127,9 @@ def _coerce_external_data_for_spark(
             entry = value
             if entry.text_key != alias:
                 entry = ExternalStatementData(
-                    alias, tabular=entry.tabular, text_value=entry.text_value,
+                    alias,
+                    tabular=entry.tabular,
+                    text_value=entry.text_value,
                 )
             out[alias] = entry
             continue
@@ -143,7 +148,9 @@ def _coerce_external_data_for_spark(
         if isinstance(value, tuple) and len(value) == 2:
             tabular, text_value = value
             out[alias] = ExternalStatementData(
-                alias, tabular=tabular, text_value=text_value,
+                alias,
+                tabular=tabular,
+                text_value=text_value,
             )
             continue
 
@@ -289,8 +296,12 @@ class SQLEngine(DatabricksService, StatementExecutor):
             catalog_name = catalog_name or self.catalog_name
             schema_name = schema_name or self.schema_name
 
-            if PreparedStatement.looks_like_query(obj) or isinstance(obj, PreparedStatement):
-                return self.execute(obj, catalog_name=catalog_name, schema_name=schema_name)
+            if PreparedStatement.looks_like_query(obj) or isinstance(
+                obj, PreparedStatement
+            ):
+                return self.execute(
+                    obj, catalog_name=catalog_name, schema_name=schema_name
+                )
             else:
                 raise TypeError(
                     f"SQLEngine.__call__ only accepts SQL strings, not {type(obj).__name__}."
@@ -369,7 +380,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
     def _submit_statement(
         self,
         statement: WarehousePreparedStatement | SparkPreparedStatement,
-        start: bool = True
+        start: bool = True,
     ) -> WarehouseStatementResult | SparkStatementResult:
         """Dispatch by concrete statement type to the matching inner executor.
 
@@ -481,7 +492,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
     def execute_many(
         self,
-        statements: Iterable[str | PreparedStatement | StatementResult] | Mapping[str, str | PreparedStatement | StatementResult],
+        statements: (
+            Iterable[str | PreparedStatement | StatementResult]
+            | Mapping[str, str | PreparedStatement | StatementResult]
+        ),
         *,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
@@ -513,7 +527,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
                     "use driver-side retry, not StatementResult.retry()."
                 )
             return self.spark.execute_many(
-                statements, wait=wait, raise_error=raise_error, parallel=parallel,
+                statements,
+                wait=wait,
+                raise_error=raise_error,
+                parallel=parallel,
             )
 
         # Warehouse path — broadcast retry config onto warehouse statements.
@@ -521,14 +538,20 @@ class SQLEngine(DatabricksService, StatementExecutor):
             statements = self._broadcast_retry(statements, retry)
 
         return self.warehouse(
-            warehouse_id=warehouse_id, warehouse_name=warehouse_name,
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name,
         ).execute_many(
-            statements, wait=wait, raise_error=raise_error, parallel=parallel,
+            statements,
+            wait=wait,
+            raise_error=raise_error,
+            parallel=parallel,
         )
 
     @staticmethod
     def _broadcast_retry(
-        statements: Iterable[str | PreparedStatement | StatementResult] | Mapping[str, Any],
+        statements: (
+            Iterable[str | PreparedStatement | StatementResult] | Mapping[str, Any]
+        ),
         retry: Optional[WaitingConfigArg],
     ) -> Iterable[Any]:
         """Apply ``retry`` to every warehouse statement in ``statements``.
@@ -611,10 +634,17 @@ class SQLEngine(DatabricksService, StatementExecutor):
     def insert_into(
         self,
         data: Union[
-            pa.Table, pa.RecordBatch, pa.RecordBatchReader,
-            dict, list, str,
-            PreparedStatement, StatementResult,
-            "pandas.DataFrame", "polars.DataFrame", "pyspark.sql.DataFrame",
+            pa.Table,
+            pa.RecordBatch,
+            pa.RecordBatchReader,
+            dict,
+            list,
+            str,
+            PreparedStatement,
+            StatementResult,
+            "pandas.DataFrame",
+            "polars.DataFrame",
+            "pyspark.sql.DataFrame",
         ],
         *,
         mode: Mode | str | None = None,
@@ -642,8 +672,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
     ) -> "StatementBatch | None":
         """Resolve the target :class:`Table` and call :meth:`Table.insert_into`."""
         target = self._resolve_target(
-            location=location, catalog_name=catalog_name,
-            schema_name=schema_name, table_name=table_name, table=table,
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            table=table,
         )
         return target.insert_into(
             data,
@@ -692,8 +725,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
     ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.arrow_insert`."""
         target = self._resolve_target(
-            location=location, catalog_name=catalog_name,
-            schema_name=schema_name, table_name=table_name, table=table,
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            table=table,
         )
         return target.arrow_insert(
             data,
@@ -743,8 +779,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
     ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.spark_insert`."""
         target = self._resolve_target(
-            location=location, catalog_name=catalog_name,
-            schema_name=schema_name, table_name=table_name, table=table,
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            table=table,
         )
         return target.spark_insert(
             data,
@@ -792,8 +831,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
     ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.sql_insert`."""
         target = self._resolve_target(
-            location=location, catalog_name=catalog_name,
-            schema_name=schema_name, table_name=table_name, table=table,
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
+            table=table,
         )
         return target.sql_insert(
             statement,
@@ -829,7 +871,9 @@ class SQLEngine(DatabricksService, StatementExecutor):
         """Drop a table if it exists."""
         return self.table(
             location,
-            catalog_name=catalog_name, schema_name=schema_name, table_name=table_name,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
         ).delete(wait=wait, missing_ok=not raise_error)
 
     def create_table(
@@ -845,6 +889,58 @@ class SQLEngine(DatabricksService, StatementExecutor):
         """Create a table if it does not already exist."""
         target = self.table(
             location=full_name,
-            catalog_name=catalog_name, schema_name=schema_name, table_name=table_name,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            table_name=table_name,
         )
         return target.create(definition=definition, missing_ok=True, **kwargs)
+
+    # ------------------------------------------------------------------
+    # SparkTabular (Dataset) convenience
+    # ------------------------------------------------------------------
+
+    def dataset(
+        self,
+        sql_or_table: str,
+        *,
+        schema: Any = None,
+    ) -> "Dataset":
+        """Return a :class:`Dataset` from a SQL query or table name.
+
+        Auto-detects SQL (``SELECT``, ``WITH``, …) vs table name.
+        Session resolved through Databricks Connect.
+        """
+        from yggdrasil.spark.tabular import Dataset
+
+        session = self.spark.resolve_session(create=True)
+        if PreparedStatement.looks_like_query(sql_or_table):
+            return Dataset.from_sql(
+                sql_or_table,
+                spark_session=session,
+                schema=schema,
+            )
+        return Dataset.from_table(
+            sql_or_table,
+            spark_session=session,
+            schema=schema,
+        )
+
+    def parallelize(
+        self,
+        function: "Callable",
+        inputs: "Iterable",
+        *,
+        schema: Any = None,
+        byte_size: int = 128 * 1024 * 1024,
+    ) -> "Dataset":
+        """Distribute *function* over *inputs* via Spark executors."""
+        from yggdrasil.spark.tabular import Dataset
+
+        session = self.spark.resolve_session(create=True)
+        return Dataset.parallelize(
+            function,
+            inputs,
+            schema=schema,
+            spark_session=session,
+            byte_size=byte_size,
+        )
