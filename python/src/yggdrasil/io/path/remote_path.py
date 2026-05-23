@@ -493,16 +493,7 @@ class RemotePath(Path):
             return n
         return super().truncate(n)
 
-    def _write_all_bytes(self, data: "bytes | bytearray") -> int:
-        """Atomic whole-content write without a preceding truncate.
 
-        The base ``_write_all_bytes`` does ``truncate(0) + write_bytes``
-        which on remote backends costs a full download + re-upload of
-        nothing before the real payload goes out. ``write_mv`` with
-        ``overwrite=True`` at offset 0 achieves the same semantics in
-        one round trip — the atomic blob upload replaces the object.
-        """
-        return self.write_mv(memoryview(data), 0, overwrite=True)
 
     # ------------------------------------------------------------------
     # Page-level helpers
