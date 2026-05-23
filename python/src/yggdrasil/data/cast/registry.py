@@ -378,6 +378,13 @@ def convert(
         return conv(value, options)  # type: ignore[return-value]
 
     if target_is_type:
+        from_ = getattr(target_hint, "from_", None)
+        if callable(from_):
+            try:
+                return from_(value)  # type: ignore[return-value]
+            except (TypeError, ValueError, KeyError, AttributeError):
+                pass
+
         if issubclass(target_hint, enum.Enum):
             return convert_to_python_enum(value, target_hint, options=options)  # type: ignore[return-value]
         if dataclasses.is_dataclass(target_hint):
