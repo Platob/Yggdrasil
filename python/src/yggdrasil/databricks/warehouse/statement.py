@@ -1101,7 +1101,7 @@ class WarehouseStatementResult(StatementResult):
                     yield Job.make(fetch_batches, link.external_link)
 
         def raw_batches() -> Iterator[pa.RecordBatch]:
-            with JobPoolExecutor.parse(max_workers) as ex:
+            with JobPoolExecutor.from_(max_workers) as ex:
                 for result in ex.as_completed(
                     jobs(),
                     ordered=True,

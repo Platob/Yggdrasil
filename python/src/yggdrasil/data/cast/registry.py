@@ -373,6 +373,16 @@ def convert(
         from yggdrasil.data.options import CastOptions
         options = CastOptions.check(options, **kwargs)
 
+    if target_is_type:
+        from_ = getattr(target_hint, "from_", None)
+        if callable(from_):
+            try:
+                result = from_(value)
+                if isinstance(result, target_hint):
+                    return result  # type: ignore[return-value]
+            except (TypeError, ValueError, KeyError, AttributeError):
+                pass
+
     conv = find_converter(type(value), target_hint)
     if conv is not None:
         return conv(value, options)  # type: ignore[return-value]

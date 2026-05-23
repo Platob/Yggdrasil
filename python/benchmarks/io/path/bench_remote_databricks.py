@@ -34,6 +34,9 @@ from yggdrasil.databricks.fs.dbfs_path import DBFSPath
 from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 from yggdrasil.io.path.remote_path import RemotePath
+from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.primitive.csv_file import CSVFile
+from yggdrasil.io.primitive.ndjson_file import NDJSONFile
 from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
@@ -391,7 +394,197 @@ def scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=200,
     ))
 
+    # -------------------------------------------------------------------
+    # Write SDK-call profiles
+    # -------------------------------------------------------------------
+    # Measure how many backend calls each write shape costs. The
+    # page-buffered truncate override should eliminate the extra
+    # download + re-upload that the base Path.truncate(0) issues.
+
+    write_payload = b"x" * 8192
+
+    # VolumePath — write_all (truncate + write_bytes under the hood)
+    service, client, workspace = _stub_databricks_service(payload=b"old")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/out.bin", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    workspace.files.delete.reset_mock()
+    p.write_all(write_payload)
+    out.append({
+        "label": "VolumePath.write_all(8 KiB) — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # VolumePath — write_bytes (single upload)
+    service, client, workspace = _stub_databricks_service(payload=b"old")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/out.bin", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    p.write_bytes(write_payload)
+    out.append({
+        "label": "VolumePath.write_bytes(8 KiB) — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # VolumePath — open("wb") + write + close (cursor path)
+    service, client, workspace = _stub_databricks_service(payload=b"old")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/out.bin", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    with p.open("wb") as f:
+        f.write(write_payload)
+    out.append({
+        "label": "VolumePath open('wb') write close — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # DBFSPath — write_all
+    service, client, workspace = _stub_databricks_service(payload=b"old")
+    RemotePath._INSTANCES.clear()
+    p = DBFSPath("/dbfs/out.bin", service=service)
+    workspace.dbfs.put.reset_mock()
+    workspace.dbfs.read.reset_mock()
+    workspace.dbfs.get_status.reset_mock()
+    workspace.dbfs.delete.reset_mock()
+    p.write_all(write_payload)
+    out.append({
+        "label": "DBFSPath.write_all(8 KiB) — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # DBFSPath — open("wb") + write + close
+    service, client, workspace = _stub_databricks_service(payload=b"old")
+    RemotePath._INSTANCES.clear()
+    p = DBFSPath("/dbfs/out.bin", service=service)
+    workspace.dbfs.put.reset_mock()
+    workspace.dbfs.read.reset_mock()
+    workspace.dbfs.get_status.reset_mock()
+    workspace.dbfs.delete.reset_mock()
+    with p.open("wb") as f:
+        f.write(write_payload)
+    out.append({
+        "label": "DBFSPath open('wb') write close — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # VolumePath — seek + multi-write (still 1 call)
+    service, client, workspace = _stub_databricks_service(payload=b"old")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/out.bin", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    with p.open("wb") as f:
+        f.write(b"head")
+        f.seek(100)
+        f.write(b"tail")
+    out.append({
+        "label": "VolumePath open('wb') seek write write — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # ParquetFile write → VolumePath via write_arrow_io
+    service, client, workspace = _stub_databricks_service(payload=b"")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/x.parquet", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    ParquetFile(holder=p, owns_holder=False).write_arrow_table(
+        pa.table({"id": pa.array(range(100), type=pa.int64())}),
+    )
+    out.append({
+        "label": "ParquetFile(VolumePath).write_arrow_table — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    _bench_table = pa.table({"id": pa.array(range(100), type=pa.int64())})
+
+    # ArrowIPCFile write → VolumePath
+    service, client, workspace = _stub_databricks_service(payload=b"")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/x.arrow", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    ArrowIPCFile(holder=p, owns_holder=False).write_arrow_table(_bench_table)
+    out.append({
+        "label": "ArrowIPCFile(VolumePath).write_arrow_table — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # CSVFile write → VolumePath
+    service, client, workspace = _stub_databricks_service(payload=b"")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/x.csv", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    CSVFile(holder=p, owns_holder=False).write_arrow_table(_bench_table)
+    out.append({
+        "label": "CSVFile(VolumePath).write_arrow_table — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # NDJSONFile write → VolumePath
+    service, client, workspace = _stub_databricks_service(payload=b"")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/x.ndjson", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    NDJSONFile(holder=p, owns_holder=False).write_arrow_table(_bench_table)
+    out.append({
+        "label": "NDJSONFile(VolumePath).write_arrow_table — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
+    # Write timing — VolumePath.write_all
+    out.append(_time_one(
+        "VolumePath.write_all(8 KiB)",
+        lambda: _write_volume(write_payload),
+        repeat=repeat, inner=500,
+    ))
+
+    # Write timing — VolumePath open("wb") + write
+    out.append(_time_one(
+        "VolumePath open('wb') write close",
+        lambda: _write_volume_cursor(write_payload),
+        repeat=repeat, inner=500,
+    ))
+
     return out
+
+
+def _write_volume(payload: bytes) -> None:
+    service, _, _ = _stub_databricks_service()
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/out.bin", service=service)
+    p.write_all(payload)
+
+
+def _write_volume_cursor(payload: bytes) -> None:
+    service, _, _ = _stub_databricks_service()
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/out.bin", service=service)
+    with p.open("wb") as f:
+        f.write(payload)
 
 
 def _read_via_volume_path(service, payload):

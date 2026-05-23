@@ -113,85 +113,6 @@ _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 # its requests touch instead of walking the whole tree.
 
 
-# Minimum body size (bytes) before the cache-persist auto-compress
-# helper bothers to gzip. Below ~1 MiB the gzip header overhead +
-# per-call CPU + the small storage win is mostly noise; the Arrow IPC
-# writer on the local fast-path already zstd-compresses the row.
-_BODY_AUTOCOMPRESS_MIN_SIZE: int = 1 * 1024 * 1024
-
-# Plaintext MIME types worth gzipping before cache persistence. Routed
-# through the :class:`MimeType` enum so the alias / case / prefix
-# normalization is consistent with the rest of the codebase — if a
-# new plaintext format gets added to :class:`MimeTypes`, drop it into
-# this set in one place rather than maintaining a string list. Binary
-# entropy-dense formats (parquet, arrow IPC, mp4, zip, jpeg, …) stay
-# out — gzipping them costs CPU for near-zero savings.
-_AUTOCOMPRESS_MIMES: frozenset[MimeType] = frozenset({
-    MimeTypes.JSON,
-    MimeTypes.NDJSON,
-    MimeTypes.XML,
-    MimeTypes.HTML,
-    MimeTypes.PLAIN,
-    MimeTypes.CSV,
-    MimeTypes.TSV,
-    MimeTypes.YAML,
-    MimeTypes.TOML,
-})
-
-
-def _maybe_autocompress_body_for_cache(
-    response: Response,
-    *,
-    min_size: int = _BODY_AUTOCOMPRESS_MIN_SIZE,
-    codec: Codec = Codecs.GZIP,
-) -> None:
-    """Gzip-compress *response.body* in place before cache persistence.
-
-    Applies only when ALL of:
-
-    * the response has no existing ``Content-Encoding`` header (we
-      don't recompress brotli / gzip / zstd payloads — that's a no-win
-      for storage and breaks ``.content`` round-tripping),
-    * the response's resolved :class:`MimeType` is in
-      :data:`_AUTOCOMPRESS_MIMES`,
-    * the body is at least *min_size* bytes,
-    * gzip actually shrinks it by >10% — the storage win has to
-      outweigh the extra CPU on both the persist and the eventual
-      read.
-
-    On compress: swaps a fresh :class:`Memory` over the gzipped bytes
-    into ``response.buffer`` and stamps ``Content-Encoding: gzip`` +
-    new ``Content-Length`` via :meth:`Response.set_media_type`, which
-    already invalidates the response's deterministic-projection cache
-    so the row that lands in the Arrow batch carries the compressed
-    body + correct headers in one consistent shape. The cache reader
-    side picks the codec back off ``Content-Encoding`` and routes
-    ``.content`` / ``.text`` / ``.json`` through the existing
-    :class:`Codec` path — no special-case decompression on the read
-    path.
-    """
-    if response.headers.get("Content-Encoding"):
-        return
-    buffer = response.buffer
-    if buffer is None or buffer.size < min_size:
-        return
-    mime = response.media_type.mime_type if response.media_type is not None else None
-    if mime is None or mime not in _AUTOCOMPRESS_MIMES:
-        return
-
-    raw = buffer.to_bytes()
-    compressed = codec.compress_bytes(raw)
-    if len(compressed) >= int(len(raw) * 0.9):
-        # < 10% savings — gzip overhead + read-side decompress isn't
-        # worth it. Skip and persist the original bytes.
-        return
-
-    new_buffer = Memory()
-    with new_buffer.open(mode="wb", owns_holder=False) as bio:
-        bio.write(compressed)
-    response.buffer = new_buffer
-    response.set_media_type(MediaType.from_mime(mime_type=mime, codec=codec))
-
 
 def _insert_cache(
     tabular: Any,
@@ -1017,7 +938,6 @@ class HTTPSession(Session):
         )
         if tabular is None:
             return
-        _maybe_autocompress_body_for_cache(response)
         batch = response.to_arrow_batch(parse=False)
         # Prune values matter for the remote MERGE narrow-target
         # path; the local FolderPath ignores them on writes (it
@@ -1299,16 +1219,11 @@ class HTTPSession(Session):
         remote_cfg = config.remote_cache
         local_cfg = config.local_cache
 
-        # Per-request configs take precedence over the session-level ones.
         effective_local_cfg = request.local_cache_config or local_cfg
         effective_remote_cfg = request.remote_cache_config or remote_cfg
 
-        # --- 1. Check local cache first (fast, disk-based) ---
-        # UPSERT mode skips the lookup outright — the fresh fetch
-        # below will overwrite the on-disk entry through the same
-        # ``Tabular.write_arrow_batches`` surface both backends use.
         local_cache_tabular: Any = None
-        if effective_local_cfg.local_cache_enabled:
+        if effective_local_cfg is not None and effective_local_cfg.local_cache_enabled:
             local_cache_tabular = effective_local_cfg.cache_tabular(session=self)
             if effective_local_cfg.mode != Mode.UPSERT:
                 local_response = self._load_cached_response(
@@ -1322,7 +1237,8 @@ class HTTPSession(Session):
         # --- 2. Check remote cache (slower, network-based) ---
         # Skip when the effective config demands a forced refresh (UPSERT).
         if (
-            effective_remote_cfg.remote_cache_enabled
+            effective_remote_cfg is not None
+            and effective_remote_cfg.remote_cache_enabled
             and effective_remote_cfg.mode != Mode.UPSERT
         ):
             remote_response = self._load_cached_response(
@@ -1349,12 +1265,14 @@ class HTTPSession(Session):
         # cache lookups above already ran; reaching here means both
         # missed, so raise instead of crossing the wire.
         if config.cache_only:
+            local_enabled = effective_local_cfg.local_cache_enabled if effective_local_cfg is not None else False
+            remote_enabled = effective_remote_cfg.remote_cache_enabled if effective_remote_cfg is not None else False
             raise LookupError(
                 f"cache_only=True but no cached response for {request.method} "
                 f"{request.url} (local_cache_enabled="
-                f"{effective_local_cfg.local_cache_enabled}, "
+                f"{local_enabled}, "
                 f"remote_cache_enabled="
-                f"{effective_remote_cfg.remote_cache_enabled})."
+                f"{remote_enabled})."
             )
 
         request = self.prepare_request_before_send(request)
@@ -1371,7 +1289,7 @@ class HTTPSession(Session):
                 tabular=local_cache_tabular,
             )
 
-        if effective_remote_cfg.remote_cache_enabled:
+        if effective_remote_cfg is not None and effective_remote_cfg.remote_cache_enabled:
             # Pass the effective config so its mode (UPSERT or APPEND)
             # is used directly by the remote write.
             self._store_cached_response(
@@ -1498,7 +1416,7 @@ class HTTPSession(Session):
         pool: Optional[JobPoolExecutor | int] = None,
     ) -> HTTPResponse:
         if not isinstance(pool, JobPoolExecutor):
-            with JobPoolExecutor.parse(pool) as parsed_pool:
+            with JobPoolExecutor.from_(pool) as parsed_pool:
                 return self._combine_paginated_pages(
                     result=result,
                     request=request,
@@ -1679,22 +1597,18 @@ class HTTPSession(Session):
     def _effective_local_cfg(
         self,
         request: PreparedRequest,
-        session_cfg: CacheConfig,
-    ) -> CacheConfig:
-        # Prebuild the per-request override the same way
-        # :meth:`_send_many_batches` prebuilds the session-level
-        # config — so the downstream code can reach ``eff.path``
-        # uniformly without a ``local_cache_folder(session=...)``
-        # dance. ``prebuild`` is idempotent and skips remote-only /
-        # disabled configs.
+        session_cfg: CacheConfig | None,
+    ) -> CacheConfig | None:
         cfg = request.local_cache_config or session_cfg
+        if cfg is None:
+            return None
         return cfg.prebuild(session=self)
 
     def _effective_remote_cfg(
         self,
         request: PreparedRequest,
-        session_cfg: CacheConfig,
-    ) -> CacheConfig:
+        session_cfg: CacheConfig | None,
+    ) -> CacheConfig | None:
         return request.remote_cache_config or session_cfg
 
     @staticmethod
@@ -1754,7 +1668,7 @@ class HTTPSession(Session):
         hits: dict[Path, list[Response]] = {}
         misses: list[PreparedRequest] = []
 
-        if not session_local_cfg.local_cache_enabled and not any(
+        if (session_local_cfg is None or not session_local_cfg.local_cache_enabled) and not any(
             r.local_cache_config for r in batch
         ):
             # Cheap path: no local cache anywhere in this batch.
@@ -1771,7 +1685,7 @@ class HTTPSession(Session):
                 if key_to_local_cfg is not None
                 else None
             ) or self._effective_local_cfg(req, session_local_cfg)
-            if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
+            if eff is None or not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
             root = eff.local_cache_folder(session=self)
@@ -1838,7 +1752,7 @@ class HTTPSession(Session):
                 if key_to_remote_cfg is not None
                 else None
             ) or self._effective_remote_cfg(req, session_remote_cfg)
-            if t_cfg.mode == Mode.UPSERT:
+            if t_cfg is None or t_cfg.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
@@ -2072,7 +1986,7 @@ class HTTPSession(Session):
                 if key_to_remote_cfg is not None
                 else None
             ) or self._effective_remote_cfg(req, session_remote_cfg)
-            if t_cfg.mode == Mode.UPSERT:
+            if t_cfg is None or t_cfg.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
@@ -2378,7 +2292,7 @@ class HTTPSession(Session):
             eff = key_to_local_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_local_cfg
-            if not eff.local_cache_enabled:
+            if eff is None or not eff.local_cache_enabled:
                 continue
             root = eff.local_cache_folder(session=self)
             bucket = groups.get(root)
@@ -2395,8 +2309,6 @@ class HTTPSession(Session):
             # splits the batch back out by ``partition_key`` so each
             # response still lands under its own
             # ``partition_key=<v>/`` directory.
-            for response in group_responses:
-                _maybe_autocompress_body_for_cache(response)
             batch = _Response.values_to_arrow_batch(group_responses)
             Job.make(
                 _insert_cache, tabular, eff, batch,
@@ -2434,7 +2346,7 @@ class HTTPSession(Session):
             eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_remote_cfg
-            if not eff.remote_cache_enabled:
+            if eff is None or not eff.remote_cache_enabled:
                 continue
             gkey = self._remote_write_group_key(eff)
             if gkey not in groups:
@@ -2523,7 +2435,7 @@ class HTTPSession(Session):
             eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_remote_cfg
-            if not eff.remote_cache_enabled:
+            if eff is None or not eff.remote_cache_enabled:
                 continue
             if not eff.mirror_local_to_remote:
                 continue
@@ -2660,15 +2572,8 @@ class HTTPSession(Session):
         is_spark = spark is not None
 
         session_remote_cfg = config.remote_cache
-        # Build the session-level local cache's :class:`Tabular` once
-        # at entry so the rest of the pipeline can reach for
-        # ``cfg.tabular`` symmetrically with the remote side. The
-        # session-aware path (``base_url`` host/path → cache root)
-        # only resolves correctly when we have ``self`` in scope, so
-        # the prebuild has to happen here rather than at config-build
-        # time. ``prebuild`` is idempotent and a no-op on
-        # already-built / disabled / remote configs.
-        session_local_cfg = config.local_cache.prebuild(session=self)
+        _lc = config.local_cache
+        session_local_cfg = _lc.prebuild(session=self) if _lc is not None else None
 
         if is_spark:
             # FAIR scheduling lets the concurrent stage-4 inserts
@@ -2704,8 +2609,8 @@ class HTTPSession(Session):
             config.max_in_flight,
             ttl,
             config.ordered,
-            session_local_cfg.local_cache_enabled,
-            session_remote_cfg.remote_cache_enabled,
+            session_local_cfg.local_cache_enabled if session_local_cfg is not None else False,
+            session_remote_cfg.remote_cache_enabled if session_remote_cfg is not None else False,
         )
 
         chunk_index = 0
@@ -3115,7 +3020,7 @@ class HTTPSession(Session):
         for cfg_key, eff in key_to_remote_cfg.items():
             if eff is None:
                 eff = session_remote_cfg
-            if not eff.remote_cache_enabled:
+            if eff is None or not eff.remote_cache_enabled:
                 continue
             gkey = self._remote_write_group_key(eff)
             if gkey not in groups:
@@ -3393,6 +3298,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "GET",
@@ -3412,6 +3318,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def post(
@@ -3434,6 +3341,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "POST",
@@ -3454,6 +3362,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def put(
@@ -3476,6 +3385,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "PUT",
@@ -3496,6 +3406,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def patch(
@@ -3518,6 +3429,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "PATCH",
@@ -3538,6 +3450,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def delete(
@@ -3560,6 +3473,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "DELETE",
@@ -3580,6 +3494,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def head(
@@ -3601,6 +3516,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "HEAD",
@@ -3620,6 +3536,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def options(
@@ -3642,6 +3559,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "OPTIONS",
@@ -3662,6 +3580,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def request(
@@ -3685,6 +3604,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
         # form-urlencoding for mappings/sequences), ``timeout=`` becomes
@@ -3743,6 +3663,7 @@ class HTTPSession(Session):
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            **options,
         )
 
     def prepare_request(

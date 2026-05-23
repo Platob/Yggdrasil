@@ -304,7 +304,7 @@ def _resolve_currency_col(
     if isinstance(currency_col, str) and currency_col in columns:
         return get_distinct(), None
     if isinstance(currency_col, str):
-        static = Currency.parse(currency_col)
+        static = Currency.from_(currency_col)
         return (static,), static
     raise TypeError(
         f"{fn_name}: currency_col must be a Currency, ISO code str, or column name; "
@@ -369,7 +369,7 @@ def with_currency_equivalents(
     if fx is None:
         fx = FxRate()
 
-    target_currencies = tuple(Currency.parse(t) for t in targets)
+    target_currencies = tuple(Currency.from_(t) for t in targets)
     if not target_currencies:
         raise ValueError(
             "with_currency_equivalents(targets=()): pass at least one target "
@@ -381,7 +381,7 @@ def with_currency_equivalents(
 
     def _get_distinct_polars() -> tuple[Currency, ...]:
         seen = eager[currency_col].cast(pl.Utf8).drop_nulls().unique().to_list()  # type: ignore[union-attr]
-        return tuple(Currency.parse(s) for s in seen if s)
+        return tuple(Currency.from_(s) for s in seen if s)
 
     sources, static_source = _resolve_currency_col(
         currency_col, list(eager.columns), _get_distinct_polars, "with_currency_equivalents"
@@ -635,7 +635,7 @@ def spark_with_currency_equivalents(
     if fx is None:
         fx = FxRate()
 
-    target_currencies = tuple(Currency.parse(t) for t in targets)
+    target_currencies = tuple(Currency.from_(t) for t in targets)
     if not target_currencies:
         raise ValueError(
             "spark_with_currency_equivalents(targets=()): pass at least one "
@@ -709,7 +709,7 @@ def _distinct_currencies_spark(df: "ss.DataFrame", currency_col: str) -> list[Cu
         if token is None:
             continue
         try:
-            out.append(Currency.parse(token))
+            out.append(Currency.from_(token))
         except (TypeError, ValueError):
             LOGGER.warning(
                 "Skipping unparseable currency token %r from column %r",
@@ -832,9 +832,9 @@ def dash_dual_value_fields(
         elif isinstance(target, Currency):
             currency_targets = (target,)
         elif isinstance(target, str):
-            currency_targets = (Currency.parse(target),)
+            currency_targets = (Currency.from_(target),)
         elif isinstance(target, (list, tuple)):
-            currency_targets = tuple(Currency.parse(t) for t in target)
+            currency_targets = tuple(Currency.from_(t) for t in target)
         else:
             raise TypeError(
                 f"dash_dual_value_fields(currency=True, target={target!r}): "

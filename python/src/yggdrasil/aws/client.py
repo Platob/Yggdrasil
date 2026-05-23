@@ -480,7 +480,7 @@ class AWSClient(Singleton):
         return url
 
     @classmethod
-    def parse(cls: Type[TC], obj: Any) -> TC:
+    def from_(cls: Type[TC], obj: Any) -> TC:
         """Coerce *obj* (str / URL / dict / AWSClient) to a client."""
         if isinstance(obj, cls):
             return obj

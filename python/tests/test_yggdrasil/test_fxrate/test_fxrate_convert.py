@@ -42,7 +42,7 @@ class TestConvertLatest:
     def test_alias_resolution(self) -> None:
         b = StubFxBackend(quotes=(make_quote("USD", "EUR", value=0.92),))
         fx = FxRate(backends=(b,))
-        # Aliases parse through Currency.parse — '$' → USD, '€' → EUR.
+        # Aliases parse through Currency.from_ — '$' → USD, '€' → EUR.
         assert fx.convert(100.0, "$", "€") == pytest.approx(92.0)
 
     def test_currency_instances(self) -> None:

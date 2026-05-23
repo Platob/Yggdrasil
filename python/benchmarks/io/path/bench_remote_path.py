@@ -56,11 +56,16 @@ def _fmt(r: dict) -> str:
     unit = "us"
     if r["best"] < 1e-6:
         scale, unit = 1e9, "ns"
+    elif r["best"] >= 1e-3:
+        scale, unit = 1e3, "ms"
+    extra = ""
+    if "calls" in r:
+        extra = f"  sdk_calls={r['calls']:>3d}"
     return (
         f"{r['label']:<62s}  "
         f"best={r['best']*scale:8.2f} {unit}  "
         f"median={r['median']*scale:8.2f} {unit}  "
-        f"mean={r['mean']*scale:8.2f} {unit}"
+        f"mean={r['mean']*scale:8.2f} {unit}{extra}"
     )
 
 
@@ -247,8 +252,130 @@ def scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=2_000,
     ))
 
+    # -------------------------------------------------------------------
+    # Write SDK-call profiles
+    # -------------------------------------------------------------------
+
+    write_payload = b"x" * 8192
+
+    # write_all — truncate(0) + write_bytes
+    service = _stub_service(b"old-content")
+    RemotePath._INSTANCES.clear()
+    p = S3Path("s3://bucket/out.bin", service=service)
+    client = service.boto_client
+    client.put_object.reset_mock()
+    client.get_object.reset_mock()
+    client.head_object.reset_mock()
+    client.delete_object.reset_mock()
+    p.write_all(write_payload)
+    calls = sum(
+        m.call_count for m in (
+            client.put_object, client.get_object,
+            client.head_object, client.delete_object,
+        )
+    )
+    out.append({
+        "label": "S3Path.write_all(8 KiB) — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": calls,
+    })
+
+    # write_bytes — single put
+    service = _stub_service(b"old-content")
+    RemotePath._INSTANCES.clear()
+    p = S3Path("s3://bucket/out.bin", service=service)
+    client = service.boto_client
+    client.put_object.reset_mock()
+    client.get_object.reset_mock()
+    client.head_object.reset_mock()
+    p.write_bytes(write_payload)
+    calls = sum(
+        m.call_count for m in (
+            client.put_object, client.get_object,
+            client.head_object,
+        )
+    )
+    out.append({
+        "label": "S3Path.write_bytes(8 KiB) — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": calls,
+    })
+
+    # open("wb") + write + close — cursor path
+    service = _stub_service(b"old-content")
+    RemotePath._INSTANCES.clear()
+    p = S3Path("s3://bucket/out.bin", service=service)
+    client = service.boto_client
+    client.put_object.reset_mock()
+    client.get_object.reset_mock()
+    client.head_object.reset_mock()
+    client.delete_object.reset_mock()
+    with p.open("wb") as f:
+        f.write(write_payload)
+    calls = sum(
+        m.call_count for m in (
+            client.put_object, client.get_object,
+            client.head_object, client.delete_object,
+        )
+    )
+    out.append({
+        "label": "S3Path open('wb') write close — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": calls,
+    })
+
+    # S3Path — seek + multi-write (still 1 call)
+    service = _stub_service(b"old-content")
+    RemotePath._INSTANCES.clear()
+    p = S3Path("s3://bucket/out.bin", service=service)
+    client = service.boto_client
+    client.put_object.reset_mock()
+    client.get_object.reset_mock()
+    client.head_object.reset_mock()
+    with p.open("wb") as f:
+        f.write(b"head")
+        f.seek(100)
+        f.write(b"tail")
+    calls = sum(
+        m.call_count for m in (
+            client.put_object, client.get_object,
+            client.head_object, client.delete_object,
+        )
+    )
+    out.append({
+        "label": "S3Path open('wb') seek write write — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": calls,
+    })
+
+    # Write timings
+    out.append(_time_one(
+        "S3Path.write_all(8 KiB)",
+        lambda: _write_s3(write_payload),
+        repeat=repeat, inner=2_000,
+    ))
+    out.append(_time_one(
+        "S3Path open('wb') write close",
+        lambda: _write_s3_cursor(write_payload),
+        repeat=repeat, inner=2_000,
+    ))
+
     RemotePath._INSTANCES.clear()
     return out
+
+
+def _write_s3(payload: bytes) -> None:
+    service = _stub_service()
+    RemotePath._INSTANCES.clear()
+    S3Path("s3://bucket/out.bin", service=service).write_all(payload)
+
+
+def _write_s3_cursor(payload: bytes) -> None:
+    service = _stub_service()
+    RemotePath._INSTANCES.clear()
+    p = S3Path("s3://bucket/out.bin", service=service)
+    with p.open("wb") as f:
+        f.write(payload)
 
 
 def _walk_parents(p, n: int):

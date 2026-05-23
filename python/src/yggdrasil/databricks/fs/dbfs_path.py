@@ -284,36 +284,9 @@ class DBFSPath(DatabricksPath):
         """
         if offset != 0 or size >= 0:
             return super()._write_stream(src, offset=offset, size=size, **kwargs)
-        return self._stream_upload(src)
+        return self._upload(src)
 
-    def _write_mv(self, data: memoryview, pos: int) -> int:
-        """Splice via download → in-memory splice → re-upload.
-
-        DBFS has no positional-write API; a positional write has to be
-        a read-modify-write at the file granularity. The hot path
-        (``pos == 0``) skips the download entirely. For ``pos > 0`` we
-        issue a single read-to-EOF (no preceding ``get_status``) and
-        let :class:`FileNotFoundError` translate to "no bytes here yet".
-        """
-        n = len(data)
-        if n == 0:
-            return 0
-
-        if pos == 0:
-            payload = bytes(data)
-        else:
-            try:
-                existing = bytes(self._read_mv(-1, 0))
-            except FileNotFoundError:
-                existing = b""
-            if pos > len(existing):
-                existing = existing + b"\x00" * (pos - len(existing))
-            payload = existing[:pos] + bytes(data) + existing[pos + n :]
-
-        self._stream_upload(payload)
-        return n
-
-    def _stream_upload(self, content: Any) -> int:
+    def _upload(self, content: Any) -> int:
         """Write *content* to ``self.api_path`` via the streaming SDK.
 
         Accepts either a bytes-like payload or a seekable binary
@@ -387,31 +360,6 @@ class DBFSPath(DatabricksPath):
         else:
             logger.info("Uploaded DBFS file %r (size=stream)", self)
         return size
-
-    def truncate(self, n: int) -> int:
-        if n < 0:
-            raise ValueError(f"truncate size must be >= 0, got {n!r}")
-
-        if n == 0:
-            self._stream_upload(b"")
-            return 0
-
-        # Single read-to-EOF — no preceding ``get_status`` probe. A
-        # missing object is the natural "nothing to truncate" case;
-        # let it surface as zero existing bytes.
-        try:
-            existing = bytes(self._read_mv(-1, 0))
-        except FileNotFoundError:
-            existing = b""
-        if n <= len(existing):
-            head = existing[:n]
-        else:
-            head = existing + b"\x00" * (n - len(existing))
-        self._stream_upload(head)
-        return n
-
-    def _upload_full(self, content: "Any") -> int:
-        return self._stream_upload(content)
 
     def _clear(self) -> None:
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))

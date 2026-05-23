@@ -305,7 +305,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         elif mode is Mode.TRUNCATE:
             action = Mode.OVERWRITE
         elif mode in _MERGE_MODES:
-            if self.size == 0:
+            if not self.size_known or self.size == 0:
                 action = Mode.OVERWRITE
             else:
                 action = mode
@@ -316,12 +316,13 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         else:
             action = Mode.OVERWRITE
 
+        _has_existing = self.size_known and self.size > 0
         if action is Mode.IGNORE:
-            if self.size > 0:
+            if _has_existing:
                 return
             action = Mode.OVERWRITE
         elif action is Mode.ERROR_IF_EXISTS:
-            if self.size > 0:
+            if _has_existing:
                 raise FileExistsError(
                     f"{type(self).__name__} buffer is non-empty "
                     f"({self.size} bytes); refusing to overwrite under "
@@ -338,7 +339,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         if first is None:
             return
 
-        if action in _MERGE_MODES and self.size > 0:
+        if action in _MERGE_MODES and _has_existing:
             rewrite_options = options.with_target(self.collect_schema(options))
             existing = list(self._read_arrow_batches(rewrite_options))
             incoming: Iterator[pa.RecordBatch] = rewrite_options.cast_arrow_batch_iterator(iter([first, *iterator]))

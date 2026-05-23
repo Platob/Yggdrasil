@@ -671,7 +671,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 self.path
                 / self.YGGMETA_DIRNAME
                 / self.YGGMETA_SCHEMA_FILENAME
-            ).write_bytes(sink.getvalue().to_pybytes())
+            ).write_bytes(sink.getvalue().to_pybytes(), overwrite=True)
         except Exception:
             # Sidecar is opportunistic — never fail the data write.
             pass
@@ -1387,21 +1387,13 @@ class FolderPath(IO[bytes, FolderOptions]):
         first = materialised[0]
         first_schema = self._schema_for_arrow(first.schema)
 
+        action = self._resolve_action(options.mode)
+        if action is Mode.OVERWRITE:
+            from yggdrasil.data.schema import Schema
+            self._schema_cache = Schema.empty()
+
         partition_columns = self.partition_columns(options, schema=first_schema)
         if partition_columns:
-            # Partition split: union the materialised batches, group
-            # by the leading partition column, and recurse into each
-            # ``<self.path>/<col>=<val>/``. The recursion re-resolves
-            # the partition layout from the same schema; the child's
-            # ``static_values`` pins the consumed column so
-            # :meth:`partition_columns` filters it out and only the
-            # remaining levels fire. Multi-level layouts unwind
-            # automatically, single-column layouts land in the flat
-            # branch on the second hop. The partition column stays
-            # in the written payload — Hive convention drops it,
-            # but the cache layout keeps it so the row-level
-            # predicate on read runs against the same in-payload
-            # column without re-stamping from the directory name.
             head = partition_columns[0]
             if head not in first.schema.names:
                 raise ValueError(
@@ -1561,13 +1553,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         row_size = getattr(options, "row_size", None) or 0
 
         def _leaf_options(child: "Tabular") -> Any:
-            base = child.options_class()()
-            # In-place stamps on the freshly minted (frozen) options
-            # via the named ``with_*`` helpers — calling
-            # ``dataclasses.replace`` per child reruns
-            # ``__post_init__`` and allocates a fresh slot layout,
-            # which the bench (Session._store_cached_response) flagged
-            # as a 500 us / write regression.
+            base = child.options_class()(mode=Mode.OVERWRITE)
             if checked_cast and hasattr(base, "checked_cast"):
                 base.with_checked_cast(True, copy=False)
             if source_schema is not None:

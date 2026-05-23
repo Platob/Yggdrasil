@@ -22,6 +22,9 @@ from pathlib import Path
 
 BENCH_DIR = Path(__file__).resolve().parent
 
+# HTTP benchmarks live alongside their tests for better grouping.
+_TEST_BENCH_DIR = BENCH_DIR.parent / "tests" / "test_yggdrasil" / "test_http_" / "benchmarks"
+
 # Benchmarks that require live external systems — skipped by default.
 # Opt in with ``--include <name>``.
 _REQUIRES_LIVE: frozenset[str] = frozenset({
@@ -31,17 +34,21 @@ _REQUIRES_LIVE: frozenset[str] = frozenset({
 
 
 def _discover() -> list[Path]:
-    """Find every ``bench_*.py`` under ``BENCH_DIR`` (recursive).
+    """Find every ``bench_*.py`` under ``BENCH_DIR`` and the test HTTP
+    benchmarks directory (recursive).
 
     Benches are organized into module-mirrored subfolders
-    (``benchmarks/data/``, ``benchmarks/io/primitive/``, …) — we
-    walk the whole tree so newly-added module benches get picked
-    up without touching this file.
+    (``benchmarks/data/``, ``benchmarks/io/primitive/``, …) and the
+    HTTP benchmarks live in ``tests/test_yggdrasil/test_http_/benchmarks/``
+    — we walk both trees so all benches get picked up.
     """
-    return sorted(
+    found = [
         p for p in BENCH_DIR.rglob("bench_*.py")
         if p.name != Path(__file__).name
-    )
+    ]
+    if _TEST_BENCH_DIR.is_dir():
+        found.extend(_TEST_BENCH_DIR.rglob("bench_*.py"))
+    return sorted(found)
 
 
 def _run_one(path: Path, *, repeat: int) -> int:

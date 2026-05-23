@@ -144,7 +144,7 @@ def with_mongo_connection(
         from yggdrasil.databricks.compute.execution_context import exclude_env_key
         from yggdrasil.databricks.cluster.cluster import Cluster
 
-        databricks = DatabricksClient.parse(databricks)
+        databricks = DatabricksClient.from_(databricks)
 
         try:
             if isinstance(cluster, Cluster):

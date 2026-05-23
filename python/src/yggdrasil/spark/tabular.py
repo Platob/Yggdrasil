@@ -719,14 +719,23 @@ class Dataset(Tabular[CastOptions]):
     @classmethod
     def parallelize(
         cls,
-        function: Callable[..., Any],
         inputs: "Iterable[Any]",
+        function: "Callable[..., Any] | None" = None,
         schema: "Schema | None" = None,
         *,
         spark_session: Optional["SparkSession"] = None,
         byte_size: int = 128 * 1024 * 1024,
     ) -> "Dataset":
-        """Distribute ``function`` over ``inputs`` via ``mapInArrow``.
+        """Distribute ``function`` over ``inputs`` via ``mapInArrow``,
+        or create a frame directly from ``inputs`` when no function is
+        given.
+
+        Two call shapes:
+
+        * ``parallelize(inputs, function, schema=...)`` — apply
+          *function* to each element of *inputs* on Spark executors.
+        * ``parallelize(inputs, schema=...)`` — wrap *inputs* as a
+          :class:`Dataset` (delegates to :meth:`from_iterable`).
 
         Per-input dispatch goes through
         :func:`yggdrasil.dataclasses.build_row_invoker` so any
@@ -737,6 +746,13 @@ class Dataset(Tabular[CastOptions]):
         of pickled outputs; ``schema=<Schema>`` casts outputs and
         returns a typed frame.
         """
+        if function is None:
+            return cls.from_iterable(
+                inputs,
+                schema=schema,
+                spark_session=spark_session,
+                byte_size=byte_size,
+            )
         from yggdrasil.environ import PyEnv
         from yggdrasil.data.schema import Schema as _Schema
         from yggdrasil.dataclasses.safe_function import build_row_invoker

@@ -849,7 +849,7 @@ class DataType(BaseChildrenFields, ABC):
 
         Differences from :meth:`unwrap_optional`:
 
-        * String hints route through :class:`ParsedDataType.parse` so
+        * String hints route through :class:`ParsedDataType.from_` so
           the field name / nullability tag baked into the DSL form
           (e.g. ``"int64?"``) survives.
         * Multi-type unions stay intact — the caller wants
@@ -858,7 +858,7 @@ class DataType(BaseChildrenFields, ABC):
           without losing the multi-arm shape.
         """
         if isinstance(hint, str):
-            parsed = ParsedDataType.parse(hint)
+            parsed = ParsedDataType.from_(hint)
             if parsed.type_id == DataTypeId.NULL:
                 return type(None), True
             return hint, bool(parsed.nullable)

@@ -358,27 +358,6 @@ class WorkspacePath(DatabricksPath):
             return super()._write_stream(src, offset=offset, size=size, **kwargs)
         return self._upload(src)
 
-    def _write_mv(self, data: memoryview, pos: int) -> int:
-        n = len(data)
-        if n == 0:
-            return 0
-        if pos == 0:
-            payload = bytes(data)
-        else:
-            # Single ``workspace.download`` round trip — no preceding
-            # ``get_status`` probe. The Workspace API delivers the
-            # whole object on any download call, so asking for
-            # "to EOF" is no more expensive than a sized read.
-            try:
-                existing = bytes(self._read_mv(-1, 0))
-            except FileNotFoundError:
-                existing = b""
-            if pos > len(existing):
-                existing = existing + b"\x00" * (pos - len(existing))
-            payload = existing[:pos] + bytes(data) + existing[pos + n :]
-        self._upload(payload)
-        return n
-
     def _upload(self, content: Any) -> int:
         """Upload *content* through ``workspace.upload`` with retry semantics.
 
@@ -551,29 +530,6 @@ class WorkspacePath(DatabricksPath):
             )
         )
         return target
-
-    def truncate(self, n: int) -> int:
-        if n < 0:
-            raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        if n == 0:
-            self._upload(b"")
-            return 0
-        # Single ``workspace.download`` round trip — no preceding
-        # ``get_status``. A missing target surfaces as zero bytes and
-        # we upload a fresh zero-padded head.
-        try:
-            existing = bytes(self._read_mv(-1, 0))
-        except FileNotFoundError:
-            existing = b""
-        if n <= len(existing):
-            head = existing[:n]
-        else:
-            head = existing + b"\x00" * (n - len(existing))
-        self._upload(head)
-        return n
-
-    def _upload_full(self, content: "Any") -> int:
-        return self._upload(content)
 
     def _clear(self) -> None:
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))

@@ -261,6 +261,27 @@ class RemotePath(Path):
     # Resize is a no-op on remote backends — the upload IS the resize
     # ------------------------------------------------------------------
 
+    def _bread(self, n: int, pos: int, mode) -> "BytesIO":
+        from yggdrasil.io.bytes_io import BytesIO
+        del mode
+        if n == 0:
+            return BytesIO()
+        try:
+            data = bytes(self._read_mv(n, pos))
+        except FileNotFoundError:
+            data = b""
+        return BytesIO(data)
+
+    def _bwrite(self, data, pos: int, mode) -> int:
+        del mode
+        if hasattr(data, "to_bytes"):
+            payload = data.to_bytes()
+        elif hasattr(data, "read"):
+            payload = data.read()
+        else:
+            payload = bytes(data)
+        return self._write_mv(memoryview(payload), pos)
+
     def resize(self, n: int) -> int:
         """No-op for remote-backend paths.
 
@@ -378,7 +399,11 @@ class RemotePath(Path):
             offset = self._pos
         if size >= 0 and len(data) > size:
             data = data[:size]
-        total = self._effective_total()
+        if overwrite and offset == 0:
+            total = 0
+            self._stamp_buffered_size(0)
+        else:
+            total = self._effective_total()
         offset = _resolve_pos(offset, total)
         if offset < 0:
             raise ValueError(
@@ -423,35 +448,69 @@ class RemotePath(Path):
             self.flush()
         return n
 
-    def flush(self) -> None:
-        """Commit any dirty buffered pages to the backend.
+    def write_arrow_io(self, payload: "Any") -> int:
+        """Commit an Arrow-encoded payload directly to the backend.
 
-        Assembles the full payload from the page cache (fetching any
-        non-dirty gaps from the backend on the way) and writes it
-        through the subclass ``_write_mv`` primitive in a single
-        round trip. Whole-file backends (HTTP PUT, Volumes upload,
-        S3 PutObject) get the same shape as a direct
-        :meth:`write_bytes`; positional backends absorb one combined
-        write instead of one per buffered ``write_mv``. Pages are
-        marked clean afterwards so a follow-up read collapses to
-        cache hits.
+        Accepts a ``pa.Buffer``, ``bytes``, ``bytearray``, or
+        ``memoryview`` and uploads it in one backend call — no
+        page buffer, no truncate, no stat probe. Tabular IO files
+        (ParquetFile, ArrowIPCFile, etc.) route through this after
+        the format encoder finishes so the encoded bytes go straight
+        to the remote object without intermediate copies.
         """
+        if isinstance(payload, (bytes, bytearray)):
+            data = payload
+        elif isinstance(payload, memoryview):
+            data = bytes(payload)
+        else:
+            data = bytes(memoryview(payload))
+        self._upload(data)
+        self._touch_stat(size=len(data))
+        return len(data)
+
+    def _upload(self, content: bytes) -> int:
+        """Backend-specific atomic upload. Subclasses must override.
+
+        Accepts a materialised ``bytes`` payload and writes it as the
+        entire object in one round trip. Returns the byte count.
+        Called by :meth:`flush` and :meth:`_write_mv` (``pos == 0``).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _upload(content)."
+        )
+
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        """Splice *data* at *pos* via the backend upload primitive.
+
+        ``pos == 0`` is the fast path — a direct :meth:`_upload` with
+        no preceding download. ``pos > 0`` falls back to
+        read-modify-write: download the existing object, splice the
+        new bytes in, re-upload.
+        """
+        n = len(data)
+        if n == 0:
+            return 0
+        if pos == 0:
+            self._upload(bytes(data))
+            return n
+        try:
+            existing = bytes(self._read_mv(-1, 0))
+        except FileNotFoundError:
+            existing = b""
+        if pos > len(existing):
+            existing = existing + b"\x00" * (pos - len(existing))
+        payload = existing[:pos] + bytes(data) + existing[pos + n:]
+        self._upload(payload)
+        return n
+
+    def flush(self) -> None:
+        """Commit dirty buffered pages to the backend in one upload."""
         if self._dirty_pages:
             size = self._effective_total()
             payload = bytes(self._paged_read(size, 0)) if size > 0 else b""
-            # Strip the buffered-write tip off the stat cache before
-            # the subclass primitive runs. S3 / Volumes /…
-            # ``_write_mv`` consults ``_existing_size_or_zero`` to
-            # know how many bytes to splice in; with the buffered
-            # tip stamped onto the cache they'd issue a phantom GET
-            # for bytes the backend never had. The subclass's own
-            # ``_persist_stat_cache`` restamps the cache to reflect
-            # the freshly-committed object.
-            self._stat_cached = None
-            self._stat_cached_at = 0.0
             self._buffered_size = None
             try:
-                super().write_mv(memoryview(payload), 0, overwrite=True)
+                self._upload(payload)
             finally:
                 self._dirty_pages.clear()
         super().flush()
@@ -472,6 +531,26 @@ class RemotePath(Path):
                 exc,
             )
         super()._release()
+
+    def truncate(self, n: int) -> int:
+        """Page-buffered truncate for the ``truncate(0)`` overwrite prelude.
+
+        ``truncate(0)`` clears the page cache and stamps the logical
+        size without a network call — the subsequent write + flush
+        replaces the object atomically. ``truncate(n > 0)`` falls
+        through to the base read-modify-write path.
+        """
+        if n < 0:
+            raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        if n == 0 and self._page_size is not None:
+            if self._pages is not None:
+                self._discard_pages_past(0)
+            self._stamp_buffered_size(0)
+            self._touch_stat(size=0)
+            return 0
+        return super().truncate(n)
+
+
 
     # ------------------------------------------------------------------
     # Page-level helpers

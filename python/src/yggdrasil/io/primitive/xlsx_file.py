@@ -445,12 +445,13 @@ class XLSXFile(IO[bytes, XlsxOptions]):
         """
         action = self._resolve_action(options.mode)
 
+        _has_existing = self.size_known and self.size > 0
         if action is Mode.IGNORE:
-            if self.size > 0:
+            if _has_existing:
                 return
             action = Mode.OVERWRITE
         elif action is Mode.ERROR_IF_EXISTS:
-            if self.size > 0:
+            if _has_existing:
                 raise FileExistsError(
                     f"{type(self).__name__} buffer is non-empty "
                     f"({self.size} bytes); refusing to overwrite under "
@@ -468,7 +469,7 @@ class XLSXFile(IO[bytes, XlsxOptions]):
             return
 
         carry: list[tuple[str, list[tuple]]] = []
-        if action is Mode.APPEND and self.size > 0:
+        if action is Mode.APPEND and _has_existing:
             openpyxl = _openpyxl()
             with self.arrow_input_stream() as v:
                 wb_in = openpyxl.load_workbook(v, read_only=True, data_only=True)

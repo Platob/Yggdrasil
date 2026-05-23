@@ -250,7 +250,7 @@ class TestWithCurrencyEquivalents(PolarsTestCase):
             "amount": [100.0, 100.0],
             "ccy":    ["EUR", "XYZ"],
         })
-        # Currency.parse('XYZ') succeeds (any 3-letter alpha is treated
+        # Currency.from_('XYZ') succeeds (any 3-letter alpha is treated
         # as a valid ISO code), but the stub backend doesn't have rates
         # for XYZ — the equivalent column is null on that row.
         out = with_currency_equivalents(

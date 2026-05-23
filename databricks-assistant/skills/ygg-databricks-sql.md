@@ -1,94 +1,127 @@
-# Skill: run SQL on Databricks and get an Arrow / Polars / pandas / Spark frame
+# Skill: run SQL and manage tables
 
 ## When to use
 
-The user asks to "run / execute a query", "query Databricks SQL", "get
-a DataFrame from a warehouse", "fetch query results as Arrow / pandas
-/ Polars / Spark / a list of dicts", or to bind parameters / stream
-results / read into a target schema.
+The user asks to run SQL, query Databricks, get a DataFrame from a
+query, create/insert/merge a table, or work with `StatementResult`.
 
-## Primary surface
+## Run SQL
 
 ```python
 from yggdrasil.databricks import DatabricksClient
 
 dbc = DatabricksClient()
-stmt = dbc.sql.execute("SELECT * FROM main.default.orders LIMIT 100")
+result = dbc.sql.execute("SELECT * FROM main.default.orders LIMIT 100")
 ```
 
-`dbc.sql` is a `SQLEngine`. `execute(...)` returns a
-`StatementResult` (subclass of `yggdrasil.data.DataTable`'s `Tabular`)
-— a typed handle to the result, not yet materialised.
-
-## Materialise to whichever engine you want
+`execute(...)` returns a `StatementResult` — materialise to any engine:
 
 ```python
-stmt.to_arrow_table()   # pyarrow.Table
-stmt.to_pandas()        # pandas.DataFrame
-stmt.to_polars()        # polars.DataFrame
-stmt.to_spark()         # pyspark.sql.DataFrame
-stmt.to_pylist()        # list[dict] — only when rows ARE the endpoint
+result.to_arrow_table()   # pyarrow.Table
+result.to_polars()        # polars.DataFrame
+result.to_pandas()        # pandas.DataFrame
+result.to_spark()         # pyspark.sql.DataFrame
+result.to_pylist()        # list[dict] — only for genuine row endpoints
 ```
 
-Each materialiser preserves schema intent (names, order, nullability,
-nested structure, timezone). Don't post-process the result through
-another `.cast()` chain — pass a target schema instead (below).
-
-## Pin a target schema
-
-```python
-from yggdrasil.data.cast.options import CastOptions
-import yggdrasil.arrow as pa
-
-target = pa.schema([
-    pa.field("id",    pa.int64(),   nullable=False),
-    pa.field("amount", pa.decimal128(18, 2)),
-])
-
-stmt = dbc.sql.execute(
-    "SELECT id, amount FROM main.default.orders",
-    options=CastOptions(target_field=target),
-)
-out = stmt.to_arrow_table()  # already conforming to `target`
-```
-
-## Parameters / bindings
+### Parameters
 
 ```python
 dbc.sql.execute(
-    "SELECT * FROM main.default.orders WHERE id = :id",
+    "SELECT * FROM orders WHERE id = :id",
     parameters={"id": 42},
 )
 ```
 
-Don't string-format SQL with f-strings; the engine binds parameters
-safely.
+Don't f-string SQL — use parameter binding.
 
-## Warehouse vs. compute
-
-`SQLEngine` routes to a Databricks SQL warehouse by default. Choose
-explicitly:
+### Run many
 
 ```python
-dbc.sql.execute(q, warehouse_id="…")        # specific warehouse
-dbc.sql.execute(q, cluster_id="…")          # all-purpose cluster (Spark Connect)
+batch = dbc.sql.execute_many([
+    "CREATE TABLE IF NOT EXISTS ...",
+    "INSERT INTO ... SELECT ...",
+    "OPTIMIZE ...",
+])
 ```
 
-Defaults come from `DATABRICKS_WAREHOUSE_ID`,
-`DATABRICKS_CLUSTER_ID`, `DATABRICKS_SERVERLESS_COMPUTE_ID`.
+## Tables
 
-## DML / merges / inserts
+```python
+tbl = dbc.tables["main.default.orders"]
+```
 
-For inserts on a target table, prefer the `Table` API (see the
-`ygg-databricks-table` skill) — it handles staging, async inserts,
-Delta MERGE, prune-by predicates, and schema reconciliation. For
-one-off DML, `dbc.sql.execute("DELETE FROM …")` is fine.
+### Create
+
+```python
+from yggdrasil.data import Schema, Field, DataType
+
+schema = Schema.from_fields([
+    Field("id", DataType.int64(), nullable=False),
+    Field("amount", DataType.decimal(18, 2)),
+    Field("ts", DataType.timestamp("UTC")),
+])
+
+tbl.ensure_created(schema=schema)   # idempotent
+```
+
+### Insert
+
+Accepts Arrow, pandas, Polars, Spark frames, or dicts:
+
+```python
+tbl.insert(arrow_table)
+tbl.insert(polars_df)
+tbl.insert({"id": [1, 2], "amount": [9.99, 12.00]})
+```
+
+### Merge / upsert
+
+```python
+tbl.merge(data, keys=["id"], update_columns=["amount", "ts"])
+```
+
+### Async insert (large data via Volume staging)
+
+```python
+job = tbl.async_insert(data, staging_volume="main.default.staging")
+job.wait()
+```
+
+### Delete
+
+```python
+tbl.delete_where("ts < '2024-01-01'")
+tbl.delete()   # drop table
+```
+
+### Inspect
+
+```python
+tbl.exists
+tbl.schema         # yggdrasil Schema
+tbl.arrow_schema   # pyarrow.Schema
+tbl.columns        # list[Field]
+tbl.read_info()    # refresh metadata
+```
+
+## Dataset shortcut
+
+For Spark-native reads and writes, use Dataset:
+
+```python
+ds = dbc.dataset("SELECT * FROM main.raw.events")
+ds.map(transform).to_table("main.curated.events")
+```
+
+See the `ygg-spark-tabular` skill.
 
 ## Don'ts
 
-- Don't `to_pylist()` then comprehension over rows for type coercion
-  — pass a `target_field` schema and let the cast registry do it.
-- Don't open a fresh warehouse / cluster connection per query;
-  `SQLEngine` already pools and retries (`retry_sdk_call`).
-- Don't pre-check `exists` on a table before querying it — let the
-  query fail and handle `NotFound` if needed.
+- Don't pre-check `exists()` before inserting — `ensure_created` is
+  idempotent.
+- Don't loop rows to insert — pass a frame to `insert` / `merge`.
+- Don't call `ws.tables.create(...)` directly — use
+  `tbl.ensure_created()`.
+- Don't `to_pylist()` for type coercion — pass a target schema via
+  `CastOptions(target_field=...)`.

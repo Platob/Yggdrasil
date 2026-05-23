@@ -272,20 +272,20 @@ class TestWrite:
         body = client.put_object.call_args.kwargs["Body"]
         assert body == b"abc"
 
-    def test_truncate_to_zero_uploads_empty(self, client, service) -> None:
+    def test_truncate_to_zero_is_local_when_page_buffered(self, client, service) -> None:
         client.head_object.return_value = {"ContentLength": 6, "LastModified": None}
-        client.get_object.return_value = {"Body": _Body(b"abcdef")}
         p = S3Path("s3://b/k", service=service)
         p.truncate(0)
-        body = client.put_object.call_args.kwargs["Body"]
-        assert body == b""
+        client.put_object.assert_not_called()
+        client.get_object.assert_not_called()
+        assert p.size == 0
 
 
-class TestWriteAll:
+class TestOverwrite:
 
     def test_single_put_no_stat_no_get(self, client, service) -> None:
         p = S3Path("s3://b/data.bin", service=service)
-        n = p.write_all(b"hello-world")
+        n = p.write_bytes(b"hello-world", overwrite=True)
         assert n == 11
         client.put_object.assert_called_once()
         kwargs = client.put_object.call_args.kwargs
@@ -295,30 +295,10 @@ class TestWriteAll:
         client.head_object.assert_not_called()
         client.get_object.assert_not_called()
 
-    def test_stream_input(self, client, service) -> None:
-        import io
-
-        p = S3Path("s3://b/data.bin", service=service)
-        p.write_all(io.BytesIO(b"streamed"))
-        assert client.put_object.call_args.kwargs["Body"] == b"streamed"
-        client.head_object.assert_not_called()
-
     def test_memoryview_input(self, client, service) -> None:
         p = S3Path("s3://b/data.bin", service=service)
-        p.write_all(memoryview(b"view"))
+        p.write_bytes(memoryview(b"view"), overwrite=True)
         assert client.put_object.call_args.kwargs["Body"] == b"view"
-
-    def test_pyarrow_buffer_input(self, client, service) -> None:
-        import pyarrow as pa
-
-        buf = pa.BufferOutputStream()
-        buf.write(b"arrow-buffer-payload")
-        arrow_buf = buf.getvalue()
-
-        p = S3Path("s3://b/data.bin", service=service)
-        n = p.write_all(arrow_buf)
-        assert n == 20
-        assert client.put_object.call_args.kwargs["Body"] == b"arrow-buffer-payload"
 
     def test_parquet_roundtrip(self, client, service) -> None:
         import io
@@ -331,7 +311,7 @@ class TestWriteAll:
         parquet_bytes = sink.getvalue()
 
         p = S3Path("s3://b/out.parquet", service=service)
-        n = p.write_all(parquet_bytes)
+        n = p.write_bytes(parquet_bytes, overwrite=True)
 
         assert n == len(parquet_bytes)
         client.put_object.assert_called_once()
@@ -344,32 +324,9 @@ class TestWriteAll:
 
     def test_seeds_stat_cache(self, client, service) -> None:
         p = S3Path("s3://b/k", service=service)
-        p.write_all(b"12345")
+        p.write_bytes(b"12345", overwrite=True)
         assert p.size == 5
         client.head_object.assert_not_called()
-
-    def test_fewer_sdk_calls_than_write_bytes(self, client, service) -> None:
-        client.head_object.side_effect = _client_error()
-        client.list_objects_v2.return_value = {"KeyCount": 0}
-
-        p1 = S3Path("s3://b/a.bin", service=service)
-        p1.write_bytes(b"via-write-bytes")
-        wb_put_count = client.put_object.call_count
-        wb_head_count = client.head_object.call_count
-
-        client.put_object.reset_mock()
-        client.head_object.reset_mock()
-        client.head_object.side_effect = _client_error()
-
-        p2 = S3Path("s3://b/b.bin", service=service)
-        p2.write_all(b"via-write-all")
-        wa_put_count = client.put_object.call_count
-        wa_head_count = client.head_object.call_count
-
-        assert wa_put_count == 1
-        assert wa_head_count == 0
-        assert wa_put_count <= wb_put_count
-        assert wa_head_count < wb_head_count
 
     def test_parquetfile_write_arrow_table_uses_write_all(
         self,

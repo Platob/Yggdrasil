@@ -927,19 +927,20 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
     def parallelize(
         self,
-        function: "Callable",
         inputs: "Iterable",
+        function: "Callable | None" = None,
         *,
         schema: Any = None,
         byte_size: int = 128 * 1024 * 1024,
     ) -> "Dataset":
-        """Distribute *function* over *inputs* via Spark executors."""
+        """Distribute *function* over *inputs* via Spark executors, or
+        create a Dataset directly from *inputs* when no function is given."""
         from yggdrasil.spark.tabular import Dataset
 
         session = self.spark.resolve_session(create=True)
         return Dataset.parallelize(
-            function,
             inputs,
+            function,
             schema=schema,
             spark_session=session,
             byte_size=byte_size,

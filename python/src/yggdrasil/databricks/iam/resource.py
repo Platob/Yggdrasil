@@ -111,16 +111,13 @@ class IAMUser(DatabricksResource):
         )
 
     @classmethod
-    def parse(
+    def from_(
         cls,
         obj: Any,
         *,
         service: IAMUsers | None = None,
         client_type: Optional[ClientType] = None,
     ) -> "IAMUser":
-        """
-        Parse an arbitrary user-like object into ``IAMUser``.
-        """
         if isinstance(obj, cls):
             return obj
 
@@ -131,23 +128,23 @@ class IAMUser(DatabricksResource):
             ).set_details(obj)
 
         if isinstance(obj, Mapping):
-            return cls.parse_mapping(
+            return cls.from_mapping(
                 obj,
                 service=service,
                 client_type=client_type,
             )
 
         if isinstance(obj, str):
-            return cls.parse_str(
+            return cls.from_str(
                 obj,
                 service=service,
                 client_type=client_type,
             )
 
-        raise ValueError(f"Unsupported object type for parsing IAMUser: {type(obj)}")
+        raise ValueError(f"Unsupported object type for IAMUser: {type(obj)}")
 
     @classmethod
-    def parse_str(
+    def from_str(
         cls,
         value: str,
         *,
@@ -176,7 +173,7 @@ class IAMUser(DatabricksResource):
         )
 
     @classmethod
-    def parse_mapping(
+    def from_mapping(
         cls,
         data: Mapping[str, Any],
         *,
@@ -184,8 +181,7 @@ class IAMUser(DatabricksResource):
         client_type: Optional[ClientType] = None,
         **kwargs: Any,
     ) -> "IAMUser":
-        """
-        Parse a mapping into ``IAMUser``.
+        """Coerce a mapping into ``IAMUser``.
 
         Accepts mixed v1/v2/SCIM-style field names.
         """
@@ -343,16 +339,13 @@ class IAMGroup(DatabricksResource):
         return self.name or self.id or "unknown-group"
 
     @classmethod
-    def parse(
+    def from_(
         cls,
         obj: Any,
         *,
         service: IAMGroups | None = None,
         client_type: Optional[ClientType] = None,
     ) -> "IAMGroup":
-        """
-        Parse an arbitrary group-like object into ``IAMGroup``.
-        """
         if isinstance(obj, cls):
             return obj
 
@@ -363,16 +356,16 @@ class IAMGroup(DatabricksResource):
             ).set_details(obj)
 
         if isinstance(obj, Mapping):
-            return cls.parse_mapping(
+            return cls.from_mapping(
                 obj,
                 service=service,
                 client_type=client_type,
             )
 
-        raise ValueError(f"Unsupported object type for parsing IAMGroup: {type(obj)}")
+        raise ValueError(f"Unsupported object type for IAMGroup: {type(obj)}")
 
     @classmethod
-    def parse_mapping(
+    def from_mapping(
         cls,
         data: Mapping[str, Any],
         *,
@@ -380,8 +373,7 @@ class IAMGroup(DatabricksResource):
         client_type: Optional[ClientType] = None,
         **kwargs: Any,
     ) -> "IAMGroup":
-        """
-        Parse a mapping into ``IAMGroup``.
+        """Coerce a mapping into ``IAMGroup``.
 
         Accepts mixed v1/v2/SCIM-style field names.
         """
@@ -397,7 +389,7 @@ class IAMGroup(DatabricksResource):
         raw_members = kwargs.get("members") or kwargs.get("users") or []
 
         members = [
-            IAMUser.parse(member, service=service.users)
+            IAMUser.from_(member, service=service.users)
             for member in raw_members
             if member
         ] or None
@@ -441,7 +433,7 @@ class IAMGroup(DatabricksResource):
                 )
 
             self.members = [
-                IAMUser.parse(member, service=self.service.users)
+                IAMUser.from_(member, service=self.service.users)
                 for member in details.members or []
             ] or None
             return self
@@ -477,7 +469,7 @@ class IAMGroup(DatabricksResource):
 
         Membership is deduplicated by id, then by name, then by username.
         """
-        parsed_user = IAMUser.parse(user, service=self.service.users)
+        parsed_user = IAMUser.from_(user, service=self.service.users)
 
         if self.members is None:
             self.members = []

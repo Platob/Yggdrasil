@@ -23,8 +23,8 @@ overhead rather than the OS network stack.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/bench_http.py
-    PYTHONPATH=src python benchmarks/io/bench_http.py --repeat 7
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_http.py
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_http.py --repeat 7
 """
 from __future__ import annotations
 

@@ -652,194 +652,14 @@ class S3Path(RemotePath):
 
         return memoryview(data or b"")
 
-    def _write_mv(self, data: memoryview, pos: int) -> int:
-        """Splice *data* at *pos* via read-modify-write ``PutObject``.
-
-        S3 has no positional write; the only honest answer at the
-        object level is to download the existing payload, splice
-        the new bytes in at *pos*, and re-upload. Most callers don't
-        actually hit this hot path because :class:`BytesIO`'s
-        scratch transaction absorbs positional writes locally and
-        commits the whole object once on close.
-        """
-        n = len(data)
-        if n == 0:
-            return 0
-
-        try:
-            existing = bytes(self._read_mv(self._existing_size_or_zero(), 0))
-        except FileNotFoundError:
-            existing = b""
-
-        # Pad up to pos with zeros if the splice lands past EOF —
-        # mirrors local-fd behavior under O_RDWR.
-        if pos > len(existing):
-            existing = existing + b"\x00" * (pos - len(existing))
-
-        head = existing[:pos]
-        tail = existing[pos + n :]
-        payload = head + bytes(data) + tail
-
-        LOGGER.debug(
-            "Writing S3 object %r (bytes=%d, pos=%d, rmw=True)",
-            self,
-            len(payload),
-            pos,
-        )
-        self._call(
-            self.client.put_object,
-            Bucket=self.bucket,
-            Key=self.key,
-            Body=payload,
-        )
-        LOGGER.info("Wrote S3 object %r (bytes=%d)", self, len(payload))
-        self._persist_stat_cache(
-            IOStats(
-                size=len(payload),
-                kind=IOKind.FILE,
-                mtime=time.time(),
-                media_type=self.media_type,
-            )
-        )
-        return n
-
-    def _existing_size_or_zero(self) -> int:
-        """Read-side size probe used by RMW; tolerates a missing object."""
-        try:
-            return int(self._stat().size)
-        except Exception:
-            return 0
-
-    def truncate(self, n: int) -> int:
-        """Re-upload the head *n* bytes (zero-padded if extending)."""
-        if n < 0:
-            raise ValueError(f"truncate size must be >= 0, got {n!r}")
-
-        current = 0
-        try:
-            existing = bytes(self._read_mv(self._existing_size_or_zero(), 0))
-            current = len(existing)
-        except FileNotFoundError:
-            existing = b""
-
-        if n == current and current > 0:
-            return n
-
-        if n == 0:
-            payload = b""
-        elif n <= len(existing):
-            payload = existing[:n]
-        else:
-            payload = existing + b"\x00" * (n - len(existing))
-
-        LOGGER.debug("Truncating S3 object %r (size=%d)", self, n)
-        self._call(
-            self.client.put_object,
-            Bucket=self.bucket,
-            Key=self.key,
-            Body=payload,
-        )
-        LOGGER.info("Truncated S3 object %r (size=%d)", self, n)
-        self._persist_stat_cache(
-            IOStats(
-                size=len(payload),
-                kind=IOKind.FILE,
-                mtime=time.time(),
-                media_type=self.media_type,
-            )
-        )
-        return n
-
-    def reserve(self, n: int) -> None:
-        """No-op — S3 has no capacity-vs-size distinction."""
-        if n < 0:
-            raise ValueError(f"reserve size must be >= 0, got {n!r}")
-
-    def _clear(self) -> None:
-        """``DeleteObject``. Idempotent."""
-        self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
-
-    # ==================================================================
-    # _bread / _bwrite — fallbacks the base class declares abstract
-    # ==================================================================
-
-    def _bread(self, n: int, pos: int, mode):  # noqa: D401
-        """Fallback whole-file read into a fresh :class:`BytesIO`.
-
-        Used by callers that explicitly want a buffer instead of a
-        :class:`memoryview`; the hot path goes through :meth:`_read_mv`
-        directly.
-        """
-        from yggdrasil.io.bytes_io import BytesIO
-
-        del mode
-        size = n if n >= 0 else max(0, self._existing_size_or_zero() - pos)
-        if size <= 0:
-            return BytesIO()
-        try:
-            data = bytes(self._read_mv(size, pos))
-        except FileNotFoundError:
-            data = b""
-        return BytesIO(data)
-
-    def _bwrite(self, data, pos: int, mode) -> int:
-        """Fallback whole-file write from a :class:`BytesIO`."""
-        del mode
-        if hasattr(data, "to_bytes"):
-            payload = data.to_bytes()
-        elif hasattr(data, "read"):
-            payload = data.read()
-        else:
-            payload = bytes(data)
-        if pos == 0:
-            LOGGER.debug("Writing S3 object %r (bytes=%d)", self, len(payload))
-            self.client.put_object(
-                Bucket=self.bucket,
-                Key=self.key,
-                Body=payload,
-            )
-            LOGGER.info("Wrote S3 object %r (bytes=%d)", self, len(payload))
-            self._persist_stat_cache(
-                IOStats(
-                    size=len(payload),
-                    kind=IOKind.FILE,
-                    mtime=time.time(),
-                    media_type=self.media_type,
-                )
-            )
-            return len(payload)
-        return self._write_mv(memoryview(payload), pos)
-
-    # ==================================================================
-    # Fast whole-file write — no stat / resize / truncate overhead
-    # ==================================================================
-
-    def write_all(self, data: "Any") -> int:
-        """Write *data* as the entire object in one ``PutObject``.
-
-        Skips the stat probe, resize, truncate, and read-modify-write
-        the normal ``write_bytes`` path performs.
-
-        Accepts ``bytes``, ``bytearray``, ``memoryview``,
-        ``pyarrow.Buffer``, or any file-like with ``.read()``.
-        """
-        if isinstance(data, memoryview):
-            data = bytes(data)
-        if hasattr(data, "read"):
-            data = data.read()
-        if not isinstance(data, (bytes, bytearray)):
-            try:
-                data = bytes(memoryview(data))
-            except TypeError:
-                data = bytes(data)
-        payload = data
-        size = len(payload)
+    def _upload(self, content: bytes) -> int:
+        size = len(content)
         LOGGER.debug("Writing S3 object %r (bytes=%d)", self, size)
         self._call(
             self.client.put_object,
             Bucket=self.bucket,
             Key=self.key,
-            Body=payload,
+            Body=content,
         )
         LOGGER.info("Wrote S3 object %r (bytes=%d)", self, size)
         self._persist_stat_cache(
@@ -851,6 +671,13 @@ class S3Path(RemotePath):
             )
         )
         return size
+
+    def reserve(self, n: int) -> None:
+        if n < 0:
+            raise ValueError(f"reserve size must be >= 0, got {n!r}")
+
+    def _clear(self) -> None:
+        self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
     # ==================================================================
     # Repr

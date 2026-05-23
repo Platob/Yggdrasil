@@ -35,8 +35,8 @@ service to learn what the pool can actually do.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/bench_http_concurrent.py
-    PYTHONPATH=src python benchmarks/io/bench_http_concurrent.py --repeat 5
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_http_concurrent.py
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_http_concurrent.py --repeat 5
 """
 
 from __future__ import annotations
@@ -48,9 +48,12 @@ import sys
 import time
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_BENCH_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _BENCH_DIR.parent.parent.parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+if str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
 os.environ["PYTHONPATH"] = (
     str(_PROJECT_ROOT)
     + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
@@ -60,7 +63,7 @@ from yggdrasil.http_ import HTTPSession  # noqa: E402
 from yggdrasil.io.request import PreparedRequest  # noqa: E402
 from yggdrasil.io.send_config import SendManyConfig  # noqa: E402
 
-from benchmarks.io._bench_http_server import start_bench_server  # noqa: E402
+from _bench_http_server import start_bench_server  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

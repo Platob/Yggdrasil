@@ -1,10 +1,9 @@
 """In-process Session stub for the ``spark_send`` benchmark.
 
 Kept in its own module so :class:`_StubBenchSession` resolves to a
-stable ``benchmarks.io._bench_stub_session._StubBenchSession`` qualname.
-Spark workers unpickle the broadcast session by importing that path;
-defining the class inline in ``bench_spark_send.py`` would land it
-under ``__main__`` and break the worker-side import.
+stable qualname that Spark workers can import when unpickling the
+broadcast session. Defining the class inline in ``bench_spark_send.py``
+would land it under ``__main__`` and break the worker-side import.
 """
 from __future__ import annotations
 

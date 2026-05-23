@@ -745,28 +745,6 @@ class VolumePath(DatabricksPath):
             return super()._write_stream(src, offset=offset, size=size, **kwargs)
         return self._upload(src)
 
-    def _write_mv(self, data: memoryview, pos: int) -> int:
-        n = len(data)
-        if n == 0:
-            return 0
-        if pos == 0:
-            payload = bytes(data)
-        else:
-            # Positional write: pull the existing blob in a single
-            # ``files.download`` round trip (no preceding
-            # ``get_metadata`` probe). Volumes downloads the whole
-            # object regardless of the requested window, so asking
-            # for "to EOF" is free.
-            try:
-                existing = bytes(self._read_mv(-1, 0))
-            except FileNotFoundError:
-                existing = b""
-            if pos > len(existing):
-                existing = existing + b"\x00" * (pos - len(existing))
-            payload = existing[:pos] + bytes(data) + existing[pos + n :]
-        self._upload(payload)
-        return n
-
     def _upload(self, content: Any) -> int:
         """Upload *content* through ``files.upload`` with retry semantics.
 
@@ -832,29 +810,6 @@ class VolumePath(DatabricksPath):
         else:
             logger.info("Uploaded volume file %r (size=stream)", self)
         return size
-
-    def truncate(self, n: int) -> int:
-        if n < 0:
-            raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        if n == 0:
-            return 0
-        # One ``files.download`` round trip — skip the ``get_metadata``
-        # probe and read the whole object. A missing target collapses
-        # to "no existing bytes" and we upload a fresh zero-padded
-        # head of size ``n``.
-        try:
-            existing = bytes(self._read_mv(-1, 0))
-        except FileNotFoundError:
-            existing = b""
-        if n <= len(existing):
-            head = existing[:n]
-        else:
-            head = existing + b"\x00" * (n - len(existing))
-        self._upload(head)
-        return n
-
-    def _upload_full(self, content: "Any") -> int:
-        return self._upload(content)
 
     def _clear(self) -> None:
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))

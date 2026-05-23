@@ -46,17 +46,17 @@ class Currency:
             raise ValueError(f"Currency code must be ISO-4217 alpha-3, got {self.code!r}")
 
     @classmethod
-    def parse(cls, obj: Any) -> "Currency":
+    def from_(cls, obj: Any) -> "Currency":
         if isinstance(obj, cls):
             return obj
         if obj is None:
             return cls.USD
         if isinstance(obj, str):
-            return cls.parse_str(obj)
+            return cls.from_str(obj)
         raise TypeError(f"Cannot parse {type(obj).__name__} as {cls.__name__}")
 
     @classmethod
-    def parse_str(cls, s: str) -> "Currency":
+    def from_str(cls, s: str) -> "Currency":
         if not isinstance(s, str):
             raise TypeError(f"Expected str, got {type(s).__name__}")
         # Fast path: most callers pass an already-canonical ISO code

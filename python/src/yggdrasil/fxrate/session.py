@@ -73,7 +73,7 @@ LOGGER = logging.getLogger(__name__)
 
 #: ``(source, target)`` shape accepted by :meth:`FxRate.fetch`. Each
 #: side accepts a :class:`Currency` instance, an ISO 4217 alpha-3
-#: code, or any alias :meth:`Currency.parse_str` recognises
+#: code, or any alias :meth:`Currency.from_str` recognises
 #: (``"$"`` → USD, ``"€"`` → EUR, ``"yen"`` → JPY, …).
 PairLike = tuple[Union[Currency, str], Union[Currency, str]]
 
@@ -160,7 +160,7 @@ def _coerce_currency(value: Union[Currency, str]) -> Currency:
     if isinstance(value, Currency):
         return value
     try:
-        return Currency.parse(value)
+        return Currency.from_(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"Invalid currency {value!r}: {exc}. Pass an ISO 4217 alpha-3 "
@@ -411,7 +411,7 @@ class FxRate(HTTPSession):
         Args:
             pairs: Iterable of ``(source, target)`` couples. Each side
                 accepts :class:`Currency`, an ISO 4217 alpha-3 string,
-                or any alias :meth:`Currency.parse_str` accepts
+                or any alias :meth:`Currency.from_str` accepts
                 (``"$"``, ``"€"``, ``"yen"`` …).
             start: Window start, UTC. Anything :func:`yggdrasil.data
                 .cast.convert` parses into a :class:`datetime.datetime`
@@ -506,7 +506,7 @@ class FxRate(HTTPSession):
         Args:
             amount: Source-currency amount.
             source: Source currency — :class:`Currency`, ISO 4217
-                alpha-3, or any alias :meth:`Currency.parse_str` accepts.
+                alpha-3, or any alias :meth:`Currency.from_str` accepts.
             target: Target currency — same coercion rules.
             at: Optional historical point. Anything
                 :func:`yggdrasil.data.cast.convert` parses into a

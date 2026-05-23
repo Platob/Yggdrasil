@@ -29,8 +29,8 @@ fails to come up — the bench prints a single skip row in that case.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/bench_session_cache_spark.py
-    PYTHONPATH=src python benchmarks/io/bench_session_cache_spark.py --repeat 5
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_session_cache_spark.py
+    PYTHONPATH=src python tests/test_yggdrasil/test_http_/benchmarks/bench_session_cache_spark.py --repeat 5
 """
 from __future__ import annotations
 

@@ -928,17 +928,6 @@ class URL(os.PathLike):
         return _encode_path(path, safe=safe)
 
     @classmethod
-    def parse(
-        cls,
-        obj: Any,
-        *,
-        default_scheme: str | None = None,
-        decode: bool = False,
-        normalize: bool = True,
-    ):
-        return cls.from_(obj, default_scheme=default_scheme, decode=decode, normalize=normalize)
-
-    @classmethod
     def from_(
         cls,
         obj: Any,

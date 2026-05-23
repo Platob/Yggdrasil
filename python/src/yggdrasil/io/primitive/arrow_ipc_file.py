@@ -248,7 +248,7 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         # would only see "no bytes left to read at the cursor" and
         # would mis-fire after an earlier write parked the cursor at
         # EOF. APPEND-into-recently-written is the canonical case.
-        has_existing = self.size > 0
+        has_existing = self.size_known and self.size > 0
 
         if action is Mode.IGNORE:
             if has_existing:

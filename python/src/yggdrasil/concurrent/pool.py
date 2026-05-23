@@ -69,7 +69,7 @@ class JobPoolExecutor(ThreadPoolExecutor):
     # ------------------------------------------------------------------
 
     @classmethod
-    def parse(
+    def from_(
         cls,
         obj: Any,
         *,

@@ -59,7 +59,7 @@ def databricks_remote_compute(
     if workspace is None:
         return identity if _func is None else _func
 
-    workspace = DatabricksClient.parse(workspace)
+    workspace = DatabricksClient.from_(workspace)
 
     if cluster is None:
         if cluster_id or cluster_name:

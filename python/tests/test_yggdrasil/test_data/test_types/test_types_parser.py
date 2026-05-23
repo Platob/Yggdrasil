@@ -259,7 +259,7 @@ class TestParserTemporalFastPaths:
         )
 
     def test_variant_normalizes_to_object(self) -> None:
-        assert ParsedDataType.parse("variant") == ParsedDataType(
+        assert ParsedDataType.from_("variant") == ParsedDataType(
             DataTypeId.OBJECT, DataTypeMetadata()
         )
 
@@ -272,7 +272,7 @@ class TestParserTemporalFastPaths:
 class TestParserPythonSyntax:
 
     def test_list_int(self) -> None:
-        assert ParsedDataType.parse("list[int]") == ParsedDataType(
+        assert ParsedDataType.from_("list[int]") == ParsedDataType(
             DataTypeId.ARRAY,
             DataTypeMetadata(),
             children=(
@@ -281,7 +281,7 @@ class TestParserPythonSyntax:
         )
 
     def test_dict_str_int(self) -> None:
-        assert ParsedDataType.parse("dict[str, int]") == ParsedDataType(
+        assert ParsedDataType.from_("dict[str, int]") == ParsedDataType(
             DataTypeId.MAP,
             DataTypeMetadata(),
             children=(
@@ -291,7 +291,7 @@ class TestParserPythonSyntax:
         )
 
     def test_tuple_fixed_becomes_struct_with_positional_names(self) -> None:
-        assert ParsedDataType.parse("tuple[int, str]") == ParsedDataType(
+        assert ParsedDataType.from_("tuple[int, str]") == ParsedDataType(
             DataTypeId.STRUCT,
             DataTypeMetadata(ordered=True, extras={"container": "tuple"}),
             children=(
@@ -307,26 +307,26 @@ class TestParserPythonSyntax:
         )
 
     def test_set_normalises_to_array(self) -> None:
-        assert ParsedDataType.parse("set[str]") == ParsedDataType(
+        assert ParsedDataType.from_("set[str]") == ParsedDataType(
             DataTypeId.ARRAY,
             DataTypeMetadata(ordered=False, extras={"container": "set"}),
             children=(ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),),
         )
 
     def test_optional_marks_inner_nullable(self) -> None:
-        assert ParsedDataType.parse("Optional[int]") == ParsedDataType(
+        assert ParsedDataType.from_("Optional[int]") == ParsedDataType(
             DataTypeId.INT32,
             DataTypeMetadata(nullable=True, byte_size=4),
         )
 
     def test_pipe_union_with_none_marks_nullable(self) -> None:
-        assert ParsedDataType.parse("int | None") == ParsedDataType(
+        assert ParsedDataType.from_("int | None") == ParsedDataType(
             DataTypeId.INT32,
             DataTypeMetadata(nullable=True, byte_size=4),
         )
 
     def test_pipe_union_with_three_children(self) -> None:
-        assert ParsedDataType.parse("int | str | None") == ParsedDataType(
+        assert ParsedDataType.from_("int | str | None") == ParsedDataType(
             DataTypeId.UNION,
             DataTypeMetadata(nullable=True),
             children=(
@@ -336,7 +336,7 @@ class TestParserPythonSyntax:
         )
 
     def test_generic_union(self) -> None:
-        assert ParsedDataType.parse("Union[int, str]") == ParsedDataType(
+        assert ParsedDataType.from_("Union[int, str]") == ParsedDataType(
             DataTypeId.UNION,
             DataTypeMetadata(),
             children=(
@@ -346,7 +346,7 @@ class TestParserPythonSyntax:
         )
 
     def test_annotated_preserves_inner_type_and_extras(self) -> None:
-        assert ParsedDataType.parse('Annotated[str, "pk", "indexed"]') == ParsedDataType(
+        assert ParsedDataType.from_('Annotated[str, "pk", "indexed"]') == ParsedDataType(
             DataTypeId.STRING,
             DataTypeMetadata(
                 extras={"annotation_1": "pk", "annotation_2": "indexed"}
@@ -362,13 +362,13 @@ class TestParserPythonSyntax:
 class TestParserLiteralsAndEnums:
 
     def test_literal_with_strings(self) -> None:
-        assert ParsedDataType.parse('Literal["a", "b"]') == ParsedDataType(
+        assert ParsedDataType.from_('Literal["a", "b"]') == ParsedDataType(
             DataTypeId.ENUM,
             DataTypeMetadata(literals=("a", "b"), enum_values=("a", "b")),
         )
 
     def test_literal_with_mixed_types(self) -> None:
-        assert ParsedDataType.parse("Literal[1, 'x', true, None]") == ParsedDataType(
+        assert ParsedDataType.from_("Literal[1, 'x', true, None]") == ParsedDataType(
             DataTypeId.ENUM,
             DataTypeMetadata(
                 literals=(1, "x", True, None),
@@ -377,13 +377,13 @@ class TestParserLiteralsAndEnums:
         )
 
     def test_enum_function_single(self) -> None:
-        assert ParsedDataType.parse("enum('a')") == ParsedDataType(
+        assert ParsedDataType.from_("enum('a')") == ParsedDataType(
             DataTypeId.ENUM,
             DataTypeMetadata(literals=("a",), enum_values=("a",)),
         )
 
     def test_enum_function_multiple(self) -> None:
-        assert ParsedDataType.parse("enum('a', 'b', 'c')") == ParsedDataType(
+        assert ParsedDataType.from_("enum('a', 'b', 'c')") == ParsedDataType(
             DataTypeId.ENUM,
             DataTypeMetadata(
                 literals=("a", "b", "c"),
@@ -400,49 +400,49 @@ class TestParserLiteralsAndEnums:
 class TestParserSQLSyntax:
 
     def test_decimal_python_style(self) -> None:
-        assert ParsedDataType.parse("decimal(18, 4)") == ParsedDataType(
+        assert ParsedDataType.from_("decimal(18, 4)") == ParsedDataType(
             DataTypeId.DECIMAL, DataTypeMetadata(precision=18, scale=4)
         )
 
     def test_decimal_sql_numeric(self) -> None:
-        assert ParsedDataType.parse("numeric(38, 12)") == ParsedDataType(
+        assert ParsedDataType.from_("numeric(38, 12)") == ParsedDataType(
             DataTypeId.DECIMAL, DataTypeMetadata(precision=38, scale=12)
         )
 
     def test_varchar_with_length(self) -> None:
-        assert ParsedDataType.parse("varchar(255)") == ParsedDataType(
+        assert ParsedDataType.from_("varchar(255)") == ParsedDataType(
             DataTypeId.STRING, DataTypeMetadata(length=255, args=(255,))
         )
 
     def test_character_varying_with_length(self) -> None:
-        assert ParsedDataType.parse("character varying(1024)") == ParsedDataType(
+        assert ParsedDataType.from_("character varying(1024)") == ParsedDataType(
             DataTypeId.STRING, DataTypeMetadata(length=1024, args=(1024,))
         )
 
     def test_timestamp_with_time_zone(self) -> None:
-        assert ParsedDataType.parse("timestamp with time zone") == ParsedDataType(
+        assert ParsedDataType.from_("timestamp with time zone") == ParsedDataType(
             DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="with_time_zone")
         )
 
     def test_timestamp_without_time_zone(self) -> None:
-        assert ParsedDataType.parse("timestamp without time zone") == ParsedDataType(
+        assert ParsedDataType.from_("timestamp without time zone") == ParsedDataType(
             DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="without_time_zone")
         )
 
     def test_timestamp_ntz(self) -> None:
-        assert ParsedDataType.parse("timestamp_ntz") == ParsedDataType(
+        assert ParsedDataType.from_("timestamp_ntz") == ParsedDataType(
             DataTypeId.TIMESTAMP, DataTypeMetadata(timezone="ntz")
         )
 
     def test_array_of_string(self) -> None:
-        assert ParsedDataType.parse("array<string>") == ParsedDataType(
+        assert ParsedDataType.from_("array<string>") == ParsedDataType(
             DataTypeId.ARRAY,
             DataTypeMetadata(),
             children=(ParsedDataType(DataTypeId.STRING, DataTypeMetadata()),),
         )
 
     def test_map_string_int(self) -> None:
-        assert ParsedDataType.parse("map<string, int>") == ParsedDataType(
+        assert ParsedDataType.from_("map<string, int>") == ParsedDataType(
             DataTypeId.MAP,
             DataTypeMetadata(),
             children=(
@@ -452,7 +452,7 @@ class TestParserSQLSyntax:
         )
 
     def test_struct_simple(self) -> None:
-        assert ParsedDataType.parse("struct<a:int,b:string>") == ParsedDataType(
+        assert ParsedDataType.from_("struct<a:int,b:string>") == ParsedDataType(
             DataTypeId.STRUCT,
             DataTypeMetadata(),
             children=(
@@ -468,7 +468,7 @@ class TestParserSQLSyntax:
         )
 
     def test_struct_with_quoted_names_and_nullability_suffixes(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             'struct<"price"?:decimal(18,6),`ts`!:timestamp_ntz>'
         ) == ParsedDataType(
             DataTypeId.STRUCT,
@@ -488,7 +488,7 @@ class TestParserSQLSyntax:
         )
 
     def test_struct_field_not_null_phrase(self) -> None:
-        parsed = ParsedDataType.parse(
+        parsed = ParsedDataType.from_(
             "STRUCT<scheme: STRING NOT NULL, userinfo: STRING, "
             "host: STRING NOT NULL, port: INT, path: STRING NOT NULL, "
             "query: STRING, fragment: STRING>"
@@ -508,7 +508,7 @@ class TestParserSQLSyntax:
         ]
 
     def test_struct_field_non_null_phrase(self) -> None:
-        parsed = ParsedDataType.parse("struct<a: int NON NULL, b: string>")
+        parsed = ParsedDataType.from_("struct<a: int NON NULL, b: string>")
         assert [(c.name, c.metadata.nullable) for c in parsed.children] == [
             ("a", False),
             ("b", None),
@@ -519,7 +519,7 @@ class TestParserSQLSyntax:
         # in Spark/Databricks DDL with names like `_xml:lang` and
         # `_rtr:msgType` — the colon is part of the name, not the
         # name/type separator).
-        parsed = ParsedDataType.parse(
+        parsed = ParsedDataType.from_(
             "struct<_xml:lang:string, _rtr:msgType:string, normal:int, "
             "rtr:versionedId:array<struct<_guid:string>>>"
         )
@@ -536,7 +536,7 @@ class TestParserSQLSyntax:
         ]
 
     def test_recursive_nested_expression(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "array<map<string, struct<a:int,b:array<string>>>> | null"
         ) == ParsedDataType(
             DataTypeId.ARRAY,
@@ -574,7 +574,7 @@ class TestParserSQLSyntax:
         )
 
     def test_dictionary_named_metadata(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "dictionary[index=int, value=string, ordered=true]"
         ) == ParsedDataType(
             DataTypeId.DICTIONARY,
@@ -586,7 +586,7 @@ class TestParserSQLSyntax:
         )
 
     def test_dictionary_positional_args(self) -> None:
-        assert ParsedDataType.parse("dictionary[int, string]") == ParsedDataType(
+        assert ParsedDataType.from_("dictionary[int, string]") == ParsedDataType(
             DataTypeId.DICTIONARY,
             DataTypeMetadata(),
             children=(
@@ -604,7 +604,7 @@ class TestParserSQLSyntax:
 class TestParserMetadata:
 
     def test_string_metadata_with_quoted_values(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "string[encoding='utf8', format=`email`, nullable=true]"
         ) == ParsedDataType(
             DataTypeId.STRING,
@@ -612,22 +612,22 @@ class TestParserMetadata:
         )
 
     def test_binary_metadata(self) -> None:
-        assert ParsedDataType.parse("binary[encoding=base64]") == ParsedDataType(
+        assert ParsedDataType.from_("binary[encoding=base64]") == ParsedDataType(
             DataTypeId.BINARY, DataTypeMetadata(encoding="base64")
         )
 
     def test_time_metadata(self) -> None:
-        assert ParsedDataType.parse("time[unit=ms, nullable=false]") == ParsedDataType(
+        assert ParsedDataType.from_("time[unit=ms, nullable=false]") == ParsedDataType(
             DataTypeId.TIME, DataTypeMetadata(unit="ms", nullable=False)
         )
 
     def test_duration_metadata(self) -> None:
-        assert ParsedDataType.parse("interval[unit=us]") == ParsedDataType(
+        assert ParsedDataType.from_("interval[unit=us]") == ParsedDataType(
             DataTypeId.DURATION, DataTypeMetadata(unit="us")
         )
 
     def test_timestamp_metadata_full(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             'timestamp[tz="UTC", unit="ns", ordered=true, nullable=true]'
         ) == ParsedDataType(
             DataTypeId.TIMESTAMP,
@@ -637,7 +637,7 @@ class TestParserMetadata:
         )
 
     def test_metadata_identifier_values_treated_as_strings(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "timestamp[tz=UTC, unit=ms, encoding=base64]"
         ) == ParsedDataType(
             DataTypeId.TIMESTAMP,
@@ -656,12 +656,12 @@ class TestParserMetadata:
     def test_nullability_suffixes(
         self, expr: str, expected_nullable: bool
     ) -> None:
-        assert ParsedDataType.parse(expr) == ParsedDataType(
+        assert ParsedDataType.from_(expr) == ParsedDataType(
             DataTypeId.STRING, DataTypeMetadata(nullable=expected_nullable)
         )
 
     def test_outer_pipe_None_overrides_inner_metadata(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "timestamp[nullable=false] | None"
         ) == ParsedDataType(
             DataTypeId.TIMESTAMP, DataTypeMetadata(nullable=True)
@@ -677,20 +677,20 @@ class TestParserEdgeCases:
 
     def test_empty_input_raises(self) -> None:
         with pytest.raises(ValueError, match="empty"):
-            ParsedDataType.parse("")
+            ParsedDataType.from_("")
 
     def test_empty_with_default_returns_default(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "", default=DataTypeId.NULL
         ) == ParsedDataType(DataTypeId.NULL, DataTypeMetadata())
 
     def test_invalid_with_default_returns_default(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "map<string>", default=DataTypeId.NULL
         ) == ParsedDataType(DataTypeId.NULL, DataTypeMetadata())
 
     def test_invalid_with_object_default_returns_object(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "map<string>", default=DataTypeId.OBJECT
         ) == ParsedDataType(DataTypeId.OBJECT, DataTypeMetadata())
 
@@ -698,35 +698,35 @@ class TestParserEdgeCases:
         # Anything that isn't a DataTypeId / ParsedDataType / Ellipsis
         # collapses to OBJECT — strings used to land here, but OBJECT
         # is the safer "I don't know what this is" type.
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "map<string>", default=None
         ) == ParsedDataType(DataTypeId.OBJECT, DataTypeMetadata())
 
     def test_map_requires_two_children(self) -> None:
         with pytest.raises(ValueError, match="exactly two"):
-            ParsedDataType.parse("map<string>")
+            ParsedDataType.from_("map<string>")
 
     def test_unbalanced_brackets_raise(self) -> None:
         with pytest.raises(ValueError):
-            ParsedDataType.parse("array<map<string, int>")
+            ParsedDataType.from_("array<map<string, int>")
 
     def test_unterminated_string_literal_raises(self) -> None:
         with pytest.raises(ValueError):
-            ParsedDataType.parse('Literal["x]')
+            ParsedDataType.from_('Literal["x]')
 
     def test_trailing_tokens_raise(self) -> None:
         with pytest.raises(ValueError, match="Unexpected trailing tokens"):
-            ParsedDataType.parse("int garbage")
+            ParsedDataType.from_("int garbage")
 
     def test_unknown_type_falls_back_to_object(self) -> None:
-        assert ParsedDataType.parse("my_custom_type") == ParsedDataType(
+        assert ParsedDataType.from_("my_custom_type") == ParsedDataType(
             DataTypeId.OBJECT,
             DataTypeMetadata(name="my_custom_type"),
             name="my_custom_type",
         )
 
     def test_unknown_type_inside_map_falls_back_to_object(self) -> None:
-        assert ParsedDataType.parse(
+        assert ParsedDataType.from_(
             "map<string, my_custom_type(point, 4326)>"
         ) == ParsedDataType(
             DataTypeId.MAP,
@@ -772,7 +772,7 @@ class TestParserTypeIdMatrix:
         ],
     )
     def test_top_level_type_ids(self, expr: str, expected_id: DataTypeId) -> None:
-        assert ParsedDataType.parse(expr).type_id is expected_id
+        assert ParsedDataType.from_(expr).type_id is expected_id
 
 
 # ---------------------------------------------------------------------------

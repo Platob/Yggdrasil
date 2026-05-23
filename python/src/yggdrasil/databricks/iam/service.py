@@ -61,7 +61,7 @@ class IAMGroups(IAM):
             members = [self.client.iam.users.current_user]
 
         if group is None:
-            group = IAMGroup.parse_mapping(
+            group = IAMGroup.from_mapping(
                 kwargs,
                 service=self,
                 client_type=client_type,
@@ -69,7 +69,7 @@ class IAMGroups(IAM):
                 members=members
             )
         else:
-            group = IAMGroup.parse(
+            group = IAMGroup.from_(
                 group,
                 service=self,
                 client_type=client_type
@@ -120,7 +120,7 @@ class IAMGroups(IAM):
                 details=e.details,
             ) from e
 
-        result = IAMGroup.parse(
+        result = IAMGroup.from_(
             details,
             service=self,
             client_type=client_type
@@ -208,7 +208,7 @@ class IAMGroups(IAM):
 
         try:
             for details in client.groups.list(filter=filter_by):
-                group = IAMGroup.parse(details, service=self, client_type=client_type)
+                group = IAMGroup.from_(details, service=self, client_type=client_type)
                 yield group
                 cnt += 1
 
@@ -233,7 +233,7 @@ class IAMUsers(IAM):
         from .resource import IAMUser
 
         if user is None:
-            user = IAMUser.parse_mapping(
+            user = IAMUser.from_mapping(
                 kwargs,
                 service=self,
                 client_type=client_type,
@@ -241,7 +241,7 @@ class IAMUsers(IAM):
                 active=active
             )
         else:
-            user = IAMUser.parse(
+            user = IAMUser.from_(
                 user,
                 service=self,
                 client_type=client_type
@@ -280,7 +280,7 @@ class IAMUsers(IAM):
         except Exception:
             raise
 
-        result = IAMUser.parse(
+        result = IAMUser.from_(
             details,
             service=self,
             client_type=client_type
@@ -323,7 +323,7 @@ class IAMUsers(IAM):
         cnt, limit = 0, limit or float("inf")
 
         for details in client.users.list(filter=filter_by):
-            user = IAMUser.parse(details, service=self, client_type=client_type)
+            user = IAMUser.from_(details, service=self, client_type=client_type)
             yield user
             cnt += 1
 
@@ -337,7 +337,7 @@ class IAMUsers(IAM):
         def factory():
             try:
                 details = self.client.workspace_client().current_user.me()
-                result = IAMUser.parse(
+                result = IAMUser.from_(
                     details,
                     service=self,
                     client_type=self.client.default_client_type

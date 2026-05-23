@@ -281,7 +281,7 @@ def _coerce_buffer(
 def _parse_status_code(obj: Mapping[str, Any]) -> int:
     status = get_from_dict(obj, keys=("status_code", "status", "code"), prefix=None)
     if status is MISSING or status in (None, ""):
-        raise ValueError("Response.parse_mapping: missing status_code/status/code")
+        raise ValueError("Response.from_mapping: missing status_code/status/code")
     return int(status) if isinstance(status, int) else int(float(str(status).strip()))
 
 
@@ -853,40 +853,40 @@ class Response(Tabular["ResponseOptions"]):
     # ------------------------------------------------------------------
 
     @classmethod
-    def parse(cls, obj: Any, *, normalize: bool = True) -> "Response":
+    def from_(cls, obj: Any, *, normalize: bool = True) -> "Response":
         if isinstance(obj, cls):
             return obj
         if isinstance(obj, str):
-            return cls.parse_str(obj, normalize=normalize)
+            return cls.from_str(obj, normalize=normalize)
         if isinstance(obj, Mapping):
-            return cls.parse_mapping(obj, normalize=normalize)
-        return cls.parse_str(str(obj), normalize=normalize)
+            return cls.from_mapping(obj, normalize=normalize)
+        return cls.from_str(str(obj), normalize=normalize)
 
     @classmethod
-    def parse_str(cls, raw: str, *, normalize: bool = True) -> "Response":
+    def from_str(cls, raw: str, *, normalize: bool = True) -> "Response":
         s = raw.strip()
         if not s:
-            raise ValueError("Response.parse_str: empty string")
+            raise ValueError("Response.from_str: empty string")
         try:
             d = json_module.loads(s)
         except Exception as exc:
-            raise ValueError("Response.parse_str: expected JSON object string") from exc
+            raise ValueError("Response.from_str: expected JSON object string") from exc
         if not isinstance(d, Mapping):
-            raise ValueError("Response.parse_str: JSON must decode to a mapping")
-        return cls.parse_mapping(d, normalize=normalize)
+            raise ValueError("Response.from_str: JSON must decode to a mapping")
+        return cls.from_mapping(d, normalize=normalize)
 
     @classmethod
-    def parse_mapping(
+    def from_mapping(
         cls,
         obj: Mapping[str, Any],
         *,
         normalize: bool = True,
     ) -> "Response":
         if not obj:
-            raise ValueError("Response.parse_mapping: empty mapping")
+            raise ValueError("Response.from_mapping: empty mapping")
 
         req_obj = get_from_dict(obj, keys=("request",), prefix=None)
-        request = PreparedRequest.parse(
+        request = PreparedRequest.from_(
             obj if req_obj is MISSING or req_obj in (None, "") else req_obj,
             normalize=normalize,
         )
@@ -1507,7 +1507,7 @@ class Response(Tabular["ResponseOptions"]):
                 return [_to_python(v) for v in value]
             return value
 
-        return cls.parse_mapping(_to_python(row), normalize=normalize)
+        return cls.from_mapping(_to_python(row), normalize=normalize)
 
     @classmethod
     def from_arrow_tabular(
@@ -1599,7 +1599,7 @@ class Response(Tabular["ResponseOptions"]):
         #  2) legacy nested ``request`` struct (pre-unnest snapshots
         #     and round-tripping through ``arrow_values``);
         #  3) flat top-level request columns (``method``, ``url`` ...) —
-        #     used by ``parse_mapping`` callers that bypass the schema.
+        #     used by ``from_mapping`` callers that bypass the schema.
         request_value = get("request")
         if isinstance(request_value, Mapping):
             request = PreparedRequest._from_get(request_value.get, normalize=normalize)

@@ -747,31 +747,6 @@ class Path(IO, os.PathLike, ABC):
     # Fast whole-file write
     # ==================================================================
 
-    def write_all(self, data: "Any") -> int:
-        """Write *data* as the entire file content in one shot.
-
-        On local paths this is a single ``open("wb") + write``.
-        Remote subclasses override with their atomic upload
-        primitive, skipping the stat / resize / truncate overhead
-        the normal ``write_bytes`` path performs.
-
-        Accepts ``bytes``, ``bytearray``, ``memoryview``, or any
-        file-like with ``.read()``.
-        """
-        if isinstance(data, memoryview):
-            data = bytes(data)
-        if hasattr(data, "read"):
-            data = data.read()
-        if not isinstance(data, (bytes, bytearray)):
-            data = bytes(data)
-        fspath = os.fspath(self)
-        parent = os.path.dirname(fspath)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(fspath, "wb") as fh:
-            fh.write(data)
-        return len(data)
-
     # ==================================================================
     # Dunder
     # ==================================================================

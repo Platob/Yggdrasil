@@ -817,37 +817,6 @@ class DatabricksPath(DatabricksResource, RemotePath):
 
     # ------------------------------------------------------------------
     # Fast whole-file write — no stat / resize / truncate overhead
-    # ------------------------------------------------------------------
-
-    def write_all(self, data: "Any") -> int:
-        """Write *data* as the entire file content in one shot.
-
-        Skips the stat probe, resize, truncate, and
-        read-modify-write the normal ``write_bytes`` path performs
-        and goes straight to the backend's atomic upload.
-
-        Accepts ``bytes``, ``bytearray``, ``memoryview``,
-        ``pyarrow.Buffer``, or any file-like with ``.read()``.
-        """
-        if isinstance(data, memoryview):
-            data = bytes(data)
-        elif not isinstance(data, (bytes, bytearray)) and not hasattr(data, "read"):
-            try:
-                data = bytes(memoryview(data))
-            except TypeError:
-                data = bytes(data)
-        return self._upload_full(data)
-
-    def _upload_full(self, content: "Any") -> int:
-        """Backend-specific atomic upload. Subclasses override."""
-        return self._write_mv(
-            (
-                memoryview(content)
-                if isinstance(content, (bytes, bytearray))
-                else memoryview(bytes(content))
-            ),
-            0,
-        )
 
 
 # ---------------------------------------------------------------------------

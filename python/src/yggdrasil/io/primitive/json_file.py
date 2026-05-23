@@ -190,12 +190,13 @@ class JSONFile(IO[bytes, JsonOptions]):
         """
         action = self._resolve_action(options.mode)
 
+        _has_existing = self.size_known and self.size > 0
         if action is Mode.IGNORE:
-            if self.size > 0:
+            if _has_existing:
                 return
             action = Mode.OVERWRITE
         elif action is Mode.ERROR_IF_EXISTS:
-            if self.size > 0:
+            if _has_existing:
                 raise FileExistsError(
                     f"{type(self).__name__} buffer is non-empty "
                     f"({self.size} bytes); refusing to overwrite under "
@@ -212,7 +213,7 @@ class JSONFile(IO[bytes, JsonOptions]):
         if first is None:
             return
 
-        if action is Mode.APPEND and self.size > 0:
+        if action is Mode.APPEND and _has_existing:
             existing = list(self._read_arrow_batches(options))
             chained = iter([*existing, first, *iterator])
             return self._write_arrow_batches(

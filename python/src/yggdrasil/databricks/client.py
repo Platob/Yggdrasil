@@ -728,7 +728,7 @@ class DatabricksClient(Singleton, URLBased):
     from_parsed_url = from_url
 
     @classmethod
-    def parse(cls, obj: Any):
+    def from_(cls, obj: Any):
         if isinstance(obj, cls):
             return obj
         elif isinstance(obj, URL):
@@ -1464,27 +1464,27 @@ class DatabricksClient(Singleton, URLBased):
 
     def parallelize(
         self,
-        function: "Callable",
         inputs: "Any",
+        function: "Callable | None" = None,
         *,
         schema: Any = None,
         byte_size: int = 128 * 1024 * 1024,
     ):
-        """Distribute *function* over *inputs* via Spark executors.
-
-        Builds a :class:`~yggdrasil.spark.tabular.Dataset` directly
-        from :meth:`Dataset.parallelize`, using the Databricks
-        Connect session from :meth:`spark`::
+        """Distribute *function* over *inputs* via Spark executors, or
+        create a :class:`~yggdrasil.spark.tabular.Dataset` directly
+        from *inputs* when no function is given::
 
             dbc = DatabricksClient()
-            results = dbc.parallelize(fetch, urls, schema=output_schema)
-            results.to_table("main.curated.fetched")
+            # With function
+            results = dbc.parallelize(urls, fetch, schema=output_schema)
+            # Without function — just wrap inputs as a Dataset
+            ds = dbc.parallelize(rows, schema=output_schema)
         """
         from yggdrasil.spark.tabular import Dataset
 
         return Dataset.parallelize(
-            function,
             inputs,
+            function,
             schema=schema,
             spark_session=self.spark(),
             byte_size=byte_size,

@@ -229,7 +229,7 @@ def dash_fxrate_entrypoint(
             Typically ``"<catalog>.<source>.dash_fxrate"``.
         targets_json: JSON-encoded list of target currency ISO 4217
             codes (``["EUR","USD","CHF"]``). Validated through
-            :meth:`Currency.parse` so typos fail at deploy time.
+            :meth:`Currency.from_` so typos fail at deploy time.
         lookback_days: Refresh window depth. Defaults to 30 days —
             enough to absorb late upstream republishes the raw
             ingestion job picks up.
@@ -251,7 +251,7 @@ def dash_fxrate_entrypoint(
 
     _logger = _logging.getLogger("yggdrasil.fxrate.dash")
 
-    targets = [Currency.parse(t) for t in _json.loads(targets_json)]
+    targets = [Currency.from_(t) for t in _json.loads(targets_json)]
     if not targets:
         raise ValueError(
             "dash_fxrate_entrypoint: targets_json must decode to a non-empty "
@@ -288,7 +288,7 @@ def dash_fxrate_entrypoint(
     table.ensure_created(definition=Schema.from_fields(fields))
 
     # Portable wide-form pivot via MAX(CASE WHEN …). Currency codes are
-    # ISO 4217 alpha-3 (validated by ``Currency.parse``), so the inline
+    # ISO 4217 alpha-3 (validated by ``Currency.from_``), so the inline
     # interpolation is safe; table names came from the deploy-time call
     # site, same authority as every other SQL in this codebase.
     cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=int(lookback_days))
@@ -690,7 +690,7 @@ def deploy_scheduled_fxrate_job(
 
 
 def _normalise_dash_targets(targets: Iterable[str]) -> list[str]:
-    """Normalise *targets* through :meth:`Currency.parse` and dedupe.
+    """Normalise *targets* through :meth:`Currency.from_` and dedupe.
 
     Validates at deploy time so a typo doesn't ride into a scheduled
     run; preserves the caller's order so the dash table's column order
@@ -702,7 +702,7 @@ def _normalise_dash_targets(targets: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for t in targets:
-        code = Currency.parse(t).code
+        code = Currency.from_(t).code
         if code in seen:
             continue
         seen.add(code)

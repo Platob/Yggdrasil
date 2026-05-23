@@ -150,7 +150,7 @@ class ParsedDataType:
         )
 
     @classmethod
-    def parse(
+    def from_(
         cls,
         value: str,
         *,
@@ -197,7 +197,7 @@ class ParsedDataType:
         *,
         default: Any = ...,
     ) -> DataTypeId:
-        return cls.parse(
+        return cls.from_(
             value,
             default=default,
         ).type_id
@@ -644,7 +644,7 @@ class _Parser:
         self.n_tokens = len(self.tokens)
         self.index = 0
         # Stored for subclass / debug use; the parser body always
-        # raises on failure and lets :meth:`ParsedDataType.parse`
+        # raises on failure and lets :meth:`ParsedDataType.from_`
         # decide whether to re-raise or fall back to ``default``.
         self.default = default
 
@@ -1637,7 +1637,7 @@ class _Parser:
     def _fail(self, message: str) -> Any:
         """Signal a parse error by raising ``ValueError``.
 
-        Always raises — the outer :meth:`ParsedDataType.parse` owns the
+        Always raises — the outer :meth:`ParsedDataType.from_` owns the
         recovery decision via its ``raise_error`` flag. Raising here
         (rather than returning a sentinel) keeps mid-parse state
         coherent: a sentinel return would cascade into
@@ -1807,12 +1807,12 @@ def parse_data_type(
     *,
     default: Any = ...,
 ) -> ParsedDataType:
-    """Module-level alias for :meth:`ParsedDataType.parse`.
+    """Module-level alias for :meth:`ParsedDataType.from_`.
 
     See that method for the ``default`` semantics — passing
     :data:`...` raises on failure, anything else is a fallback.
     """
-    return ParsedDataType.parse(
+    return ParsedDataType.from_(
         value,
         default=default,
     )
