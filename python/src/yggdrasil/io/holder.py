@@ -2326,10 +2326,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         if isinstance(data, memoryview):
             return self._write_all_bytes(bytes(data))
 
-        if isinstance(data, IO):
-            return self._write_all_bytes(data.to_bytes())
-
-        if hasattr(data, "read"):
+        if isinstance(data, IO) or hasattr(data, "read"):
             return self._write_all_stream(data)
 
         # Buffer-protocol objects (pa.Buffer, numpy arrays, etc.)
