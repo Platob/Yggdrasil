@@ -27,21 +27,19 @@ from typing import Any, Iterable
 
 from ..nodes import (
     Arithmetic,
-    ArithmeticOp,
     Between,
     Cast,
     Column,
     Comparison,
-    CompareOp,
     Expression,
     InList,
     IsNull,
     Like,
     Literal,
     Logical,
-    LogicalOp,
     Not,
 )
+from ..operators import ArithmeticOp, CompareOp, LogicalOp
 
 
 __all__ = ["to_sql", "from_sql", "Dialect", "DEFAULT_DIALECT"]

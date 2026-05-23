@@ -1268,7 +1268,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 topmost = node
             node = getattr(node, "tabular_parent", None)
         try:
-            from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+            from yggdrasil.io.tabular.execution.expr import free_columns
             cols = free_columns(predicate)
         except Exception:
             return None

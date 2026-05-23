@@ -11,6 +11,16 @@ Public surface:
   :func:`neg` — fluent factories.
 - :class:`CompareOp`, :class:`LogicalOp`, :class:`ArithmeticOp` —
   shared operator enums.
+- :func:`simplify` — algebraic normaliser (also exposed as
+  :meth:`Expression.simplify`).
+- :func:`walk`, :func:`free_columns` — pre-order visitors.
+- :func:`extract_partition_filters` — over-approximate partition
+  pruner.
+
+The implementation is split across sibling modules to keep each
+file focused: ``nodes.py`` for the AST dataclasses, ``operators.py``
+for the operator enums, ``simplify.py`` / ``partition.py`` / ``walk.py``
+for the algorithms. Callers import everything from here.
 
 Projections live on :class:`yggdrasil.data.data_field.Field`,
 which is the single canonical "selector" the tabular API
@@ -32,25 +42,24 @@ directly.
 from .builder import all_of, any_of, col, neg
 from .nodes import (
     Arithmetic,
-    ArithmeticOp,
     Between,
     Cast,
     Column,
     Comparison,
-    CompareOp,
     Expression,
     InList,
     IsNull,
     Like,
     Literal,
     Logical,
-    LogicalOp,
     Not,
     Predicate,
-    extract_partition_filters,
     lit,
-    simplify,
 )
+from .operators import ArithmeticOp, CompareOp, LogicalOp
+from .partition import extract_partition_filters
+from .simplify import simplify
+from .walk import free_columns, walk
 
 __all__ = [
     "Arithmetic",
@@ -73,7 +82,9 @@ __all__ = [
     "any_of",
     "col",
     "extract_partition_filters",
+    "free_columns",
     "lit",
     "neg",
     "simplify",
+    "walk",
 ]

@@ -563,7 +563,7 @@ class Tabular(ABC, Generic[O]):
             return True
         if free_cols is None:
             try:
-                from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+                from yggdrasil.io.tabular.execution.expr import free_columns
                 free_cols = free_columns(predicate)
             except Exception:
                 return True

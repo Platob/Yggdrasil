@@ -1613,7 +1613,7 @@ def _arrow_row_filter_for(
     if predicate is None:
         return None
     try:
-        from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+        from yggdrasil.io.tabular.execution.expr import free_columns
     except ImportError:
         return None
 

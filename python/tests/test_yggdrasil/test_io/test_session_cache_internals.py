@@ -138,7 +138,7 @@ class TestCacheLookupPredicates:
         )
 
     def _free_columns(self, pred):
-        from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+        from yggdrasil.io.tabular.execution.expr import free_columns
         return free_columns(pred)
 
     def test_single_request_predicate_partitions_and_matches(self) -> None:
