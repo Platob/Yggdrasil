@@ -593,56 +593,77 @@ class Predicate(Expression):
     def filter_arrow_batch(self, batch: "Any") -> "Any":
         """Return *batch* keeping only rows where the predicate holds.
 
-        Wraps the input :class:`pyarrow.RecordBatch` in a single-row-
-        group :class:`pyarrow.dataset.InMemoryDataset` and runs the
-        filter through ``Dataset.to_table(filter=...)``, which executes
-        in pyarrow's C++ kernels. Returns a fresh ``RecordBatch``;
-        when the filter drops every row, the result is a zero-row
-        batch with the same schema. Pass-through on a zero-row input.
+        Picks the best filter strategy internally:
+
+        * **Hashset shortcut** — when the predicate decomposes into
+          ``InList(Column, [literals])`` or
+          ``AND(InList, InList, ...)`` (the canonical post-``simplify``
+          shape for primary-key / cache-key lookups), each row is
+          probed against a :class:`frozenset` of accepted values per
+          column. Skips pyarrow's per-call compile + scan entirely —
+          ~30x faster than :meth:`pa.RecordBatch.filter` on the
+          1-row-per-leaf cache shape.
+        * **pyarrow fallback** — anything else (``Comparison``,
+          ``OR``-chains, ``Between``, ``Like``, unhashable IN values)
+          compiles to a :class:`pyarrow.compute.Expression` once via
+          :meth:`to_arrow` and filters through pyarrow's C++ kernel.
+
+        Null handling matches pyarrow's ``isin``:
+
+        * ``v is None and includes_null`` → kept,
+        * ``v is None and not includes_null`` → dropped,
+        * ``v in value_set`` → kept,
+        * otherwise → dropped.
+
+        Returns a non-zero-row :class:`pa.RecordBatch` when at least
+        one row matches, a zero-row slice (same schema) when none do.
         """
-        import pyarrow as pa
-        import pyarrow.dataset as pds
+        import pyarrow as pa  # noqa: F401  — used by the fast path
 
         if batch.num_rows == 0:
             return batch
-        table = pds.dataset(pa.Table.from_batches([batch])).to_table(
-            filter=self.to_arrow(),
-        )
-        out = table.combine_chunks().to_batches()
-        if out:
-            return out[0]
-        return pa.RecordBatch.from_pylist([], schema=batch.schema)
+        clauses = _predicate_to_inlist_clauses(self)
+        if clauses is not None:
+            return _apply_inlist_clauses_to_batch(batch, clauses)
+        return batch.filter(self.to_arrow())
 
     def filter_arrow_table(self, table: "Any") -> "Any":
         """Return *table* keeping only rows where the predicate holds.
 
-        Same shape as :meth:`filter_arrow_batch` but for
-        :class:`pyarrow.Table`. Empty input returns the input
-        unchanged so callers don't have to guard the zero-row case.
+        Same dispatch rules as :meth:`filter_arrow_batch` — hashset
+        shortcut for static-value ``InList`` shapes,
+        :meth:`pa.Table.filter` for the general case. Empty input
+        returns the input unchanged so callers don't have to guard
+        the zero-row case.
         """
-        import pyarrow.dataset as pds
-
         if table.num_rows == 0:
             return table
-        return pds.dataset(table).to_table(filter=self.to_arrow())
+        clauses = _predicate_to_inlist_clauses(self)
+        if clauses is not None:
+            return _apply_inlist_clauses_to_table(table, clauses)
+        return table.filter(self.to_arrow())
 
     def filter_arrow_batches(
         self, batches: "Iterable[Any]",
     ) -> "Iterator[Any]":
         """Streaming filter — yield surviving batches one at a time.
 
-        Compiles the predicate to a pyarrow expression once and
-        reuses it across the stream. Empty / fully-dropped batches
-        are skipped (no zero-row pass-through), so consumers can
-        treat the output as "non-empty rows that match" without an
-        extra guard.
-
-        Routes through :meth:`pa.RecordBatch.filter` directly so
-        the per-batch cost stays C++-native — the previous shape
-        wrapped each batch in a fresh
-        :class:`pa.dataset.Dataset` + Table.from_batches before
-        the kernel ran, which dominated on small batches.
+        Decomposition / pyarrow compile happens once outside the
+        loop; the per-batch cost is then either a Python hashset
+        probe (the AND-of-InList fast path) or a pyarrow C++
+        ``RecordBatch.filter`` call. Empty / fully-dropped batches
+        are skipped so consumers can treat the output as
+        "non-empty rows that match" without an extra guard.
         """
+        clauses = _predicate_to_inlist_clauses(self)
+        if clauses is not None:
+            for batch in batches:
+                if batch.num_rows == 0:
+                    continue
+                kept = _apply_inlist_clauses_to_batch(batch, clauses)
+                if kept.num_rows > 0:
+                    yield kept
+            return
         expr = self.to_arrow()
         for batch in batches:
             if batch.num_rows == 0:
@@ -651,71 +672,6 @@ class Predicate(Expression):
             if kept.num_rows > 0:
                 yield kept
 
-    def filter_arrow_batch_via_hashset(self, batch: "Any") -> "Any | None":
-        """Try a Python-hashset filter for static ``InList`` predicates.
-
-        Recognises predicates shaped as ``InList(Column, [literals])``
-        — optionally AND'd together at the top level — and evaluates
-        them by materialising the referenced columns to Python values
-        and probing each against a :class:`frozenset`. Wins on tiny
-        batches (per-leaf cache reads, partition fan-out) where
-        pyarrow's :meth:`pa.RecordBatch.filter` is dominated by
-        per-call compile + scan overhead rather than by the data
-        size — bench shows ~770 us / call for a 64-way OR-of-eq on a
-        1-row batch versus ~3 us for the equivalent hashset probe.
-
-        Null semantics match pyarrow's ``isin`` filter:
-
-        * ``v is None and includes_null`` → row kept.
-        * ``v is None and not includes_null`` → row dropped (null is
-          neither "in" nor "not in" the value set; the filter drops).
-        * ``v in value_set`` → row kept.
-        * otherwise → dropped.
-
-        Returns the filtered :class:`pa.RecordBatch` on a fast-path
-        match (possibly the same batch if every row survives, or a
-        zero-row slice if none do), or ``None`` to signal "shape
-        too complex; use the pyarrow filter instead". Callers should
-        check the result and fall back when ``None``.
-        """
-        clauses = _predicate_to_inlist_clauses(self)
-        if clauses is None:
-            return None
-        n = batch.num_rows
-        if n == 0:
-            return batch
-        schema_names = batch.schema.names
-        surviving: "list[int] | None" = None
-        for column, value_set, includes_null in clauses:
-            if column not in schema_names:
-                # Missing column — let the pyarrow path surface its
-                # error (or its lenient behaviour) rather than make
-                # up a verdict here.
-                return None
-            col_values = batch.column(column).to_pylist()
-            iterator = range(n) if surviving is None else surviving
-            new_surviving: list[int] = []
-            if includes_null:
-                for i in iterator:
-                    v = col_values[i]
-                    if v is None or v in value_set:
-                        new_surviving.append(i)
-            else:
-                for i in iterator:
-                    v = col_values[i]
-                    if v is not None and v in value_set:
-                        new_surviving.append(i)
-            surviving = new_surviving
-            if not surviving:
-                break
-        if surviving is None or len(surviving) == n:
-            return batch
-        if not surviving:
-            return batch.slice(0, 0)
-        import pyarrow as pa
-
-        return batch.take(pa.array(surviving, type=pa.int64()))
-
 
 def _predicate_to_inlist_clauses(
     predicate: "Predicate",
@@ -723,14 +679,15 @@ def _predicate_to_inlist_clauses(
     """Decompose an AST into ``[(col_name, value_set, includes_null), …]``.
 
     Returns ``None`` when the predicate isn't pure-``InList`` /
-    pure-AND-of-``InList``, when a target is anything other than a
+    pure-``AND-of-InList``, when a target is anything other than a
     bare :class:`Column`, or when the value set carries unhashable
     literals (lists, dicts, …). The caller falls back to the
     pyarrow filter on a ``None`` return.
 
-    Used by :meth:`Predicate.filter_arrow_batch_via_hashset`; the
+    Used internally by :meth:`Predicate.filter_arrow_batch` /
+    :meth:`filter_arrow_table` / :meth:`filter_arrow_batches`; the
     decomposition is shape-local (no pyarrow imports) so it stays
-    cheap to attempt on every batch and the recognition cost is
+    cheap to attempt on every call and the recognition cost is
     bounded by the AST depth (typically 1–2 levels for the cache
     lookup predicate).
     """
@@ -752,6 +709,102 @@ def _predicate_to_inlist_clauses(
             out.extend(sub)
         return out
     return None
+
+
+def _apply_inlist_clauses_to_batch(
+    batch: "Any",
+    clauses: "list[tuple[str, frozenset, bool]]",
+) -> "Any":
+    """Apply pre-decomposed IN-list clauses to a :class:`pa.RecordBatch`.
+
+    Hashset-driven row filter — extracts each clause's column once,
+    walks the surviving index set, and finally takes the keepers.
+    Identity-returns *batch* when every row matches; returns a
+    zero-row slice when none do. Null semantics match
+    :func:`pyarrow.compute.is_in` — ``includes_null=True`` keeps
+    null rows, ``False`` drops them.
+    """
+    import pyarrow as pa
+
+    n = batch.num_rows
+    schema_names = batch.schema.names
+    surviving: "list[int] | None" = None
+    for column, value_set, includes_null in clauses:
+        if column not in schema_names:
+            # Missing column — defer to the caller's general path.
+            return batch.filter(
+                # Tiny fallback: build the equivalent pyarrow filter
+                # via ``isin`` here so the missing-column case still
+                # gets a uniform error from pyarrow rather than a
+                # silently-wrong empty result.
+                pa.compute.field(column).isin(list(value_set))
+            )
+        col_values = batch.column(column).to_pylist()
+        iterator = range(n) if surviving is None else surviving
+        new_surviving: list[int] = []
+        if includes_null:
+            for i in iterator:
+                v = col_values[i]
+                if v is None or v in value_set:
+                    new_surviving.append(i)
+        else:
+            for i in iterator:
+                v = col_values[i]
+                if v is not None and v in value_set:
+                    new_surviving.append(i)
+        surviving = new_surviving
+        if not surviving:
+            break
+    if surviving is None or len(surviving) == n:
+        return batch
+    if not surviving:
+        return batch.slice(0, 0)
+    return batch.take(pa.array(surviving, type=pa.int64()))
+
+
+def _apply_inlist_clauses_to_table(
+    table: "Any",
+    clauses: "list[tuple[str, frozenset, bool]]",
+) -> "Any":
+    """Apply pre-decomposed IN-list clauses to a :class:`pa.Table`.
+
+    Same algorithm as :func:`_apply_inlist_clauses_to_batch` but
+    handles the chunked-column case — columns are walked chunk by
+    chunk, the global index space is preserved across chunks, and
+    the final ``Table.take`` materialises the survivors in one
+    kernel call.
+    """
+    import pyarrow as pa
+
+    n = table.num_rows
+    schema_names = table.schema.names
+    surviving: "list[int] | None" = None
+    for column, value_set, includes_null in clauses:
+        if column not in schema_names:
+            return table.filter(
+                pa.compute.field(column).isin(list(value_set))
+            )
+        col_values = table.column(column).to_pylist()
+        iterator = range(n) if surviving is None else surviving
+        new_surviving: list[int] = []
+        if includes_null:
+            for i in iterator:
+                v = col_values[i]
+                if v is None or v in value_set:
+                    new_surviving.append(i)
+        else:
+            for i in iterator:
+                v = col_values[i]
+                if v is not None and v in value_set:
+                    new_surviving.append(i)
+        surviving = new_surviving
+        if not surviving:
+            break
+    if surviving is None or len(surviving) == n:
+        return table
+    if not surviving:
+        return table.slice(0, 0)
+    return table.take(pa.array(surviving, type=pa.int64()))
 
 
 # ---------------------------------------------------------------------------
