@@ -12,9 +12,9 @@ pulling :mod:`yggdrasil.io` first; see ``AGENTS.md`` →
 
 The hierarchy also:
 
-1. Inherits from the stdlib-backed pool exceptions in
-   :mod:`yggdrasil.http_._pool` (urllib3-shaped, but stdlib-only) so
-   transport-level ``except`` blocks still match across the
+1. Inherits from the stdlib-backed transport exceptions in
+   :mod:`yggdrasil.http_.exceptions` (urllib3-shaped, but stdlib-only)
+   so transport-level ``except`` blocks still match across the
    transport/business boundary.
 2. Carries a bound ``Response`` (and/or ``PreparedRequest``) on every
    exception so callers never need to thread response objects through
@@ -23,7 +23,7 @@ The hierarchy also:
    adding typed ``response`` / ``request`` attributes where applicable.
 
 Hierarchy (transport exceptions sourced from
-:mod:`yggdrasil.http_._pool.exceptions`; additions marked with *):
+:mod:`yggdrasil.http_.exceptions`; additions marked with *):
 ─────────────────────────────────────────────────────
 HTTPError                           ← _http_pool.HTTPError
   ├── RequestError *                ← request-bound base
@@ -73,7 +73,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from yggdrasil.http_._pool import exceptions as _u3
+from yggdrasil.http_.exceptions import exceptions as _u3
 
 from .base import YGGException
 
@@ -407,27 +407,20 @@ class ResponseError(HTTPError):
         )
 
     # ------------------------------------------------------------------
-    # urllib3 HTTPResponse shim — lazy, cached
+    # urllib3 HTTPResponse shim — alias for the bound :class:`HTTPResponse`
     # ------------------------------------------------------------------
 
     @property
     def urllib3_response(self):
-        cached = self.__dict__.get("_urllib3_response")
-        if cached is not None:
-            return cached
+        """Return the bound :class:`~yggdrasil.http_.HTTPResponse`.
 
-        import io
-        from yggdrasil.http_._pool import HTTPResponse as _U3R, HTTPHeaderDict
-
-        body_bytes = self.response.buffer.to_bytes() if self.response.buffer else b""
-        shim = _U3R(
-            body=io.BytesIO(body_bytes),
-            headers=HTTPHeaderDict(self.response.headers or {}),
-            status=self.response.status_code,
-            preload_content=False,
-        )
-        self.__dict__["_urllib3_response"] = shim
-        return shim
+        After the pool / response merge, the high-level
+        :class:`HTTPResponse` carries the full urllib3-shaped surface
+        (``.status`` / ``.headers`` / ``.read`` / ``.stream`` /
+        ``.release_conn`` / ``.drain_conn`` / ``.data``) directly, so
+        the explicit shim is gone — the response IS the shim.
+        """
+        return self.response
 
 
 # ---------------------------------------------------------------------------

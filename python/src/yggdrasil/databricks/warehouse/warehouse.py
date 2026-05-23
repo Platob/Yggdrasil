@@ -47,7 +47,12 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
 
-from yggdrasil.http_._pool import PoolManager, Retry, Timeout, disable_warnings, exceptions as _http_exceptions
+from yggdrasil.http_.exceptions import (
+    exceptions as _http_exceptions,
+    disable_warnings,
+)
+from yggdrasil.http_.retry import Retry
+from yggdrasil.http_.timeout import Timeout
 
 from databricks.sdk.errors import InternalError, DeadlineExceeded, TemporarilyUnavailable
 from databricks.sdk.service.sql import (
@@ -78,6 +83,8 @@ from ..client import DatabricksResource
 from ..fs import VolumePath
 
 if TYPE_CHECKING:
+    from yggdrasil.http_ import HTTPSession
+
     from .service import Warehouses
 
 __all__ = [
@@ -292,21 +299,21 @@ class SQLWarehouse(
     # External-link fetch pool
     # ------------------------------------------------------------------
 
-    def external_link_pool(self, max_workers: int = 8) -> "PoolManager":
-        """Return the cached :class:`PoolManager` for chunk reads.
+    def external_link_pool(self, max_workers: int = 8) -> "HTTPSession":
+        """Return the cached :class:`HTTPSession` for chunk reads.
+
+        :class:`HTTPSession` is the pool now — it owns the per-host
+        socket cache, retries, redirect handling, and (with
+        ``verify=False``) TLS-off support for Databricks-issued
+        presigned URLs against cloud-storage hostnames whose
+        certificates aren't always reachable from the workspace
+        egress path.
 
         Built lazily on the first ``EXTERNAL_LINKS`` chunk read and
         reused across every :class:`WarehouseStatementResult` attached
-        to this warehouse.  Tying the pool to the warehouse instance
-        means a long-running process can dispose of the pool (and its
-        sockets) by dropping the warehouse handle — no module-level
-        cache the runtime can never reach.
-
-        ``max_workers`` is a sizing *hint* applied only on the first
-        call; subsequent callers get the existing pool regardless of
-        what they pass.  Per-warehouse pool sizing is a warehouse-level
-        property, not a per-call one.  If you need a differently-sized
-        pool, that's a separate warehouse handle.
+        to this warehouse. ``max_workers`` is a sizing *hint* applied
+        only on the first call; subsequent callers get the existing
+        session regardless of what they pass.
         """
         pool = self._external_link_pool_instance
         if pool is not None:
@@ -321,26 +328,27 @@ class SQLWarehouse(
     def _release(self, committed: bool = False) -> None:
         """Release per-warehouse resources.
 
-        Currently just clears the external-link pool's connections.
+        Currently just clears the external-link session's connections.
         Safe to call multiple times.  Existing lifecycle methods
         (:meth:`stop`, :meth:`delete`) don't call this — closing
         sockets is independent of remote warehouse state, since a
-        stopped warehouse can be started again and the pool would
+        stopped warehouse can be started again and the session would
         still serve.
         """
         pool = self._external_link_pool_instance
         if pool is not None:
-            # The pool slot can hold a bare ``object()`` placeholder during
+            # The slot can hold a bare ``object()`` placeholder during
             # pickle / fixture round-trips (see
-            # ``test_warehouse_pickle.py``), so don't blindly call ``.clear``
-            # — that's a ``PoolManager`` method, not a generic one.
-            clear = getattr(pool, "clear", None)
+            # ``test_warehouse_pickle.py``), so don't blindly call
+            # ``.clear_connections`` — it's an :class:`HTTPSession`
+            # method, not a generic one.
+            clear = getattr(pool, "clear_connections", None) or getattr(pool, "clear", None)
             if callable(clear):
                 try:
                     clear()
                 except Exception:
                     LOGGER.exception(
-                        "Failed to clear external-link pool for %r; continuing.",
+                        "Failed to clear external-link session for %r; continuing.",
                         self,
                     )
             self._external_link_pool_instance = None
@@ -930,45 +938,37 @@ class SQLWarehouse(
 
 
 
-def _build_external_link_pool(max_workers: int) -> PoolManager:
-    """Build a :class:`PoolManager` for external-link fetches.
+def _build_external_link_pool(max_workers: int) -> "HTTPSession":
+    """Build a TLS-off :class:`HTTPSession` for external-link fetches.
 
-    The pool is reused across every chunk read for the warehouse it's
-    attached to (see :meth:`SQLWarehouse.external_link_pool`); pulling
-    it onto the warehouse instance — rather than a module-level cache —
-    ties the underlying connection lifecycle to the warehouse handle.
-    When the warehouse is GC'd, the pool drops with it, so a
-    long-running process holding many warehouses doesn't accumulate
+    The session is reused across every chunk read for the warehouse
+    it's attached to (see :meth:`SQLWarehouse.external_link_pool`);
+    pulling it onto the warehouse instance — rather than a module-level
+    cache — ties the underlying connection lifecycle to the warehouse
+    handle. When the warehouse is GC'd, the session drops with it, so
+    a long-running process holding many warehouses doesn't accumulate
     pooled sockets the runtime can't reach.
 
-    Sizing is keyed off `max_workers` so a warehouse running with
-    higher fetch parallelism gets a correspondingly larger pool;
-    `maxsize` is a cap, not a floor, so idle slots cost nothing.
-    Timeouts are generous because external-link payloads are Arrow
-    IPC streams from cloud storage that can run hundreds of MB.
+    Sizing is keyed off ``max_workers`` so a warehouse running with
+    higher fetch parallelism gets a correspondingly larger
+    ``pool_maxsize``; idle slots cost nothing. TLS verification is
+    disabled — the presigned URLs Databricks hands out point at
+    cloud-storage hostnames whose certificates aren't always reachable
+    from the workspace egress path (private-link / proxy-rewritten
+    endpoints, customer-managed VPCs), and the URL itself carries a
+    short-lived signed token so the transport doesn't need certificate
+    based authentication.
     """
-    retry = Retry(
-        total=4,
-        connect=4,
-        read=4,
-        backoff_factor=0.2,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-    # TLS verification is disabled for external-link chunk fetches: the
-    # presigned URLs Databricks hands out point at cloud-storage hostnames
-    # whose certificates aren't always reachable from the workspace egress
-    # path (private-link / proxy-rewritten endpoints, customer-managed
-    # VPCs), and the URL itself carries a short-lived signed token so the
-    # transport doesn't need certificate-based authentication.
+    from yggdrasil.dataclasses.waiting import WaitingConfig
+    from yggdrasil.http_ import HTTPSession
+
     disable_warnings(_http_exceptions.InsecureRequestWarning)
-    return PoolManager(
-        num_pools=max(4, max_workers // 2),
-        maxsize=max_workers * 2,
-        retries=retry,
-        timeout=Timeout(connect=10.0, read=60.0),
-        cert_reqs="CERT_NONE",
-        assert_hostname=False,
+    # Per-warehouse, TLS-off — pin singleton_ttl=False so each warehouse
+    # gets its own session (the default HTTPSession singleton key would
+    # collapse two TLS-off warehouses onto the same socket cache).
+    return HTTPSession(
+        base_url=None,
+        verify=False,
+        pool_maxsize=max_workers * 2,
+        waiting=WaitingConfig(timeout=60),
     )

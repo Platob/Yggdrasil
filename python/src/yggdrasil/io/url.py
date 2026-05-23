@@ -545,6 +545,22 @@ class URL(os.PathLike):
     # ``str(url.parent)`` calls in singleton keys collapse to a
     # local hit. ``None`` means "not computed yet".
     _parent_url: "URL | None" = field(default=None, init=False, repr=False, compare=False)
+    # Memoised :attr:`extensions` and :attr:`media_type`. Both are
+    # derived from the immutable :attr:`path` and are hit on every
+    # leaf-resolution / codec dispatch in :mod:`yggdrasil.io.nested`
+    # (and any caller that asks "what format is this URL?"). The
+    # extensions walk is a few string splits; the media_type walk
+    # additionally fires :meth:`MediaType.from_url` (codec + mime
+    # registry walk). Caching on the URL itself keeps both behind a
+    # single slot read once warm. ``None`` is a real value for both
+    # (no extensions / no registered media type), so the sentinel
+    # ``...`` (Ellipsis) flags "not computed yet".
+    _extensions_cache: "tuple[str, ...] | None | Any" = field(
+        default=..., init=False, repr=False, compare=False,
+    )
+    _media_type_cache: "MediaType | None | Any" = field(
+        default=..., init=False, repr=False, compare=False,
+    )
 
     def __hash__(self):
         return hash(self.to_string())
@@ -629,31 +645,49 @@ class URL(os.PathLike):
         Mirrors :attr:`pathlib.PurePosixPath.suffixes` but inlined —
         ``extensions`` is read on every codec / media-type dispatch in
         the IO layer, and ``PurePosixPath`` is ~5x slower than the
-        string-level walk this implementation does.
+        string-level walk this implementation does. The parsed result
+        is memoised on :attr:`_extensions_cache` so repeat reads
+        collapse to one slot lookup — the cache layer's
+        :meth:`FolderPath._leaf_for` walk hits every child URL's
+        extensions on every iter_children.
         """
+        cached = self._extensions_cache
+        if cached is not ...:
+            # Return a fresh list so callers that mutate the result
+            # don't poison the cache.
+            return list(cached) if cached else []
+
         path = self.path
+        result: tuple[str, ...]
         if not path or path == "/":
-            return []
-        # Last path segment, with trailing slash stripped.
-        if path.endswith("/"):
-            path = path[:-1]
+            result = ()
+        else:
+            # Last path segment, with trailing slash stripped.
+            if path.endswith("/"):
+                path = path[:-1]
             if not path:
-                return []
-        idx = path.rfind("/")
-        name = path[idx + 1:] if idx != -1 else path
-        if not name:
-            return []
-        # Leading-dot files (``.env``, ``.hidden``) have no extension on
-        # their own; ``.env.local`` still yields ``["local"]``.
-        if name[0] == ".":
-            name = name[1:]
-            if "." not in name:
-                return []
-        if "." not in name:
-            return []
-        parts = name.split(".")
-        # ``"file.csv".split(".") == ["file", "csv"]`` — drop the stem.
-        return [s.lower() for s in parts[1:]]
+                result = ()
+            else:
+                idx = path.rfind("/")
+                name = path[idx + 1:] if idx != -1 else path
+                if not name:
+                    result = ()
+                # Leading-dot files (``.env``, ``.hidden``) have no extension on
+                # their own; ``.env.local`` still yields ``["local"]``.
+                elif name[0] == "." and "." not in name[1:]:
+                    result = ()
+                elif name[0] == ".":
+                    parts = name[1:].split(".")
+                    result = tuple(s.lower() for s in parts[1:])
+                elif "." not in name:
+                    result = ()
+                else:
+                    parts = name.split(".")
+                    # ``"file.csv".split(".") == ["file", "csv"]`` — drop the stem.
+                    result = tuple(s.lower() for s in parts[1:])
+
+        object.__setattr__(self, "_extensions_cache", result)
+        return list(result)
 
     @property
     def name(self) -> str:
@@ -777,7 +811,22 @@ class URL(os.PathLike):
 
     @property
     def media_type(self):
-        return self.infer_media_type(default=None)
+        """Inferred :class:`MediaType` from this URL's extensions.
+
+        Memoised on :attr:`_media_type_cache` — the same URL is hit
+        by every leaf-resolution / codec dispatch in
+        :mod:`yggdrasil.io.nested` and by the lazy
+        :attr:`IO.media_type` fallback on every cursor that bound
+        only a URL. ``None`` is a real value (URL has no extensions
+        / no registered media type), so the sentinel ``...`` flags
+        "not computed yet".
+        """
+        cached = self._media_type_cache
+        if cached is not ...:
+            return cached
+        result = media_type_class().from_url(self, default=None)
+        object.__setattr__(self, "_media_type_cache", result)
+        return result
 
     @property
     def mime_types(self):
@@ -790,7 +839,18 @@ class URL(os.PathLike):
         return [mc.from_str(_) for _ in ext]
 
     def infer_media_type(self, default: "MediaType" = ...):
-        return media_type_class().from_url(self, default=default)
+        """Same as :attr:`media_type` but with a caller-supplied default.
+
+        Reuses the :attr:`media_type` cache when the result would be
+        ``None`` (so callers that pass an explicit ``default`` for the
+        miss case still hit the slot). The cache itself only holds the
+        ``default=None`` answer — ``None`` is the value that all other
+        defaults override.
+        """
+        result = self.media_type
+        if result is None and default is not ...:
+            return default
+        return result
 
     @property
     def mime_type(self):
@@ -1434,6 +1494,11 @@ class URL(os.PathLike):
         setattr_(new, "_anonymized", None)
         setattr_(new, "_anonymized_cache", None)
         setattr_(new, "_parent_url", None)
+        # New path → invalidate the extension / media-type caches;
+        # the inferred values are derived from the path stem and
+        # change with it (``trades.csv → trades.parquet`` flips both).
+        setattr_(new, "_extensions_cache", ...)
+        setattr_(new, "_media_type_cache", ...)
         return new
 
     @property
@@ -1650,6 +1715,9 @@ class URL(os.PathLike):
             setattr_(new, "_str_raw", None)
             setattr_(new, "_anonymized", None)
             setattr_(new, "_anonymized_cache", None)
+            setattr_(new, "_parent_url", None)
+            setattr_(new, "_extensions_cache", ...)
+            setattr_(new, "_media_type_cache", ...)
             return new
         base = self.to_string(encode=True)
         target = ref.to_string(encode=True) if isinstance(ref, URL) else ref

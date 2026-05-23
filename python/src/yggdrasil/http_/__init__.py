@@ -6,13 +6,17 @@ the body, headers, status, and request bound on a single object. The
 supporting types (:class:`HTTPRequest`, :class:`HTTPPath`, :class:`Cookies`)
 round out the surface for paths and cookie jars.
 
-The pool / retry / timeout primitives live in :mod:`yggdrasil.http_._pool`
-(stdlib-only, urllib3-shaped) — feature code should not import them directly.
+The transport-shape side modules (:mod:`yggdrasil.http_.retry`,
+:mod:`yggdrasil.http_.timeout`, :mod:`yggdrasil.http_.exceptions`,
+:mod:`yggdrasil.http_.headers`) hold the stdlib-only, urllib3-shaped
+primitives. :class:`HTTPSession` IS the connection pool — no separate
+``PoolManager`` indirection.
 
 Submodule imports are deferred via PEP 562 ``__getattr__`` so importing
-``yggdrasil.http_._pool`` (used by :mod:`yggdrasil.exceptions.http`) does not
-pull the full session / response / path chain — that chain transitively reaches
-back into ``yggdrasil.exceptions`` and would otherwise close the loop.
+:mod:`yggdrasil.http_.exceptions` (used by :mod:`yggdrasil.exceptions.http`)
+does not pull the full session / response / path chain — that chain
+transitively reaches back into :mod:`yggdrasil.exceptions` and would
+otherwise close the loop.
 """
 from __future__ import annotations
 

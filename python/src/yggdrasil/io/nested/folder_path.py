@@ -94,6 +94,14 @@ from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.io.url import hive_cast_value, hive_encode, hive_split
 
+# Side-effect import: ensures every primitive leaf (parquet / csv /
+# arrow / ndjson / json / xlsx) has registered itself in the
+# :data:`yggdrasil.io.holder._HOLDER_FORMAT_REGISTRY` so
+# :meth:`IO.class_for_media_type` actually finds them. Hoisted to
+# module-top so :meth:`FolderPath._leaf_for` (per-child during
+# :meth:`iter_children`) doesn't pay a dict lookup on every iter.
+import yggdrasil.io.primitive  # noqa: F401
+
 if TYPE_CHECKING:
     from yggdrasil.io.path import Path
 
@@ -107,6 +115,8 @@ __all__ = ["FolderPath", "FolderOptions"]
 # constructors onto one instance keeps those warm across calls
 # without leaking across the lifetime of long-running workers.
 _FOLDER_PATH_SINGLETON_TTL: float = 15.0 * 60.0
+
+
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -174,7 +184,6 @@ class FolderPath(IO[bytes, FolderOptions]):
         "path",
         "_yggmeta_enabled",
         "_predicate_free_cols",
-        "_predicate_arrow_expr",
         "_static_values_cache",
         "_initialized",
     )
@@ -201,6 +210,25 @@ class FolderPath(IO[bytes, FolderOptions]):
         default_ttl=_FOLDER_PATH_SINGLETON_TTL, max_size=10_000,
     )
     _INSTANCES_LOCK: ClassVar[RLock] = RLock()
+
+    # Per-leaf-partition data cache. Keyed by the full URL string of
+    # the partition directory (e.g. ``file:///cache/partition_key=ab/``);
+    # value is the tuple of unfiltered :class:`pa.RecordBatch` that
+    # :meth:`_read_arrow_batches` last drained from the directory's
+    # leaf files. Hits skip every file open / IPC parse / per-leaf
+    # batch yield in :meth:`iter_children` — the row-level predicate
+    # filter still runs in pyarrow's C++ kernels on the cached
+    # batches, so different predicates against the same partition
+    # all share one cache entry.
+    #
+    # TTL is short (60 s default) so the cache eventually converges
+    # with any out-of-process writer; in-process writes invalidate
+    # explicitly via :meth:`_invalidate_partition_cache` so a
+    # ``send_many`` write/read cycle on the same partition never
+    # serves stale rows.
+    _PARTITION_DATA_CACHE: "ClassVar[ExpiringDict[str, tuple]]" = ExpiringDict(
+        default_ttl=60.0, max_size=4_096,
+    )
 
     @classmethod
     def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
@@ -317,20 +345,6 @@ class FolderPath(IO[bytes, FolderOptions]):
         # batch lookup pays the walk once instead of 64+ times.
         self._predicate_free_cols: "tuple[int, tuple[str, ...]] | None" = None
         # Compiled-predicate cache mirroring :attr:`_predicate_free_cols`.
-        # :meth:`Expression.to_arrow` walks the whole AST and rebuilds
-        # the pyarrow Expression on every call; the original
-        # :meth:`Expression.filter_arrow_batches` invokes it once per
-        # call, but :meth:`_read_arrow_batches` invokes it once *per
-        # leaf file* (each leaf gets its own ``filter_arrow_batches``
-        # wrap). On a partitioned cache batch lookup against 64
-        # partitions × 1 file that's 64 redundant rebuilds of the
-        # same AST per ``send_many`` chunk; cProfile flagged
-        # ``pa.compute`` Expression assembly as the dominant cost
-        # (~22% of one ``Session.send_many(all hit, 64 req)`` call).
-        # Same id-keyed walk-up-parents pattern as
-        # :meth:`_free_cols_for` so a batch lookup pays the compile
-        # exactly once across every recursive level + every leaf.
-        self._predicate_arrow_expr: "tuple[int, Any] | None" = None
         # Hive partition KV cache — :attr:`static_values` walks the
         # URL segments and casts each value to the schema-declared
         # dtype on every call. The URL is immutable, the schema is
@@ -767,12 +781,28 @@ class FolderPath(IO[bytes, FolderOptions]):
                 schema = None
         if schema is None or not getattr(schema, "children", None):
             schema = getattr(options, "target", None) if options is not None else None
+
+        # Cache the walk by ``(id(schema), id(static_values))``. The
+        # ``schema.children`` scan is called from both :meth:`iter_children`
+        # and :meth:`_read_arrow_batches`, runs over every field for the
+        # ``partition_by`` tag, and the answer is invariant for the
+        # lifetime of the resolved schema + static-values pair.
+        # RESPONSE_SCHEMA has 28 children — the bench was spending 11 ms
+        # / 500 reads on this walk before the cache.
+        static_values = self.static_values
+        cache_key = (id(schema), id(static_values))
+        cache = getattr(self, "_partition_columns_cache", None)
+        if cache is not None and cache[0] == cache_key:
+            return cache[1]
+
         children = getattr(schema, "children", None) or ()
-        consumed = set(self.static_values)
-        return tuple(
+        consumed = set(static_values) if static_values else ()
+        result = tuple(
             f.name for f in children
             if getattr(f, "partition_by", False) and f.name not in consumed
         )
+        self._partition_columns_cache = (cache_key, result)
+        return result
 
     def _iter_partition_children(
         self,
@@ -837,22 +867,35 @@ class FolderPath(IO[bytes, FolderOptions]):
         Skips :meth:`Path.iterdir` entirely — N stat probes against a
         deterministic path layout instead of a full directory walk.
 
-        The existence check is taken here, before minting the child:
-        on a 64-OR batch lookup against a partially-populated cache
-        the hot shape is "most candidates miss". Skipping the
-        FolderPath allocation + adoption + downstream ``_read_arrow_batches``
-        for misses cuts ~95 us per non-existent partition. When the
-        candidate does exist we'd have paid a stat inside the
-        child's ``iter_children`` anyway, so the early stat doesn't
-        regress the hit path.
+        The existence check is taken **here, before** minting the
+        child. We tried the lazy variant (mint every candidate via
+        :meth:`child_folder` and let the child's own
+        :meth:`iter_children` short-circuit on a missing path); the
+        bench numbers (``benchmarks/io/bench_http_cache.py``) decide
+        against it:
+
+        * On a dense, hot cache the lazy variant cuts
+          :meth:`iter_children` itself by ~31 % (~4.3 ms → ~3.0 ms
+          on 64 hits) but the full Session.send_many time barely
+          moves — the read is I/O dominated.
+        * On a sparse cache (all-miss / cold) the lazy variant adds
+          a fresh :class:`FolderPath` allocation per non-existent
+          candidate. ``Session._split_local_cache (all miss, 64
+          req)`` regressed from 3.1 ms to 5.3 ms (+68 %), and
+          ``Session._store_cached_response`` from 3.8 ms to 4.3 ms
+          (+14 %). The mint cost dominates the saved-stat budget.
+
+        Eager :meth:`Path.exists` keeps the prune cheap for misses
+        and only pays one extra stat per real hit, which the child's
+        :meth:`iter_children` would have taken anyway. The
+        :meth:`child_folder` / :meth:`child_file` helpers remain
+        available for callers that genuinely want a lazy child.
 
         ``hive_cast_value`` is **not** re-applied to the accepted
         values: :func:`extract_partition_filters` already hands back
         values typed against the predicate's literal types — running
         them through another ``pa.compute.cast`` for every of the N
-        candidates wastes a kernel call per probe (and was the
-        single biggest cost in the prune hot path before the
-        skip).
+        candidates wastes a kernel call per probe.
         """
         for value in sorted(values, key=lambda v: (v is None, v)):
             encoded = hive_encode(value)
@@ -957,17 +1000,17 @@ class FolderPath(IO[bytes, FolderOptions]):
         media type — the caller skips it. This is the contract
         :meth:`_read_arrow_batches` relies on to ignore non-tabular
         siblings without forcing the user to clean the directory.
-        """
-        # Side-effect import: ensures every primitive leaf (parquet /
-        # csv / arrow / ndjson / json / xlsx) has registered itself
-        # in the Tabular registry, so ``class_for_media_type`` can
-        # actually find them.
-        import yggdrasil.io.primitive  # noqa: F401
 
-        try:
-            mt = MediaType.from_(entry.url, default=None)
-        except Exception:
-            mt = None
+        Both lookups are cached upstream — :attr:`URL.media_type`
+        memoises the codec / mime inference on the URL itself, and
+        :meth:`IO.class_for_media_type` is a dict probe on
+        :data:`_HOLDER_FORMAT_REGISTRY`. The per-child cost in the
+        steady state collapses to two cached attribute reads.
+        """
+        url = entry.url
+        if url is None:
+            return None
+        mt = url.media_type
         if mt is None:
             return None
         try:
@@ -1068,15 +1111,25 @@ class FolderPath(IO[bytes, FolderOptions]):
         free_cols = self._free_cols_for(predicate)
         if self._should_prune_by_predicate(options, free_cols=free_cols):
             return
-        # Compile the predicate to a :class:`pyarrow.compute.Expression`
-        # once for the whole read subtree (cached on the topmost
-        # FolderPath via :meth:`_arrow_expr_for`). Status-quo path went
-        # through :meth:`Expression.filter_arrow_batches` per leaf file,
-        # which rebuilt the same AST every call — cProfile flagged this
-        # as ~22% of an all-hit ``Session.send_many`` chunk. Calling
-        # :meth:`pa.RecordBatch.filter` inline below skips the wrapper
-        # while keeping the same "non-empty batches that match" contract.
-        arrow_expr = self._arrow_expr_for(predicate)
+
+        # Leaf-partition data cache: a folder bound to a ``<col>=<val>/``
+        # path (non-empty :attr:`static_values`) holds the actual file
+        # leaves for that partition. We cache the union of their
+        # unfiltered batches keyed by the partition's full URL — every
+        # subsequent read of the same partition skips the file
+        # opens / IPC parse and pays only the row-level filter cost
+        # on already-in-memory batches.
+        cache_key = self._partition_cache_key()
+        if cache_key is not None:
+            cached = self._PARTITION_DATA_CACHE.get(cache_key)
+            if cached is not None:
+                yield from self._yield_filtered(cached, predicate)
+                return
+
+        accumulated: "list[pa.RecordBatch] | None" = (
+            [] if cache_key is not None else None
+        )
+
         for child in self.iter_children(options=options):
             if child._should_prune_by_predicate(options, free_cols=free_cols):
                 continue
@@ -1084,20 +1137,106 @@ class FolderPath(IO[bytes, FolderOptions]):
             stream = child._read_arrow_batches(child_options)
             # Sub-folders recurse and apply the predicate at their
             # own leaf level; flat-format leaves (parquet / arrow IPC
-            # / csv) don't filter rows themselves, so we run the
-            # row-level predicate here in pyarrow's C++ kernels. The
-            # static-value prune above already eliminated whole sub-trees
-            # the predicate rejects on a partition column; this is the
-            # residual non-partition filter.
-            if arrow_expr is not None and not isinstance(child, FolderPath):
-                for batch in stream:
-                    if batch.num_rows == 0:
-                        continue
-                    kept = batch.filter(arrow_expr)
-                    if kept.num_rows > 0:
-                        yield kept
-            else:
+            # / csv) don't filter rows themselves, so we route each
+            # leaf batch through :meth:`Predicate.filter_arrow_batch`
+            # — the predicate picks the best engine internally
+            # (hashset shortcut for the typical ``InList`` /
+            # ``AND-of-InList`` cache lookup shape, pyarrow's C++
+            # ``filter`` for everything else). The static-value prune
+            # above already eliminated whole sub-trees the predicate
+            # rejects on a partition column; this is the residual
+            # non-partition filter.
+            if isinstance(child, FolderPath):
+                # Recursive sub-folder branch: any inner partition
+                # leaf populates its own cache entry via the same
+                # mechanism; we don't double-cache the recursive
+                # output here.
                 yield from stream
+                continue
+            for batch in stream:
+                if batch.num_rows == 0:
+                    continue
+                if accumulated is not None:
+                    accumulated.append(batch)
+                if predicate is None:
+                    yield batch
+                    continue
+                kept = predicate.filter_arrow_batch(batch)
+                if kept.num_rows > 0:
+                    yield kept
+
+        if accumulated is not None and cache_key is not None:
+            # Detach the cached batches from any mmap-backed buffer
+            # the leaf reader may have handed up — without this, a
+            # subsequent file close / re-write (e.g. an OVERWRITE on
+            # the same partition) could yank the bytes out from under
+            # the cached batch and a later cache hit would see zero
+            # rows. ``concat_batches`` materialises into in-memory
+            # buffers when given a single chunk, owned independently
+            # of the source file.
+            if accumulated:
+                self._PARTITION_DATA_CACHE.set(
+                    cache_key, (pa.Table.from_batches(accumulated)
+                                 .combine_chunks()
+                                 .to_batches()),
+                )
+            else:
+                self._PARTITION_DATA_CACHE.set(cache_key, ())
+
+    def _partition_cache_key(self) -> "str | None":
+        """Return the in-memory partition-cache key, or ``None`` to skip caching.
+
+        Only :class:`FolderPath` instances bound to a real Hive
+        ``<col>=<val>/`` partition (non-empty :attr:`static_values`)
+        cache their batches — the root cache folder doesn't, since
+        its read flows into per-partition child reads that each
+        cache independently. The leaf's URL string is stable across
+        the singleton's lifetime so it's safe to use as the key.
+        """
+        if not self.static_values:
+            return None
+        full = getattr(self.path, "full_path", None)
+        return full() if callable(full) else None
+
+    def _invalidate_partition_cache(self) -> None:
+        """Drop this folder's :attr:`_PARTITION_DATA_CACHE` entry.
+
+        Called at the start of :meth:`_write_arrow_batches` so any
+        concurrent in-process reader sees the invalidation before a
+        write begins. Non-partition folders (root cache directory,
+        flat folders without Hive layout) have no key and skip the
+        cache entirely, so this is a no-op for them.
+        """
+        key = self._partition_cache_key()
+        if key is not None:
+            self._PARTITION_DATA_CACHE.pop(key, None)
+
+    @staticmethod
+    def _yield_filtered(
+        batches: "Iterable[pa.RecordBatch]",
+        predicate: "Any | None",
+    ) -> "Iterator[pa.RecordBatch]":
+        """Apply *predicate* to ``batches`` (pass-through when ``None``).
+
+        Used by the cache-hit branch of :meth:`_read_arrow_batches`;
+        :meth:`Predicate.filter_arrow_batch` picks the hashset
+        shortcut for ``InList`` / ``AND-of-InList`` shapes and
+        :meth:`pa.RecordBatch.filter` for everything else. Empty /
+        fully-dropped batches are skipped so consumers can treat
+        the output as "non-empty rows that match" without an extra
+        guard.
+        """
+        if predicate is None:
+            for batch in batches:
+                if batch.num_rows:
+                    yield batch
+            return
+        for batch in batches:
+            if batch.num_rows == 0:
+                continue
+            kept = predicate.filter_arrow_batch(batch)
+            if kept.num_rows > 0:
+                yield kept
 
     def _free_cols_for(self, predicate: Any) -> "tuple[str, ...] | None":
         """Memoised :func:`free_columns` lookup keyed by ``id(predicate)``.
@@ -1140,35 +1279,6 @@ class FolderPath(IO[bytes, FolderOptions]):
         except Exception:
             pass
         return cols
-
-    def _arrow_expr_for(self, predicate: Any) -> Any:
-        """Memoised :meth:`Expression.to_arrow` lift keyed by ``id(predicate)``.
-
-        Same walk-up-parents shape as :meth:`_free_cols_for`. The
-        compiled :class:`pyarrow.compute.Expression` is the same object
-        every level of the recursive read can reuse via
-        :meth:`pa.RecordBatch.filter` — building it once collapses the
-        per-leaf-file recompile that cProfile flagged on the
-        ``Session.send_many(local cache ALL HIT)`` path.
-        """
-        if predicate is None:
-            return None
-        pid = id(predicate)
-        node: Any = self
-        topmost: "FolderPath" = self
-        while node is not None:
-            cached = getattr(node, "_predicate_arrow_expr", None)
-            if cached is not None and cached[0] == pid:
-                return cached[1]
-            if isinstance(node, FolderPath):
-                topmost = node
-            node = getattr(node, "tabular_parent", None)
-        expr = predicate.to_arrow()
-        try:
-            topmost._predicate_arrow_expr = (pid, expr)
-        except Exception:
-            pass
-        return expr
 
     def _child_read_options(
         self, child: "Tabular", options: FolderOptions,
@@ -1256,6 +1366,14 @@ class FolderPath(IO[bytes, FolderOptions]):
         """
         import pyarrow.compute as pc
 
+        # Invalidate this folder's leaf-partition data cache up front
+        # so a concurrent reader on this process can't serve a hit from
+        # the about-to-be-stale entry. Recursive writes on partition
+        # children invalidate their own keys when they re-enter; the
+        # root partitioned folder has no cache key (empty static_values)
+        # so the call collapses to a no-op there.
+        self._invalidate_partition_cache()
+
         # Materialise the input once. The partition split needs to
         # see every batch at once (per-batch splitting scatters one
         # part file per (batch, value) pair into the same partition
@@ -1320,15 +1438,36 @@ class FolderPath(IO[bytes, FolderOptions]):
             # APPEND / AUTO). UPSERT / MERGE pass through unchanged
             # so per-partition dedup against existing rows still
             # fires inside each child's flat branch.
-            if action is Mode.OVERWRITE or action in (
-                Mode.IGNORE, Mode.ERROR_IF_EXISTS,
-            ):
-                child_options = dataclasses.replace(options, mode=Mode.APPEND)
-            else:
-                child_options = options
+            #
+            # ``checked_cast=True`` short-circuits the per-batch
+            # schema rebuild + cast inside every leaf write: the
+            # subsets are slices of the parent's already-resolved
+            # ``pa.Table``, so they share its schema by construction
+            # — every batch matches the target the parent just stamped
+            # via :meth:`_schema_for_arrow`. RESPONSE_SCHEMA has 28
+            # columns; the rebuild-and-cast was ~150 us per child
+            # write before, now ~5 us.
+            child_mode = (
+                Mode.APPEND if action is Mode.OVERWRITE or action in (
+                    Mode.IGNORE, Mode.ERROR_IF_EXISTS,
+                ) else options.mode
+            )
+            child_options = dataclasses.replace(
+                options, mode=child_mode, checked_cast=True,
+            )
 
             table = pa.Table.from_batches(materialised)
             column = table.column(head)
+            # Serial fan-out: a per-partition ThreadPoolExecutor was
+            # benched (``_write_partitions_parallel`` git history)
+            # and ran 2x **slower** at every partition count from 4
+            # through 16, at both 100 and 10_000 rows per partition.
+            # Pool spawn + per-job GIL handoff dominated the small
+            # per-partition Python pre-amble (subset slice, child
+            # FolderPath mint, schema cache walk) and pyarrow's own
+            # parquet writer already releases the GIL during the
+            # encode that's actually parallelisable. Keep the inline
+            # loop until a workload appears where parallelism wins.
             for scalar in pc.unique(column.combine_chunks()):
                 value = scalar.as_py()
                 mask = (
@@ -1374,22 +1513,68 @@ class FolderPath(IO[bytes, FolderOptions]):
             return
 
         # Plain APPEND (or empty folder): mint a fresh part and drain.
-        self._write_parts(materialised, options)
+        # ``source_schema`` pre-stamps the already-resolved yggdrasil
+        # :class:`Schema` so the leaf write's :meth:`check_source`
+        # short-circuits (no per-write ``Field.from_arrow`` rebuild)
+        # while still leaving ``options.merged`` populated for the
+        # writer's schema slot. ``checked_cast=True`` then collapses
+        # the per-batch cast loop — the batches share the same
+        # schema we just stamped.
+        self._write_parts(
+            materialised, options,
+            source_schema=first_schema, checked_cast=True,
+        )
         self._persist_schema(first_schema, media_type=options.child_media_type)
 
     def _write_parts(
         self,
         batches: Iterable[pa.RecordBatch],
         options: FolderOptions,
+        *,
+        source_schema: Any = None,
+        checked_cast: bool = False,
     ) -> None:
         """Mint one or more part files and drain *batches* into them.
 
         Honors ``options.byte_size`` / ``options.row_size`` for
         per-part rechunking; with neither set, drains the whole
         stream into a single part.
+
+        Two opt-in fast-paths the partition / cache writer hits:
+
+        * ``source_schema`` (the yggdrasil :class:`Schema` the parent
+          resolved via :meth:`_schema_for_arrow`) is pre-stamped onto
+          ``options.source`` so the leaf's
+          :meth:`CastOptions.check_source` skips the per-write
+          :meth:`Field.from_arrow_schema` rebuild while
+          ``options.merged`` (the writer's schema slot) stays populated.
+        * ``checked_cast=True`` flips :attr:`CastOptions.checked_cast`
+          so the leaf's :meth:`cast_arrow_tabular` short-circuits per
+          batch — the caller guarantees every batch matches the
+          target.
+
+        RESPONSE_SCHEMA has 28 columns; together these collapse the
+        leaf write's per-batch setup from ~150 us to ~5 us.
         """
         byte_size = getattr(options, "byte_size", None) or 0
         row_size = getattr(options, "row_size", None) or 0
+
+        def _leaf_options(child: "Tabular") -> Any:
+            base = child.options_class()()
+            # In-place stamps on the freshly minted (frozen) options
+            # via the named ``with_*`` helpers — calling
+            # ``dataclasses.replace`` per child reruns
+            # ``__post_init__`` and allocates a fresh slot layout,
+            # which the bench (Session._store_cached_response) flagged
+            # as a 500 us / write regression.
+            if checked_cast and hasattr(base, "checked_cast"):
+                base.with_checked_cast(True, copy=False)
+            if source_schema is not None:
+                try:
+                    base.with_source(source_schema, copy=False)
+                except Exception:
+                    pass
+            return base
 
         if byte_size > 0 or row_size > 0:
             from yggdrasil.arrow.cast import rechunk_arrow_batches
@@ -1403,9 +1588,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 if batch.num_rows == 0:
                     continue
                 child = self.make_child(options=options)
-                child.write_arrow_batches(
-                    [batch], options=child.options_class()(),
-                )
+                child.write_arrow_batches([batch], options=_leaf_options(child))
             return
 
         batch_iter = iter(batches)
@@ -1416,7 +1599,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         child = self.make_child(options=options)
         child.write_arrow_batches(
             _chain_first(first, batch_iter),
-            options=child.options_class()(),
+            options=_leaf_options(child),
         )
 
     # ==================================================================

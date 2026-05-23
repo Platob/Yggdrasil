@@ -1440,6 +1440,7 @@ class Field(BaseChildrenFields):
         md = self.metadata
         return bool(md and md.get(self._TAG_KEY_SORTED))
 
+
     @property
     def comment(self) -> str | None:
         if not self.metadata:
@@ -1638,6 +1639,7 @@ class Field(BaseChildrenFields):
 
     def with_sorted(self, value: bool = True, inplace: bool = False) -> "Field":
         return self._with_tag_flag(b"sorted", value, inplace)
+
 
     # ==================================================================
     # Builders — `with_*` mutators, `copy`, `merge_with`, `autotag`

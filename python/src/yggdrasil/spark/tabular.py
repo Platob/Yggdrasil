@@ -380,7 +380,15 @@ class Dataset(Tabular[CastOptions]):
                 schema.to_spark_schema() if schema is not None else None
             )
             return spark.createDataFrame([], schema=spark_schema)
-        return options.cast_spark_tabular(self._frame)
+        # Cast first (schema alignment), then apply the read-time
+        # passes (resample + dedup) natively on the Spark frame so
+        # the read path doesn't have to detour through
+        # ``df.toArrow → arrow.ops → createDataFrame`` to honor
+        # ``unique_by`` / ``time_sample_by``. The fast path runs
+        # entirely inside Spark — ``groupBy + applyInArrow`` for the
+        # partitioned resample, ``row_number() OVER (...)`` for dedup.
+        frame = options.cast_spark_tabular(self._frame)
+        return options.apply_post_read_spark_frame(frame)
 
     def _read_spark_dataset(self, options: CastOptions) -> "Dataset":
         # Source already speaks Spark — skip the
@@ -389,9 +397,13 @@ class Dataset(Tabular[CastOptions]):
         # stable across ``to_spark_dataset()`` round trips, which the
         # ``Dataset``-as-cache pattern relies on.
         target = options.target
-        if target is None:
+        if target is None and not options.unique_by and not options.time_sample_by:
             return self
-        frame = options.cast_spark_tabular(self._frame) if self._frame is not None else None
+        if self._frame is None:
+            frame = None
+        else:
+            frame = options.cast_spark_tabular(self._frame)
+            frame = options.apply_post_read_spark_frame(frame)
         return type(self)(frame=frame, schema=target)
 
     def _write_spark_frame(
@@ -469,6 +481,52 @@ class Dataset(Tabular[CastOptions]):
         table = pa.Table.from_batches(materialized)
         frame = any_to_spark_dataframe(table, options=options)
         self._write_spark_frame(frame, options)
+
+    # ------------------------------------------------------------------
+    # Typed-argument projection / row-filter hooks
+    #
+    # Override the cross-engine defaults in :class:`Tabular` so the
+    # returned ``Dataset`` carries over per-instance state
+    # (``installed_modules``, the typed ``schema`` for filter — which
+    # preserves the row layout). The base defaults would re-build a
+    # bare ``Dataset(frame=...)`` and lose the executor-side module
+    # install record, forcing a re-install on the next transform.
+    # ------------------------------------------------------------------
+
+    def _select(self, *, columns: list[str]) -> "Dataset":
+        if self._frame is None:
+            return self
+        new_frame = self._frame.select(*columns)
+        # Schema becomes the projection — leave it to the new Dataset
+        # to read off ``frame.schema``. Preserving the typed schema
+        # would require manual sub-setting that the engine just did
+        # in the SQL planner.
+        return type(self)(
+            frame=new_frame,
+            schema=None,
+            installed_modules=self.installed_modules,
+        )
+
+    def _drop(self, *, columns: list[str]) -> "Dataset":
+        if self._frame is None:
+            return self
+        present = [c for c in columns if c in self._frame.columns]
+        new_frame = self._frame.drop(*present) if present else self._frame
+        return type(self)(
+            frame=new_frame,
+            schema=None,
+            installed_modules=self.installed_modules,
+        )
+
+    def _filter(self, *, predicate: Any) -> "Dataset":
+        if self._frame is None:
+            return self
+        new_frame = self._frame.filter(predicate.to_pyspark())
+        return type(self)(
+            frame=new_frame,
+            schema=self.schema,
+            installed_modules=self.installed_modules,
+        )
 
     # ==================================================================
     # ``Dataset``-style constructors
@@ -1030,18 +1088,51 @@ class Dataset(Tabular[CastOptions]):
 
     def filter(
         self,
-        predicate: "Callable[[Any], bool]",
+        predicate: "Callable[[Any], bool] | Any",
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
     ) -> "Dataset":
-        """Drop rows where ``predicate(row)`` is false.
+        """Drop rows where *predicate* is false.
 
-        Predicate sees unpickled objects (dynamic mode) or row-dicts
-        (typed mode). When called on a typed frame without a
-        ``schema`` argument, the existing schema is preserved (no
-        re-cast needed).
+        Two shapes, dispatched by the predicate's runtime type:
+
+        * **Predicate-like** — a SQL string, a yggdrasil
+          :class:`Expression` / :class:`Predicate` node, or a native
+          engine expression (:class:`pyarrow.compute.Expression`,
+          :class:`polars.Expr`, :class:`pyspark.sql.Column`). Routes
+          through the typed :meth:`_filter` hook; the cross-engine
+          :meth:`Tabular.filter` contract — the predicate compiles
+          to a :class:`pyspark.sql.Column` and Spark's Catalyst
+          plans the filter natively.
+        * **Pure callable** (the legacy :class:`Dataset` shape) —
+          ``predicate(row)`` evaluated per row inside a
+          :meth:`mapInArrow` worker; sees unpickled objects on a
+          dynamic frame or row-dicts on a typed frame. Kept for
+          backwards compatibility — row-by-row callables are the
+          last-resort path when no vectorised predicate fits.
+
+        When called on a typed frame without a ``schema`` argument
+        the existing schema is preserved (no re-cast needed); the
+        ``byte_size`` cap only applies to the callable path.
         """
+        from yggdrasil.io.tabular.execution.expr import Expression
+
+        # Predicate-like inputs route to the cross-engine
+        # :meth:`Tabular.filter`. Recognised: yggdrasil Expression,
+        # SQL string, or native engine expression (pyarrow / polars /
+        # pyspark) — the module-name sniff matches
+        # :meth:`Expression.from_`. ``callable(predicate)`` is the
+        # remaining signal: anything that isn't a real Python
+        # callable can't be the legacy row-predicate path.
+        if isinstance(predicate, (Expression, str)) or not callable(predicate):
+            module = (type(predicate).__module__ or "").split(".", 1)[0]
+            if (
+                isinstance(predicate, (Expression, str))
+                or module in {"pyarrow", "polars", "pyspark"}
+            ):
+                return super().filter(predicate)
+
         from yggdrasil.data.schema import Schema as _Schema
         from yggdrasil.pickle.ser import dumps, loads
         from yggdrasil.spark.frame import (

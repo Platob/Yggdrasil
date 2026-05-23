@@ -206,6 +206,15 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     # base default) still see the materialised frame.
     # -------------------------------------------------------------------------
 
+    def _native_spark_frame(self) -> Optional["DataFrame"]:
+        # Surface the persisted frame so :meth:`Tabular._write_table`
+        # skips the driver-side Arrow collect when this result is
+        # piped into a Spark-aware sink, and so
+        # :meth:`Tabular._unique` / :meth:`Tabular._resample` route
+        # through the spark.ops fast path instead of collecting to
+        # Arrow.
+        return self.spark_dataframe
+
     def _read_spark_frame(self, options: CastOptions) -> "DataFrame":
         self._require_started()
         return self._persisted_data._read_spark_frame(options)

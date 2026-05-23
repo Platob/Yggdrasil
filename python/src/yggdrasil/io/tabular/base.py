@@ -82,6 +82,338 @@ if TYPE_CHECKING:
 __all__ = ["Tabular", "is_tabular_source"]
 
 
+# ---------------------------------------------------------------------------
+# Coercion helpers — :meth:`Tabular.resample` / :meth:`Tabular.unique`
+# accept the same flexible argument shapes the rest of the codebase
+# offers (string names, :class:`yggdrasil.data.Field` objects,
+# iterables of either, :class:`int` / :class:`float` /
+# :class:`datetime.timedelta` / ISO-8601 strings for durations). The
+# coercion normalises everything to the canonical typed shape
+# (``list[str]`` / ``int seconds``) before the typed
+# :meth:`_unique` / :meth:`_resample` hook runs.
+# ---------------------------------------------------------------------------
+
+
+def _coerce_column_name(value: Any) -> str:
+    """Resolve *value* to a column name string.
+
+    Accepts a bare :class:`str`, or anything with a ``.name``
+    attribute (:class:`yggdrasil.data.Field` and friends). Raises
+    :class:`TypeError` for anything else so the caller gets a clear
+    error message at the public boundary rather than a cryptic
+    pyarrow / pyspark failure mid-pipeline.
+    """
+    if isinstance(value, str):
+        return value
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name
+    raise TypeError(
+        f"Column reference must be a string name or a Field-like with "
+        f"a ``.name`` attribute, got {type(value).__name__}: {value!r}."
+    )
+
+
+def _coerce_column_keys(value: Any) -> list[str]:
+    """Resolve *value* to a flat ``list[str]`` of column names.
+
+    Accepts a single name / Field, an iterable mixing the two, or
+    ``None`` / empty (which yields ``[]``). Duplicates inside the
+    iterable are preserved — the caller's order is the contract for
+    multi-key dedup / partitioning.
+
+    A :class:`yggdrasil.data.Field` is iterable (it yields its
+    children), so the scalar-vs-sequence dispatch has to check for
+    the scalar ``.name`` attribute *before* trying to iterate.
+    Strings and bytes also take the scalar path.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (bytes, bytearray)):
+        raise TypeError(
+            f"Column reference must be a string / Field / iterable of those, "
+            f"got {type(value).__name__}: {value!r}."
+        )
+    # Scalar Field-like (has a string ``.name``) → single-element list.
+    # Checked before the iterable branch because Field itself is iterable.
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return [name]
+    return [_coerce_column_name(item) for item in value]
+
+
+def _coerce_predicate(value: Any) -> Any:
+    """Normalize *value* into a :class:`Predicate` AST node.
+
+    Accepts the same shapes :meth:`Expression.from_` does — SQL
+    strings, an existing :class:`Expression` (must mark as
+    :class:`Predicate`), or a pyarrow / polars / pyspark native
+    expression (lifted via the matching backend importer). The
+    result is always a yggdrasil :class:`Predicate` so the typed
+    :meth:`Tabular._filter` hook sees a single shape regardless of
+    where the predicate came from.
+    """
+    from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+
+    if isinstance(value, Predicate):
+        return value
+    if isinstance(value, Expression):
+        raise TypeError(
+            f"filter expected a boolean expression (predicate); "
+            f"got non-predicate {type(value).__name__}: {value!r}. "
+            "Use a comparison (col('x') > 1), is_in / between / "
+            "is_null, or a SQL predicate string."
+        )
+    if isinstance(value, str):
+        expr = Expression.from_sql(value)
+        if not isinstance(expr, Predicate):
+            raise TypeError(
+                f"filter expected a SQL predicate string; "
+                f"{value!r} parses to a non-predicate "
+                f"{type(expr).__name__}."
+            )
+        return expr
+    # Native engine expression — pyarrow / polars / pyspark. The
+    # ``Expression.from_`` dispatcher sniffs the source's module so
+    # the optional deps stay optional (we never import an engine
+    # we haven't seen).
+    expr = Expression.from_(value)
+    if not isinstance(expr, Predicate):
+        raise TypeError(
+            f"filter expected a boolean expression (predicate); "
+            f"{type(value).__name__} lifted to non-predicate "
+            f"{type(expr).__name__}."
+        )
+    return expr
+
+
+def _coerce_sampling_seconds(value: Any) -> int:
+    """Resolve *value* into an integer second count for resample.
+
+    Accepted shapes:
+
+    * :class:`int` — used verbatim (booleans are rejected even though
+      they're a subclass; ``True == 1`` would be a footgun here).
+    * :class:`float` — rounded to the nearest integer.
+    * :class:`datetime.timedelta` — ``td.total_seconds()`` rounded.
+    * :class:`str` — ISO-8601 duration parsed via
+      :func:`yggdrasil.data.types.primitive.temporal._parse_iso_duration`.
+
+    Anything else raises :class:`TypeError`.
+    """
+    import datetime as dt
+
+    if isinstance(value, bool):
+        raise TypeError(
+            f"sampling must be int / float / timedelta / str, got bool: {value!r}."
+        )
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value))
+    if isinstance(value, dt.timedelta):
+        return int(round(value.total_seconds()))
+    if isinstance(value, str):
+        from yggdrasil.data.types.primitive.temporal import _parse_iso_duration
+
+        td = _parse_iso_duration(value)
+        if td is None:
+            raise ValueError(
+                f"sampling={value!r} is not a recognised ISO-8601 duration. "
+                "Pass an integer second count, a ``datetime.timedelta``, "
+                "or a string like ``'PT1H'`` / ``'P1D'`` / ``'PT15M'``."
+            )
+        return int(round(td.total_seconds()))
+    raise TypeError(
+        f"sampling must be int / float / timedelta / str (ISO-8601 "
+        f"duration), got {type(value).__name__}: {value!r}."
+    )
+
+
+def _default_unique(self_: "Tabular", *, keys: list[str]) -> "Tabular":
+    """Engine-routing dedup — Spark-native if available, else Arrow.
+
+    Defined at module scope so :meth:`Tabular._unique` (and any
+    subclass's super-call) shares one implementation regardless of
+    where it's invoked from. Spark-shape detection goes through
+    :meth:`Tabular._native_spark_frame` so any holder that surfaces
+    a :class:`pyspark.sql.DataFrame` natively (the
+    :class:`Dataset` itself, a :class:`SparkStatementResult`) keeps
+    the work on the executors.
+    """
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        from yggdrasil.spark.ops import dedup_spark_dataframe
+        from yggdrasil.spark.tabular import Dataset
+
+        new_frame = dedup_spark_dataframe(spark_frame, keys)
+        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+
+    from yggdrasil.arrow.ops import dedup_arrow_table
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    out = dedup_arrow_table(table, keys)
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _default_resample(
+    self_: "Tabular",
+    *,
+    time_column: str,
+    sampling_seconds: int,
+    partition_by: list[str],
+    fill_strategy: "str | None",
+) -> "Tabular":
+    """Engine-routing resample — Spark-native if available, else Arrow."""
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        from yggdrasil.spark.ops import resample_spark_dataframe
+        from yggdrasil.spark.tabular import Dataset
+
+        new_frame = resample_spark_dataframe(
+            spark_frame,
+            time_column=time_column,
+            sampling_seconds=sampling_seconds,
+            partition_by=partition_by or None,
+            fill_strategy=fill_strategy,
+        )
+        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+
+    from yggdrasil.arrow.ops import resample_arrow_table
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    out = resample_arrow_table(
+        table,
+        time_column=time_column,
+        sampling_seconds=sampling_seconds,
+        partition_by=partition_by or None,
+        fill_strategy=fill_strategy,
+    )
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _flatten_column_args(args: "tuple[Any, ...]") -> list[str]:
+    """Flatten variadic select / drop column args to a ``list[str]``.
+
+    Accepts strings, :class:`Field`-like objects (resolved via
+    :attr:`.name`), and iterables mixing those (so callers can pass
+    ``select("a", "b")`` *or* ``select(["a", "b"])`` interchangeably,
+    matching the rest of the library's keyword conventions).
+    Preserves caller-given order; duplicates are kept on purpose —
+    deduping would silently mask a select-with-duplicate bug.
+    """
+    out: list[str] = []
+    for item in args:
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        if isinstance(item, (bytes, bytearray)):
+            raise TypeError(
+                f"Column reference must be a string / Field / iterable of "
+                f"those, got {type(item).__name__}: {item!r}."
+            )
+        name = getattr(item, "name", None)
+        if isinstance(name, str):
+            out.append(name)
+            continue
+        try:
+            iter(item)
+        except TypeError:
+            raise TypeError(
+                f"Column reference must be a string / Field / iterable of "
+                f"those, got {type(item).__name__}: {item!r}."
+            )
+        out.extend(_coerce_column_name(child) for child in item)
+    return out
+
+
+def _default_select(self_: "Tabular", *, columns: list[str]) -> "Tabular":
+    """Engine-routing select — Spark-native when available, else Arrow."""
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        # ``DataFrame.select`` raises on a missing column, so the
+        # public method's "preserve order" contract is the caller's
+        # problem to keep right. We don't filter missing names here —
+        # the Spark error is more informative than a silent drop.
+        from yggdrasil.spark.tabular import Dataset
+
+        new_frame = spark_frame.select(*columns)
+        return Dataset(frame=new_frame, schema=None)
+
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    # ``pa.Table.select`` raises ``KeyError`` on a missing column —
+    # match the Spark side's "fail loud" behavior so a typo in a
+    # select call doesn't silently return an unexpected shape.
+    out = table.select(columns)
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _default_drop(self_: "Tabular", *, columns: list[str]) -> "Tabular":
+    """Engine-routing drop — Spark-native when available, else Arrow.
+
+    Missing columns in the source are filtered out *before* the
+    underlying engine call — neither :meth:`pa.Table.drop_columns`
+    nor :meth:`DataFrame.drop` raise on a missing reference by
+    default in current versions, but pinning the contract here
+    means callers see consistent behavior even if those defaults
+    drift.
+    """
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        from yggdrasil.spark.tabular import Dataset
+
+        present = [c for c in columns if c in spark_frame.columns]
+        new_frame = spark_frame.drop(*present) if present else spark_frame
+        return Dataset(frame=new_frame, schema=None)
+
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    present = [c for c in columns if c in table.schema.names]
+    if not present:
+        return ArrowTabular(table, schema=table.schema)
+    out = table.drop_columns(present)
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _default_filter(self_: "Tabular", *, predicate: Any) -> "Tabular":
+    """Engine-routing row filter — Spark-native when available, else Arrow."""
+    spark_frame = self_._native_spark_frame()
+    if spark_frame is not None:
+        from yggdrasil.spark.tabular import Dataset
+
+        new_frame = spark_frame.filter(predicate.to_pyspark())
+        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+
+    from yggdrasil.arrow.tabular import ArrowTabular
+
+    table = self_.read_arrow_table()
+    out = predicate.filter_arrow_table(table)
+    return ArrowTabular(out, schema=out.schema)
+
+
+def _schema_for_new_tabular(self_: "Tabular") -> "Schema | None":
+    """Return the source's declared schema, if one is set.
+
+    The :meth:`Tabular._schema_cache` slot holds the per-instance
+    schema (``...`` sentinel when none was declared). Reading the
+    raw slot avoids triggering :meth:`collect_schema`'s materialise
+    side-effect on the destination Tabular — the dedup / resample
+    op preserves the source's column layout, so propagating the
+    declared schema is correct without re-inferring.
+    """
+    cached = getattr(self_, "_schema_cache", ...)
+    if cached is ...:
+        return None
+    return cached
+
+
 def is_tabular_source(obj: Any) -> bool:
     """True iff *obj* is a shape :meth:`Tabular.from_` can coerce.
 
@@ -750,16 +1082,47 @@ class Tabular(ABC, Generic[O]):
     # Arrow surface
     # ==================================================================
 
+    def _read_arrow_batches_resolved(
+        self, options: O,
+    ) -> Iterator[pa.RecordBatch]:
+        """Inner read entry — applies the post-read tagged-schema passes.
+
+        Every public read path (:meth:`read_arrow_batches`,
+        :meth:`_read_arrow_table`, :meth:`_read_arrow_batch_reader`)
+        funnels through this method so the schema-driven post-passes
+        fire exactly once regardless of which entry point the caller
+        picks:
+
+        * :meth:`CastOptions.resample_arrow_batches` — snap rows to
+          the target's ``time_sampling`` grid (Field tag), aggregating
+          finer-grained sources via
+          :func:`yggdrasil.arrow.ops.resample_arrow_table`.
+        * :meth:`CastOptions.dedup_arrow_batches` — collapse duplicate
+          rows on columns flagged ``unique`` via
+          :func:`yggdrasil.arrow.ops.dedup_arrow_table`.
+
+        Resample runs **before** dedup: the resample's bucket collapse
+        already implicitly dedupes on the time column, so a downstream
+        unique-tagged column (typically the same time axis) sees a
+        much smaller input. Both passes identity-short-circuit when
+        no matching tag fires, so the common case stays zero-cost.
+        """
+        stream = self._read_arrow_batches(options)
+        stream = options.resample_arrow_batches(stream)
+        stream = options.dedup_arrow_batches(stream)
+        return stream
+
     def read_arrow_batches(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
         resolved = self.check_options(options, overrides=locals())
+        stream = self._read_arrow_batches_resolved(resolved)
         if not logger.isEnabledFor(logging.DEBUG):
-            yield from self._read_arrow_batches(resolved)
+            yield from stream
             return
         n_batches = 0
         n_rows = 0
-        for batch in self._read_arrow_batches(resolved):
+        for batch in stream:
             n_batches += 1
             n_rows += batch.num_rows
             yield batch
@@ -776,6 +1139,14 @@ class Tabular(ABC, Generic[O]):
         return self._read_arrow_table(self.check_options(options, overrides=locals()))
 
     def _read_arrow_table(self, options: O) -> pa.Table:
+        # Pull the raw batches off the underlying reader and assemble
+        # them into one :class:`pa.Table`, then run the
+        # resample / dedup passes directly on that Table via
+        # :meth:`CastOptions.apply_post_read_table`. The iterator
+        # wraps (:meth:`_read_arrow_batches_resolved`) materialise +
+        # re-batch internally too; calling them here would
+        # ``Table.from_batches → group_by → to_batches → Table.from_batches``
+        # for a wasted round trip. Single-Table path bypasses that.
         batches = list(self._read_arrow_batches(options))
         if not batches:
             schema = (
@@ -784,7 +1155,8 @@ class Tabular(ABC, Generic[O]):
                 or Schema.empty()
             )
             return schema.to_arrow_schema().empty_table()
-        return pa.Table.from_batches(batches)
+        table = pa.Table.from_batches(batches)
+        return options.apply_post_read_table(table)
 
     def read_arrow_batch_reader(
         self, options: "O | None" = None, **kwargs: Any,
@@ -796,7 +1168,8 @@ class Tabular(ABC, Generic[O]):
     def _read_arrow_batch_reader(self, options: O) -> "pa.RecordBatchReader":
         schema = options.check_target(obj=self.collect_schema).merged
         return pa.RecordBatchReader.from_batches(
-            schema.to_arrow_schema(), self._read_arrow_batches(options),
+            schema.to_arrow_schema(),
+            self._read_arrow_batches_resolved(options),
         )
 
     def read_arrow_dataset(
@@ -963,7 +1336,7 @@ class Tabular(ABC, Generic[O]):
                 type(self).__name__,
                 n_batches,
                 n_rows,
-                options.mode,
+                options.mode.name,
             )
         if options.sync_metadata:
             self._commit_metadata()
@@ -1351,6 +1724,264 @@ class Tabular(ABC, Generic[O]):
         _flush()
         if options.sync_metadata:
             self._commit_metadata()
+
+    # ==================================================================
+    # Cross-engine set / time transforms
+    #
+    # ``unique`` (dedup on keys) and ``resample`` (snap to a time grid)
+    # share one shape: a flexible public surface that coerces whatever
+    # the caller passed into the canonical typed shape, plus a typed
+    # private hook (:meth:`_unique` / :meth:`_resample`) that holders
+    # speaking a non-Arrow engine override to stay native.
+    #
+    # The default private implementations route on
+    # :meth:`_native_spark_frame` — a Spark-shaped holder
+    # (:class:`yggdrasil.spark.tabular.Dataset`,
+    # :class:`yggdrasil.spark.statement.SparkStatementResult`) returns
+    # a fresh :class:`Dataset`; everything else collects through Arrow
+    # and returns an :class:`yggdrasil.arrow.tabular.ArrowTabular`. No
+    # per-class overrides needed — the routing is the contract.
+    # ==================================================================
+
+    def unique(
+        self,
+        by: "str | Any | Iterable[Any]",
+    ) -> "Tabular":
+        """Drop duplicate rows on *by*; keep first occurrence per key tuple.
+
+        Parameters
+        ----------
+        by
+            One or more column references — :class:`str` column names,
+            :class:`yggdrasil.data.Field` instances (resolved via
+            :attr:`Field.name`), or any iterable mixing the two. Empty
+            / ``None`` is a no-op — returns ``self``.
+
+        Returns
+        -------
+        Tabular
+            A new holder carrying the deduped rows. Spark-shaped
+            inputs (anything whose :meth:`_native_spark_frame`
+            exposes a :class:`pyspark.sql.DataFrame`) return a fresh
+            :class:`yggdrasil.spark.tabular.Dataset` over the
+            spark-side dedup; everything else collects through Arrow
+            and returns an :class:`yggdrasil.arrow.tabular.ArrowTabular`.
+        """
+        keys = _coerce_column_keys(by)
+        if not keys:
+            return self
+        return self._unique(keys=keys)
+
+    def _unique(self, *, keys: list[str]) -> "Tabular":
+        """Typed-argument dedup hook.
+
+        Default routes on :meth:`_native_spark_frame`:
+
+        * holds a Spark frame → :func:`yggdrasil.spark.ops.dedup_spark_dataframe`
+          wrapped in a fresh :class:`Dataset`,
+        * otherwise → :meth:`read_arrow_table` →
+          :func:`yggdrasil.arrow.ops.dedup_arrow_table` →
+          :class:`ArrowTabular`.
+
+        Subclasses that already speak a typed engine path can override
+        to skip the round trip entirely; the default already handles
+        the two engines the codebase ships with.
+        """
+        return _default_unique(self, keys=keys)
+
+    def resample(
+        self,
+        on: "str | Any",
+        sampling: "int | float | Any",
+        *,
+        partition_by: "str | Any | Iterable[Any] | None" = None,
+        fill_strategy: "str | None" = "ffill",
+    ) -> "Tabular":
+        """Align rows to a fixed time grid on *on*; one row per bucket.
+
+        Parameters
+        ----------
+        on
+            The time column to resample on — column name
+            (:class:`str`) or :class:`yggdrasil.data.Field`.
+        sampling
+            Bucket size. Accepted shapes:
+
+            * :class:`int` / :class:`float` — seconds (floats are
+              rounded to the nearest integer second).
+            * :class:`datetime.timedelta` — total seconds.
+            * :class:`str` — ISO-8601 duration (``"PT1H"``,
+              ``"P1D"``, ``"PT15M"``) parsed via
+              :func:`yggdrasil.data.types.primitive.temporal._parse_iso_duration`.
+
+            ``sampling <= 0`` is a short-circuit — returns ``self``.
+        partition_by
+            Entity columns the resample is independent on. ``None`` /
+            empty → flat global timeline. Same coercion as
+            :meth:`unique`'s ``by``.
+        fill_strategy
+            How to fill nulls left by the bucket's "first" aggregation.
+            ``"ffill"`` (default), ``"bfill"``, or ``"none"`` /
+            ``None`` to disable. See
+            :func:`yggdrasil.arrow.ops.fill_arrow_table` for the
+            full semantics.
+
+        Returns
+        -------
+        Tabular
+            Spark-shaped holders return a :class:`Dataset` over the
+            spark-side resample; everything else returns an
+            :class:`ArrowTabular` over the arrow-side resample.
+        """
+        time_column = _coerce_column_name(on)
+        sampling_seconds = _coerce_sampling_seconds(sampling)
+        if sampling_seconds <= 0:
+            return self
+        part_cols = _coerce_column_keys(partition_by) if partition_by else []
+        return self._resample(
+            time_column=time_column,
+            sampling_seconds=sampling_seconds,
+            partition_by=part_cols,
+            fill_strategy=fill_strategy,
+        )
+
+    def _resample(
+        self,
+        *,
+        time_column: str,
+        sampling_seconds: int,
+        partition_by: list[str],
+        fill_strategy: "str | None",
+    ) -> "Tabular":
+        """Typed-argument resample hook.
+
+        Same routing model as :meth:`_unique` — Spark-shaped
+        holders run :func:`yggdrasil.spark.ops.resample_spark_dataframe`
+        and return a fresh :class:`Dataset`; everything else routes
+        through :func:`yggdrasil.arrow.ops.resample_arrow_table` and
+        returns an :class:`ArrowTabular`.
+        """
+        return _default_resample(
+            self,
+            time_column=time_column,
+            sampling_seconds=sampling_seconds,
+            partition_by=partition_by,
+            fill_strategy=fill_strategy,
+        )
+
+    # ==================================================================
+    # Projection / row filter
+    #
+    # Same public / typed-hook split as ``unique`` / ``resample``: the
+    # public method accepts flexible input and coerces, the private
+    # ``_select`` / ``_drop`` / ``_filter`` see canonical typed
+    # arguments and engine-route on :meth:`_native_spark_frame`.
+    # ==================================================================
+
+    def select(
+        self,
+        *columns: "str | Any",
+    ) -> "Tabular":
+        """Project to *columns* and return a new Tabular.
+
+        Each entry is a column reference — :class:`str`, a
+        :class:`yggdrasil.data.Field` (resolved via
+        :attr:`Field.name`), or an iterable mixing both. The result
+        preserves the caller's order, which matches both
+        :meth:`pyarrow.Table.select` and
+        :meth:`pyspark.sql.DataFrame.select` semantics.
+
+        Raises :class:`ValueError` on an empty selection — a zero-
+        column projection is almost always a caller mistake; pass
+        :class:`Schema.empty` projections through the cast surface
+        instead.
+        """
+        cols = _flatten_column_args(columns)
+        if not cols:
+            raise ValueError(
+                f"{type(self).__name__}.select needs at least one column; "
+                "pass column names ('a', 'b'), Field objects, or "
+                "iterables of either."
+            )
+        return self._select(columns=cols)
+
+    def _select(self, *, columns: list[str]) -> "Tabular":
+        """Typed-argument projection hook.
+
+        Spark-native holders return a fresh :class:`Dataset` carrying
+        ``frame.select(*columns)``; everything else collects through
+        :meth:`read_arrow_table`, projects via
+        :meth:`pa.Table.select`, and wraps the result in an
+        :class:`ArrowTabular`.
+        """
+        return _default_select(self, columns=columns)
+
+    def drop(
+        self,
+        *columns: "str | Any",
+    ) -> "Tabular":
+        """Return a new Tabular with the named columns removed.
+
+        Columns missing from the source are silently ignored —
+        matches Spark's :meth:`DataFrame.drop` and pyarrow's
+        :meth:`Table.drop_columns` (when filtered to existing
+        names). An empty argument list is a no-op that returns
+        ``self``.
+        """
+        cols = _flatten_column_args(columns)
+        if not cols:
+            return self
+        return self._drop(columns=cols)
+
+    def _drop(self, *, columns: list[str]) -> "Tabular":
+        """Typed-argument drop hook.
+
+        Same routing as :meth:`_select`. Missing columns in the
+        source are filtered out before the underlying engine's
+        ``drop`` runs so neither pyarrow nor pyspark raises on
+        an absent reference.
+        """
+        return _default_drop(self, columns=columns)
+
+    def filter(
+        self,
+        predicate: Any,
+    ) -> "Tabular":
+        """Drop rows where *predicate* is false.
+
+        ``predicate`` accepts every shape
+        :meth:`yggdrasil.io.tabular.execution.expr.Expression.from_`
+        recognises:
+
+        * a SQL predicate string (``"x > 0 AND y IS NOT NULL"``),
+          parsed by the in-tree SQL parser;
+        * a yggdrasil :class:`Predicate` node
+          (``col("x") > 0``, :func:`is_in`, :func:`between`, …);
+        * a native engine expression —
+          :class:`pyarrow.compute.Expression`,
+          :class:`polars.Expr`, or :class:`pyspark.sql.Column` —
+          lifted via the matching backend.
+
+        The predicate is parsed once and dispatched to the typed
+        :meth:`_filter` hook; the engine-side filter then runs in
+        its native kernel (Arrow C++, Spark Catalyst) so the row
+        scan stays vectorised.
+        """
+        pred = _coerce_predicate(predicate)
+        return self._filter(predicate=pred)
+
+    def _filter(self, *, predicate: Any) -> "Tabular":
+        """Typed-argument row-filter hook.
+
+        ``predicate`` is always a yggdrasil :class:`Predicate` at
+        this point (the public :meth:`filter` did the lift). Spark-
+        native holders compile to a :class:`pyspark.sql.Column` and
+        return a fresh :class:`Dataset` via
+        :meth:`DataFrame.filter`; everything else compiles to a
+        :class:`pyarrow.compute.Expression` and runs the C++
+        kernel via :meth:`Predicate.filter_arrow_table`.
+        """
+        return _default_filter(self, predicate=predicate)
 
     # ==================================================================
     # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.

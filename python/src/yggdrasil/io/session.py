@@ -238,7 +238,18 @@ class Session(Singleton, ABC):
         passthrough (the test stubs do this) still inherits the
         parent's named knobs without leaking attribute slots back
         through ``__getnewargs_ex__``.
+
+        Memoised on the class itself (``__dict__`` slot, not
+        ``setattr``) so a subclass doesn't pick up the parent's
+        cached set. The :class:`Singleton` probe path consults this
+        on *every* ``HTTPSession(…)`` construction — without the
+        cache, the :mod:`inspect`-driven MRO walk dominated the
+        singleton-hit cost (~24 us / 60 us total).
         """
+        cached = cls.__dict__.get("_INIT_PARAM_NAMES_CACHE")
+        if cached is not None:
+            return cached
+
         import inspect
 
         names: set[str] = set()
@@ -259,7 +270,9 @@ class Session(Singleton, ABC):
                 ):
                     continue
                 names.add(name)
-        return frozenset(names)
+        result = frozenset(names)
+        type.__setattr__(cls, "_INIT_PARAM_NAMES_CACHE", result)
+        return result
 
     def __setstate__(self, state):
         # Defer to :meth:`Singleton.__setstate__` for the live-singleton

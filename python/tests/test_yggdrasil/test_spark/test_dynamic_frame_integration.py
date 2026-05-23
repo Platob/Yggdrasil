@@ -39,11 +39,15 @@ import signal
 import unittest
 import uuid
 
-import pyarrow as pa
+import pytest
 
-from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.data import field, schema
-from yggdrasil.data.types.primitive import (
+pytest.importorskip("pyspark")
+
+import pyarrow as pa  # noqa: E402
+
+from yggdrasil.arrow.tests import ArrowTestCase  # noqa: E402
+from yggdrasil.data import field, schema  # noqa: E402
+from yggdrasil.data.types.primitive import (  # noqa: E402
     DateType,
     DecimalType,
     Float64Type,
@@ -51,8 +55,8 @@ from yggdrasil.data.types.primitive import (
     Int64Type,
     StringType,
 )
-from yggdrasil.spark.frame import DYNAMIC_SCHEMA, Dataset, is_dynamic_schema
-from yggdrasil.spark.tests import SparkTestCase
+from yggdrasil.spark.frame import DYNAMIC_SCHEMA, Dataset, is_dynamic_schema  # noqa: E402
+from yggdrasil.spark.tests import SparkTestCase  # noqa: E402
 
 
 _TEST_TIMEOUT_SECONDS = int(os.environ.get("YGG_SPARK_TEST_TIMEOUT", "120"))

@@ -537,12 +537,20 @@ class LocalPath(Path):
             try:
                 is_dir = entry.is_dir(follow_symlinks=False)
                 st = entry.stat(follow_symlinks=False)
+                # Skip the eager ``child.media_type`` lookup: every
+                # caller that needs it (``_leaf_for``, ``stat()``)
+                # resolves it lazily off ``URL.infer_media_type`` the
+                # first time they read it, with the result cached on
+                # the child's ``_media_type`` slot. Pre-computing it
+                # during ``_ls`` ran a URL extension parse for every
+                # scandir entry — even non-tabular siblings the
+                # ``FolderPath._leaf_for`` cache already short-circuits.
                 child._persist_stat_cache(IOStats(
                     size=int(st.st_size),
                     mtime=float(st.st_mtime),
                     mode=int(st.st_mode),
                     kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
-                    media_type=child.media_type,
+                    media_type=None,
                 ))
             except OSError:
                 # Race: the entry vanished between scandir and stat.
