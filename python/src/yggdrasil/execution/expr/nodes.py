@@ -315,7 +315,41 @@ class Expression:
             case_insensitive=case_insensitive, negated=True,
         )
 
-    def cast(self, dtype: "DataType") -> "Cast":
+    def cast(self, dtype: "DataType") -> "Expression":
+        """Coerce *self* to ``dtype``.
+
+        Smart factory — not all calls return a fresh :class:`Cast` node:
+
+        - When *self* already advertises ``dtype`` (a :class:`Column`
+          whose ``field.dtype`` matches, or a :class:`Cast` already
+          targeting ``dtype``), :meth:`cast` is a no-op and returns
+          *self* unchanged.
+        - When *self* is an Object- or Null-typed :class:`Column`,
+          the column carries no real type information yet — its
+          ``field.dtype`` is replaced with ``dtype`` in a new
+          :class:`Column` (no :class:`Cast` wrapper needed: the
+          downstream filter / SQL emitter reads the field's dtype
+          directly).
+        - When *self* is a :class:`Cast` already, the inner cast
+          collapses: ``Cast(x, A).cast(B)`` becomes
+          ``Cast(x, B)`` so backends emit one cast, not two.
+        - Otherwise, wrap *self* in :class:`Cast`.
+
+        Construct :class:`Cast` directly to opt out of these
+        rewrites (e.g. when a test wants the raw wrapper).
+        """
+        from yggdrasil.data.types.id import DataTypeId
+
+        if isinstance(self, Column):
+            current = self.field.dtype
+            if current is dtype or current == dtype:
+                return self
+            if current.type_id in (DataTypeId.OBJECT, DataTypeId.NULL):
+                return Column(self.field.with_dtype(dtype, inplace=False))
+        if isinstance(self, Cast):
+            if self.dtype is dtype or self.dtype == dtype:
+                return self
+            return Cast(self.operand, dtype)
         return Cast(self, dtype)
 
     # ------------------------------------------------------------------
@@ -686,15 +720,26 @@ class Column(Expression):
     is the job of :class:`yggdrasil.data.data_field.Field`, which
     is the canonical "selector" for the tabular API.
 
-    ``field`` carries the typed :class:`Field` when known — backends
-    that need engine-flavoured types (Spark casts, Arrow scalars)
-    use it to build correctly-typed literals on comparison without
-    asking the caller for a separate dtype.
+    A column carries exactly one slot — a :class:`Field` — that
+    owns its name, dtype, nullability, metadata, and (via
+    :attr:`Field.table_qualifier`) the SQL ``T.col`` qualifier.
+    Backends that need engine-flavoured types (Spark casts, Arrow
+    scalars) read straight off ``column.field`` instead of asking
+    the caller for separate dtype / alias arguments.
     """
 
-    name: str
-    field: "Field | None" = None
-    alias: "str | None" = None  # Optional table alias (e.g. ``T`` in ``T.col``).
+    field: "Field"
+
+    @property
+    def name(self) -> str:
+        """Convenience shortcut for ``self.field.name``."""
+        return self.field.name
+
+    @property
+    def alias(self) -> "str | None":
+        """Convenience shortcut for ``self.field.table_qualifier`` (the
+        SQL ``T.col`` qualifier)."""
+        return self.field.table_qualifier
 
     @property
     def dtype(self) -> "DataType | None":

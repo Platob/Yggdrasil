@@ -387,7 +387,7 @@ def _alias_columns(expr, alias: str):
     )
 
     if isinstance(expr, Column):
-        return type(expr)(name=expr.name, field=expr.field, alias=alias)
+        return type(expr)(expr.field.set_table_qualifier(alias, inplace=False))
     if isinstance(expr, Comparison):
         return Comparison(
             _alias_columns(expr.left, alias),

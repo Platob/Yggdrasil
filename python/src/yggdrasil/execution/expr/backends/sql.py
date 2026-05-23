@@ -880,7 +880,9 @@ class _SqlParser:
             self._eat()
             second = self._expect_kind("ident")
             alias, name = name, second.text
-        return Column(name=name, alias=alias)
+        from ..builder import col as _col
+
+        return _col(name, alias=alias)
 
     def _parse_cast(self) -> Expression:
         self._expect_kw("CAST")

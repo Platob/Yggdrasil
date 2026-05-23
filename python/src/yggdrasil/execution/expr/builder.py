@@ -49,20 +49,49 @@ __all__ = ["col", "neg", "all_of", "any_of"]
 
 
 def col(
-    name: str,
+    name: "str | Field",
     *,
     field: "Field | None" = None,
     alias: "str | None" = None,
+    dtype: "Any | None" = None,
 ) -> Column:
-    """Build a :class:`Column` reference for ``name``.
+    """Build a :class:`Column` reference.
 
-    ``field`` binds typed metadata so backends can pick the right
-    literal cast / engine type without a separate dtype argument.
-    ``alias`` qualifies the column for SQL emitters that want
-    ``T.col``; the AST node still compares ``equals`` across alias
-    differences via the underlying name.
+    ``name`` is the column identifier; pass a pre-built :class:`Field`
+    here to reuse the typed metadata (the bound dtype, nullability,
+    children, …). ``dtype`` is the convenience knob for the common
+    "I know the column type" case — when omitted the field's dtype
+    defaults to :class:`ObjectType` (the Any-shaped sentinel) so
+    backends fall back to engine-side inference. ``alias`` qualifies
+    the column for SQL emitters that want ``T.col``; it's stored on
+    the field as ``table_qualifier`` so the AST node's single slot
+    still owns the full lookup state.
+
+    ``field=`` is the legacy entry point: when the caller already has
+    a :class:`Field` instance, hand it in directly and the builder
+    skips the construction. ``field`` and ``dtype`` are mutually
+    exclusive — the field's dtype wins if both are supplied.
     """
-    return Column(name=name, field=field, alias=alias)
+    from yggdrasil.data.data_field import Field
+    from yggdrasil.data.types.primitive import ObjectType
+
+    if isinstance(name, Field):
+        # Caller already prepared the field; honour it.
+        bound = name
+        caller_owned = True
+    elif field is not None:
+        bound = field if field.name == name else field.with_name(name, inplace=False)
+        caller_owned = field is bound
+    else:
+        bound = Field(name=name, dtype=dtype if dtype is not None else ObjectType())
+        caller_owned = False
+    if alias:
+        # Caller-owned fields might be shared with other Columns — copy
+        # before stamping the qualifier so we don't leak the bolt-on
+        # into unrelated trees. The fresh-built path can mutate the
+        # locally-owned field directly.
+        bound = bound.set_table_qualifier(alias, inplace=not caller_owned)
+    return Column(field=bound)
 
 
 def neg(expr: Expression) -> Not:
