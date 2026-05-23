@@ -3400,7 +3400,12 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
         n = len(view)
         if not append and n > 0 and codec is None:
-            self.write_all(bytes(view))
+            target = self._parent if self._parent is not None else self
+            write_arrow_io = getattr(target, "write_arrow_io", None)
+            if write_arrow_io is not None:
+                write_arrow_io(view)
+            else:
+                self.write_all(bytes(view))
         elif append:
             self.seek(0, 2)  # SEEK_END
             if n > 0:

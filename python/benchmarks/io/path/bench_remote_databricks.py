@@ -492,6 +492,22 @@ def scenarios(repeat: int) -> list[dict]:
         "calls": _total_sdk_calls(workspace),
     })
 
+    # ParquetFile write → VolumePath via write_arrow_io
+    service, client, workspace = _stub_databricks_service(payload=b"")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/x.parquet", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    ParquetFile(holder=p, owns_holder=False).write_arrow_table(
+        pa.table({"id": pa.array(range(100), type=pa.int64())}),
+    )
+    out.append({
+        "label": "ParquetFile(VolumePath).write_arrow_table — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
     # Write timing — VolumePath.write_all
     out.append(_time_one(
         "VolumePath.write_all(8 KiB)",

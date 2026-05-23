@@ -444,6 +444,26 @@ class RemotePath(Path):
             self.flush()
         return n
 
+    def write_arrow_io(self, payload: "Any") -> int:
+        """Commit an Arrow-encoded payload directly to the backend.
+
+        Accepts a ``pa.Buffer``, ``bytes``, ``bytearray``, or
+        ``memoryview`` and uploads it in one backend call — no
+        page buffer, no truncate, no stat probe. Tabular IO files
+        (ParquetFile, ArrowIPCFile, etc.) route through this after
+        the format encoder finishes so the encoded bytes go straight
+        to the remote object without intermediate copies.
+        """
+        if isinstance(payload, (bytes, bytearray)):
+            data = payload
+        elif isinstance(payload, memoryview):
+            data = bytes(payload)
+        else:
+            data = bytes(memoryview(payload))
+        self._upload(data)
+        self._touch_stat(size=len(data))
+        return len(data)
+
     def write_all(self, data: "Any") -> int:
         if self._parent is not None:
             return self._active().write_all(data)
