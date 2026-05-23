@@ -82,56 +82,57 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Expression:
     """Abstract base for every node in the AST.
 
-    Expressions are immutable dataclasses. Combinators don't mutate
-    operands — they wrap them in a new node — so an expression
+    Expressions are immutable by convention — combinators don't
+    mutate operands but wrap them in a new node, so an expression
     tree can be safely cached, reused, or shared across threads.
 
-    The dataclass is built with ``eq=False`` because the operator
-    overloads (``==``, ``<``, …) below produce :class:`Comparison`
-    nodes instead of returning a bool — that's what makes
-    ``col("price") >= 100`` work. Structural equality uses
-    :meth:`equals`; identity-based hashing keeps nodes usable as
-    dict keys.
+    Concrete subclasses opt out of :class:`dataclasses.dataclass`:
+    a manual ``__slots__`` + explicit ``__init__`` is roughly 3× the
+    construction throughput of ``@dataclass(frozen=True, slots=True)``
+    on the per-node hot path, and the AST builds enough nodes per
+    predicate (one ``Comparison`` per ``c == v``, one ``Logical`` per
+    ``|`` / ``&``) that the savings show up in
+    ``benchmarks/io/tabular/bench_predicate.py``.
 
-    Subclasses override nothing; this class is a marker plus the
-    operator surface and ``to_*`` dispatchers. Backend-specific
-    compilation lives in the matching
-    ``yggdrasil.execution.expr.backends.*`` module — kept off the node
-    so a build that excludes (say) pyspark doesn't import the
+    The ``__eq__`` / ``<`` / ``>`` / ``>=`` / ``<=`` / ``!=`` operator
+    overloads on this base produce :class:`Comparison` nodes instead
+    of returning a bool — that's what makes ``col("price") >= 100``
+    work. Structural equality uses :meth:`equals`; identity-based
+    hashing keeps nodes usable as dict keys.
+
+    Subclasses override nothing structural; this class is a marker
+    plus the operator surface and ``to_*`` dispatchers. Backend-
+    specific compilation lives in the matching
+    ``yggdrasil.execution.expr.backends.*`` module — kept off the
+    node so a build that excludes (say) pyspark doesn't import the
     optional dependency.
     """
+
+    __slots__ = ()
 
     #: Set on Boolean-valued subclasses so `isinstance(x, Predicate)`
     #: is the cheap typing test. The base class stays scalar.
     _IS_PREDICATE: ClassVar[bool] = False
 
-    #: Cached per-class field-name tuple. ``dataclasses.fields(self)``
-    #: walks the ``__dataclass_fields__`` mapping and filters by field
-    #: kind on every call — fine for cold paths, painful on the
-    #: structural ``__hash__`` / :meth:`equals` hot loop. We populate
-    #: this slot once per concrete subclass via :meth:`__init_subclass__`
-    #: so the hot loop becomes a single attribute lookup.
+    #: Per-class field-name tuple. Set explicitly on every concrete
+    #: subclass alongside ``__slots__`` so the structural ``__hash__``
+    #: / :meth:`equals` hot loop is a single ClassVar lookup — no
+    #: ``dataclasses.fields(...)`` walk, no ``__slots__`` filtering
+    #: per call.
     _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ()
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        # Skip ``super().__init_subclass__`` — the dataclass decorator
-        # wraps the class with a closure that breaks the implicit
-        # ``__class__`` cell ``super()`` relies on. ``object``'s
-        # default ``__init_subclass__`` is a no-op anyway, so calling
-        # it explicitly costs nothing here.
-        #
-        # ``dataclasses.fields`` is safe to call once at class-creation
-        # time. We deliberately don't recurse into base classes — the
-        # dataclass decorator already flattens inherited fields onto
-        # the subclass's ``__dataclass_fields__``.
-        if dataclasses.is_dataclass(cls):
-            cls._FIELD_NAMES = tuple(
-                f.name for f in dataclasses.fields(cls)
-            )
+        # Fallback for subclasses that forgot to declare _FIELD_NAMES
+        # explicitly: read from __slots__. Cheap once per class.
+        super().__init_subclass__(**kwargs)
+        if "_FIELD_NAMES" not in cls.__dict__:
+            slots = cls.__dict__.get("__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            cls._FIELD_NAMES = tuple(slots)
 
     # ------------------------------------------------------------------
     # Identity / structural equality
@@ -195,22 +196,22 @@ class Expression:
     # ------------------------------------------------------------------
 
     def __eq__(self, other: "ExpressionLike") -> "Comparison":  # type: ignore[override]
-        return Comparison(self, CompareOp.EQ, _coerce(other))
+        return _smart_comparison(self, CompareOp.EQ, _coerce(other))
 
     def __ne__(self, other: "ExpressionLike") -> "Comparison":  # type: ignore[override]
-        return Comparison(self, CompareOp.NE, _coerce(other))
+        return _smart_comparison(self, CompareOp.NE, _coerce(other))
 
     def __lt__(self, other: "ExpressionLike") -> "Comparison":
-        return Comparison(self, CompareOp.LT, _coerce(other))
+        return _smart_comparison(self, CompareOp.LT, _coerce(other))
 
     def __le__(self, other: "ExpressionLike") -> "Comparison":
-        return Comparison(self, CompareOp.LE, _coerce(other))
+        return _smart_comparison(self, CompareOp.LE, _coerce(other))
 
     def __gt__(self, other: "ExpressionLike") -> "Comparison":
-        return Comparison(self, CompareOp.GT, _coerce(other))
+        return _smart_comparison(self, CompareOp.GT, _coerce(other))
 
     def __ge__(self, other: "ExpressionLike") -> "Comparison":
-        return Comparison(self, CompareOp.GE, _coerce(other))
+        return _smart_comparison(self, CompareOp.GE, _coerce(other))
 
     # ------------------------------------------------------------------
     # Arithmetic — chained scalar expressions; result still has the
@@ -575,8 +576,19 @@ class Expression:
     #: Alias — ``from_pyspark`` matches ``to_pyspark``.
     from_pyspark = from_spark
 
+    def __repr__(self) -> str:
+        # Generic ``Node(field=value, ...)`` rendering keyed on the
+        # ClassVar ``_FIELD_NAMES`` tuple. Subclasses that want a
+        # custom shape (or want to hide internal slots) override
+        # this; the default is fine for the AST nodes whose fields
+        # all carry useful repr.
+        parts = [
+            f"{name}={getattr(self, name, None)!r}"
+            for name in type(self)._FIELD_NAMES
+        ]
+        return f"{type(self).__name__}({', '.join(parts)})"
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
+
 class Predicate(Expression):
     """Marker mix-in for boolean-valued expressions.
 
@@ -590,6 +602,7 @@ class Predicate(Expression):
     on every leaf rewrite.
     """
 
+    __slots__ = ()
     _IS_PREDICATE: ClassVar[bool] = True
 
     def filter_arrow_batch(self, batch: "Any") -> "Any":
@@ -831,6 +844,115 @@ class Predicate(Expression):
         if isinstance(target, (list, tuple)):
             return self.filter_pylist(target)
         return self.filter_iterable(target)
+
+
+def _smart_comparison(
+    left: "Expression",
+    op: "CompareOp",
+    right: "Expression",
+) -> "Comparison":
+    """Build a :class:`Comparison`, applying construction-time rewrites.
+
+    Currently only the temporal-timezone pushdown
+    (:func:`_try_timezone_pushdown`) — keeping the dispatch table
+    open here means any future "rewrite at operator time" rule
+    (Cast-of-Literal constant-folding, NOT-EQ shortcut for null
+    literals, …) lands at this one site instead of leaking branches
+    through every overload on :class:`Expression`.
+    """
+    rewrite = _try_timezone_pushdown(left, op, right)
+    if rewrite is not None:
+        return rewrite
+    return Comparison(left, op, right)
+
+
+def _try_timezone_pushdown(
+    left: "Any",
+    op: "CompareOp",
+    right: "Any",
+) -> "Expression | None":
+    """Rewrite ``Cast(col_tz_X, ts_tz_Y) op lit_tz_Y`` to native filter.
+
+    When a comparison casts a tz-aware timestamp column into a
+    different timezone just to match a tz-aware literal, the result
+    is N-row tz arithmetic that an engine has to run before it can
+    filter. The arithmetic is reversible and constant on the literal
+    side: converting the literal to the column's native tz once
+    means the filter can compare native column values directly,
+    which Arrow / Polars / Spark all push down into their column
+    pruning + parquet predicate pushdown layer.
+
+    Returns the rewritten :class:`Comparison` (without the Cast wrap)
+    when the rewrite is safe, or ``None`` to fall back to the
+    literal-shape comparison.
+
+    Triggers only when ALL of these hold:
+
+    * Exactly one side is a :class:`Cast` over a :class:`Column`
+      with a :class:`TimestampType` ``field.dtype``;
+    * The Cast targets a :class:`TimestampType` whose tz is not
+      naive;
+    * The opposing side is a :class:`Literal` carrying a
+      ``datetime.datetime`` value (or ``Literal.dtype`` is a
+      :class:`TimestampType`) so the tz of the literal is known;
+    * Neither tz is naive (the conversion would be ill-defined).
+    """
+    # Light, lazy imports — temporal pushdown is the one place the
+    # expression AST has to peek at concrete DataType subclasses, and
+    # we don't want to drag :mod:`yggdrasil.data.types` into base AST
+    # construction unconditionally.
+    from yggdrasil.data.types.primitive.temporal import TimestampType
+
+    cast_side, lit_side = None, None
+    if isinstance(left, Cast) and isinstance(right, Literal):
+        cast_side, lit_side = left, right
+        flip = False
+    elif isinstance(right, Cast) and isinstance(left, Literal):
+        cast_side, lit_side = right, left
+        flip = True
+    else:
+        return None
+
+    if not isinstance(cast_side.operand, Column):
+        return None
+    cast_target = cast_side.dtype
+    if not isinstance(cast_target, TimestampType) or cast_target.tz.is_naive():
+        return None
+    source_field = cast_side.operand.field
+    if source_field is None:
+        return None
+    source_dtype = source_field.dtype
+    if not isinstance(source_dtype, TimestampType) or source_dtype.tz.is_naive():
+        return None
+    if source_dtype.tz == cast_target.tz:
+        # Cast to the same tz is a no-op the smart ``cast`` factory
+        # already swallows; but defensively short-circuit here too.
+        if flip:
+            return Comparison(lit_side, op, cast_side.operand)
+        return Comparison(cast_side.operand, op, lit_side)
+    value = lit_side.value
+    import datetime as _dt
+
+    if not isinstance(value, _dt.datetime):
+        return None
+    if value.tzinfo is None:
+        # Naive literal — caller didn't tell us which tz; refuse to
+        # guess. Keep the comparison as-is (the Cast renders at the
+        # engine).
+        return None
+    try:
+        import zoneinfo
+    except ImportError:
+        return None
+    try:
+        source_zone = zoneinfo.ZoneInfo(source_dtype.tz.iana)
+    except Exception:
+        return None
+    converted = value.astimezone(source_zone)
+    new_literal = Literal(value=converted, dtype=source_dtype)
+    if flip:
+        return Comparison(new_literal, op, cast_side.operand)
+    return Comparison(cast_side.operand, op, new_literal)
 
 
 def _try_collapse_or(
@@ -1081,7 +1203,6 @@ def _apply_inlist(
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Column(Expression):
     """A reference to a column inside an expression tree.
 
@@ -1100,17 +1221,28 @@ class Column(Expression):
     pickle round-trips) that have no business with them.
     """
 
-    name: str
-    field: "Field | None" = None
-    alias: "str | None" = None  # Column-rename: ``foo AS bar``.
-    qualifier: "str | None" = None  # Table qualifier: ``T.col``.
+    __slots__ = ("name", "field", "alias", "qualifier")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = (
+        "name", "field", "alias", "qualifier",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        field: "Field | None" = None,
+        alias: "str | None" = None,
+        qualifier: "str | None" = None,
+    ) -> None:
+        self.name = name
+        self.field = field
+        self.alias = alias
+        self.qualifier = qualifier
 
     @property
     def dtype(self) -> "DataType | None":
         return self.field.dtype if self.field is not None else None
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Literal(Expression):
     """A scalar literal value.
 
@@ -1120,8 +1252,16 @@ class Literal(Expression):
     rendered as ``DATE`` instead of ``TIMESTAMP``).
     """
 
-    value: Any
-    dtype: "DataType | None" = None
+    __slots__ = ("value", "dtype")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("value", "dtype")
+
+    def __init__(
+        self,
+        value: Any,
+        dtype: "DataType | None" = None,
+    ) -> None:
+        self.value = value
+        self.dtype = dtype
 
 
 def lit(value: Any, dtype: "DataType | None" = None) -> Literal:
@@ -1134,17 +1274,24 @@ def lit(value: Any, dtype: "DataType | None" = None) -> Literal:
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Comparison(Predicate):
-    left: Expression
-    op: CompareOp
-    right: Expression
+    __slots__ = ("left", "op", "right")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("left", "op", "right")
+
+    def __init__(
+        self,
+        left: Expression,
+        op: CompareOp,
+        right: Expression,
+    ) -> None:
+        self.left = left
+        self.op = op
+        self.right = right
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Logical(Predicate):
-    op: LogicalOp
-    operands: "tuple[Expression, ...]" = ()
+    __slots__ = ("op", "operands")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("op", "operands")
 
     def __new__(
         cls,
@@ -1159,11 +1306,9 @@ class Logical(Predicate):
         #   ``c = v1 OR c = v2 OR ...`` chain.
         # * Single-operand Logical unwraps to its only operand.
         #
-        # Same-op flatten lives in :meth:`__post_init__` (cheaper to
-        # run there, where it sees the post-``__init__`` operand
-        # tuple). Returning a non-:class:`Logical` from ``__new__``
-        # skips Python's normal ``__init__`` dispatch on the result,
-        # so the collapse / unwrap path stays a single allocation.
+        # Returning a non-:class:`Logical` from ``__new__`` skips
+        # Python's normal ``__init__`` dispatch on the result, so the
+        # collapse / unwrap path stays a single allocation.
         if op is LogicalOp.OR:
             collapsed = _try_collapse_or(operands)
             if collapsed is not None:
@@ -1173,52 +1318,47 @@ class Logical(Predicate):
             return operands_tuple[0]
         return object.__new__(cls)
 
-    def __post_init__(self) -> None:
-        # Defensive: keep the operand tuple immutable even if the
-        # caller handed in a list. Frozen dataclasses use
-        # object.__setattr__ for post-init normalization.
-        #
-        # Same-op flatten — a child ``Logical`` with the same operator
-        # is inlined into our operand list so the tree stays right-
-        # leaning regardless of how Python's left-associative ``|`` /
-        # ``&`` built it. ``(a | b) | c`` and ``a | (b | c)`` both
-        # land as ``Logical(OR, (a, b, c))``.
-        #
-        # Skip the rebuild when the operands are already canonical:
-        # the common case (every operand is a non-Logical leaf, plus
-        # the caller already handed us a tuple) costs one ``any(...)``
-        # pass and a type check. Reach for the full flatten + tuple
-        # rebuild only when there's an actual same-op child to inline.
-        op = self.op
-        operands = self.operands
-        if not isinstance(operands, tuple):
-            operands = tuple(operands)
-            object.__setattr__(self, "operands", operands)
+    def __init__(
+        self,
+        op: LogicalOp = LogicalOp.AND,
+        operands: "Iterable[Expression]" = (),
+    ) -> None:
+        # Same-op flatten — inline a child ``Logical`` with the same
+        # operator so the tree stays right-leaning regardless of how
+        # Python's left-associative ``|`` / ``&`` built it.
+        # ``(a | b) | c`` and ``a | (b | c)`` both land as
+        # ``Logical(OR, (a, b, c))``. Skip the rebuild when the
+        # operands are already canonical: the common case (every
+        # operand is a non-Logical leaf, the caller already handed us
+        # a tuple) costs one type check.
+        operands_tuple = operands if isinstance(operands, tuple) else tuple(operands)
+        if not operands_tuple:
+            raise ValueError(f"Logical {op.value} needs at least one operand.")
         needs_flatten = False
-        for operand in operands:
+        for operand in operands_tuple:
             if isinstance(operand, Logical) and operand.op is op:
                 needs_flatten = True
                 break
         if needs_flatten:
             flat: "list[Expression]" = []
-            for operand in operands:
+            for operand in operands_tuple:
                 if isinstance(operand, Logical) and operand.op is op:
                     flat.extend(operand.operands)
                 else:
                     flat.append(operand)
-            object.__setattr__(self, "operands", tuple(flat))
-        if not self.operands:
-            raise ValueError(
-                f"Logical {self.op.value} needs at least one operand."
-            )
+            operands_tuple = tuple(flat)
+        self.op = op
+        self.operands = operands_tuple
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Not(Predicate):
-    operand: Expression
+    __slots__ = ("operand",)
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("operand",)
+
+    def __init__(self, operand: Expression) -> None:
+        self.operand = operand
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Between(Predicate):
     """``column BETWEEN low AND high`` — inclusive on both bounds.
 
@@ -1227,13 +1367,24 @@ class Between(Predicate):
     natively.
     """
 
-    target: Expression
-    low: Expression
-    high: Expression
-    negated: bool = False
+    __slots__ = ("target", "low", "high", "negated")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = (
+        "target", "low", "high", "negated",
+    )
+
+    def __init__(
+        self,
+        target: Expression,
+        low: Expression,
+        high: Expression,
+        negated: bool = False,
+    ) -> None:
+        self.target = target
+        self.low = low
+        self.high = high
+        self.negated = negated
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class InList(Predicate):
     """``column IN (...)`` against a finite literal value list.
 
@@ -1244,26 +1395,25 @@ class InList(Predicate):
     ``... OR col IS NULL``.
     """
 
-    target: Expression
-    values: "tuple[Any, ...]" = ()
-    negated: bool = False
-    includes_null: bool = False
+    __slots__ = ("target", "values", "negated", "includes_null")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = (
+        "target", "values", "negated", "includes_null",
+    )
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        target: Expression,
+        values: "Iterable[Any]" = (),
+        negated: bool = False,
+        includes_null: bool = False,
+    ) -> None:
         # Dedupe in first-seen order — hashable values use a ``set``
         # fast path; the unhashable branch falls back to a linear
         # ``in out`` scan so dicts / lists still land deterministically.
         # The latter is O(n²) but only fires when the caller seeded
         # the InList with unhashable types — uncommon in practice.
-        #
-        # The dedup pass also normalises ``values`` into a tuple even
-        # when nothing duplicates, so do the scan with an early
-        # ``len(seen) == len(values)`` exit when the input was
-        # already unique and tuple-shaped — that avoids the
-        # ``tuple(deduped)`` rebuild on the steady-state "InList
-        # built from a deduped set" path.
-        values = self.values
-        is_tuple = isinstance(values, tuple)
+        if not isinstance(values, tuple):
+            values = tuple(values)
         seen: "set[Any]" = set()
         deduped: "list[Any] | None" = None
         for i, v in enumerate(values):
@@ -1274,7 +1424,6 @@ class InList(Predicate):
                     continue
                 seen.add(v)
             except TypeError:
-                # Unhashable — escape to the linear list scan.
                 if deduped is None:
                     deduped = list(values[:i])
                 if v in deduped:
@@ -1283,19 +1432,21 @@ class InList(Predicate):
                 continue
             if deduped is not None:
                 deduped.append(v)
-        if deduped is not None:
-            object.__setattr__(self, "values", tuple(deduped))
-        elif not is_tuple:
-            object.__setattr__(self, "values", tuple(values))
+        self.target = target
+        self.values = tuple(deduped) if deduped is not None else values
+        self.negated = negated
+        self.includes_null = includes_null
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class IsNull(Predicate):
-    target: Expression
-    negated: bool = False  # ``IS NOT NULL`` when True.
+    __slots__ = ("target", "negated")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("target", "negated")
+
+    def __init__(self, target: Expression, negated: bool = False) -> None:
+        self.target = target
+        self.negated = negated  # ``IS NOT NULL`` when True.
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Like(Predicate):
     """SQL-style ``LIKE`` / ``ILIKE``.
 
@@ -1303,10 +1454,22 @@ class Like(Predicate):
     for ``ILIKE`` semantics; ``negated`` for ``NOT LIKE``.
     """
 
-    target: Expression
-    pattern: str
-    case_insensitive: bool = False
-    negated: bool = False
+    __slots__ = ("target", "pattern", "case_insensitive", "negated")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = (
+        "target", "pattern", "case_insensitive", "negated",
+    )
+
+    def __init__(
+        self,
+        target: Expression,
+        pattern: str,
+        case_insensitive: bool = False,
+        negated: bool = False,
+    ) -> None:
+        self.target = target
+        self.pattern = pattern
+        self.case_insensitive = case_insensitive
+        self.negated = negated
 
 
 # ---------------------------------------------------------------------------
@@ -1314,21 +1477,32 @@ class Like(Predicate):
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Cast(Expression):
     """Explicit type cast. Returns a typed scalar expression."""
 
-    operand: Expression
-    dtype: "DataType"
+    __slots__ = ("operand", "dtype")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("operand", "dtype")
+
+    def __init__(self, operand: Expression, dtype: "DataType") -> None:
+        self.operand = operand
+        self.dtype = dtype
 
 
-@dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class Arithmetic(Expression):
     """Two-operand arithmetic. Result type is the widened operand type."""
 
-    op: ArithmeticOp
-    left: Expression
-    right: Expression
+    __slots__ = ("op", "left", "right")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("op", "left", "right")
+
+    def __init__(
+        self,
+        op: ArithmeticOp,
+        left: Expression,
+        right: Expression,
+    ) -> None:
+        self.op = op
+        self.left = left
+        self.right = right
 
 
 # ---------------------------------------------------------------------------

@@ -728,8 +728,8 @@ def _columns_referenced(expr: Any) -> "set[str]":
                 out.add(cur.name)
             continue
         if isinstance(cur, Expression):
-            for fld in dataclasses.fields(cur):
-                v = getattr(cur, fld.name, None)
+            for name in type(cur)._FIELD_NAMES:
+                v = getattr(cur, name, None)
                 if isinstance(v, Expression):
                     stack.append(v)
                 elif isinstance(v, (list, tuple)):
