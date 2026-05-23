@@ -45,7 +45,6 @@ from yggdrasil.io.url import URL
 from .resource import DatabricksResource
 from .service import DatabricksService
 
-
 __all__ = ["DatabricksPath"]
 
 
@@ -77,10 +76,11 @@ _PENDING_URL_STASH: dict[int, "URL"] = {}
 #: scheme each subclass registers under (the ``dbfs+<surface>``
 #: convention — see :class:`Scheme`).
 _POSIX_NAMESPACES: dict[str, str] = {
-    "dbfs":      Scheme.DATABRICKS_DBFS.value,
-    "Volumes":   Scheme.DATABRICKS_VOLUME.value,
+    "dbfs": Scheme.DATABRICKS_DBFS.value,
+    "Volumes": Scheme.DATABRICKS_VOLUME.value,
     "Workspace": Scheme.DATABRICKS_WORKSPACE.value,
 }
+
 
 def _looks_like_posix(value: str) -> bool:
     if not isinstance(value, str) or not value.startswith("/"):
@@ -147,7 +147,7 @@ def _strip_dbfs_family_prefix(url: "URL") -> "URL":
     raw_path = url.path or "/"
     path = raw_path.lstrip("/")
     head = path.split("/", 1)[0] if path else ""
-    rest = path[len(head) + 1:] if "/" in path else ""
+    rest = path[len(head) + 1 :] if "/" in path else ""
     suffix = "/" + rest if rest else "/"
     if head == "Volumes":
         return url.with_scheme(Scheme.DATABRICKS_VOLUME.value)._replace(path=suffix)
@@ -222,12 +222,15 @@ def _resolve_databricks_subclass(
         depth = len(parts)
         if depth == 1:
             from yggdrasil.databricks.catalog.catalog import Catalog
+
             return Catalog, candidate
         if depth == 2:
             from yggdrasil.databricks.schema.schema import Schema
+
             return Schema, candidate
         if depth == 3:
             from yggdrasil.databricks.volume.volume import Volume
+
             return Volume, candidate
         return VolumePath, candidate
     if scheme == Scheme.DATABRICKS_WORKSPACE.value:
@@ -242,16 +245,19 @@ def _resolve_databricks_subclass(
         # that go through ``DatabricksPath(...)`` don't have to know
         # the SQL module exists.
         from yggdrasil.databricks.table.table import Table
+
         return Table, candidate
     if scheme == Scheme.DATABRICKS_CATALOG.value:
         # ``dbfs+catalog:///cat`` — explicit catalog URL form. Routes
         # to the same :class:`Catalog` resource the volume-path dispatch
         # picks for ``dbfs+volume:///cat``.
         from yggdrasil.databricks.catalog.catalog import Catalog
+
         return Catalog, candidate
     if scheme == Scheme.DATABRICKS_SCHEMA.value:
         # ``dbfs+schema:///cat/sch`` — explicit schema URL form.
         from yggdrasil.databricks.schema.schema import Schema
+
         return Schema, candidate
 
     # Unknown scheme (or empty) — let the caller's intended class
@@ -429,6 +435,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
             from .fs.dbfs_path import DBFSPath
             from .fs.volume_path import VolumePath
             from .fs.workspace_path import WorkspacePath
+
             if target in (DBFSPath, VolumePath, WorkspacePath):
                 if normalized is not None:
                     data = None
@@ -443,7 +450,9 @@ class DatabricksPath(DatabricksResource, RemotePath):
                 # so the inner ``__new__`` doesn't see the
                 # POSIX seed.
                 if normalized is not None and not getattr(
-                    instance, "_initialized", False,
+                    instance,
+                    "_initialized",
+                    False,
                 ):
                     _PENDING_URL_STASH[id(instance)] = normalized
                 return instance
@@ -524,14 +533,22 @@ class DatabricksPath(DatabricksResource, RemotePath):
                 url = _strip_dbfs_family_prefix(url)
                 target_scheme = self.scheme
                 if target_scheme is not None:
-                    target_token = target_scheme.value if isinstance(
-                        target_scheme, Scheme,
-                    ) else str(target_scheme)
+                    target_token = (
+                        target_scheme.value
+                        if isinstance(
+                            target_scheme,
+                            Scheme,
+                        )
+                        else str(target_scheme)
+                    )
                     if not url.scheme:
                         url = url.with_scheme(target_token)
 
         super().__init__(
-            service=service, data=data, url=url, temporary=temporary,
+            service=service,
+            data=data,
+            url=url,
+            temporary=temporary,
             **kwargs,
         )
 
@@ -695,7 +712,8 @@ class DatabricksPath(DatabricksResource, RemotePath):
         # ``Path._TRANSIENT_STATE_ATTRS``) actually stay out of the
         # payload — same convention :class:`Singleton` enforces.
         return {
-            k: v for k, v in self.__dict__.items()
+            k: v
+            for k, v in self.__dict__.items()
             if k not in self._TRANSIENT_STATE_ATTRS
         }
 
@@ -745,9 +763,8 @@ class DatabricksPath(DatabricksResource, RemotePath):
         """
         if cursor:
             offset = self._pos
-        buffered = (
-            self._buffersize is not None
-            and (self._dirty_pages or self._buffered_size is not None)
+        buffered = self._buffersize is not None and (
+            self._dirty_pages or self._buffered_size is not None
         )
         if size < 0 and offset == 0 and not buffered:
             # ``FileNotFoundError`` propagates — semantics match the
@@ -775,6 +792,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
         the precondition.
         """
         from yggdrasil.io.bytes_io import BytesIO
+
         del mode
         if n == 0:
             return BytesIO()
@@ -797,14 +815,58 @@ class DatabricksPath(DatabricksResource, RemotePath):
             return 0
         return self._write_mv(memoryview(payload), pos)
 
+    # ------------------------------------------------------------------
+    # Fast whole-file write — no stat / resize / truncate overhead
+    # ------------------------------------------------------------------
+
+    def write_full_bytes(self, data: "Any") -> int:
+        """Write *data* as the entire file content in one shot.
+
+        Skips every pre-check the normal write path performs — no
+        ``_stat`` probe, no ``resize``, no ``truncate``, no
+        read-modify-write — and goes straight to the backend's
+        atomic upload. Use this for write-once payloads (parquet
+        files, staged scripts, serialised artifacts) where the
+        caller owns the complete content and doesn't need
+        positional splicing.
+
+        Accepts ``bytes``, ``bytearray``, ``memoryview``, or any
+        file-like object with ``.read()`` (``io.BytesIO``, open
+        file handle, ``pa.BufferOutputStream`` buffer, Arrow IPC
+        sink, …). Streams are passed through to the SDK upload
+        without eager materialisation when the backend supports it.
+
+        Returns the byte count written (``-1`` for streams of
+        unknown length).
+        """
+        if isinstance(data, memoryview):
+            data = bytes(data)
+        return self._upload_full(data)
+
+    def _upload_full(self, content: "Any") -> int:
+        """Backend-specific atomic upload. Subclasses override."""
+        return self._write_mv(
+            (
+                memoryview(content)
+                if isinstance(content, (bytes, bytearray))
+                else memoryview(bytes(content))
+            ),
+            0,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Error duck-typing — module-private; subclasses keep their own variants
 # ---------------------------------------------------------------------------
 
 
-_PARENT_MISSING_NAMES = frozenset({
-    "NotFound", "ResourceDoesNotExist", "FileNotFoundError",
-})
+_PARENT_MISSING_NAMES = frozenset(
+    {
+        "NotFound",
+        "ResourceDoesNotExist",
+        "FileNotFoundError",
+    }
+)
 
 _PARENT_MISSING_MESSAGES = (
     "does not exist",

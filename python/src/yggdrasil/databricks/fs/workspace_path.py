@@ -23,10 +23,8 @@ from yggdrasil.io.url import URL
 from ..path import DatabricksPath
 from ..workspaces.service import Workspaces
 
-
 __all__ = ["WorkspacePath"]
 from ...dataclasses import WaitingConfig
-
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +102,9 @@ class WorkspacePath(DatabricksPath):
         except Exception:
             return ""
         name = getattr(info, "user_name", None) or getattr(
-            info, "userName", None,
+            info,
+            "userName",
+            None,
         )
         if not isinstance(name, str) or not name:
             return ""
@@ -118,15 +118,15 @@ class WorkspacePath(DatabricksPath):
     def _stat_uncached(self) -> IOStats:
         try:
             info = self._call(
-                self.client.workspace_client().workspace.get_status, self.api_path,
+                self.client.workspace_client().workspace.get_status,
+                self.api_path,
             )
         except Exception:
             return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
 
         ot = getattr(info, "object_type", None)
-        is_dir = (
-            getattr(ot, "name", None) == "DIRECTORY"
-            or str(ot).upper().endswith("DIRECTORY")
+        is_dir = getattr(ot, "name", None) == "DIRECTORY" or str(ot).upper().endswith(
+            "DIRECTORY"
         )
         size = int(getattr(info, "size", 0) or 0)
         mtime_ms = getattr(info, "modified_at", None) or 0
@@ -158,7 +158,9 @@ class WorkspacePath(DatabricksPath):
             return
         logger.debug(
             "Listing workspace directory %r -> %d entries (recursive=%s)",
-            self, len(entries), recursive,
+            self,
+            len(entries),
+            recursive,
         )
         for info in entries:
             child_path = getattr(info, "path", None)
@@ -168,9 +170,9 @@ class WorkspacePath(DatabricksPath):
             # the URL path is the namespace-stripped suffix.
             url_path = child_path
             if url_path.startswith("/Workspace/"):
-                url_path = url_path[len("/Workspace"):]
+                url_path = url_path[len("/Workspace") :]
             elif url_path.startswith("/Workspace"):
-                url_path = url_path[len("/Workspace"):] or "/"
+                url_path = url_path[len("/Workspace") :] or "/"
             # ``singleton_ttl`` defaults to ``False`` so listing
             # children stay out of ``DatabricksPath._INSTANCES``;
             # callers wanting cached children pass it through ``ls``.
@@ -180,19 +182,20 @@ class WorkspacePath(DatabricksPath):
                 singleton_ttl=singleton_ttl,
             )
             ot = getattr(info, "object_type", None)
-            is_dir = (
-                getattr(ot, "name", None) == "DIRECTORY"
-                or str(ot).upper().endswith("DIRECTORY")
-            )
+            is_dir = getattr(ot, "name", None) == "DIRECTORY" or str(
+                ot
+            ).upper().endswith("DIRECTORY")
             # Seed from the listing entry so the caller's ``is_file()``
             # / ``size`` / ``exists()`` per child don't each issue a
             # follow-up ``workspace.get_status`` round trip.
             mtime_ms = getattr(info, "modified_at", None) or 0
-            child._persist_stat_cache(IOStats(
-                kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
-                size=0 if is_dir else int(getattr(info, "size", 0) or 0),
-                mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
-            ))
+            child._persist_stat_cache(
+                IOStats(
+                    kind=IOKind.DIRECTORY if is_dir else IOKind.FILE,
+                    size=0 if is_dir else int(getattr(info, "size", 0) or 0),
+                    mtime=float(mtime_ms) / 1000.0 if mtime_ms else 0.0,
+                )
+            )
             yield child
             if recursive and is_dir:
                 yield from child._ls(recursive=True, singleton_ttl=singleton_ttl)
@@ -227,7 +230,8 @@ class WorkspacePath(DatabricksPath):
         try:
             self._call(
                 self.client.workspace_client().workspace.delete,
-                self.api_path, recursive=False,
+                self.api_path,
+                recursive=False,
             )
         except Exception:
             if not missing_ok:
@@ -235,17 +239,22 @@ class WorkspacePath(DatabricksPath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
+        self,
+        recursive: bool,
+        missing_ok: bool,
+        wait: WaitingConfig,
     ) -> None:
         del wait
         logger.debug(
             "Deleting workspace directory %r (recursive=%s)",
-            self, recursive,
+            self,
+            recursive,
         )
         try:
             self._call(
                 self.client.workspace_client().workspace.delete,
-                self.api_path, recursive=recursive,
+                self.api_path,
+                recursive=recursive,
             )
         except Exception:
             if not missing_ok:
@@ -284,7 +293,10 @@ class WorkspacePath(DatabricksPath):
             data = bytes(body)
         logger.debug(
             "Downloaded workspace file %r -> %d bytes (slice pos=%d n=%s)",
-            self, len(data), pos, "EOF" if n < 0 else n,
+            self,
+            len(data),
+            pos,
+            "EOF" if n < 0 else n,
         )
 
         # ``workspace.download`` always returns the whole object, so its
@@ -293,11 +305,13 @@ class WorkspacePath(DatabricksPath):
         # so the next ``size`` / ``exists`` lookup is local.
         media_type = _media_type_from_response(response)
         if self._stat_cached is None:
-            self._persist_stat_cache(IOStats(
-                size=len(data),
-                kind=IOKind.FILE,
-                media_type=media_type,
-            ))
+            self._persist_stat_cache(
+                IOStats(
+                    size=len(data),
+                    kind=IOKind.FILE,
+                    media_type=media_type,
+                )
+            )
         else:
             self._stat_cached.size = len(data)
             if media_type is not None and self._stat_cached.media_type is None:
@@ -314,7 +328,12 @@ class WorkspacePath(DatabricksPath):
         return memoryview(data)
 
     def _write_stream(
-        self, src: Any, *, offset: int, size: int = -1, **kwargs: Any,
+        self,
+        src: Any,
+        *,
+        offset: int,
+        size: int = -1,
+        **kwargs: Any,
     ) -> int:
         """Override the base chunked stream — Workspace wants one PUT.
 
@@ -356,7 +375,7 @@ class WorkspacePath(DatabricksPath):
                 existing = b""
             if pos > len(existing):
                 existing = existing + b"\x00" * (pos - len(existing))
-            payload = existing[:pos] + bytes(data) + existing[pos + n:]
+            payload = existing[:pos] + bytes(data) + existing[pos + n :]
         self._upload(payload)
         return n
 
@@ -383,7 +402,8 @@ class WorkspacePath(DatabricksPath):
         size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
             "Uploading workspace file %r (%s bytes)",
-            self, size if size >= 0 else "?",
+            self,
+            size if size >= 0 else "?",
         )
         upload = self.client.workspace_client().workspace.upload
         api_path = self.api_path
@@ -398,7 +418,9 @@ class WorkspacePath(DatabricksPath):
                 # reads the full body even on a retry.
                 stream.seek(0)
                 upload(path=api_path, content=stream, format=fmt, overwrite=True)
+
         else:
+
             def _do_upload() -> None:
                 # Bytes-like input — ``WorkspaceExt.upload`` will
                 # build a fresh ``BytesIO`` per request, so no
@@ -423,24 +445,28 @@ class WorkspacePath(DatabricksPath):
             logger.warning(
                 "Workspace upload of %r hit %s despite overwrite=True — "
                 "deleting conflicting node and retrying",
-                self, type(exc).__name__,
+                self,
+                type(exc).__name__,
             )
             try:
                 self._call(
                     self.client.workspace_client().workspace.delete,
-                    api_path, recursive=False,
+                    api_path,
+                    recursive=False,
                 )
             except Exception as del_exc:
                 if not _looks_like_not_found(del_exc):
                     raise
             self._call_ensuring_parents(_do_upload)
         if size >= 0:
-            self._persist_stat_cache(IOStats(
-                size=size,
-                kind=IOKind.FILE,
-                mtime=time.time(),
-                media_type=self.media_type,
-            ))
+            self._persist_stat_cache(
+                IOStats(
+                    size=size,
+                    kind=IOKind.FILE,
+                    mtime=time.time(),
+                    media_type=self.media_type,
+                )
+            )
             logger.info("Uploaded workspace file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded workspace file %r (size=stream)", self)
@@ -491,9 +517,7 @@ class WorkspacePath(DatabricksPath):
         )
 
         target: "WorkspacePath" = (
-            self
-            if suffix in (".zip", ".whl")
-            else self / archive_default
+            self if suffix in (".zip", ".whl") else self / archive_default
         )
 
         if not overwrite and target.exists():
@@ -518,12 +542,14 @@ class WorkspacePath(DatabricksPath):
                 except OSError:
                     pass
 
-        target._persist_stat_cache(IOStats(
-            size=int(size),
-            kind=IOKind.FILE,
-            mtime=time.time(),
-            media_type=target.media_type,
-        ))
+        target._persist_stat_cache(
+            IOStats(
+                size=int(size),
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=target.media_type,
+            )
+        )
         return target
 
     def truncate(self, n: int) -> int:
@@ -546,6 +572,9 @@ class WorkspacePath(DatabricksPath):
         self._upload(head)
         return n
 
+    def _upload_full(self, content: "Any") -> int:
+        return self._upload(content)
+
     def _clear(self) -> None:
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
@@ -564,10 +593,7 @@ def _media_type_from_response(info) -> "MediaType | None":
     """
     if info is None:
         return None
-    mime = (
-        getattr(info, "content_type", None)
-        or getattr(info, "mime_type", None)
-    )
+    mime = getattr(info, "content_type", None) or getattr(info, "mime_type", None)
     if not mime:
         return None
     return MediaType.from_(mime, default=None)
@@ -576,7 +602,9 @@ def _media_type_from_response(info) -> "MediaType | None":
 def _looks_like_not_found(exc: BaseException) -> bool:
     name = type(exc).__name__
     return name in (
-        "NotFound", "ResourceDoesNotExist", "FileNotFoundError",
+        "NotFound",
+        "ResourceDoesNotExist",
+        "FileNotFoundError",
     ) or isinstance(exc, FileNotFoundError)
 
 
@@ -604,6 +632,7 @@ def _import_format_auto() -> Any:
     """
     try:
         from databricks.sdk.service.workspace import ImportFormat
+
         return ImportFormat.AUTO
     except Exception:
         return "AUTO"
@@ -619,6 +648,7 @@ def _export_format_auto() -> Any:
     """
     try:
         from databricks.sdk.service.workspace import ExportFormat
+
         return ExportFormat.AUTO
     except Exception:
         return "AUTO"
