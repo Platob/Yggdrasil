@@ -1018,7 +1018,7 @@ class TestPartitionDataCache:
 
         # Predicate-bearing reads still hit the cache; the row-level
         # filter runs on the cached batches in pyarrow's C++ kernel.
-        from yggdrasil.io.tabular.execution.expr import col
+        from yggdrasil.execution.expr import col
         filtered = folder.filter(col("v") >= 3).read_arrow_table()
         assert sorted(filtered.column("v").to_pylist()) == [3, 4, 5]
 

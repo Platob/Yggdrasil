@@ -29,7 +29,7 @@ with the output :attr:`name`, optional :attr:`alias` for the
 source-side label, and target :attr:`dtype`, then pass it to
 ``LazyTabular.select`` or a SQL ``statement.select`` list.
 
-Per-engine compilation lives under :mod:`yggdrasil.io.tabular.execution.expr.backends`:
+Per-engine compilation lives under :mod:`yggdrasil.execution.expr.backends`:
 each backend ships ``to_<target>`` and (where introspection is
 feasible) ``from_<target>``. The :class:`Expression` base
 exposes them as instance and class methods (``to_python`` /

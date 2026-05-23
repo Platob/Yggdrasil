@@ -1613,7 +1613,7 @@ def _arrow_row_filter_for(
     if predicate is None:
         return None
     try:
-        from yggdrasil.io.tabular.execution.expr import free_columns
+        from yggdrasil.execution.expr import free_columns
     except ImportError:
         return None
 
@@ -1671,7 +1671,7 @@ def _merge_prune_with_predicate(
     extracted set (when extractable).
 
     Predicate extraction routes through
-    :func:`yggdrasil.io.tabular.execution.expr.extract_partition_filters`,
+    :func:`yggdrasil.execution.expr.extract_partition_filters`,
     which over-approximates and only reports columns it can pin to
     a finite set — comparisons, ``IN`` lists, ``IS NULL``, and their
     ``AND`` / ``OR`` composition. Ranges, ``NOT``, and arithmetic
@@ -1681,7 +1681,7 @@ def _merge_prune_with_predicate(
     """
     if predicate is None or not partition_columns:
         return explicit
-    from yggdrasil.io.tabular.execution.expr import extract_partition_filters
+    from yggdrasil.execution.expr import extract_partition_filters
 
     derived = extract_partition_filters(predicate, partition_columns)
     if not derived:

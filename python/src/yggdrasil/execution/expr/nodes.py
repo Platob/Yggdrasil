@@ -101,7 +101,7 @@ class Expression:
     Subclasses override nothing; this class is a marker plus the
     operator surface and ``to_*`` dispatchers. Backend-specific
     compilation lives in the matching
-    ``yggdrasil.io.tabular.execution.expr.backends.*`` module — kept off the node
+    ``yggdrasil.execution.expr.backends.*`` module — kept off the node
     so a build that excludes (say) pyspark doesn't import the
     optional dependency.
     """
@@ -327,7 +327,7 @@ class Expression:
         """Return a logically equivalent but normalized form.
 
         Convenience method that delegates to
-        :func:`yggdrasil.io.tabular.execution.expr.simplify.simplify`.
+        :func:`yggdrasil.execution.expr.simplify.simplify`.
         See its docstring for the exact rewrites — the headline
         ones are nested-Logical flattening, ``InList`` value
         de-duplication, and OR-of-equalities collapse

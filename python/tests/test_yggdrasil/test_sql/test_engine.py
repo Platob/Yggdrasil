@@ -11,8 +11,8 @@ pytest.importorskip("sqlglot")
 import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.io.tabular.execution.expr import col
-from yggdrasil.io.tabular.execution.sql import (
+from yggdrasil.execution.expr import col
+from yggdrasil.execution.sql import (
     Aggregate,
     Engine,
     EnginePlan,

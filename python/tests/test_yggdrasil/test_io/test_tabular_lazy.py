@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.polars.tests import PolarsTestCase
-from yggdrasil.io.tabular.execution.expr import Logical, Predicate, col
-from yggdrasil.io.tabular.execution.plan import (
+from yggdrasil.execution.expr import Logical, Predicate, col
+from yggdrasil.execution.plan import (
     Apply,
     ExecutionPlan,
     Filter,

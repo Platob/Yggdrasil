@@ -61,7 +61,7 @@ from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ParquetFile
 from yggdrasil.io.tabular import Tabular, O
-from yggdrasil.io.tabular.execution.expr import (
+from yggdrasil.execution.expr import (
     Expression,
     InList,
     Logical,
@@ -70,7 +70,7 @@ from yggdrasil.io.tabular.execution.expr import (
     col as expr_col,
     simplify,
 )
-from yggdrasil.io.tabular.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
+from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 
 from ..fs import VolumePath
 from ..volume import Volume
@@ -324,7 +324,7 @@ def _build_prune_predicate(
 
     Builds one AST: per-column ``InList`` from ``prune_values`` AND'd
     with the user's ``where``, target-aliased, and routed through
-    :func:`yggdrasil.io.tabular.execution.expr.simplify` so:
+    :func:`yggdrasil.execution.expr.simplify` so:
 
     * Duplicate values inside any one column's ``IN`` list collapse
       (``{"region": ["us", "us", "eu"]}`` → ``IN ('us', 'eu')``) —
@@ -386,7 +386,7 @@ def _alias_columns(expr, alias: str):
     Returns a new tree — the AST is immutable so we never mutate
     the caller's predicate.
     """
-    from yggdrasil.io.tabular.execution.expr.nodes import (
+    from yggdrasil.execution.expr.nodes import (
         Arithmetic,
         Between,
         Cast,

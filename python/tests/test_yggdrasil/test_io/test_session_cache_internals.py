@@ -138,7 +138,7 @@ class TestCacheLookupPredicates:
         )
 
     def _free_columns(self, pred):
-        from yggdrasil.io.tabular.execution.expr import free_columns
+        from yggdrasil.execution.expr import free_columns
         return free_columns(pred)
 
     def test_single_request_predicate_partitions_and_matches(self) -> None:
@@ -152,7 +152,7 @@ class TestCacheLookupPredicates:
         assert "request_public_url_hash" in free
 
     def test_batch_predicate_emits_partition_in_clause(self) -> None:
-        from yggdrasil.io.tabular.execution.expr import extract_partition_filters
+        from yggdrasil.execution.expr import extract_partition_filters
 
         cfg = self._cfg()
         reqs = [
@@ -168,7 +168,7 @@ class TestCacheLookupPredicates:
         )
 
     def test_predicate_extracts_partition_filters(self) -> None:
-        from yggdrasil.io.tabular.execution.expr import (
+        from yggdrasil.execution.expr import (
             extract_partition_filters,
         )
 
@@ -206,12 +206,12 @@ class TestCacheLookupPredicates:
 
     def test_batch_predicate_emits_in_list_per_match_column(self) -> None:
         """``make_batch_lookup_predicate`` runs the result through
-        :func:`yggdrasil.io.tabular.execution.expr.simplify` so a chain
+        :func:`yggdrasil.execution.expr.simplify` so a chain
         of ``col == v_i`` per request collapses into one
         ``col IN (v_1, ..., v_N)`` — the IN-list compiles faster inside
         pyarrow's filter kernel than an N-way ``OR``.
         """
-        from yggdrasil.io.tabular.execution.expr import InList, Logical, LogicalOp
+        from yggdrasil.execution.expr import InList, Logical, LogicalOp
 
         cfg = self._cfg()
         reqs = [make_request(f"https://example.com/r{i}") for i in range(32)]
@@ -231,7 +231,7 @@ class TestCacheLookupPredicates:
         public ``Expression`` builders so the predicate parser path stays
         the source of truth.
         """
-        from yggdrasil.io.tabular.execution.expr import (
+        from yggdrasil.execution.expr import (
             InList,
             any_of,
             col,
@@ -246,7 +246,7 @@ class TestCacheLookupPredicates:
 
     def test_batch_predicate_dedups_repeated_match_values(self) -> None:
         """Multiple requests sharing a match value collapse to one IN-list entry."""
-        from yggdrasil.io.tabular.execution.expr import InList
+        from yggdrasil.execution.expr import InList
 
         cfg = self._cfg()
         # Two requests with the same URL → same match value. The IN-list

@@ -4,7 +4,7 @@ Small visitor primitive every backend reaches for when it needs to
 collect schema-side information (referenced column names, free
 variables, optimisation flags) without producing a transformed tree.
 For rewrites prefer pattern-matching on node types directly — see
-:mod:`yggdrasil.io.tabular.execution.expr.simplify`.
+:mod:`yggdrasil.execution.expr.simplify`.
 """
 
 from __future__ import annotations

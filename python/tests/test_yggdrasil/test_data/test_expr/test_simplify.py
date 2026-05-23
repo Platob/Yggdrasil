@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.tabular.execution.expr import (
+from yggdrasil.execution.expr import (
     Comparison,
     Expression,
     InList,
@@ -36,7 +36,7 @@ from yggdrasil.io.tabular.execution.expr import (
     lit,
     simplify,
 )
-from yggdrasil.io.tabular.execution.expr.backends.python import to_python
+from yggdrasil.execution.expr.backends.python import to_python
 
 
 def _eval_all(expr: Expression, samples: list[dict]) -> list:

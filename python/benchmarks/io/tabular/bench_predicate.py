@@ -9,7 +9,7 @@ runs it. Three cost surfaces show up in real workloads:
    builder allocates one frozen dataclass per node, so a deep
    tree (``c == a | c == b | c == c | c == d | ...``) is cheap
    per node but ``__post_init__`` work adds up at scale.
-2. **Simplify** — :func:`yggdrasil.io.tabular.execution.expr.simplify`
+2. **Simplify** — :func:`yggdrasil.execution.expr.simplify`
    is the algebraic rewrite pass (InList dedup, OR-of-EQ collapse,
    Logical flatten, AND dedup). Pipelines that build predicates
    programmatically (chained ``|`` calls inside a loop) feed it
@@ -58,12 +58,12 @@ from typing import Callable
 import pyarrow as pa
 import pyarrow.dataset as pds
 
-from yggdrasil.io.tabular.execution.expr import (
+from yggdrasil.execution.expr import (
     Expression,
     col,
     simplify,
 )
-from yggdrasil.io.tabular.execution.expr.backends.python import (
+from yggdrasil.execution.expr.backends.python import (
     filter_rows,
     to_python,
 )

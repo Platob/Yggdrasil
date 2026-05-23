@@ -48,7 +48,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.executor import StatementExecutor
 from yggdrasil.io.tabular import Tabular
-from yggdrasil.io.tabular.execution.expr import Predicate
+from yggdrasil.execution.expr import Predicate
 from yggdrasil.data.statement import (
     ExternalStatementData,
     PreparedStatement,

@@ -40,13 +40,13 @@ from typing import TYPE_CHECKING, Any, ClassVar, List, Optional, Sequence, Tuple
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+from yggdrasil.execution.expr import Expression, Predicate
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.tabular import ArrowTabular, Tabular
 
 
 if TYPE_CHECKING:
-    from yggdrasil.io.tabular.execution.sql.catalog import SqlContext
+    from yggdrasil.execution.sql.catalog import SqlContext
 
 
 __all__ = [
@@ -717,7 +717,7 @@ def _narrow_schema(full: Any, projection: "Sequence[str]") -> Any:
 
 def _columns_referenced(expr: Any) -> "set[str]":
     """Walk *expr*'s subtree and collect every :class:`Column` name."""
-    from yggdrasil.io.tabular.execution.expr import Column, Expression
+    from yggdrasil.execution.expr import Column, Expression
 
     out: set[str] = set()
     stack: list[Any] = [expr]

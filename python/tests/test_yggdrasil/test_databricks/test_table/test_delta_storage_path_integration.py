@@ -60,7 +60,7 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.databricks.table.table import Table
 from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions
-from yggdrasil.io.tabular.execution.expr import col as expr_col
+from yggdrasil.execution.expr import col as expr_col
 
 from .. import DatabricksIntegrationCase
 

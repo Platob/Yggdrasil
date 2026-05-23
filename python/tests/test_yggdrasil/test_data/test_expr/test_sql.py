@@ -13,8 +13,8 @@ import datetime as dt
 
 import pytest
 
-from yggdrasil.io.tabular.execution.expr import col, lit
-from yggdrasil.io.tabular.execution.expr.backends.sql import from_sql, to_sql
+from yggdrasil.execution.expr import col, lit
+from yggdrasil.execution.expr.backends.sql import from_sql, to_sql
 
 
 class TestQuotingByDialect:

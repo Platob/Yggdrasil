@@ -32,7 +32,7 @@ import dataclasses
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Tuple
 
 from yggdrasil.data.data_field import Field
-from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+from yggdrasil.execution.expr import Expression, Predicate
 
 if TYPE_CHECKING:
     import polars as pl

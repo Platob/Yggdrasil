@@ -54,7 +54,7 @@ from yggdrasil.data.data_field import Field
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions
-from yggdrasil.io.tabular.execution.expr import col as expr_col
+from yggdrasil.execution.expr import col as expr_col
 
 
 PARTITION_KEYS = [f"p{i:02d}" for i in range(64)]

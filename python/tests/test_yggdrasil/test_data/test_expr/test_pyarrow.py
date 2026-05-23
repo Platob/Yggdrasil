@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-from yggdrasil.io.tabular.execution.expr import col
+from yggdrasil.execution.expr import col
 
 
 def _table():
@@ -139,7 +139,7 @@ class TestPredicateFilterPicksBestEngine:
         assert kept.column("x").to_pylist() == [1, 3]
 
     def test_and_of_in_lists(self):
-        from yggdrasil.io.tabular.execution.expr import simplify
+        from yggdrasil.execution.expr import simplify
 
         t = pa.Table.from_pylist([
             {"x": 1, "y": "a"},
@@ -168,7 +168,7 @@ class TestPredicateFilterPicksBestEngine:
         assert kept.schema.equals(batch.schema)
 
     def test_includes_null_matches_null_rows(self):
-        from yggdrasil.io.tabular.execution.expr import simplify
+        from yggdrasil.execution.expr import simplify
 
         t = pa.Table.from_pylist([{"x": 1}, {"x": None}, {"x": 5}])
         batch = t.to_batches()[0]
@@ -221,7 +221,7 @@ class TestPredicateFilterPicksBestEngine:
 
     def test_matches_pyarrow_filter_on_mixed_input(self):
         """``filter_arrow_batch`` agrees row-for-row with the pyarrow path."""
-        from yggdrasil.io.tabular.execution.expr import simplify
+        from yggdrasil.execution.expr import simplify
 
         t = pa.Table.from_pylist([
             {"x": 1, "y": "a"},
@@ -238,7 +238,7 @@ class TestPredicateFilterPicksBestEngine:
 
     def test_filter_arrow_table_picks_best_engine(self):
         """``filter_arrow_table`` mirrors the per-batch dispatch."""
-        from yggdrasil.io.tabular.execution.expr import simplify
+        from yggdrasil.execution.expr import simplify
 
         t = pa.Table.from_pylist([
             {"x": 1, "y": "a"},

@@ -2,7 +2,7 @@
 
 The single line you'll write 95% of the time::
 
-    import yggdrasil.io.tabular.execution.sql as ysql
+    import yggdrasil.execution.sql as ysql
 
     ysql.register("trades", trades_io)              # name → Tabular
     result = ysql.sql("SELECT symbol, SUM(qty) AS total "
@@ -70,7 +70,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-from yggdrasil.io.tabular.execution.expr import Expression
+from yggdrasil.execution.expr import Expression
 
 from .catalog import (
     SqlContext,
@@ -255,7 +255,7 @@ def sql(
     .. code-block:: python
 
         import pyarrow as pa
-        import yggdrasil.io.tabular.execution.sql as ysql
+        import yggdrasil.execution.sql as ysql
 
         trades = pa.table({
             "symbol": ["AAPL", "GOOG", "AAPL"],

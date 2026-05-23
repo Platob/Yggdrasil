@@ -42,7 +42,7 @@ from yggdrasil.databricks.table.table import (
     _build_dml_statements,
     _build_prune_predicate,
 )
-from yggdrasil.io.tabular.execution.expr import col as expr_col
+from yggdrasil.execution.expr import col as expr_col
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +441,7 @@ class TestBuildPrunePredicate:
     """The helper that feeds prune_predicates into the SQL builders.
 
     It routes the combined predicate through
-    :func:`yggdrasil.io.tabular.execution.expr.simplify`, so duplicate
+    :func:`yggdrasil.execution.expr.simplify`, so duplicate
     InList values and OR-of-EQ-on-same-column chains in the user's
     ``where`` collapse before SQL emission.
     """

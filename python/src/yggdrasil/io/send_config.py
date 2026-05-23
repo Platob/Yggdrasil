@@ -895,7 +895,7 @@ class CacheConfig(_ConfigBase):
         """
         if request is None or not self.request_by:
             return None
-        from yggdrasil.io.tabular.execution.expr import all_of, col
+        from yggdrasil.execution.expr import all_of, col
 
         clauses: list[Any] = []
         match_value = request.match_value
@@ -921,7 +921,7 @@ class CacheConfig(_ConfigBase):
         ``None`` when no clauses apply so callers can compose with
         :func:`all_of` cleanly.
         """
-        from yggdrasil.io.tabular.execution.expr import all_of, col
+        from yggdrasil.execution.expr import all_of, col
 
         clauses: list[Any] = []
         if response is not None:
@@ -959,7 +959,7 @@ class CacheConfig(_ConfigBase):
         engine's native filter (SQL ``WHERE``) inside
         :meth:`Tabular.read_arrow_batches`.
         """
-        from yggdrasil.io.tabular.execution.expr import all_of, col
+        from yggdrasil.execution.expr import all_of, col
 
         clauses: list[Any] = []
         if request is not None:
@@ -988,7 +988,7 @@ class CacheConfig(_ConfigBase):
         batch is empty and no time window applies.
 
         The naive ``OR`` of per-request match clauses is fed
-        through :func:`yggdrasil.io.tabular.execution.expr.simplify`
+        through :func:`yggdrasil.execution.expr.simplify`
         before return — when every disjunct compares the same
         target with ``EQ``, the simplifier collapses the chain into
         a single ``InList`` (and folds in any ``IS NULL`` operands
@@ -1004,7 +1004,7 @@ class CacheConfig(_ConfigBase):
         rows on the read side; remote Tabular backends translate the
         same predicate into their engine's native filter.
         """
-        from yggdrasil.io.tabular.execution.expr import (
+        from yggdrasil.execution.expr import (
             all_of,
             any_of,
             col,

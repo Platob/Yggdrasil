@@ -951,7 +951,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         if predicate is None:
             return None
         try:
-            from yggdrasil.io.tabular.execution.expr import (
+            from yggdrasil.execution.expr import (
                 extract_partition_filters,
             )
             extracted = extract_partition_filters(predicate, (column,))
@@ -1268,7 +1268,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 topmost = node
             node = getattr(node, "tabular_parent", None)
         try:
-            from yggdrasil.io.tabular.execution.expr import free_columns
+            from yggdrasil.execution.expr import free_columns
             cols = free_columns(predicate)
         except Exception:
             return None

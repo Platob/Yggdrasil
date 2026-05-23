@@ -59,7 +59,7 @@ from typing import (
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.databricks.warehouse.statement import WarehouseStatementBatch
-from yggdrasil.io.tabular.execution.expr import Predicate
+from yggdrasil.execution.expr import Predicate
 from yggdrasil.pickle import json as ygg_json
 
 if TYPE_CHECKING:
@@ -1125,7 +1125,7 @@ def _predicate_to_sql(value: Any) -> Optional[str]:
         return value
     if isinstance(value, Predicate):
         try:
-            from yggdrasil.io.tabular.execution.expr.backends.sql import (
+            from yggdrasil.execution.expr.backends.sql import (
                 Dialect,
                 to_sql as expr_to_sql,
             )

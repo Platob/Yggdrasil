@@ -1116,7 +1116,7 @@ class Dataset(Tabular[CastOptions]):
         the existing schema is preserved (no re-cast needed); the
         ``byte_size`` cap only applies to the callable path.
         """
-        from yggdrasil.io.tabular.execution.expr import Expression
+        from yggdrasil.execution.expr import Expression
 
         # Predicate-like inputs route to the cross-engine
         # :meth:`Tabular.filter`. Recognised: yggdrasil Expression,
