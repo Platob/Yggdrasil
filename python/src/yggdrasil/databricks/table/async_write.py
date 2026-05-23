@@ -1185,7 +1185,7 @@ def stage_async_insert(
     zorder_by: Optional[Sequence[str]] = None,
     optimize_after_merge: bool = False,
     vacuum_hours: int | None = None,
-    where: Any = None,
+    where: "Predicate | None" = None,
     prune_by: Any = None,
     prune_values: Optional[Mapping[str, Any]] = None,
     safe_merge: bool = False,

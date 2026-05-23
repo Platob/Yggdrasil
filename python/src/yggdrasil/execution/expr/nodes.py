@@ -73,6 +73,7 @@ __all__ = [
     "Cast",
     "Arithmetic",
     "ExpressionLike",
+    "PredicateLike",
     "lit",
 ]
 
@@ -1853,6 +1854,16 @@ class Arithmetic(Expression):
 
 
 ExpressionLike = Union[Expression, Any]
+
+#: Anything :meth:`Expression.from_` accepts as a predicate input —
+#: a yggdrasil :class:`Predicate`, a yggdrasil :class:`Expression`,
+#: a SQL string, or a foreign engine expression
+#: (``pyarrow.compute.Expression`` / ``polars.Expr`` /
+#: ``pyspark.sql.Column``). Use this on public surfaces that accept
+#: "anything that can be lifted to a predicate" — internal call
+#: sites that have already routed through :meth:`Expression.from_`
+#: should narrow to :class:`Predicate`.
+PredicateLike = Union["Predicate", Expression, str, Any]
 
 
 def _coerce(value: "ExpressionLike") -> Expression:

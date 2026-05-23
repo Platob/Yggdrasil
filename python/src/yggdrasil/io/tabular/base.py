@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     import polars as pl
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
+    from yggdrasil.execution.expr import Predicate, PredicateLike
     from yggdrasil.io.holder import Holder
     from yggdrasil.spark.tabular import Dataset
 
@@ -382,7 +383,7 @@ def _default_drop(self_: "Tabular", *, columns: list[str]) -> "Tabular":
     return ArrowTabular(out, schema=out.schema)
 
 
-def _default_filter(self_: "Tabular", *, predicate: Any) -> "Tabular":
+def _default_filter(self_: "Tabular", *, predicate: "Predicate") -> "Tabular":
     """Engine-routing row filter — Spark-native when available, else Arrow."""
     spark_frame = self_._native_spark_frame()
     if spark_frame is not None:
@@ -536,7 +537,7 @@ class Tabular(ABC, Generic[O]):
 
     def matches_static(
         self,
-        predicate: "Any",
+        predicate: "Predicate",
         *,
         free_cols: "tuple[str, ...] | None" = None,
     ) -> bool:
@@ -788,7 +789,7 @@ class Tabular(ABC, Generic[O]):
 
     def delete(
         self,
-        predicate: "Any",
+        predicate: "PredicateLike",
         *,
         options: "O | None" = None,
         **kwargs: Any,
@@ -824,7 +825,7 @@ class Tabular(ABC, Generic[O]):
             predicate, self.check_options(options, overrides=locals()),
         )
 
-    def _delete(self, predicate: "Any", options: O) -> int:
+    def _delete(self, predicate: "Predicate", options: O) -> int:
         """Generic single-leaf delete: filter all batches, rewrite.
 
         Routes the row-level work through
@@ -1945,7 +1946,7 @@ class Tabular(ABC, Generic[O]):
 
     def filter(
         self,
-        predicate: Any,
+        predicate: "PredicateLike",
     ) -> "Tabular":
         """Drop rows where *predicate* is false.
 
@@ -1970,7 +1971,7 @@ class Tabular(ABC, Generic[O]):
         pred = _coerce_predicate(predicate)
         return self._filter(predicate=pred)
 
-    def _filter(self, *, predicate: Any) -> "Tabular":
+    def _filter(self, *, predicate: "Predicate") -> "Tabular":
         """Typed-argument row-filter hook.
 
         ``predicate`` is always a yggdrasil :class:`Predicate` at

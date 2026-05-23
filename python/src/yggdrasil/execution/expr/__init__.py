@@ -52,6 +52,7 @@ from .nodes import (
     Column,
     Comparison,
     Expression,
+    ExpressionLike,
     InList,
     IsNull,
     Like,
@@ -59,6 +60,7 @@ from .nodes import (
     Logical,
     Not,
     Predicate,
+    PredicateLike,
     lit,
 )
 from .operators import ArithmeticOp, CompareOp, LogicalOp
@@ -74,6 +76,7 @@ __all__ = [
     "Comparison",
     "CompareOp",
     "Expression",
+    "ExpressionLike",
     "InList",
     "IsNull",
     "Like",
@@ -82,6 +85,7 @@ __all__ = [
     "LogicalOp",
     "Not",
     "Predicate",
+    "PredicateLike",
     "all_of",
     "any_of",
     "col",

@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from pyspark import StorageLevel
     from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
     from yggdrasil.data.schema import Schema
+    from yggdrasil.execution.expr import Predicate
 
 
 __all__ = ["Dataset", "SparkTabular"]
@@ -518,7 +519,7 @@ class Dataset(Tabular[CastOptions]):
             installed_modules=self.installed_modules,
         )
 
-    def _filter(self, *, predicate: Any) -> "Dataset":
+    def _filter(self, *, predicate: "Predicate") -> "Dataset":
         if self._frame is None:
             return self
         new_frame = predicate.filter_spark_frame(self._frame)

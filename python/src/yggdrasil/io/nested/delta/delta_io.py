@@ -70,7 +70,7 @@ import os
 import random
 import time
 import uuid
-from typing import Any, Callable, ClassVar, Iterable, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, List, Optional
 
 import pyarrow as pa
 
@@ -107,6 +107,9 @@ from yggdrasil.io.nested.delta.schema_codec import (
     spark_json_to_arrow_schema,
 )
 from yggdrasil.io.nested.delta.snapshot import Snapshot
+
+if TYPE_CHECKING:
+    from yggdrasil.execution.expr import Predicate
 
 __all__ = ["ConcurrentDeltaCommitError", "DeltaFolder", "DeltaOptions"]
 
@@ -1162,7 +1165,7 @@ class DeltaFolder(FolderPath):
     # Row-level delete — DV-based or rewrite, picked from options
     # ==================================================================
 
-    def _delete(self, predicate: Any, options: DeltaOptions) -> int:
+    def _delete(self, predicate: "Predicate", options: DeltaOptions) -> int:
         """Drop rows matching *predicate* and emit a Delta commit.
 
         Two strategies, picked from ``options.delete_via_dv``:
@@ -1319,7 +1322,7 @@ class DeltaFolder(FolderPath):
         self,
         *,
         leaf: ParquetFile,
-        predicate: Any,
+        predicate: "Predicate",
         existing_dv: "Optional[DeletionVector]",
     ) -> "tuple[list[int], list[int]]":
         """Return ``(survivor_abs_indices, deleted_abs_indices)`` for a parquet.
@@ -1588,7 +1591,7 @@ def _reinterpret_unsigned_as_signed(batch: pa.RecordBatch) -> pa.RecordBatch:
 
 
 def _arrow_row_filter_for(
-    predicate: "Any",
+    predicate: "Predicate",
     partition_columns: "List[str]",
     target_schema: "Optional[pa.Schema]",
 ) -> "Optional[Callable[[pa.RecordBatch], pa.RecordBatch]]":
@@ -1658,7 +1661,7 @@ def _arrow_row_filter_for(
 
 def _merge_prune_with_predicate(
     explicit: "Optional[dict]",
-    predicate: "Any",
+    predicate: "Predicate",
     partition_columns: "List[str]",
 ) -> "Optional[dict]":
     """Combine caller-supplied ``prune_values`` with predicate-extracted hints.
