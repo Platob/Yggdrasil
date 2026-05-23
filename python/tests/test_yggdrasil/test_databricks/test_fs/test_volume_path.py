@@ -470,6 +470,19 @@ class TestWriteAll:
         assert isinstance(sent, io.BytesIO)
         assert sent.getvalue() == b"view"
 
+    def test_pyarrow_buffer_input(self, workspace, client, service) -> None:
+        import pyarrow as pa
+
+        buf = pa.BufferOutputStream()
+        buf.write(b"arrow-buffer-payload")
+        arrow_buf = buf.getvalue()
+
+        p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
+        n = p.write_all(arrow_buf)
+        assert n == 20
+        sent = workspace.files.upload.call_args.kwargs["contents"]
+        assert sent.getvalue() == b"arrow-buffer-payload"
+
     def test_parquet_roundtrip(self, workspace, client, service) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq

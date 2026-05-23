@@ -826,16 +826,16 @@ class DatabricksPath(DatabricksResource, RemotePath):
         read-modify-write the normal ``write_bytes`` path performs
         and goes straight to the backend's atomic upload.
 
-        Accepts ``bytes``, ``bytearray``, ``memoryview``, or any
-        file-like object with ``.read()``. Streams are passed
-        through to the SDK upload without eager materialisation
-        when the backend supports it.
-
-        Returns the byte count written (``-1`` for streams of
-        unknown length).
+        Accepts ``bytes``, ``bytearray``, ``memoryview``,
+        ``pyarrow.Buffer``, or any file-like with ``.read()``.
         """
         if isinstance(data, memoryview):
             data = bytes(data)
+        elif not isinstance(data, (bytes, bytearray)) and not hasattr(data, "read"):
+            try:
+                data = bytes(memoryview(data))
+            except TypeError:
+                data = bytes(data)
         return self._upload_full(data)
 
     def _upload_full(self, content: "Any") -> int:

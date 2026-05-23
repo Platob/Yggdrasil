@@ -308,6 +308,18 @@ class TestWriteAll:
         p.write_all(memoryview(b"view"))
         assert client.put_object.call_args.kwargs["Body"] == b"view"
 
+    def test_pyarrow_buffer_input(self, client, service) -> None:
+        import pyarrow as pa
+
+        buf = pa.BufferOutputStream()
+        buf.write(b"arrow-buffer-payload")
+        arrow_buf = buf.getvalue()
+
+        p = S3Path("s3://b/data.bin", service=service)
+        n = p.write_all(arrow_buf)
+        assert n == 20
+        assert client.put_object.call_args.kwargs["Body"] == b"arrow-buffer-payload"
+
     def test_parquet_roundtrip(self, client, service) -> None:
         import io
         import pyarrow as pa

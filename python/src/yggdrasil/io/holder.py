@@ -2311,25 +2311,30 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         * **Memory** — ``seek(0) + truncate(0) + write_bytes``.
 
         Accepts ``bytes``, ``bytearray``, ``memoryview``, ``str``,
-        or any file-like with ``.read()``. Streams are probed: the
-        first 1 MiB is pulled; if that's the whole payload it is
-        written atomically, otherwise the remainder is appended via
-        ``write_bytes`` in a streaming loop.
+        ``pyarrow.Buffer``, or any file-like with ``.read()``.
+        Streams are probed: the first 1 MiB is pulled; if that's
+        the whole payload it is written atomically, otherwise the
+        remainder is appended via ``write_bytes`` in a streaming
+        loop.
         """
         if self._parent is not None:
             return self._active().write_all(data)
 
         if isinstance(data, str):
             data = data.encode("utf-8")
+        if isinstance(data, (bytes, bytearray)):
+            return self._write_all_bytes(data)
         if isinstance(data, memoryview):
-            data = bytes(data)
+            return self._write_all_bytes(bytes(data))
 
         if hasattr(data, "read"):
             return self._write_all_stream(data)
 
-        if not isinstance(data, (bytes, bytearray)):
+        # Buffer-protocol objects (pa.Buffer, numpy arrays, etc.)
+        try:
+            data = bytes(memoryview(data))
+        except TypeError:
             data = bytes(data)
-
         return self._write_all_bytes(data)
 
     def _write_all_bytes(self, data: "bytes | bytearray") -> int:

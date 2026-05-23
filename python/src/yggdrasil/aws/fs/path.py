@@ -820,14 +820,19 @@ class S3Path(RemotePath):
         Skips the stat probe, resize, truncate, and read-modify-write
         the normal ``write_bytes`` path performs.
 
-        Accepts ``bytes``, ``bytearray``, ``memoryview``, or any
-        file-like with ``.read()``.
+        Accepts ``bytes``, ``bytearray``, ``memoryview``,
+        ``pyarrow.Buffer``, or any file-like with ``.read()``.
         """
         if isinstance(data, memoryview):
             data = bytes(data)
         if hasattr(data, "read"):
             data = data.read()
-        payload = bytes(data) if not isinstance(data, bytes) else data
+        if not isinstance(data, (bytes, bytearray)):
+            try:
+                data = bytes(memoryview(data))
+            except TypeError:
+                data = bytes(data)
+        payload = data
         size = len(payload)
         LOGGER.debug("Writing S3 object %r (bytes=%d)", self, size)
         self._call(
