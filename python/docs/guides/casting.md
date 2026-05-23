@@ -89,7 +89,7 @@ print(dataclass_to_arrow_field(Position))
 | `cast_polars_dataframe`, `cast_polars_lazyframe` | `yggdrasil.polars.cast` |
 | `cast_spark_dataframe` | `yggdrasil.spark.cast` |
 
-Each module registers its converters **on import**. Always reach the optional engines via their `lib.py` guard so base installs stay functional:
+Each module registers its converters **on import**. Always reach the optional engines via `yggdrasil.lazy_imports` so base installs stay functional:
 
 ```python
 from yggdrasil.lazy_imports import polars
