@@ -763,7 +763,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
         """
         if cursor:
             offset = self._pos
-        buffered = self._buffersize is not None and (
+        buffered = self._page_size is not None and (
             self._dirty_pages or self._buffered_size is not None
         )
         if size < 0 and offset == 0 and not buffered:

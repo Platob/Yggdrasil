@@ -2299,25 +2299,69 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
     def write_all(self, data: "Any") -> int:
         """Replace the entire content in one shot.
 
-        Cursor IOs delegate to their parent's ``write_all``.
-        Storage IOs that override this (remote paths) skip the
-        stat / resize / truncate overhead ``write_bytes`` pays.
-        The base implementation falls back to
-        ``seek(0) + truncate(0) + write_bytes``.
+        Smart routing:
+
+        * **Cursor IO** — delegates to the storage parent's
+          ``write_all`` so a ``ParquetFile(holder=VolumePath)``
+          reaches the backend's atomic upload directly.
+        * **Local path** — ``open("wb") + write`` via the
+          :meth:`Path.write_all` override.
+        * **Remote path** — subclass atomic upload
+          (``DatabricksPath._upload_full``, ``S3Path.write_all``).
+        * **Memory** — ``seek(0) + truncate(0) + write_bytes``.
+
+        Accepts ``bytes``, ``bytearray``, ``memoryview``, ``str``,
+        or any file-like with ``.read()``. Streams are probed: the
+        first 1 MiB is pulled; if that's the whole payload it is
+        written atomically, otherwise the remainder is appended via
+        ``write_bytes`` in a streaming loop.
         """
         if self._parent is not None:
             return self._active().write_all(data)
-        if isinstance(data, memoryview):
-            data = bytes(data)
-        if hasattr(data, "read"):
-            data = data.read()
+
         if isinstance(data, str):
             data = data.encode("utf-8")
+        if isinstance(data, memoryview):
+            data = bytes(data)
+
+        if hasattr(data, "read"):
+            return self._write_all_stream(data)
+
         if not isinstance(data, (bytes, bytearray)):
             data = bytes(data)
+
+        return self._write_all_bytes(data)
+
+    def _write_all_bytes(self, data: "bytes | bytearray") -> int:
+        """Atomic whole-content write from a materialised buffer."""
         self.seek(0)
         self.truncate(0)
         return self.write_bytes(data)
+
+    def _write_all_stream(self, src: "Any") -> int:
+        """Write a stream, probing the first chunk to decide the path.
+
+        Reads up to 1 MiB; if that's the whole payload, dispatches
+        to :meth:`_write_all_bytes` (one atomic write). Otherwise
+        writes the head, then streams the remainder in chunks so
+        large payloads don't materialise fully in memory.
+        """
+        head = src.read(_COPY_CHUNK)
+        if not head:
+            self._write_all_bytes(b"")
+            return 0
+        tail = src.read(_COPY_CHUNK)
+        if not tail:
+            return self._write_all_bytes(head)
+        # Large stream: write head then append rest
+        n = self._write_all_bytes(head)
+        n += self.write_bytes(tail, offset=-1)
+        while True:
+            chunk = src.read(_COPY_CHUNK)
+            if not chunk:
+                break
+            n += self.write_bytes(chunk, offset=-1)
+        return n
 
     def read_text(
         self,

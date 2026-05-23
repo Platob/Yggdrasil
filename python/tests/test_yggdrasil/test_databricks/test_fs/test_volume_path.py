@@ -398,7 +398,7 @@ class TestWrite:
         p = VolumePath(
             "/Volumes/c/s/v/x.bin",
             service=service,
-            buffersize=page_size,
+            page_size=page_size,
         )
         with p.open("wb") as fh:
             fh.write(payload)
@@ -426,7 +426,7 @@ class TestWrite:
         p = VolumePath(
             "/Volumes/c/s/v/x.bin",
             service=service,
-            buffersize=page_size,
+            page_size=page_size,
         )
         with p.open("wb") as fh:
             for _ in range(n_chunks):
