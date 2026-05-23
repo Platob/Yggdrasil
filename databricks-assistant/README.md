@@ -1,156 +1,41 @@
-# Databricks Assistant config for `ygg[data,databricks]`
+# Databricks Assistant config for `ygg[databricks]`
 
-Instruction files and Skills that teach the Databricks Assistant (Genie Code)
-how to write idiomatic code against [Yggdrasil](https://github.com/Platob/Yggdrasil)
-(`pip install "ygg[data,databricks]"`).
+Instruction files and Skills that teach the Databricks Assistant how
+to write idiomatic code against
+[Yggdrasil](https://github.com/Platob/Yggdrasil)
+(`pip install "ygg[databricks]"`).
 
 ## What's here
 
-| File | Where it goes in the Assistant settings panel |
+| File | Where it goes |
 | --- | --- |
-| [`.assistant_workspace_instructions.md`](.assistant_workspace_instructions.md) | **Workspace instructions** — admin-managed, loaded for every user in the workspace. |
-| [`user_instructions.md`](user_instructions.md) | **User instructions** — personal file an individual user can paste into "Add instructions file". |
-| [`skills/`](skills/) | **Skills folder** — markdown skills the Assistant can route to per task. Each file is a self-contained skill. |
+| [`.assistant_workspace_instructions.md`](.assistant_workspace_instructions.md) | **Workspace instructions** — loaded for every user. |
+| [`user_instructions.md`](user_instructions.md) | **User instructions** — personal preferences. |
+| [`skills/`](skills/) | **Skills folder** — markdown skills the Assistant routes to per task. |
 
 ## Installing into a Databricks workspace
 
-The Assistant configuration UI exposes three slots (see the workspace's
-**Assistant settings** sidebar):
-
-1. **Workspace instructions** — copy `.assistant_workspace_instructions.md`
-   into the workspace root (a workspace admin can do this from the settings
-   panel via "Edit" on the `.assistant_workspace_instructions.md` slot).
-2. **User instructions** — each user clicks **Add instructions file** and
-   pastes the contents of `user_instructions.md`.
-3. **Skills folder** — click **Create skills folder**, then upload the
-   files from [`skills/`](skills/) into it. Workspace admins can use the
-   **Create workspace skills folder** slot to publish them to every user.
-
-The Assistant picks skills by matching the task against each skill's
-"When to use" section, so the filename and that section are what matter
-most for routing.
+1. **Workspace instructions** — copy
+   `.assistant_workspace_instructions.md` into the workspace
+   instructions slot (admin panel).
+2. **User instructions** — each user pastes `user_instructions.md`
+   into "Add instructions file".
+3. **Skills folder** — upload the files from `skills/` into the
+   workspace or user skills folder.
 
 ## Skills inventory
 
 | Skill | Covers |
 | --- | --- |
-| [`ygg-install`](skills/ygg-install.md) | `%pip install "ygg[data,databricks]"`, version pinning, env vars |
+| [`ygg-install`](skills/ygg-install.md) | `%pip install "ygg[databricks]"`, version pinning |
 | [`ygg-databricks-client`](skills/ygg-databricks-client.md) | `DatabricksClient`, auth, services, resource singletons |
-| [`ygg-databricks-sql`](skills/ygg-databricks-sql.md) | `dbc.sql.execute(...)`, parameter binding, warehouse vs cluster routing |
-| [`ygg-databricks-tables`](skills/ygg-databricks-tables.md) | `Table.create / insert / async_insert / merge / delete_where` |
-| [`ygg-databricks-files`](skills/ygg-databricks-files.md) | `DatabricksPath`, DBFS / Volume / Workspace IO |
-| [`ygg-databricks-jobs`](skills/ygg-databricks-jobs.md) | Run / wait on jobs, secrets, clusters, warehouses, `WaitingConfig` |
-| [`ygg-databricks-job-workflows`](skills/ygg-databricks-job-workflows.md) | `dbc.jobs.create_or_update`, `JobTask.from_callable`, cron / file-arrival schedules, multi-task DAGs |
-| [`ygg-databricks-genie`](skills/ygg-databricks-genie.md) | `dbc.genie.ask`, `GenieSpace`, `GenieConversation` |
-| [`ygg-databricks-vector-search`](skills/ygg-databricks-vector-search.md) | `dbc.ai.vector_search.endpoint/index/query`, `Schema → schema_json`, time-series-aware retrieval, typed Arrow results |
-| [`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) | End-to-end recipe: HTTP / API / S3 → discover → cast → Unity Catalog → schedule |
-| [`ygg-resilient-ingestion`](skills/ygg-resilient-ingestion.md) | `ErrorNotifyingHTTPSession`, SMTP / Slack notifiers, quarantine + dead-letter tables, idempotent MERGE, "minimum strict failing" pattern |
-| [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) | Sample an unknown endpoint, infer + tighten a `Schema`, validate against fresh data |
-| [`ygg-data-modeling`](skills/ygg-data-modeling.md) | Schema-per-source, `raw_<entity>` + provenance, PK / FK / partition via `Field` metadata, cross-source joins via shared ISO dims |
-| [`ygg-curated-views`](skills/ygg-curated-views.md) | UTC timestamps, decimal money, ISO currency / country / language / timezone, lat/lon + `geo_point()` + GeoJSON, naming, table vs view |
-| [`ygg-display-views`](skills/ygg-display-views.md) | Business-display `dash_*` layer — wide / pivoted / time-series rollups, KPI tables, geo-display, materialisation picker, multi-task refresh DAG |
-| [`ygg-databricks-apps`](skills/ygg-databricks-apps.md) | Databricks Apps (Next.js + FastAPI / Next.js full-stack) over `dash_*` tables — OAuth OBO auth, Arrow IPC wire format, `react-leaflet` / `deck.gl` world-map plugins keyed on ISO 3166 / EIC / WGS84, trader-facing KPI map shapes, deploy via `databricks apps deploy` |
-| [`ygg-trading-commodity`](skills/ygg-trading-commodity.md) | Trading / commodity / energy market data: MIC codes, ENTSO-E EIC, OHLCV bars, contracts, FX, idempotency for corrections / settlements |
-| [`ygg-energy-trading-analyst`](skills/ygg-energy-trading-analyst.md) | Shared energy-trading analyst conventions — `analyst_<task>_*` artifacts, FX risk via `FxRate`, cross-geo-zone risk, weather / freight / storage / macro feature universe |
-| [`ygg-trading-analyst-power`](skills/ygg-trading-analyst-power.md) | Power desk — ENTSO-E day-ahead / intraday, cross-zone spreads, spark / dark / clean spreads, residual load, NTC-bounded mean reversion |
-| [`ygg-trading-analyst-gas`](skills/ygg-trading-analyst-gas.md) | Gas desk — TTF / NBP / HH / JKM, HDD/CDD, storage z-score, LNG arbitrage with freight + regas constraints, inter-hub spreads, fuel-switching feedback |
-| [`ygg-trading-analyst-oil`](skills/ygg-trading-analyst-oil.md) | Oil desk — Brent / WTI / Dubai, crack spreads (3-2-1, gasoil), curve shape, grade differentials, tanker arb, hurricane risk, ENEX-event regime breaks |
-| [`ygg-modelist`](skills/ygg-modelist.md) | Modelist profile — many simulation runs, walk-forward back-tests, model KPIs + trading-decision KPIs, SHAP / partial dependence, rendered notebook artifact per run, AI/BI dashboards + Databricks Apps frontend |
-| [`ygg-modelist-weather`](skills/ygg-modelist-weather.md) | Weather modelist — per-zone temperature / HDD-CDD, wind power (hub-height + power curve), photovoltaic (POA + temp derate + PR), basin precipitation / runoff; NWP ensemble post-processing |
-| [`ygg-mlops`](skills/ygg-mlops.md) | MLflow on Databricks + UC registry, `ml_<task>_features` / `_predictions` / `_runs` tables, autoML candidate discovery, drift detection |
-| [`ygg-cast`](skills/ygg-cast.md) | `convert(value, target)`, `CastOptions`, registry extension |
-| [`ygg-schema-fields`](skills/ygg-schema-fields.md) | `Field` / `Schema` / `DataType`, schema intent |
-| [`ygg-statement-result`](skills/ygg-statement-result.md) | `StatementResult` / `Tabular` / `DataTable` consumption, streaming |
-| [`ygg-enums`](skills/ygg-enums.md) | `ByteUnit`, `Currency`, `MimeType`, `TimeZone`, … |
-| [`ygg-json-pickle`](skills/ygg-json-pickle.md) | `yggdrasil.pickle.json`, `serde`, singleton-by-config pickling |
-| [`ygg-http`](skills/ygg-http.md) | `HTTPSession`, `HTTPRequest`, `HTTPResponse`, `URL`, retries / caching |
-| [`ygg-benchmarks`](skills/ygg-benchmarks.md) | `python/benchmarks/`, before/after workflow, `run_all.py`, picking the right metric |
-| [`ygg-logging`](skills/ygg-logging.md) | `<Verb> <ResourceNoun> %r (...)`, `%r` lazy logging, anti-patterns |
-| [`ygg-pitfalls`](skills/ygg-pitfalls.md) | Post-generation checklist — row loops, bare imports, pre-checks, etc. |
+| [`ygg-spark-tabular`](skills/ygg-spark-tabular.md) | `Dataset` / `SparkTabular` — map, apply, filter, parallelize, to_table |
+| [`ygg-databricks-sql`](skills/ygg-databricks-sql.md) | SQL execution, `StatementResult`, table create/insert/merge |
+| [`ygg-databricks-files`](skills/ygg-databricks-files.md) | `DatabricksPath`, DBFS, Volumes, Workspace files |
+| [`ygg-databricks-jobs`](skills/ygg-databricks-jobs.md) | Jobs, `@task` / `@flow` workflows, schedules, secrets |
+| [`ygg-databricks-genie`](skills/ygg-databricks-genie.md) | Genie Q&A, spaces, conversations |
 
-## Autonomous ingestion workflow
+## Keeping in sync
 
-The skills are organised so a prompt like *"ingest this API into
-`main.sales.orders` every hour"* (plus a docs URL or sample payload)
-can be answered end-to-end without further questions:
-
-1. [`ygg-schema-discovery`](skills/ygg-schema-discovery.md) — probe
-   the source, infer a `Schema`, tighten it, commit the literal.
-2. [`ygg-data-modeling`](skills/ygg-data-modeling.md) — pick the
-   layout (one schema per source, `raw_<entity>` + provenance,
-   PK / FK / partition via `Field` metadata).
-3. [`ygg-databricks-tables`](skills/ygg-databricks-tables.md) —
-   reconcile catalog / schema / table, `ensure_created(schema=...)`.
-4. [`ygg-http`](skills/ygg-http.md) +
-   [`ygg-cast`](skills/ygg-cast.md) +
-   [`ygg-resilient-ingestion`](skills/ygg-resilient-ingestion.md) —
-   pull pages with `HTTPSession` (or `SchemaSession` when responses
-   *are* the bronze cache, or `ErrorNotifyingHTTPSession` when the
-   upstream is flaky and the schedule must keep running), cast
-   through the schema, route bad rows to a quarantine table, write
-   via `Table.insert / merge / async_insert`.
-5. [`ygg-databricks-job-workflows`](skills/ygg-databricks-job-workflows.md)
-   — stage the callable via `Job.pytask`, attach a
-   `CronSchedule` / `FileArrivalTriggerConfiguration`.
-6. [`ygg-curated-views`](skills/ygg-curated-views.md) — standardise
-   UTC timestamps, decimal money, ISO codes, `geo_point` + GeoJSON
-   for renderable rows; expose the curated layer that BI / ML read.
-7. [`ygg-display-views`](skills/ygg-display-views.md) — wide /
-   pivoted / pre-rolled `dash_*` tables and views for dashboard
-   query patterns. Refreshed as a downstream task on the same
-   Job DAG.
-8. [`ygg-databricks-apps`](skills/ygg-databricks-apps.md) —
-   **optional, only when AI/BI Dashboard isn't enough** — Next.js
-   + FastAPI (or Next.js full-stack) over the `dash_*` tables;
-   `react-leaflet` / `deck.gl` world maps keyed on ISO 3166 /
-   EIC / WGS84; Arrow IPC wire format for sub-second renders;
-   OAuth on-behalf-of so the user's RBAC carries through. Skip
-   this step when the consumer just needs scroll-and-filter.
-9. [`ygg-benchmarks`](skills/ygg-benchmarks.md) — add a bench for the
-   hot transform path before merging.
-
-[`ygg-ingestion-pipeline`](skills/ygg-ingestion-pipeline.md) is the
-master recipe that chains the first seven; step 8 is the optional
-custom-frontend exit and step 9 is the cross-cutting performance gate.
-
-## Energy trading desks — analyst + modelist track
-
-For commodity-trading users the data engineering chain feeds two
-downstream roles, each with its own skills:
-
-1. **Modelist** (the quant who builds the forecast).
-   [`ygg-modelist`](skills/ygg-modelist.md) — turns curated
-   tables into many simulation candidates per cycle (nested MLflow
-   runs, walk-forward back-tests), persists a per-run KPI matrix
-   that includes **trading-decision KPIs** (`directional_acc`,
-   `pnl_proxy_per_unit`, `hit_rate_p80_band`), renders a
-   high-quality explanation notebook per run (SHAP + partial
-   dependence + calibration + residual diagnostics), runs
-   champion / challenger promotion behind a primary + guard
-   metric, and exposes the leaderboard through an AI/BI Dashboard
-   or a Databricks App. A specialised sibling
-   [`ygg-modelist-weather`](skills/ygg-modelist-weather.md) owns
-   the per-zone weather features (temperature, photovoltaic,
-   wind power, precipitation) every energy desk depends on.
-2. **Analyst** (the trader-facing decision producer).
-   [`ygg-energy-trading-analyst`](skills/ygg-energy-trading-analyst.md)
-   is the shared layer — `analyst_<task>_signals`,
-   `analyst_<task>_positions_proposed`, FX risk via
-   `yggdrasil.fxrate.FxRate`, cross-geo-zone aggregation via
-   `GeoZoneCatalog`, and the wider feature universe (weather,
-   freight, storage, carbon, macro, events). Pick the desk-
-   specific skill from there:
-   - [`ygg-trading-analyst-power`](skills/ygg-trading-analyst-power.md)
-   - [`ygg-trading-analyst-gas`](skills/ygg-trading-analyst-gas.md)
-   - [`ygg-trading-analyst-oil`](skills/ygg-trading-analyst-oil.md)
-
-Both tracks read curated; neither writes back into it.
-
-## Keeping these files in sync with the library
-
-Skills reference public surface (`yggdrasil.data.cast.convert`,
-`DatabricksClient`, `Volume`, `Table`, `SQLEngine`, …). When that surface
-changes in `python/src/yggdrasil/`, update the skill that mentions it. The
-canonical style/voice rules live in [`../AGENTS.md`](../AGENTS.md); the
-skills here are condensed call-site guidance for end users, not a
-replacement for `AGENTS.md`.
+Skills reference the public surface of `yggdrasil`. When that surface
+changes in `python/src/yggdrasil/`, update the relevant skill.

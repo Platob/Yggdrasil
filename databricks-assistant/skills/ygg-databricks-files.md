@@ -1,99 +1,104 @@
-# Skill: read / write DBFS, Unity Catalog Volumes, and Workspace files
+# Skill: read/write files on Databricks and other filesystems
 
 ## When to use
 
-The user asks to read / write / list / delete a file on DBFS, on a
-Unity Catalog Volume, in the Workspace tree, or to stage Parquet /
-JSON / bytes for a later table insert. Triggers include
-"`dbfs:/...`", "`/Volumes/...`", "Volume path", "workspace file",
-"upload a file", "download a notebook", "iterate a directory".
+The user asks to read/write/list/delete files on DBFS, Unity Catalog
+Volumes, the Workspace tree, or to stage data for table inserts.
 
-## Primary surface
+## DatabricksPath — universal entry point
 
 ```python
-from yggdrasil.databricks import (
-    DatabricksClient, DatabricksPath, DBFSPath, VolumePath, WorkspacePath,
-)
+from yggdrasil.databricks import DatabricksPath, VolumePath, DBFSPath, WorkspacePath
 
+# Auto-dispatch by path shape
+p = DatabricksPath.from_("/Volumes/main/default/staging/data.parquet")  # → VolumePath
+p = DatabricksPath.from_("dbfs:/tmp/data.parquet")                      # → DBFSPath
+p = DatabricksPath.from_("/Workspace/Users/me/script.py")               # → WorkspacePath
+```
+
+Or via the client:
+
+```python
+from yggdrasil.databricks import DatabricksClient
 dbc = DatabricksClient()
+
+p = dbc.dbfs_path("dbfs:/tmp/data.parquet")
 ```
 
-`DatabricksPath.from_(...)` is the universal entry point — give it a
-URL or string, get back the right subclass:
+## Read / write
 
 ```python
-DatabricksPath.from_("dbfs:/tmp/raw.parquet")
-# -> DBFSPath
+# Bytes
+data = p.read_bytes()
+p.write_bytes(b"content")
 
-DatabricksPath.from_("/Volumes/main/default/staging/raw.parquet")
-# -> VolumePath
+# Text
+text = p.read_text()
+p.write_text("content")
 
-DatabricksPath.from_("/Users/me/notebooks/setup.py")
-# -> WorkspacePath
+# File-like
+with p.open("rb") as f:
+    content = f.read()
 ```
 
-Or build directly via the client:
+## Directory operations
 
 ```python
-dbc.dbfs_path("dbfs:/tmp/raw.parquet")
-dbc.volume_path("/Volumes/main/default/staging/raw.parquet")
-dbc.workspace_path("/Users/me/notebooks/setup.py")
-```
+p.exists                           # bool (stat-cached)
+p.is_dir()
+p.is_file()
+p.size                             # file size in bytes
 
-## Common operations
+p.iterdir()                        # iterate children
+p.glob("*.parquet")                # pattern matching
 
-```python
-p = dbc.volume_path("/Volumes/main/default/staging/raw.parquet")
-
-p.exists                  # cached stat
-p.read_bytes()            # bytes
-p.read_text()             # str
-p.write_bytes(b"…")       # bytes
-p.write_text("…")         # str
-p.open("rb")              # file-like, integrates with yggdrasil.io.BytesIO
-p.iterdir()               # iterable of DatabricksPath children
-p.unlink(missing_ok=True) # delete
 p.mkdir(parents=True, exist_ok=True)
+p.unlink(missing_ok=True)          # delete file
 ```
 
-Paths carry their bound `DatabricksClient` — `__repr__` shows the
-full identity. They are picklable + hashable; same `(client, url)` →
-same instance.
+## Volume paths
 
-## Staging Parquet for table inserts
+Volumes are the preferred filesystem for Unity Catalog workloads:
 
 ```python
-vol = dbc.volume("main.default.staging")
+vol = dbc.volumes["main.default.staging"]
 vol.ensure_created()
 
-dst = vol.path / "orders/2026-05-19.parquet"
-dst.write_bytes(arrow_buf.getvalue())
+# Navigate
+dst = vol.path / "orders" / "2026-05-19.parquet"
+dst.write_bytes(parquet_bytes)
 
-# then hand `dst` to Table.async_insert / Table.copy_into / SQL COPY INTO.
+# List contents
+for child in vol.path.iterdir():
+    print(child)
 ```
 
-See the `ygg-databricks-table` skill for the insert side.
+## Stage Parquet for table inserts
 
-## Fail fast, don't pre-check
+```python
+vol = dbc.volumes["main.default.staging"]
+vol.ensure_created()
 
-Don't gate a `download` / `upload` / `delete` / `read_bytes` /
-`iterdir` on a preceding `exists()` / `stat()` / HEAD probe — the
-probe doubles the round trip, races concurrent writers, and lies
-under eventual consistency. Catch `NotFound` / `FileNotFoundError`
-from the real call instead. The library's retry policy
-(`retry_sdk_call`) absorbs transient 5xx / throttling / connect
-timeouts automatically; deterministic errors propagate immediately.
+dst = vol.path / "batch.parquet"
+dst.write_bytes(arrow_buf.getvalue())
 
-After a mutation, the path's stat cache auto-invalidates — don't
-manually clear it.
+# Then insert via Table.async_insert or COPY INTO
+tbl = dbc.tables["main.default.orders"]
+tbl.async_insert(arrow_table, staging_volume="main.default.staging")
+```
+
+## Path properties
+
+- Paths carry their bound `DatabricksClient` automatically.
+- Singleton-cached: same `(client, url)` → same instance.
+- Picklable and hashable — safe across Spark workers and job tasks.
+- Stat results are cached with a 5-minute TTL.
 
 ## Don'ts
 
-- Don't pass raw `dbfs:/...` / `/Volumes/...` strings around if a
-  `DatabricksPath` would carry the bound client + cache.
-- Don't loop `read_bytes()` over many small files — batch via
-  `iterdir()` + parallel `Job` / `concurrent.futures` (see the
-  `yggdrasil.concurrent` module).
-- Don't call `ws.files.upload(...)` / `ws.dbfs.put(...)` directly
-  when a `path.write_bytes(...)` does the same thing with retry +
-  cache invalidation.
+- Don't pass raw strings around when a `DatabricksPath` carries the
+  client + cache.
+- Don't `exists()` before `read_bytes()` — do the read, catch
+  `NotFoundError` if needed. The retry policy handles transient errors.
+- Don't call `ws.files.upload(...)` directly — use
+  `path.write_bytes(...)` for retry + cache invalidation.

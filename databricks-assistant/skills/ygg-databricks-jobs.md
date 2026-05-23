@@ -1,81 +1,127 @@
-# Skill: trigger and wait on Databricks jobs / secrets / compute
+# Skill: create, schedule, and run Databricks jobs
 
 ## When to use
 
-The user asks to "run a job", "trigger a workflow", "wait for a job
-run", "list job runs", "read a secret", "start / restart / terminate
-a cluster", or "list warehouses".
+The user asks to create a job, schedule a pipeline, run a function as
+a Databricks task, set up a cron schedule, or use `@task` / `@flow`.
 
-## Jobs
+## Run existing jobs
 
 ```python
 from yggdrasil.databricks import DatabricksClient
 
 dbc = DatabricksClient()
-job = dbc.job(123456789)          # Job singleton by id
-job.run_now(notebook_params={"date": "2026-05-19"})
-job.wait()                         # blocks until terminal
-job.last_run.result_state          # SUCCESS / FAILED / …
+job = dbc.jobs.get(name="my-pipeline")
+job.run_now()
+job.wait()
+job.last_run.result_state  # SUCCESS / FAILED
 ```
 
-`dbc.jobs.list(...)`, `dbc.jobs.find(name="…")` for discovery. Use
-the `Job` singleton's own `.run_now(...)` / `.wait(...)` /
-`.cancel(...)` rather than `ws.jobs.run_now(...)` — the singleton
-wraps the SDK call with project defaults, the `_store_infos` cache,
-and the standard retry / waiting policies (`WaitingConfig`).
+## Create a job with `@task` / `@flow`
+
+```python
+from yggdrasil.databricks.workflow import flow, task, secret
+
+@task
+def ingest(date: str) -> str:
+    from yggdrasil.databricks import DatabricksClient
+    dbc = DatabricksClient()
+    (dbc.dataset(f"SELECT * FROM vendor.raw WHERE date = '{date}'")
+     .map(clean)
+     .to_table("main.curated.events"))
+    return "main.curated.events"
+
+@task(retries=2)
+def load(path: str, api_key: str = secret("vendor", "api-key")) -> None:
+    ...
+
+@flow(name="daily-ingest", schedule="0 2 * * *")
+def daily(date: str = "2025-01-01"):
+    p = ingest(date)
+    load(p)
+
+daily.deploy()                  # upsert Databricks Job
+daily.run(date="2026-05-23")    # trigger it
+```
+
+- `@task` runs unchanged locally (for testing) and as a Databricks
+  task inside a `@flow` trace.
+- `@flow.deploy()` traces the body, stages tasks, upserts the Job.
+- `secret("scope", "key")` resolves at runtime — cleartext never
+  lives on disk.
+
+## Stage a callable directly (no decorator)
+
+```python
+job = dbc.jobs.create_or_update(
+    name="orders_etl",
+    tasks=[],
+    **dbc.jobs.userinfo_defaults(),   # git source, notifications, tags
+)
+
+# Single task
+job.pytask(ingest_fn, "2026-01-01", task_key="ingest").create()
+
+# Multi-task DAG
+extract = job.pytask(extract_fn, task_key="extract").create()
+transform = job.pytask(
+    transform_fn,
+    task_key="transform",
+    depends_on=["extract"],
+).create()
+load = job.pytask(load_fn, task_key="load", depends_on=["transform"]).create()
+```
+
+`pytask` extracts the function source, stages a `.py` runner in
+Workspace, and AST-walks imports to resolve pip dependencies
+automatically.
+
+## Schedules
+
+```python
+from databricks.sdk.service.jobs import CronSchedule
+
+dbc.jobs.create_or_update(
+    name="hourly_ingest",
+    tasks=[...],
+    schedule=CronSchedule(
+        quartz_cron_expression="0 0 * * * ?",  # every hour
+        timezone_id="UTC",
+    ),
+)
+```
+
+| Want | Quartz cron |
+| --- | --- |
+| Every hour | `0 0 * * * ?` |
+| Every 15 min | `0 */15 * * * ?` |
+| Daily at 02:30 UTC | `0 30 2 * * ?` |
+| Weekdays at 09:00 | `0 0 9 ? * MON-FRI` |
+
+## Compute
+
+Default is **serverless** (fast cold start, internal pipelines).
+Use a **classic cluster** for ingestion that hits the public internet:
+
+```python
+job.pytask(
+    ingest_fn,
+    task_key="ingest",
+    existing_cluster_id="0123-...",  # cluster with internet egress
+).create()
+```
 
 ## Secrets
 
 ```python
 val = dbc.secrets.get("my-scope", "db-password")
-```
-
-Don't print secrets in logs. The library masks them in `__repr__`,
-but downstream code is your responsibility.
-
-## Compute / clusters
-
-```python
-cluster = dbc.cluster("0123-456789-abcdef")
-cluster.start()
-cluster.wait_for_state("RUNNING")
-cluster.terminate()
-```
-
-Use the `Cluster.ensure_running()` helper when "start if stopped,
-wait, then proceed" is the intent — it folds the state check + start
-+ wait into one call with the right retries.
-
-## Warehouses
-
-```python
-wh = dbc.warehouse("my-sql-warehouse")
-wh.ensure_running()
-wh.execute("SELECT 1")           # convenience pass-through to dbc.sql
-```
-
-Warehouse metadata is cached in an `ExpiringDict`; let the cache do
-its job and don't hand-roll a second one.
-
-## Waiting / retries
-
-Most lifecycle methods accept a `WaitingConfigArg` keyword
-(`timeout=`, `interval=`, etc.) that builds a `WaitingConfig`. Pass
-seconds / `timedelta` directly:
-
-```python
-job.wait(timeout=600)            # seconds
-cluster.wait_for_state("RUNNING", timeout=timedelta(minutes=10))
+dbc.secrets["my-scope/db-password"]  # dict-like access
 ```
 
 ## Don'ts
 
-- Don't sleep-poll a job state in a Python loop; the singleton's
-  `.wait(...)` already does exponential backoff with the right
-  budget.
-- Don't fork a parallel pickled-credentials path to run tasks across
-  Spark — `DatabricksClient` is already picklable + singleton-by-
-  config across workers.
-- Don't shell out to `databricks` CLI from a notebook when a service
-  method (`dbc.jobs.run_now`, `dbc.secrets.get`, …) does the same in
-  one round trip.
+- Don't sleep-poll a job — `job.wait()` does exponential backoff.
+- Don't `ws.jobs.create(...)` directly — use
+  `dbc.jobs.create_or_update()`.
+- Don't hand-write the `.py` runner — `pytask` stages it for you.
+- Don't list pip deps manually — `auto_dependencies` walks the AST.
