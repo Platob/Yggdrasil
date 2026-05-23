@@ -364,3 +364,108 @@ class TestArrowIPCOverVolume:
         vol.invalidate_singleton()
         loaded = ArrowIPCFile(holder=vol, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)
+
+
+# ---------------------------------------------------------------------------
+# SDK call-count consistency: cold write = 1 upload, 0 stat probes
+# ---------------------------------------------------------------------------
+
+
+def _s3_call_counts(client: MagicMock) -> dict[str, int]:
+    return {
+        name: getattr(client, name).call_count
+        for name in ("head_object", "get_object", "put_object", "delete_object")
+    }
+
+
+class TestS3WriteColdPath:
+    """A cold remote path (no prior stat) must write in 1 SDK call."""
+
+    def _fresh_s3(self, store: dict) -> S3Path:
+        from yggdrasil.io.path.remote_path import RemotePath
+        RemotePath._INSTANCES.clear()
+        client = _s3_round_trip_client(store)
+        s3 = S3Path("s3://my-bucket/data.bin", service=_s3_service(client))
+        client.head_object.reset_mock()
+        client.get_object.reset_mock()
+        client.put_object.reset_mock()
+        client.delete_object.reset_mock()
+        return s3
+
+    def test_write_all_one_call(self, table) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        s3.write_all(b"hello")
+        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.head_object.call_count == 0
+        assert s3.service.boto_client.get_object.call_count == 0
+        assert store["buf"] == b"hello"
+
+    def test_cursor_write_one_call(self, table) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        with s3.open("wb") as f:
+            f.write(b"cursor-data")
+        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.head_object.call_count == 0
+        assert s3.service.boto_client.get_object.call_count == 0
+        assert store["buf"] == b"cursor-data"
+
+    def test_cursor_seek_write_one_call(self, table) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        with s3.open("wb") as f:
+            f.write(b"head")
+            f.seek(10)
+            f.write(b"tail")
+        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.get_object.call_count == 0
+        assert len(store["buf"]) == 14
+        assert store["buf"][:4] == b"head"
+        assert store["buf"][10:] == b"tail"
+
+    def test_parquet_write_one_call(self, table) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        s3 = S3Path("s3://my-bucket/data.parquet", service=s3.service)
+        s3.service.boto_client.put_object.reset_mock()
+        ParquetFile(holder=s3, owns_holder=False).write_arrow_table(table)
+        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.head_object.call_count == 0
+        assert store["buf"].startswith(b"PAR1")
+
+    def test_arrow_ipc_write_one_call(self, table) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        ArrowIPCFile(holder=s3, owns_holder=False).write_arrow_table(table)
+        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.head_object.call_count == 0
+
+    def test_csv_write_one_call(self, table) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        CSVFile(holder=s3, owns_holder=False).write_arrow_table(table)
+        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.head_object.call_count == 0
+
+    def test_ndjson_write_one_call(self, table) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        NDJSONFile(holder=s3, owns_holder=False).write_arrow_table(table)
+        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.head_object.call_count == 0
+
+    def test_stat_correct_after_write(self, table) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        s3.write_all(b"hello world")
+        assert s3.size == 11
+        assert s3.size_known
+
+    def test_read_back_after_cursor_write(self) -> None:
+        store = {}
+        s3 = self._fresh_s3(store)
+        with s3.open("wb") as f:
+            f.write(b"round-trip")
+        data = s3.read_bytes()
+        assert data == b"round-trip"
