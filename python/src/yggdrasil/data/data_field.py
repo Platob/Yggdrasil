@@ -2337,7 +2337,7 @@ class Field(BaseChildrenFields):
         default: Any = None,
     ) -> "Field":
         if isinstance(hint, str):
-            parsed = ParsedDataType.parse(hint)
+            parsed = ParsedDataType.from_(hint)
             resolved_name = name or parsed.name or _default_name(hint)
             resolved_nullable = parsed.nullable if nullable is None else bool(nullable)
 
@@ -2419,7 +2419,7 @@ class Field(BaseChildrenFields):
                 resolved_hint = value.type
 
         if isinstance(resolved_hint, str):
-            parsed = ParsedDataType.parse(resolved_hint)
+            parsed = ParsedDataType.from_(resolved_hint)
             inferred_nullable = bool(parsed.nullable)
             if default is None:
                 inferred_nullable = True
@@ -2458,7 +2458,7 @@ class Field(BaseChildrenFields):
             return cls.from_dict(payload)
 
         name_text, type_text = _split_field_shorthand(text)
-        parsed = ParsedDataType.parse(type_text)
+        parsed = ParsedDataType.from_(type_text)
         parsed_name, name_nullable = _parse_field_name_token(name_text)
 
         nullable = parsed.nullable

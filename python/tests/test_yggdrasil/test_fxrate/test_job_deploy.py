@@ -551,7 +551,7 @@ class TestDeployDashTask(DatabricksTestCase):
         assert "lookback_days=14" in dash_body
 
     def test_dash_targets_invalid_raises_at_deploy_time(self) -> None:
-        # ``Currency.parse`` enforces ISO 4217 — a 4-char code fails fast.
+        # ``Currency.from_`` enforces ISO 4217 — a 4-char code fails fast.
         with self._patch_create() as create_or_update:
             create_or_update.return_value = MagicMock(
                 job_id=1, job_name="ygg-fxrate-ingestion",

@@ -728,7 +728,7 @@ class DatabricksClient(Singleton, URLBased):
     from_parsed_url = from_url
 
     @classmethod
-    def parse(cls, obj: Any):
+    def from_(cls, obj: Any):
         if isinstance(obj, cls):
             return obj
         elif isinstance(obj, URL):

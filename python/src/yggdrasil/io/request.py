@@ -592,7 +592,7 @@ class PreparedRequest:
         return self._session.send(self, config, **kwargs)
 
     @classmethod
-    def parse(
+    def from_(
         cls,
         obj: Any,
         *,

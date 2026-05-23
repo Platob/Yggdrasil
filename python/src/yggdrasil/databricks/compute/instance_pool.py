@@ -959,7 +959,7 @@ def databricks_pool_remote_compute(
     if workspace is None:
         return identity if _func is None else _func
 
-    workspace = DatabricksClient.parse(workspace)
+    workspace = DatabricksClient.from_(workspace)
     pools = workspace.compute.instance_pools
 
     if pool is None:

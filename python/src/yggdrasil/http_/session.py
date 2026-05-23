@@ -1418,7 +1418,7 @@ class HTTPSession(Session):
         pool: Optional[JobPoolExecutor | int] = None,
     ) -> HTTPResponse:
         if not isinstance(pool, JobPoolExecutor):
-            with JobPoolExecutor.parse(pool) as parsed_pool:
+            with JobPoolExecutor.from_(pool) as parsed_pool:
                 return self._combine_paginated_pages(
                     result=result,
                     request=request,

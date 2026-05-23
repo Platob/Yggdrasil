@@ -7,9 +7,9 @@ from yggdrasil.data.enums.currency import Currency
 
 
 def test_parse_aliases() -> None:
-    assert Currency.parse_str("$") == Currency.USD
-    assert Currency.parse_str("euro") == Currency.EUR
-    assert Currency.parse(None) == Currency.USD
+    assert Currency.from_str("$") == Currency.USD
+    assert Currency.from_str("euro") == Currency.EUR
+    assert Currency.from_(None) == Currency.USD
 
 
 def test_invalid_code_raises() -> None:
