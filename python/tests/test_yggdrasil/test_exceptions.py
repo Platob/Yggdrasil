@@ -40,7 +40,7 @@ from yggdrasil.exceptions import (
     make_for_status,
 )
 
-from .test_io._helpers import make_request, make_response
+from .test_http_._helpers import make_request, make_response
 
 
 # ---------------------------------------------------------------------------

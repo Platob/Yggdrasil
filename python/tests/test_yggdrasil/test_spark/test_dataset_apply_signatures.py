@@ -328,7 +328,7 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
     def test_parallelize_with_multi_arg_function(self) -> None:
         rows_in = [{"id": i, "name": f"p{i}"} for i in range(5)]
         out = Dataset.parallelize(
-            _multi_arg, rows_in, schema=_OUT_SCHEMA, spark_session=self.spark,
+            rows_in, _multi_arg, schema=_OUT_SCHEMA, spark_session=self.spark,
         )
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["label"] for r in rows], [f"p{i}" for i in range(5)])

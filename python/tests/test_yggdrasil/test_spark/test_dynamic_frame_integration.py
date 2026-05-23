@@ -367,7 +367,7 @@ class TestApplyTabularShapes(_DatasetTestBase):
             return _Row(id=i, label=f"row-{i}", score=float(i) * 1.5)
 
         out = Dataset.parallelize(
-            make_row, range(8), schema=sch, spark_session=self.spark,
+            range(8), make_row, schema=sch, spark_session=self.spark,
         )
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["id"] for r in rows], list(range(8)))
@@ -461,7 +461,7 @@ class TestTransformLineage(_DatasetTestBase):
 
         sch = schema([field("y", Int64Type)])
         out = Dataset.parallelize(
-            lambda x: {"y": fn(x)}, range(5),
+            range(5), lambda x: {"y": fn(x)},
             schema=sch, spark_session=self.spark,
         )
         rows = sorted(r["y"] for r in out.collect())
