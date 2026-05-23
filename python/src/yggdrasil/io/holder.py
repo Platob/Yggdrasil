@@ -2311,11 +2311,10 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         * **Memory** — ``seek(0) + truncate(0) + write_bytes``.
 
         Accepts ``bytes``, ``bytearray``, ``memoryview``, ``str``,
-        ``pyarrow.Buffer``, or any file-like with ``.read()``.
-        Streams are probed: the first 1 MiB is pulled; if that's
-        the whole payload it is written atomically, otherwise the
-        remainder is appended via ``write_bytes`` in a streaming
-        loop.
+        ``pyarrow.Buffer``, yggdrasil :class:`IO`, or any file-like
+        with ``.read()``. Streams are probed: the first 1 MiB is
+        pulled; if that's the whole payload it is written
+        atomically, otherwise the remainder is appended in chunks.
         """
         if self._parent is not None:
             return self._active().write_all(data)
@@ -2326,6 +2325,9 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             return self._write_all_bytes(data)
         if isinstance(data, memoryview):
             return self._write_all_bytes(bytes(data))
+
+        if isinstance(data, IO):
+            return self._write_all_bytes(data.to_bytes())
 
         if hasattr(data, "read"):
             return self._write_all_stream(data)
