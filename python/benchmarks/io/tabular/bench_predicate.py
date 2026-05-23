@@ -485,6 +485,140 @@ def _cast_scenarios(
     return out
 
 
+def _temporal_scenarios(
+    rows_n: int,
+    repeat: int,
+    engines: set[str],
+) -> list[dict]:
+    """Tz-pushdown cost: filter UTC arrow column by Paris-tz literal.
+
+    The optimisation: convert the literal to the column's native tz
+    once at filter time and let the engine compare against the
+    storage values directly, instead of casting every row through
+    a tz kernel before the comparison.
+
+    Three scenarios to read together:
+
+    - ``baseline``: column carries no bound :class:`Field`; the
+      smart ``cast`` factory swallows the cast and pyarrow's tz-
+      aware compare runs natively (no rewrite, but no per-row
+      cast either — pyarrow does the conversion in the kernel).
+    - ``cast wrap``: column carries a UTC :class:`Field`, so
+      ``cast(Paris)`` wraps in a real :class:`Cast` node. The
+      construction-time pushdown unwraps it and converts the
+      literal to UTC.
+    - ``target rewrite``: column carries a Paris-claiming
+      :class:`Field` (intentionally mismatched), but the target's
+      Arrow schema reports UTC. The filter-time rewrite firing
+      against the target's schema is what makes the filter pick
+      up the right rows.
+    """
+    if "arrow" not in engines:
+        return []
+    import datetime as _dt
+    import zoneinfo
+    import pyarrow as pa
+
+    from yggdrasil.data.data_field import Field
+    from yggdrasil.data.types.primitive.temporal import TimestampType
+
+    ts_arr = pa.array(
+        [
+            _dt.datetime(2026, 1, 1, h, 0, tzinfo=_dt.timezone.utc)
+            for h in range(rows_n % 24 or 24)
+        ]
+        * max(1, rows_n // 24),
+        type=pa.timestamp("us", tz="UTC"),
+    )[:rows_n]
+    table = pa.table({"ts": ts_arr})
+    paris_dt = _dt.datetime(
+        2026, 1, 1, 12, 0, tzinfo=zoneinfo.ZoneInfo("Europe/Paris"),
+    )
+
+    out: list[dict] = []
+
+    # 1. No bound field — the smart cast swallows the cast.
+    p_no_field = col("ts").cast(TimestampType(tz="Europe/Paris")) == paris_dt
+    out.append(_time_one(
+        f"tz: arrow filter (no-field cast) rows={rows_n}",
+        lambda: p_no_field.filter_arrow_table(table),
+        repeat=repeat, inner=20,
+    ))
+
+    # 2. UTC-bound field — construction-time pushdown fires.
+    utc_field = Field(name="ts", dtype=TimestampType(tz="UTC"))
+    p_utc_field = (
+        col("ts", field=utc_field).cast(TimestampType(tz="Europe/Paris"))
+        == paris_dt
+    )
+    out.append(_time_one(
+        f"tz: arrow filter (UTC-field cast) rows={rows_n}",
+        lambda: p_utc_field.filter_arrow_table(table),
+        repeat=repeat, inner=20,
+    ))
+
+    # 3. Paris-claiming field on a UTC target — filter-time rewrite
+    # is the only way to fix the mismatch.
+    paris_field = Field(name="ts", dtype=TimestampType(tz="Europe/Paris"))
+    p_paris_field = col("ts", field=paris_field) == paris_dt
+    out.append(_time_one(
+        f"tz: arrow filter (target schema rewrite) rows={rows_n}",
+        lambda: p_paris_field.filter_arrow_table(table),
+        repeat=repeat, inner=20,
+    ))
+
+    # 4. Polars: predicate with Paris-claim Field against UTC frame.
+    #    Polars refuses to compare two different tz-aware columns
+    #    without the rewrite — this benchmark would error out
+    #    without the bare-tz pushdown.
+    if "polars" in engines:
+        try:
+            import polars as pl
+        except ImportError:
+            engines.discard("polars")
+        else:
+            pframe = pl.from_arrow(table)
+            out.append(_time_one(
+                f"tz: polars filter (target schema rewrite) rows={rows_n}",
+                lambda: p_paris_field.filter_polars_frame(pframe),
+                repeat=repeat, inner=20,
+            ))
+
+    return out
+
+    out: list[dict] = []
+    if "arrow" in engines:
+        table = _build_arrow_table(rows_n)
+        out.append(_time_one(
+            f"cast: arrow no-cast rows={rows_n} vals={values_n}",
+            lambda: no_cast.filter_arrow_table(table),
+            repeat=repeat, inner=20,
+        ))
+        out.append(_time_one(
+            f"cast: arrow with cast rows={rows_n} vals={values_n}",
+            lambda: casted.filter_arrow_table(table),
+            repeat=repeat, inner=20,
+        ))
+    if "polars" in engines:
+        try:
+            import polars as pl
+        except ImportError:
+            engines.discard("polars")
+        else:
+            pframe = pl.from_arrow(_build_arrow_table(rows_n))
+            out.append(_time_one(
+                f"cast: polars no-cast rows={rows_n} vals={values_n}",
+                lambda: no_cast.filter_polars_frame(pframe),
+                repeat=repeat, inner=20,
+            ))
+            out.append(_time_one(
+                f"cast: polars with cast rows={rows_n} vals={values_n}",
+                lambda: casted.filter_polars_frame(pframe),
+                repeat=repeat, inner=20,
+            ))
+    return out
+
+
 def _dispatch_scenarios(
     rows_n: int,
     values_n: int,
@@ -547,6 +681,7 @@ def scenarios(
         *_python_eval_scenarios(rows_n, values_n, repeat),
         *(_arrow_eval_scenarios(rows_n, values_n, repeat) if "arrow" in engines else []),
         *_cast_scenarios(rows_n, values_n, repeat, engines),
+        *_temporal_scenarios(rows_n, repeat, engines),
         *_dispatch_scenarios(rows_n, values_n, repeat, engines),
     ]
 

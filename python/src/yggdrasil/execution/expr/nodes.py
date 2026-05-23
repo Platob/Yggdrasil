@@ -633,23 +633,29 @@ class Predicate(Expression):
         :meth:`_filter` for the threshold rationale). Empty /
         fully-dropped batches are skipped so consumers see only
         "non-empty rows that match".
-        """
-        clauses = _to_inlist_clauses(self)
-        expr = self.to_arrow()
-        if clauses is not None:
-            cutoff = _HASHSET_SHORTCUT_MAX_ROWS
 
-            def apply(b: "Any", _c=clauses, _e=expr, _cut=cutoff) -> "Any":
-                if b.num_rows <= _cut:
-                    return _apply_inlist(b, _c)
-                return b.filter(_e)
-        else:
-            def apply(b: "Any", _e=expr) -> "Any":
-                return b.filter(_e)
+        The target-schema rewrite is lazy: ``_to_inlist_clauses``
+        only matches naked ``InList(Column, …)`` shapes that don't
+        benefit from the rewrite, so when the predicate decomposes
+        into clauses we keep the cheap hashset path and never walk
+        the rewrite. Mixed-shape predicates fall through to a
+        single ``to_arrow`` compile on the first non-empty batch.
+        """
+        cutoff = _HASHSET_SHORTCUT_MAX_ROWS
+        clauses = _to_inlist_clauses(self)
+        effective_arrow: "Any" = None
         for batch in batches:
             if batch.num_rows == 0:
                 continue
-            kept = apply(batch)
+            if clauses is not None and batch.num_rows <= cutoff:
+                kept = _apply_inlist(batch, clauses)
+            else:
+                if effective_arrow is None:
+                    effective = _rewrite_with_target_lookup(
+                        self, _arrow_tz_lookup(batch.schema),
+                    )
+                    effective_arrow = effective.to_arrow()
+                kept = batch.filter(effective_arrow)
             if kept.num_rows > 0:
                 yield kept
 
@@ -667,12 +673,23 @@ class Predicate(Expression):
         amortises over the larger row count. Bench numbers on a
         5 000-row table show the kernel running ~10× faster than the
         hashset; on a 1-row leaf the hashset runs ~30× faster.
+
+        Also runs :func:`_rewrite_with_target_lookup` against the
+        target's schema before the pyarrow kernel sees the predicate
+        — that's how the timezone pushdown fires when the
+        predicate's :class:`Column` carries no bound :class:`Field`
+        but the target Table / RecordBatch does. The rewrite is
+        skipped on the hashset-shortcut path: ``_to_inlist_clauses``
+        only matches naked ``InList(Column, …)`` shapes that the
+        rewrite has nothing to do with, so paying the walk on every
+        cache-lookup batch is pure overhead.
         """
         if target.num_rows <= _HASHSET_SHORTCUT_MAX_ROWS:
             clauses = _to_inlist_clauses(self)
             if clauses is not None:
                 return _apply_inlist(target, clauses)
-        return target.filter(self.to_arrow())
+        effective = _rewrite_with_target_lookup(self, _arrow_tz_lookup(target.schema))
+        return target.filter(effective.to_arrow())
 
     # ------------------------------------------------------------------
     # Engine filters — mirrors the read_X / write_X surface every
@@ -686,9 +703,14 @@ class Predicate(Expression):
         """Filter a :class:`polars.DataFrame` / :class:`polars.LazyFrame`.
 
         Both shapes expose ``.filter(expr)`` accepting a
-        :class:`polars.Expr`, so one method covers both.
+        :class:`polars.Expr``, so one method covers both. The target
+        schema feeds the same temporal-tz rewrite as the Arrow
+        filter — a Polars frame whose ``ts`` column is UTC and a
+        predicate built with a Paris-tz Cast lands with the literal
+        already in UTC by the time polars sees the expression.
         """
-        return frame.filter(self.to_polars())
+        effective = _rewrite_with_target_lookup(self, _polars_tz_lookup(frame.schema))
+        return frame.filter(effective.to_polars())
 
     def filter_pandas_frame(self, frame: "Any") -> "Any":
         """Filter a :class:`pandas.DataFrame` via the pyarrow kernel.
@@ -870,6 +892,7 @@ def _try_timezone_pushdown(
     left: "Any",
     op: "CompareOp",
     right: "Any",
+    column_tz_iana: "Callable[[Column], str | None] | None" = None,
 ) -> "Expression | None":
     """Rewrite ``Cast(col_tz_X, ts_tz_Y) op lit_tz_Y`` to native filter.
 
@@ -886,16 +909,24 @@ def _try_timezone_pushdown(
     when the rewrite is safe, or ``None`` to fall back to the
     literal-shape comparison.
 
+    ``column_tz_iana`` lets a filter-time caller hand in a lookup
+    against the *target's* schema — pyarrow Table / RecordBatch
+    schemas, polars frame schemas, etc. — so the rewrite fires even
+    when the predicate's :class:`Column` carries no bound
+    :class:`Field`. Default is to read from ``column.field.dtype``
+    so construction-time ``__eq__`` / ``__lt__`` overloads still
+    pick up the rewrite when the caller already provided a typed
+    Field.
+
     Triggers only when ALL of these hold:
 
-    * Exactly one side is a :class:`Cast` over a :class:`Column`
-      with a :class:`TimestampType` ``field.dtype``;
+    * Exactly one side is a :class:`Cast` over a :class:`Column`;
     * The Cast targets a :class:`TimestampType` whose tz is not
       naive;
+    * The source column's actual tz (from ``column_tz_iana`` or
+      the bound Field) is tz-aware;
     * The opposing side is a :class:`Literal` carrying a
-      ``datetime.datetime`` value (or ``Literal.dtype`` is a
-      :class:`TimestampType`) so the tz of the literal is known;
-    * Neither tz is naive (the conversion would be ill-defined).
+      tz-aware ``datetime.datetime`` value.
     """
     # Light, lazy imports — temporal pushdown is the one place the
     # expression AST has to peek at concrete DataType subclasses, and
@@ -918,13 +949,22 @@ def _try_timezone_pushdown(
     cast_target = cast_side.dtype
     if not isinstance(cast_target, TimestampType) or cast_target.tz.is_naive():
         return None
-    source_field = cast_side.operand.field
-    if source_field is None:
-        return None
-    source_dtype = source_field.dtype
-    if not isinstance(source_dtype, TimestampType) or source_dtype.tz.is_naive():
-        return None
-    if source_dtype.tz == cast_target.tz:
+    source_tz: "str | None" = None
+    if column_tz_iana is not None:
+        source_tz = column_tz_iana(cast_side.operand)
+    if source_tz is None:
+        # Fall back to the Column's bound field — the construction-time
+        # path (no target schema available) relies on this.
+        source_field = cast_side.operand.field
+        if source_field is None:
+            return None
+        source_dtype = source_field.dtype
+        if not isinstance(source_dtype, TimestampType):
+            return None
+        if source_dtype.tz.is_naive():
+            return None
+        source_tz = source_dtype.tz.iana
+    if source_tz == cast_target.tz.iana:
         # Cast to the same tz is a no-op the smart ``cast`` factory
         # already swallows; but defensively short-circuit here too.
         if flip:
@@ -945,14 +985,173 @@ def _try_timezone_pushdown(
     except ImportError:
         return None
     try:
-        source_zone = zoneinfo.ZoneInfo(source_dtype.tz.iana)
+        source_zone = zoneinfo.ZoneInfo(source_tz)
     except Exception:
         return None
     converted = value.astimezone(source_zone)
-    new_literal = Literal(value=converted, dtype=source_dtype)
+    source_dtype_lit = TimestampType(unit="us", tz=source_tz)
+    new_literal = Literal(value=converted, dtype=source_dtype_lit)
     if flip:
         return Comparison(new_literal, op, cast_side.operand)
     return Comparison(cast_side.operand, op, new_literal)
+
+
+def _rewrite_with_target_lookup(
+    expr: "Expression",
+    column_tz_iana: "Callable[[Column], str | None]",
+) -> "Expression":
+    """Walk *expr* and apply target-schema-aware rewrites.
+
+    Two rewrites fire so the engine never has to do per-row work
+    the literal can absorb at constant cost:
+
+    1. **Cast-of-Column tz pushdown** —
+       ``Cast(col_X, ts_tz_Y) op lit_Y`` with target column X in
+       tz_Z: convert the literal to tz_Z and drop the cast wrap.
+    2. **Bare-column tz pushdown** — ``Column op tz_aware_lit``
+       where the literal's tz differs from the target column's tz:
+       convert the literal to the column's tz. The predicate's
+       :attr:`Column.field` is ignored — the target schema is the
+       authoritative source.
+
+    Returns *expr* unchanged when no rewrite triggers, so callers
+    can use identity (``new is expr``) to skip downstream
+    allocations on the steady-state "predicate already aligned with
+    target" path.
+    """
+    if isinstance(expr, Comparison):
+        new_left = _rewrite_with_target_lookup(expr.left, column_tz_iana)
+        new_right = _rewrite_with_target_lookup(expr.right, column_tz_iana)
+        rewrite = _try_timezone_pushdown(
+            new_left, expr.op, new_right, column_tz_iana=column_tz_iana,
+        )
+        if rewrite is not None:
+            return rewrite
+        rewrite = _try_bare_tz_rewrite(
+            new_left, expr.op, new_right, column_tz_iana,
+        )
+        if rewrite is not None:
+            return rewrite
+        if new_left is expr.left and new_right is expr.right:
+            return expr
+        return Comparison(new_left, expr.op, new_right)
+    if isinstance(expr, Logical):
+        new_ops = tuple(
+            _rewrite_with_target_lookup(o, column_tz_iana)
+            for o in expr.operands
+        )
+        if all(a is b for a, b in zip(new_ops, expr.operands)):
+            return expr
+        return Logical(expr.op, new_ops)
+    if isinstance(expr, Not):
+        new_inner = _rewrite_with_target_lookup(expr.operand, column_tz_iana)
+        if new_inner is expr.operand:
+            return expr
+        return Not(new_inner)
+    if isinstance(expr, Between):
+        new_target = _rewrite_with_target_lookup(expr.target, column_tz_iana)
+        new_low = _rewrite_with_target_lookup(expr.low, column_tz_iana)
+        new_high = _rewrite_with_target_lookup(expr.high, column_tz_iana)
+        if (
+            new_target is expr.target
+            and new_low is expr.low
+            and new_high is expr.high
+        ):
+            return expr
+        return Between(new_target, new_low, new_high, negated=expr.negated)
+    return expr
+
+
+def _try_bare_tz_rewrite(
+    left: "Any",
+    op: "CompareOp",
+    right: "Any",
+    column_tz_iana: "Callable[[Column], str | None]",
+) -> "Expression | None":
+    """Rewrite ``Column op tz_aware_literal`` to the target column's tz.
+
+    Mirrors :func:`_try_timezone_pushdown` for the no-Cast shape:
+    when a comparison's column claims one tz (or none) and the
+    target schema reports a different tz, convert the literal once
+    to the target tz so the engine compares in storage-native units.
+    Polars in particular refuses to compare two tz-aware Datetime
+    columns with different time zones, so this rewrite is the
+    difference between a working filter and a ``SchemaError`` for
+    polars filters built against a mis-typed predicate.
+    """
+    if isinstance(left, Column) and isinstance(right, Literal):
+        column, lit_side, flip = left, right, False
+    elif isinstance(right, Column) and isinstance(left, Literal):
+        column, lit_side, flip = right, left, True
+    else:
+        return None
+    value = lit_side.value
+    import datetime as _dt
+
+    if not isinstance(value, _dt.datetime) or value.tzinfo is None:
+        return None
+    target_tz = column_tz_iana(column)
+    if target_tz is None:
+        return None
+    # Already aligned — keep the comparison shape unchanged so the
+    # outer walk's identity check can skip the rebuild.
+    try:
+        import zoneinfo
+    except ImportError:
+        return None
+    try:
+        target_zone = zoneinfo.ZoneInfo(target_tz)
+    except Exception:
+        return None
+    if value.tzinfo is target_zone or value.utcoffset() == target_zone.utcoffset(value):
+        # Same physical zone — no conversion needed. Still strip a
+        # stale ``Literal.dtype`` if it disagrees with target, so the
+        # downstream emitter doesn't re-tag.
+        if lit_side.dtype is None:
+            return None
+    converted = value.astimezone(target_zone)
+    from yggdrasil.data.types.primitive.temporal import TimestampType
+
+    new_literal = Literal(value=converted, dtype=TimestampType(unit="us", tz=target_tz))
+    if flip:
+        return Comparison(new_literal, op, column)
+    return Comparison(column, op, new_literal)
+
+
+def _arrow_tz_lookup(schema: "Any") -> "Callable[[Column], str | None]":
+    """Return a column → IANA-tz lookup over a :class:`pyarrow.Schema`."""
+    import pyarrow as pa
+
+    def lookup(column: Column) -> "str | None":
+        try:
+            ftype = schema.field(column.name).type
+        except (KeyError, ValueError):
+            return None
+        if pa.types.is_timestamp(ftype) and ftype.tz:
+            return ftype.tz
+        return None
+
+    return lookup
+
+
+def _polars_tz_lookup(schema: "Any") -> "Callable[[Column], str | None]":
+    """Return a column → IANA-tz lookup over a :class:`polars.Schema`.
+
+    Polars's ``Datetime`` dtype carries the tz as a string attribute;
+    we read it through the ``.time_zone`` field. ``schema`` may be a
+    polars Schema mapping (``frame.schema``) where the value is the
+    polars ``DataType`` instance for that column.
+    """
+
+    def lookup(column: Column) -> "str | None":
+        try:
+            dtype = schema[column.name]
+        except (KeyError, TypeError):
+            return None
+        tz = getattr(dtype, "time_zone", None)
+        return tz if tz else None
+
+    return lookup
 
 
 def _try_collapse_or(
