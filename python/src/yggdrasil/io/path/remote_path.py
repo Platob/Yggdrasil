@@ -261,6 +261,27 @@ class RemotePath(Path):
     # Resize is a no-op on remote backends — the upload IS the resize
     # ------------------------------------------------------------------
 
+    def _bread(self, n: int, pos: int, mode) -> "BytesIO":
+        from yggdrasil.io.bytes_io import BytesIO
+        del mode
+        if n == 0:
+            return BytesIO()
+        try:
+            data = bytes(self._read_mv(n, pos))
+        except FileNotFoundError:
+            data = b""
+        return BytesIO(data)
+
+    def _bwrite(self, data, pos: int, mode) -> int:
+        del mode
+        if hasattr(data, "to_bytes"):
+            payload = data.to_bytes()
+        elif hasattr(data, "read"):
+            payload = data.read()
+        else:
+            payload = bytes(data)
+        return self._write_mv(memoryview(payload), pos)
+
     def resize(self, n: int) -> int:
         """No-op for remote-backend paths.
 
@@ -423,35 +444,67 @@ class RemotePath(Path):
             self.flush()
         return n
 
-    def flush(self) -> None:
-        """Commit any dirty buffered pages to the backend.
+    def write_all(self, data: "Any") -> int:
+        if self._parent is not None:
+            return self._active().write_all(data)
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if isinstance(data, memoryview):
+            data = bytes(data)
+        elif not isinstance(data, (bytes, bytearray)):
+            if hasattr(data, "read"):
+                data = data.read()
+            else:
+                try:
+                    data = bytes(memoryview(data))
+                except TypeError:
+                    data = bytes(data)
+        self._upload(data)
+        return len(data)
 
-        Assembles the full payload from the page cache (fetching any
-        non-dirty gaps from the backend on the way) and writes it
-        through the subclass ``_write_mv`` primitive in a single
-        round trip. Whole-file backends (HTTP PUT, Volumes upload,
-        S3 PutObject) get the same shape as a direct
-        :meth:`write_bytes`; positional backends absorb one combined
-        write instead of one per buffered ``write_mv``. Pages are
-        marked clean afterwards so a follow-up read collapses to
-        cache hits.
+    def _upload(self, content: bytes) -> int:
+        """Backend-specific atomic upload. Subclasses must override.
+
+        Accepts a materialised ``bytes`` payload and writes it as the
+        entire object in one round trip. Returns the byte count.
+        Called by :meth:`flush` and :meth:`_write_mv` (``pos == 0``).
         """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _upload(content)."
+        )
+
+    def _write_mv(self, data: memoryview, pos: int) -> int:
+        """Splice *data* at *pos* via the backend upload primitive.
+
+        ``pos == 0`` is the fast path — a direct :meth:`_upload` with
+        no preceding download. ``pos > 0`` falls back to
+        read-modify-write: download the existing object, splice the
+        new bytes in, re-upload.
+        """
+        n = len(data)
+        if n == 0:
+            return 0
+        if pos == 0:
+            self._upload(bytes(data))
+            return n
+        try:
+            existing = bytes(self._read_mv(-1, 0))
+        except FileNotFoundError:
+            existing = b""
+        if pos > len(existing):
+            existing = existing + b"\x00" * (pos - len(existing))
+        payload = existing[:pos] + bytes(data) + existing[pos + n:]
+        self._upload(payload)
+        return n
+
+    def flush(self) -> None:
+        """Commit dirty buffered pages to the backend in one upload."""
         if self._dirty_pages:
             size = self._effective_total()
             payload = bytes(self._paged_read(size, 0)) if size > 0 else b""
             self._buffered_size = None
-            # Tell the backend the object is empty so _write_mv's
-            # read-modify-write (S3 PutObject, etc.) doesn't issue
-            # a GET for the old content — we already have the full
-            # payload assembled from the page cache.
-            self._stat_cached = None
-            self._stat_cached_at = 0.0
-            self._persist_stat_cache(
-                IOStats(size=0, kind=IOKind.FILE, mtime=time.time(),
-                        media_type=self.media_type)
-            )
             try:
-                self._write_mv(memoryview(payload), 0)
+                self._upload(payload)
             finally:
                 self._dirty_pages.clear()
         super().flush()

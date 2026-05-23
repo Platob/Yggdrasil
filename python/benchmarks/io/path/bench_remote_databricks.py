@@ -475,6 +475,23 @@ def scenarios(repeat: int) -> list[dict]:
         "calls": _total_sdk_calls(workspace),
     })
 
+    # VolumePath — seek + multi-write (still 1 call)
+    service, client, workspace = _stub_databricks_service(payload=b"old")
+    RemotePath._INSTANCES.clear()
+    p = VolumePath("/Volumes/cat/sch/vol/out.bin", service=service)
+    workspace.files.upload.reset_mock()
+    workspace.files.download.reset_mock()
+    workspace.files.get_metadata.reset_mock()
+    with p.open("wb") as f:
+        f.write(b"head")
+        f.seek(100)
+        f.write(b"tail")
+    out.append({
+        "label": "VolumePath open('wb') seek write write — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": _total_sdk_calls(workspace),
+    })
+
     # Write timing — VolumePath.write_all
     out.append(_time_one(
         "VolumePath.write_all(8 KiB)",

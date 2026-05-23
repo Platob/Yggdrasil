@@ -324,6 +324,30 @@ def scenarios(repeat: int) -> list[dict]:
         "calls": calls,
     })
 
+    # S3Path — seek + multi-write (still 1 call)
+    service = _stub_service(b"old-content")
+    RemotePath._INSTANCES.clear()
+    p = S3Path("s3://bucket/out.bin", service=service)
+    client = service.boto_client
+    client.put_object.reset_mock()
+    client.get_object.reset_mock()
+    client.head_object.reset_mock()
+    with p.open("wb") as f:
+        f.write(b"head")
+        f.seek(100)
+        f.write(b"tail")
+    calls = sum(
+        m.call_count for m in (
+            client.put_object, client.get_object,
+            client.head_object, client.delete_object,
+        )
+    )
+    out.append({
+        "label": "S3Path open('wb') seek write write — SDK calls",
+        "best": 0.0, "median": 0.0, "mean": 0.0,
+        "calls": calls,
+    })
+
     # Write timings
     out.append(_time_one(
         "S3Path.write_all(8 KiB)",
