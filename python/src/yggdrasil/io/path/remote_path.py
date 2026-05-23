@@ -399,7 +399,11 @@ class RemotePath(Path):
             offset = self._pos
         if size >= 0 and len(data) > size:
             data = data[:size]
-        total = self._effective_total()
+        if overwrite and offset == 0:
+            total = 0
+            self._stamp_buffered_size(0)
+        else:
+            total = self._effective_total()
         offset = _resolve_pos(offset, total)
         if offset < 0:
             raise ValueError(
@@ -462,24 +466,6 @@ class RemotePath(Path):
             data = bytes(memoryview(payload))
         self._upload(data)
         self._touch_stat(size=len(data))
-        return len(data)
-
-    def write_all(self, data: "Any") -> int:
-        if self._parent is not None:
-            return self._active().write_all(data)
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        if isinstance(data, memoryview):
-            data = bytes(data)
-        elif not isinstance(data, (bytes, bytearray)):
-            if hasattr(data, "read"):
-                data = data.read()
-            else:
-                try:
-                    data = bytes(memoryview(data))
-                except TypeError:
-                    data = bytes(data)
-        self._upload(data)
         return len(data)
 
     def _upload(self, content: bytes) -> int:
@@ -547,23 +533,21 @@ class RemotePath(Path):
         super()._release()
 
     def truncate(self, n: int) -> int:
-        """Page-buffered truncate avoids the network round trip.
+        """Page-buffered truncate for the ``truncate(0)`` overwrite prelude.
 
-        The base ``Path.truncate`` downloads the file, truncates in
-        memory, and re-uploads — two network calls for what is usually
-        a ``truncate(0)`` before an overwrite. When page buffering is
-        active, clear the pages and stamp the new logical size so the
-        subsequent writes + flush produce the correct payload in one
-        upload.
+        ``truncate(0)`` clears the page cache and stamps the logical
+        size without a network call — the subsequent write + flush
+        replaces the object atomically. ``truncate(n > 0)`` falls
+        through to the base read-modify-write path.
         """
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        if self._page_size is not None:
+        if n == 0 and self._page_size is not None:
             if self._pages is not None:
-                self._discard_pages_past(n)
-            self._stamp_buffered_size(n)
-            self._touch_stat(size=n)
-            return n
+                self._discard_pages_past(0)
+            self._stamp_buffered_size(0)
+            self._touch_stat(size=0)
+            return 0
         return super().truncate(n)
 
 

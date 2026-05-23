@@ -395,7 +395,7 @@ class TestS3WriteColdPath:
     def test_write_all_one_call(self, table) -> None:
         store = {}
         s3 = self._fresh_s3(store)
-        s3.write_all(b"hello")
+        s3.write_bytes(b"hello", overwrite=True)
         assert s3.service.boto_client.put_object.call_count == 1
         assert s3.service.boto_client.head_object.call_count == 0
         assert s3.service.boto_client.get_object.call_count == 0
@@ -458,7 +458,7 @@ class TestS3WriteColdPath:
     def test_stat_correct_after_write(self, table) -> None:
         store = {}
         s3 = self._fresh_s3(store)
-        s3.write_all(b"hello world")
+        s3.write_bytes(b"hello world", overwrite=True)
         assert s3.size == 11
         assert s3.size_known
 

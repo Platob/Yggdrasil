@@ -2296,77 +2296,6 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             cursor=cursor,
         )
 
-    def write_all(self, data: "Any") -> int:
-        """Replace the entire content in one shot.
-
-        Smart routing:
-
-        * **Cursor IO** — delegates to the storage parent's
-          ``write_all`` so a ``ParquetFile(holder=VolumePath)``
-          reaches the backend's atomic upload directly.
-        * **Local path** — ``open("wb") + write`` via the
-          :meth:`Path.write_all` override.
-        * **Remote path** — subclass atomic upload
-          (``DatabricksPath._upload_full``, ``S3Path.write_all``).
-        * **Memory** — ``seek(0) + truncate(0) + write_bytes``.
-
-        Accepts ``bytes``, ``bytearray``, ``memoryview``, ``str``,
-        ``pyarrow.Buffer``, yggdrasil :class:`IO`, or any file-like
-        with ``.read()``. Streams are probed: the first 1 MiB is
-        pulled; if that's the whole payload it is written
-        atomically, otherwise the remainder is appended in chunks.
-        """
-        if self._parent is not None:
-            return self._active().write_all(data)
-
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        if isinstance(data, (bytes, bytearray)):
-            return self._write_all_bytes(data)
-        if isinstance(data, memoryview):
-            return self._write_all_bytes(bytes(data))
-
-        if isinstance(data, IO) or hasattr(data, "read"):
-            return self._write_all_stream(data)
-
-        # Buffer-protocol objects (pa.Buffer, numpy arrays, etc.)
-        try:
-            data = bytes(memoryview(data))
-        except TypeError:
-            data = bytes(data)
-        return self._write_all_bytes(data)
-
-    def _write_all_bytes(self, data: "bytes | bytearray") -> int:
-        """Atomic whole-content write from a materialised buffer."""
-        self.seek(0)
-        self.truncate(0)
-        return self.write_bytes(data)
-
-    def _write_all_stream(self, src: "Any") -> int:
-        """Write a stream, probing the first chunk to decide the path.
-
-        Reads up to 1 MiB; if that's the whole payload, dispatches
-        to :meth:`_write_all_bytes` (one atomic write). Otherwise
-        writes the head, then streams the remainder in chunks so
-        large payloads don't materialise fully in memory.
-        """
-        head = src.read(_COPY_CHUNK)
-        if not head:
-            self._write_all_bytes(b"")
-            return 0
-        tail = src.read(_COPY_CHUNK)
-        if not tail:
-            return self._write_all_bytes(head)
-        # Large stream: write head then append rest
-        n = self._write_all_bytes(head)
-        n += self.write_bytes(tail, offset=-1)
-        while True:
-            chunk = src.read(_COPY_CHUNK)
-            if not chunk:
-                break
-            n += self.write_bytes(chunk, offset=-1)
-        return n
-
     def read_text(
         self,
         encoding: str = "utf-8",
@@ -3405,7 +3334,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             if write_arrow_io is not None:
                 write_arrow_io(view)
             else:
-                self.write_all(bytes(view))
+                self.write_bytes(bytes(view), overwrite=True)
         elif append:
             self.seek(0, 2)  # SEEK_END
             if n > 0:

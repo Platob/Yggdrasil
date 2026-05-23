@@ -442,7 +442,7 @@ class TestWriteAll:
         self, workspace, client, service
     ) -> None:
         p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
-        p.write_all(b"hello-world")
+        p.write_bytes(b"hello-world", overwrite=True)
 
         workspace.files.upload.assert_called_once()
         kwargs = workspace.files.upload.call_args.kwargs
@@ -457,14 +457,14 @@ class TestWriteAll:
     def test_stream_input(self, workspace, client, service) -> None:
         p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
         stream = io.BytesIO(b"streamed")
-        p.write_all(stream)
+        p.write_bytes(stream, overwrite=True)
 
         workspace.files.upload.assert_called_once()
         workspace.files.get_metadata.assert_not_called()
 
     def test_memoryview_input(self, workspace, client, service) -> None:
         p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
-        p.write_all(memoryview(b"view"))
+        p.write_bytes(memoryview(b"view"), overwrite=True)
 
         sent = workspace.files.upload.call_args.kwargs["contents"]
         assert isinstance(sent, io.BytesIO)
@@ -478,7 +478,7 @@ class TestWriteAll:
         arrow_buf = buf.getvalue()
 
         p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
-        n = p.write_all(arrow_buf)
+        n = p.write_bytes(arrow_buf, overwrite=True)
         assert n == 20
         sent = workspace.files.upload.call_args.kwargs["contents"]
         assert sent.getvalue() == b"arrow-buffer-payload"
@@ -493,7 +493,7 @@ class TestWriteAll:
         parquet_bytes = sink.getvalue()
 
         p = VolumePath("/Volumes/c/s/v/out.parquet", service=service)
-        n = p.write_all(parquet_bytes)
+        n = p.write_bytes(parquet_bytes, overwrite=True)
 
         assert n == len(parquet_bytes)
         workspace.files.upload.assert_called_once()
@@ -515,14 +515,14 @@ class TestWriteAll:
 
         workspace.files.upload.side_effect = upload
         p = VolumePath("/Volumes/cat/sch/vol/sub/x.parquet", service=service)
-        p.write_all(b"data")
+        p.write_bytes(b"data", overwrite=True)
 
         workspace.files.create_directory.assert_called_once_with(
             "/Volumes/cat/sch/vol/sub",
         )
         assert workspace.files.upload.call_count == 2
 
-    def test_fewer_sdk_calls_than_write_bytes(self, workspace, client, service) -> None:
+    def test_overwrite_fewer_calls_than_plain_write(self, workspace, client, service) -> None:
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
 
@@ -536,14 +536,13 @@ class TestWriteAll:
         workspace.files.get_metadata.side_effect = NotFound()
 
         p2 = VolumePath("/Volumes/c/s/v/b.bin", service=service)
-        p2.write_all(b"via-write-full")
-        wfb_upload_count = workspace.files.upload.call_count
-        wfb_meta_count = workspace.files.get_metadata.call_count
+        p2.write_bytes(b"via-overwrite", overwrite=True)
+        ow_upload_count = workspace.files.upload.call_count
+        ow_meta_count = workspace.files.get_metadata.call_count
 
-        assert wfb_upload_count == 1
-        assert wfb_meta_count == 0
-        assert wfb_upload_count <= wb_upload_count
-        assert wfb_meta_count < wb_meta_count
+        assert ow_upload_count == 1
+        assert ow_meta_count == 0
+        assert ow_upload_count <= wb_upload_count
 
     def test_parquetfile_write_arrow_table_uses_write_all(
         self,
