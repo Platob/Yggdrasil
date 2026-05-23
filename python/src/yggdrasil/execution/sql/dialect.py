@@ -1,7 +1,7 @@
 """SQL flavor handling for :mod:`yggdrasil.sql`.
 
 We piggyback on the same :class:`Dialect` enum the expression
-backend already uses (:mod:`yggdrasil.io.tabular.execution.expr.backends.sql`) so a
+backend already uses (:mod:`yggdrasil.execution.expr.backends.sql`) so a
 predicate parsed via :func:`Expression.from_sql` and a query parsed
 via :func:`yggdrasil.sql.sql` agree on identifier quoting, literal
 escaping, and ``ILIKE`` availability without a second source of
@@ -16,7 +16,7 @@ pass-throughs to sqlglot.
 
 from __future__ import annotations
 
-from yggdrasil.io.tabular.execution.expr.backends.sql import (
+from yggdrasil.execution.expr.backends.sql import (
     DEFAULT_DIALECT,
     Dialect,
     _resolve_dialect,

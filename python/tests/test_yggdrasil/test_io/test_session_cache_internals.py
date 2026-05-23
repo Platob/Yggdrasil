@@ -138,7 +138,7 @@ class TestCacheLookupPredicates:
         )
 
     def _free_columns(self, pred):
-        from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+        from yggdrasil.execution.expr import free_columns
         return free_columns(pred)
 
     def test_single_request_predicate_partitions_and_matches(self) -> None:
@@ -152,7 +152,7 @@ class TestCacheLookupPredicates:
         assert "request_public_url_hash" in free
 
     def test_batch_predicate_emits_partition_in_clause(self) -> None:
-        from yggdrasil.io.tabular.execution.expr import extract_partition_filters
+        from yggdrasil.execution.expr import extract_partition_filters
 
         cfg = self._cfg()
         reqs = [
@@ -168,7 +168,7 @@ class TestCacheLookupPredicates:
         )
 
     def test_predicate_extracts_partition_filters(self) -> None:
-        from yggdrasil.io.tabular.execution.expr import (
+        from yggdrasil.execution.expr import (
             extract_partition_filters,
         )
 
@@ -204,70 +204,29 @@ class TestCacheLookupPredicates:
         cfg = self._cfg()
         assert cfg.make_batch_lookup_predicate(requests=[]) is None
 
-    def test_batch_predicate_emits_in_list_per_match_column(self) -> None:
-        """``make_batch_lookup_predicate`` runs the result through
-        :func:`yggdrasil.io.tabular.execution.expr.simplify` so a chain
-        of ``col == v_i`` per request collapses into one
-        ``col IN (v_1, ..., v_N)`` — the IN-list compiles faster inside
-        pyarrow's filter kernel than an N-way ``OR``.
+    def test_batch_predicate_top_level_is_and_of_partition_and_match(self) -> None:
+        """``make_batch_lookup_predicate`` returns an AND of the
+        partition-key IN clause and the OR-of-match-clauses. Leaf
+        shapes stay as the builder produced them — there's no
+        post-hoc simplify pass.
         """
-        from yggdrasil.io.tabular.execution.expr import InList, Logical, LogicalOp
+        from yggdrasil.execution.expr import InList, Logical, LogicalOp
 
         cfg = self._cfg()
         reqs = [make_request(f"https://example.com/r{i}") for i in range(32)]
         pred = cfg.make_batch_lookup_predicate(requests=reqs)
-        # Top-level: AND of (partition_key IN ...) and (<match_col> IN ...).
+        # Top-level: AND of (partition_key IN ...) and the per-request
+        # OR / single-leaf match.
         assert isinstance(pred, Logical)
         assert pred.op is LogicalOp.AND
-        # Every leaf clause is an IN-list — no OR-of-equalities nesting.
-        for clause in pred.operands:
-            assert isinstance(clause, InList), (
-                f"Expected InList, got {type(clause).__name__}: {clause!r}"
-            )
-
-    def test_or_of_eq_with_null_collapses_to_in_with_includes_null(self) -> None:
-        """The AST simplifier folds ``col == v1 | col == v2 | col IS NULL``
-        into one ``InList(includes_null=True)`` — verified through the
-        public ``Expression`` builders so the predicate parser path stays
-        the source of truth.
-        """
-        from yggdrasil.io.tabular.execution.expr import (
-            InList,
-            any_of,
-            col,
-            simplify,
-        )
-
-        raw = any_of(col("x") == 1, col("x") == 2, col("x").is_null())
-        simplified = simplify(raw)
-        assert isinstance(simplified, InList)
-        assert simplified.values == (1, 2)
-        assert simplified.includes_null is True
-
-    def test_batch_predicate_dedups_repeated_match_values(self) -> None:
-        """Multiple requests sharing a match value collapse to one IN-list entry."""
-        from yggdrasil.io.tabular.execution.expr import InList
-
-        cfg = self._cfg()
-        # Two requests with the same URL → same match value. The IN-list
-        # should carry one occurrence, not two.
-        reqs = [
-            make_request("https://example.com/dup"),
-            make_request("https://example.com/dup"),
-            make_request("https://example.com/other"),
-        ]
-        pred = cfg.make_batch_lookup_predicate(requests=reqs)
-        # Find the match-column IN-list (the partition_key one comes first).
-        match_in_lists = [
+        # The partition-key constraint is an explicit ``is_in`` so it's
+        # an :class:`InList`; the rest of the operands are whatever
+        # ``request_predicate`` / ``response_predicate`` built.
+        partition_clauses = [
             c for c in pred.operands
-            if isinstance(c, InList)
-            and getattr(c.target, "name", None) != "partition_key"
+            if isinstance(c, InList) and getattr(c.target, "name", None) == "partition_key"
         ]
-        assert match_in_lists, "expected at least one match-column IN-list"
-        for in_list in match_in_lists:
-            assert len(in_list.values) == len(set(in_list.values)), (
-                f"InList {in_list!r} carries duplicate values"
-            )
+        assert partition_clauses, "expected a partition_key InList"
 
 
 # ---------------------------------------------------------------------------

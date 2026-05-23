@@ -11,7 +11,7 @@ planner-style "what columns does X have" lookup collapses to one
 Why a three-level engine in addition to :class:`SqlContext`
 -----------------------------------------------------------
 
-:class:`yggdrasil.io.tabular.execution.sql.SqlContext` is the flat
+:class:`yggdrasil.execution.sql.SqlContext` is the flat
 ``name → Tabular`` mapping the SQL executor uses. It deliberately
 ignores catalog / schema namespacing because the executor's call sites
 only need a single identifier. :class:`TabularEngine` covers the
@@ -29,11 +29,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional, Tuple
 
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.io.tabular.execution.plan import ExecutionPlan, PlanOp
+from yggdrasil.execution.plan import ExecutionPlan, PlanOp
 
 if TYPE_CHECKING:
     from yggdrasil.data.schema import Schema
-    from yggdrasil.io.tabular.execution.sql.statement import SqlStatementResult
+    from yggdrasil.execution.sql.statement import SqlStatementResult
 
 
 __all__ = [
@@ -134,7 +134,7 @@ class TabularEngine:
         here.
         """
         key = self._check_key(catalog, schema, name)
-        from yggdrasil.io.tabular.execution.sql.catalog import coerce_source
+        from yggdrasil.execution.sql.catalog import coerce_source
         io = coerce_source(tabular)
         entry = TabularEntry(catalog=key[0], schema=key[1], name=key[2], tabular=io)
         with self._lock:
@@ -388,7 +388,7 @@ class TabularEngine:
         sources: "Mapping[str, Any] | None" = None,
         **kwargs: Any,
     ) -> "SqlStatementResult":
-        """Run *query* through :class:`yggdrasil.io.tabular.execution.sql.Engine`,
+        """Run *query* through :class:`yggdrasil.execution.sql.Engine`,
         with this engine's entries available as named sources.
 
         Each entry is registered under three aliases — its dotted
@@ -396,7 +396,7 @@ class TabularEngine:
         so SQL referencing any spelling resolves. Per-call *sources*
         override individual aliases without polluting the engine.
         """
-        from yggdrasil.io.tabular.execution.sql.engine import Engine as _SqlEngine
+        from yggdrasil.execution.sql.engine import Engine as _SqlEngine
 
         merged: dict[str, Any] = {}
         with self._lock:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-from yggdrasil.io.tabular.execution.expr import col
+from yggdrasil.execution.expr import col
 
 
 def _table():
@@ -121,8 +121,8 @@ class TestPredicateFilterPicksBestEngine:
     """``Predicate.filter_arrow_batch`` picks the fastest engine internally.
 
     For predicates that decompose into ``InList(Column, [literals])``
-    or ``AND(InList, InList, ...)`` — the canonical post-``simplify``
-    shape for primary-key / cache-key lookups — each row is probed
+    or ``AND(InList, InList, ...)`` — the canonical shape for
+    primary-key / cache-key lookups — each row is probed
     against a Python :class:`frozenset` per column. On a 1-row leaf
     batch with a 64-way OR-of-eq this is ~30x faster than pyarrow's
     :meth:`RecordBatch.filter`, which is dominated by per-call
@@ -139,8 +139,6 @@ class TestPredicateFilterPicksBestEngine:
         assert kept.column("x").to_pylist() == [1, 3]
 
     def test_and_of_in_lists(self):
-        from yggdrasil.io.tabular.execution.expr import simplify
-
         t = pa.Table.from_pylist([
             {"x": 1, "y": "a"},
             {"x": 2, "y": "b"},
@@ -148,17 +146,20 @@ class TestPredicateFilterPicksBestEngine:
             {"x": 4, "y": "c"},
         ])
         batch = t.to_batches()[0]
-        pred = simplify(col("x").is_in([1, 3]) & col("y").is_in(["a"]))
+        pred = col("x").is_in([1, 3]) & col("y").is_in(["a"])
         kept = pred.filter_arrow_batch(batch)
         assert kept.column("x").to_pylist() == [1, 3]
 
     def test_returns_input_when_every_row_matches(self):
-        # All-pass case: the hashset path hands back the original
-        # batch (no take call) — caller may see ``kept is batch``.
+        # All-pass case: result has the same row count and values
+        # as the input. ``pa.RecordBatch.filter`` may rebuild the
+        # batch when the mask is all True — what matters is row-
+        # for-row identity of the data, not Python ``is`` identity.
         t = pa.Table.from_pylist([{"x": 1}, {"x": 2}])
         batch = t.to_batches()[0]
         kept = col("x").is_in([1, 2, 3]).filter_arrow_batch(batch)
-        assert kept is batch
+        assert kept.num_rows == batch.num_rows
+        assert kept.column("x").to_pylist() == batch.column("x").to_pylist()
 
     def test_returns_zero_row_slice_when_nothing_matches(self):
         t = pa.Table.from_pylist([{"x": 1}, {"x": 2}])
@@ -168,12 +169,12 @@ class TestPredicateFilterPicksBestEngine:
         assert kept.schema.equals(batch.schema)
 
     def test_includes_null_matches_null_rows(self):
-        from yggdrasil.io.tabular.execution.expr import simplify
-
         t = pa.Table.from_pylist([{"x": 1}, {"x": None}, {"x": 5}])
         batch = t.to_batches()[0]
-        # ``simplify`` folds ``IN [1] | IS NULL`` into ``InList(includes_null=True)``.
-        pred = simplify(col("x").is_in([1]) | col("x").is_null())
+        # Build the InList directly with ``includes_null=True`` — the
+        # builder doesn't fold ``IN [1] | IS NULL`` for us anymore, so
+        # the caller spells the intent out via ``is_in([1, None])``.
+        pred = col("x").is_in([1, None])
         kept = pred.filter_arrow_batch(batch)
         out = kept.column("x").to_pylist()
         assert sorted(v for v in out if v is not None) == [1]
@@ -221,8 +222,6 @@ class TestPredicateFilterPicksBestEngine:
 
     def test_matches_pyarrow_filter_on_mixed_input(self):
         """``filter_arrow_batch`` agrees row-for-row with the pyarrow path."""
-        from yggdrasil.io.tabular.execution.expr import simplify
-
         t = pa.Table.from_pylist([
             {"x": 1, "y": "a"},
             {"x": 2, "y": "b"},
@@ -231,21 +230,19 @@ class TestPredicateFilterPicksBestEngine:
             {"x": 4, "y": "a"},
         ])
         batch = t.to_batches()[0]
-        pred = simplify(col("x").is_in([1, 3, 4]) & col("y").is_in(["a"]))
+        pred = col("x").is_in([1, 3, 4]) & col("y").is_in(["a"])
         ours = pred.filter_arrow_batch(batch)
         baseline = batch.filter(pred.to_arrow())
         assert ours.to_pylist() == baseline.to_pylist()
 
     def test_filter_arrow_table_picks_best_engine(self):
         """``filter_arrow_table`` mirrors the per-batch dispatch."""
-        from yggdrasil.io.tabular.execution.expr import simplify
-
         t = pa.Table.from_pylist([
             {"x": 1, "y": "a"},
             {"x": 2, "y": "b"},
             {"x": 3, "y": "a"},
         ])
-        pred = simplify(col("x").is_in([1, 3]) & col("y").is_in(["a"]))
+        pred = col("x").is_in([1, 3]) & col("y").is_in(["a"])
         out = pred.filter_arrow_table(t)
         assert out.column("x").to_pylist() == [1, 3]
 

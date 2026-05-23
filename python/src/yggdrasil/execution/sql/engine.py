@@ -56,14 +56,14 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import pyarrow as pa
 
-from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+from yggdrasil.execution.expr import Expression, Predicate
 from yggdrasil.io.tabular import Tabular
 
-from yggdrasil.io.tabular.execution.sql.catalog import SqlContext
-from yggdrasil.io.tabular.execution.sql.dialect import Dialect, resolve_dialect
-from yggdrasil.io.tabular.execution.sql.plan import PlanNode
-from yggdrasil.io.tabular.execution.sql.planner import Planner
-from yggdrasil.io.tabular.execution.sql.statement import (
+from yggdrasil.execution.sql.catalog import SqlContext
+from yggdrasil.execution.sql.dialect import Dialect, resolve_dialect
+from yggdrasil.execution.sql.plan import PlanNode
+from yggdrasil.execution.sql.planner import Planner
+from yggdrasil.execution.sql.statement import (
     PersistTarget,
     SqlPreparedStatement,
     SqlStatementResult,
@@ -209,7 +209,7 @@ class Engine:
 
         plan_tree = Planner(dialect=d).plan(query)
         if where_pred is not None:
-            from yggdrasil.io.tabular.execution.sql.plan import Filter as _Filter
+            from yggdrasil.execution.sql.plan import Filter as _Filter
             plan_tree = _Filter(child=plan_tree, predicate=where_pred)
         return EnginePlan(statement=statement, plan=plan_tree)
 
@@ -267,7 +267,7 @@ class Engine:
         # Whole-query pushdown — only attempted on raw SQL input.
         if pushdown:
             ctx = self.catalog if not sources else self.catalog.child(sources)
-            from yggdrasil.io.tabular.execution.sql.databricks_pushdown import try_databricks_pushdown
+            from yggdrasil.execution.sql.databricks_pushdown import try_databricks_pushdown
 
             pushed = try_databricks_pushdown(
                 query,

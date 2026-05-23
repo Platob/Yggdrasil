@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.tabular.execution.expr import col
+from yggdrasil.execution.expr import col
 
 pl = pytest.importorskip("polars")
 

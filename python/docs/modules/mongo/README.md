@@ -69,12 +69,7 @@ df_polars = coll.read_polars_frame()
 df_pandas = coll.read_pandas_frame()
 
 # With a filter
-import pyarrow as pa
-import pyarrow.compute as pc
-from yggdrasil.io.tabular import TabularReadOptions
-
-options = TabularReadOptions(filter={"status": "active"})
-tbl = coll.read_arrow_table(options=options)
+tbl = coll.read_arrow_table(filter={"status": "active"})
 
 # Python list of dicts (fallback path)
 docs = coll.read_pylist()

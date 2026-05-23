@@ -1,12 +1,12 @@
-# Optional dependency guards (`lib.py` pattern)
+# Optional dependency guards (`lazy_imports` pattern)
 
-Yggdrasil keeps most integrations optional. Import external libraries through package `lib.py` modules.
+Yggdrasil keeps most integrations optional. Import external libraries through `yggdrasil.lazy_imports`.
 
 ## Safe imports
 
 ```python
-from yggdrasil.polars.lib import polars
-from yggdrasil.pandas.lib import pandas
+from yggdrasil.lazy_imports import polars
+from yggdrasil.lazy_imports import pandas
 ```
 
 These wrappers use runtime import/install guards so base installs stay lightweight.
@@ -14,7 +14,7 @@ These wrappers use runtime import/install guards so base installs stay lightweig
 ## Example
 
 ```python
-from yggdrasil.polars.lib import polars
+from yggdrasil.lazy_imports import polars
 
 df = polars.DataFrame({"id": [1, 2], "value": [10.0, 20.0]})
 print(df)

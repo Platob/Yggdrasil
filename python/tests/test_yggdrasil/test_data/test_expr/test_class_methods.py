@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.tabular.execution.expr import Expression, Predicate, col, lit
+from yggdrasil.execution.expr import Expression, Predicate, col, lit
 
 
 class TestEngineDispatch:

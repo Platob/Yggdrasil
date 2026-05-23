@@ -456,14 +456,14 @@ Each engine module registers its converters **on import**:
 | Module | Helpers |
 | --- | --- |
 | `yggdrasil.arrow.cast` | `any_to_arrow_table`, `cast_arrow_tabular`, `cast_arrow_record_batch_reader`, `rechunk_arrow_batches` |
-| `yggdrasil.polars.cast` | `cast_polars_dataframe`, `cast_polars_lazyframe`, `arrow_table_to_polars_dataframe`, `polars_dataframe_to_arrow_table` |
+| `yggdrasil.polars.cast` | `cast_polars_dataframe`, `cast_polars_lazyframe`, `polars_dataframe_to_arrow_table` |
 | `yggdrasil.pandas.cast` | `cast_pandas_dataframe` |
 | `yggdrasil.spark.cast` | `cast_spark_dataframe`, `any_to_spark_dataframe`, `spark_dataframe_to_arrow` |
 
-Always reach the optional engines via their `lib.py` guard so base installs stay functional:
+Always reach the optional engines via `yggdrasil.lazy_imports` so base installs stay functional:
 
 ```python
-from yggdrasil.polars.lib import polars   # correct
+from yggdrasil.lazy_imports import polars   # correct
 import polars                             # wrong — breaks base installs
 ```
 
@@ -492,7 +492,7 @@ The benchmark is checked-in; quote before/after numbers when changing the regist
 
 ```python
 import dataclasses
-from yggdrasil.io.tabular.spark import Dataset
+from yggdrasil.spark.tabular import Dataset
 from yggdrasil.data import field, schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 

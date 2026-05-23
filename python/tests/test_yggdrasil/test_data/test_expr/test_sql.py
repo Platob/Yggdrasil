@@ -13,8 +13,8 @@ import datetime as dt
 
 import pytest
 
-from yggdrasil.io.tabular.execution.expr import col, lit
-from yggdrasil.io.tabular.execution.expr.backends.sql import from_sql, to_sql
+from yggdrasil.execution.expr import col, lit
+from yggdrasil.execution.expr.backends.sql import from_sql, to_sql
 
 
 class TestQuotingByDialect:
@@ -28,9 +28,9 @@ class TestQuotingByDialect:
             '"price" >= 100'
         )
 
-    def test_alias_qualifies_column(self):
+    def test_qualifier_renders_as_table_prefix(self):
         assert (
-            col("price", alias="t") >= 100
+            col("price", qualifier="t") >= 100
         ).to_sql(dialect="databricks") == "`t`.`price` >= 100"
 
 
@@ -114,7 +114,7 @@ class TestFromSqlRoundtrip:
         back = from_sql(sql)
         # The parser keeps operand order — emit and compare the
         # rendered SQL of the lifted tree, not the operand tuple,
-        # so the test stays portable across simplify rewrites.
+        # so the test stays portable across construction-time rewrites.
         assert "`price` >= 100" in to_sql(back)
         assert "`side` = 'buy'" in to_sql(back)
 

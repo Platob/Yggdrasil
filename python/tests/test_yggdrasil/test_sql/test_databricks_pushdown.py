@@ -20,8 +20,8 @@ import pyarrow as pa
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.io.tabular import ArrowTabular
-from yggdrasil.io.tabular.execution.sql import Engine, SqlContext
-from yggdrasil.io.tabular.execution.sql.databricks_pushdown import (
+from yggdrasil.execution.sql import Engine, SqlContext
+from yggdrasil.execution.sql.databricks_pushdown import (
     is_databricks_table,
     try_databricks_pushdown,
 )

@@ -44,7 +44,7 @@ convert("19,95", Decimal)   # Decimal('19.95')
 ## Schema-aware tabular casting (Arrow)
 
 ```python
-import yggdrasil.arrow as pa
+import pyarrow as pa
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.arrow.cast import cast_arrow_tabular
 
@@ -89,20 +89,20 @@ print(dataclass_to_arrow_field(Position))
 | `cast_polars_dataframe`, `cast_polars_lazyframe` | `yggdrasil.polars.cast` |
 | `cast_spark_dataframe` | `yggdrasil.spark.cast` |
 
-Each module registers its converters **on import**. Always reach the optional engines via their `lib.py` guard so base installs stay functional:
+Each module registers its converters **on import**. Always reach the optional engines via `yggdrasil.lazy_imports` so base installs stay functional:
 
 ```python
-from yggdrasil.polars.lib import polars
-from yggdrasil.pandas.lib import pandas
+from yggdrasil.lazy_imports import polars
+from yggdrasil.lazy_imports import pandas
 ```
 
 ### Polars
 
 ```python
-import yggdrasil.arrow as pa
+import pyarrow as pa
 from yggdrasil.data.cast.options import CastOptions
 from yggdrasil.polars.cast import cast_polars_dataframe
-from yggdrasil.polars.lib import polars
+from yggdrasil.lazy_imports import polars
 
 df = polars.DataFrame({"id": ["1"], "score": ["4.5"]})
 target = pa.schema([pa.field("id", pa.int64()), pa.field("score", pa.float64())])
@@ -112,12 +112,13 @@ out = cast_polars_dataframe(df, CastOptions(target_field=target))
 ### Arrow ↔ Polars round-trip
 
 ```python
-from yggdrasil.polars.cast import (
-    arrow_table_to_polars_dataframe,
-    polars_dataframe_to_arrow_table,
-)
+import polars as pl
+from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
 
-pl_df = arrow_table_to_polars_dataframe(arrow_table)
+# Arrow → Polars (use polars directly)
+pl_df = pl.from_arrow(arrow_table)
+
+# Polars → Arrow
 roundtrip = polars_dataframe_to_arrow_table(pl_df)
 ```
 

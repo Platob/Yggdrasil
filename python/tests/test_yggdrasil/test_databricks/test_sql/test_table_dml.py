@@ -42,7 +42,7 @@ from yggdrasil.databricks.table.table import (
     _build_dml_statements,
     _build_prune_predicate,
 )
-from yggdrasil.io.tabular.execution.expr import col as expr_col
+from yggdrasil.execution.expr import col as expr_col
 
 
 # ---------------------------------------------------------------------------
@@ -440,10 +440,12 @@ class TestDeleteInsertShape:
 class TestBuildPrunePredicate:
     """The helper that feeds prune_predicates into the SQL builders.
 
-    It routes the combined predicate through
-    :func:`yggdrasil.io.tabular.execution.expr.simplify`, so duplicate
-    InList values and OR-of-EQ-on-same-column chains in the user's
-    ``where`` collapse before SQL emission.
+    The combined predicate carries the cheap normalisation
+    :class:`InList` / :class:`Logical` apply in ``__post_init__``:
+    duplicate ``IN`` values dedupe and same-op ``Logical`` nesting
+    flattens before SQL emission. OR-of-EQ-on-same-column chains
+    stay as-is — the caller spells the ``IN`` clause explicitly via
+    ``col(...).is_in([...])`` when that's what they want.
     """
 
     def test_empty_inputs_return_empty_list(self) -> None:
@@ -457,10 +459,11 @@ class TestBuildPrunePredicate:
         assert len(out) == 1
         assert out[0] == "`T`.`region` IN ('us', 'eu')"
 
-    def test_duplicate_values_collapse_via_simplify(self) -> None:
+    def test_duplicate_in_values_collapse_in_post_init(self) -> None:
         # Real-world: caller assembled the values list by concatenating
-        # per-batch keys, didn't pre-uniqify. Simplify drops the dup
-        # so the IN list emitted to the warehouse is minimal.
+        # per-batch keys, didn't pre-uniqify. ``InList.__post_init__``
+        # drops the dup so the IN list emitted to the warehouse is
+        # minimal.
         out = _build_prune_predicate(
             {"region": ("us", "eu", "us", "uk", "eu")},
             None, target_alias="T",
@@ -494,8 +497,10 @@ class TestBuildPrunePredicate:
         assert out == ["`T`.`region` = 'us'"]
 
     def test_where_or_chain_collapses_to_in_list(self) -> None:
-        # The headline simplify rewrite — three OR'd equalities on
-        # the same column become one InList.
+        # ``Logical.__new__`` collapses OR-of-EQ-on-same-target into a
+        # single ``InList`` at construction time, so the three-way OR
+        # the user spelled with ``|`` lands as ``region IN (...)``
+        # before SQL emission ever sees it.
         where = (
             (expr_col("region") == "us")
             | (expr_col("region") == "eu")

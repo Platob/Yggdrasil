@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     import polars as pl
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
+    from yggdrasil.execution.expr import Predicate, PredicateLike
     from yggdrasil.io.holder import Holder
     from yggdrasil.spark.tabular import Dataset
 
@@ -155,7 +156,7 @@ def _coerce_predicate(value: Any) -> Any:
     :meth:`Tabular._filter` hook sees a single shape regardless of
     where the predicate came from.
     """
-    from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+    from yggdrasil.execution.expr import Expression, Predicate
 
     if isinstance(value, Predicate):
         return value
@@ -382,13 +383,13 @@ def _default_drop(self_: "Tabular", *, columns: list[str]) -> "Tabular":
     return ArrowTabular(out, schema=out.schema)
 
 
-def _default_filter(self_: "Tabular", *, predicate: Any) -> "Tabular":
+def _default_filter(self_: "Tabular", *, predicate: "Predicate") -> "Tabular":
     """Engine-routing row filter — Spark-native when available, else Arrow."""
     spark_frame = self_._native_spark_frame()
     if spark_frame is not None:
         from yggdrasil.spark.tabular import Dataset
 
-        new_frame = spark_frame.filter(predicate.to_pyspark())
+        new_frame = predicate.filter_spark_frame(spark_frame)
         return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
 
     from yggdrasil.arrow.tabular import ArrowTabular
@@ -536,7 +537,7 @@ class Tabular(ABC, Generic[O]):
 
     def matches_static(
         self,
-        predicate: "Any",
+        predicate: "Predicate",
         *,
         free_cols: "tuple[str, ...] | None" = None,
     ) -> bool:
@@ -563,7 +564,7 @@ class Tabular(ABC, Generic[O]):
             return True
         if free_cols is None:
             try:
-                from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+                from yggdrasil.execution.expr import free_columns
                 free_cols = free_columns(predicate)
             except Exception:
                 return True
@@ -788,7 +789,7 @@ class Tabular(ABC, Generic[O]):
 
     def delete(
         self,
-        predicate: "Any",
+        predicate: "PredicateLike",
         *,
         options: "O | None" = None,
         **kwargs: Any,
@@ -796,7 +797,7 @@ class Tabular(ABC, Generic[O]):
         """Delete every row matching *predicate*. Return rows removed.
 
         *predicate* is a :class:`Predicate` from
-        :mod:`yggdrasil.io.tabular.execution.expr` or a SQL string
+        :mod:`yggdrasil.execution.expr` or a SQL string
         that parses into one (``"id IN (1,2,3)"``,
         ``"price > 100 AND region = 'EU'"``).
 
@@ -810,7 +811,7 @@ class Tabular(ABC, Generic[O]):
         partitioned tree never scans partitions it can prove don't
         match.
         """
-        from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+        from yggdrasil.execution.expr import Expression, Predicate
 
         if isinstance(predicate, str):
             predicate = Expression.from_sql(predicate)
@@ -824,7 +825,7 @@ class Tabular(ABC, Generic[O]):
             predicate, self.check_options(options, overrides=locals()),
         )
 
-    def _delete(self, predicate: "Any", options: O) -> int:
+    def _delete(self, predicate: "Predicate", options: O) -> int:
         """Generic single-leaf delete: filter all batches, rewrite.
 
         Routes the row-level work through
@@ -887,7 +888,7 @@ class Tabular(ABC, Generic[O]):
         contract is just: return a :class:`Tabular` whose reads
         produce the same rows the wrapper would.
         """
-        from yggdrasil.io.tabular.execution.plan import ExecutionPlan
+        from yggdrasil.execution.plan import ExecutionPlan
         from yggdrasil.io.tabular.lazy import LazyTabular
 
         coerced = (
@@ -913,7 +914,7 @@ class Tabular(ABC, Generic[O]):
         a single :class:`Select` over ``"*"`` so the lazy frame still
         round-trips every column when collected with no further ops.
         """
-        from yggdrasil.io.tabular.execution.plan import ExecutionPlan, Select
+        from yggdrasil.execution.plan import ExecutionPlan, Select
         from yggdrasil.io.tabular.lazy import LazyTabular
 
         return LazyTabular(self, plan=ExecutionPlan((Select(("*",)),)))
@@ -1945,12 +1946,12 @@ class Tabular(ABC, Generic[O]):
 
     def filter(
         self,
-        predicate: Any,
+        predicate: "PredicateLike",
     ) -> "Tabular":
         """Drop rows where *predicate* is false.
 
         ``predicate`` accepts every shape
-        :meth:`yggdrasil.io.tabular.execution.expr.Expression.from_`
+        :meth:`yggdrasil.execution.expr.Expression.from_`
         recognises:
 
         * a SQL predicate string (``"x > 0 AND y IS NOT NULL"``),
@@ -1970,7 +1971,7 @@ class Tabular(ABC, Generic[O]):
         pred = _coerce_predicate(predicate)
         return self._filter(predicate=pred)
 
-    def _filter(self, *, predicate: Any) -> "Tabular":
+    def _filter(self, *, predicate: "Predicate") -> "Tabular":
         """Typed-argument row-filter hook.
 
         ``predicate`` is always a yggdrasil :class:`Predicate` at

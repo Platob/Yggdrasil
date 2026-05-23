@@ -20,11 +20,11 @@ Three orthogonal axes, all on the same partitioned Delta fixture:
    small fixture because there's no per-batch Python overhead, but
    that flips as fixtures grow.
 2. **Predicate driver** — no filter / explicit ``prune_values`` /
-   single-EQ predicate / OR-of-EQ predicate (simplify collapses
-   to InList) / partition + row-level predicate / row-level-only
-   predicate. The whole predicate-driven path runs the AST through
-   :func:`simplify` + :func:`extract_partition_filters` once at
-   read time and folds the residual into a per-batch
+   single-EQ predicate / OR-of-EQ predicate / partition +
+   row-level predicate / row-level-only predicate. The whole
+   predicate-driven path runs the AST through
+   :func:`extract_partition_filters` once at read time and folds
+   the residual into a per-batch
    ``pyarrow.compute`` filter — file prune *and* row prune from one
    :class:`Predicate`.
 3. **Write shape** — table write vs batch-iterator write. The
@@ -59,7 +59,7 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions
-from yggdrasil.io.tabular.execution.expr import col as expr_col
+from yggdrasil.execution.expr import col as expr_col
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ def _extractor_scenarios(repeat: int) -> list[dict]:
     invocation regardless of how many batches the read produces — so
     the per-stream amortised cost shrinks linearly with stream length.
     """
-    from yggdrasil.io.tabular.execution.expr import extract_partition_filters
+    from yggdrasil.execution.expr import extract_partition_filters
 
     out: list[dict] = []
     pcols = ("region", "date")
@@ -245,7 +245,7 @@ def _extractor_scenarios(repeat: int) -> list[dict]:
     for k in PARTITION_KEYS[1:16]:
         or_chain = or_chain | (expr_col("region") == k)
     out.append(_time_one(
-        "extract: OR-of-EQ 16 values (simplify → InList → extract)",
+        "extract: OR-of-EQ 16 values (per-operand union → extract)",
         lambda: extract_partition_filters(or_chain, pcols),
         repeat=repeat, inner=2_000,
     ))
@@ -386,9 +386,9 @@ def _read_scenarios(
 
     # -----------------------------------------------------------------
     # Predicate-driven — one Predicate drives file prune + row filter.
-    # The simplify pass collapses OR-of-EQ to InList; the extractor
-    # turns the InList into a partition-prune set; the residual flows
-    # into a per-batch pyarrow.compute filter.
+    # ``extract_partition_filters`` walks the AST, unions per-operand
+    # accepted values into a partition-prune set, and the residual
+    # flows into a per-batch pyarrow.compute filter.
     # -----------------------------------------------------------------
 
     eq_pred = expr_col("region") == target_key

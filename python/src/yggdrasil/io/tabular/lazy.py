@@ -11,7 +11,7 @@ is never mutated, so chains like ``lt.where(...).where(...).select(...)``
 are safe.
 
 The plan is the single intermediate representation. Predicates are
-canonicalized through :class:`yggdrasil.io.tabular.execution.expr.Expression`
+canonicalized through :class:`yggdrasil.execution.expr.Expression`
 when the input is a SQL string or a yggdrasil node, and kept
 backend-native otherwise (round-tripping a polars ``Expr`` through
 the AST loses dtype information). Adjacent :class:`Filter` nodes fuse
@@ -43,8 +43,8 @@ from yggdrasil.data.data_field import Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.io.tabular.execution.expr import Expression, Predicate
-from yggdrasil.io.tabular.execution.plan import (
+from yggdrasil.execution.expr import Expression, Predicate
+from yggdrasil.execution.plan import (
     Apply,
     ExecutionPlan,
     Filter,

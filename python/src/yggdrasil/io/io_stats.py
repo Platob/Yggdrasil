@@ -42,10 +42,16 @@ class IOKind(IntEnum):
 
     Integer-backed so the value compares cheaply and round-trips
     through binary protocols / cache keys without string overhead.
+
+    ``MISSING`` and ``MEMORY`` are deliberately distinct values so a
+    fresh :class:`Memory` holder's stat reports ``MEMORY`` and not
+    ``MISSING`` — an ``IntEnum`` aliases equal-valued members to the
+    first declared name, which previously collapsed ``MEMORY`` into
+    ``MISSING`` and silently broke ``stat().kind`` for every memory
+    holder.
     """
 
     MISSING = 0
-    MEMORY = 0
     FILE = 1
     DIRECTORY = 2
     SYMLINK = 3
@@ -53,6 +59,7 @@ class IOKind(IntEnum):
     FIFO = 5
     CHAR_DEVICE = 6
     BLOCK_DEVICE = 7
+    MEMORY = 8
 
 
 @dataclass(slots=True, repr=False, eq=False)

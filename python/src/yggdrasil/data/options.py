@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from yggdrasil.data.data_field import Field
     from yggdrasil.data.schema import Schema
-    from yggdrasil.io.tabular.execution.expr import Predicate
+    from yggdrasil.execution.expr import Predicate
 
 # ``Field`` / ``Schema`` are imported lazily — top-level imports here
 # would form a cycle through ``yggdrasil.data.schema`` ↔

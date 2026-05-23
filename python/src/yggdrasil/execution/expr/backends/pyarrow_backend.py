@@ -20,21 +20,19 @@ from typing import Any
 
 from ..nodes import (
     Arithmetic,
-    ArithmeticOp,
     Between,
     Cast,
     Column,
     Comparison,
-    CompareOp,
     Expression,
     InList,
     IsNull,
     Like,
     Literal,
     Logical,
-    LogicalOp,
     Not,
 )
+from ..operators import ArithmeticOp, CompareOp, LogicalOp
 
 
 __all__ = ["to_pyarrow", "from_pyarrow"]
@@ -226,7 +224,9 @@ def _lift(node: Any) -> Expression:
     # older builds use ``__repr__``-style introspection.
     name = _try_field_name(node, pc)
     if name is not None:
-        return Column(name=name)
+        from ..builder import col as _col
+
+        return _col(name)
 
     # Literal — pyarrow scalar wrapped as a constant Expression.
     scalar_value = _try_literal_value(node, pc)

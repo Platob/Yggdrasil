@@ -49,4 +49,4 @@ print(resp.status)
 
 For advanced patterns (prepared requests, `send_many`, cache config, response conversions), see:
 
-- [http_](http_/README.md)
+- [http_](../http_/README.md)

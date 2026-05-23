@@ -10,7 +10,7 @@ Example
 
 ::
 
-    from yggdrasil.io.tabular.execution.expr import col, lit
+    from yggdrasil.execution.expr import col, lit
 
     p = (col("price") >= 100) & col("side").is_in(["buy", "sell"])
     p.to_sql()       # SQL string
@@ -49,20 +49,53 @@ __all__ = ["col", "neg", "all_of", "any_of"]
 
 
 def col(
-    name: str,
+    name: "str | Field",
     *,
     field: "Field | None" = None,
     alias: "str | None" = None,
+    qualifier: "str | None" = None,
+    dtype: "Any | None" = None,
 ) -> Column:
-    """Build a :class:`Column` reference for ``name``.
+    """Build a :class:`Column` reference.
 
-    ``field`` binds typed metadata so backends can pick the right
-    literal cast / engine type without a separate dtype argument.
-    ``alias`` qualifies the column for SQL emitters that want
-    ``T.col``; the AST node still compares ``equals`` across alias
-    differences via the underlying name.
+    ``name`` is the column identifier; pass a pre-built :class:`Field`
+    here to reuse the typed metadata (the bound dtype, nullability,
+    children, …). ``dtype`` is the convenience knob for the common
+    "I know the column type" case — when omitted the (synthesised)
+    field's dtype defaults to :class:`ObjectType` so backends fall
+    back to engine-side inference.
+
+    ``alias`` adds a column-level rename so emitters render
+    ``foo AS bar``. ``qualifier`` adds the table-level ``T.col``
+    addressing used by aliased SQL / MERGE rewrites. Both live on
+    the :class:`Column` itself — :class:`Field` stays as origin
+    metadata only.
+
+    ``field=`` is the explicit entry: when the caller already has a
+    :class:`Field` instance, hand it in directly and the builder
+    skips the construction. ``field`` and ``dtype`` are mutually
+    exclusive — the field's dtype wins if both are supplied.
     """
-    return Column(name=name, field=field, alias=alias)
+    from yggdrasil.data.data_field import Field as _Field
+    from yggdrasil.data.types.primitive import ObjectType
+
+    if isinstance(name, _Field):
+        bound: _Field | None = name
+        col_name = name.name
+    elif field is not None:
+        bound = field
+        col_name = name
+    elif dtype is not None:
+        bound = _Field(name=name, dtype=dtype)
+        col_name = name
+    else:
+        # Lazy default — most predicates never look at ``column.dtype``,
+        # so skip the per-call ``Field`` allocation and let the smart
+        # ``Expression.cast`` factory synthesise one on demand.
+        bound = None
+        col_name = name
+
+    return Column(name=col_name, field=bound, alias=alias, qualifier=qualifier)
 
 
 def neg(expr: Expression) -> Not:

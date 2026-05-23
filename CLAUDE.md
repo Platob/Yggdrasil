@@ -21,10 +21,9 @@ uv venv --seed .venv && source .venv/bin/activate   # .venv\Scripts\activate on 
 uv pip install -e .[dev]                     # core dev tooling
 
 # Optional extras are additive — install only what a task needs:
-#   [data] pandas+polars+numpy   [bigdata] pyspark+delta
-#   [databricks] databricks-sdk  [api] fastapi+uvicorn+pydantic
+#   [databricks] databricks-sdk  [bigdata] pyspark
+#   [delta] deltalake            [api] fastapi+uvicorn+pydantic
 #   [pickle] cloudpickle/dill/zstandard/xxhash/blake3
-#   [http] urllib3   [mongo] mongoengine
 
 pytest                                        # full suite
 pytest tests/test_yggdrasil/test_data/        # scope to one area

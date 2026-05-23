@@ -41,12 +41,12 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, List, Optional, Tuple
 
-from yggdrasil.io.tabular.execution.expr import Expression, Predicate
+from yggdrasil.execution.expr import Expression, Predicate
 
-from yggdrasil.io.tabular.execution.sql.dialect import Dialect, resolve_dialect
+from yggdrasil.execution.sql.dialect import Dialect, resolve_dialect
 from yggdrasil.lazy_imports import sqlglot_expressions
-from yggdrasil.io.tabular.execution.sql.parser import parse, SqlParseError
-from yggdrasil.io.tabular.execution.sql.plan import (
+from yggdrasil.execution.sql.parser import parse, SqlParseError
+from yggdrasil.execution.sql.plan import (
     Aggregate,
     AggregateSpec,
     Filter,

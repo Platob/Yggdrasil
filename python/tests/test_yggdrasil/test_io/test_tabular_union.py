@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from yggdrasil.arrow.tests import ArrowTestCase
 from yggdrasil.polars.tests import PolarsTestCase
-from yggdrasil.io.tabular.execution.expr import col
-from yggdrasil.io.tabular.execution.plan import Filter, GroupByAgg, Select
+from yggdrasil.execution.expr import col
+from yggdrasil.execution.plan import Filter, GroupByAgg, Select
 from yggdrasil.io.tabular import ArrowTabular, UnionTabular
 
 

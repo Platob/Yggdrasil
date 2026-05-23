@@ -19,21 +19,19 @@ from typing import Any
 
 from ..nodes import (
     Arithmetic,
-    ArithmeticOp,
     Between,
     Cast,
     Column,
     Comparison,
-    CompareOp,
     Expression,
     InList,
     IsNull,
     Like,
     Literal,
     Logical,
-    LogicalOp,
     Not,
 )
+from ..operators import ArithmeticOp, CompareOp, LogicalOp
 
 
 __all__ = ["to_polars", "from_polars"]
@@ -236,7 +234,9 @@ def _lift_polars_node(node: Any) -> Expression:
 
     # Polars JSON encodes node types as a single top-level key.
     if "Column" in node:
-        return Column(name=str(node["Column"]))
+        from ..builder import col as _col
+
+        return _col(str(node["Column"]))
     if "Literal" in node:
         return _lift_polars_literal(node["Literal"])
     if "BinaryExpr" in node:

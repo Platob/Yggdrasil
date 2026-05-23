@@ -52,7 +52,7 @@ pip install ygg
 === "Arrow schema contract"
 
     ```python
-    import yggdrasil.arrow as pa
+    import pyarrow as pa
     from yggdrasil.arrow.cast import cast_arrow_tabular
     from yggdrasil.data.cast.options import CastOptions
 
@@ -113,12 +113,11 @@ pip install ygg
 ## Install patterns
 
 ```bash
-pip install ygg                   # core: pyarrow + polars
-pip install "ygg[data]"           # pandas, numpy, sqlglot
-pip install "ygg[bigdata]"        # pyspark, delta-spark
+pip install ygg                   # core: pyarrow + polars + xxhash + orjson
+pip install "ygg[bigdata]"        # pyspark
 pip install "ygg[databricks]"     # databricks-sdk
 pip install "ygg[api]"            # fastapi, uvicorn, pydantic
-pip install "ygg[http]"           # urllib3, xxhash
+pip install "ygg[http]"           # xxhash
 pip install "ygg[pickle]"         # cloudpickle, dill, zstandard, blake3
 pip install "ygg[mongo]"          # mongoengine
 pip install "ygg[postgres]"       # psycopg, adbc-driver-postgresql
@@ -126,4 +125,4 @@ pip install "ygg[kafka]"          # confluent-kafka
 pip install "ygg[delta]"          # deltalake
 ```
 
-The only hard runtime deps are `pyarrow>=20` and `polars>=1.3`.
+The only hard runtime deps are `pyarrow>=20`, `polars>=1.3`, `xxhash`, and `orjson>=3.10`.

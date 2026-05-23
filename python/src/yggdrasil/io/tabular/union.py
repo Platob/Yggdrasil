@@ -36,7 +36,7 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.io.tabular.execution.plan import ExecutionPlan
+from yggdrasil.execution.plan import ExecutionPlan
 from yggdrasil.io.tabular.lazy import LazyTabular
 from yggdrasil.lazy_imports import polars_module
 

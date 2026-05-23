@@ -317,7 +317,19 @@ class Memory(IO):
         Memory holders own their size / mtime / media_type directly —
         no backend round-trip — so :meth:`stat` is just a copy of the
         slot fields plus :data:`IOKind.MEMORY`.
+
+        Lazy mtime: ``__init__`` deliberately doesn't sample the clock
+        (a ``time.time()`` syscall per :class:`Memory` allocation would
+        dominate tight per-row holder loops), so ``_mtime`` lands at
+        ``0.0`` for holders the caller never explicitly stamped. On the
+        first :meth:`stat` call we materialise "now" and cache it back
+        into ``_mtime``, so subsequent stats are O(1) and the value
+        stays stable across them. Holders the caller did stamp (via
+        :meth:`touch_mtime` or :meth:`_touch_stat(mtime=...)`) keep
+        the explicit value untouched.
         """
+        if self._mtime == 0.0:
+            self._mtime = time.time()
         return IOStats(
             kind=IOKind.MEMORY,
             size=self._size,

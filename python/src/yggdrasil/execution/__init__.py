@@ -22,7 +22,7 @@ Design
   top when the source supports it.
 """
 
-from yggdrasil.io.tabular.execution.expr import (
+from yggdrasil.execution.expr import (
     Arithmetic,
     ArithmeticOp,
     Between,
@@ -45,7 +45,7 @@ from yggdrasil.io.tabular.execution.expr import (
     lit,
     neg,
 )
-from yggdrasil.io.tabular.execution.plan import (
+from yggdrasil.execution.plan import (
     ExecutionPlan,
     PlanOp,
     Filter as FilterOp,

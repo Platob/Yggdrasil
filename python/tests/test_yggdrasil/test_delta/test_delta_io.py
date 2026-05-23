@@ -191,7 +191,7 @@ class TestPredicatePartitionPruning(DeltaTestCase):
 
     def _files_read(self, options: DeltaOptions) -> int:
         """Count partition files surviving the prune (pre-parquet open)."""
-        from yggdrasil.io.nested.delta.delta_io import _merge_prune_with_predicate
+        from yggdrasil.io.nested.delta.delta_folder import _merge_prune_with_predicate
 
         snap = self.d.snapshot(fresh=False)
         prune = _merge_prune_with_predicate(
@@ -200,7 +200,7 @@ class TestPredicatePartitionPruning(DeltaTestCase):
         return sum(1 for _ in snap.prune_files(prune_values=prune))
 
     def test_eq_predicate_prunes_to_one_file(self) -> None:
-        from yggdrasil.io.tabular.execution.expr import col as expr_col
+        from yggdrasil.execution.expr import col as expr_col
 
         opts = DeltaOptions(predicate=(expr_col("region") == "us"))
         # Four partitions exist (us, us is one file because the writer
@@ -211,7 +211,7 @@ class TestPredicatePartitionPruning(DeltaTestCase):
         self.assertEqual(set(out.column("region").to_pylist()), {"us"})
 
     def test_or_predicate_collapses_to_in_set(self) -> None:
-        from yggdrasil.io.tabular.execution.expr import col as expr_col
+        from yggdrasil.execution.expr import col as expr_col
 
         opts = DeltaOptions(
             predicate=(expr_col("region") == "us")
@@ -227,7 +227,7 @@ class TestPredicatePartitionPruning(DeltaTestCase):
         # The ``id > 1`` half can't drive partition pruning, but the
         # ``region == "us"`` half still picks one file. The row-level
         # filter takes care of the ``id > 1`` rejection downstream.
-        from yggdrasil.io.tabular.execution.expr import col as expr_col
+        from yggdrasil.execution.expr import col as expr_col
 
         opts = DeltaOptions(
             predicate=(expr_col("region") == "us") & (expr_col("id") > 1),
@@ -240,7 +240,7 @@ class TestPredicatePartitionPruning(DeltaTestCase):
     def test_predicate_intersects_with_explicit_prune_values(self) -> None:
         # ``prune_values=us|eu`` AND ``predicate region == us`` →
         # intersection is just ``us``.
-        from yggdrasil.io.tabular.execution.expr import col as expr_col
+        from yggdrasil.execution.expr import col as expr_col
 
         opts = DeltaOptions(
             prune_values={"region": ("us", "eu")},
@@ -251,7 +251,7 @@ class TestPredicatePartitionPruning(DeltaTestCase):
         self.assertEqual(set(out.column("region").to_pylist()), {"us"})
 
     def test_predicate_alone_with_unknown_value_returns_empty(self) -> None:
-        from yggdrasil.io.tabular.execution.expr import col as expr_col
+        from yggdrasil.execution.expr import col as expr_col
 
         opts = DeltaOptions(predicate=(expr_col("region") == "antarctica"))
         self.assertEqual(self._files_read(opts), 0)
@@ -262,7 +262,7 @@ class TestPredicatePartitionPruning(DeltaTestCase):
         # ``id > 1`` is not extractable for partition pruning (range,
         # not partition column anyway) — every file survives the
         # prune, then the row-level filter strips the rejected rows.
-        from yggdrasil.io.tabular.execution.expr import col as expr_col
+        from yggdrasil.execution.expr import col as expr_col
 
         opts = DeltaOptions(predicate=(expr_col("id") > 3))
         self.assertEqual(self._files_read(opts), 4)

@@ -22,22 +22,20 @@ alone is sufficient for dispatch.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Mapping
+from typing import ClassVar, Mapping
 
 import pyarrow as pa
 
-from yggdrasil.pickle.ser.serialized import Serialized
-from yggdrasil.pickle.ser.tags import Tags
+from yggdrasil.io.request import PreparedRequest
+from yggdrasil.io.response import Response
+from yggdrasil.pickle.ser.constants import CODEC_NONE
 from yggdrasil.pickle.ser.pyarrow import (
     _merge_metadata,
     _record_batch_to_ipc_file_buffer,
     _table_from_ipc_file_buffer,
 )
-from yggdrasil.pickle.ser.constants import CODEC_NONE
-
-if TYPE_CHECKING:
-    from yggdrasil.io.request import PreparedRequest
-    from yggdrasil.io.response import Response
+from yggdrasil.pickle.ser.serialized import Serialized
+from yggdrasil.pickle.ser.tags import Tags
 
 __all__ = [
     "HttpSerialized",
@@ -88,9 +86,6 @@ class HttpSerialized(Serialized[object]):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> "Serialized[object] | None":
-        from yggdrasil.io.request import PreparedRequest
-        from yggdrasil.io.response import Response
-
         if isinstance(obj, Response):
             # Response must come first — it IS-A PreparedRequest container
             return ResponseSerialized.from_value(obj, metadata=metadata, codec=codec)
@@ -113,8 +108,6 @@ class PreparedRequestSerialized(HttpSerialized):
 
     @property
     def value(self) -> "PreparedRequest":
-        from yggdrasil.io.request import PreparedRequest
-
         batch = _batch_from_payload(self)
         return next(PreparedRequest.from_arrow(batch, normalize=False))
 
@@ -154,8 +147,6 @@ class PreparedRequestSerialized(HttpSerialized):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> "Serialized[object] | None":
-        from yggdrasil.io.request import PreparedRequest
-
         if isinstance(obj, PreparedRequest):
             return cls.from_value(obj, metadata=metadata, codec=codec)
         return None
@@ -173,8 +164,6 @@ class ResponseSerialized(HttpSerialized):
 
     @property
     def value(self) -> "Response":
-        from yggdrasil.io.response import Response
-
         batch = _batch_from_payload(self)
         return next(Response.from_arrow_tabular(batch))
 
@@ -214,8 +203,6 @@ class ResponseSerialized(HttpSerialized):
         metadata: Mapping[bytes, bytes] | None = None,
         codec: int | None = None,
     ) -> "Serialized[object] | None":
-        from yggdrasil.io.response import Response
-
         if isinstance(obj, Response):
             return cls.from_value(obj, metadata=metadata, codec=codec)
         return None
@@ -227,4 +214,15 @@ class ResponseSerialized(HttpSerialized):
 
 for _cls in (PreparedRequestSerialized, ResponseSerialized):
     Tags.register_class(_cls, tag=_cls.TAG)
+
+# Pre-register the base Python types so ``Tags.get_class_from_type``
+# finds the right serializer for subclasses too — ``PreparedRequest.prepare``
+# returns the HTTP-aware ``HTTPRequest`` subclass (module
+# ``yggdrasil.http_.request``) whenever the URL is HTTP, and ``Response``
+# has a sibling ``HTTPResponse``. Without these pytype entries the
+# ``Serialized.from_python_object`` module-prefix check
+# (``mod.startswith("yggdrasil.io")``) misses those subclasses and the
+# instance falls through to ``GenericObjectSerialized``.
+Tags.register_class(PreparedRequestSerialized, pytype=PreparedRequest)
+Tags.register_class(ResponseSerialized, pytype=Response)
 

@@ -2,7 +2,7 @@
 
 `yggdrasil.polars`, `yggdrasil.pandas`, and `yggdrasil.spark` each register their engine-specific converters into the shared cast registry when imported. After import, `convert(obj, pl.DataFrame)` / `convert(obj, pd.DataFrame)` / `convert(obj, SparkDataFrame)` dispatch through those converters automatically.
 
-None of the three bridge packages are hard dependencies. Each exposes a `lib.py` guard — import via the guard so base installs that don't have the engine still get a clean "install extra X" error instead of an `ImportError`.
+None of the three bridge packages are hard dependencies. Import via `yggdrasil.lazy_imports` so base installs that don't have the engine still get a clean "install extra X" error instead of an `ImportError`.
 
 ## One-liners
 

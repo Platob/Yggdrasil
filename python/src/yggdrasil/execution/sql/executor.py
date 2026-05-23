@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterable
 
 import pyarrow as pa
 
-from yggdrasil.io.tabular.execution.expr import (
+from yggdrasil.execution.expr import (
     Column,
     Expression,
     Logical,
@@ -306,7 +306,7 @@ class PolarsSqlExecutor(SqlExecutor):
             ) from exc
 
         if statement.predicate is not None:
-            lazy = lazy.filter(statement.predicate.to_polars())
+            lazy = statement.predicate.filter_polars_frame(lazy)
 
         if statement.select is not None:
             lazy = lazy.select([

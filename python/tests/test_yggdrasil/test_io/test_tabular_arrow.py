@@ -429,7 +429,7 @@ class TestArrowTabularSpill(ArrowTestCase):
         )
 
     def test_filter_accepts_yggdrasil_expression(self) -> None:
-        from yggdrasil.io.tabular.execution.expr import col
+        from yggdrasil.execution.expr import col
 
         t = self.table({"a": [1, 2, 3, 4], "b": ["x", "y", "x", "z"]})
         out = ArrowTabular(t).filter(col("b") == "x")
@@ -440,7 +440,7 @@ class TestArrowTabularSpill(ArrowTestCase):
 
     def test_filter_chained_yggdrasil_expressions(self) -> None:
         # Two predicates AND-merged via ``&`` on the AST.
-        from yggdrasil.io.tabular.execution.expr import col
+        from yggdrasil.execution.expr import col
 
         t = self.table({"a": [1, 2, 3, 4, 5], "b": ["x", "y", "x", "z", "x"]})
         out = ArrowTabular(t).filter((col("a") > 1) & (col("b") == "x"))

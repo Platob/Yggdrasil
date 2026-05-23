@@ -103,6 +103,7 @@ from yggdrasil.io.url import hive_cast_value, hive_encode, hive_split
 import yggdrasil.io.primitive  # noqa: F401
 
 if TYPE_CHECKING:
+    from yggdrasil.execution.expr import Predicate
     from yggdrasil.io.path import Path
 
 
@@ -951,7 +952,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         if predicate is None:
             return None
         try:
-            from yggdrasil.io.tabular.execution.expr import (
+            from yggdrasil.execution.expr import (
                 extract_partition_filters,
             )
             extracted = extract_partition_filters(predicate, (column,))
@@ -1238,7 +1239,7 @@ class FolderPath(IO[bytes, FolderOptions]):
             if kept.num_rows > 0:
                 yield kept
 
-    def _free_cols_for(self, predicate: Any) -> "tuple[str, ...] | None":
+    def _free_cols_for(self, predicate: "Predicate") -> "tuple[str, ...] | None":
         """Memoised :func:`free_columns` lookup keyed by ``id(predicate)``.
 
         Walks ``tabular_parent`` looking for an already-cached
@@ -1268,7 +1269,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 topmost = node
             node = getattr(node, "tabular_parent", None)
         try:
-            from yggdrasil.io.tabular.execution.expr.nodes import free_columns
+            from yggdrasil.execution.expr import free_columns
             cols = free_columns(predicate)
         except Exception:
             return None
@@ -1789,7 +1790,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     # Row-level delete
     # ==================================================================
 
-    def _delete(self, predicate: Any, options: FolderOptions) -> int:
+    def _delete(self, predicate: "Predicate", options: FolderOptions) -> int:
         """Walk children, filter each leaf in isolation, rewrite survivors.
 
         Streams leaf-by-leaf so a single match in one part file doesn't

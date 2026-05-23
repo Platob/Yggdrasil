@@ -87,13 +87,10 @@ import pandas as pd
 df = table.read_pandas_frame()
 
 # With a SQL filter pushed down
-from yggdrasil.io.tabular import TabularReadOptions
-options = TabularReadOptions(filter="amount > 100 AND placed_at > '2026-01-01'")
-tbl = table.read_arrow_table(options=options)
+tbl = table.read_arrow_table(filter="amount > 100 AND placed_at > '2026-01-01'")
 
 # Selected columns only
-options = TabularReadOptions(columns=["id", "amount"])
-tbl = table.read_arrow_table(options=options)
+tbl = table.read_arrow_table(columns=["id", "amount"])
 ```
 
 ## Write

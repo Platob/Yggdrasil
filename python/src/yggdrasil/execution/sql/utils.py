@@ -6,7 +6,7 @@ rendered via :meth:`Expression.to_sql` and a CTE name quoted here
 agree on escape rules.
 
 Single-source: identifier quote chars come from
-``yggdrasil.io.tabular.execution.expr.backends.sql._IDENT_QUOTES``. Literal rendering
+``yggdrasil.execution.expr.backends.sql._IDENT_QUOTES``. Literal rendering
 defers to the same emitter's ``_render_literal`` so date / bytes /
 NULL handling stays consistent.
 """
@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Sequence
 
-from yggdrasil.io.tabular.execution.expr.backends.sql import (
+from yggdrasil.execution.expr.backends.sql import (
     _IDENT_QUOTES,
     _render_literal,
 )

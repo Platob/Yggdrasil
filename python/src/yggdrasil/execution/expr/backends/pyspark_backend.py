@@ -24,21 +24,19 @@ from typing import Any
 
 from ..nodes import (
     Arithmetic,
-    ArithmeticOp,
     Between,
     Cast,
     Column,
     Comparison,
-    CompareOp,
     Expression,
     InList,
     IsNull,
     Like,
     Literal,
     Logical,
-    LogicalOp,
     Not,
 )
+from ..operators import ArithmeticOp, CompareOp, LogicalOp
 
 
 __all__ = ["to_pyspark", "from_pyspark"]
@@ -58,10 +56,9 @@ def to_pyspark(expr: Expression):
 
 def _emit(expr: Expression, F):  # type: ignore[no-untyped-def]
     if isinstance(expr, Column):
-        ref = F.col(expr.name)
-        if expr.alias:
-            return F.col(f"{expr.alias}.{expr.name}")
-        return ref
+        if expr.qualifier:
+            return F.col(f"{expr.qualifier}.{expr.name}")
+        return F.col(expr.name)
 
     if isinstance(expr, Literal):
         lit = F.lit(expr.value)
