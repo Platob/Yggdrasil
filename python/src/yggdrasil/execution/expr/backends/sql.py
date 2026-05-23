@@ -197,8 +197,14 @@ def _wrap(text: str, my_prec: int, parent_prec: int) -> str:
 
 def _render_column(col: Column, dialect: Dialect) -> str:
     quoted = _quote_ident(col.name, dialect)
-    if col.alias:
-        return f"{_quote_ident(col.alias, dialect)}.{quoted}"
+    if col.qualifier:
+        quoted = f"{_quote_ident(col.qualifier, dialect)}.{quoted}"
+    # NB: ``col.alias`` (column-level rename ``foo AS bar``) is the
+    # caller's intent in a SELECT list, not inside a predicate. The
+    # predicate emitter renders bare ``col`` here so a WHERE clause
+    # doesn't accidentally emit ``foo AS bar = 5``; SELECT-list
+    # emitters that need the rename wrap this with their own
+    # ``AS <alias>`` suffix.
     return quoted
 
 
@@ -874,15 +880,15 @@ class _SqlParser:
 
     def _parse_column(self) -> Expression:
         first = self._expect_kind("ident")
-        alias: "str | None" = None
+        qualifier: "str | None" = None
         name = first.text
         if self.cur.kind == "dot":
             self._eat()
             second = self._expect_kind("ident")
-            alias, name = name, second.text
+            qualifier, name = name, second.text
         from ..builder import col as _col
 
-        return _col(name, alias=alias)
+        return _col(name, qualifier=qualifier)
 
     def _parse_cast(self) -> Expression:
         self._expect_kw("CAST")

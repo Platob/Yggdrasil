@@ -496,20 +496,18 @@ class TestBuildPrunePredicate:
         )
         assert out == ["`T`.`region` = 'us'"]
 
-    def test_where_or_chain_renders_flattened(self) -> None:
-        # ``Logical.__post_init__`` flattens same-op nesting, so the
-        # left-leaning chain Python's ``|`` builds renders as one
-        # parenthesised OR — no nested OR-of-ORs — even though the
-        # OR-of-EQ → InList collapse no longer fires.
+    def test_where_or_chain_collapses_to_in_list(self) -> None:
+        # ``Logical.__new__`` collapses OR-of-EQ-on-same-target into a
+        # single ``InList`` at construction time, so the three-way OR
+        # the user spelled with ``|`` lands as ``region IN (...)``
+        # before SQL emission ever sees it.
         where = (
             (expr_col("region") == "us")
             | (expr_col("region") == "eu")
             | (expr_col("region") == "uk")
         )
         out = _build_prune_predicate(None, where, target_alias="T")
-        assert out == [
-            "(`T`.`region` = 'us' OR `T`.`region` = 'eu' OR `T`.`region` = 'uk')"
-        ]
+        assert out == ["`T`.`region` IN ('us', 'eu', 'uk')"]
 
     def test_where_is_anded_with_prune_values(self) -> None:
         out = _build_prune_predicate(

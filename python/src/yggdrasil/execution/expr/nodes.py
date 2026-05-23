@@ -341,11 +341,24 @@ class Expression:
         from yggdrasil.data.types.id import DataTypeId
 
         if isinstance(self, Column):
-            current = self.field.dtype
+            current = self.field.dtype if self.field is not None else None
             if current is dtype or current == dtype:
                 return self
-            if current.type_id in (DataTypeId.OBJECT, DataTypeId.NULL):
-                return Column(self.field.with_dtype(dtype, inplace=False))
+            if current is None or current.type_id in (
+                DataTypeId.OBJECT, DataTypeId.NULL,
+            ):
+                from yggdrasil.data.data_field import Field
+
+                if self.field is None:
+                    new_field = Field(name=self.name, dtype=dtype)
+                else:
+                    new_field = self.field.with_dtype(dtype, inplace=False)
+                return Column(
+                    name=self.name,
+                    field=new_field,
+                    alias=self.alias,
+                    qualifier=self.qualifier,
+                )
         if isinstance(self, Cast):
             if self.dtype is dtype or self.dtype == dtype:
                 return self
@@ -820,6 +833,130 @@ class Predicate(Expression):
         return self.filter_iterable(target)
 
 
+def _try_collapse_or(
+    operands: "Iterable[Expression]",
+) -> "Expression | None":
+    """Detect OR-of-(EQ | InList | IsNull) on the same target.
+
+    Walks *operands* (descending into nested ``Logical(OR)`` so the
+    left-leaning chain ``a | b | c`` is treated as one flat
+    disjunction) and tries to consolidate every operand into a
+    single :class:`InList`. Returns the merged InList when every
+    operand was foldable AND shared the same structural target —
+    that's the predicate-AST normalization the caller used to do by
+    hand via the old ``simplify`` helper.
+
+    Returns ``None`` for any shape that can't fully collapse:
+    different targets, negated InList / IsNull, comparisons other
+    than EQ, unhashable literal values. The caller then keeps the
+    raw :class:`Logical(OR)` as-is.
+
+    Null-aware: ``IsNull(c)`` contributes ``includes_null=True`` to
+    the merged InList; ``c == None`` is *not* collapsible because
+    SQL 3VL makes it UNKNOWN regardless of row value (rejected by
+    WHERE), which differs from "matches NULL rows".
+    """
+    target: "Expression | None" = None
+    target_hash: int = 0
+    values: "list[Any]" = []
+    includes_null = False
+    seen_values: "set[Any]" = set()
+
+    def _ingest(values_iter: "Iterable[Any]") -> bool:
+        # Hashable-only collapse — an unhashable literal escapes the
+        # frozenset path :meth:`Predicate._filter` later relies on.
+        for v in values_iter:
+            try:
+                if v in seen_values:
+                    continue
+                seen_values.add(v)
+            except TypeError:
+                return False
+            values.append(v)
+        return True
+
+    def _walk(items: "Iterable[Expression]") -> bool:
+        nonlocal target, target_hash, includes_null
+        for op in items:
+            # Descend through nested same-op OR so the flat operand
+            # list is what we collapse against.
+            if isinstance(op, Logical) and op.op is LogicalOp.OR:
+                if not _walk(op.operands):
+                    return False
+                continue
+            this_target, this_values, this_null = _classify_or_operand(op)
+            if this_target is None:
+                return False
+            if target is None:
+                target = this_target
+                target_hash = hash(target)
+            else:
+                # Structural target equality — same column / cast /
+                # arithmetic shape. Hash short-circuit avoids the
+                # field walk on the common case.
+                if hash(this_target) != target_hash or not target.equals(this_target):
+                    return False
+            if this_null:
+                includes_null = True
+            if this_values and not _ingest(this_values):
+                return False
+        return True
+
+    if not _walk(operands):
+        return None
+    if target is None:
+        return None
+    # Need at least two contributions to be a meaningful collapse —
+    # a single EQ collapsing to a 1-element InList loses signal.
+    if not values and not includes_null:
+        return None
+    if len(values) + (1 if includes_null else 0) < 2:
+        return None
+    return InList(
+        target=target,
+        values=tuple(values),
+        negated=False,
+        includes_null=includes_null,
+    )
+
+
+def _classify_or_operand(
+    op: "Expression",
+) -> "tuple[Expression | None, tuple[Any, ...], bool]":
+    """Return ``(target, values, includes_null)`` for an OR-foldable operand.
+
+    Foldable shapes:
+
+    - ``Comparison(target, EQ, Literal(v))`` with ``v is not None``.
+      ``Comparison(Literal(v), EQ, target)`` (literal-on-left) works
+      the same way. We deliberately *do not* fold ``v is None`` —
+      SQL 3VL makes ``c == None`` UNKNOWN regardless of row value.
+    - ``InList(target, values, negated=False, includes_null=…)``.
+    - ``IsNull(target, negated=False)`` — contributes only the
+      ``includes_null=True`` flag.
+
+    Anything else returns ``(None, (), False)`` and the caller
+    bails out.
+    """
+    if isinstance(op, Comparison) and op.op is CompareOp.EQ:
+        if isinstance(op.right, Literal):
+            v = op.right.value
+            if v is None:
+                return None, (), False
+            return op.left, (v,), False
+        if isinstance(op.left, Literal):
+            v = op.left.value
+            if v is None:
+                return None, (), False
+            return op.right, (v,), False
+        return None, (), False
+    if isinstance(op, InList) and not op.negated:
+        return op.target, op.values, op.includes_null
+    if isinstance(op, IsNull) and not op.negated:
+        return op.target, (), True
+    return None, (), False
+
+
 # Row count above which :meth:`Predicate._filter` stops using the
 # hashset shortcut and falls through to pyarrow's C++ filter. Tuned
 # from ``benchmarks/io/tabular/bench_predicate.py`` — the hashset
@@ -948,31 +1085,25 @@ def _apply_inlist(
 class Column(Expression):
     """A reference to a column inside an expression tree.
 
-    Used as the leaf node for in-expression references
-    (``col("price") > 100``); projection / rename / cast-on-select
-    is the job of :class:`yggdrasil.data.data_field.Field`, which
-    is the canonical "selector" for the tabular API.
+    Owns the *expression-side* lookup state: the column ``name`` the
+    backend resolves on the frame, an optional SQL ``alias`` rename
+    (so ``col("foo").with_alias("bar")`` renders as ``foo AS bar``),
+    and the table-level ``qualifier`` for ``T.col`` style addressing
+    inside a MERGE / aliased SQL query.
 
-    A column carries exactly one slot — a :class:`Field` — that
-    owns its name, dtype, nullability, metadata, and (via
-    :attr:`Field.table_qualifier`) the SQL ``T.col`` qualifier.
-    Backends that need engine-flavoured types (Spark casts, Arrow
-    scalars) read straight off ``column.field`` instead of asking
-    the caller for separate dtype / alias arguments.
+    ``field`` is the *origin* metadata — the typed :class:`Field`
+    the column was sourced from (dtype, nullability, source-schema
+    children). Backends consult it for typed-literal casts and
+    engine-flavoured dtypes, but it deliberately does **not** carry
+    expression-side knobs like the table qualifier — those would
+    bleed back into Field consumers (schema diffs, cast registry,
+    pickle round-trips) that have no business with them.
     """
 
-    field: "Field"
-
-    @property
-    def name(self) -> str:
-        """Convenience shortcut for ``self.field.name``."""
-        return self.field.name
-
-    @property
-    def alias(self) -> "str | None":
-        """Convenience shortcut for ``self.field.table_qualifier`` (the
-        SQL ``T.col`` qualifier)."""
-        return self.field.table_qualifier
+    name: str
+    field: "Field | None" = None
+    alias: "str | None" = None  # Column-rename: ``foo AS bar``.
+    qualifier: "str | None" = None  # Table qualifier: ``T.col``.
 
     @property
     def dtype(self) -> "DataType | None":
@@ -1014,6 +1145,33 @@ class Comparison(Predicate):
 class Logical(Predicate):
     op: LogicalOp
     operands: "tuple[Expression, ...]" = ()
+
+    def __new__(
+        cls,
+        op: LogicalOp = LogicalOp.AND,
+        operands: "Iterable[Expression]" = (),
+    ):
+        # Smart constructor — absorbs the cheap rewrites callers used
+        # to remember to apply by hand:
+        #
+        # * OR-of-(EQ | InList | IsNull) on the same target merges
+        #   into one :class:`InList` so emitters never see a wide
+        #   ``c = v1 OR c = v2 OR ...`` chain.
+        # * Single-operand Logical unwraps to its only operand.
+        #
+        # Same-op flatten lives in :meth:`__post_init__` (cheaper to
+        # run there, where it sees the post-``__init__`` operand
+        # tuple). Returning a non-:class:`Logical` from ``__new__``
+        # skips Python's normal ``__init__`` dispatch on the result,
+        # so the collapse / unwrap path stays a single allocation.
+        if op is LogicalOp.OR:
+            collapsed = _try_collapse_or(operands)
+            if collapsed is not None:
+                return collapsed
+        operands_tuple = operands if isinstance(operands, tuple) else tuple(operands)
+        if len(operands_tuple) == 1:
+            return operands_tuple[0]
+        return object.__new__(cls)
 
     def __post_init__(self) -> None:
         # Defensive: keep the operand tuple immutable even if the

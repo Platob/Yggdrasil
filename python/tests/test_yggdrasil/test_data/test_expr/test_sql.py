@@ -28,9 +28,9 @@ class TestQuotingByDialect:
             '"price" >= 100'
         )
 
-    def test_alias_qualifies_column(self):
+    def test_qualifier_renders_as_table_prefix(self):
         assert (
-            col("price", alias="t") >= 100
+            col("price", qualifier="t") >= 100
         ).to_sql(dialect="databricks") == "`t`.`price` >= 100"
 
 

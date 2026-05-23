@@ -53,6 +53,7 @@ def col(
     *,
     field: "Field | None" = None,
     alias: "str | None" = None,
+    qualifier: "str | None" = None,
     dtype: "Any | None" = None,
 ) -> Column:
     """Build a :class:`Column` reference.
@@ -60,38 +61,41 @@ def col(
     ``name`` is the column identifier; pass a pre-built :class:`Field`
     here to reuse the typed metadata (the bound dtype, nullability,
     children, …). ``dtype`` is the convenience knob for the common
-    "I know the column type" case — when omitted the field's dtype
-    defaults to :class:`ObjectType` (the Any-shaped sentinel) so
-    backends fall back to engine-side inference. ``alias`` qualifies
-    the column for SQL emitters that want ``T.col``; it's stored on
-    the field as ``table_qualifier`` so the AST node's single slot
-    still owns the full lookup state.
+    "I know the column type" case — when omitted the (synthesised)
+    field's dtype defaults to :class:`ObjectType` so backends fall
+    back to engine-side inference.
 
-    ``field=`` is the legacy entry point: when the caller already has
-    a :class:`Field` instance, hand it in directly and the builder
+    ``alias`` adds a column-level rename so emitters render
+    ``foo AS bar``. ``qualifier`` adds the table-level ``T.col``
+    addressing used by aliased SQL / MERGE rewrites. Both live on
+    the :class:`Column` itself — :class:`Field` stays as origin
+    metadata only.
+
+    ``field=`` is the explicit entry: when the caller already has a
+    :class:`Field` instance, hand it in directly and the builder
     skips the construction. ``field`` and ``dtype`` are mutually
     exclusive — the field's dtype wins if both are supplied.
     """
-    from yggdrasil.data.data_field import Field
+    from yggdrasil.data.data_field import Field as _Field
     from yggdrasil.data.types.primitive import ObjectType
 
-    if isinstance(name, Field):
-        # Caller already prepared the field; honour it.
-        bound = name
-        caller_owned = True
+    if isinstance(name, _Field):
+        bound: _Field | None = name
+        col_name = name.name
     elif field is not None:
-        bound = field if field.name == name else field.with_name(name, inplace=False)
-        caller_owned = field is bound
+        bound = field
+        col_name = name
+    elif dtype is not None:
+        bound = _Field(name=name, dtype=dtype)
+        col_name = name
     else:
-        bound = Field(name=name, dtype=dtype if dtype is not None else ObjectType())
-        caller_owned = False
-    if alias:
-        # Caller-owned fields might be shared with other Columns — copy
-        # before stamping the qualifier so we don't leak the bolt-on
-        # into unrelated trees. The fresh-built path can mutate the
-        # locally-owned field directly.
-        bound = bound.set_table_qualifier(alias, inplace=not caller_owned)
-    return Column(field=bound)
+        # Lazy default — most predicates never look at ``column.dtype``,
+        # so skip the per-call ``Field`` allocation and let the smart
+        # ``Expression.cast`` factory synthesise one on demand.
+        bound = None
+        col_name = name
+
+    return Column(name=col_name, field=bound, alias=alias, qualifier=qualifier)
 
 
 def neg(expr: Expression) -> Not:

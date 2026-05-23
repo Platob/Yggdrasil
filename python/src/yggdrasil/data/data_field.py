@@ -34,7 +34,6 @@ from yggdrasil.data.constants import (
     DEFAULT_FIELD_NAME,
     MEDIA_TYPE_METADATA_KEY,
     POSITION_KEY,
-    TABLE_QUALIFIER_KEY,
     TAG_PREFIX,
 )
 from yggdrasil.data.enums import Mode
@@ -1169,62 +1168,6 @@ class Field(BaseChildrenFields):
         if self.metadata is None:
             object.__setattr__(self, "metadata", {})
         self.metadata[ALIAS_KEY] = value.encode("utf-8")
-        self._on_metadata_mutated()
-        return self
-
-    @property
-    def table_qualifier(self) -> "str | None":
-        """SQL table-level qualifier — the ``T`` in ``T.col``.
-
-        Stored in :attr:`metadata` under :data:`TABLE_QUALIFIER_KEY`.
-        Distinct from :attr:`alias` (which is the source-side column
-        rename used by :meth:`select_in`): this one is what predicate
-        emitters render as ``<qualifier>.<name>`` when the predicate
-        is rewritten to address columns through a specific table
-        alias (e.g. ``T.foo`` inside a MERGE).
-
-        ``None`` (the default) means "render the bare name" — the
-        common case for top-level WHERE / filter predicates.
-        """
-        if not self.metadata:
-            return None
-        value = self.metadata.get(TABLE_QUALIFIER_KEY)
-        if value is None:
-            return None
-        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
-
-    def set_table_qualifier(
-        self,
-        value: "str | None",
-        *,
-        inplace: bool = True,
-    ) -> "Field":
-        """Set / clear :attr:`table_qualifier`.
-
-        ``None`` or empty string clears the qualifier; anything else
-        stores it under :data:`TABLE_QUALIFIER_KEY`. With
-        ``inplace=False`` returns a fresh :class:`Field` instead of
-        mutating *self* — preferred when the field is shared across
-        multiple :class:`Column` references (e.g. predicate rewrites
-        that bolt a table qualifier on for SQL emission without
-        leaking the qualifier back to the original predicate's
-        Column).
-        """
-        if not inplace:
-            target = self.copy()
-            target.set_table_qualifier(value, inplace=True)
-            return target
-        if not value:
-            if not self.metadata or TABLE_QUALIFIER_KEY not in self.metadata:
-                return self
-            self.metadata.pop(TABLE_QUALIFIER_KEY, None)
-            if not self.metadata:
-                object.__setattr__(self, "metadata", None)
-            self._on_metadata_mutated()
-            return self
-        if self.metadata is None:
-            object.__setattr__(self, "metadata", {})
-        self.metadata[TABLE_QUALIFIER_KEY] = value.encode("utf-8")
         self._on_metadata_mutated()
         return self
 

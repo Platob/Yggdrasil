@@ -56,10 +56,9 @@ def to_pyspark(expr: Expression):
 
 def _emit(expr: Expression, F):  # type: ignore[no-untyped-def]
     if isinstance(expr, Column):
-        ref = F.col(expr.name)
-        if expr.alias:
-            return F.col(f"{expr.alias}.{expr.name}")
-        return ref
+        if expr.qualifier:
+            return F.col(f"{expr.qualifier}.{expr.name}")
+        return F.col(expr.name)
 
     if isinstance(expr, Literal):
         lit = F.lit(expr.value)
