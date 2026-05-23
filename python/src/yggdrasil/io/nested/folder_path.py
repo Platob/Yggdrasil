@@ -671,7 +671,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 self.path
                 / self.YGGMETA_DIRNAME
                 / self.YGGMETA_SCHEMA_FILENAME
-            ).write_bytes(sink.getvalue().to_pybytes())
+            ).write_bytes(sink.getvalue().to_pybytes(), overwrite=True)
         except Exception:
             # Sidecar is opportunistic — never fail the data write.
             pass
@@ -1561,13 +1561,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         row_size = getattr(options, "row_size", None) or 0
 
         def _leaf_options(child: "Tabular") -> Any:
-            base = child.options_class()()
-            # In-place stamps on the freshly minted (frozen) options
-            # via the named ``with_*`` helpers — calling
-            # ``dataclasses.replace`` per child reruns
-            # ``__post_init__`` and allocates a fresh slot layout,
-            # which the bench (Session._store_cached_response) flagged
-            # as a 500 us / write regression.
+            base = child.options_class()(mode=Mode.OVERWRITE)
             if checked_cast and hasattr(base, "checked_cast"):
                 base.with_checked_cast(True, copy=False)
             if source_schema is not None:
