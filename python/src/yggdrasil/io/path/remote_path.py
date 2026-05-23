@@ -439,19 +439,19 @@ class RemotePath(Path):
         if self._dirty_pages:
             size = self._effective_total()
             payload = bytes(self._paged_read(size, 0)) if size > 0 else b""
-            # Strip the buffered-write tip off the stat cache before
-            # the subclass primitive runs. S3 / Volumes /…
-            # ``_write_mv`` consults ``_existing_size_or_zero`` to
-            # know how many bytes to splice in; with the buffered
-            # tip stamped onto the cache they'd issue a phantom GET
-            # for bytes the backend never had. The subclass's own
-            # ``_persist_stat_cache`` restamps the cache to reflect
-            # the freshly-committed object.
+            self._buffered_size = None
+            # Tell the backend the object is empty so _write_mv's
+            # read-modify-write (S3 PutObject, etc.) doesn't issue
+            # a GET for the old content — we already have the full
+            # payload assembled from the page cache.
             self._stat_cached = None
             self._stat_cached_at = 0.0
-            self._buffered_size = None
+            self._persist_stat_cache(
+                IOStats(size=0, kind=IOKind.FILE, mtime=time.time(),
+                        media_type=self.media_type)
+            )
             try:
-                super().write_mv(memoryview(payload), 0, overwrite=True)
+                self._write_mv(memoryview(payload), 0)
             finally:
                 self._dirty_pages.clear()
         super().flush()

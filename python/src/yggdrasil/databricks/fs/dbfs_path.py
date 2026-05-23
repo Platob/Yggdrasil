@@ -391,14 +391,17 @@ class DBFSPath(DatabricksPath):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        if self._page_size is not None:
+            if self._pages is not None:
+                self._discard_pages_past(n)
+            self._stamp_buffered_size(n)
+            self._touch_stat(size=n)
+            return n
 
         if n == 0:
             self._stream_upload(b"")
             return 0
 
-        # Single read-to-EOF — no preceding ``get_status`` probe. A
-        # missing object is the natural "nothing to truncate" case;
-        # let it surface as zero existing bytes.
         try:
             existing = bytes(self._read_mv(-1, 0))
         except FileNotFoundError:

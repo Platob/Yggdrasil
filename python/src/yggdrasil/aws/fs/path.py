@@ -711,9 +711,14 @@ class S3Path(RemotePath):
             return 0
 
     def truncate(self, n: int) -> int:
-        """Re-upload the head *n* bytes (zero-padded if extending)."""
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        if self._page_size is not None:
+            if self._pages is not None:
+                self._discard_pages_past(n)
+            self._stamp_buffered_size(n)
+            self._touch_stat(size=n)
+            return n
 
         current = 0
         try:

@@ -836,12 +836,14 @@ class VolumePath(DatabricksPath):
     def truncate(self, n: int) -> int:
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        if self._page_size is not None:
+            if self._pages is not None:
+                self._discard_pages_past(n)
+            self._stamp_buffered_size(n)
+            self._touch_stat(size=n)
+            return n
         if n == 0:
             return 0
-        # One ``files.download`` round trip — skip the ``get_metadata``
-        # probe and read the whole object. A missing target collapses
-        # to "no existing bytes" and we upload a fresh zero-padded
-        # head of size ``n``.
         try:
             existing = bytes(self._read_mv(-1, 0))
         except FileNotFoundError:
