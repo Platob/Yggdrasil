@@ -113,85 +113,6 @@ _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 # its requests touch instead of walking the whole tree.
 
 
-# Minimum body size (bytes) before the cache-persist auto-compress
-# helper bothers to gzip. Below ~1 MiB the gzip header overhead +
-# per-call CPU + the small storage win is mostly noise; the Arrow IPC
-# writer on the local fast-path already zstd-compresses the row.
-_BODY_AUTOCOMPRESS_MIN_SIZE: int = 1 * 1024 * 1024
-
-# Plaintext MIME types worth gzipping before cache persistence. Routed
-# through the :class:`MimeType` enum so the alias / case / prefix
-# normalization is consistent with the rest of the codebase — if a
-# new plaintext format gets added to :class:`MimeTypes`, drop it into
-# this set in one place rather than maintaining a string list. Binary
-# entropy-dense formats (parquet, arrow IPC, mp4, zip, jpeg, …) stay
-# out — gzipping them costs CPU for near-zero savings.
-_AUTOCOMPRESS_MIMES: frozenset[MimeType] = frozenset({
-    MimeTypes.JSON,
-    MimeTypes.NDJSON,
-    MimeTypes.XML,
-    MimeTypes.HTML,
-    MimeTypes.PLAIN,
-    MimeTypes.CSV,
-    MimeTypes.TSV,
-    MimeTypes.YAML,
-    MimeTypes.TOML,
-})
-
-
-def _maybe_autocompress_body_for_cache(
-    response: Response,
-    *,
-    min_size: int = _BODY_AUTOCOMPRESS_MIN_SIZE,
-    codec: Codec = Codecs.GZIP,
-) -> None:
-    """Gzip-compress *response.body* in place before cache persistence.
-
-    Applies only when ALL of:
-
-    * the response has no existing ``Content-Encoding`` header (we
-      don't recompress brotli / gzip / zstd payloads — that's a no-win
-      for storage and breaks ``.content`` round-tripping),
-    * the response's resolved :class:`MimeType` is in
-      :data:`_AUTOCOMPRESS_MIMES`,
-    * the body is at least *min_size* bytes,
-    * gzip actually shrinks it by >10% — the storage win has to
-      outweigh the extra CPU on both the persist and the eventual
-      read.
-
-    On compress: swaps a fresh :class:`Memory` over the gzipped bytes
-    into ``response.buffer`` and stamps ``Content-Encoding: gzip`` +
-    new ``Content-Length`` via :meth:`Response.set_media_type`, which
-    already invalidates the response's deterministic-projection cache
-    so the row that lands in the Arrow batch carries the compressed
-    body + correct headers in one consistent shape. The cache reader
-    side picks the codec back off ``Content-Encoding`` and routes
-    ``.content`` / ``.text`` / ``.json`` through the existing
-    :class:`Codec` path — no special-case decompression on the read
-    path.
-    """
-    if response.headers.get("Content-Encoding"):
-        return
-    buffer = response.buffer
-    if buffer is None or buffer.size < min_size:
-        return
-    mime = response.media_type.mime_type if response.media_type is not None else None
-    if mime is None or mime not in _AUTOCOMPRESS_MIMES:
-        return
-
-    raw = buffer.to_bytes()
-    compressed = codec.compress_bytes(raw)
-    if len(compressed) >= int(len(raw) * 0.9):
-        # < 10% savings — gzip overhead + read-side decompress isn't
-        # worth it. Skip and persist the original bytes.
-        return
-
-    new_buffer = Memory()
-    with new_buffer.open(mode="wb", owns_holder=False) as bio:
-        bio.write(compressed)
-    response.buffer = new_buffer
-    response.set_media_type(MediaType.from_mime(mime_type=mime, codec=codec))
-
 
 def _insert_cache(
     tabular: Any,
@@ -1017,7 +938,6 @@ class HTTPSession(Session):
         )
         if tabular is None:
             return
-        _maybe_autocompress_body_for_cache(response)
         batch = response.to_arrow_batch(parse=False)
         # Prune values matter for the remote MERGE narrow-target
         # path; the local FolderPath ignores them on writes (it
@@ -2395,8 +2315,6 @@ class HTTPSession(Session):
             # splits the batch back out by ``partition_key`` so each
             # response still lands under its own
             # ``partition_key=<v>/`` directory.
-            for response in group_responses:
-                _maybe_autocompress_body_for_cache(response)
             batch = _Response.values_to_arrow_batch(group_responses)
             Job.make(
                 _insert_cache, tabular, eff, batch,
@@ -3393,6 +3311,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "GET",
@@ -3412,6 +3331,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def post(
@@ -3434,6 +3354,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "POST",
@@ -3454,6 +3375,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def put(
@@ -3476,6 +3398,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "PUT",
@@ -3496,6 +3419,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def patch(
@@ -3518,6 +3442,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "PATCH",
@@ -3538,6 +3463,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def delete(
@@ -3560,6 +3486,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "DELETE",
@@ -3580,6 +3507,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def head(
@@ -3601,6 +3529,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "HEAD",
@@ -3620,6 +3549,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def options(
@@ -3642,6 +3572,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         return self.request(
             "OPTIONS",
@@ -3662,6 +3593,7 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             send=send,
+            **options,
         )
 
     def request(
@@ -3685,6 +3617,7 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
+        **options,
     ) -> Response | PreparedRequest:
         # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
         # form-urlencoding for mappings/sequences), ``timeout=`` becomes
@@ -3743,6 +3676,7 @@ class HTTPSession(Session):
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
+            **options,
         )
 
     def prepare_request(

@@ -1464,27 +1464,27 @@ class DatabricksClient(Singleton, URLBased):
 
     def parallelize(
         self,
-        function: "Callable",
-        inputs: "Any",
+        inputs: "Callable | Any",
+        inputs_or_schema: "Any | None" = None,
         *,
         schema: Any = None,
         byte_size: int = 128 * 1024 * 1024,
     ):
-        """Distribute *function* over *inputs* via Spark executors.
-
-        Builds a :class:`~yggdrasil.spark.tabular.Dataset` directly
-        from :meth:`Dataset.parallelize`, using the Databricks
-        Connect session from :meth:`spark`::
+        """Distribute *function* over *inputs* via Spark executors, or
+        create a :class:`~yggdrasil.spark.tabular.Dataset` directly
+        from *inputs* when no function is given::
 
             dbc = DatabricksClient()
+            # With function
             results = dbc.parallelize(fetch, urls, schema=output_schema)
-            results.to_table("main.curated.fetched")
+            # Without function — just wrap inputs as a Dataset
+            ds = dbc.parallelize(rows, schema=output_schema)
         """
         from yggdrasil.spark.tabular import Dataset
 
         return Dataset.parallelize(
-            function,
             inputs,
+            inputs_or_schema,
             schema=schema,
             spark_session=self.spark(),
             byte_size=byte_size,

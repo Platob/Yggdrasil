@@ -680,8 +680,7 @@ class MemoryStream(Holder):
             self._window_start = n
             if self._spill_file is not None:
                 self._spill_file.truncate(n - self._spill_start)
-            stats = self.stat()
-            stats.size = self.size
+            self._touch_stat(size=self.size)
             return self.size
 
         local = n - self._window_start
@@ -691,8 +690,7 @@ class MemoryStream(Holder):
         elif local > cur:
             self._buf.extend(b"\x00" * (local - cur))
         self._slide_window()
-        stats = self.stat()
-        stats.size = self.size
+        self._touch_stat(size=self.size)
         # ``mtime`` left alone — see :meth:`Memory.truncate` for the
         # rationale: per-call clock reads in the write hot path are
         # expensive enough to dominate tight loops. Use
@@ -712,8 +710,7 @@ class MemoryStream(Holder):
         self._close_spill()
         # ``_eof`` reflects the source state, not the buffer; clear()
         # of the buffer doesn't unsignal EOF on a drained source.
-        stats = self.stat()
-        stats.size = 0
+        self._touch_stat(size=0)
 
     # ------------------------------------------------------------------
     # Convenience overrides
