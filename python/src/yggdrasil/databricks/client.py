@@ -1441,13 +1441,26 @@ class DatabricksClient(Singleton, URLBased):
         *,
         schema: Any = None,
     ):
-        """Return a :class:`Dataset` from a SQL query or table name.
+        """Return a :class:`~yggdrasil.spark.tabular.Dataset` from SQL or a table name.
 
-        Pass-through to :meth:`SQLEngine.dataset` so scripting callers
-        can write ``dbc.dataset("SELECT ...")`` without an extra
-        ``.sql`` hop.
+        Resolves the Spark session via :meth:`spark` (Databricks
+        Connect) and builds a :class:`Dataset` directly — no
+        intermediate executor hop::
+
+            dbc = DatabricksClient()
+            ds = dbc.dataset("SELECT * FROM main.sales.orders")
+            ds = dbc.dataset("main.sales.orders")
+
+        The result is a full :class:`Dataset` — call ``.map``,
+        ``.filter``, ``.to_table``, ``.toArrow``, etc. on it.
         """
-        return self.sql.dataset(sql_or_table, schema=schema)
+        from yggdrasil.data.statement import PreparedStatement
+        from yggdrasil.spark.tabular import Dataset
+
+        session = self.spark()
+        if PreparedStatement.looks_like_query(sql_or_table):
+            return Dataset.from_sql(sql_or_table, spark_session=session, schema=schema)
+        return Dataset.from_table(sql_or_table, spark_session=session, schema=schema)
 
     def parallelize(
         self,
@@ -1459,13 +1472,21 @@ class DatabricksClient(Singleton, URLBased):
     ):
         """Distribute *function* over *inputs* via Spark executors.
 
-        Pass-through to :meth:`SQLEngine.parallelize` so scripting
-        callers can write ``dbc.parallelize(fn, items)`` directly.
+        Builds a :class:`~yggdrasil.spark.tabular.Dataset` directly
+        from :meth:`Dataset.parallelize`, using the Databricks
+        Connect session from :meth:`spark`::
+
+            dbc = DatabricksClient()
+            results = dbc.parallelize(fetch, urls, schema=output_schema)
+            results.to_table("main.curated.fetched")
         """
-        return self.sql.parallelize(
+        from yggdrasil.spark.tabular import Dataset
+
+        return Dataset.parallelize(
             function,
             inputs,
             schema=schema,
+            spark_session=self.spark(),
             byte_size=byte_size,
         )
 

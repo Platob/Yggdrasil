@@ -907,14 +907,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
     ) -> "Dataset":
         """Return a :class:`Dataset` from a SQL query or table name.
 
-        When *sql_or_table* looks like a query (starts with ``SELECT``,
-        ``WITH``, ``SHOW``, ``DESCRIBE``, …) it is executed via the
-        Spark session; otherwise it is read as a table name via
-        ``spark.table(name)``.
-
-        The session is resolved through the Databricks Spark executor
-        so Databricks Connect / serverless / classic compute wiring
-        applies automatically.
+        Auto-detects SQL (``SELECT``, ``WITH``, …) vs table name.
+        Session resolved through Databricks Connect.
         """
         from yggdrasil.spark.tabular import Dataset
 
@@ -939,15 +933,14 @@ class SQLEngine(DatabricksService, StatementExecutor):
         schema: Any = None,
         byte_size: int = 128 * 1024 * 1024,
     ) -> "Dataset":
-        """Distribute *function* over *inputs* using Spark executors.
+        """Distribute *function* over *inputs* via Spark executors."""
+        from yggdrasil.spark.tabular import Dataset
 
-        Resolves the session through this engine's Spark executor
-        (Databricks Connect for serverless / classic compute) and
-        delegates to :meth:`Dataset.parallelize`.
-        """
-        return self.spark.parallelize(
+        session = self.spark.resolve_session(create=True)
+        return Dataset.parallelize(
             function,
             inputs,
             schema=schema,
+            spark_session=session,
             byte_size=byte_size,
         )
