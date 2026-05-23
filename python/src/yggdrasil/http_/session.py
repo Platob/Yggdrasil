@@ -1219,16 +1219,11 @@ class HTTPSession(Session):
         remote_cfg = config.remote_cache
         local_cfg = config.local_cache
 
-        # Per-request configs take precedence over the session-level ones.
         effective_local_cfg = request.local_cache_config or local_cfg
         effective_remote_cfg = request.remote_cache_config or remote_cfg
 
-        # --- 1. Check local cache first (fast, disk-based) ---
-        # UPSERT mode skips the lookup outright — the fresh fetch
-        # below will overwrite the on-disk entry through the same
-        # ``Tabular.write_arrow_batches`` surface both backends use.
         local_cache_tabular: Any = None
-        if effective_local_cfg.local_cache_enabled:
+        if effective_local_cfg is not None and effective_local_cfg.local_cache_enabled:
             local_cache_tabular = effective_local_cfg.cache_tabular(session=self)
             if effective_local_cfg.mode != Mode.UPSERT:
                 local_response = self._load_cached_response(
@@ -1242,7 +1237,8 @@ class HTTPSession(Session):
         # --- 2. Check remote cache (slower, network-based) ---
         # Skip when the effective config demands a forced refresh (UPSERT).
         if (
-            effective_remote_cfg.remote_cache_enabled
+            effective_remote_cfg is not None
+            and effective_remote_cfg.remote_cache_enabled
             and effective_remote_cfg.mode != Mode.UPSERT
         ):
             remote_response = self._load_cached_response(
@@ -1269,12 +1265,14 @@ class HTTPSession(Session):
         # cache lookups above already ran; reaching here means both
         # missed, so raise instead of crossing the wire.
         if config.cache_only:
+            local_enabled = effective_local_cfg.local_cache_enabled if effective_local_cfg is not None else False
+            remote_enabled = effective_remote_cfg.remote_cache_enabled if effective_remote_cfg is not None else False
             raise LookupError(
                 f"cache_only=True but no cached response for {request.method} "
                 f"{request.url} (local_cache_enabled="
-                f"{effective_local_cfg.local_cache_enabled}, "
+                f"{local_enabled}, "
                 f"remote_cache_enabled="
-                f"{effective_remote_cfg.remote_cache_enabled})."
+                f"{remote_enabled})."
             )
 
         request = self.prepare_request_before_send(request)
@@ -1291,7 +1289,7 @@ class HTTPSession(Session):
                 tabular=local_cache_tabular,
             )
 
-        if effective_remote_cfg.remote_cache_enabled:
+        if effective_remote_cfg is not None and effective_remote_cfg.remote_cache_enabled:
             # Pass the effective config so its mode (UPSERT or APPEND)
             # is used directly by the remote write.
             self._store_cached_response(
@@ -1599,22 +1597,18 @@ class HTTPSession(Session):
     def _effective_local_cfg(
         self,
         request: PreparedRequest,
-        session_cfg: CacheConfig,
-    ) -> CacheConfig:
-        # Prebuild the per-request override the same way
-        # :meth:`_send_many_batches` prebuilds the session-level
-        # config — so the downstream code can reach ``eff.path``
-        # uniformly without a ``local_cache_folder(session=...)``
-        # dance. ``prebuild`` is idempotent and skips remote-only /
-        # disabled configs.
+        session_cfg: CacheConfig | None,
+    ) -> CacheConfig | None:
         cfg = request.local_cache_config or session_cfg
+        if cfg is None:
+            return None
         return cfg.prebuild(session=self)
 
     def _effective_remote_cfg(
         self,
         request: PreparedRequest,
-        session_cfg: CacheConfig,
-    ) -> CacheConfig:
+        session_cfg: CacheConfig | None,
+    ) -> CacheConfig | None:
         return request.remote_cache_config or session_cfg
 
     @staticmethod
@@ -1674,7 +1668,7 @@ class HTTPSession(Session):
         hits: dict[Path, list[Response]] = {}
         misses: list[PreparedRequest] = []
 
-        if not session_local_cfg.local_cache_enabled and not any(
+        if (session_local_cfg is None or not session_local_cfg.local_cache_enabled) and not any(
             r.local_cache_config for r in batch
         ):
             # Cheap path: no local cache anywhere in this batch.
@@ -1691,7 +1685,7 @@ class HTTPSession(Session):
                 if key_to_local_cfg is not None
                 else None
             ) or self._effective_local_cfg(req, session_local_cfg)
-            if not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
+            if eff is None or not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
             root = eff.local_cache_folder(session=self)
@@ -1758,7 +1752,7 @@ class HTTPSession(Session):
                 if key_to_remote_cfg is not None
                 else None
             ) or self._effective_remote_cfg(req, session_remote_cfg)
-            if t_cfg.mode == Mode.UPSERT:
+            if t_cfg is None or t_cfg.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
@@ -1992,7 +1986,7 @@ class HTTPSession(Session):
                 if key_to_remote_cfg is not None
                 else None
             ) or self._effective_remote_cfg(req, session_remote_cfg)
-            if t_cfg.mode == Mode.UPSERT:
+            if t_cfg is None or t_cfg.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
             if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
@@ -2298,7 +2292,7 @@ class HTTPSession(Session):
             eff = key_to_local_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_local_cfg
-            if not eff.local_cache_enabled:
+            if eff is None or not eff.local_cache_enabled:
                 continue
             root = eff.local_cache_folder(session=self)
             bucket = groups.get(root)
@@ -2352,7 +2346,7 @@ class HTTPSession(Session):
             eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_remote_cfg
-            if not eff.remote_cache_enabled:
+            if eff is None or not eff.remote_cache_enabled:
                 continue
             gkey = self._remote_write_group_key(eff)
             if gkey not in groups:
@@ -2441,7 +2435,7 @@ class HTTPSession(Session):
             eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
             if eff is None:
                 eff = session_remote_cfg
-            if not eff.remote_cache_enabled:
+            if eff is None or not eff.remote_cache_enabled:
                 continue
             if not eff.mirror_local_to_remote:
                 continue
@@ -2578,15 +2572,8 @@ class HTTPSession(Session):
         is_spark = spark is not None
 
         session_remote_cfg = config.remote_cache
-        # Build the session-level local cache's :class:`Tabular` once
-        # at entry so the rest of the pipeline can reach for
-        # ``cfg.tabular`` symmetrically with the remote side. The
-        # session-aware path (``base_url`` host/path → cache root)
-        # only resolves correctly when we have ``self`` in scope, so
-        # the prebuild has to happen here rather than at config-build
-        # time. ``prebuild`` is idempotent and a no-op on
-        # already-built / disabled / remote configs.
-        session_local_cfg = config.local_cache.prebuild(session=self)
+        _lc = config.local_cache
+        session_local_cfg = _lc.prebuild(session=self) if _lc is not None else None
 
         if is_spark:
             # FAIR scheduling lets the concurrent stage-4 inserts
@@ -2622,8 +2609,8 @@ class HTTPSession(Session):
             config.max_in_flight,
             ttl,
             config.ordered,
-            session_local_cfg.local_cache_enabled,
-            session_remote_cfg.remote_cache_enabled,
+            session_local_cfg.local_cache_enabled if session_local_cfg is not None else False,
+            session_remote_cfg.remote_cache_enabled if session_remote_cfg is not None else False,
         )
 
         chunk_index = 0
@@ -3033,7 +3020,7 @@ class HTTPSession(Session):
         for cfg_key, eff in key_to_remote_cfg.items():
             if eff is None:
                 eff = session_remote_cfg
-            if not eff.remote_cache_enabled:
+            if eff is None or not eff.remote_cache_enabled:
                 continue
             gkey = self._remote_write_group_key(eff)
             if gkey not in groups:

@@ -1054,8 +1054,8 @@ class SendConfig(_ConfigBase):
     raise_error: bool = True
     stream: bool = True
     wait: WaitingConfig = field(default=DEFAULT_WAITING_CONFIG)
-    remote_cache: CacheConfig = field(default=DEFAULT_CACHE_CONFIG)
-    local_cache: CacheConfig = field(default=DEFAULT_CACHE_CONFIG)
+    remote_cache: CacheConfig | None = None
+    local_cache: CacheConfig | None = None
     # When True, ``Session._send`` consults the local + remote caches as
     # usual but skips the network fallback — a full miss raises
     # :class:`LookupError` instead of crossing the wire. ``send_many``
@@ -1079,11 +1079,12 @@ class SendConfig(_ConfigBase):
 
     def __post_init__(self):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
-        object.__setattr__(self, "remote_cache", CacheConfig.from_(self.remote_cache))
-        object.__setattr__(self, "local_cache", CacheConfig.from_(self.local_cache))
-        # ``True`` / ``...`` → resolve the live SparkSession via
-        # :meth:`PyEnv.spark_session` so callers don't have to thread
-        # one through every layer. ``None`` stays ``None`` (Python mode).
+        rc = self.remote_cache
+        if rc is not None:
+            object.__setattr__(self, "remote_cache", CacheConfig.from_(rc))
+        lc = self.local_cache
+        if lc is not None:
+            object.__setattr__(self, "local_cache", CacheConfig.from_(lc))
         spark = self.spark_session
         if spark is True or spark is ...:
             spark = PyEnv.spark_session()
@@ -1145,8 +1146,8 @@ class SendManyConfig(_ConfigBase):
     wait: WaitingConfigArg = None
     raise_error: bool = True
     stream: bool = True
-    remote_cache: CacheConfig = field(default_factory=CacheConfig)
-    local_cache: CacheConfig = field(default_factory=CacheConfig)
+    remote_cache: CacheConfig | None = None
+    local_cache: CacheConfig | None = None
     cache_only: bool = False
     # See :class:`SendConfig.as_tabular` — controls whether
     # ``Session.send_many`` returns an ``Iterator[Response]`` (False)
@@ -1168,8 +1169,12 @@ class SendManyConfig(_ConfigBase):
 
     def __post_init__(self):
         object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
-        object.__setattr__(self, "remote_cache", CacheConfig.from_(self.remote_cache))
-        object.__setattr__(self, "local_cache", CacheConfig.from_(self.local_cache))
+        rc = self.remote_cache
+        if rc is not None:
+            object.__setattr__(self, "remote_cache", CacheConfig.from_(rc))
+        lc = self.local_cache
+        if lc is not None:
+            object.__setattr__(self, "local_cache", CacheConfig.from_(lc))
         spark = self.spark_session
         if spark is True or spark is ...:
             spark = PyEnv.spark_session()
