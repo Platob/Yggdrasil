@@ -24,7 +24,6 @@ from .nodes import (
     Logical,
 )
 from .operators import CompareOp, LogicalOp
-from .simplify import simplify
 
 
 __all__ = ["extract_partition_filters"]
@@ -36,12 +35,12 @@ def extract_partition_filters(
 ) -> "dict[str, frozenset]":
     """Over-approximate per-column accepted-value sets from a predicate.
 
-    Walks *expr* (after :func:`simplify`) and returns, for each
-    column in *columns* that the predicate constrains to a finite
-    set, the :class:`frozenset` of values the column *could* take
-    in any row the predicate accepts. Columns not in the returned
-    dict are unconstrained — the predicate doesn't restrict their
-    value to a finite, enumerable set.
+    Walks *expr* and returns, for each column in *columns* that the
+    predicate constrains to a finite set, the :class:`frozenset` of
+    values the column *could* take in any row the predicate accepts.
+    Columns not in the returned dict are unconstrained — the
+    predicate doesn't restrict their value to a finite, enumerable
+    set.
 
     The result is suitable for partition pruning: a file whose
     partition value for ``col`` isn't in the extracted set can be
@@ -75,7 +74,7 @@ def extract_partition_filters(
     allowed = frozenset(columns)
     if not allowed:
         return {}
-    return _extract_partition(simplify(expr), allowed)
+    return _extract_partition(expr, allowed)
 
 
 def _extract_partition(

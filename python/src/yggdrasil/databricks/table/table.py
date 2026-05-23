@@ -68,7 +68,6 @@ from yggdrasil.execution.expr import (
     LogicalOp,
     Predicate,
     col as expr_col,
-    simplify,
 )
 from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 
@@ -323,21 +322,10 @@ def _build_prune_predicate(
     """Combine ``prune_values`` + ``where`` into a single target-side SQL clause.
 
     Builds one AST: per-column ``InList`` from ``prune_values`` AND'd
-    with the user's ``where``, target-aliased, and routed through
-    :func:`yggdrasil.execution.expr.simplify` so:
-
-    * Duplicate values inside any one column's ``IN`` list collapse
-      (``{"region": ["us", "us", "eu"]}`` → ``IN ('us', 'eu')``) —
-      :func:`_collect_prune_values_polars` already calls ``.unique()``
-      on collected frames, but the user-passed dict path may carry
-      duplicates and would otherwise emit a bloated ``IN`` list.
-    * OR-of-equalities inside ``where`` on the same column collapse
-      to an ``IN`` list (``col("date") == d1 | col("date") == d2``
-      → ``IN (d1, d2)``), matching the canonical shape the rest of
-      the prune clause produces.
-    * Nested ``Logical`` (the left-leaning chain Python's ``|``
-      builds) flattens, so the rendered SQL has the minimum
-      parenthesisation.
+    with the user's ``where``, target-aliased. ``InList.__post_init__``
+    dedupes per-column values and ``Logical.__post_init__`` flattens
+    same-op nesting so the rendered SQL is already tight without an
+    explicit normalisation pass.
 
     Return shape stays ``list[str]`` (0 or 1 elements) so the
     downstream :func:`_build_dml_statements` / :func:`_build_merge_statement`
@@ -365,15 +353,14 @@ def _build_prune_predicate(
     # Alias once over the combined tree — single walk instead of one
     # per part.
     aliased = _alias_columns(combined, target_alias)
-    normalized = simplify(aliased)
-    sql = expr_to_sql(normalized, dialect=Dialect.DATABRICKS)
+    sql = expr_to_sql(aliased, dialect=Dialect.DATABRICKS)
     # Top-level OR (e.g. a single ``InList`` with ``includes_null=True``
     # renders as ``T.x IN (...) OR T.x IS NULL``) needs parens before
     # the consumer concatenates it with AND. A top-level AND is
     # already what the consumer would build anyway, so no wrap.
-    if isinstance(normalized, Logical) and normalized.op is LogicalOp.OR:
+    if isinstance(aliased, Logical) and aliased.op is LogicalOp.OR:
         sql = f"({sql})"
-    elif isinstance(normalized, InList) and normalized.includes_null:
+    elif isinstance(aliased, InList) and aliased.includes_null:
         sql = f"({sql})"
     return [sql]
 

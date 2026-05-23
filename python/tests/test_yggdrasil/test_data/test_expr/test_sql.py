@@ -114,7 +114,7 @@ class TestFromSqlRoundtrip:
         back = from_sql(sql)
         # The parser keeps operand order — emit and compare the
         # rendered SQL of the lifted tree, not the operand tuple,
-        # so the test stays portable across simplify rewrites.
+        # so the test stays portable across construction-time rewrites.
         assert "`price` >= 100" in to_sql(back)
         assert "`side` = 'buy'" in to_sql(back)
 

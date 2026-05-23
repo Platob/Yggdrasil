@@ -22,7 +22,6 @@ this file stays focused on the dataclass shapes:
 - ``operators.py`` — operator enums (``CompareOp``, ``LogicalOp``,
   ``ArithmeticOp``).
 - ``walk.py`` — :func:`walk` / :func:`free_columns` visitors.
-- ``simplify.py`` — :func:`simplify` and the OR/AND collapse rules.
 - ``partition.py`` — :func:`extract_partition_filters` over-approx
   pruner.
 
@@ -318,25 +317,6 @@ class Expression:
 
     def cast(self, dtype: "DataType") -> "Cast":
         return Cast(self, dtype)
-
-    # ------------------------------------------------------------------
-    # Algebraic rewrites — equivalent tree, fewer / cheaper nodes.
-    # ------------------------------------------------------------------
-
-    def simplify(self) -> "Expression":
-        """Return a logically equivalent but normalized form.
-
-        Convenience method that delegates to
-        :func:`yggdrasil.execution.expr.simplify.simplify`.
-        See its docstring for the exact rewrites — the headline
-        ones are nested-Logical flattening, ``InList`` value
-        de-duplication, and OR-of-equalities collapse
-        (``c == a | c == b | c.is_null() → c.is_in([a, b])``
-        with ``includes_null=True``).
-        """
-        from .simplify import simplify
-
-        return simplify(self)
 
     # ------------------------------------------------------------------
     # Backend dispatch — kept thin. Each backend is a module that
@@ -761,7 +741,20 @@ class Logical(Predicate):
         # Defensive: keep the operand tuple immutable even if the
         # caller handed in a list. Frozen dataclasses use
         # object.__setattr__ for post-init normalization.
-        object.__setattr__(self, "operands", tuple(self.operands))
+        #
+        # Same-op flatten — a child ``Logical`` with the same operator
+        # is inlined into our operand list so the tree stays right-
+        # leaning regardless of how Python's left-associative ``|`` /
+        # ``&`` built it. ``(a | b) | c`` and ``a | (b | c)`` both
+        # land as ``Logical(OR, (a, b, c))``.
+        op = self.op
+        flat: "list[Expression]" = []
+        for operand in self.operands:
+            if isinstance(operand, Logical) and operand.op is op:
+                flat.extend(operand.operands)
+            else:
+                flat.append(operand)
+        object.__setattr__(self, "operands", tuple(flat))
         if not self.operands:
             raise ValueError(
                 f"Logical {self.op.value} needs at least one operand."
@@ -805,7 +798,23 @@ class InList(Predicate):
     includes_null: bool = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "values", tuple(self.values))
+        # Dedupe in first-seen order — hashable values use a ``set``
+        # fast path; the unhashable branch falls back to a linear
+        # ``in out`` scan so dicts / lists still land deterministically.
+        # The latter is O(n²) but only fires when the caller seeded
+        # the InList with unhashable types — uncommon in practice.
+        seen: "set[Any]" = set()
+        deduped: "list[Any]" = []
+        for v in self.values:
+            try:
+                if v in seen:
+                    continue
+                seen.add(v)
+            except TypeError:
+                if v in deduped:
+                    continue
+            deduped.append(v)
+        object.__setattr__(self, "values", tuple(deduped))
 
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)

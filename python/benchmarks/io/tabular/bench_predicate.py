@@ -6,26 +6,21 @@ SQL emitters, pyarrow scanner pushdowns) and the engine that
 runs it. Three cost surfaces show up in real workloads:
 
 1. **Construction** — fluent factory + operator overloads. The
-   builder allocates one frozen dataclass per node, so a deep
-   tree (``c == a | c == b | c == c | c == d | ...``) is cheap
-   per node but ``__post_init__`` work adds up at scale.
-2. **Simplify** — :func:`yggdrasil.execution.expr.simplify`
-   is the algebraic rewrite pass (InList dedup, OR-of-EQ collapse,
-   Logical flatten, AND dedup). Pipelines that build predicates
-   programmatically (chained ``|`` calls inside a loop) feed it
-   long OR chains; the cost has to stay sub-µs per node or the
-   "always simplify before emit" pattern stops paying off.
-3. **Emit** — ``to_python`` / ``to_arrow`` / ``to_polars`` /
+   builder allocates one frozen dataclass per node. ``InList``
+   dedupes its values and ``Logical`` flattens same-op nesting
+   in ``__post_init__`` so the tree the caller sees is already
+   canonical, but those small rewrites cost runtime that adds
+   up at scale.
+2. **Emit** — ``to_python`` / ``to_arrow`` / ``to_polars`` /
    ``to_sql`` walk the tree once and produce the engine-side
    form. Hot for cache-key building (the SQL emitter is the
    string the cache hashes on) and for pyarrow / polars pushdowns
    that hand the predicate to the engine per batch.
-4. **Evaluate** — the Python-backend filter compiles the tree to
+3. **Evaluate** — the Python-backend filter compiles the tree to
    a callable and runs it per row; the pyarrow backend runs the
    whole filter inside C++. Two very different cost profiles.
 
-Scenarios target the load-bearing rewrite the OR-collapse is
-designed to win: a long chain of ``c == X`` literals (the shape
+Scenarios contrast a long chain of ``c == X`` literals (the shape
 pipelines actually build from a list of allowed values via
 ``functools.reduce(operator.or_, …)``) vs the explicit
 ``c.is_in([...])`` shape. Numbers should show:
@@ -33,13 +28,12 @@ pipelines actually build from a list of allowed values via
 - Construction cost grows linearly in chain length for both
   shapes; the InList form is roughly ``1/N`` per value (one
   dataclass + one tuple normalize) where the OR chain is
-  ``N`` Comparisons + ``N-1`` Logicals.
-- Simplify on the OR chain runs once, collapses to a single
-  InList, and the downstream emit / evaluate cost drops
-  accordingly.
-- pyarrow filter throughput on the collapsed form is ``isin``
+  ``N`` Comparisons + ``N-1`` Logicals (flattened by
+  ``__post_init__`` into one operand tuple).
+- pyarrow filter throughput on the InList form is ``isin``
   (one kernel) vs ``equal | equal | ...`` (one kernel per
-  literal then logical reduction).
+  literal then logical reduction) — same gap users see between
+  spelling the predicate as ``is_in`` vs an OR chain.
 
 Usage::
 
@@ -61,7 +55,6 @@ import pyarrow.dataset as pds
 from yggdrasil.execution.expr import (
     Expression,
     col,
-    simplify,
 )
 from yggdrasil.execution.expr.backends.python import (
     filter_rows,
@@ -164,56 +157,14 @@ def _construction_scenarios(values_n: int, repeat: int) -> list[dict]:
         lambda: _build_inlist("id", values),
         repeat=repeat, inner=10_000,
     ))
-    # Long chain with duplicates — simplify dedups it later. Cost
-    # here is just the construction; the win lands in the simplify
-    # row below.
+    # ``InList.__post_init__`` dedupes the duplicate-laden value list
+    # the caller built by concatenating per-batch keys. Cost here is
+    # the construction + dedup combined.
     dup_values = values * 2
     out.append(_time_one(
-        f"build: InList with 2× duplicates ({values_n * 2} entries)",
+        f"build: InList with 2× duplicates ({values_n * 2} entries → {values_n})",
         lambda: _build_inlist("id", dup_values),
         repeat=repeat, inner=10_000,
-    ))
-    return out
-
-
-def _simplify_scenarios(values_n: int, repeat: int) -> list[dict]:
-    """Cost of the rewrite pass — both no-op and actual-collapse shapes."""
-    values = list(range(values_n))
-    or_chain = _build_or_chain("id", values)
-    inlist = _build_inlist("id", values)
-    duplicated = _build_inlist("id", values + values)
-    or_with_isnull = or_chain | col("id").is_null()
-    mixed = (
-        _build_or_chain("id", values[: values_n // 2])
-        | _build_or_chain("side", ["buy", "sell"])
-        | col("price").is_null()
-    )
-
-    out: list[dict] = []
-    out.append(_time_one(
-        f"simplify: OR-chain ({values_n} eqs) → InList",
-        lambda: simplify(or_chain),
-        repeat=repeat, inner=1_000,
-    ))
-    out.append(_time_one(
-        f"simplify: InList no-op ({values_n} unique values)",
-        lambda: simplify(inlist),
-        repeat=repeat, inner=10_000,
-    ))
-    out.append(_time_one(
-        f"simplify: InList dedup ({values_n * 2} → {values_n})",
-        lambda: simplify(duplicated),
-        repeat=repeat, inner=2_000,
-    ))
-    out.append(_time_one(
-        f"simplify: OR-chain + IsNull ({values_n} eqs)",
-        lambda: simplify(or_with_isnull),
-        repeat=repeat, inner=1_000,
-    ))
-    out.append(_time_one(
-        f"simplify: mixed OR (id + side + IsNull, {values_n // 2 + 3} ops)",
-        lambda: simplify(mixed),
-        repeat=repeat, inner=1_000,
     ))
     return out
 
@@ -223,7 +174,6 @@ def _emit_scenarios(values_n: int, repeat: int) -> list[dict]:
     values = list(range(values_n))
     or_chain = _build_or_chain("id", values)
     inlist = _build_inlist("id", values)
-    simplified = simplify(or_chain)  # should be an InList
 
     out: list[dict] = []
     out.append(_time_one(
@@ -234,11 +184,6 @@ def _emit_scenarios(values_n: int, repeat: int) -> list[dict]:
     out.append(_time_one(
         f"emit: to_python(InList, {values_n} vals)",
         lambda: to_python(inlist),
-        repeat=repeat, inner=5_000,
-    ))
-    out.append(_time_one(
-        f"emit: to_python(simplified OR-chain)",
-        lambda: to_python(simplified),
         repeat=repeat, inner=5_000,
     ))
 
@@ -287,7 +232,6 @@ def _python_eval_scenarios(rows_n: int, values_n: int, repeat: int) -> list[dict
     rows = _build_python_rows(rows_n)
     or_chain = _build_or_chain("id", values)
     inlist = _build_inlist("id", values)
-    simplified = simplify(or_chain)
 
     def _drain(expr: Expression) -> None:
         for _ in filter_rows(expr, rows):
@@ -304,11 +248,6 @@ def _python_eval_scenarios(rows_n: int, values_n: int, repeat: int) -> list[dict
         lambda: _drain(inlist),
         repeat=repeat, inner=5,
     ))
-    out.append(_time_one(
-        f"eval: python filter_rows simplified-OR rows={rows_n} vals={values_n}",
-        lambda: _drain(simplified),
-        repeat=repeat, inner=5,
-    ))
     return out
 
 
@@ -320,7 +259,6 @@ def _arrow_eval_scenarios(rows_n: int, values_n: int, repeat: int) -> list[dict]
 
     or_chain_expr = _build_or_chain("id", values).to_arrow()
     inlist_expr = _build_inlist("id", values).to_arrow()
-    simplified_expr = simplify(_build_or_chain("id", values)).to_arrow()
 
     out: list[dict] = []
     out.append(_time_one(
@@ -333,18 +271,12 @@ def _arrow_eval_scenarios(rows_n: int, values_n: int, repeat: int) -> list[dict]
         lambda: ds.to_table(filter=inlist_expr),
         repeat=repeat, inner=20,
     ))
-    out.append(_time_one(
-        f"eval: arrow filter simplified-OR rows={rows_n} vals={values_n}",
-        lambda: ds.to_table(filter=simplified_expr),
-        repeat=repeat, inner=20,
-    ))
     return out
 
 
 def scenarios(rows_n: int, values_n: int, repeat: int) -> list[dict]:
     return [
         *_construction_scenarios(values_n, repeat),
-        *_simplify_scenarios(values_n, repeat),
         *_emit_scenarios(values_n, repeat),
         *_python_eval_scenarios(rows_n, values_n, repeat),
         *_arrow_eval_scenarios(rows_n, values_n, repeat),

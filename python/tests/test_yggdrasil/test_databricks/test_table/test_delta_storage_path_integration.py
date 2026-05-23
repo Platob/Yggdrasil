@@ -13,7 +13,7 @@ plus a ``_delta_log`` transaction log. Two ways to read it:
    — point :class:`DeltaFolder` at the table's :attr:`storage_location`
    (an S3 / ABFS / GCS URI vended by Unity Catalog's temporary table
    credentials API) and open the parquet files directly. Skips the
-   warehouse entirely and lets the predicate AST + ``simplify`` +
+   warehouse entirely and lets the predicate AST +
    ``extract_partition_filters`` drive partition pruning at the file
    level — same machinery the local-only delta tests exercise.
 
@@ -338,13 +338,13 @@ class TestDeltaStoragePathBenchmark(DatabricksIntegrationCase):
             store_secs=store_secs, store_rows=store_table.num_rows,
         )
 
-    def test_or_collapse_round_trip(self) -> None:
-        """``region == us | == eu | == uk``: the OR chain collapses to InList.
+    def test_or_chain_round_trip(self) -> None:
+        """``region == us | == eu | == uk``: OR-of-EQ on the same column.
 
-        :func:`simplify` rewrites the three-way OR into a single
-        ``InList``, which then drives partition pruning the same way
-        a hand-written ``is_in`` would. Warehouse runs the
-        equivalent ``IN`` clause.
+        ``extract_partition_filters`` walks the OR and unions the per-
+        operand value sets, so partition pruning still resolves the
+        accepted values without an explicit ``is_in`` rewrite.
+        Warehouse runs the equivalent ``IN`` clause.
         """
         target = ("us", "eu", "uk")
         sql_where = "region IN ('us', 'eu', 'uk')"
