@@ -204,9 +204,13 @@ nav:
           - fxrate: modules/fxrate/README.md
           - jwt: modules/jwt/README.md
           - exceptions: modules/exceptions/README.md
+      - Services:
+          - fastapi: modules/fastapi/README.md
+          - cli: modules/cli/README.md
       - Utilities:
           - pyutils: modules/pyutils/README.md
           - concurrent: modules/concurrent/README.md
+          - environ: modules/environ/README.md
           - optional libs: modules/libs/README.md
           - extension helpers: modules/libs/extensions/README.md
           - deltalake (status): modules/deltalake/README.md
