@@ -633,6 +633,127 @@ class Predicate(Expression):
             return _apply_inlist(target, clauses)
         return target.filter(self.to_arrow())
 
+    # ------------------------------------------------------------------
+    # Engine filters — mirrors the read_X / write_X surface every
+    # ``Tabular`` already exposes. Each method runs the predicate on
+    # the matching engine's native representation, applying the
+    # cast-column optimisation when present (see :func:`_cast_columns`
+    # and the per-backend fallback in :meth:`_apply_engine_filter`).
+    # ------------------------------------------------------------------
+
+    def filter_polars_frame(self, frame: "Any") -> "Any":
+        """Filter a :class:`polars.DataFrame` / :class:`polars.LazyFrame`.
+
+        Both shapes expose ``.filter(expr)`` accepting a
+        :class:`polars.Expr`, so one method covers both.
+        """
+        return frame.filter(self.to_polars())
+
+    def filter_pandas_frame(self, frame: "Any") -> "Any":
+        """Filter a :class:`pandas.DataFrame` row-wise.
+
+        Compiles the predicate to a Python callable and applies it to
+        each row's ``to_dict()`` view — pandas has no first-class
+        predicate kernel so this is the canonical entry point.
+        """
+        from .backends.python import to_python
+
+        fn = to_python(self)
+        mask = frame.apply(lambda row: bool(fn(row)), axis=1)
+        return frame[mask]
+
+    def filter_spark_frame(self, frame: "Any") -> "Any":
+        """Filter a :class:`pyspark.sql.DataFrame`."""
+        return frame.filter(self.to_pyspark())
+
+    def filter_pylist(
+        self, rows: "Iterable[Any]",
+    ) -> "list[Any]":
+        """Filter a list / iterable of ``Mapping`` rows (the
+        :meth:`Tabular.read_pylist` shape)."""
+        from .backends.python import to_python
+
+        fn = to_python(self)
+        return [row for row in rows if fn(row)]
+
+    def filter_pydict(self, data: "Mapping[str, Any]") -> "dict[str, list]":
+        """Filter a column-oriented ``{col: [values, ...]}`` dict.
+
+        Mirrors :meth:`Tabular.read_pydict`: builds a temporary Arrow
+        table, runs the same hashset / pyarrow filter as
+        :meth:`filter_arrow_table`, and unzips the survivors back into
+        a fresh ``{col: list}`` dict. Empty input or no surviving rows
+        return a dict with the same key set and empty lists.
+        """
+        import pyarrow as pa
+
+        if not data:
+            return {}
+        table = pa.table(data)
+        filtered = self.filter_arrow_table(table)
+        return {name: filtered.column(name).to_pylist() for name in filtered.schema.names}
+
+    def filter_iterable(
+        self, items: "Iterable[Any]",
+        *,
+        key: "Any | None" = None,
+    ) -> "Iterator[Any]":
+        """Filter an arbitrary iterable. Items default to dict-shaped
+        rows (``Mapping[str, Any]``); pass ``key=`` to project the
+        comparison target (e.g. ``key=attrgetter('payload')``) when
+        the predicate columns address a sub-shape of each item.
+        Yields each item the predicate accepts."""
+        from .backends.python import to_python
+
+        fn = to_python(self)
+        if key is None:
+            for item in items:
+                if fn(item):
+                    yield item
+            return
+        for item in items:
+            if fn(key(item)):
+                yield item
+
+    def filter(self, target: "Any") -> "Any":
+        """Generic dispatch — pick the right ``filter_*`` for *target*'s type.
+
+        Recognised shapes:
+
+        - :class:`pyarrow.Table` → :meth:`filter_arrow_table`.
+        - :class:`pyarrow.RecordBatch` → :meth:`filter_arrow_batch`.
+        - :class:`pandas.DataFrame` → :meth:`filter_pandas_frame`.
+        - :class:`polars.DataFrame` / :class:`polars.LazyFrame` →
+          :meth:`filter_polars_frame`.
+        - :class:`pyspark.sql.DataFrame` → :meth:`filter_spark_frame`.
+        - :class:`dict` of columns → :meth:`filter_pydict`.
+        - :class:`list` / :class:`tuple` → :meth:`filter_pylist`.
+        - Anything else iterable → :meth:`filter_iterable`.
+
+        Optional dependencies (polars / pandas / pyspark) are detected
+        by module-name sniffing on ``type(target)`` so this method
+        never imports them just to dispatch — the relevant
+        ``filter_*`` does the import when called.
+        """
+        import pyarrow as pa
+
+        if isinstance(target, pa.Table):
+            return self.filter_arrow_table(target)
+        if isinstance(target, pa.RecordBatch):
+            return self.filter_arrow_batch(target)
+        module = (type(target).__module__ or "").split(".", 1)[0]
+        if module == "pandas":
+            return self.filter_pandas_frame(target)
+        if module == "polars":
+            return self.filter_polars_frame(target)
+        if module == "pyspark":
+            return self.filter_spark_frame(target)
+        if isinstance(target, dict):
+            return self.filter_pydict(target)
+        if isinstance(target, (list, tuple)):
+            return self.filter_pylist(target)
+        return self.filter_iterable(target)
+
 
 def _to_inlist_clauses(
     predicate: "Predicate",

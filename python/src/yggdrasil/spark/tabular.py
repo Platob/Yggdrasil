@@ -521,7 +521,7 @@ class Dataset(Tabular[CastOptions]):
     def _filter(self, *, predicate: Any) -> "Dataset":
         if self._frame is None:
             return self
-        new_frame = self._frame.filter(predicate.to_pyspark())
+        new_frame = predicate.filter_spark_frame(self._frame)
         return type(self)(
             frame=new_frame,
             schema=self.schema,

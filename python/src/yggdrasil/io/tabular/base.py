@@ -388,7 +388,7 @@ def _default_filter(self_: "Tabular", *, predicate: Any) -> "Tabular":
     if spark_frame is not None:
         from yggdrasil.spark.tabular import Dataset
 
-        new_frame = spark_frame.filter(predicate.to_pyspark())
+        new_frame = predicate.filter_spark_frame(spark_frame)
         return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
 
     from yggdrasil.arrow.tabular import ArrowTabular
