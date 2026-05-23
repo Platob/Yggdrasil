@@ -16,14 +16,15 @@ be used standalone — open-source Spark, local PySpark, or composed into
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, ClassVar, Optional, Any, TypeVar, Callable, Iterator
+from typing import TYPE_CHECKING, ClassVar, Optional, Any, TypeVar, Callable
 
 from yggdrasil.data.executor import StatementExecutor
 from .statement import SparkPreparedStatement, SparkStatementResult, SparkStatementBatch
-from ..data.options import CastOptions
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
+
+    from .tabular import Dataset
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,9 @@ class SparkStatementExecutor(
     # Executor contract
     # -------------------------------------------------------------------------
 
-    def _submit_statement(self, statement: SparkPreparedStatement, start: bool = True) -> SparkStatementResult:
+    def _submit_statement(
+        self, statement: SparkPreparedStatement, start: bool = True
+    ) -> SparkStatementResult:
         """Build a :class:`SparkStatementResult` and optionally run it.
 
         Spark execution is synchronous; when *start* is True the result
@@ -196,7 +199,9 @@ class SparkStatementExecutor(
     # Convenience
     # -------------------------------------------------------------------------
 
-    def sql(self, text: str, *, row_limit: Optional[int] = None) -> SparkStatementResult:
+    def sql(
+        self, text: str, *, row_limit: Optional[int] = None
+    ) -> SparkStatementResult:
         """Shortcut: run a raw SQL string and return the terminal result.
 
         Equivalent to ``execute(SparkPreparedStatement(text, row_limit=row_limit))``
@@ -217,28 +222,34 @@ class SparkStatementExecutor(
         session = self.resolve_session() if session is None else session
         conf = dict(conf or {})
         return _scoped_spark_conf(session, conf)
-    
+
     def parallelize(
         self,
+        function: Callable[[IN], OUT],
         inputs: Any,
         *,
-        options: CastOptions | None = None,
-        transformer: Callable[[IN], OUT] | None = None,
-    ):
-        from .cast import any_to_spark_dataframe
+        schema: "Any | None" = None,
+        byte_size: int = 128 * 1024 * 1024,
+    ) -> "Dataset":
+        """Distribute *function* over *inputs* via Spark executors.
 
-        options = CastOptions.check(options)
-        df = any_to_spark_dataframe(
+        Resolves a :class:`SparkSession` through :meth:`resolve_session`,
+        then delegates to :meth:`Dataset.parallelize` — the session
+        resolution is the only value-add over calling ``Dataset.parallelize``
+        directly (it picks the right Databricks Connect / classic / local
+        session for the caller's context).
+        """
+        from .tabular import Dataset
+
+        session = self.resolve_session(create=True)
+        return Dataset.parallelize(
+            function,
             inputs,
-            options.with_target(options.source).with_source(None)
+            schema=schema,
+            spark_session=session,
+            byte_size=byte_size,
         )
 
-        def within_partitions(iterator: Iterator[IN]):
-            for item in iterator:
-                yield transformer(item) if transformer is not None else item
-
-        # TODO: complete
-        raise NotImplementedError
 
 class _scoped_spark_conf:
     """Context manager: stash & set Spark session conf keys; restore on exit."""
@@ -265,5 +276,7 @@ class _scoped_spark_conf:
                 else:
                     self._session.conf.set(k, prev)
             except Exception:
-                logger.debug("Failed to restore Spark conf %r; continuing.", k, exc_info=True)
+                logger.debug(
+                    "Failed to restore Spark conf %r; continuing.", k, exc_info=True
+                )
         return False

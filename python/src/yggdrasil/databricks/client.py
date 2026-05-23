@@ -4,14 +4,28 @@ import re
 import time
 from pathlib import Path
 from threading import RLock
-from typing import Optional, Any, Type, ClassVar, TypeVar, TYPE_CHECKING, Callable, Union
+from typing import (
+    Optional,
+    Any,
+    Type,
+    ClassVar,
+    TypeVar,
+    TYPE_CHECKING,
+    Callable,
+    Union,
+)
 
 from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.config import Config
 
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig, ExpiringDict, Singleton
+from yggdrasil.dataclasses import (
+    WaitingConfigArg,
+    WaitingConfig,
+    ExpiringDict,
+    Singleton,
+)
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.data.enums import MimeTypes, Scheme
 from yggdrasil.io.url import URL, URLBased
@@ -35,11 +49,7 @@ if TYPE_CHECKING:
     from .ai import DatabricksAI
     from .tags.service import EntityTags
 
-__all__ = [
-    "DatabricksClient",
-    "DatabricksService",
-    "DatabricksResource"
-]
+__all__ = ["DatabricksClient", "DatabricksService", "DatabricksResource"]
 
 LOGGER = logging.getLogger(__name__)
 CURRENT_BASE_CLIENT: Optional["DatabricksClient"] = None
@@ -281,7 +291,9 @@ class DatabricksClient(Singleton, URLBased):
     # Names of the kwargs ``__init__`` accepts. Materialised once so
     # downstream consumers (Workspace cloning, ``DatabricksService.check_client``,
     # the pickle serializer) don't have to walk the signature.
-    _INIT_NAMES: ClassVar[tuple[str, ...]] = tuple(_ENV_DEFAULTS) + tuple(_STATIC_DEFAULTS)
+    _INIT_NAMES: ClassVar[tuple[str, ...]] = tuple(_ENV_DEFAULTS) + tuple(
+        _STATIC_DEFAULTS
+    )
 
     # ----- transport policy -------------------------------------------------
 
@@ -290,18 +302,31 @@ class DatabricksClient(Singleton, URLBased):
     # providers bound to the *source* host's filesystem (token-cache.json,
     # ~/.databrickscfg, IMDS, gcloud DAC, etc). Sub-service caches hold
     # back-references to ``self`` and re-hydrate lazily via @property.
-    _TRANSIENT_STATE: ClassVar[frozenset[str]] = frozenset({
-        "_workspace_client",
-        "_account_client",
-        "_workspace_config",
-        "_account_config",
-        "_was_connected",
-        "_base_url_cached",
-        "_workspace", "_sql", "_entity_tags", "_warehouses", "_compute",
-        "_secrets", "_iam", "_tables", "_columns_svc",
-        "_catalogs", "_schemas", "_volumes", "_genie", "_filesystem",
-        "_jobs",
-    })
+    _TRANSIENT_STATE: ClassVar[frozenset[str]] = frozenset(
+        {
+            "_workspace_client",
+            "_account_client",
+            "_workspace_config",
+            "_account_config",
+            "_was_connected",
+            "_base_url_cached",
+            "_workspace",
+            "_sql",
+            "_entity_tags",
+            "_warehouses",
+            "_compute",
+            "_secrets",
+            "_iam",
+            "_tables",
+            "_columns_svc",
+            "_catalogs",
+            "_schemas",
+            "_volumes",
+            "_genie",
+            "_filesystem",
+            "_jobs",
+        }
+    )
 
     # Config attributes worth snapshotting for warm restart on another host.
     # PAT / OAuth secret fields already live on DatabricksClient itself and
@@ -647,8 +672,7 @@ class DatabricksClient(Singleton, URLBased):
             user, password = None, None
 
         return (
-            self.base_url
-            .with_scheme(scheme or type(self).scheme.value)
+            self.base_url.with_scheme(scheme or type(self).scheme.value)
             .with_query_items(query)
             .with_user_password(user=user, password=password)
         )
@@ -679,9 +703,7 @@ class DatabricksClient(Singleton, URLBased):
         for key, value in u.query_items():
             parsed[key] = value
 
-        host = parsed.pop("host", None) or (
-            f"https://{u.host}/" if u.host else None
-        )
+        host = parsed.pop("host", None) or (f"https://{u.host}/" if u.host else None)
         if not host:
             raise ValueError(
                 f"Host is required for {cls.__name__} URL: {u!r}. "
@@ -873,13 +895,25 @@ class DatabricksClient(Singleton, URLBased):
 
         has_pat = bool(self.token)
         has_oauth = bool(self.client_id and self.client_secret)
-        has_azure_sp = bool(self.azure_client_id and self.azure_client_secret and self.azure_tenant_id)
+        has_azure_sp = bool(
+            self.azure_client_id and self.azure_client_secret and self.azure_tenant_id
+        )
         has_azure_msi = self.azure_use_msi is True
         has_gcp = bool(self.google_credentials or self.google_service_account)
         has_profile = bool(self.profile)
         in_runtime = self.is_in_databricks_environment()
 
-        if not any((has_pat, has_oauth, has_azure_sp, has_azure_msi, has_gcp, has_profile, in_runtime)):
+        if not any(
+            (
+                has_pat,
+                has_oauth,
+                has_azure_sp,
+                has_azure_msi,
+                has_gcp,
+                has_profile,
+                in_runtime,
+            )
+        ):
             lines.append(
                 "  - no credentials found. Provide one of:\n"
                 "      * DATABRICKS_TOKEN (PAT)\n"
@@ -890,9 +924,13 @@ class DatabricksClient(Singleton, URLBased):
             )
 
         if self.client_id and not self.client_secret:
-            lines.append("  - client_id is set but client_secret is missing (OAuth requires both).")
+            lines.append(
+                "  - client_id is set but client_secret is missing (OAuth requires both)."
+            )
         if self.client_secret and not self.client_id:
-            lines.append("  - client_secret is set but client_id is missing (OAuth requires both).")
+            lines.append(
+                "  - client_secret is set but client_id is missing (OAuth requires both)."
+            )
 
         if self.auth_type:
             lines.append(
@@ -920,7 +958,9 @@ class DatabricksClient(Singleton, URLBased):
             if self.auth_type is not None:
                 raise
 
-            fallback_auth = "runtime" if self.is_in_databricks_environment() else "external-browser"
+            fallback_auth = (
+                "runtime" if self.is_in_databricks_environment() else "external-browser"
+            )
             object.__setattr__(self, "auth_type", fallback_auth)
 
             try:
@@ -934,13 +974,26 @@ class DatabricksClient(Singleton, URLBased):
 
         for key in (
             "auth_type",
-            "token", "client_id", "client_secret", "account_id", "token_audience",
-            "azure_workspace_resource_id", "azure_use_msi", "azure_client_secret",
-            "azure_client_id", "azure_tenant_id", "azure_environment",
-            "google_credentials", "google_service_account",
-            "http_timeout_seconds", "retry_timeout_seconds", "debug_truncate_bytes",
-            "debug_headers", "rate_limit",
-            "max_connection_pools", "max_connections_per_pool",
+            "token",
+            "client_id",
+            "client_secret",
+            "account_id",
+            "token_audience",
+            "azure_workspace_resource_id",
+            "azure_use_msi",
+            "azure_client_secret",
+            "azure_client_id",
+            "azure_tenant_id",
+            "azure_environment",
+            "google_credentials",
+            "google_service_account",
+            "http_timeout_seconds",
+            "retry_timeout_seconds",
+            "debug_truncate_bytes",
+            "debug_headers",
+            "rate_limit",
+            "max_connection_pools",
+            "max_connections_per_pool",
         ):
             value = getattr(config, key, None)
             if value is not None:
@@ -977,7 +1030,9 @@ class DatabricksClient(Singleton, URLBased):
 
     def workspace_client(self) -> DWC:
         if self._workspace_client is None:
-            object.__setattr__(self, "_workspace_client", DWC(config=self.workspace_config))
+            object.__setattr__(
+                self, "_workspace_client", DWC(config=self.workspace_config)
+            )
         return self._workspace_client
 
     def account_client(self) -> DAC:
@@ -1074,11 +1129,7 @@ class DatabricksClient(Singleton, URLBased):
         """
         if update:
             return {}
-        return {
-            k: self.safe_tag_value(v)
-            for k, v in self._owner_tag_pairs()
-            if v
-        }
+        return {k: self.safe_tag_value(v) for k, v in self._owner_tag_pairs() if v}
 
     def _owner_tag_pairs(self) -> list[tuple[str, Optional[str]]]:
         """Return the ``(key, value)`` tag pairs sourced from environment + client.
@@ -1098,11 +1149,13 @@ class DatabricksClient(Singleton, URLBased):
             ("ProductVersion", self.product_version),
         ]
         if info is not None:
-            pairs.extend([
-                ("Owner", info.email),
-                ("Hostname", info.hostname or None),
-                ("User", info.key or None),
-            ])
+            pairs.extend(
+                [
+                    ("Owner", info.email),
+                    ("Hostname", info.hostname or None),
+                    ("User", info.key or None),
+                ]
+            )
         return pairs
 
     def user_scoped_name(
@@ -1209,7 +1262,9 @@ class DatabricksClient(Singleton, URLBased):
     ) -> str:
         if catalog_name and schema_name:
             base_path = "/Volumes/%s/%s/%s" % (
-                catalog_name, schema_name, volume_name or "tmp"
+                catalog_name,
+                schema_name,
+                volume_name or "tmp",
             )
         else:
             base_path = "/Workspace/Shared/.ygg/tmp"
@@ -1300,7 +1355,12 @@ class DatabricksClient(Singleton, URLBased):
                 if path.name.startswith("tmp"):
                     parts = path.name.split("-")
 
-                    if len(parts) > 2 and parts[0] == "tmp" and parts[1].isdigit() and parts[2].isdigit():
+                    if (
+                        len(parts) > 2
+                        and parts[0] == "tmp"
+                        and parts[1].isdigit()
+                        and parts[2].isdigit()
+                    ):
                         end = int(parts[2])
 
                         if end and time.time() > end:
@@ -1309,9 +1369,9 @@ class DatabricksClient(Singleton, URLBased):
             LOGGER.info("Cleaned temp path %s", base_path)
         else:
             (
-                Job
-                .make(self.clean_tmp_folder, raise_error=raise_error, base_path=base_path)
-                .fire_and_forget()
+                Job.make(
+                    self.clean_tmp_folder, raise_error=raise_error, base_path=base_path
+                ).fire_and_forget()
             )
 
         return self
@@ -1359,6 +1419,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .workspaces import Workspace
+
         cached = Workspace(**{name: getattr(self, name) for name in self._INIT_NAMES})
         self.__dict__["_workspace"] = cached
         return cached
@@ -1369,9 +1430,44 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .sql.engine import SQLEngine
+
         cached = SQLEngine(client=self)
         self.__dict__["_sql"] = cached
         return cached
+
+    def dataset(
+        self,
+        sql_or_table: str,
+        *,
+        schema: Any = None,
+    ):
+        """Return a :class:`Dataset` from a SQL query or table name.
+
+        Pass-through to :meth:`SQLEngine.dataset` so scripting callers
+        can write ``dbc.dataset("SELECT ...")`` without an extra
+        ``.sql`` hop.
+        """
+        return self.sql.dataset(sql_or_table, schema=schema)
+
+    def parallelize(
+        self,
+        function: "Callable",
+        inputs: "Any",
+        *,
+        schema: Any = None,
+        byte_size: int = 128 * 1024 * 1024,
+    ):
+        """Distribute *function* over *inputs* via Spark executors.
+
+        Pass-through to :meth:`SQLEngine.parallelize` so scripting
+        callers can write ``dbc.parallelize(fn, items)`` directly.
+        """
+        return self.sql.parallelize(
+            function,
+            inputs,
+            schema=schema,
+            byte_size=byte_size,
+        )
 
     @property
     def entity_tags(self) -> "EntityTags":
@@ -1379,6 +1475,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .tags.service import EntityTags
+
         cached = EntityTags(client=self)
         self.__dict__["_entity_tags"] = cached
         return cached
@@ -1389,6 +1486,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from yggdrasil.databricks.warehouse.service import Warehouses
+
         cached = Warehouses(client=self)
         self.__dict__["_warehouses"] = cached
         return cached
@@ -1400,6 +1498,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .compute.service import Compute
+
         cached = Compute(client=self)
         self.__dict__["_compute"] = cached
         return cached
@@ -1411,6 +1510,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .secrets.service import Secrets
+
         cached = Secrets(client=self)
         self.__dict__["_secrets"] = cached
         return cached
@@ -1421,6 +1521,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .iam import IAM
+
         cached = IAM(client=self)
         self.__dict__["_iam"] = cached
         return cached
@@ -1432,6 +1533,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .table.tables import Tables
+
         cached = Tables(client=self)
         self.__dict__["_tables"] = cached
         return cached
@@ -1450,6 +1552,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .column.columns import Columns
+
         cached = Columns(client=self)
         self.__dict__["_columns_svc"] = cached
         return cached
@@ -1468,6 +1571,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .catalog.catalogs import Catalogs
+
         cached = Catalogs(client=self)
         self.__dict__["_catalogs"] = cached
         return cached
@@ -1486,6 +1590,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .schema.schemas import Schemas
+
         cached = Schemas(client=self)
         self.__dict__["_schemas"] = cached
         return cached
@@ -1504,6 +1609,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .volume.volumes import Volumes
+
         cached = Volumes(client=self)
         self.__dict__["_volumes"] = cached
         return cached
@@ -1515,6 +1621,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .jobs.service import Jobs
+
         cached = Jobs(client=self)
         self.__dict__["_jobs"] = cached
         return cached
@@ -1526,6 +1633,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .genie import Genie
+
         cached = Genie(client=self)
         self.__dict__["_genie"] = cached
         return cached
@@ -1545,6 +1653,7 @@ class DatabricksClient(Singleton, URLBased):
         if cached is not None:
             return cached
         from .ai import DatabricksAI
+
         cached = DatabricksAI(client=self)
         self.__dict__["_ai"] = cached
         return cached
@@ -1655,12 +1764,14 @@ class DatabricksClient(Singleton, URLBased):
         """
         try:
             from pyspark.sql import SparkSession  # noqa
+
             active = SparkSession.getActiveSession()
         except Exception:
             active = None
         if active is not None:
             LOGGER.debug(
-                "Reusing active Spark Connect session for %r", self,
+                "Reusing active Spark Connect session for %r",
+                self,
             )
             return self._bind_spark_session(active)
 
@@ -1673,7 +1784,9 @@ class DatabricksClient(Singleton, URLBased):
         mode = "serverless" if self.is_serverless_compute else "classic"
         LOGGER.debug(
             "Resolving Spark Connect dependencies for %r (mode=%s, deps=%r)",
-            self, mode, deps,
+            self,
+            mode,
+            deps,
         )
         registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
         specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)
@@ -1681,7 +1794,11 @@ class DatabricksClient(Singleton, URLBased):
         LOGGER.debug(
             "Creating Spark Connect session %r (mode=%s, cluster_id=%r, "
             "serverless_compute_id=%r, install_specs=%d)",
-            self, mode, self.cluster_id, self.serverless_compute_id, len(specs),
+            self,
+            mode,
+            self.cluster_id,
+            self.serverless_compute_id,
+            len(specs),
         )
         builder = DatabricksSession.builder.sdkConfig(self.workspace_config)
 
@@ -1696,21 +1813,23 @@ class DatabricksClient(Singleton, URLBased):
             # ``addArtifacts(pyfile=True)`` instead.
             session = builder.getOrCreate()
             local_paths = [
-                spec[len("local:"):]
-                for spec in specs
-                if spec.startswith("local:")
+                spec[len("local:") :] for spec in specs if spec.startswith("local:")
             ]
             if local_paths:
                 LOGGER.debug(
                     "Attaching wheel artifacts to Spark Connect session %r "
                     "(count=%d, paths=%r)",
-                    self, len(local_paths), local_paths,
+                    self,
+                    len(local_paths),
+                    local_paths,
                 )
                 session.addArtifacts(*local_paths, pyfile=True)
 
         LOGGER.info(
             "Created Spark Connect session %r (mode=%s, install_specs=%d)",
-            self, mode, len(specs),
+            self,
+            mode,
+            len(specs),
         )
         return self._bind_spark_session(session)
 
@@ -1756,9 +1875,7 @@ class DatabricksClient(Singleton, URLBased):
             registry.client = self
             return registry
 
-        local_cache = (
-            Path(os.fspath(cache_dir)) if cache_dir is not None else None
-        )
+        local_cache = Path(os.fspath(cache_dir)) if cache_dir is not None else None
         return WorkspacePyPIRegistry(
             client=self,
             base_path=registry,
@@ -1782,6 +1899,7 @@ class DatabricksClient(Singleton, URLBased):
             return None
 
         from databricks.connect import DatabricksEnv
+
         env = DatabricksEnv()
         env = env.withDependencies(list(install_specs))
         return env
@@ -1792,7 +1910,8 @@ DATABRICKS_CLIENT_INIT_NAMES = frozenset(DatabricksClient._INIT_NAMES)
 # credentials / host that already ride in the URL host + userinfo. Computed
 # once at import so the hot path doesn't walk the init-name tuple per call.
 _TO_URL_QUERY_KEYS: tuple[str, ...] = tuple(
-    name for name in DatabricksClient._INIT_NAMES
+    name
+    for name in DatabricksClient._INIT_NAMES
     if name not in ("host", "token", "client_id", "client_secret")
 )
 CHECKED_TMP_WORKSPACES: ExpiringDict[str, set[str]] = ExpiringDict()
