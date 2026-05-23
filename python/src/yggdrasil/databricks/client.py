@@ -1464,8 +1464,8 @@ class DatabricksClient(Singleton, URLBased):
 
     def parallelize(
         self,
-        inputs: "Callable | Any",
-        inputs_or_schema: "Any | None" = None,
+        inputs: "Any",
+        function: "Callable | None" = None,
         *,
         schema: Any = None,
         byte_size: int = 128 * 1024 * 1024,
@@ -1476,7 +1476,7 @@ class DatabricksClient(Singleton, URLBased):
 
             dbc = DatabricksClient()
             # With function
-            results = dbc.parallelize(fetch, urls, schema=output_schema)
+            results = dbc.parallelize(urls, fetch, schema=output_schema)
             # Without function — just wrap inputs as a Dataset
             ds = dbc.parallelize(rows, schema=output_schema)
         """
@@ -1484,7 +1484,7 @@ class DatabricksClient(Singleton, URLBased):
 
         return Dataset.parallelize(
             inputs,
-            inputs_or_schema,
+            function,
             schema=schema,
             spark_session=self.spark(),
             byte_size=byte_size,

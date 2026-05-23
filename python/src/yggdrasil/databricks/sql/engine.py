@@ -927,8 +927,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
     def parallelize(
         self,
-        inputs: "Callable | Iterable",
-        inputs_or_schema: "Iterable | None" = None,
+        inputs: "Iterable",
+        function: "Callable | None" = None,
         *,
         schema: Any = None,
         byte_size: int = 128 * 1024 * 1024,
@@ -940,7 +940,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         session = self.spark.resolve_session(create=True)
         return Dataset.parallelize(
             inputs,
-            inputs_or_schema,
+            function,
             schema=schema,
             spark_session=session,
             byte_size=byte_size,

@@ -719,8 +719,8 @@ class Dataset(Tabular[CastOptions]):
     @classmethod
     def parallelize(
         cls,
-        inputs: "Callable[..., Any] | Iterable[Any]",
-        inputs_or_schema: "Iterable[Any] | Schema | None" = None,
+        inputs: "Iterable[Any]",
+        function: "Callable[..., Any] | None" = None,
         schema: "Schema | None" = None,
         *,
         spark_session: Optional["SparkSession"] = None,
@@ -732,7 +732,7 @@ class Dataset(Tabular[CastOptions]):
 
         Two call shapes:
 
-        * ``parallelize(function, inputs, schema=...)`` — apply
+        * ``parallelize(inputs, function, schema=...)`` — apply
           *function* to each element of *inputs* on Spark executors.
         * ``parallelize(inputs, schema=...)`` — wrap *inputs* as a
           :class:`Dataset` (delegates to :meth:`from_iterable`).
@@ -746,17 +746,13 @@ class Dataset(Tabular[CastOptions]):
         of pickled outputs; ``schema=<Schema>`` casts outputs and
         returns a typed frame.
         """
-        if not callable(inputs):
-            if inputs_or_schema is not None and schema is None:
-                schema = inputs_or_schema  # type: ignore[assignment]
+        if function is None:
             return cls.from_iterable(
                 inputs,
                 schema=schema,
                 spark_session=spark_session,
                 byte_size=byte_size,
             )
-        function: Callable[..., Any] = inputs  # type: ignore[assignment]
-        inputs = inputs_or_schema  # type: ignore[assignment]
         from yggdrasil.environ import PyEnv
         from yggdrasil.data.schema import Schema as _Schema
         from yggdrasil.dataclasses.safe_function import build_row_invoker
