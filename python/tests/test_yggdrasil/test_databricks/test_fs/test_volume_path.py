@@ -1,4 +1,5 @@
 """Mock-driven tests for :class:`VolumePath`."""
+
 from __future__ import annotations
 
 import io
@@ -38,6 +39,7 @@ def reset_volume_credentials_refresher_singletons():
     # would survive into the next, masking refresher behavior the new
     # test is trying to assert.
     from yggdrasil.databricks.fs.volume_path import VolumeCredentialsRefresher
+
     VolumeCredentialsRefresher._INSTANCES.clear()
     yield
     VolumeCredentialsRefresher._INSTANCES.clear()
@@ -50,6 +52,7 @@ def reset_volume_info_cache():
     # cache would short-circuit the SDK call this case is trying to
     # observe.
     from yggdrasil.databricks.volume.volume import Volume
+
     Volume._INSTANCES.clear()
     yield
     Volume._INSTANCES.clear()
@@ -103,7 +106,8 @@ class TestConstruction:
 
     def test_legacy_posix_string(self, workspace, client, service) -> None:
         p = VolumePath(
-            "/Volumes/cat/sch/vol/data.parquet", service=service,
+            "/Volumes/cat/sch/vol/data.parquet",
+            service=service,
         )
         assert p.full_path() == "/Volumes/cat/sch/vol/data.parquet"
         assert p.api_path == "/Volumes/cat/sch/vol/data.parquet"
@@ -164,7 +168,9 @@ class TestStat:
         assert p._stat_uncached().kind is IOKind.DIRECTORY
         workspace.files.get_metadata.assert_not_called()
 
-    def test_file_fallback_when_leaf_has_no_extension(self, workspace, client, service) -> None:
+    def test_file_fallback_when_leaf_has_no_extension(
+        self, workspace, client, service
+    ) -> None:
         # Even a bare-leaf path can be a file (extensionless data
         # dumps). When the directory probe NotFounds, fall back to
         # ``get_metadata``.
@@ -175,7 +181,9 @@ class TestStat:
         assert s.kind is IOKind.FILE
         assert s.size == 7
 
-    def test_directory_fallback_when_leaf_has_extension(self, workspace, client, service) -> None:
+    def test_directory_fallback_when_leaf_has_extension(
+        self, workspace, client, service
+    ) -> None:
         # ``foo.parquet`` looks like a file but could legitimately be a
         # directory; when ``get_metadata`` NotFounds we fall back to
         # ``get_directory_metadata``.
@@ -192,7 +200,10 @@ class TestStat:
         assert p._stat_uncached().kind is IOKind.MISSING
 
     def test_implicit_directory_visible_through_listing(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         # ``files.upload("/.../parent/file.bin")`` against a parent
         # the caller never explicitly mkdir'd silently materialises
@@ -204,12 +215,14 @@ class TestStat:
         # raise against a directory the caller just wrote into.
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
-        workspace.files.list_directory_contents.return_value = iter([
-            SimpleNamespace(
-                path="/Volumes/c/s/v/parent/file.bin",
-                is_directory=False,
-            ),
-        ])
+        workspace.files.list_directory_contents.return_value = iter(
+            [
+                SimpleNamespace(
+                    path="/Volumes/c/s/v/parent/file.bin",
+                    is_directory=False,
+                ),
+            ]
+        )
         p = VolumePath("/Volumes/c/s/v/parent", service=service)
         assert p._stat_uncached().kind is IOKind.DIRECTORY
 
@@ -244,7 +257,9 @@ class TestRead:
         workspace.files.get_metadata.assert_not_called()
         workspace.files.download.assert_called_once()
 
-    def test_parquet_read_arrow_table_one_sdk_call(self, workspace, client, service) -> None:
+    def test_parquet_read_arrow_table_one_sdk_call(
+        self, workspace, client, service
+    ) -> None:
         # The tabular IO ↔ remote path interaction is the headline
         # scenario: ``ParquetFile(VolumePath).read_arrow_table()`` must
         # bottom out in a single ``files.download`` call. Earlier
@@ -295,7 +310,9 @@ class TestWrite:
         assert isinstance(sent, io.BytesIO)
         assert sent.getvalue() == b"abcdef"
 
-    def test_stream_input_routes_through_upload(self, workspace, client, service) -> None:
+    def test_stream_input_routes_through_upload(
+        self, workspace, client, service
+    ) -> None:
         """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
         :class:`IO[bytes]` and lands on one ``files.upload`` call."""
         import io
@@ -314,7 +331,9 @@ class TestWrite:
         assert isinstance(kwargs["contents"], _IO)
         assert workspace.files.upload.call_count == 1
 
-    def test_stream_input_seeks_to_origin_on_retry(self, workspace, client, service) -> None:
+    def test_stream_input_seeks_to_origin_on_retry(
+        self, workspace, client, service
+    ) -> None:
         """Transient ``files.upload`` failures must rewind a stream input."""
         import io
         from unittest.mock import patch
@@ -357,7 +376,10 @@ class TestWrite:
         assert sent.getvalue() == b"aXXde"
 
     def test_open_wb_multi_page_payload_uploads_once(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         # ``with vp.open("wb") as fh: fh.write(...)`` must collapse to
         # a single ``files.upload`` even when the payload spans
@@ -374,7 +396,9 @@ class TestWrite:
         page_size = 1024
         payload = b"A" * (page_size * 5 + 13)  # 5+ pages, off-boundary tail
         p = VolumePath(
-            "/Volumes/c/s/v/x.bin", service=service, buffersize=page_size,
+            "/Volumes/c/s/v/x.bin",
+            service=service,
+            buffersize=page_size,
         )
         with p.open("wb") as fh:
             fh.write(payload)
@@ -384,7 +408,10 @@ class TestWrite:
         assert sent.getvalue() == payload
 
     def test_open_wb_many_small_writes_uploads_once(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         # Repeated small writes inside one ``open("wb")`` accumulate in
         # the page cache and commit on close as one upload — no
@@ -397,7 +424,9 @@ class TestWrite:
         chunk = b"X" * 200
         n_chunks = 50  # 10_000 bytes total, ~10 pages
         p = VolumePath(
-            "/Volumes/c/s/v/x.bin", service=service, buffersize=page_size,
+            "/Volumes/c/s/v/x.bin",
+            service=service,
+            buffersize=page_size,
         )
         with p.open("wb") as fh:
             for _ in range(n_chunks):
@@ -407,11 +436,13 @@ class TestWrite:
         assert sent.getvalue() == chunk * n_chunks
 
 
-class TestWriteFullBytes:
+class TestWriteAll:
 
-    def test_single_upload_no_stat_no_truncate(self, workspace, client, service) -> None:
+    def test_single_upload_no_stat_no_truncate(
+        self, workspace, client, service
+    ) -> None:
         p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
-        p.write_full_bytes(b"hello-world")
+        p.write_all(b"hello-world")
 
         workspace.files.upload.assert_called_once()
         kwargs = workspace.files.upload.call_args.kwargs
@@ -426,20 +457,20 @@ class TestWriteFullBytes:
     def test_stream_input(self, workspace, client, service) -> None:
         p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
         stream = io.BytesIO(b"streamed")
-        p.write_full_bytes(stream)
+        p.write_all(stream)
 
         workspace.files.upload.assert_called_once()
         workspace.files.get_metadata.assert_not_called()
 
     def test_memoryview_input(self, workspace, client, service) -> None:
         p = VolumePath("/Volumes/c/s/v/data.bin", service=service)
-        p.write_full_bytes(memoryview(b"view"))
+        p.write_all(memoryview(b"view"))
 
         sent = workspace.files.upload.call_args.kwargs["contents"]
         assert isinstance(sent, io.BytesIO)
         assert sent.getvalue() == b"view"
 
-    def test_parquet_via_write_full_bytes(self, workspace, client, service) -> None:
+    def test_parquet_roundtrip(self, workspace, client, service) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
@@ -449,7 +480,7 @@ class TestWriteFullBytes:
         parquet_bytes = sink.getvalue()
 
         p = VolumePath("/Volumes/c/s/v/out.parquet", service=service)
-        n = p.write_full_bytes(parquet_bytes)
+        n = p.write_all(parquet_bytes)
 
         assert n == len(parquet_bytes)
         workspace.files.upload.assert_called_once()
@@ -471,7 +502,7 @@ class TestWriteFullBytes:
 
         workspace.files.upload.side_effect = upload
         p = VolumePath("/Volumes/cat/sch/vol/sub/x.parquet", service=service)
-        p.write_full_bytes(b"data")
+        p.write_all(b"data")
 
         workspace.files.create_directory.assert_called_once_with(
             "/Volumes/cat/sch/vol/sub",
@@ -492,7 +523,7 @@ class TestWriteFullBytes:
         workspace.files.get_metadata.side_effect = NotFound()
 
         p2 = VolumePath("/Volumes/c/s/v/b.bin", service=service)
-        p2.write_full_bytes(b"via-write-full")
+        p2.write_all(b"via-write-full")
         wfb_upload_count = workspace.files.upload.call_count
         wfb_meta_count = workspace.files.get_metadata.call_count
 
@@ -527,10 +558,12 @@ class TestListing:
         # ``/Volumes/<cat>/<sch>/<vol>/...`` paths; the catalog
         # segment must round-trip through child construction.
         workspace.files.list_directory_contents.return_value = [
-            SimpleNamespace(path="/Volumes/trading/sch/vol/folder/a.bin",
-                            is_directory=False),
-            SimpleNamespace(path="/Volumes/trading/sch/vol/folder/sub",
-                            is_directory=True),
+            SimpleNamespace(
+                path="/Volumes/trading/sch/vol/folder/a.bin", is_directory=False
+            ),
+            SimpleNamespace(
+                path="/Volumes/trading/sch/vol/folder/sub", is_directory=True
+            ),
         ]
         p = VolumePath("/Volumes/trading/sch/vol/folder", service=service)
         children = list(p.iterdir())
@@ -541,12 +574,16 @@ class TestListing:
         assert all(isinstance(c, VolumePath) for c in children)
 
     def test_iterdir_does_not_persist_children_as_singletons(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         # ``_ls`` builds children with ``singleton_ttl=False`` so an
         # iterdir-style hot loop doesn't pin thousands of short-lived
         # paths in the bounded ``DatabricksPath._INSTANCES`` cache.
         from yggdrasil.databricks.path import DatabricksPath
+
         DatabricksPath._INSTANCES.clear()
         cache_size_before = len(list(DatabricksPath._INSTANCES.keys()))
 
@@ -570,9 +607,9 @@ class TestListing:
         # explicitly opt out.
         keys_after = list(DatabricksPath._INSTANCES.keys())
         for k in keys_after:
-            assert "ephemeral.bin" not in repr(k), (
-                f"listing children should not enter _INSTANCES, found {k!r}"
-            )
+            assert "ephemeral.bin" not in repr(
+                k
+            ), f"listing children should not enter _INSTANCES, found {k!r}"
 
     def test_iterdir_seeds_child_stat(self, workspace, client, service) -> None:
         # ``list_directory_contents`` already carries ``is_directory``
@@ -609,7 +646,9 @@ class TestVolumeAutoCreate:
     (``create_directory`` on the parent) and only blind-create the
     catalog / schema / managed volume when that fails NotFound."""
 
-    def test_only_subdir_missing_skips_volume_create(self, workspace, client, service) -> None:
+    def test_only_subdir_missing_skips_volume_create(
+        self, workspace, client, service
+    ) -> None:
         # Upload fails because parent dir missing; one parent
         # ``create_directory`` is enough — no catalog/schema/volume
         # creates should happen.
@@ -623,7 +662,8 @@ class TestVolumeAutoCreate:
 
         workspace.files.upload.side_effect = upload
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
+            "/Volumes/cat/sch/vol/sub/file.bin",
+            service=service,
         )
         p.write_bytes(b"payload")
 
@@ -635,7 +675,9 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.assert_not_called()
         assert workspace.files.upload.call_count == 2
 
-    def test_volume_missing_only_creates_volume(self, workspace, client, service) -> None:
+    def test_volume_missing_only_creates_volume(
+        self, workspace, client, service
+    ) -> None:
         # Common case: catalog + schema already exist, only the volume
         # is missing. The upload's ``NotFound("Volume … does not exist")``
         # message names the volume directly, so the recovery path skips
@@ -653,7 +695,8 @@ class TestVolumeAutoCreate:
         workspace.files.upload.side_effect = upload
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
+            "/Volumes/cat/sch/vol/sub/file.bin",
+            service=service,
         )
         p.write_bytes(b"payload")
 
@@ -677,7 +720,10 @@ class TestVolumeAutoCreate:
         assert getattr(vt, "name", str(vt)).upper() == "MANAGED"
 
     def test_generic_not_found_still_probes_create_directory(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         # When the upload error doesn't name the volume (just a generic
         # ``"does not exist"``), the recovery path still attempts the
@@ -704,7 +750,8 @@ class TestVolumeAutoCreate:
         workspace.files.create_directory.side_effect = create_directory
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
+            "/Volumes/cat/sch/vol/sub/file.bin",
+            service=service,
         )
         p.write_bytes(b"payload")
 
@@ -714,7 +761,10 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.assert_called_once()
 
     def test_schema_missing_creates_schema_then_volume(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         # Schema is also missing — first ``volumes.create`` fails
         # NotFound, then ``schemas.create`` succeeds, then volume create
@@ -738,17 +788,21 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.side_effect = volumes_create
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
+            "/Volumes/cat/sch/vol/sub/file.bin",
+            service=service,
         )
         p.write_bytes(b"payload")
 
         workspace.catalogs.create.assert_not_called()
         workspace.schemas.create.assert_called_once_with(
-            name="sch", catalog_name="cat",
+            name="sch",
+            catalog_name="cat",
         )
         assert workspace.volumes.create.call_count == 2
 
-    def test_catalog_missing_creates_full_chain(self, workspace, client, service) -> None:
+    def test_catalog_missing_creates_full_chain(
+        self, workspace, client, service
+    ) -> None:
         # Both schema and catalog are missing — volume.create then
         # schema.create both fail NotFound, falling through to catalog
         # → schema → volume creation.
@@ -779,7 +833,8 @@ class TestVolumeAutoCreate:
         workspace.schemas.create.side_effect = schemas_create
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
+            "/Volumes/cat/sch/vol/sub/file.bin",
+            service=service,
         )
         p.write_bytes(b"payload")
 
@@ -805,7 +860,8 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.side_effect = AlreadyExists()
 
         p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", service=service,
+            "/Volumes/cat/sch/vol/sub/file.bin",
+            service=service,
         )
         p.write_bytes(b"payload")  # should not raise
 
@@ -813,7 +869,9 @@ class TestVolumeAutoCreate:
         workspace.catalogs.create.assert_not_called()
         workspace.schemas.create.assert_not_called()
 
-    def test_propagates_when_not_a_volume_path(self, workspace, client, service) -> None:
+    def test_propagates_when_not_a_volume_path(
+        self, workspace, client, service
+    ) -> None:
         # Path too shallow to address a volume — auto-create can't help,
         # so the original error must surface.
         workspace.files.upload.side_effect = NotFound("does not exist")
@@ -845,7 +903,9 @@ class TestRetryPolicy:
         # InternalError-then-success sequence through
         # ``get_metadata`` rather than ``get_directory_metadata``.
         p = VolumePath(
-            "/Volumes/c/s/v/x.bin", service=service, retry_sleep=spy,
+            "/Volumes/c/s/v/x.bin",
+            service=service,
+            retry_sleep=spy,
         )
         assert p.size == 3
         assert recorded == [1.0, 1.0]
@@ -883,6 +943,7 @@ def _aws_creds_response(
     session_token: str = "session-test",
 ):
     import datetime as _dt
+
     return SimpleNamespace(
         aws_temp_credentials=SimpleNamespace(
             access_key_id=access_key_id,
@@ -901,7 +962,9 @@ def _aws_creds_response(
 
 class TestVolumeInfoCaching:
 
-    def test_volume_info_caches_after_first_read(self, workspace, client, service) -> None:
+    def test_volume_info_caches_after_first_read(
+        self, workspace, client, service
+    ) -> None:
         workspace.volumes.read.return_value = _volume_info()
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         first = p.volume_info()
@@ -909,14 +972,18 @@ class TestVolumeInfoCaching:
         assert first is second
         workspace.volumes.read.assert_called_once_with("cat.sch.vol")
 
-    def test_volume_info_refresh_forces_reread(self, workspace, client, service) -> None:
+    def test_volume_info_refresh_forces_reread(
+        self, workspace, client, service
+    ) -> None:
         workspace.volumes.read.side_effect = [_volume_info(), _volume_info()]
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         p.volume_info()
         p.volume_info(refresh=True)
         assert workspace.volumes.read.call_count == 2
 
-    def test_storage_location_resolves_from_volume_info(self, workspace, client, service) -> None:
+    def test_storage_location_resolves_from_volume_info(
+        self, workspace, client, service
+    ) -> None:
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://bkt/__unitystorage/c/s/v",
         )
@@ -924,7 +991,10 @@ class TestVolumeInfoCaching:
         assert p.storage_location() == "s3://bkt/__unitystorage/c/s/v"
 
     def test_storage_location_caches_independently_of_volume_info(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         workspace.volumes.read.return_value = _volume_info()
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
@@ -946,7 +1016,9 @@ class TestTemporaryCredentials:
 
     def test_vends_via_volume_id(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-42")
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
@@ -964,9 +1036,13 @@ class TestTemporaryCredentials:
         assert kwargs["volume_id"] == "vid-42"
         assert _op_token(kwargs["operation"]) == "READ_VOLUME"
 
-    def test_write_operation_maps_to_write_volume(self, workspace, client, service) -> None:
+    def test_write_operation_maps_to_write_volume(
+        self, workspace, client, service
+    ) -> None:
         workspace.volumes.read.return_value = _volume_info()
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         p.temporary_credentials(mode="overwrite")
@@ -988,11 +1064,17 @@ class TestTemporaryCredentials:
 class TestCredentialsRefresherSingleton:
 
     def test_same_volume_collapses_to_one_provider(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         from yggdrasil.databricks.fs.volume_path import VolumeCredentialsRefresher
+
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         # Two distinct VolumePath instances pointing at the same volume.
@@ -1004,10 +1086,15 @@ class TestCredentialsRefresherSingleton:
         assert r1 is r2
 
     def test_get_credentials_per_mode_hits_right_operation(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
@@ -1018,27 +1105,38 @@ class TestCredentialsRefresherSingleton:
         assert "READ_VOLUME" in ops and "WRITE_VOLUME" in ops
 
     def test_different_volume_id_yields_different_provider(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         workspace.volumes.read.return_value = _volume_info(
-            name="v1", volume_id="vid-A",
+            name="v1",
+            volume_id="vid-A",
         )
         p1 = VolumePath("/Volumes/cat/sch/v1/x", service=service)
         r1 = p1.credentials_refresher()
 
         workspace.volumes.read.return_value = _volume_info(
-            name="v2", volume_id="vid-B",
+            name="v2",
+            volume_id="vid-B",
         )
         p2 = VolumePath("/Volumes/cat/sch/v2/x", service=service)
         r2 = p2.credentials_refresher()
         assert r1 is not r2
 
-    def test_aws_client_shared_through_provider(self, workspace, client, service) -> None:
+    def test_aws_client_shared_through_provider(
+        self, workspace, client, service
+    ) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p1 = VolumePath("/Volumes/cat/sch/vol/x", service=service)
@@ -1048,9 +1146,13 @@ class TestCredentialsRefresherSingleton:
         c2 = p2.aws(mode="read", region="us-east-1")
         assert c1 is c2
 
-    def test_aws_client_cached_per_mode_and_region(self, workspace, client, service) -> None:
+    def test_aws_client_cached_per_mode_and_region(
+        self, workspace, client, service
+    ) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
@@ -1063,9 +1165,13 @@ class TestCredentialsRefresherSingleton:
         assert c_us is not c_eu
         assert c_us is not c_us_write
 
-    def test_workspace_rebound_on_repeat_construction(self, workspace, client, service) -> None:
+    def test_workspace_rebound_on_repeat_construction(
+        self, workspace, client, service
+    ) -> None:
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         # First binding uses ``workspace`` (fixture-provided).
@@ -1079,7 +1185,9 @@ class TestCredentialsRefresherSingleton:
         client_b = MagicMock()
         workspace_b = client_b.workspace_client.return_value
         workspace_b.volumes.read.return_value = _volume_info(volume_id="vid-A")
-        workspace_b.temporary_volume_credentials.generate_temporary_volume_credentials.return_value = _aws_creds_response()
+        workspace_b.temporary_volume_credentials.generate_temporary_volume_credentials.return_value = (
+            _aws_creds_response()
+        )
         service_b = MagicMock(spec=Volumes)
         service_b.client = client_b
         p2 = VolumePath("/Volumes/cat/sch/vol/y", service=service_b)
@@ -1087,10 +1195,15 @@ class TestCredentialsRefresherSingleton:
         assert r2 is r1
         assert r2.workspace is workspace_b
 
-    def test_pickle_collapses_to_live_singleton(self, workspace, client, service) -> None:
+    def test_pickle_collapses_to_live_singleton(
+        self, workspace, client, service
+    ) -> None:
         import pickle
+
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
@@ -1100,12 +1213,18 @@ class TestCredentialsRefresherSingleton:
         loaded = pickle.loads(pickle.dumps(r))
         assert loaded is r
 
-    def test_get_credentials_returns_canonical_credentials(self, workspace, client, service) -> None:
+    def test_get_credentials_returns_canonical_credentials(
+        self, workspace, client, service
+    ) -> None:
         from yggdrasil.aws.config import AwsCredentials
+
         workspace.volumes.read.return_value = _volume_info(volume_id="vid-A")
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response(
-            access_key_id="AKIA-direct", secret_access_key="secret-direct",
+            access_key_id="AKIA-direct",
+            secret_access_key="secret-direct",
         )
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
@@ -1118,7 +1237,9 @@ class TestCredentialsRefresherSingleton:
 
 class TestVolumeInfoNotFoundRecovery:
 
-    def test_creates_volume_on_not_found_then_re_reads(self, workspace, client, service) -> None:
+    def test_creates_volume_on_not_found_then_re_reads(
+        self, workspace, client, service
+    ) -> None:
         # First ``volumes.read`` raises NotFound; the recovery path
         first_call = {"done": False}
 
@@ -1144,7 +1265,9 @@ class TestVolumeInfoNotFoundRecovery:
         assert create_kwargs["schema_name"] == "sch"
         assert create_kwargs["name"] == "vol"
 
-    def test_recovery_also_creates_missing_schema(self, workspace, client, service) -> None:
+    def test_recovery_also_creates_missing_schema(
+        self, workspace, client, service
+    ) -> None:
         read_outcomes = [NotFound("missing"), _volume_info(volume_id="vid")]
 
         def read(full_name):
@@ -1172,7 +1295,9 @@ class TestVolumeInfoNotFoundRecovery:
         assert info.volume_id == "vid"
         workspace.schemas.create.assert_called_once()
 
-    def test_propagates_other_errors_unchanged(self, workspace, client, service) -> None:
+    def test_propagates_other_errors_unchanged(
+        self, workspace, client, service
+    ) -> None:
         # PermissionDenied is deterministic — the recovery path must
         # not swallow it.
         workspace.volumes.read.side_effect = PermissionDenied("nope")
@@ -1182,7 +1307,10 @@ class TestVolumeInfoNotFoundRecovery:
         workspace.volumes.create.assert_not_called()
 
     def test_temporary_credentials_inherits_create_on_not_found(
-        self, workspace, client, service,
+        self,
+        workspace,
+        client,
+        service,
     ) -> None:
         # ``temporary_credentials`` calls ``volume_info`` first, so
         # the create-on-NotFound flow surfaces transparently — the
@@ -1200,7 +1328,9 @@ class TestVolumeInfoNotFoundRecovery:
         workspace.volumes.create.return_value = SimpleNamespace(
             volume_id="vid-after-create",
         )
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
@@ -1220,10 +1350,13 @@ class TestStoragePath:
 
     def test_returns_s3_path_for_s3_volume(self, workspace, client, service) -> None:
         from yggdrasil.aws.fs.path import S3Path
+
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://my-bucket/__unitystorage/cat/sch/vol",
         )
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/cat/sch/vol/x.parquet", service=service)
@@ -1235,7 +1368,9 @@ class TestStoragePath:
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://bkt/u/c/s/v",
         )
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/c/s/v/x", service=service)
@@ -1249,7 +1384,9 @@ class TestStoragePath:
             _volume_info(storage_location="s3://bkt/u/c/s/v"),
             _volume_info(storage_location="s3://bkt/u/c/s/v"),
         ]
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/c/s/v/x", service=service)
@@ -1278,17 +1415,22 @@ class TestVolumeArrowFilesystem:
         pytest.importorskip("boto3")
 
         import pyarrow.fs as pafs
+
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://bkt/u/c/s/v",
         )
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/c/s/v/x", service=service)
         fs = p.arrow_filesystem(region="us-east-1")
         assert isinstance(fs, pafs.S3FileSystem)
 
-    def test_arrow_filesystem_routes_through_s3service(self, workspace, client, service) -> None:
+    def test_arrow_filesystem_routes_through_s3service(
+        self, workspace, client, service
+    ) -> None:
         # Spy that ``VolumePath.arrow_filesystem`` actually goes
         # through ``S3Service.arrow_filesystem`` rather than building
         # the pyarrow object directly. That keeps the credential
@@ -1296,12 +1438,15 @@ class TestVolumeArrowFilesystem:
         workspace.volumes.read.return_value = _volume_info(
             storage_location="s3://bkt/u/c/s/v",
         )
-        gen = workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        gen = (
+            workspace.temporary_volume_credentials.generate_temporary_volume_credentials
+        )
         gen.return_value = _aws_creds_response()
 
         p = VolumePath("/Volumes/c/s/v/x", service=service)
         aws_client = p.aws(region="us-east-1")
         from unittest.mock import patch
+
         sentinel = object()
         with patch.object(
             type(aws_client.s3),
@@ -1387,7 +1532,8 @@ class TestUCNavigation:
         assert p.schema is sentinel
         assert p.schema is sentinel
         client.schemas.schema.assert_called_once_with(
-            catalog_name="cat", schema_name="sch",
+            catalog_name="cat",
+            schema_name="sch",
         )
 
     def test_catalog_raises_without_uc_prefix(self, workspace, client, service) -> None:

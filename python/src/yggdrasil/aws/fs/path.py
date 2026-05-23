@@ -222,6 +222,7 @@ class S3Path(RemotePath):
         """
         if self._service is None:
             from yggdrasil.aws.fs.service import S3Service
+
             self._service = S3Service.current()
         return self._service
 
@@ -329,7 +330,8 @@ class S3Path(RemotePath):
         try:
             response = self._call(
                 self.client.head_object,
-                Bucket=self.bucket, Key=self.key,
+                Bucket=self.bucket,
+                Key=self.key,
             )
         except Exception as exc:
             if not _is_not_found(exc):
@@ -389,7 +391,8 @@ class S3Path(RemotePath):
         except Exception as exc:
             LOGGER.debug(
                 "Listing S3 prefix %r failed — yielding empty (exc=%r)",
-                self, exc,
+                self,
+                exc,
             )
             return
 
@@ -443,7 +446,8 @@ class S3Path(RemotePath):
         try:
             self._call(
                 self.client.delete_object,
-                Bucket=self.bucket, Key=self.key,
+                Bucket=self.bucket,
+                Key=self.key,
             )
         except Exception:
             if not missing_ok:
@@ -453,7 +457,10 @@ class S3Path(RemotePath):
         self.invalidate_singleton()
 
     def _remove_dir(
-        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
+        self,
+        recursive: bool,
+        missing_ok: bool,
+        wait: WaitingConfig,
     ) -> None:
         """Bulk-delete every object under the prefix.
 
@@ -468,12 +475,14 @@ class S3Path(RemotePath):
                 placeholder = placeholder + "/"
             LOGGER.debug(
                 "Deleting S3 prefix placeholder %r (missing_ok=%s)",
-                self, missing_ok,
+                self,
+                missing_ok,
             )
             try:
                 self._call(
                     self.client.delete_object,
-                    Bucket=self.bucket, Key=placeholder,
+                    Bucket=self.bucket,
+                    Key=placeholder,
                 )
             except Exception:
                 if missing_ok:
@@ -488,7 +497,9 @@ class S3Path(RemotePath):
             prefix = prefix + "/"
 
         LOGGER.debug(
-            "Deleting S3 prefix %r recursively (missing_ok=%s)", self, missing_ok,
+            "Deleting S3 prefix %r recursively (missing_ok=%s)",
+            self,
+            missing_ok,
         )
         paginator = self.client.get_paginator("list_objects_v2")
         batch: list[dict[str, str]] = []
@@ -524,13 +535,10 @@ class S3Path(RemotePath):
         )
         errors = response.get("Errors") or []
         if errors:
-            sample = ", ".join(
-                f"{e.get('Key')!r}={e.get('Code')}" for e in errors[:3]
-            )
+            sample = ", ".join(f"{e.get('Key')!r}={e.get('Code')}" for e in errors[:3])
             more = f" (+{len(errors) - 3} more)" if len(errors) > 3 else ""
             raise OSError(
-                f"S3 delete_objects reported {len(errors)} error(s): "
-                f"{sample}{more}"
+                f"S3 delete_objects reported {len(errors)} error(s): " f"{sample}{more}"
             )
 
     # ==================================================================
@@ -624,12 +632,14 @@ class S3Path(RemotePath):
             mtime = _mtime_from_response(response)
             media_type = _media_type_from_response(response)
             if self._stat_cached is None:
-                self._persist_stat_cache(IOStats(
-                    size=total,
-                    kind=IOKind.FILE,
-                    mtime=mtime,
-                    media_type=media_type,
-                ))
+                self._persist_stat_cache(
+                    IOStats(
+                        size=total,
+                        kind=IOKind.FILE,
+                        mtime=mtime,
+                        media_type=media_type,
+                    )
+                )
             else:
                 self._stat_cached.size = total
                 if mtime:
@@ -667,24 +677,30 @@ class S3Path(RemotePath):
             existing = existing + b"\x00" * (pos - len(existing))
 
         head = existing[:pos]
-        tail = existing[pos + n:]
+        tail = existing[pos + n :]
         payload = head + bytes(data) + tail
 
         LOGGER.debug(
             "Writing S3 object %r (bytes=%d, pos=%d, rmw=True)",
-            self, len(payload), pos,
+            self,
+            len(payload),
+            pos,
         )
         self._call(
             self.client.put_object,
-            Bucket=self.bucket, Key=self.key, Body=payload,
+            Bucket=self.bucket,
+            Key=self.key,
+            Body=payload,
         )
         LOGGER.info("Wrote S3 object %r (bytes=%d)", self, len(payload))
-        self._persist_stat_cache(IOStats(
-            size=len(payload),
-            kind=IOKind.FILE,
-            mtime=time.time(),
-            media_type=self.media_type,
-        ))
+        self._persist_stat_cache(
+            IOStats(
+                size=len(payload),
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            )
+        )
         return n
 
     def _existing_size_or_zero(self) -> int:
@@ -719,15 +735,19 @@ class S3Path(RemotePath):
         LOGGER.debug("Truncating S3 object %r (size=%d)", self, n)
         self._call(
             self.client.put_object,
-            Bucket=self.bucket, Key=self.key, Body=payload,
+            Bucket=self.bucket,
+            Key=self.key,
+            Body=payload,
         )
         LOGGER.info("Truncated S3 object %r (size=%d)", self, n)
-        self._persist_stat_cache(IOStats(
-            size=len(payload),
-            kind=IOKind.FILE,
-            mtime=time.time(),
-            media_type=self.media_type,
-        ))
+        self._persist_stat_cache(
+            IOStats(
+                size=len(payload),
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            )
+        )
         return n
 
     def reserve(self, n: int) -> None:
@@ -751,6 +771,7 @@ class S3Path(RemotePath):
         directly.
         """
         from yggdrasil.io.bytes_io import BytesIO
+
         del mode
         size = n if n >= 0 else max(0, self._existing_size_or_zero() - pos)
         if size <= 0:
@@ -773,17 +794,58 @@ class S3Path(RemotePath):
         if pos == 0:
             LOGGER.debug("Writing S3 object %r (bytes=%d)", self, len(payload))
             self.client.put_object(
-                Bucket=self.bucket, Key=self.key, Body=payload,
+                Bucket=self.bucket,
+                Key=self.key,
+                Body=payload,
             )
             LOGGER.info("Wrote S3 object %r (bytes=%d)", self, len(payload))
-            self._persist_stat_cache(IOStats(
-                size=len(payload),
+            self._persist_stat_cache(
+                IOStats(
+                    size=len(payload),
+                    kind=IOKind.FILE,
+                    mtime=time.time(),
+                    media_type=self.media_type,
+                )
+            )
+            return len(payload)
+        return self._write_mv(memoryview(payload), pos)
+
+    # ==================================================================
+    # Fast whole-file write — no stat / resize / truncate overhead
+    # ==================================================================
+
+    def write_all(self, data: "Any") -> int:
+        """Write *data* as the entire object in one ``PutObject``.
+
+        Skips the stat probe, resize, truncate, and read-modify-write
+        the normal ``write_bytes`` path performs.
+
+        Accepts ``bytes``, ``bytearray``, ``memoryview``, or any
+        file-like with ``.read()``.
+        """
+        if isinstance(data, memoryview):
+            data = bytes(data)
+        if hasattr(data, "read"):
+            data = data.read()
+        payload = bytes(data) if not isinstance(data, bytes) else data
+        size = len(payload)
+        LOGGER.debug("Writing S3 object %r (bytes=%d)", self, size)
+        self._call(
+            self.client.put_object,
+            Bucket=self.bucket,
+            Key=self.key,
+            Body=payload,
+        )
+        LOGGER.info("Wrote S3 object %r (bytes=%d)", self, size)
+        self._persist_stat_cache(
+            IOStats(
+                size=size,
                 kind=IOKind.FILE,
                 mtime=time.time(),
                 media_type=self.media_type,
-            ))
-            return len(payload)
-        return self._write_mv(memoryview(payload), pos)
+            )
+        )
+        return size
 
     # ==================================================================
     # Repr

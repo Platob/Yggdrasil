@@ -52,7 +52,7 @@ __all__ = ["Path"]
 # Path
 # ---------------------------------------------------------------------------
 
-TS_PATTERN = re.compile(r'-(\d+)-(\d+)-')
+TS_PATTERN = re.compile(r"-(\d+)-(\d+)-")
 
 
 class Path(IO, os.PathLike, ABC):
@@ -112,6 +112,7 @@ class Path(IO, os.PathLike, ABC):
             scheme = url.scheme
             if scheme:
                 from yggdrasil.io.url import URLBased
+
                 try:
                     target = URLBased.for_scheme(scheme)
                 except (ValueError, ImportError) as exc:
@@ -120,6 +121,7 @@ class Path(IO, os.PathLike, ABC):
                     ) from exc
                 return target(url=url, **kwargs)
             from yggdrasil.io.path.local_path import LocalPath
+
             return LocalPath(url=url, **kwargs)
         return cls(url=url, **kwargs)
 
@@ -187,7 +189,10 @@ class Path(IO, os.PathLike, ABC):
 
     @abstractmethod
     def _remove_dir(
-        self, recursive: bool, missing_ok: bool, wait: WaitingConfig,
+        self,
+        recursive: bool,
+        missing_ok: bool,
+        wait: WaitingConfig,
     ) -> None:
         """Remove the directory at this path."""
 
@@ -375,7 +380,7 @@ class Path(IO, os.PathLike, ABC):
         missing_ok: bool = True,
         wait: WaitingConfigArg = True,
         fresher_than: Optional[TimeLike] = None,
-        older_than: Optional[TimeLike] = None
+        older_than: Optional[TimeLike] = None,
     ) -> "Path":
         stat = self._stat()
         kind = stat.kind
@@ -387,8 +392,7 @@ class Path(IO, os.PathLike, ABC):
         if fresher_than or older_than:
             fresher_than = IOStats.normalize_timestamp(fresher_than, default=0.0)
             older_than = IOStats.normalize_timestamp(
-                fresher_than,
-                default=dt.datetime.now(tz=dt.timezone.utc).timestamp()
+                fresher_than, default=dt.datetime.now(tz=dt.timezone.utc).timestamp()
             )
 
             if kind == IOKind.FILE:
@@ -397,8 +401,11 @@ class Path(IO, os.PathLike, ABC):
             elif kind == IOKind.DIRECTORY:
                 for child in self.ls(recursive=False):
                     child.remove(
-                        recursive=recursive, missing_ok=missing_ok,
-                        wait=wait, fresher_than=fresher_than, older_than=older_than
+                        recursive=recursive,
+                        missing_ok=missing_ok,
+                        wait=wait,
+                        fresher_than=fresher_than,
+                        older_than=older_than,
                     )
 
                     if child.is_empty():
@@ -497,19 +504,15 @@ class Path(IO, os.PathLike, ABC):
 
         if isinstance(target, IO):
             return super()._transfer_to(target)
-        if (
-            isinstance(target, Path)
-            and self.is_local_path
-            and target.is_local_path
-        ):
+        if isinstance(target, Path) and self.is_local_path and target.is_local_path:
             import shutil
+
             shutil.copyfile(os.fspath(self), os.fspath(target))
             return
         if self.is_local_path:
             target.write_local_path(os.fspath(self))
             return
         return super()._transfer_to(target)
-
 
     # ==================================================================
     # Module upload / import — share local Python packages over the wire
@@ -563,11 +566,7 @@ class Path(IO, os.PathLike, ABC):
             )
         )
 
-        target: "Path" = (
-            self
-            if suffix in (".zip", ".whl")
-            else self / archive_default
-        )
+        target: "Path" = self if suffix in (".zip", ".whl") else self / archive_default
 
         if not overwrite and target.exists():
             raise FileExistsError(
@@ -647,6 +646,7 @@ class Path(IO, os.PathLike, ABC):
             # ``.whl`` archives don't sit on ``sys.path``
             # directly — installing them is the supported path.
             from yggdrasil.environ import PyEnv
+
             PyEnv.current().install(local_archive, raise_error=True)
             importlib.invalidate_caches()
             return importlib.import_module(resolved_name)
@@ -742,6 +742,31 @@ class Path(IO, os.PathLike, ABC):
 
     def __rtruediv__(self, other: Any) -> "Path":
         return Path.from_(other) / self
+
+    # ==================================================================
+    # Fast whole-file write
+    # ==================================================================
+
+    def write_all(self, data: "Any") -> int:
+        """Write *data* as the entire file content in one shot.
+
+        On local paths this is a single ``open("wb") + write``.
+        Remote subclasses override with their atomic upload
+        primitive, skipping the stat / resize / truncate overhead
+        the normal ``write_bytes`` path performs.
+
+        Accepts ``bytes``, ``bytearray``, ``memoryview``, or any
+        file-like with ``.read()``.
+        """
+        if isinstance(data, memoryview):
+            data = bytes(data)
+        if hasattr(data, "read"):
+            data = data.read()
+        if not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
+        with open(os.fspath(self), "wb") as fh:
+            fh.write(data)
+        return len(data)
 
     # ==================================================================
     # Dunder

@@ -819,22 +819,17 @@ class DatabricksPath(DatabricksResource, RemotePath):
     # Fast whole-file write — no stat / resize / truncate overhead
     # ------------------------------------------------------------------
 
-    def write_full_bytes(self, data: "Any") -> int:
+    def write_all(self, data: "Any") -> int:
         """Write *data* as the entire file content in one shot.
 
-        Skips every pre-check the normal write path performs — no
-        ``_stat`` probe, no ``resize``, no ``truncate``, no
-        read-modify-write — and goes straight to the backend's
-        atomic upload. Use this for write-once payloads (parquet
-        files, staged scripts, serialised artifacts) where the
-        caller owns the complete content and doesn't need
-        positional splicing.
+        Skips the stat probe, resize, truncate, and
+        read-modify-write the normal ``write_bytes`` path performs
+        and goes straight to the backend's atomic upload.
 
         Accepts ``bytes``, ``bytearray``, ``memoryview``, or any
-        file-like object with ``.read()`` (``io.BytesIO``, open
-        file handle, ``pa.BufferOutputStream`` buffer, Arrow IPC
-        sink, …). Streams are passed through to the SDK upload
-        without eager materialisation when the backend supports it.
+        file-like object with ``.read()``. Streams are passed
+        through to the SDK upload without eager materialisation
+        when the backend supports it.
 
         Returns the byte count written (``-1`` for streams of
         unknown length).
