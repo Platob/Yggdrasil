@@ -155,6 +155,7 @@ def _resolve_in_memory_tabular(data: Any) -> "type | None":
     # :class:`IO` get back an in-memory holder rather than a TypeError.
     if isinstance(data, (pa.Table, pa.RecordBatch, pa.RecordBatchReader)):
         from yggdrasil.arrow.tabular import ArrowTabular
+
         return ArrowTabular
 
     mod = (type(data).__module__ or "").split(".", 1)[0]
@@ -165,26 +166,29 @@ def _resolve_in_memory_tabular(data: Any) -> "type | None":
         # to wrap; route DataFrames only.
         if "DataFrame" in type(data).__name__:
             from yggdrasil.spark.tabular import Dataset
+
             return Dataset
         return None
 
     if mod in ("polars", "pandas"):
         from yggdrasil.arrow.tabular import ArrowTabular
+
         return ArrowTabular
 
     # Pure-Python row-list / column-dict shapes. Match the same
     # guards :meth:`ArrowTabular._ingest` uses so the dispatch and
     # the ingest agree on what "I can handle this" means.
-    if isinstance(data, list) and data and all(
-        isinstance(r, dict) for r in data
-    ):
+    if isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
         from yggdrasil.arrow.tabular import ArrowTabular
+
         return ArrowTabular
     if (
-        isinstance(data, dict) and data
+        isinstance(data, dict)
+        and data
         and all(isinstance(v, (list, tuple)) for v in data.values())
     ):
         from yggdrasil.arrow.tabular import ArrowTabular
+
         return ArrowTabular
 
     return None
@@ -221,6 +225,7 @@ def _resolve_subclass(
         # falls back to LocalPath — that's the only path-shaped backend
         # that's always available.
         from .path.local_path import LocalPath
+
         url_obj = URL.from_(path)
         scheme_from_path = url_obj.scheme
         if scheme_from_path:
@@ -235,6 +240,7 @@ def _resolve_subclass(
 
     # binary, str, pathlib.Path, None, bytes-like — all default to memory
     from .memory import Memory
+
     return Memory
 
 
@@ -287,10 +293,7 @@ def _resolve_format_target(
     :meth:`IO.class_for_media_type` for the registry lookup, which
     bootstraps the leaf packages on a cold miss.
     """
-    mt = (
-        MediaType.from_(media_type, default=None)
-        if media_type is not None else None
-    )
+    mt = MediaType.from_(media_type, default=None) if media_type is not None else None
 
     if mt is None:
         for src in (path, data):
@@ -676,20 +679,35 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             if fmt_target is not None and issubclass(fmt_target, IO):
                 instance = fmt_target.__new__(
                     fmt_target,
-                    data=data, stat=stat, scheme=scheme, url=url,
-                    binary=binary, path=path, holder=holder,
-                    owns_holder=owns_holder, **kwargs,
+                    data=data,
+                    stat=stat,
+                    scheme=scheme,
+                    url=url,
+                    binary=binary,
+                    path=path,
+                    holder=holder,
+                    owns_holder=owns_holder,
+                    **kwargs,
                 )
                 if not isinstance(instance, cls):
                     type(instance).__init__(
                         instance,
-                        data=data, path=path, binary=binary, url=url,
-                        holder=holder, owns_holder=owns_holder, **kwargs,
+                        data=data,
+                        path=path,
+                        binary=binary,
+                        url=url,
+                        holder=holder,
+                        owns_holder=owns_holder,
+                        **kwargs,
                     )
                 return instance
 
             target = _resolve_subclass(
-                scheme=scheme, url=url, binary=binary, path=path, data=data,
+                scheme=scheme,
+                url=url,
+                binary=binary,
+                path=path,
+                data=data,
             )
             return target.__new__(
                 target,
@@ -799,11 +817,17 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             # we don't re-enter the format-dispatch path on ``cls``.
             try:
                 parent_target = _resolve_subclass(
-                    scheme=scheme, url=url, binary=binary,
-                    path=path, data=data,
+                    scheme=scheme,
+                    url=url,
+                    binary=binary,
+                    path=path,
+                    data=data,
                 )
                 instance._parent = parent_target(
-                    data=data, path=path, binary=binary, url=url,
+                    data=data,
+                    path=path,
+                    binary=binary,
+                    url=url,
                 )
                 instance._owns_parent = True
             except (TypeError, ValueError):
@@ -900,9 +924,15 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         # (file-like objects, backend-specific shapes), fall back to
         # :meth:`from_` to build a fresh in-memory holder for the
         # cursor to wrap.
-        if self._parent is None and data is not None and not (
-            isinstance(data, (bytes, bytearray, memoryview, str, pathlib.PurePath, URL))
-            or isinstance(data, IO)
+        if (
+            self._parent is None
+            and data is not None
+            and not (
+                isinstance(
+                    data, (bytes, bytearray, memoryview, str, pathlib.PurePath, URL)
+                )
+                or isinstance(data, IO)
+            )
         ):
             try:
                 tmp = type(self).from_(data, mode=mode)
@@ -1078,16 +1108,23 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             # substrate — borrow the holder rather than drain.
             return cls(
                 holder=obj._parent if obj._parent is not None else obj,
-                owns_holder=False, mode=mode, url=url, **kwargs,
+                owns_holder=False,
+                mode=mode,
+                url=url,
+                **kwargs,
             )
 
         if isinstance(obj, (bytes, bytearray, memoryview)):
             if is_storage:
                 return cls(binary=obj, url=url, **kwargs)
             from .memory import Memory
+
             return cls(
-                holder=Memory(binary=obj), owns_holder=True, mode=mode,
-                url=url, **kwargs,
+                holder=Memory(binary=obj),
+                owns_holder=True,
+                mode=mode,
+                url=url,
+                **kwargs,
             )
 
         if hasattr(obj, "read") and not isinstance(obj, (str, bytes)):
@@ -1100,18 +1137,34 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             local_path = _local_path_for_handle(obj)
             if local_path is not None:
                 from yggdrasil.io.path.local_path import LocalPath
+
                 if is_storage:
-                    return LocalPath(local_path) if cls in (IO, LocalPath) else cls(path=local_path, url=url, **kwargs)
+                    return (
+                        LocalPath(local_path)
+                        if cls in (IO, LocalPath)
+                        else cls(path=local_path, url=url, **kwargs)
+                    )
                 return cls(
                     holder=LocalPath(local_path),
-                    owns_holder=True, mode=mode, url=url, **kwargs,
+                    owns_holder=True,
+                    mode=mode,
+                    url=url,
+                    **kwargs,
                 )
             from yggdrasil.io.memory_stream import MemoryStream
+
             if is_storage:
-                return MemoryStream(obj) if cls in (IO,) else cls(data=obj, url=url, **kwargs)
+                return (
+                    MemoryStream(obj)
+                    if cls in (IO,)
+                    else cls(data=obj, url=url, **kwargs)
+                )
             return cls(
                 holder=MemoryStream(obj),
-                owns_holder=True, mode=mode, url=url, **kwargs,
+                owns_holder=True,
+                mode=mode,
+                url=url,
+                **kwargs,
             )
 
         # Path-like — route through ``cls(path=...)`` so scheme-aware
@@ -1458,7 +1511,10 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             if cursor:
                 offset = self._pos
             written = self._active().write_mv(
-                data, offset, size=size, overwrite=overwrite,
+                data,
+                offset,
+                size=size,
+                overwrite=overwrite,
                 update_stat=update_stat,
             )
             if cursor:
@@ -1625,9 +1681,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         """
         if self._parent is not None:
             return self._active().size
-        raise NotImplementedError(
-            f"{type(self).__name__} has no size implementation."
-        )
+        raise NotImplementedError(f"{type(self).__name__} has no size implementation.")
 
     @property
     def size_known(self) -> bool:
@@ -1685,9 +1739,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         """
         if self._parent is not None:
             return self._active()._stat()
-        raise NotImplementedError(
-            f"{type(self).__name__} has no _stat implementation."
-        )
+        raise NotImplementedError(f"{type(self).__name__} has no _stat implementation.")
 
     def _touch_stat(
         self,
@@ -1777,6 +1829,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             return
         try:
             from yggdrasil.data.enums.media_type import MediaType
+
             mt = MediaType.from_(value, default=None)
         except Exception:
             mt = value
@@ -2152,8 +2205,10 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         and advances it by the bytes written.
         """
         return self.write_mv(
-            _as_byte_mv(data), pos,
-            update_stat=update_stat, cursor=cursor,
+            _as_byte_mv(data),
+            pos,
+            update_stat=update_stat,
+            cursor=cursor,
         )
 
     def memoryview(self) -> memoryview:
@@ -2219,18 +2274,50 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             data = data.encode("utf-8")
         if isinstance(data, IO):
             return self.write_holder(
-                data, offset=offset, size=size, overwrite=overwrite,
+                data,
+                offset=offset,
+                size=size,
+                overwrite=overwrite,
                 cursor=cursor,
             )
         if hasattr(data, "read"):
             return self.write_stream(
-                data, offset=offset, size=size, overwrite=overwrite,
+                data,
+                offset=offset,
+                size=size,
+                overwrite=overwrite,
                 cursor=cursor,
             )
         return self.write_mv(
-            _as_byte_mv(data), offset, size=size, overwrite=overwrite,
+            _as_byte_mv(data),
+            offset,
+            size=size,
+            overwrite=overwrite,
             cursor=cursor,
         )
+
+    def write_all(self, data: "Any") -> int:
+        """Replace the entire content in one shot.
+
+        Cursor IOs delegate to their parent's ``write_all``.
+        Storage IOs that override this (remote paths) skip the
+        stat / resize / truncate overhead ``write_bytes`` pays.
+        The base implementation falls back to
+        ``seek(0) + truncate(0) + write_bytes``.
+        """
+        if self._parent is not None:
+            return self._active().write_all(data)
+        if isinstance(data, memoryview):
+            data = bytes(data)
+        if hasattr(data, "read"):
+            data = data.read()
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
+        self.seek(0)
+        self.truncate(0)
+        return self.write_bytes(data)
 
     def read_text(
         self,
@@ -2246,7 +2333,9 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         ``cursor=True`` reads from the internal cursor and advances it.
         """
         return self.read_bytes(
-            size, offset, cursor=cursor,
+            size,
+            offset,
+            cursor=cursor,
         ).decode(encoding, errors=errors)
 
     def write_text(
@@ -2263,7 +2352,9 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         ``cursor=True`` writes at the internal cursor and advances it.
         """
         return self.write_bytes(
-            text.encode(encoding, errors=errors), offset, cursor=cursor,
+            text.encode(encoding, errors=errors),
+            offset,
+            cursor=cursor,
         )
 
     # ------------------------------------------------------------------
@@ -2271,7 +2362,11 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
     # ------------------------------------------------------------------
 
     def readinto(
-        self, buffer: Any, *, offset: int = 0, cursor: bool = False,
+        self,
+        buffer: Any,
+        *,
+        offset: int = 0,
+        cursor: bool = False,
     ) -> int:
         """Fill *buffer* with bytes starting at ``offset``.
 
@@ -2301,7 +2396,11 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         return n
 
     def readline(
-        self, limit: int = -1, *, offset: int = 0, cursor: bool = False,
+        self,
+        limit: int = -1,
+        *,
+        offset: int = 0,
+        cursor: bool = False,
     ) -> bytes:
         """Read up to the next newline starting at ``offset``.
 
@@ -2331,7 +2430,11 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         return line
 
     def readlines(
-        self, hint: int = -1, *, offset: int = 0, cursor: bool = False,
+        self,
+        hint: int = -1,
+        *,
+        offset: int = 0,
+        cursor: bool = False,
     ) -> list[bytes]:
         """Read every line from ``offset`` to EOF (or until ``hint`` bytes).
 
@@ -2408,45 +2511,101 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
     # ``cursor=True`` for non-default behaviour.
 
     def _read_struct(
-        self, fmt: str, n: int, offset: int, *, cursor: bool = False,
+        self,
+        fmt: str,
+        n: int,
+        offset: int,
+        *,
+        cursor: bool = False,
     ) -> Any:
         if not cursor and offset == 0 and self._parent is not None:
             cursor = True
         return struct.unpack(
-            fmt, self.read_bytes(n, offset, cursor=cursor),
+            fmt,
+            self.read_bytes(n, offset, cursor=cursor),
         )[0]
 
     def _write_struct(
-        self, fmt: str, value: Any, offset: int, *, cursor: bool = False,
+        self,
+        fmt: str,
+        value: Any,
+        offset: int,
+        *,
+        cursor: bool = False,
     ) -> int:
         if not cursor and offset == 0 and self._parent is not None:
             cursor = True
         return self.write_bytes(
-            struct.pack(fmt, value), offset, cursor=cursor,
+            struct.pack(fmt, value),
+            offset,
+            cursor=cursor,
         )
 
-    def read_int8(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<b", 1, offset, cursor=cursor)
-    def write_int8(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<b", int(v), offset, cursor=cursor)
-    def read_uint8(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<B", 1, offset, cursor=cursor)
-    def write_uint8(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<B", int(v), offset, cursor=cursor)
-    def read_int16(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<h", 2, offset, cursor=cursor)
-    def write_int16(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<h", int(v), offset, cursor=cursor)
-    def read_uint16(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<H", 2, offset, cursor=cursor)
-    def write_uint16(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<H", int(v), offset, cursor=cursor)
-    def read_int32(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<i", 4, offset, cursor=cursor)
-    def write_int32(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<i", int(v), offset, cursor=cursor)
-    def read_uint32(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<I", 4, offset, cursor=cursor)
-    def write_uint32(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<I", int(v), offset, cursor=cursor)
-    def read_int64(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<q", 8, offset, cursor=cursor)
-    def write_int64(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<q", int(v), offset, cursor=cursor)
-    def read_uint64(self, *, offset: int = 0, cursor: bool = False) -> int: return self._read_struct("<Q", 8, offset, cursor=cursor)
-    def write_uint64(self, v: int, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<Q", int(v), offset, cursor=cursor)
-    def read_f32(self, *, offset: int = 0, cursor: bool = False) -> float: return self._read_struct("<f", 4, offset, cursor=cursor)
-    def write_f32(self, v: float, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<f", float(v), offset, cursor=cursor)
-    def read_f64(self, *, offset: int = 0, cursor: bool = False) -> float: return self._read_struct("<d", 8, offset, cursor=cursor)
-    def write_f64(self, v: float, *, offset: int = 0, cursor: bool = False) -> int: return self._write_struct("<d", float(v), offset, cursor=cursor)
-    def read_bool(self, *, offset: int = 0, cursor: bool = False) -> bool: return bool(self.read_uint8(offset=offset, cursor=cursor))
-    def write_bool(self, v: bool, *, offset: int = 0, cursor: bool = False) -> int: return self.write_uint8(1 if v else 0, offset=offset, cursor=cursor)
+    def read_int8(self, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._read_struct("<b", 1, offset, cursor=cursor)
+
+    def write_int8(self, v: int, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<b", int(v), offset, cursor=cursor)
+
+    def read_uint8(self, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._read_struct("<B", 1, offset, cursor=cursor)
+
+    def write_uint8(self, v: int, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<B", int(v), offset, cursor=cursor)
+
+    def read_int16(self, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._read_struct("<h", 2, offset, cursor=cursor)
+
+    def write_int16(self, v: int, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<h", int(v), offset, cursor=cursor)
+
+    def read_uint16(self, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._read_struct("<H", 2, offset, cursor=cursor)
+
+    def write_uint16(self, v: int, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<H", int(v), offset, cursor=cursor)
+
+    def read_int32(self, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._read_struct("<i", 4, offset, cursor=cursor)
+
+    def write_int32(self, v: int, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<i", int(v), offset, cursor=cursor)
+
+    def read_uint32(self, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._read_struct("<I", 4, offset, cursor=cursor)
+
+    def write_uint32(self, v: int, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<I", int(v), offset, cursor=cursor)
+
+    def read_int64(self, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._read_struct("<q", 8, offset, cursor=cursor)
+
+    def write_int64(self, v: int, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<q", int(v), offset, cursor=cursor)
+
+    def read_uint64(self, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._read_struct("<Q", 8, offset, cursor=cursor)
+
+    def write_uint64(self, v: int, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<Q", int(v), offset, cursor=cursor)
+
+    def read_f32(self, *, offset: int = 0, cursor: bool = False) -> float:
+        return self._read_struct("<f", 4, offset, cursor=cursor)
+
+    def write_f32(self, v: float, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<f", float(v), offset, cursor=cursor)
+
+    def read_f64(self, *, offset: int = 0, cursor: bool = False) -> float:
+        return self._read_struct("<d", 8, offset, cursor=cursor)
+
+    def write_f64(self, v: float, *, offset: int = 0, cursor: bool = False) -> int:
+        return self._write_struct("<d", float(v), offset, cursor=cursor)
+
+    def read_bool(self, *, offset: int = 0, cursor: bool = False) -> bool:
+        return bool(self.read_uint8(offset=offset, cursor=cursor))
+
+    def write_bool(self, v: bool, *, offset: int = 0, cursor: bool = False) -> int:
+        return self.write_uint8(1 if v else 0, offset=offset, cursor=cursor)
 
     # ------------------------------------------------------------------
     # Local-path bridge
@@ -2730,7 +2889,9 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         effective = src_size if size < 0 else min(src_size, size)
         if effective < _INLINE_WRITE_THRESHOLD:
             return self.write_mv(
-                src.read_mv(effective, 0), offset, overwrite=overwrite,
+                src.read_mv(effective, 0),
+                offset,
+                overwrite=overwrite,
             )
         from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
@@ -2748,7 +2909,11 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
     # ------------------------------------------------------------------
 
     def upload(
-        self, src: Any, *, size: int = -1, offset: int = 0,
+        self,
+        src: Any,
+        *,
+        size: int = -1,
+        offset: int = 0,
     ) -> "Holder":
         """Upload *src*'s bytes into this holder.
 
@@ -2827,7 +2992,11 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         return target
 
     def download(
-        self, to: Any = None, *, size: int = -1, offset: int = 0,
+        self,
+        to: Any = None,
+        *,
+        size: int = -1,
+        offset: int = 0,
     ) -> "Holder | IO":
         """Copy this holder's bytes to a local target.
 
@@ -2943,6 +3112,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         value's bytes when available.
         """
         import xxhash
+
         return xxhash.xxh3_64(self.read_bytes())
 
     def xxh3_int64(self) -> int:
@@ -2961,9 +3131,10 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         ):
             return self._xxh3_64_cached
         import xxhash
+
         v = xxhash.xxh3_64(self.read_bytes()).intdigest()
-        if v >= 2 ** 63:
-            v -= 2 ** 64
+        if v >= 2**63:
+            v -= 2**64
         self._xxh3_64_cached = v
         self._xxh3_64_size = self._size
         self._xxh3_64_mtime = self._mtime
@@ -2977,7 +3148,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         hash don't re-walk the payload."""
         v = self.xxh3_int64()
         if v < 0:
-            v += 2 ** 64
+            v += 2**64
         return v.to_bytes(8, "big")
 
     # ==================================================================
@@ -3078,6 +3249,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         resolution; the context manager closes it on exit.
         """
         from yggdrasil.io.base import _FormatInputContext
+
         return _FormatInputContext(self)
 
     def _format_buffer(self) -> "_FormatBufferContext":
@@ -3088,6 +3260,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         the bytes are compressed and committed to ``self``.
         """
         from yggdrasil.io.base import _FormatBufferContext
+
         return _FormatBufferContext(self)
 
     def arrow_input_stream(self) -> "_ArrowInputStreamContext":
@@ -3100,10 +3273,13 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         so the caller hands it directly to pyarrow readers.
         """
         from yggdrasil.io.base import _ArrowInputStreamContext
+
         return _ArrowInputStreamContext(self)
 
     def arrow_output_stream(
-        self, *, append: bool = False,
+        self,
+        *,
+        append: bool = False,
     ) -> "_ArrowOutputStreamContext":
         """Context manager yielding a :class:`pa.BufferOutputStream` writer.
 
@@ -3115,6 +3291,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         compression and the overwrite-vs-append disposition.
         """
         from yggdrasil.io.base import _ArrowOutputStreamContext
+
         return _ArrowOutputStreamContext(self, append=append)
 
     def _commit_format_payload(
@@ -3174,13 +3351,17 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         restore_pos = self._pos if not self._acquired else None
 
         n = len(view)
-        if append:
+        if not append and n > 0 and codec is None:
+            self.write_all(bytes(view))
+        elif append:
             self.seek(0, 2)  # SEEK_END
+            if n > 0:
+                self.write_bytes(view, cursor=True)
         else:
             self.seek(0)
             self.truncate(0)
-        if n > 0:
-            self.write_bytes(view, cursor=True)
+            if n > 0:
+                self.write_bytes(view, cursor=True)
 
         if restore_pos is not None:
             self._pos = min(restore_pos, self.size)
@@ -3221,7 +3402,11 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         it. ``copy=True`` allocates a fresh holder over the same bytes
         and returns a new IO over it.
         """
-        mt = MediaType.from_(media_type, default=None) if media_type is not None else None
+        mt = (
+            MediaType.from_(media_type, default=None)
+            if media_type is not None
+            else None
+        )
         if copy:
             payload = self.to_bytes()
             return type(self)(payload, media_type=mt)
@@ -3242,7 +3427,11 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         Raises :class:`KeyError` when no media type can be resolved or
         the resolved type has no registered Tabular leaf.
         """
-        mt = MediaType.from_(media_type, default=None) if media_type is not None else None
+        mt = (
+            MediaType.from_(media_type, default=None)
+            if media_type is not None
+            else None
+        )
         if mt is None:
             try:
                 mt = self.media_type
@@ -3289,9 +3478,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         target = self._parent if self._parent is not None else self
         fileno = getattr(target, "fileno", None)
         if fileno is None or fileno is IO.fileno:
-            raise OSError(
-                f"{type(self).__name__} has no underlying file descriptor."
-            )
+            raise OSError(f"{type(self).__name__} has no underlying file descriptor.")
         return fileno()
 
     # ---- stdlib-style cursor read / write -----------------------------
@@ -3348,7 +3535,8 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             return 0
         if isinstance(b, str):
             return self.write_bytes(
-                b.encode("utf-8"), cursor=True,
+                b.encode("utf-8"),
+                cursor=True,
             )
         if isinstance(b, (bytes, bytearray, memoryview)):
             return self.write_bytes(b, cursor=True)
@@ -3416,7 +3604,8 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
         mt = (
             MediaType.from_(media_type, default=None)
-            if media_type is not None else None
+            if media_type is not None
+            else None
         )
         if mt is None:
             mt = self.media_type
@@ -3447,11 +3636,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             buf = self
 
         mime = mt.mime_type if mt is not None else None
-        is_jsonlike = (
-            mime is None
-            or mime is MimeTypes.JSON
-            or mime.is_any_bytes
-        )
+        is_jsonlike = mime is None or mime is MimeTypes.JSON or mime.is_any_bytes
 
         if is_jsonlike:
             text = buf.to_bytes().decode("utf-8", errors="replace")
@@ -3460,6 +3645,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             if orient is not None:
                 try:
                     from yggdrasil.lazy_imports import pandas as pd
+
                     return pd.read_json(text, orient=orient)
                 except Exception:
                     pass
@@ -3472,7 +3658,8 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
                 return None
             return _json.loads(text)
         leaf = (
-            buf if isinstance(buf, leaf_cls)
+            buf
+            if isinstance(buf, leaf_cls)
             else leaf_cls(
                 holder=buf._parent if buf._parent is not None else buf,
                 owns_holder=False,
@@ -3496,6 +3683,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
                 codec_obj = inner
             else:
                 from yggdrasil.data.enums.codec import Codec
+
                 codec_obj = Codec.from_(codec, default=None)
         if codec_obj is None:
             if copy:
@@ -3550,7 +3738,8 @@ def _looks_like_directory(url: URL) -> bool:
 
 
 def _join_dir_hint(
-    dst: "IO", src: "IO",
+    dst: "IO",
+    src: "IO",
 ) -> "IO":
     """Apply ``cp``-style directory hint when *dst* is a slash-terminated Path.
 

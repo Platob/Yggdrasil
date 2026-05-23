@@ -764,7 +764,11 @@ class Path(IO, os.PathLike, ABC):
             data = data.read()
         if not isinstance(data, (bytes, bytearray)):
             data = bytes(data)
-        with open(os.fspath(self), "wb") as fh:
+        fspath = os.fspath(self)
+        parent = os.path.dirname(fspath)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(fspath, "wb") as fh:
             fh.write(data)
         return len(data)
 

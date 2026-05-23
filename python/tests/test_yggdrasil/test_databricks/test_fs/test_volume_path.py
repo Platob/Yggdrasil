@@ -532,6 +532,67 @@ class TestWriteAll:
         assert wfb_upload_count <= wb_upload_count
         assert wfb_meta_count < wb_meta_count
 
+    def test_parquetfile_write_arrow_table_uses_write_all(
+        self,
+        workspace,
+        client,
+        service,
+    ) -> None:
+        """ParquetFile(holder=VolumePath).write_arrow_table() routes
+        through write_all via _commit_format_payload: 1 upload,
+        1 get_metadata (mode guard size check), 0 downloads."""
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        table = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "name": pa.array(["a", "b", "c"]),
+            }
+        )
+
+        workspace.files.download.side_effect = NotFound()
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        workspace.files.list_directory_contents.side_effect = NotFound()
+
+        p = VolumePath("/Volumes/c/s/v/out.parquet", service=service)
+        pf = ParquetFile(holder=p, owns_holder=False)
+        pf.write_arrow_table(table)
+
+        assert workspace.files.upload.call_count == 1
+        assert workspace.files.download.call_count == 0
+
+    def test_parquetfile_write_single_upload(
+        self,
+        workspace,
+        client,
+        service,
+    ) -> None:
+        """write_arrow_table via ParquetFile issues exactly 1 upload.
+
+        Before: _commit_format_payload did seek(0) + truncate(0) +
+        write_bytes — on VolumePath truncate downloads the file +
+        re-uploads, then write_bytes does another upload = 2+ uploads.
+        After: write_all skips truncate — 1 upload total.
+        """
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        table = pa.table({"x": pa.array([10, 20, 30], type=pa.int32())})
+
+        workspace.files.download.side_effect = NotFound()
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        workspace.files.list_directory_contents.side_effect = NotFound()
+
+        p = VolumePath("/Volumes/c/s/v/metrics.parquet", service=service)
+        pf = ParquetFile(holder=p, owns_holder=False)
+        pf.write_arrow_table(table)
+
+        assert workspace.files.upload.call_count == 1
+        assert workspace.files.download.call_count == 0
+
 
 class TestMutators:
 

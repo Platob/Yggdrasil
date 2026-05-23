@@ -359,6 +359,62 @@ class TestWriteAll:
         assert wa_put_count <= wb_put_count
         assert wa_head_count < wb_head_count
 
+    def test_parquetfile_write_arrow_table_uses_write_all(
+        self,
+        client,
+        service,
+    ) -> None:
+        """ParquetFile(holder=S3Path).write_arrow_table() routes through
+        write_all: 1 put_object, 0 get_object for the write itself."""
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        client.head_object.side_effect = _client_error()
+        client.get_object.side_effect = _client_error()
+        client.list_objects_v2.return_value = {"KeyCount": 0}
+
+        table = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "name": pa.array(["a", "b", "c"]),
+            }
+        )
+
+        p = S3Path("s3://b/out.parquet", service=service)
+        pf = ParquetFile(holder=p, owns_holder=False)
+        pf.write_arrow_table(table)
+
+        assert client.put_object.call_count == 1
+        assert client.get_object.call_count == 0
+
+    def test_parquetfile_write_single_put_object(
+        self,
+        client,
+        service,
+    ) -> None:
+        """write_arrow_table issues exactly 1 put_object.
+
+        Before: _commit_format_payload did seek(0) + truncate(0) +
+        write_bytes — on S3Path that's head_object (size) + get_object
+        (truncate) + put_object (truncate) + put_object (write).
+        After: 1 put_object, 0 get_object.
+        """
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        client.head_object.side_effect = _client_error()
+        client.get_object.side_effect = _client_error()
+        client.list_objects_v2.return_value = {"KeyCount": 0}
+
+        table = pa.table({"x": pa.array([10, 20, 30], type=pa.int32())})
+
+        p = S3Path("s3://b/metrics.parquet", service=service)
+        pf = ParquetFile(holder=p, owns_holder=False)
+        pf.write_arrow_table(table)
+
+        assert client.put_object.call_count == 1
+        assert client.get_object.call_count == 0
+
 
 # ---------------------------------------------------------------------------
 # Listing
