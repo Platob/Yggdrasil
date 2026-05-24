@@ -32,13 +32,17 @@ singleton cache cleanly:
 from __future__ import annotations
 
 import logging
+import pathlib
 import threading
 from abc import ABC
-from typing import Any, ClassVar, Mapping, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
 
 from yggdrasil.concurrent.threading import JobPoolExecutor
 from yggdrasil.dataclasses.singleton import Singleton
 from .url import URL
+
+if TYPE_CHECKING:
+    from yggdrasil.io.nested.folder_path import FolderPath
 
 __all__ = ["Session"]
 
@@ -121,7 +125,7 @@ class Session(Singleton, ABC):
     # has a *derived* attribute it doesn't want shared across pickles
     # adds the attribute name here.
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
-        "_lock", "_job_pool",
+        "_lock", "_job_pool", "_local_cache",
     })
 
     # Prepared / response / batch types the prepare → send pipeline
@@ -200,6 +204,7 @@ class Session(Singleton, ABC):
         )
         self._lock = threading.RLock()
         self._job_pool: Optional[JobPoolExecutor] = None
+        self._local_cache: Optional["FolderPath"] = None
         self._initialized = True
 
     def __enter__(self) -> "Session":
@@ -284,6 +289,7 @@ class Session(Singleton, ABC):
             return
         super().__setstate__(state)
         self._lock = threading.RLock()
+        self._local_cache = None
         self._initialized = True
 
     @property
@@ -294,3 +300,36 @@ class Session(Singleton, ABC):
                     self._job_pool = JobPoolExecutor(max_workers=self.pool_maxsize)
                     LOGGER.debug("Created job pool with max_workers=%s", self.pool_maxsize)
         return self._job_pool
+
+    def local_cache(self) -> "FolderPath":
+        """Return the session-scoped local cache folder, creating the directory on first access.
+
+        The folder lives under ``~/.cache/http/<host>/<path>``
+        when :attr:`base_url` is set (so different APIs on the same machine
+        don't collide), or ``~/.cache/http/default`` otherwise.
+
+        Thread-safe: the directory is created under the session lock and
+        the resulting :class:`FolderPath` is cached for the lifetime of
+        the singleton.
+        """
+        cached = getattr(self, "_local_cache", None)
+        if cached is not None:
+            return cached
+        with self._lock:
+            cached = getattr(self, "_local_cache", None)
+            if cached is not None:
+                return cached
+            from yggdrasil.io.nested.folder_path import FolderPath
+            from yggdrasil.io.path import Path
+
+            root = pathlib.Path.home() / ".cache" / "http"
+            base_url = getattr(self, "base_url", None)
+            host = getattr(base_url, "host", None) if base_url is not None else None
+            if not host:
+                folder = root / "default"
+            else:
+                url_path = (getattr(base_url, "path", "") or "").strip("/")
+                folder = root / host / url_path if url_path else root / host
+            path = Path.from_(folder)
+            self._local_cache: "FolderPath" = FolderPath(path=path)
+            return self._local_cache

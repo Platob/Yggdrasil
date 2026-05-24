@@ -20,6 +20,7 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, SendConfig
 from yggdrasil.io.session import Session
+from yggdrasil.io.tabular import Tabular
 
 from ._helpers import StubSession, make_request, make_response
 
@@ -31,10 +32,11 @@ def _clear_singletons():
     Session._INSTANCES.clear()
 
 
-class FakeTable:
+class FakeTable(Tabular):
     """Minimal Tabular double that records write_arrow_batches calls."""
 
     def __init__(self, name: str = "catalog.schema.cache_table") -> None:
+        super().__init__()
         self._name = name
         self.rows: list[pa.RecordBatch] = []
         self.lookups: list[Any] = []
@@ -48,7 +50,7 @@ class FakeTable:
     def create(self, schema: pa.Schema, missing_ok: bool = False) -> None:
         self.created = True
 
-    def read_arrow_batches(self, options: Any = None, **kw) -> Iterator[pa.RecordBatch]:
+    def _read_arrow_batches(self, options: Any = None, **kw) -> Iterator[pa.RecordBatch]:
         predicate = getattr(options, "predicate", None)
         self.lookups.append(predicate)
         batches = list(self.rows)
@@ -56,7 +58,7 @@ class FakeTable:
             return iter(batches)
         return predicate.filter_arrow_batches(iter(batches))
 
-    def write_arrow_batches(self, batches: Any, options: Any = None, **kw) -> None:
+    def _write_arrow_batches(self, batches: Any, options: Any = None, **kw) -> None:
         new: list[pa.RecordBatch] = []
         for entry in batches:
             if isinstance(entry, pa.Table):

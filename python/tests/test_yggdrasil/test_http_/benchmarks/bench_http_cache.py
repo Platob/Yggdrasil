@@ -45,14 +45,13 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from yggdrasil.io import URL
 from yggdrasil.http_.session import HTTPSession
+from yggdrasil.io import URL
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -123,8 +122,7 @@ _LOCAL_TABULAR.write_arrow_batches(
 
 
 def _cleanup_tmp() -> None:
-    if CFG_LOCAL.is_local:
-        shutil.rmtree(str(CFG_LOCAL.tabular.path), ignore_errors=True)
+    shutil.rmtree(str(CFG_LOCAL.tabular.path), ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -217,21 +215,6 @@ def _check_arg_scenarios(repeat: int) -> list[dict]:
 def _predicate_scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
 
-    out.append(_time_one(
-        "CacheConfig.cache_enabled (default)",
-        lambda: CFG_DEFAULT.cache_enabled,
-        repeat=repeat, inner=500_000,
-    ))
-    out.append(_time_one(
-        "CacheConfig.local_cache_enabled (local)",
-        lambda: CFG_LOCAL.local_cache_enabled,
-        repeat=repeat, inner=500_000,
-    ))
-    out.append(_time_one(
-        "CacheConfig.remote_cache_enabled (no tabular)",
-        lambda: CFG_REMOTE_BY_PUBLIC.remote_cache_enabled,
-        repeat=repeat, inner=500_000,
-    ))
     out.append(_time_one(
         "CacheConfig.match_by (request+response)",
         lambda: CFG_REMOTE_BY_PUBLIC.match_by,
@@ -538,17 +521,8 @@ def _send_many_cache_scenarios(repeat: int) -> list[dict]:
     for r in cold_batch:
         _ = r.public_hash, r.public_url_hash
     out.append(_time_one(
-        f"Session._split_local_cache (all miss, {BATCH_SIZE} req)",
-        lambda: SESSION._split_local_cache(cold_batch, CFG_LOCAL),
-        repeat=repeat, inner=200,
-    ))
-
-    # Same scan when no local cache is active anywhere in the batch —
-    # the early-exit predicate matters because hot Spark workers /
-    # cache-disabled callers walk this path on every chunk.
-    out.append(_time_one(
-        f"Session._split_local_cache (cache off, {BATCH_SIZE} req)",
-        lambda: SESSION._split_local_cache(cold_batch, CFG_DEFAULT),
+        f"Session._group_by_holders ({BATCH_SIZE} req)",
+        lambda: SESSION._group_by_holders(cold_batch),
         repeat=repeat, inner=2_000,
     ))
 

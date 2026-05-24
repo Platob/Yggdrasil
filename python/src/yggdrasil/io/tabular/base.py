@@ -66,6 +66,7 @@ from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MediaType, MimeType, Mode, ModeLike
+from yggdrasil.environ import PyEnv
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 
 
@@ -654,35 +655,37 @@ class Tabular(ABC, Generic[O]):
         *,
         media_type: "MediaType | MimeType | str | None" = None,
         default: Any = ...,
+        as_folder: bool = False,
         **kwargs: Any,
-    ) -> "Tabular":
-        """Coerce *obj* into a :class:`Tabular` leaf for read/write.
+    ) -> "Tabular | None":
+        """Coerce *obj* into a :class:`Tabular`.
 
         Routes:
 
-        * :class:`Tabular` (incl. :class:`Holder` / :class:`Path` /
-          :class:`Memory` / :class:`IO`) — returned as-is. When
-          *media_type* is supplied and *obj* is a :class:`Holder`,
-          :meth:`Holder.for_holder` is invoked so the caller can
-          override the format leaf the holder's stamped MediaType
-          would otherwise dispatch to.
+        * ``None`` — returns *default* (``None`` when
+          ``default=None``).
+        * :class:`Tabular` — returned as-is. When *as_folder* is
+          ``True`` and *obj* is a local :class:`Path`, wraps it in
+          a :class:`FolderPath`.
         * ``str`` / :class:`os.PathLike` — coerced via
-          :meth:`Path.from_`, which scheme-dispatches to the right
-          concrete subclass (:class:`LocalPath`, :class:`S3Path`,
-          :class:`DatabricksPath`, …). Strings are accepted only when
-          path-shaped (see :func:`is_tabular_source`); plain content
-          strings raise.
-        * File-like objects (anything with a callable ``read``
-          returning ``bytes``) — drained into a :class:`Memory`
-          holder; *media_type* is required since a raw byte stream
-          has no URL extension to sniff.
+          :class:`Path.from_`. When *as_folder* is ``True``,
+          wraps in :class:`FolderPath`.
+        * File-like objects — drained into :class:`Memory`;
+          *media_type* required.
 
         Falls back to *default* on unrecognised shapes when supplied;
-        otherwise raises :class:`TypeError` with the offending type.
+        otherwise raises :class:`TypeError`.
         """
+        if obj is None:
+            return default if default is not ... else None
+
         from yggdrasil.io.holder import Holder
 
         if isinstance(obj, Tabular):
+            if as_folder and isinstance(obj, Holder) and obj.is_local:
+                from yggdrasil.io.nested.folder_path import FolderPath
+                if not isinstance(obj, FolderPath):
+                    return FolderPath(path=obj)
             if media_type is not None and isinstance(obj, Holder):
                 return Holder.for_holder(obj, media_type=media_type, **kwargs)
             return obj
@@ -698,6 +701,9 @@ class Tabular(ABC, Generic[O]):
                 )
             from yggdrasil.io.path import Path as YggPath
             path = YggPath.from_(obj)
+            if as_folder:
+                from yggdrasil.io.nested.folder_path import FolderPath
+                return FolderPath(path=path)
             if media_type is not None:
                 return Holder.for_holder(path, media_type=media_type, **kwargs)
             return path
@@ -813,6 +819,15 @@ class Tabular(ABC, Generic[O]):
         base raising.
         """
         return 0
+
+    def create(
+        self,
+        schema: Schema,
+        *,
+        mode: ModeLike = None,
+        **kwargs
+    ):
+        raise NotImplementedError()
 
     # ==================================================================
     # Row-level delete
@@ -1218,15 +1233,29 @@ class Tabular(ABC, Generic[O]):
 
     def read_table(
         self, options: "O | None" = None, **kwargs: Any,
-    ) -> pa.Table:
-        """Read into a pyarrow :class:`pa.Table`.
+    ) -> "Tabular | None":
+        """Read into an in-memory :class:`Tabular`.
 
-        Pyarrow is the only hard runtime dependency, so it's the
-        portable default. Callers that want a different engine can
-        ask for :meth:`read_polars_frame` / :meth:`read_spark_frame`
-        explicitly.
+        When ``options.spark_session`` is set, reads via
+        :meth:`_read_spark_frame` and wraps in a :class:`Dataset`.
+        Otherwise materializes Arrow batches into :class:`ArrowTabular`.
+        Returns ``None`` when empty.
         """
-        return self._read_arrow_table(self.check_options(options, overrides=locals()))
+        return self._read_table(self.check_options(options, overrides=locals()))
+
+    def _read_table(self, options: O) -> "Tabular | None":
+        spark = options.spark_session
+
+        if spark is not None or PyEnv.in_databricks():
+            from yggdrasil.spark.tabular import Dataset as _Dataset
+            df = self._read_spark_frame(options)
+            return _Dataset(frame=df) if df is not None else None
+
+        batches = list(self.read_arrow_batches(options=options))
+        if not batches or all(b.num_rows == 0 for b in batches):
+            return None
+        from yggdrasil.arrow.tabular import ArrowTabular
+        return ArrowTabular(batches)
 
     def write_table(
         self,
@@ -2091,6 +2120,22 @@ class Tabular(ABC, Generic[O]):
         kernel via :meth:`Predicate.filter_arrow_table`.
         """
         return _default_filter(self, predicate=predicate)
+
+    def cast(self, schema: "Schema") -> "Tabular":
+        """Cast rows to *schema*, returning a new :class:`Tabular`.
+
+        Each batch is cast through
+        :meth:`Schema.cast_arrow_batch_iterator`. The result is an
+        :class:`ArrowTabular` with the target schema applied.
+        """
+        from yggdrasil.arrow.tabular import ArrowTabular as _ArrowTabular
+
+        batches = list(schema.cast_arrow_batch_iterator(
+            self.read_arrow_batches(),
+        ))
+        if not batches:
+            return _ArrowTabular(schema.to_arrow_schema().empty_table())
+        return _ArrowTabular(batches)
 
     # ==================================================================
     # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.

@@ -31,12 +31,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pyarrow as pa
 import pytest
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.io.send_config import CacheConfig, SendConfig
-
 from ._helpers import StubSession, make_request, make_response
 
 
@@ -177,36 +175,6 @@ class TestSessionSend:
         assert sorted(r.json()["i"] for r in out) == [0, 1, 2]
         assert len(s.calls) == 3
 
-    def test_send_many_as_tabular_returns_arrow_tabular(self) -> None:
-        from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
-        from yggdrasil.io.tabular import ArrowTabular
-
-        s = StubSession()
-        s.queue(*[
-            make_response(body=f'{{"i":{i}}}'.encode())
-            for i in range(3)
-        ])
-        reqs = (make_request(f"https://example.com/tab/{i}") for i in range(3))
-        result = s.send_many(reqs, as_tabular=True)
-
-        assert isinstance(result, ArrowTabular)
-        table = result.read_arrow_table()
-        assert table.schema == RESPONSE_ARROW_SCHEMA
-        assert table.num_rows == 3
-        assert len(s.calls) == 3
-
-    def test_send_many_as_tabular_empty_iter(self) -> None:
-        from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
-        from yggdrasil.io.tabular import ArrowTabular
-
-        s = StubSession()
-        result = s.send_many(iter([]), as_tabular=True)
-        assert isinstance(result, ArrowTabular)
-        # Schema is preserved on the empty tabular so downstream
-        # consumers can read columns without a probe.
-        assert result.schema == RESPONSE_ARROW_SCHEMA
-        assert result.num_rows == 0
-
     def test_send_many_default_still_yields_responses(self) -> None:
         from collections.abc import Iterator as IteratorABC
 
@@ -214,7 +182,6 @@ class TestSessionSend:
         s.queue(*[make_response() for _ in range(2)])
         reqs = (make_request(f"https://example.com/iter/{i}") for i in range(2))
         out = s.send_many(reqs)
-        # Default (as_tabular=False) keeps the streaming-iterator contract.
         assert isinstance(out, IteratorABC)
         assert len(list(out)) == 2
 
@@ -560,8 +527,6 @@ class TestCacheConfigCoercion:
         from yggdrasil.io.path import LocalPath, Path as YggPath
 
         cfg = CacheConfig.from_(tmp_path)
-        assert cfg.is_local is True
-        assert cfg.is_remote is False
         # Path-shaped sugar is wrapped in a :class:`FolderPath`; the
         # backing :class:`Path` is the canonical abstract one.
         assert isinstance(cfg.tabular, FolderPath)
@@ -688,15 +653,14 @@ class TestLocalCacheFolderPerHost:
 class TestSendConfig:
 
     def test_from__accepts_dict(self) -> None:
-        cfg = SendConfig.from_({"raise_error": False, "stream": False})
+        cfg = SendConfig.from_({"raise_error": False})
         assert cfg.raise_error is False
-        assert cfg.stream is False
 
     def test_from__accepts_send_config(self) -> None:
         base = SendConfig(raise_error=False)
-        merged = SendConfig.from_(base, stream=False)
+        merged = SendConfig.from_(base, cache_only=True)
         assert merged.raise_error is False
-        assert merged.stream is False
+        assert merged.cache_only is True
 
     def test_local_cache_folder_default(self) -> None:
         cfg = CacheConfig()
