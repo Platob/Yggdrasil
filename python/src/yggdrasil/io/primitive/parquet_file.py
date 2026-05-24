@@ -57,6 +57,39 @@ _INDEX_PLACEHOLDER_PREFIX: str = "__index_level_"
 __all__ = ["ParquetFile", "ParquetOptions"]
 
 
+def _collect_index_levels(schema: pa.Schema) -> list[tuple[int, str]]:
+    """Extract index levels from yggdrasil tags or pyarrow ``b"pandas"`` metadata.
+
+    Returns a list of ``(level_position, column_name)`` pairs. Prefers
+    the ``index_key`` / ``index_key_level`` per-field tags; falls back
+    to the ``b"pandas"`` JSON blob when those are absent (files written
+    by ``pandas.to_parquet``, Spark, etc.).
+    """
+    levels: list[tuple[int, str]] = []
+    for f in schema:
+        meta = f.metadata
+        if not meta:
+            continue
+        if meta.get(_Field._TAG_KEY_INDEX_KEY):
+            raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
+            try:
+                pos = int(raw_level) if raw_level is not None else 0
+            except (TypeError, ValueError):
+                pos = 0
+            levels.append((pos, f.name))
+    if levels:
+        return levels
+
+    raw = (schema.metadata or {}).get(b"pandas")
+    if not raw:
+        return levels
+    pmeta = ygg_json.loads(raw)
+    for pos, entry in enumerate(pmeta.get("index_columns", ())):
+        if isinstance(entry, str):
+            levels.append((pos, entry))
+    return levels
+
+
 #: Modes that read existing bytes, merge with the incoming stream,
 #: and rewrite the file in one shot. Parquet's footer covers every
 #: row group, so APPEND, UPSERT and MERGE all share the same
@@ -487,30 +520,19 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         self._write_arrow_table(enriched, options)
 
     def _read_pandas_frame(self, options: ParquetOptions) -> "pandas.DataFrame":
-        """Restore the pandas index from ``index_key`` / ``index_key_level`` tags.
+        """Restore the pandas index from ``index_key`` tags or ``b"pandas"`` metadata.
 
-        Reads the arrow table (parquet preserves per-field metadata
-        end-to-end), collects every field carrying an index-key tag,
-        materialises the DataFrame, and promotes the tagged columns
-        into the index via ``set_index`` in level order.
-        ``__index_level_N__`` placeholder names are mapped back to
-        ``None`` so the round-trip matches the source frame.
+        First checks for yggdrasil's own ``index_key`` /
+        ``index_key_level`` per-field tags (written by our
+        ``_write_pandas_frame``).  When absent — e.g. parquet files
+        produced by ``pandas.to_parquet``, Spark, or other tools —
+        falls back to pyarrow's ``b"pandas"`` JSON blob in the schema
+        metadata and extracts ``index_columns`` from it.  Both paths
+        promote tagged columns into the pandas index via ``set_index``
+        in level order.
         """
         table = self._read_arrow_table(options)
-
-        levels: list[tuple[int, str]] = []
-        for arrow_field in table.schema:
-            meta = arrow_field.metadata
-            if not meta:
-                continue
-            if not meta.get(_Field._TAG_KEY_INDEX_KEY):
-                continue
-            raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
-            try:
-                pos = int(raw_level) if raw_level is not None else 0
-            except (TypeError, ValueError):
-                pos = 0
-            levels.append((pos, arrow_field.name))
+        levels = _collect_index_levels(table.schema)
 
         df = table.to_pandas()
         if not levels:
@@ -518,7 +540,10 @@ class ParquetFile(IO[bytes, ParquetOptions]):
 
         levels.sort()
         ordered = [name for _, name in levels]
-        df = df.set_index(ordered)
+        present = [n for n in ordered if n in df.columns]
+        if not present:
+            return df
+        df = df.set_index(present)
         df.index.names = [
             None if isinstance(n, str) and n.startswith(_INDEX_PLACEHOLDER_PREFIX)
             else n

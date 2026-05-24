@@ -194,6 +194,22 @@ class TestPandasIndexRoundTrip(__import__(
         self.assertFrameEqual(result, df, check_index=True)
         assert result.index.name == "custom_idx"
 
+    def test_reads_multi_index_parquet_written_by_pandas(self) -> None:
+        """Cross-tool: pandas MultiIndex → ParquetFile restores all levels."""
+        import io
+
+        idx = self.pd.MultiIndex.from_tuples(
+            [("a", 1), ("b", 2), ("c", 3)], names=["k1", "k2"],
+        )
+        df = self.df({"v": [10, 20, 30]}, index=idx)
+        buf = io.BytesIO()
+        df.to_parquet(buf)
+        mem = Memory()
+        mem.write(buf.getvalue())
+        result = ParquetFile(holder=mem, owns_holder=False).read_pandas_frame()
+        self.assertFrameEqual(result, df, check_index=True)
+        assert result.index.names == ["k1", "k2"]
+
     def test_schema_carries_index_key_tags(self) -> None:
         """Each materialised index level lands as a tagged Field in the schema."""
         import pyarrow.parquet as pq
