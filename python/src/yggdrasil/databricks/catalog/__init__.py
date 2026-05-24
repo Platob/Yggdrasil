@@ -1,6 +1,6 @@
 """Unity Catalog catalog resource + service."""
 
-from .catalog import Catalog
+from .catalog import UCCatalog, Catalog
 from .catalogs import Catalogs
 
-__all__ = ["Catalog", "Catalogs"]
+__all__ = ["UCCatalog", "Catalog", "Catalogs"]

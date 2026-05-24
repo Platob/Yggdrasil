@@ -52,7 +52,7 @@ from databricks.sdk.errors import DatabricksError, PermissionDenied
 
 from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.path import DatabricksPath
-from yggdrasil.databricks.schema.schema import Schema
+from yggdrasil.databricks.schema.schema import UCSchema
 from yggdrasil.databricks.volume.volume import Volume
 from yggdrasil.io.io_stats import IOKind
 
@@ -94,7 +94,7 @@ class _SchemaFixture(DatabricksIntegrationCase):
 
     catalog_name: ClassVar[str]
     schema_name: ClassVar[str]
-    schema: ClassVar[Schema]
+    schema: ClassVar[UCSchema]
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -137,7 +137,7 @@ class TestSchemaIntegration(_SchemaFixture):
             f"/Volumes/{self.catalog_name}/{self.schema_name}",
             service=self.client.schemas,
         )
-        self.assertIsInstance(resolved, Schema)
+        self.assertIsInstance(resolved, UCSchema)
         self.assertEqual(resolved.catalog_name, self.catalog_name)
         self.assertEqual(resolved.schema_name, self.schema_name)
         # The dispatcher's Schema must collapse onto the same Singleton

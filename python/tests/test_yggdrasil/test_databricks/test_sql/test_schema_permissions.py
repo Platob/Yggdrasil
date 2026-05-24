@@ -13,7 +13,7 @@ from databricks.sdk.service.catalog import (
     SecurableType,
 )
 
-from yggdrasil.databricks.schema.schema import Schema, _normalize_privileges
+from yggdrasil.databricks.schema.schema import UCSchema, _normalize_privileges
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def workspace(service):
 
 @pytest.fixture
 def schema(service):
-    return Schema(service=service, catalog_name="trading_tgp_dev", schema_name="unittest")
+    return UCSchema(service=service, catalog_name="trading_tgp_dev", schema_name="unittest")
 
 
 class TestNormalizePrivileges:

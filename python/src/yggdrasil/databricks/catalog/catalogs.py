@@ -36,9 +36,9 @@ from databricks.sdk.service.catalog import CatalogInfo
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
-from yggdrasil.databricks.catalog.catalog import Catalog
+from yggdrasil.databricks.catalog.catalog import UCCatalog
 from yggdrasil.databricks.column.column import Column
-from yggdrasil.databricks.schema.schema import Schema
+from yggdrasil.databricks.schema.schema import UCSchema
 from yggdrasil.databricks.sql.sql_utils import name_matcher
 from yggdrasil.databricks.table.table import Table
 
@@ -82,7 +82,7 @@ class Catalogs(DatabricksService):
 
     # ── dict-like navigation ──────────────────────────────────────────────────
 
-    def __getitem__(self, name: str) -> Union[Catalog, Schema, Table, Column]:
+    def __getitem__(self, name: str) -> Union[UCCatalog, UCSchema, Table, Column]:
         """Route a 1-, 2-, 3-, or 4-part dotted name to the right resource.
 
         * ``catalogs["main"]``                     → :class:`Catalog`
@@ -112,13 +112,13 @@ class Catalogs(DatabricksService):
         """
         self[name].rename(new_name)
 
-    def __iter__(self) -> Iterator[Catalog]:
+    def __iter__(self) -> Iterator[UCCatalog]:
         """Iterate over all visible catalogs (``self.list_catalogs()``)."""
         return self.list_catalogs()
 
     # ── factory methods ───────────────────────────────────────────────────────
 
-    def catalog(self, name: str) -> Catalog:
+    def catalog(self, name: str) -> UCCatalog:
         """Return a :class:`Catalog` bound to this service.
 
         Uses the module-level cache when available.
@@ -126,7 +126,7 @@ class Catalogs(DatabricksService):
         Args:
             name: Catalog name.
         """
-        cat = Catalog(service=self, catalog_name=name)
+        cat = UCCatalog(service=self, catalog_name=name)
         key = self._cache_key(name)
         cached = _CATALOG_INFO_CACHE.get(key)
         if cached is not None:
@@ -134,7 +134,7 @@ class Catalogs(DatabricksService):
             object.__setattr__(cat, "_infos_fetched_at", time.time())
         return cat
 
-    def schema(self, full_name: str) -> Schema:
+    def schema(self, full_name: str) -> UCSchema:
         """Return a :class:`Schema` from a ``"catalog.schema"`` string.
 
         Args:
@@ -145,7 +145,7 @@ class Catalogs(DatabricksService):
             raise ValueError(
                 f"Expected a 'catalog.schema' two-part name, got {full_name!r}"
             )
-        return Schema(service=self, catalog_name=parts[0], schema_name=parts[1])
+        return UCSchema(service=self, catalog_name=parts[0], schema_name=parts[1])
 
     def table(self, location: str) -> Table:
         """Return a :class:`Table` from a three-part fully-qualified name.
@@ -162,7 +162,7 @@ class Catalogs(DatabricksService):
         name: str | None = None,
         *,
         use_cache: bool = True,
-    ) -> Iterator[Catalog]:
+    ) -> Iterator[UCCatalog]:
         """Iterate over visible catalogs, populating the local cache.
 
         Args:
@@ -180,7 +180,7 @@ class Catalogs(DatabricksService):
             if matcher is not None and not matcher(info.name):
                 continue
 
-            cat = Catalog(service=self, catalog_name=info.name)
+            cat = UCCatalog(service=self, catalog_name=info.name)
             object.__setattr__(cat, "_infos", info)
 
             if use_cache:

@@ -55,8 +55,8 @@ from ..path import DatabricksPath
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
-    from yggdrasil.databricks.catalog.catalog import Catalog
-    from yggdrasil.databricks.schema.schema import Schema
+    from yggdrasil.databricks.catalog.catalog import UCCatalog
+    from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.databricks.volume.volume import Volume
 
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
@@ -288,7 +288,7 @@ class VolumePath(DatabricksPath):
         return self._volume
 
     @property
-    def catalog(self) -> "Catalog":
+    def catalog(self) -> "UCCatalog":
         """Return a :class:`Catalog` instance for this volume's parent catalog.
 
         Delegates to :attr:`volume`.catalog so the underlying
@@ -301,7 +301,7 @@ class VolumePath(DatabricksPath):
         return self.volume.catalog
 
     @property
-    def schema(self) -> "Schema":
+    def schema(self) -> "UCSchema":
         """Return a :class:`Schema` instance for this volume's parent schema.
 
         Delegates to :attr:`volume`.schema so the underlying

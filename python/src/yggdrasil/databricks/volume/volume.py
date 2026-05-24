@@ -56,9 +56,9 @@ from yggdrasil.io.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
-    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.catalog.catalog import UCCatalog
     from yggdrasil.databricks.fs.volume_path import VolumePath
-    from yggdrasil.databricks.schema.schema import Schema as UCSchema
+    from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.databricks.volume.volumes import Volumes
 
 __all__ = ["Volume"]
@@ -577,7 +577,7 @@ class Volume(DatabricksResource, Singleton):
     # ── navigation ────────────────────────────────────────────────────────────
 
     @property
-    def catalog(self) -> "Catalog":
+    def catalog(self) -> "UCCatalog":
         """Navigate up to the parent :class:`Catalog`.
 
         Returns the singleton-cached :class:`Catalog` for this

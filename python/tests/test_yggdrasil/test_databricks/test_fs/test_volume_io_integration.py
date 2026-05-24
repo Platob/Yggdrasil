@@ -43,7 +43,7 @@ import pytest
 from databricks.sdk.errors import DatabricksError, PermissionDenied
 
 from yggdrasil.databricks.fs.volume_path import VolumePath
-from yggdrasil.databricks.schema.schema import Schema
+from yggdrasil.databricks.schema.schema import UCSchema
 from yggdrasil.databricks.volume.volume import Volume
 from yggdrasil.pandas.tests import PandasTestCase
 
@@ -75,7 +75,7 @@ class _VolumeIOFixture(DatabricksIntegrationCase):
     catalog_name: ClassVar[str]
     schema_name: ClassVar[str]
     volume_name: ClassVar[str]
-    schema: ClassVar[Schema]
+    schema: ClassVar[UCSchema]
     volume: ClassVar[Volume]
 
     @classmethod

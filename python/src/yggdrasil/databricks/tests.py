@@ -148,14 +148,14 @@ class DatabricksTestCase(unittest.TestCase):
     # Cache reset
     # ------------------------------------------------------------------ #
     def _clear_databricks_caches(self) -> None:
-        from yggdrasil.databricks.catalog.catalog import Catalog
+        from yggdrasil.databricks.catalog.catalog import UCCatalog
         from yggdrasil.databricks.client import DatabricksClient
         from yggdrasil.databricks.cluster import service as _cs
         from yggdrasil.databricks.compute import instance_pool as _ip
         from yggdrasil.databricks.jobs import service as _js
         from yggdrasil.databricks.jobs.job import Job as _JobResource
         from yggdrasil.databricks.jobs.run import JobRun as _JobRunResource
-        from yggdrasil.databricks.schema.schema import Schema
+        from yggdrasil.databricks.schema.schema import UCSchema
         from yggdrasil.databricks.table.table import Table
         from yggdrasil.databricks.volume.volume import Volume
 
@@ -164,8 +164,8 @@ class DatabricksTestCase(unittest.TestCase):
         # ``client.<service>.defaults`` or cached ``_infos`` /
         # columns bleed across tests.
         DatabricksClient._INSTANCES.clear()
-        Catalog._INSTANCES.clear()
-        Schema._INSTANCES.clear()
+        UCCatalog._INSTANCES.clear()
+        UCSchema._INSTANCES.clear()
         Table._INSTANCES.clear()
         Volume._INSTANCES.clear()
         _JobResource._INSTANCES.clear()

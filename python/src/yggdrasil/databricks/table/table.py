@@ -81,9 +81,9 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
     from yggdrasil.databricks.sql.engine import SQLEngine
     from yggdrasil.databricks.table.tables import Tables
-    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.catalog.catalog import UCCatalog
     from yggdrasil.databricks.column.columns import Columns
-    from yggdrasil.databricks.schema.schema import Schema as UCSchema
+    from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
@@ -1501,14 +1501,14 @@ class Table(DatabricksPath):
         )
     
     @property
-    def catalog(self) -> "Catalog":
-        """Navigate up to the parent :class:`Catalog`.
+    def catalog(self) -> "UCCatalog":
+        """Navigate up to the parent :class:`UCCatalog`.
 
-        Returns the singleton-cached :class:`Catalog` for this
+        Returns the singleton-cached :class:`UCCatalog` for this
         client + catalog name — repeated calls hand back the same
         instance with shared :class:`CatalogInfo` cache.
         """
-        from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
+        from yggdrasil.databricks.catalog.catalog import UCCatalog as _Catalog
         return _Catalog(
             service=self.client.catalogs,
             catalog_name=self.catalog_name,
@@ -1516,13 +1516,13 @@ class Table(DatabricksPath):
 
     @property
     def schema(self) -> "UCSchema":
-        """Navigate up to the parent :class:`Schema`.
+        """Navigate up to the parent :class:`UCSchema`.
 
-        Returns the singleton-cached :class:`Schema` for this
+        Returns the singleton-cached :class:`UCSchema` for this
         client + (catalog, schema) — repeated calls hand back the
         same instance with shared :class:`SchemaInfo` cache.
         """
-        from yggdrasil.databricks.schema.schema import Schema as _Schema
+        from yggdrasil.databricks.schema.schema import UCSchema as _Schema
         return _Schema(
             service=self.client.schemas,
             catalog_name=self.catalog_name,
