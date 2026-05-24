@@ -31,12 +31,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pyarrow as pa
 import pytest
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.io.send_config import CacheConfig, SendConfig
-
 from ._helpers import StubSession, make_request, make_response
 
 
@@ -560,8 +558,6 @@ class TestCacheConfigCoercion:
         from yggdrasil.io.path import LocalPath, Path as YggPath
 
         cfg = CacheConfig.from_(tmp_path)
-        assert cfg.is_local is True
-        assert cfg.is_remote is False
         # Path-shaped sugar is wrapped in a :class:`FolderPath`; the
         # backing :class:`Path` is the canonical abstract one.
         assert isinstance(cfg.tabular, FolderPath)
@@ -690,13 +686,11 @@ class TestSendConfig:
     def test_from__accepts_dict(self) -> None:
         cfg = SendConfig.from_({"raise_error": False, "stream": False})
         assert cfg.raise_error is False
-        assert cfg.stream is False
 
     def test_from__accepts_send_config(self) -> None:
         base = SendConfig(raise_error=False)
         merged = SendConfig.from_(base, stream=False)
         assert merged.raise_error is False
-        assert merged.stream is False
 
     def test_local_cache_folder_default(self) -> None:
         cfg = CacheConfig()

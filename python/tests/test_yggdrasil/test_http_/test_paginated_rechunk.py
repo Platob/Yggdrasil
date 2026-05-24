@@ -17,10 +17,8 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
-from yggdrasil.arrow.cast import get_arrow_nbytes
 from yggdrasil.http_.response import HTTPResponse
 from yggdrasil.http_.session import HTTPSession, _PAGINATED_RECHUNK_BYTE_SIZE
-from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.session import Session
@@ -109,7 +107,6 @@ class TestCombinePaginatedPages:
             current_page=1,
             total_pages=1,
             wait_cfg=session.waiting,
-            stream=True,
             raise_error=True,
         )
         assert result is original
@@ -132,7 +129,6 @@ class TestCombinePaginatedPages:
             current_page=1,
             total_pages=3,
             wait_cfg=session.waiting,
-            stream=True,
             raise_error=True,
         )
 
@@ -153,7 +149,6 @@ class TestCombinePaginatedPages:
             current_page=1,
             total_pages=2,
             wait_cfg=session.waiting,
-            stream=True,
             raise_error=True,
         )
         assert result.tags["page_start"] == "1"
@@ -172,7 +167,6 @@ class TestCombinePaginatedPages:
             current_page=1,
             total_pages=2,
             wait_cfg=session.waiting,
-            stream=True,
             raise_error=True,
         )
         table = result.to_arrow_table(parse=True)
@@ -208,7 +202,6 @@ class TestPaginatedRechunking:
                 current_page=1,
                 total_pages=2,
                 wait_cfg=session.waiting,
-                stream=True,
                 raise_error=True,
             )
 
@@ -240,7 +233,6 @@ class TestPaginatedRechunking:
             current_page=1,
             total_pages=2,
             wait_cfg=session.waiting,
-            stream=True,
             raise_error=True,
         )
 

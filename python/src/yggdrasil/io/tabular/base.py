@@ -814,6 +814,15 @@ class Tabular(ABC, Generic[O]):
         """
         return 0
 
+    def create(
+        self,
+        schema: Schema,
+        *,
+        mode: ModeLike = None,
+        **kwargs
+    ):
+        raise NotImplementedError()
+
     # ==================================================================
     # Row-level delete
     # ==================================================================
@@ -1218,7 +1227,7 @@ class Tabular(ABC, Generic[O]):
 
     def read_table(
         self, options: "O | None" = None, **kwargs: Any,
-    ) -> pa.Table:
+    ) -> "Tabular":
         """Read into a pyarrow :class:`pa.Table`.
 
         Pyarrow is the only hard runtime dependency, so it's the
@@ -1226,7 +1235,17 @@ class Tabular(ABC, Generic[O]):
         ask for :meth:`read_polars_frame` / :meth:`read_spark_frame`
         explicitly.
         """
-        return self._read_arrow_table(self.check_options(options, overrides=locals()))
+        options = self.check_options(options, overrides=locals())
+
+        result = self
+
+        if options is None:
+            return result
+
+        if options.predicate:
+            result = result.filter(predicate=options.predicate)
+
+        return result
 
     def write_table(
         self,

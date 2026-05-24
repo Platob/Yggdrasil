@@ -52,12 +52,13 @@ import pyarrow as pa
 
 from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
+from yggdrasil.data.enums import MediaTypes, Mode
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
     WaitingConfig,
     WaitingConfigArg,
 )
-from yggdrasil.data.enums import MediaTypes, Mode
+from yggdrasil.http_.response_batch import HTTPResponseBatch
 from yggdrasil.io.authorization.base import Authorization
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
@@ -66,11 +67,9 @@ from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ArrowIPCFile
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
-from yggdrasil.http_.response_batch import HTTPResponseBatch
 from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig, _request_column_sql_name
 from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
-
 from .exceptions import (
     LocationParseError,
     LocationValueError,
@@ -82,6 +81,8 @@ from .exceptions import (
 from .response import HTTPResponse
 from .retry import Retry
 from .timeout import _resolve_timeout
+from ..data.options import CastOptions
+from ..io.holder import IO
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
@@ -828,28 +829,6 @@ class HTTPSession(Session):
             return cache_cfg.cache_tabular(session=self)
         return cache_cfg.tabular
 
-    def _read_cache_batches(
-        self,
-        tabular: Any,
-        options: Any,
-    ) -> list:
-        """Read with optional ``TABLE_OR_VIEW_NOT_FOUND`` recovery.
-
-        :class:`FolderPath` yields an empty stream when the cache
-        folder hasn't been written to yet (``Path.iterdir``'s
-        missing-dir → empty contract). Remote Databricks tables
-        raise ``[TABLE_OR_VIEW_NOT_FOUND]`` instead — catch that one
-        case and lazily create the table before retrying. Any other
-        backend exception propagates.
-        """
-        try:
-            return list(tabular.read_arrow_batches(options=options))
-        except Exception as exc:
-            if "TABLE_OR_VIEW_NOT_FOUND" in str(exc) and hasattr(tabular, "create"):
-                tabular.create(RESPONSE_ARROW_SCHEMA, missing_ok=True)
-                return list(tabular.read_arrow_batches(options=options))
-            raise
-
     def _load_cached_response(
         self,
         request: PreparedRequest,
@@ -897,7 +876,7 @@ class HTTPSession(Session):
         )
         predicate = cache_cfg.make_lookup_predicate(request=lookup_request)
         opts = CastOptions(predicate=predicate, spark_session=request.send_config_or_default.spark_session)
-        batches = self._read_cache_batches(tabular, opts)
+        batches = tabular.read_arrow_batches(options=opts.check_target(RESPONSE_SCHEMA))
 
         best: Optional[Response] = None
         for response in Response.from_arrow_tabular(iter(batches)):
@@ -1351,7 +1330,6 @@ class HTTPSession(Session):
                 current_page=int(x_current_page),
                 total_pages=int(x_total_pages),
                 wait_cfg=wait_cfg,
-                stream=config.stream,
                 raise_error=config.raise_error,
             )
 
@@ -1419,7 +1397,6 @@ class HTTPSession(Session):
         current_page: int,
         total_pages: int,
         wait_cfg: WaitingConfig,
-        stream: bool,
         raise_error: bool,
         pool: Optional[JobPoolExecutor | int] = None,
     ) -> HTTPResponse:
@@ -1431,7 +1408,6 @@ class HTTPSession(Session):
                     current_page=current_page,
                     total_pages=total_pages,
                     wait_cfg=wait_cfg,
-                    stream=stream,
                     raise_error=raise_error,
                     pool=parsed_pool,
                 )
@@ -1453,7 +1429,6 @@ class HTTPSession(Session):
                     page_num=pn,
                     body_seed=body_seed,
                     wait_cfg=wait_cfg,
-                    stream=stream,
                     raise_error=raise_error,
                 )
 
@@ -1621,93 +1596,75 @@ class HTTPSession(Session):
         :class:`ArrowTabular`; ``None`` when everything misses.
         UPSERT entries bypass the read entirely (always miss).
         """
-        misses: list[PreparedRequest] = []
+        cached, uncached = [], []
+        for r in batch:
+            if r.local_cache_config:
+                cached.append(r)
+            else:
+                uncached.append(r)
 
-        if not any(r.local_cache_config for r in batch):
-            return None, list(batch)
+        if not cached:
+            return None, uncached
 
-        path_to_cfg: dict[Path, CacheConfig] = {}
-        path_to_reqs: dict[Path, list[PreparedRequest]] = {}
+        tab, caches = None, {}
+        for r in cached:
+            holder: IO = r.local_cache_config.tabular
+            caches.setdefault(holder, []).append(r)
 
-        for req in batch:
-            eff = req.local_cache_config
-            if eff is not None:
-                eff = eff.prebuild(session=self)
-            if eff is None or not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
-                misses.append(req)
-                continue
-            root = eff.local_cache_folder(session=self)
-            bucket = path_to_reqs.get(root)
-            if bucket is None:
-                path_to_cfg[root] = eff
-                path_to_reqs[root] = bucket = []
-            bucket.append(req)
-
-        all_hits: list[Response] = []
-        for root, reqs in path_to_reqs.items():
-            eff = path_to_cfg[root]
-            r_hits, r_misses = self._lookup_cached(eff, reqs, source="local")
-            all_hits.extend(r_hits)
-            misses.extend(r_misses)
-
-        if all_hits:
-            LOGGER.info(
-                "Batch local cache: %d/%d hit(s)",
-                len(all_hits), len(batch),
+        for holder, requests in caches.items():
+            predicate = (
+                requests[0].local_cache_config
+                .make_batch_lookup_predicate(requests)
             )
-            from yggdrasil.http_.response_batch import responses_to_tabular
-            return responses_to_tabular(all_hits), misses
-        return None, misses
+
+            new_tab = holder.read_table(options=CastOptions(predicate=predicate))
+
+            if tab is None:
+                tab = new_tab
+            else:
+                tab = tab.union(new_tab)
+
+        return tab, uncached
 
     def _split_remote_cache(
         self,
-        requests: list[PreparedRequest],
-    ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
+        batch: list[PreparedRequest],
+    ) -> tuple[Tabular, list[PreparedRequest]]:
         """Stage 2: scan the remote cache.
 
         UPSERT requests bypass the read entirely (always misses, refetch).
         Non-UPSERT requests are grouped by their effective cache table so we
         execute exactly one batch SQL lookup per table.
         """
-        hits: dict[str, list[Response]] = {}
-        misses: list[PreparedRequest] = []
-        table_to_cfg: dict[str, CacheConfig] = {}
-        table_to_reqs: dict[str, list[PreparedRequest]] = {}
+        cached, uncached = [], []
+        for r in batch:
+            if r.local_cache_config:
+                cached.append(r)
+            else:
+                uncached.append(r)
 
-        for req in requests:
-            t_cfg = req.remote_cache_config
-            if t_cfg is None or t_cfg.mode == Mode.UPSERT:
-                misses.append(req)
-                continue
-            if not t_cfg.remote_cache_enabled or t_cfg.mode != Mode.APPEND:
-                misses.append(req)
-                continue
-            tkey = t_cfg.tabular.full_name(safe=True)
-            bucket = table_to_reqs.get(tkey)
-            if bucket is None:
-                table_to_cfg[tkey] = t_cfg
-                table_to_reqs[tkey] = bucket = []
-            bucket.append(req)
+        if not cached:
+            return None, uncached
 
-        total_hits = 0
-        for tkey, t_reqs in table_to_reqs.items():
-            t_cfg = table_to_cfg[tkey]
-            t_hits, t_misses = self._lookup_cached(
-                t_cfg, t_reqs, source="remote",
+        tab, caches = None, {}
+        for r in cached:
+            holder: IO = r.local_cache_config.tabular
+            caches.setdefault(holder, []).append(r)
+
+        for holder, requests in caches.items():
+            predicate = (
+                requests[0].local_cache_config
+                .make_batch_lookup_predicate(requests)
             )
-            if t_hits:
-                hits[tkey] = t_hits
-                total_hits += len(t_hits)
-            misses.extend(t_misses)
 
-        if total_hits:
-            LOGGER.info(
-                "Batch remote cache: %d/%d hit(s) across %d table(s) — "
-                "skipping network for %d request(s); breakdown: %s",
-                total_hits, len(requests), len(table_to_cfg), total_hits,
-                ", ".join(f"{tkey}={len(v)}" for tkey, v in hits.items()),
-            )
-        return hits, misses
+            new_tab = holder.read_table(options=CastOptions(predicate=predicate))
+
+            if tab is None:
+                tab = new_tab
+            else:
+                tab = tab.union(new_tab)
+
+        return tab, uncached
 
     def _lookup_cached(
         self,
@@ -1755,8 +1712,8 @@ class HTTPSession(Session):
 
         predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
         spark_session = requests[0].send_config_or_default.spark_session if requests else None
-        opts = CastOptions(predicate=predicate, spark_session=spark_session)
-        batches = self._read_cache_batches(tabular, opts)
+        opts = CastOptions(predicate=predicate, spark_session=spark_session, target=RESPONSE_SCHEMA)
+        batches = tabular.read_arrow_batches(options=opts)
 
         # Pre-compute the lookup tuple once per input request. The match
         # loop below would otherwise re-call ``cfg.request_tuple(lookup)``
@@ -1962,19 +1919,13 @@ class HTTPSession(Session):
         else:
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
         predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
-        opts = CastOptions(predicate=predicate, spark_session=spark)
-        try:
-            hits_df = cfg.tabular.read_spark_frame(options=opts)
-        except Exception as exc:
-            if "TABLE_OR_VIEW_NOT_FOUND" in str(exc):
-                cfg.tabular.create(RESPONSE_ARROW_SCHEMA, missing_ok=True)
-                hits_df = cfg.tabular.read_spark_frame(options=opts)
-            else:
-                raise
-        # Stamp the origin flags on the read side. Stored values may be
-        # stale (``mirror_local_to_remote`` pushes local hits into the
-        # remote table with ``local_cached=True``) — overwrite both so
-        # the downstream consumer always sees the layer that answered.
+        opts = CastOptions(
+            predicate=predicate,
+            spark_session=spark,
+            target=RESPONSE_SCHEMA
+        )
+        hits_df = cfg.tabular.read_spark_frame(options=opts)
+
         from pyspark.sql import functions as F
         hits_df = (
             hits_df
@@ -2094,32 +2045,6 @@ class HTTPSession(Session):
             raise_error=True,
         ):
             yield result.result
-
-    @staticmethod
-    def _enable_fair_spark_scheduler(spark: "SparkSession") -> None:
-        """Best-effort switch the Spark session into FAIR scheduling.
-
-        Stage 4 in Spark mode submits one Spark job per remote-cache
-        insert; concurrent inserts (e.g. when several requests carry
-        per-table remote configs, or when the local-cache writeback
-        runs alongside the remote insert) all want share-the-cluster
-        semantics rather than the default FIFO queue, where a slow
-        insert blocks every other job behind it.
-
-        ``spark.scheduler.mode`` is normally a SparkContext-level
-        setting; some Spark builds will accept the runtime
-        ``conf.set`` and apply it to subsequent jobs, others reject
-        it. Either way this is non-fatal — we don't want a managed
-        cluster's scheduler policy to break the request flow.
-        """
-        if spark is None:
-            return
-        try:
-            spark.conf.set("spark.scheduler.mode", "FAIR")
-        except Exception as exc:
-            LOGGER.debug(
-                "Could not switch Spark scheduler to FAIR: %s", exc,
-            )
 
     @staticmethod
     def _run_concurrently(
@@ -2314,7 +2239,6 @@ class HTTPSession(Session):
     def _send_many(
         self,
         requests: Iterator[PreparedRequest],
-        config: SendConfig,
         **batch_kw: Any,
     ) -> Iterator[Response]:
         """Stream responses, flattening the per-chunk :class:`HTTPResponseBatch`.
@@ -2322,27 +2246,13 @@ class HTTPSession(Session):
         In Spark mode ``raise_error`` is applied at the driver-iteration
         boundary so a single failure doesn't poison a whole partition.
         """
-        is_spark = config.spark_session is not None
-        for batch in self._send_many_batches(requests, config, **batch_kw):
-            for holder in batch.parts():
-                for response in Response.from_records(holder.read_records()):
-                    if is_spark and config.raise_error and not response.ok:
-                        response.raise_for_status()
-                    yield response
+        for batch in self._send_many_batches(requests, **batch_kw):
+            yield from batch.iter_responses()
 
     def send_many_batches(
         self,
         requests: Iterator[PreparedRequest],
-        config: SendConfig | Mapping[str, Any] | None = None,
         *,
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        stream: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        cache_only: bool = False,
-        as_tabular: bool = False,
-        spark_session: Optional["SparkSession"] = None,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
@@ -2350,20 +2260,13 @@ class HTTPSession(Session):
         **options,
     ) -> Iterator[HTTPResponseBatch]:
         """Yield one :class:`HTTPResponseBatch` per processed chunk."""
-        cfg = SendConfig.from_(
-            config,
-            wait=wait,
-            raise_error=raise_error,
-            stream=stream,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            cache_only=cache_only,
-            as_tabular=as_tabular,
-            spark_session=spark_session,
-            **options,
-        )
+        if options:
+            def it():
+                for r in requests:
+                    r.send_config = r.send_config_or_default()
+
         yield from self._send_many_batches(
-            requests, cfg,
+            requests,
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
@@ -2373,7 +2276,6 @@ class HTTPSession(Session):
     def _send_many_batches(
         self,
         requests: Iterator[PreparedRequest],
-        config: SendConfig,
         *,
         batch_size: int | None = None,
         max_batch_size: int | None = None,
@@ -2382,37 +2284,13 @@ class HTTPSession(Session):
         max_batch_ttl: float | None = DEFAULT_MAX_BATCH_TTL,
     ) -> Iterator[HTTPResponseBatch]:
         """Yield one :class:`HTTPResponseBatch` per processed chunk."""
-        spark = config.spark_session
-        is_spark = spark is not None
-
-        if is_spark:
-            self._enable_fair_spark_scheduler(spark)
-
         pool = self.job_pool
         if batch_size:
             eff_batch_size = batch_size
-        elif is_spark:
-            eff_batch_size = max_batch_size or 1024
         else:
             eff_batch_size = min(max_batch_size or 1024, pool.max_workers * 10)
 
         ttl = max_batch_ttl
-
-        _lc = config.local_cache
-        _rc = config.remote_cache
-        LOGGER.debug(
-            "Starting send_many pipeline (mode=%s, batch_size=%d, "
-            "max_in_flight=%s, ttl=%s, ordered=%s, "
-            "local_cache=%s, remote_cache=%s)",
-            "spark" if is_spark else "python",
-            eff_batch_size,
-            max_in_flight,
-            ttl,
-            ordered,
-            _lc.local_cache_enabled if _lc is not None else False,
-            _rc.remote_cache_enabled if _rc is not None else False,
-        )
-
         chunk_index = 0
         total_local = 0
         total_remote = 0
@@ -2462,65 +2340,20 @@ class HTTPSession(Session):
 
             chunk_index += 1
 
-            # Enrich: stamp the session-level send_config on every
-            # request that doesn't carry a per-request override.
-            # Per-request cache configs are preserved (same rule as
-            # single send()).
-            for r in chunk:
-                req_sc = r.send_config
-                if req_sc is None:
-                    r.send_config = config
-                else:
-                    merge_back: dict[str, Any] = {}
-                    if req_sc.local_cache is not None:
-                        merge_back["local_cache"] = req_sc.local_cache
-                    if req_sc.remote_cache is not None:
-                        merge_back["remote_cache"] = req_sc.remote_cache
-                    base = dataclasses.replace(config, **merge_back) if merge_back else config
-                    if base is not req_sc:
-                        r.send_config = base
-
-            # Split: requests with cache config (tabular) vs bare network.
-            uncached: list[PreparedRequest] = []
-            cached: list[PreparedRequest] = []
-            for r in chunk:
-                if r.local_cache_config or r.remote_cache_config:
-                    cached.append(r)
-                else:
-                    uncached.append(r)
-
-            LOGGER.debug(
-                "Processing send_many chunk #%d (requests=%d, "
-                "cached=%d, uncached=%d, mode=%s)",
-                chunk_index, len(chunk), len(cached), len(uncached),
-                "spark" if is_spark else "python",
-            )
-
             # --- Cached path: local → remote → network for misses ---
-            local_hits: "Tabular | None" = None
             remote_hits: "Tabular | list[Response] | None" = None
-            cache_misses: list[PreparedRequest] = list(cached)
+            local_hits, cache_misses = self._split_local_cache(chunk)
 
-            if cached:
-                local_hits, cache_misses = self._split_local_cache(cached)
+            if cache_misses:
+                remote_hits_by_table, cache_misses = self._split_remote_cache(cache_misses)
+                self._backfill_local_cache(remote_flat)
+                remote_hits = self._flatten_remote_hits(remote_hits_by_table)
 
-                if cache_misses:
-                    remote_hits_by_table, cache_misses = self._split_remote_cache(
-                        cache_misses,
-                    )
-                    remote_flat = [
-                        r
-                        for table_hits in remote_hits_by_table.values()
-                        for r in table_hits
-                    ]
-                    self._backfill_local_cache(remote_flat)
-                    remote_hits = self._flatten_remote_hits(remote_hits_by_table)
-
-                if local_hits is not None:
-                    local_responses = list(
-                        Response.from_arrow_tabular(local_hits.read_arrow_batches())
-                    )
-                    self._mirror_local_hits_to_remote(local_responses)
+            if local_hits is not None:
+                local_responses = list(
+                    Response.from_arrow_tabular(local_hits.read_arrow_batches())
+                )
+                self._mirror_local_hits_to_remote(local_responses)
 
             # --- Network: uncached requests + cache misses ---
             to_fetch = uncached + cache_misses
@@ -3362,8 +3195,6 @@ class HTTPSession(Session):
         headers: Mapping[str, str] | None = None,
         body: BytesIO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
-        local_cache_config: Optional[CacheConfig] = None,
-        remote_cache_config: Optional[CacheConfig] = None,
         *,
         json: Any | None = None,
         normalize: bool = True,
@@ -3392,9 +3223,7 @@ class HTTPSession(Session):
             tags=tags,
             json=json,
             normalize=normalize,
-            local_cache_config=local_cache_config,
-            remote_cache_config=remote_cache_config,
             send_config=send_config,
+            session=self
         )
-        request.attach_session(self)
         return request

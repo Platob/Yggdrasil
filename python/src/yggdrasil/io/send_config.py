@@ -487,47 +487,17 @@ class CacheConfig(_ConfigBase):
 
     @property
     def cache_enabled(self):
-        cache = self._derived_cache()
-        out = cache.get("cache_enabled", ...)
-        if out is ...:
-            out = self.mode in (Mode.APPEND, Mode.AUTO)
-            cache["cache_enabled"] = out
-        return out
-
-    @property
-    def is_local(self) -> bool:
-        """True when the bound :attr:`tabular` is a :class:`FolderPath`.
-
-        The local-cache fast path keys on this — it's the on-disk
-        backend that supports the partitioned write directly. Lazy
-        import keeps the property cheap for the no-cache default.
-        """
-        tab = self.tabular
-        return False if tab is None else self.tabular.is_local
-
-    @property
-    def is_remote(self) -> bool:
-        """True when the bound :attr:`tabular` is a remote backend.
-
-        Any :class:`Tabular` that isn't a :class:`FolderPath` —
-        Databricks Table, third-party adapters — drives the remote
-        cache pipeline (predicate→SQL translation, MERGE writes,
-        spark-frame dispatch).
-        """
-        tab = self.tabular
-        return False if tab is None else self.tabular.is_remote
+        return self.received_from is not None or self.received_to is not None
 
     @property
     def local_cache_enabled(self):
         if not self.cache_enabled:
             return False
-        if self.is_local:
-            return True
         return self.received_from is not None or self.received_to is not None
 
     @property
     def remote_cache_enabled(self):
-        return self.cache_enabled and self.is_remote
+        return self.cache_enabled
 
     @property
     def match_by(self) -> list[str]:
@@ -642,8 +612,6 @@ class CacheConfig(_ConfigBase):
         Used as the per-config key for grouping cache hits in
         :class:`yggdrasil.http_.response_batch.HTTPResponseBatch`.
         """
-        if self.is_local:
-            return self.tabular.path
         root = _DEFAULT_CACHE_ROOT
         base_url = getattr(session, "base_url", None) if session is not None else None
         host = getattr(base_url, "host", None) if base_url is not None else None
@@ -976,20 +944,7 @@ class SendConfig(_ConfigBase):
     wait: WaitingConfig = field(default=DEFAULT_WAITING_CONFIG)
     remote_cache: CacheConfig | None = None
     local_cache: CacheConfig | None = None
-    # When True, ``Session._send`` consults the local + remote caches as
-    # usual but skips the network fallback — a full miss returns a
-    # synthetic 404 Not Found response (tagged ``synthetic=cache_only_miss``)
-    # instead of crossing the wire. ``send_many`` emits synthetic 404s
-    # for each miss in the ``new_hits`` bucket. Lets callers replay a
-    # known warm cache offline (or after an outage) without an unintended
-    # upstream fetch.
     cache_only: bool = False
-    # ``True`` flips the public ``Session.send_many`` return type from
-    # ``Iterator[Response]`` to a single concatenated :class:`Tabular`
-    # (an :class:`ArrowTabular` in Python mode, a :class:`Dataset`
-    # wrapping a Spark frame when a session is bound). Single-request
-    # ``Session.send`` ignores this flag — it always returns
-    # :class:`Response`.
     as_tabular: bool = False
     spark_session: Optional["SparkSession"] = field(
         default=None,
@@ -1014,7 +969,6 @@ class SendConfig(_ConfigBase):
     def __getstate__(self):
         return {
             "raise_error": self.raise_error,
-            "stream": self.stream,
             "wait": self.wait,
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
@@ -1043,7 +997,13 @@ class SendConfig(_ConfigBase):
     ) -> "SendConfig":
         try:
             if arg is None:
-                if not overrides or cls._matches_default(overrides):
+                if not overrides:
+                    if default is ...:
+                        raise ValueError(
+                            f"{cls.__name__}.from_ expects a {cls.__name__}, Mapping, or None; "
+                        )
+                    return default
+                if cls._matches_default(overrides):
                     return cls.default()
                 return cls.parse_mapping(overrides)
             if isinstance(arg, cls):

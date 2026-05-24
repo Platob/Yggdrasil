@@ -41,7 +41,7 @@ from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
 from yggdrasil.data.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.schema import Schema as DataSchema
+from yggdrasil.data.schema import Schema as DataSchema, Schema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.column.column import Column
@@ -1359,8 +1359,24 @@ class Table(DatabricksPath):
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         options = options.with_source(source=self.collect_schema())
         query = self._options_to_sql(options)
+        execution = self.sql.execute(
+            query,
+            wait=True,
+            raise_error=False
+        )
 
-        for batch in self.execute(query).read_arrow_batches(options=options):
+        try:
+            execution.raise_for_status()
+        except Exception:
+            if options.target:
+                self.create(options.target)
+                s: pa.Schema = options.target.to_arrow_schema()
+                yield pa.RecordBatch.from_pylist([], schema=s)
+                return
+            else:
+                raise
+
+        for batch in execution.read_arrow_batches(options=options):
             yield batch
 
     def _write_arrow_batches(
@@ -1392,8 +1408,26 @@ class Table(DatabricksPath):
         )
 
     def _read_spark_frame(self, options: O) -> "SparkDataFrame":
+        options = options.with_source(source=self.collect_schema(options))
         query = self._options_to_sql(options)
-        return self.sql.execute(query).read_spark_frame(options)
+        execution = self.sql.execute(
+            query,
+            wait=True,
+            raise_error=False
+        )
+
+        try:
+            execution.raise_for_status()
+        except Exception:
+            if options.target:
+                self.create(options.target)
+                s: pa.Schema = options.target.to_arrow_schema()
+                yield pa.RecordBatch.from_pylist([], schema=s)
+                return
+            else:
+                raise
+
+        return execution.read_spark_frame(options)
 
     def _write_spark_frame(
         self,
@@ -2001,7 +2035,7 @@ class Table(DatabricksPath):
 
     def create(
         self,
-        definition: Union[pa.Schema, Any],
+        definition: Schema,
         *,
         mode: Mode | str | None = None,
         storage_location: str | None = None,
@@ -2010,6 +2044,7 @@ class Table(DatabricksPath):
         table_type: TableType | None = None,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         missing_ok: bool = True,
+        wait: WaitingConfigArg = True,
         or_replace: bool = False,
         record_ygg_properties: bool = True,
     ) -> "Table":
@@ -2034,6 +2069,7 @@ class Table(DatabricksPath):
                     comment=comment,
                     missing_ok=False,
                     or_replace=True,
+                    wait=wait,
                     properties=properties,
                     data_source_format=data_source_format,
                     record_ygg_properties=record_ygg_properties,
@@ -2090,6 +2126,7 @@ class Table(DatabricksPath):
         properties: Optional[dict[str, Any]] = None,
         missing_ok: bool = True,
         or_replace: bool = False,
+        wait: WaitingConfigArg = True,
         data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
         optimize_write: bool = True,
         auto_compact: bool = True,
@@ -2097,7 +2134,6 @@ class Table(DatabricksPath):
         enable_deletion_vectors: bool | None = None,
         target_file_size: int | None = None,
         column_mapping_mode: str | None = None,
-        wait_result: bool = True,
         auto_tag: bool = True,
         record_ygg_properties: bool = True,
     ) -> "Table":
@@ -2208,7 +2244,7 @@ class Table(DatabricksPath):
         )
 
         try:
-            self.sql.execute(statement, wait=wait_result)
+            self.sql.execute(statement, wait=wait)
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
                 logger.debug(
@@ -2219,7 +2255,7 @@ class Table(DatabricksPath):
                     f"CREATE SCHEMA IF NOT EXISTS {quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
                     wait=True,
                 )
-                self.sql.execute(statement, wait=wait_result)
+                self.sql.execute(statement, wait=wait)
             elif "CONSTRAINT_ALREADY_EXISTS_IN_SCHEMA" in str(exc):
                 logger.debug(
                     "Constraint already exists on table %r — ignoring", self,
@@ -2622,7 +2658,7 @@ class Table(DatabricksPath):
         comment: str | None = None,
         properties: Optional[Mapping[str, Any]] = None,
         tags: Mapping[str, str] | None = None,
-        wait_result: bool = True,
+        wait: WaitingConfigArg = True,
     ) -> "Table":
         """Create (or replace) this Table as a Unity Catalog view.
 
@@ -2661,7 +2697,7 @@ class Table(DatabricksPath):
             self, bool(or_replace), bool(missing_ok), parsed_mode.name,
         )
         try:
-            self.sql.execute(statement, wait=wait_result)
+            self.sql.execute(statement, wait=wait)
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
                 logger.debug(
@@ -2673,7 +2709,7 @@ class Table(DatabricksPath):
                     f"{quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
                     wait=True,
                 )
-                self.sql.execute(statement, wait=wait_result)
+                self.sql.execute(statement, wait=wait)
             else:
                 raise
 
