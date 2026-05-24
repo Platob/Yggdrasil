@@ -440,7 +440,7 @@ class Dataset(Tabular[CastOptions]):
             merged = self.collect_schema().merge_with(
                 other.collect_schema(), mode=mode,
             )
-            other_frame = other.read_spark_dataset(target=merged).frame
+            other_frame = other.read_spark_frame(target=merged)
         self.frame = self._frame.unionByName(
             other_frame, allowMissingColumns=True,
         )
