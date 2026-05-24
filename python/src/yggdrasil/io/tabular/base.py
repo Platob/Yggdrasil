@@ -1233,14 +1233,19 @@ class Tabular(ABC, Generic[O]):
     def read_table(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> "Tabular | None":
-        """Read into an in-memory :class:`ArrowTabular`.
+        """Read into an in-memory :class:`Tabular`.
 
-        Materializes all batches through :meth:`read_arrow_batches`
-        (with *options* applied) and wraps them in an
-        :class:`ArrowTabular`. Returns ``None`` when the source is
-        empty after filtering.
+        When ``options.spark_session`` is set, reads via
+        :meth:`read_spark_frame` and wraps in a :class:`Dataset`.
+        Otherwise materializes Arrow batches into :class:`ArrowTabular`.
+        Returns ``None`` when empty.
         """
         options = self.check_options(options, overrides=locals())
+        spark = getattr(options, "spark_session", None) if options is not None else None
+        if spark is not None:
+            from yggdrasil.spark.tabular import Dataset as _Dataset
+            df = self._read_spark_frame(options)
+            return _Dataset(frame=df) if df is not None else None
         batches = list(self.read_arrow_batches(options=options))
         if not batches or all(b.num_rows == 0 for b in batches):
             return None

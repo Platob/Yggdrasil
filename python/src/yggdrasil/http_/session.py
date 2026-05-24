@@ -1743,16 +1743,7 @@ class HTTPSession(Session):
         cfg = getattr(requests[0], attr)
         predicate = cfg.make_batch_lookup_predicate(requests)
         opts = CastOptions(predicate=predicate, spark_session=spark_session, target=RESPONSE_SCHEMA)
-
-        if spark_session is not None:
-            try:
-                df = holder.read_spark_frame(options=opts)
-                from yggdrasil.spark.tabular import Dataset as _Dataset
-                tab = _Dataset(frame=df)
-            except Exception:
-                tab = holder.read_table(options=opts)
-        else:
-            tab = holder.read_table(options=opts)
+        tab = holder.read_table(options=opts)
 
         if tab is None:
             return None, list(requests)
