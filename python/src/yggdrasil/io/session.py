@@ -304,9 +304,9 @@ class Session(Singleton, ABC):
     def local_cache(self) -> "FolderPath":
         """Return the session-scoped local cache folder, creating the directory on first access.
 
-        The folder lives under ``~/.yggdrasil/cache/response/<host>/<path>``
+        The folder lives under ``~/.yggdrasil/.cache/http/<host>/<path>``
         when :attr:`base_url` is set (so different APIs on the same machine
-        don't collide), or ``…/response/default`` otherwise.
+        don't collide), or ``…/.cache/http/default`` otherwise.
 
         Thread-safe: the directory is created under the session lock and
         the resulting :class:`FolderPath` is cached for the lifetime of
@@ -322,7 +322,7 @@ class Session(Singleton, ABC):
             from yggdrasil.io.nested.folder_path import FolderPath
             from yggdrasil.io.path import Path
 
-            root = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
+            root = pathlib.Path.home() / ".yggdrasil" / ".cache" / "http"
             base_url = getattr(self, "base_url", None)
             host = getattr(base_url, "host", None) if base_url is not None else None
             if not host:
