@@ -190,7 +190,10 @@ class JSONFile(IO[bytes, JsonOptions]):
         """
         action = self._resolve_action(options.mode)
 
-        _has_existing = self.size_known and self.size > 0
+        _holder_overwrite = (
+            self._parent is not None and self._parent._mode is Mode.OVERWRITE
+        )
+        _has_existing = not _holder_overwrite and self.size_known and self.size > 0
         if action is Mode.IGNORE:
             if _has_existing:
                 return

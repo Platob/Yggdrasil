@@ -263,16 +263,18 @@ class XLSXSheetFile(IO[bytes, XlsxOptions]):
         """
         target_name = self.sheet_name
         action = options.mode
-        if action is Mode.IGNORE and self._xlsx_parent.size > 0:
+        _holder_overwrite = self._xlsx_parent._mode is Mode.OVERWRITE
+        _has_existing = not _holder_overwrite and self._xlsx_parent.size > 0
+        if action is Mode.IGNORE and _has_existing:
             return
-        if action is Mode.ERROR_IF_EXISTS and self._xlsx_parent.size > 0:
+        if action is Mode.ERROR_IF_EXISTS and _has_existing:
             raise FileExistsError(
                 f"{type(self).__name__} parent workbook is non-empty; "
                 f"refusing to overwrite under mode={options.mode!r}."
             )
 
         carry: list[tuple[str, list[tuple]]] = []
-        if self._xlsx_parent.size > 0:
+        if _has_existing:
             openpyxl = _openpyxl()
             with self._xlsx_parent.arrow_input_stream() as v:
                 wb = openpyxl.load_workbook(v, read_only=True, data_only=True)

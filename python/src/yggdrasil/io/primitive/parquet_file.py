@@ -300,12 +300,15 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         # the merge branch below; IGNORE / ERROR_IF_EXISTS guard the
         # buffer.
         mode = options.mode
+        _holder_overwrite = (
+            self._parent is not None and self._parent._mode is Mode.OVERWRITE
+        )
         if mode is Mode.AUTO:
             action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
         elif mode is Mode.TRUNCATE:
             action = Mode.OVERWRITE
         elif mode in _MERGE_MODES:
-            if not self.size_known or self.size == 0:
+            if _holder_overwrite or not self.size_known or self.size == 0:
                 action = Mode.OVERWRITE
             else:
                 action = mode
@@ -316,7 +319,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         else:
             action = Mode.OVERWRITE
 
-        _has_existing = self.size_known and self.size > 0
+        _has_existing = not _holder_overwrite and self.size_known and self.size > 0
         if action is Mode.IGNORE:
             if _has_existing:
                 return

@@ -309,6 +309,9 @@ class CSVFile(IO[bytes, CsvOptions]):
         # APPEND / UPSERT / MERGE keep their identity for the merge
         # branch; IGNORE / ERROR_IF_EXISTS guard the buffer.
         mode = options.mode
+        _holder_overwrite = (
+            self._parent is not None and self._parent._mode is Mode.OVERWRITE
+        )
         if mode is Mode.AUTO:
             action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
         elif mode is Mode.TRUNCATE:
@@ -320,7 +323,7 @@ class CSVFile(IO[bytes, CsvOptions]):
         else:
             action = Mode.OVERWRITE
 
-        _has_existing = self.size_known and self.size > 0
+        _has_existing = not _holder_overwrite and self.size_known and self.size > 0
         if action is Mode.IGNORE:
             if _has_existing:
                 return
