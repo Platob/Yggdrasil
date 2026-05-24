@@ -1570,12 +1570,11 @@ class HTTPSession(Session):
         remote_holder: "IO | None",
         reqs: list[PreparedRequest],
         *,
-        config: SendConfig,
-        spark: "Optional[SparkSession]" = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
         """Process one holder group: local cache → remote cache → network."""
+        spark = reqs[0].send_config_or_default.spark_session if reqs else None
         n = len(reqs)
         LOGGER.debug(
             "Processing batch (requests=%d, local=%r, remote=%r)",
@@ -1621,7 +1620,8 @@ class HTTPSession(Session):
             if rc is not None:
                 self._mirror_local_hits_to_remote(local_hits, rc)
 
-        if not misses or config.cache_only:
+        cfg = reqs[0].send_config_or_default
+        if not misses or cfg.cache_only:
             if misses:
                 LOGGER.info(
                     "Synthesising %d 404 response(s) (cache_only=True)",
@@ -1640,12 +1640,11 @@ class HTTPSession(Session):
         if spark is not None:
             return self._send_spark_batch(
                 local_hits, remote_hits, reqs, misses,
-                config=config, spark=spark,
+                spark=spark,
                 local_holder=local_holder, remote_holder=remote_holder,
             )
         return self._send_local_batch(
             local_hits, remote_hits, reqs, misses,
-            config=config,
             local_holder=local_holder, remote_holder=remote_holder,
             ordered=ordered, max_in_flight=max_in_flight,
         )
@@ -1657,7 +1656,6 @@ class HTTPSession(Session):
         reqs: list[PreparedRequest],
         misses: list[PreparedRequest],
         *,
-        config: SendConfig,
         local_holder: "IO | None",
         remote_holder: "IO | None",
         ordered: bool = False,
@@ -1667,11 +1665,11 @@ class HTTPSession(Session):
         new_list: list[Response] = []
         failed: list[Response] = []
         for response in self._fetch_misses(
-            misses, config, ordered=ordered, max_in_flight=max_in_flight,
+            misses, ordered=ordered, max_in_flight=max_in_flight,
         ):
             if response.ok:
                 new_list.append(response)
-            elif config.raise_error:
+            elif misses[0].send_config_or_default.raise_error:
                 failed.append(response)
 
         LOGGER.info(
@@ -1708,7 +1706,6 @@ class HTTPSession(Session):
         reqs: list[PreparedRequest],
         misses: list[PreparedRequest],
         *,
-        config: SendConfig,
         spark: "SparkSession",
         local_holder: "IO | None",
         remote_holder: "IO | None",
@@ -1717,7 +1714,7 @@ class HTTPSession(Session):
         LOGGER.info(
             "Scattering %d miss(es) to Spark executors", len(misses),
         )
-        new_hits = self._spark_fetch_misses(misses, config, spark)
+        new_hits = self._spark_fetch_misses(misses, spark)
         rc = reqs[0].remote_cache_config
         if remote_holder is not None and rc is not None:
             LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
@@ -1841,14 +1838,13 @@ class HTTPSession(Session):
     def _fetch_misses(
         self,
         misses: list[PreparedRequest],
-        config: SendConfig,
         *,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> Iterator[Response]:
         """Stage 3: send misses through the job pool."""
         miss_send_config = dataclasses.replace(
-            config,
+            misses[0].send_config_or_default,
             remote_cache=None,
             local_cache=None,
             spark_session=None,
@@ -2129,26 +2125,22 @@ class HTTPSession(Session):
                 continue
 
             chunk_index += 1
-            config = chunk[0].send_config_or_default
-            spark = config.spark_session
             groups = self._group_by_holders(chunk)
             LOGGER.debug(
-                "Processing chunk #%d (requests=%d, groups=%d, mode=%s)",
+                "Processing chunk #%d (requests=%d, groups=%d)",
                 chunk_index, len(chunk), len(groups),
-                "spark" if spark else "local",
             )
 
             for (local_holder, remote_holder), reqs in groups.items():
                 batch = self._send_batch(
                     local_holder, remote_holder, reqs,
-                    config=config, spark=spark,
                     ordered=ordered, max_in_flight=max_in_flight,
                 )
                 total_cache_hits += len(reqs) - len(batch.misses)
                 total_network += batch.counts.get("new", 0)
                 total_failed += len(batch.failed)
                 yield batch
-                if config.raise_error and batch.failed:
+                if batch.failed:
                     batch.failed[-1].raise_for_status()
 
         LOGGER.info(
@@ -2220,7 +2212,6 @@ class HTTPSession(Session):
     def _spark_fetch_misses(
         self,
         misses: list[PreparedRequest],
-        config: SendConfig,
         spark: "SparkSession",
     ) -> "SparkDataFrame":
         """Stage 3 on Spark: scatter misses to workers via mapInArrow.
@@ -2307,6 +2298,7 @@ class HTTPSession(Session):
         # Worker-side send config: local cache with 15-min TTL keeps
         # the executor's disk cache bounded; no remote cache — the
         # driver handles remote persistence in stage 4.
+        config = misses[0].send_config_or_default
         worker_send_config = dataclasses.replace(
             config,
             remote_cache=None,
