@@ -25,7 +25,7 @@ class _StubBenchSession(Session):
     :class:`Session` already declares.
     """
 
-    def _local_send(self, request: PreparedRequest, config: SendConfig) -> Response:
+    def _local_send(self, request: PreparedRequest) -> Response:
         return Response(
             request=request,
             status_code=200,

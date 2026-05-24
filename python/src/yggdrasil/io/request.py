@@ -413,6 +413,15 @@ class PreparedRequest:
         return self._sender
 
     @property
+    def send_config_or_default(self) -> "SendConfig":
+        """Return :attr:`send_config` or the shared default singleton."""
+        sc = self.send_config
+        if sc is not None:
+            return sc
+        from .send_config import SendConfig as _SendConfig
+        return _SendConfig.default()
+
+    @property
     def local_cache_config(self) -> "CacheConfig | None":
         """Per-request local :class:`CacheConfig`, delegated to :attr:`send_config`."""
         sc = self.send_config
@@ -504,16 +513,26 @@ class PreparedRequest:
         # Generic: every ``__dict__`` entry except the transient set
         # (``_session``) survives. Re-bind the session on the worker
         # via :meth:`attach_session`.
-        return {
+        # ``send_config`` is omitted when it's ``None`` or the default
+        # singleton — no point shipping bytes that the receiver would
+        # reconstruct identically via :attr:`send_config_or_default`.
+        from .send_config import SendConfig as _SC
+        state = {
             k: v for k, v in self.__dict__.items()
             if k not in self._TRANSIENT_STATE_ATTRS
         }
+        sc = state.get("send_config")
+        if sc is None or sc is _SC.default():
+            state.pop("send_config", None)
+        return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._session = None
         self._cache = {}
         self._cache_token = ()
+        if "send_config" not in self.__dict__:
+            self.send_config = None
         # Re-coerce in case an old pickle carried ``headers`` as a
         # plain dict — :class:`Headers.from_` is a no-op on an
         # already-built instance, so the live path stays cheap.

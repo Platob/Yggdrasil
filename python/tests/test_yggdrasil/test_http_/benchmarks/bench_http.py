@@ -488,7 +488,7 @@ def _session_scenarios(repeat: int) -> list[dict]:
     # ``prepare_request_before_send``, cache short-circuits, post hooks)
     # without involving a socket.
     class _FakeHTTPSession(HTTPSession):
-        def _local_send(self, request, config):  # type: ignore[override]
+        def _local_send(self, request):  # type: ignore[override]
             resp = Response(
                 request=request,
                 status_code=200,

@@ -23,6 +23,7 @@ should not import them directly.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import datetime as dt
 import http.client
 import itertools
@@ -1064,25 +1065,25 @@ class HTTPSession(Session):
             overrides["spark_session"] = spark_session
         base = config if config is not None else request.send_config
         cfg = SendConfig.from_(base, **overrides)
+        # Per-request cache configs always win over session-level
+        # fallbacks — stamp the request's own caches back on top.
+        req_sc = request.send_config
+        if req_sc is not None:
+            merge_back: dict[str, Any] = {}
+            if req_sc.local_cache is not None:
+                merge_back["local_cache"] = req_sc.local_cache
+            if req_sc.remote_cache is not None:
+                merge_back["remote_cache"] = req_sc.remote_cache
+            if merge_back:
+                cfg = dataclasses.replace(cfg, **merge_back)
+        request.send_config = cfg
         if not start:
             return self._build_idle_response(request, cfg)
         if cfg.spark_session is not None:
-            # Fan the wire send out to an executor via the same
-            # ``mapInArrow`` path :meth:`send_many` uses, so the
-            # network call doesn't silently fall back to the driver
-            # when the caller explicitly bound a ``SparkSession``.
-            # ``_send_many`` already drains the per-chunk Spark frame
-            # row-by-row and re-applies ``raise_error`` at the driver
-            # boundary, so the contract of ``send`` (one Response,
-            # ``raise_for_status`` on failure) is preserved.
             many_cfg = SendManyConfig.from_(cfg)
             for response in self._send_many(iter([request]), many_cfg):
                 return response
-            # The fan-out yielded nothing — ``cache_only`` with a miss
-            # or a fully short-circuited pipeline. Fall back to the
-            # driver-side send so ``send`` still honours its
-            # single-Response contract.
-        return self._send(request, cfg)
+        return self._send(request)
 
     def _build_idle_response(
         self,
@@ -1230,51 +1231,47 @@ class HTTPSession(Session):
     def _send(
         self,
         request: PreparedRequest,
-        config: SendConfig,
     ) -> Response:
         """Core send pipeline: local cache → remote cache → network → writeback.
 
-        Assumes `config` is already a fully-resolved `SendConfig` (no kwargs
-        merging, no `from_`). Intended to be called by `send`, `_send_many`,
-        and any other path that has already built its effective config.
+        Reads the fully-resolved config from
+        :attr:`PreparedRequest.send_config_or_default` — callers
+        (``send``, ``_send_many``, ``_fetch_misses``) are responsible
+        for stamping the effective :class:`SendConfig` on each request
+        *before* this method is reached.
         """
-        remote_cfg = config.remote_cache
+        config = request.send_config_or_default
         local_cfg = config.local_cache
-
-        effective_local_cfg = request.local_cache_config or local_cfg
-        effective_remote_cfg = request.remote_cache_config or remote_cfg
+        remote_cfg = config.remote_cache
 
         local_cache_tabular: Any = None
-        if effective_local_cfg is not None and effective_local_cfg.local_cache_enabled:
-            local_cache_tabular = effective_local_cfg.cache_tabular(session=self)
-            if effective_local_cfg.mode != Mode.UPSERT:
+        if local_cfg is not None and local_cfg.local_cache_enabled:
+            local_cache_tabular = local_cfg.cache_tabular(session=self)
+            if local_cfg.mode != Mode.UPSERT:
                 local_response = self._load_cached_response(
-                    request, effective_local_cfg, source="local",
+                    request, local_cfg, source="local",
                 )
                 if local_response is not None:
                     if config.raise_error:
                         local_response.raise_for_status()
                     return local_response
 
-        # --- 2. Check remote cache (slower, network-based) ---
-        # Skip when the effective config demands a forced refresh (UPSERT).
         if (
-            effective_remote_cfg is not None
-            and effective_remote_cfg.remote_cache_enabled
-            and effective_remote_cfg.mode != Mode.UPSERT
+            remote_cfg is not None
+            and remote_cfg.remote_cache_enabled
+            and remote_cfg.mode != Mode.UPSERT
         ):
             remote_response = self._load_cached_response(
                 request,
-                effective_remote_cfg,
+                remote_cfg,
                 source="remote",
                 spark_session=config.spark_session,
             )
             if remote_response is not None:
-                # Backfill local cache with the remote hit
                 if local_cache_tabular is not None:
                     self._store_cached_response(
                         remote_response,
-                        effective_local_cfg,
+                        local_cfg,
                         source="local",
                         tabular=local_cache_tabular,
                     )
@@ -1282,10 +1279,6 @@ class HTTPSession(Session):
                     remote_response.raise_for_status()
                 return remote_response
 
-        # --- 3. No cache hit — perform actual request ---
-        # ``cache_only`` callers opted out of the network fallback. The
-        # cache lookups above already ran; reaching here means both
-        # missed, so return a synthetic 404 instead of crossing the wire.
         if config.cache_only:
             response = _synthetic_not_found(request)
             if config.raise_error:
@@ -1294,24 +1287,22 @@ class HTTPSession(Session):
 
         request = self.prepare_request_before_send(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
-        response = self._local_send(request, config=config)
+        response = self._local_send(request)
         response = self.prepare_response_after_received(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
         if local_cache_tabular is not None:
             self._store_cached_response(
                 response,
-                effective_local_cfg,
+                local_cfg,
                 source="local",
                 tabular=local_cache_tabular,
             )
 
-        if effective_remote_cfg is not None and effective_remote_cfg.remote_cache_enabled:
-            # Pass the effective config so its mode (UPSERT or APPEND)
-            # is used directly by the remote write.
+        if remote_cfg is not None and remote_cfg.remote_cache_enabled:
             self._store_cached_response(
                 response,
-                effective_remote_cfg,
+                remote_cfg,
                 source="remote",
                 spark_session=config.spark_session,
             )
@@ -1328,8 +1319,8 @@ class HTTPSession(Session):
     def _local_send(
         self,
         request: PreparedRequest,
-        config: SendConfig,
     ) -> HTTPResponse:
+        config = request.send_config_or_default
         wait_cfg = self.waiting if config.wait is None else config.wait
 
         result = self._wire_send(request, wait_cfg)
@@ -2164,11 +2155,6 @@ class HTTPSession(Session):
         Returns the raw `Response` stream — caller decides what to do with
         ok/error responses (yield them, persist them, raise).
         """
-        # Both local and remote writes are mutualised — workers only run
-        # the network call. Local writes are bulk-upserted by
-        # `_backfill_local_cache` and remote writes by `_persist_remote`,
-        # so per-request cache configs are stripped from the copies handed
-        # to the workers to avoid the per-response fan-out.
         miss_send_config = config.to_send_config(
             with_remote_cache=False,
             with_local_cache=False,
@@ -2188,8 +2174,7 @@ class HTTPSession(Session):
             (
                 Job.make(
                     self._send,
-                    r.copy(send_config=None),
-                    miss_send_config,
+                    r.copy(send_config=miss_send_config),
                 )
                 for r in misses
             ),
@@ -3237,30 +3222,44 @@ class HTTPSession(Session):
         )
         request_df = spark.createDataFrame(request_table).repartition(n_parts)
 
-        # Per-executor send config: keep both local and remote cache
-        # configs so the worker's send_many can short-circuit on cache
-        # hits the driver-side fan-out didn't already catch. No spark
-        # session — the worker runs the Python path. ``raise_error=False``
-        # so individual failures don't blow up the whole partition.
-        send_config = config.to_send_config(
-            with_remote_cache=True,
+        # Worker-side send config: local cache with 15-min TTL keeps
+        # the executor's disk cache bounded; no remote cache — the
+        # driver handles remote persistence in stage 4.
+        worker_send_config = config.to_send_config(
+            with_remote_cache=False,
             with_local_cache=True,
             with_spark=False,
             raise_error=False,
         )
+        lc = worker_send_config.local_cache
+        if lc is not None:
+            worker_send_config = dataclasses.replace(
+                worker_send_config,
+                local_cache=lc.copy(received_ttl=dt.timedelta(minutes=15)),
+            )
 
-        # Pickle once on the driver; the bytes ride along with the
-        # ``mapInArrow`` closure. ``Singleton.__new__`` collapses the
-        # per-partition ``pickle.loads`` onto the executor's cached
-        # ``(cls, config)`` instance, so all partitions on one executor
-        # share a single connection pool.
         self_serialized = pickle.dumps(self)
         response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
+
+        # Broadcast session bytes and send_config so Spark distributes
+        # them once via the broadcast protocol instead of embedding the
+        # blobs in every task closure.
+        try:
+            broadcast_session = spark.sparkContext.broadcast(self_serialized)
+            broadcast_config = spark.sparkContext.broadcast(worker_send_config)
+            _use_broadcast = True
+        except Exception:
+            _use_broadcast = False
 
         def _send_partition(
             batches: Iterator[pa.RecordBatch],
         ) -> Iterator[pa.RecordBatch]:
-            session = pickle.loads(self_serialized)
+            if _use_broadcast:
+                session = pickle.loads(broadcast_session.value)
+                partition_config = broadcast_config.value
+            else:
+                session = pickle.loads(self_serialized)
+                partition_config = worker_send_config
             for batch in batches:
                 partition_requests = list(PreparedRequest.from_arrow(batch))
                 if not partition_requests:
@@ -3268,7 +3267,7 @@ class HTTPSession(Session):
 
                 def _row_batches() -> Iterator[pa.RecordBatch]:
                     for resp in session.send_many(
-                        iter(partition_requests), send_config,
+                        iter(partition_requests), partition_config,
                     ):
                         yield resp.to_arrow_batch(parse=False)
 
@@ -3698,6 +3697,7 @@ class HTTPSession(Session):
         json: Any | None = None,
         normalize: bool = True,
         send_config: SendConfig | None = None,
+        **send_kwargs: Any,
     ) -> PreparedRequest:
         full_url: URL | str | None = url
 
@@ -3709,6 +3709,9 @@ class HTTPSession(Session):
         if params:
             parsed = URL.from_(full_url, normalize=normalize)
             full_url = parsed.with_query_items(params)
+
+        if send_kwargs:
+            send_config = SendConfig.from_(send_config, **send_kwargs)
 
         return PreparedRequest.prepare(
             method=method,

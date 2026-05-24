@@ -75,7 +75,7 @@ class StubSession(HTTPSession):
         self._queue.extend(responses)
         return self
 
-    def _local_send(self, request: PreparedRequest, config: SendConfig) -> Response:
+    def _local_send(self, request: PreparedRequest) -> Response:
         self.calls.append(request)
         if self._queue:
             return self._queue.pop(0)

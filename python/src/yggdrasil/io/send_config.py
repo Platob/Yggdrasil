@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import pathlib
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
@@ -24,6 +25,43 @@ if TYPE_CHECKING:
 
 
 __all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
+
+
+# Module-level cached paths — avoids repeated syscalls in hot paths
+# (``local_cache_folder`` is called per-request in the batch pipeline).
+_HOME: pathlib.Path = pathlib.Path.home()
+_TMPDIR: str = tempfile.gettempdir()
+_DEFAULT_CACHE_ROOT: pathlib.Path = _HOME / ".yggdrasil" / "cache" / "response"
+_HOME_STR: str = str(_HOME)
+_TMPDIR_STR: str = str(_TMPDIR).rstrip("/")
+
+
+def _portable_path(url: str) -> str:
+    """Replace absolute home/tmpdir prefixes with portable tokens."""
+    home = _HOME_STR
+    if url.startswith("file://" + home):
+        return "file://~" + url[len("file://" + home):]
+    if url.startswith(home):
+        return "~" + url[len(home):]
+    tmp = _TMPDIR_STR
+    if url.startswith("file://" + tmp):
+        return "file://$TMP" + url[len("file://" + tmp):]
+    if url.startswith(tmp):
+        return "$TMP" + url[len(tmp):]
+    return url
+
+
+def _expand_portable_path(url: str) -> str:
+    """Expand portable tokens back to absolute paths for this environment."""
+    if url.startswith("file://~"):
+        return "file://" + _HOME_STR + url[len("file://~"):]
+    if url.startswith("~"):
+        return _HOME_STR + url[1:]
+    if url.startswith("file://$TMP"):
+        return "file://" + _TMPDIR_STR + url[len("file://$TMP"):]
+    if url.startswith("$TMP"):
+        return _TMPDIR_STR + url[len("$TMP"):]
+    return url
 
 
 # Identity-by-default — ``public_url_hash`` is the URL-based identity
@@ -446,7 +484,7 @@ class CacheConfig(_ConfigBase):
         if tabular_url is not None:
             from yggdrasil.io.nested.folder_path import FolderPath
             object.__setattr__(
-                self, "tabular", FolderPath(path=Path.from_(tabular_url)),
+                self, "tabular", FolderPath(path=Path.from_(_expand_portable_path(tabular_url))),
             )
         else:
             object.__setattr__(self, "tabular", None)
@@ -466,6 +504,11 @@ class CacheConfig(_ConfigBase):
 
         Local cache (FolderPath) carries an addressable path; remote
         backends are dropped from the pickle wire format.
+
+        Paths under ``$HOME`` are serialized as ``~/<rest>`` and paths
+        under the system temp dir as ``$TMP/<rest>`` so the payload
+        stays portable across environments with different home or
+        temp directory paths (e.g. driver → Spark executor).
         """
         tab = self.tabular
         if tab is None:
@@ -475,7 +518,8 @@ class CacheConfig(_ConfigBase):
         except ImportError:
             return None
         if isinstance(tab, FolderPath):
-            return str(tab.path.url)
+            raw = str(tab.path.url)
+            return _portable_path(raw)
         return None
 
     @classmethod
@@ -724,7 +768,7 @@ class CacheConfig(_ConfigBase):
         """
         if self.is_local:
             return self.tabular.path
-        root = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
+        root = _DEFAULT_CACHE_ROOT
         base_url = getattr(session, "base_url", None) if session is not None else None
         host = getattr(base_url, "host", None) if base_url is not None else None
         if not host:
