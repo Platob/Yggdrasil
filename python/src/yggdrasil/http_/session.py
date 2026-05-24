@@ -1552,6 +1552,7 @@ class HTTPSession(Session):
         if local_holder is not None:
             local_hits, misses = self._read_holder(
                 local_holder, reqs, "local_cache_config",
+                spark_session=spark,
             )
             local_count = n - len(misses)
             if local_count:
@@ -1564,6 +1565,7 @@ class HTTPSession(Session):
             before = len(misses)
             remote_hits, misses = self._read_holder(
                 remote_holder, misses, "remote_cache_config",
+                spark_session=spark,
             )
             remote_count = before - len(misses)
             if remote_count:
@@ -1732,14 +1734,31 @@ class HTTPSession(Session):
         holder: "Tabular",
         requests: list[PreparedRequest],
         attr: str,
+        *,
+        spark_session: "Optional[SparkSession]" = None,
     ) -> tuple["Tabular | None", list[PreparedRequest]]:
         """Read cache hits from a single holder, matching per request.
+
+        When *spark_session* is set, reads via ``read_spark_frame``
+        so remote backends (Databricks Table) stay on the Spark plan
+        instead of collecting to Arrow on the driver.
 
         Returns ``(hits_tabular, misses)``.
         """
         cfg = getattr(requests[0], attr)
         predicate = cfg.make_batch_lookup_predicate(requests)
-        tab = holder.read_table(options=CastOptions(predicate=predicate))
+        opts = CastOptions(predicate=predicate, spark_session=spark_session)
+
+        if spark_session is not None:
+            try:
+                df = holder.read_spark_frame(options=opts)
+                from yggdrasil.spark.tabular import Dataset as _Dataset
+                tab = _Dataset(frame=df)
+            except Exception:
+                tab = holder.read_table(options=opts)
+        else:
+            tab = holder.read_table(options=opts)
+
         if tab is None:
             return None, list(requests)
 
