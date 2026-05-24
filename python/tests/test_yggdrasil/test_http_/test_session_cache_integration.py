@@ -859,9 +859,9 @@ class TestCacheOnly:
         assert out.json() == {"v": "from-remote"}
         assert len(s.calls) == 0
 
-    def test_send_full_miss_raises_lookup_error(self, tmp_path) -> None:
-        # Both caches empty → cache_only must raise instead of firing
-        # the network request.
+    def test_send_full_miss_returns_synthetic_404(self, tmp_path) -> None:
+        # Both caches empty → cache_only returns a synthetic 404
+        # instead of firing the network request.
         cache = _local_cfg(tmp_path)
         tab = _FakeRemoteTabular()
         remote = _remote_cfg(tab)
@@ -870,18 +870,20 @@ class TestCacheOnly:
         s = StubSession()
         s.queue(make_response(request=req, body=b'{"v":"network"}'))
 
-        with pytest.raises(LookupError, match="cache_only=True"):
-            s.send(
-                req,
-                local_cache=cache,
-                remote_cache=remote,
-                cache_only=True,
-            )
+        out = s.send(
+            req,
+            local_cache=cache,
+            remote_cache=remote,
+            cache_only=True,
+            raise_error=False,
+        )
+        assert out.status_code == 404
+        assert out.tags.get("synthetic") == "cache_only_miss"
         assert len(s.calls) == 0, "cache_only must not cross the wire"
 
-    def test_send_many_drops_misses_and_keeps_hits(self, tmp_path) -> None:
-        # Local hit + full miss → cache_only yields the hit and drops
-        # the miss from the stream without any network call.
+    def test_send_many_synthesises_404_for_misses(self, tmp_path) -> None:
+        # Local hit + full miss → cache_only yields the hit and a
+        # synthetic 404 for the miss without any network call.
         cache = _local_cfg(tmp_path)
         a = make_request("https://example.com/a")
         b = make_request("https://example.com/b")
@@ -894,7 +896,13 @@ class TestCacheOnly:
             iter([a, b]),
             local_cache=cache,
             cache_only=True,
+            raise_error=False,
         ))
 
-        assert [r.json()["k"] for r in out] == ["a"]
+        cached = [r for r in out if r.status_code == 200]
+        synthetic = [r for r in out if r.status_code == 404]
+        assert len(cached) == 1
+        assert cached[0].json()["k"] == "a"
+        assert len(synthetic) == 1
+        assert synthetic[0].tags.get("synthetic") == "cache_only_miss"
         assert len(s.calls) == 0

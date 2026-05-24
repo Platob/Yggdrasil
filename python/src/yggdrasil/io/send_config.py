@@ -1057,10 +1057,11 @@ class SendConfig(_ConfigBase):
     remote_cache: CacheConfig | None = None
     local_cache: CacheConfig | None = None
     # When True, ``Session._send`` consults the local + remote caches as
-    # usual but skips the network fallback — a full miss raises
-    # :class:`LookupError` instead of crossing the wire. ``send_many``
-    # silently drops misses from the stream. Lets callers replay a known
-    # warm cache offline (or after an outage) without an unintended
+    # usual but skips the network fallback — a full miss returns a
+    # synthetic 404 Not Found response (tagged ``synthetic=cache_only_miss``)
+    # instead of crossing the wire. ``send_many`` emits synthetic 404s
+    # for each miss in the ``new_hits`` bucket. Lets callers replay a
+    # known warm cache offline (or after an outage) without an unintended
     # upstream fetch.
     cache_only: bool = False
     # ``True`` flips the public ``Session.send_many`` return type from
