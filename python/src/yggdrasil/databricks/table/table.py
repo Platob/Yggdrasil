@@ -45,7 +45,7 @@ from yggdrasil.data.schema import Schema as DataSchema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.column.column import Column
-from yggdrasil.databricks.path import DatabricksPath
+from yggdrasil.databricks.resource import DatabricksResource
 from yggdrasil.databricks.sql.sql_utils import (
     MAX_TABLE_NAME_LEN,
     quote_ident,
@@ -56,8 +56,6 @@ from yggdrasil.databricks.sql.sql_utils import (
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.io import URL
-from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ParquetFile
 from yggdrasil.io.tabular import Tabular, O
@@ -927,7 +925,7 @@ def _build_ygg_properties(schema_info: DataSchema) -> dict[str, str]:
 # Table — per-table resource
 # ===========================================================================
 
-class Table(DatabricksPath):
+class Table(DatabricksResource, Tabular, Singleton):
     """A single Unity Catalog table — DDL, DML, schema, storage helpers.
 
     Registers under :attr:`Scheme.DATABRICKS_TABLE` (``dbfs+table://``)
@@ -936,10 +934,7 @@ class Table(DatabricksPath):
     a Table through :meth:`from_url` / :meth:`to_url`. Reads and writes
     flow through the active :class:`SQLEngine` via the existing
     :class:`Tabular` hooks (``_read_arrow_batches`` /
-    ``_write_arrow_batches``); the byte-level :class:`Holder`
-    primitives are intentionally not implemented because a SQL table
-    is not a positional byte buffer — callers should use the Tabular
-    surface (``read_arrow_table`` / ``write_arrow_table`` / …).
+    ``_write_arrow_batches``).
 
     Identity is ``(client, catalog_name, schema_name, table_name)``:
     two callers asking for the same fully-qualified table under the
@@ -1032,41 +1027,6 @@ class Table(DatabricksPath):
             cls._INSTANCES.set(key, instance, ttl=ttl_arg)
             return instance
 
-    def _stat_uncached(self) -> IOStats:
-        return IOStats(
-            size=0,
-            mtime=0,
-            kind=IOKind.DIRECTORY if self.exists else IOKind.MISSING,
-            media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_TABLE
-        )
-
-    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
-        raise NotImplementedError("Table is a read-only resource")
-
-    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
-        raise NotImplementedError("Table is a read-only resource")
-
-    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
-        del parents, exist_ok
-        if not self.exists:
-            raise NotImplementedError("Table is a read-only resource")
-
-    def _ls(
-        self,
-        recursive: bool = False,
-        *,
-        singleton_ttl: Any = False,
-    ) -> Iterator["Path"]:
-        del recursive, singleton_ttl
-        return iter(())
-
-    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
-        self.delete(wait=wait, missing_ok=missing_ok)
-
-    def _remove_dir(self, recursive: bool, missing_ok: bool, wait: WaitingConfig) -> None:
-        del recursive
-        self.delete(wait=wait, missing_ok=missing_ok)
-
     def full_path(self) -> str:
         return self.full_name()
 
@@ -1153,10 +1113,6 @@ class Table(DatabricksPath):
             from .tables import Tables
             service = Tables.current()
 
-        # Build a canonical ``dbfs+table://...`` URL so :class:`Holder`
-        # has a real URL to bind ``self._url`` to. The host comes from
-        # the underlying client (when available) so the URL alone
-        # round-trips through :meth:`from_url`.
         if url is None:
             host = ""
             try:
@@ -1173,7 +1129,8 @@ class Table(DatabricksPath):
                 path="/" + "/".join(path_parts) if path_parts else "/",
             )
 
-        super().__init__(service=service, url=url, temporary=temporary)
+        super().__init__(service=service)
+        self.url = url
         self.catalog_name = catalog_name
         self.schema_name = schema_name
         # Unity Catalog caps identifiers at 255 chars. Normalize once at the
@@ -1193,81 +1150,6 @@ class Table(DatabricksPath):
     @classmethod
     def default_media_type(cls) -> MimeType:
         return MimeTypes.DATABRICKS_UNITY_CATALOG_TABLE
-
-    # ------------------------------------------------------------------
-    # Holder primitives — Table is *logical*, not byte-shaped.
-    # The Tabular surface (``read_arrow_table`` / ``write_arrow_table``
-    # / …) is the supported way to move rows; the byte-level
-    # primitives raise so a misuse fails loudly with a hint at the
-    # right surface.
-    # ------------------------------------------------------------------
-
-    @property
-    def is_memory(self) -> bool:
-        return False
-
-    @property
-    def is_local_path(self) -> bool:
-        return False
-
-    @property
-    def is_remote_path(self) -> bool:
-        # The table is *logical* — neither local nor remote in the
-        # filesystem sense. The Databricks-side identity lives in the
-        # warehouse, not at a file URL we can hand to ``is_remote_path``.
-        return False
-
-    @property
-    def size(self) -> int:
-        # A SQL table has no positional byte size. Return 0 so
-        # ``BytesIO(holder=table)``-style code sees an empty buffer
-        # instead of crashing; the byte primitives still raise on
-        # actual read/write attempts.
-        return 0
-
-    def stat(self) -> IOStats:
-        return self._stat()
-
-    def _stat(self) -> IOStats:
-        return IOStats(
-            size=0, mtime=0.0, kind=IOKind.MISSING,
-            media_type=type(self).default_media_type(),
-        )
-
-    def _read_mv(self, n: int, pos: int) -> memoryview:
-        raise NotImplementedError(
-            f"{type(self).__name__} is a logical Unity Catalog table, "
-            f"not a positional byte buffer. Use the Tabular surface "
-            f"(``read_arrow_table()``, ``read_pandas_frame()``, etc.) "
-            f"to materialize rows."
-        )
-
-    def _write_mv(self, data: memoryview, pos: int) -> int:
-        raise NotImplementedError(
-            f"{type(self).__name__} is a logical Unity Catalog table, "
-            f"not a positional byte buffer. Use ``insert(...)`` / "
-            f"``write_arrow_table(...)`` to write rows."
-        )
-
-    def reserve(self, n: int) -> None:
-        # No capacity layer to pre-grow; honor the contract by
-        # rejecting only nonsense inputs.
-        if n < 0:
-            raise ValueError(f"reserve size must be >= 0, got {n!r}")
-
-    def truncate(self, n: int) -> int:
-        raise NotImplementedError(
-            f"{type(self).__name__}.truncate is byte-shaped and does "
-            f"not apply to a SQL table. Use ``insert(..., mode='overwrite')`` "
-            f"or ``execute('TRUNCATE TABLE ...')`` for the SQL equivalent."
-        )
-
-    def _clear(self) -> None:
-        raise NotImplementedError(
-            f"{type(self).__name__}._clear is byte-shaped and does "
-            f"not apply to a SQL table. Use ``execute('DROP TABLE ...')`` "
-            f"or ``insert(..., mode='overwrite')`` for the SQL equivalent."
-        )
 
     # ------------------------------------------------------------------
     # URLBased — ``dbfs+table://[creds@]host/<cat>/<sch>/<tbl>``
@@ -1556,6 +1438,18 @@ class Table(DatabricksPath):
 
     def __str__(self):
         return self.full_name(safe=True)
+
+    def __hash__(self) -> int:
+        return hash((type(self), self.catalog_name, self.schema_name, self.table_name))
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, Table):
+            return NotImplemented
+        return (
+            self.catalog_name == other.catalog_name
+            and self.schema_name == other.schema_name
+            and self.table_name == other.table_name
+        )
 
     def __getitem__(self, item: str) -> Column:
         return self.column(item)
