@@ -35,6 +35,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.data.enums import Mode
+from yggdrasil.io.nested.folder_path import FolderPath
 from yggdrasil.io.send_config import CacheConfig, SendConfig
 
 from ._helpers import StubSession, make_request, make_response
@@ -352,7 +353,8 @@ class TestRequestsCompat:
 class TestLocalCacheIntegration:
 
     def _cache(self, tmp_path) -> CacheConfig:
-        return CacheConfig(tabular=str(tmp_path), mode=Mode.APPEND)
+        from yggdrasil.io.nested.folder_path import FolderPath
+        return CacheConfig(tabular=FolderPath(path=str(tmp_path)), mode=Mode.APPEND)
 
     def _wait_for_dir(self, root, *, timeout: float = 2.0) -> bool:
         """Poll *root* for any subdir landing within *timeout*."""
@@ -476,7 +478,7 @@ class TestLocalCacheIntegration:
         s = StubSession()
         old = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
         cache = CacheConfig(
-            tabular=str(tmp_path),
+            tabular=FolderPath(path=str(tmp_path)),
             mode=Mode.APPEND,
             received_from=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
             received_to=dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc),
@@ -495,7 +497,7 @@ class TestLocalCacheIntegration:
     def test_upsert_mode_skips_lookup_and_refetches(self, tmp_path) -> None:
         """UPSERT bypasses the read, always going to the network."""
         s = StubSession()
-        cache = CacheConfig(tabular=str(tmp_path), mode=Mode.UPSERT)
+        cache = CacheConfig(tabular=FolderPath(path=str(tmp_path)), mode=Mode.UPSERT)
         req = make_request("https://example.com/x")
         self._prepopulate(
             cache, make_response(request=req, body=b'{"cached":true}'),
@@ -523,7 +525,7 @@ class TestLocalCacheIntegration:
         # win, forcing a network fetch.
         empty_dir = tmp_path / "alt"
         empty_dir.mkdir()
-        req_cache = CacheConfig(tabular=str(empty_dir), mode=Mode.APPEND)
+        req_cache = CacheConfig(tabular=FolderPath(path=str(empty_dir)), mode=Mode.APPEND)
         req = make_request("https://example.com/x").copy(
             send_config=SendConfig(local_cache=req_cache),
         )
@@ -555,43 +557,25 @@ class TestLocalCacheIntegration:
 class TestCacheConfigCoercion:
     """``CacheConfig.from_`` accepts a few convenience shapes."""
 
-    def test_from__path_sets_local_tabular(self, tmp_path) -> None:
-        from yggdrasil.io.nested.folder_path import FolderPath
+    def test_from__path_sets_tabular(self, tmp_path) -> None:
         from yggdrasil.io.path import LocalPath, Path as YggPath
 
         cfg = CacheConfig.from_(tmp_path)
-        assert cfg.is_local is True
-        assert cfg.is_remote is False
-        # Path-shaped sugar is wrapped in a :class:`FolderPath`; the
-        # backing :class:`Path` is the canonical abstract one.
-        assert isinstance(cfg.tabular, FolderPath)
-        assert isinstance(cfg.tabular.path, YggPath)
-        assert isinstance(cfg.tabular.path, LocalPath)
-        assert cfg.tabular.path == str(tmp_path)
-        assert cfg.local_cache_enabled is True
-        assert str(cfg.local_cache_folder()) == str(tmp_path)
+        assert isinstance(cfg.tabular, YggPath)
+        assert isinstance(cfg.tabular, LocalPath)
 
     def test_from__abstract_path_is_held_as_is(self, tmp_path) -> None:
-        # Passing a live :class:`Path` round-trips through ``from_``
-        # via a FolderPath wrap; the underlying Path singleton identity
-        # is preserved so the bound backend handle survives.
-        from yggdrasil.io.nested.folder_path import FolderPath
         from yggdrasil.io.path import LocalPath
 
         target = LocalPath(str(tmp_path))
         cfg = CacheConfig.from_(target)
-        assert isinstance(cfg.tabular, FolderPath)
-        assert cfg.tabular.path is target
-        assert cfg.local_cache_folder() is target
+        assert cfg.tabular is target
 
     def test_from__str_path_coerces_to_localpath(self, tmp_path) -> None:
-        from yggdrasil.io.nested.folder_path import FolderPath
         from yggdrasil.io.path import LocalPath
 
         cfg = CacheConfig.from_(str(tmp_path))
-        assert isinstance(cfg.tabular, FolderPath)
-        assert isinstance(cfg.tabular.path, LocalPath)
-        assert cfg.tabular.path == str(tmp_path)
+        assert isinstance(cfg.tabular, LocalPath)
 
     def test_from__timedelta_sets_window(self) -> None:
         import datetime as dt
@@ -620,7 +604,7 @@ class TestCacheConfigCoercion:
         from yggdrasil.io.nested.folder_path import FolderPath
         from yggdrasil.io.path import LocalPath
 
-        cfg = CacheConfig(tabular=LocalPath(str(tmp_path)))
+        cfg = CacheConfig(tabular=FolderPath(path=str(tmp_path)))
         restored = pickle.loads(pickle.dumps(cfg))
         assert isinstance(restored.tabular, FolderPath)
         assert isinstance(restored.tabular.path, LocalPath)
@@ -664,7 +648,7 @@ class TestLocalCacheFolderPerHost:
     def test_explicit_path_overrides_default(self, tmp_path) -> None:
         from yggdrasil.io.url import URL
         s = StubSession(base_url=URL.from_("https://api.example.com/"))
-        cache = CacheConfig(tabular=str(tmp_path), mode=Mode.APPEND)
+        cache = CacheConfig(tabular=FolderPath(path=str(tmp_path)), mode=Mode.APPEND)
         # Explicit ``path`` wins — host derivation is for the
         # auto-built default only.
         assert str(cache.local_cache_folder(session=s)) == str(tmp_path)

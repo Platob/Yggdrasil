@@ -31,7 +31,9 @@ import pytest
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.http_ import HTTPSession
+from yggdrasil.io.nested.folder_path import FolderPath
 from yggdrasil.io.send_config import CacheConfig
+from yggdrasil.io.tabular import Tabular
 from yggdrasil.io.session import Session
 
 from ._helpers import make_request, make_response
@@ -54,14 +56,21 @@ def _clear_session_singleton_cache():
 # ---------------------------------------------------------------------------
 
 
-class _StubTabular:
+class _StubTabular(Tabular):
     """Minimal Tabular-like object — only the attributes the group key reads."""
 
     def __init__(self, name: str) -> None:
+        super().__init__()
         self._name = name
 
     def full_name(self, safe: bool = False) -> str:
         return self._name
+
+    def _read_arrow_batches(self, options=None):
+        return iter(())
+
+    def _write_arrow_batches(self, batches=None, options=None):
+        pass
 
 
 class TestRemoteWriteGroupKey:
@@ -244,7 +253,7 @@ class TestPartitionedLocalCache:
     def _seed(self, tmp_path: Path, *requests) -> tuple[CacheConfig, "Any"]:
         from yggdrasil.io.nested.folder_path import FolderOptions
 
-        cfg = CacheConfig(tabular=str(tmp_path))
+        cfg = CacheConfig(tabular=FolderPath(path=str(tmp_path)))
         tabular = cfg.cache_tabular()
         opts = FolderOptions(mode=cfg.mode)
         # Partition layout is auto-detected from the response batch's
@@ -323,7 +332,7 @@ class TestPartitionedLocalCache:
 
     def test_lookup_misses_when_partition_directory_empty(self, tmp_path) -> None:
         # Empty cache → predicate yields no rows, no exceptions.
-        cfg = CacheConfig(tabular=str(tmp_path))
+        cfg = CacheConfig(tabular=FolderPath(path=str(tmp_path)))
         tabular = cfg.cache_tabular()
         req = make_request("https://example.com/x")
         predicate = cfg.make_lookup_predicate(request=req)

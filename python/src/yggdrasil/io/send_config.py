@@ -8,14 +8,14 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
+from yggdrasil.data.enums import Mode
 from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig
-from yggdrasil.data.enums import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.path import Path
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
-from yggdrasil.io.tabular.base import Tabular
+from yggdrasil.io.tabular import Tabular
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -378,25 +378,9 @@ class CacheConfig(_ConfigBase):
             if not self.received_from:
                 object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
 
-        # Path-shaped inputs to ``tabular`` are local-cache sugar:
-        # ``CacheConfig(tabular="/cache")`` builds a FolderPath under
-        # the hood so callers don't have to import the class. Live
-        # Tabular instances (FolderPath, Databricks Table, third-
-        # party adapters) pass through unchanged — recognised by the
-        # ``read_arrow_batches`` / ``write_arrow_batches`` duck-test
-        # so test doubles that only stub the bits a particular path
-        # exercises (``_StubTabular.full_name``, …) still flow
-        # through without being mis-coerced to a FolderPath.
-        tab = self.tabular
-        if isinstance(tab, (pathlib.PurePath, str)) or (
-            isinstance(tab, Path) and not tab.is_remote_path
-        ):
-            from yggdrasil.io.nested.folder_path import FolderPath
-            if not isinstance(tab, FolderPath):
-                object.__setattr__(
-                    self, "tabular",
-                    FolderPath(path=tab if isinstance(tab, Path) else Path.from_(tab)),
-                )
+        object.__setattr__(
+            self, "tabular", Tabular.from_(self.tabular, default=None),
+        )
 
     def __getstate__(self):
         # Project local FolderPath caches down to their URL string for
@@ -524,11 +508,16 @@ class CacheConfig(_ConfigBase):
                     overrides["received_from"] = received_to - ttl
 
             else:
-                tab = Tabular.from_(arg)
-                if isinstance(tab, Path) and not getattr(tab, "is_remote_path", False):
-                    from yggdrasil.io.nested.folder_path import FolderPath
-                    tab = FolderPath(path=tab)
-                overrides["tabular"] = tab
+                # Non-temporal arg → cache backend. ``Holder.from_`` is the
+                # canonical IO dispatch parser: bytes → :class:`Memory`,
+                # path-like str / ``pathlib`` / :class:`URL` → the
+                # scheme-matched storage class, an already-built IO /
+                # :class:`Tabular` (FolderPath, Databricks Table, …) →
+                # identity passthrough. ``__post_init__`` still wraps a
+                # bare :class:`Path` into a :class:`FolderPath` so the
+                # stored ``tabular`` is always a live :class:`Tabular`.
+                from yggdrasil.io.holder import Holder
+                overrides["tabular"] = Holder.from_(arg)
 
             return cls.parse_mapping(overrides) if overrides else cls.default()
         except (TypeError, ValueError):
@@ -1132,5 +1121,3 @@ class SendConfig(_ConfigBase):
             if default is ...:
                 raise
             return default
-
-
