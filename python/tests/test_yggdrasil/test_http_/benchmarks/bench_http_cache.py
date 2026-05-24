@@ -521,17 +521,8 @@ def _send_many_cache_scenarios(repeat: int) -> list[dict]:
     for r in cold_batch:
         _ = r.public_hash, r.public_url_hash
     out.append(_time_one(
-        f"Session._split_local_cache (all miss, {BATCH_SIZE} req)",
-        lambda: SESSION._split_local_cache(cold_batch, CFG_LOCAL),
-        repeat=repeat, inner=200,
-    ))
-
-    # Same scan when no local cache is active anywhere in the batch —
-    # the early-exit predicate matters because hot Spark workers /
-    # cache-disabled callers walk this path on every chunk.
-    out.append(_time_one(
-        f"Session._split_local_cache (cache off, {BATCH_SIZE} req)",
-        lambda: SESSION._split_local_cache(cold_batch, CFG_DEFAULT),
+        f"Session._group_by_holders ({BATCH_SIZE} req)",
+        lambda: SESSION._group_by_holders(cold_batch),
         repeat=repeat, inner=2_000,
     ))
 
