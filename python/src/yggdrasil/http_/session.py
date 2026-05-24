@@ -1576,6 +1576,11 @@ class HTTPSession(Session):
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
         """Process one holder group: local cache → remote cache → network."""
+        n = len(reqs)
+        LOGGER.debug(
+            "Processing batch (requests=%d, local=%r, remote=%r)",
+            n, local_holder, remote_holder,
+        )
         local_hits: "Tabular | None" = None
         remote_hits: "Tabular | None" = None
         misses = reqs
@@ -1584,12 +1589,29 @@ class HTTPSession(Session):
             local_hits, misses = self._read_holder(
                 local_holder, reqs, "local_cache_config",
             )
+            local_count = n - len(misses)
+            if local_count:
+                LOGGER.info(
+                    "Local cache hit %d/%d request(s) in %r",
+                    local_count, n, local_holder,
+                )
 
         if remote_holder is not None and misses:
+            before = len(misses)
             remote_hits, misses = self._read_holder(
                 remote_holder, misses, "remote_cache_config",
             )
+            remote_count = before - len(misses)
+            if remote_count:
+                LOGGER.info(
+                    "Remote cache hit %d/%d request(s) in %r",
+                    remote_count, before, remote_holder,
+                )
             if remote_hits is not None and local_holder is not None:
+                LOGGER.debug(
+                    "Backfilling %d remote hit(s) to local cache %r",
+                    remote_count, local_holder,
+                )
                 self._backfill_local_cache(
                     remote_hits, {local_holder: reqs},
                 )
@@ -1600,12 +1622,21 @@ class HTTPSession(Session):
                 self._mirror_local_hits_to_remote(local_hits, rc)
 
         if not misses or config.cache_only:
+            if misses:
+                LOGGER.info(
+                    "Synthesising %d 404 response(s) (cache_only=True)",
+                    len(misses),
+                )
             new_hits = [_synthetic_not_found(r) for r in misses] if misses else None
             return HTTPResponseBatch(
                 local_hits=local_hits, remote_hits=remote_hits,
                 new_hits=new_hits, spark=spark, misses=misses,
             )
 
+        LOGGER.debug(
+            "Fetching %d miss(es) via %s",
+            len(misses), "spark" if spark else "thread pool",
+        )
         if spark is not None:
             return self._send_spark_batch(
                 local_hits, remote_hits, reqs, misses,
@@ -1643,6 +1674,12 @@ class HTTPSession(Session):
             elif config.raise_error:
                 failed.append(response)
 
+        LOGGER.info(
+            "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
+            len(new_list) + len(failed), len(misses),
+            len(new_list), len(failed),
+        )
+
         if new_list:
             _hits = new_list
             wb: list[Callable] = []
@@ -1653,6 +1690,10 @@ class HTTPSession(Session):
                     responses_to_tabular(_hits), {local_holder: reqs},
                 ))
             if wb:
+                LOGGER.debug(
+                    "Writing back %d response(s) to %d cache(s)",
+                    len(new_list), len(wb),
+                )
                 self._run_concurrently(wb, thread_name_prefix="ygg-wb")
 
         return HTTPResponseBatch(
@@ -1673,9 +1714,13 @@ class HTTPSession(Session):
         remote_holder: "IO | None",
     ) -> HTTPResponseBatch:
         """Fetch misses via Spark mapInArrow and persist to remote cache."""
+        LOGGER.info(
+            "Scattering %d miss(es) to Spark executors", len(misses),
+        )
         new_hits = self._spark_fetch_misses(misses, config, spark)
         rc = reqs[0].remote_cache_config
         if remote_holder is not None and rc is not None:
+            LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
             self._spark_persist_remote(new_hits, rc, spark=spark)
         return HTTPResponseBatch(
             local_hits=local_hits, remote_hits=remote_hits,
@@ -2087,6 +2132,11 @@ class HTTPSession(Session):
             config = chunk[0].send_config_or_default
             spark = config.spark_session
             groups = self._group_by_holders(chunk)
+            LOGGER.debug(
+                "Processing chunk #%d (requests=%d, groups=%d, mode=%s)",
+                chunk_index, len(chunk), len(groups),
+                "spark" if spark else "local",
+            )
 
             for (local_holder, remote_holder), reqs in groups.items():
                 batch = self._send_batch(
