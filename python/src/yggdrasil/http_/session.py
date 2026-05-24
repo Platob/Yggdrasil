@@ -1614,22 +1614,17 @@ class HTTPSession(Session):
     def _split_local_cache(
         self,
         batch: list[PreparedRequest],
-    ) -> tuple[dict[Path, list[Response]], list[PreparedRequest]]:
+    ) -> tuple["Tabular | None", list[PreparedRequest]]:
         """Stage 1: scan the local cache.
 
-        Returns ``(hits_by_path, misses)``. UPSERT entries bypass the
-        read entirely (always miss, refetch). Non-UPSERT requests are
-        grouped by their effective cache :class:`FolderPath` so we
-        execute exactly **one** partition-pruned folder read per
-        cache root — mirrors :meth:`_split_remote_cache`'s
-        "one SQL per table" shape so the lookup cost scales with
-        backend, not with request count.
+        Returns ``(hits_tabular, misses)``. Hits are wrapped in an
+        :class:`ArrowTabular`; ``None`` when everything misses.
+        UPSERT entries bypass the read entirely (always miss).
         """
-        hits: dict[Path, list[Response]] = {}
         misses: list[PreparedRequest] = []
 
         if not any(r.local_cache_config for r in batch):
-            return hits, list(batch)
+            return None, list(batch)
 
         path_to_cfg: dict[Path, CacheConfig] = {}
         path_to_reqs: dict[Path, list[PreparedRequest]] = {}
@@ -1648,22 +1643,21 @@ class HTTPSession(Session):
                 path_to_reqs[root] = bucket = []
             bucket.append(req)
 
+        all_hits: list[Response] = []
         for root, reqs in path_to_reqs.items():
             eff = path_to_cfg[root]
             r_hits, r_misses = self._lookup_cached(eff, reqs, source="local")
-            if r_hits:
-                hits[root] = r_hits
+            all_hits.extend(r_hits)
             misses.extend(r_misses)
 
-        if hits:
-            total = sum(len(v) for v in hits.values())
+        if all_hits:
             LOGGER.info(
-                "Batch local cache: %d/%d hit(s) across %d path(s) — "
-                "skipping network for %d request(s); breakdown: %s",
-                total, len(batch), len(hits), total,
-                ", ".join(f"{p!r}={len(v)}" for p, v in hits.items()),
+                "Batch local cache: %d/%d hit(s)",
+                len(all_hits), len(batch),
             )
-        return hits, misses
+            from yggdrasil.http_.response_batch import responses_to_tabular
+            return responses_to_tabular(all_hits), misses
+        return None, misses
 
     def _split_remote_cache(
         self,
@@ -2285,7 +2279,7 @@ class HTTPSession(Session):
 
     def _mirror_local_hits_to_remote(
         self,
-        local_hits_by_path: Mapping[Path, "list[Response]"],
+        local_hits: "list[Response]",
     ) -> None:
         """Bulk-upsert local-cache hits into the remote cache.
 
@@ -2293,17 +2287,11 @@ class HTTPSession(Session):
         sessions skip it entirely. Each response's remote cache config
         is read from ``response.request.remote_cache_config``.
         """
-        if not local_hits_by_path:
-            return
-
-        flat: list[Response] = [
-            r for hits in local_hits_by_path.values() for r in hits
-        ]
-        if not flat:
+        if not local_hits:
             return
 
         keep: list[Response] = []
-        for response in flat:
+        for response in local_hits:
             req = response.request
             if req is None:
                 continue
@@ -2509,28 +2497,30 @@ class HTTPSession(Session):
             )
 
             # --- Cached path: local → remote → network for misses ---
-            local_hits: "list[Response] | None" = None
-            remote_hits: "list[Response] | None" = None
-            local_hits_by_path: "dict[Path, list[Response]]" = {}
+            local_hits: "Tabular | None" = None
+            remote_hits: "Tabular | list[Response] | None" = None
             cache_misses: list[PreparedRequest] = list(cached)
 
             if cached:
-                local_hits_by_path, cache_misses = self._split_local_cache(cached)
-                local_flat = [r for hits in local_hits_by_path.values() for r in hits]
-                local_hits = local_flat or None
+                local_hits, cache_misses = self._split_local_cache(cached)
 
                 if cache_misses:
                     remote_hits_by_table, cache_misses = self._split_remote_cache(
                         cache_misses,
                     )
-                    self._backfill_local_cache([
+                    remote_flat = [
                         r
                         for table_hits in remote_hits_by_table.values()
                         for r in table_hits
-                    ])
+                    ]
+                    self._backfill_local_cache(remote_flat)
                     remote_hits = self._flatten_remote_hits(remote_hits_by_table)
 
-                self._mirror_local_hits_to_remote(local_hits_by_path)
+                if local_hits is not None:
+                    local_responses = list(
+                        Response.from_arrow_tabular(local_hits.read_arrow_batches())
+                    )
+                    self._mirror_local_hits_to_remote(local_responses)
 
             # --- Network: uncached requests + cache misses ---
             to_fetch = uncached + cache_misses
@@ -2605,7 +2595,7 @@ class HTTPSession(Session):
                 else:
                     new_hits = new_list or None
 
-            local_count = len(local_hits) if local_hits else 0
+            local_count = local_hits.num_rows if local_hits is not None else 0
             remote_count = len(remote_hits) if isinstance(remote_hits, list) else 0
             net_count = len(new_hits) if isinstance(new_hits, list) else 0
             total_local += local_count
