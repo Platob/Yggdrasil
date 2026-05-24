@@ -33,7 +33,9 @@ from __future__ import annotations
 import ctypes
 import fnmatch
 import os
+import pathlib
 import sys
+import tempfile
 from dataclasses import dataclass, field, replace
 from abc import ABC, abstractmethod
 from pathlib import Path, PurePosixPath
@@ -71,6 +73,12 @@ __all__ = [
 ]
 
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+
+# Module-level cached paths — evaluated once at import so pickle
+# round-trips (driver → Spark executor, multiprocessing) don't call
+# ``Path.home()`` / ``tempfile.gettempdir()`` per URL.
+_HOME_PATH: str = str(pathlib.Path.home())
+_TMPDIR_PATH: str = str(tempfile.gettempdir()).rstrip("/")
 
 _SAFE_PATH = "/:@-._~!$&'()*+,;="
 _SAFE_QUERY = "-._~!$'()*+,;=:@/?&="
@@ -602,6 +610,51 @@ class URL(os.PathLike):
         # use object.__setattr__.
         if self.port == 0:
             object.__setattr__(self, "port", None)
+
+    # ------------------------------------------------------------------
+    # Pickle — portable local paths
+    # ------------------------------------------------------------------
+    # ``file://`` URLs that fall under ``$HOME`` or the system temp dir
+    # are serialized with portable tokens (``~``, ``$TMP``) so a pickle
+    # produced on one machine can be loaded on another where those
+    # directories differ (e.g. driver → Spark executor).  Non-file URLs
+    # pass through unchanged.
+
+    def __getstate__(self) -> dict[str, Any]:
+        path = self.path
+        if self.scheme == "file" and path:
+            path = _portable_file_path(path)
+        return {
+            "scheme": self.scheme,
+            "userinfo": self.userinfo,
+            "host": self.host,
+            "port": self.port,
+            "path": path,
+            "query": self.query,
+            "fragment": self.fragment,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        path = state["path"]
+        scheme = state.get("scheme", "")
+        if scheme == "file" and path:
+            path = _expand_file_path(path)
+        object.__setattr__(self, "scheme", scheme)
+        object.__setattr__(self, "userinfo", state.get("userinfo"))
+        object.__setattr__(self, "host", state.get("host", ""))
+        port = state.get("port")
+        object.__setattr__(self, "port", None if port == 0 else port)
+        object.__setattr__(self, "path", path or "/")
+        object.__setattr__(self, "query", state.get("query"))
+        object.__setattr__(self, "fragment", state.get("fragment"))
+        # Reset memoization caches
+        object.__setattr__(self, "_str_enc", None)
+        object.__setattr__(self, "_str_raw", None)
+        object.__setattr__(self, "_anonymized", None)
+        object.__setattr__(self, "_anonymized_cache", None)
+        object.__setattr__(self, "_parent_url", None)
+        object.__setattr__(self, "_extensions_cache", ...)
+        object.__setattr__(self, "_media_type_cache", ...)
 
     @classmethod
     def is_urlish(cls, value: Any) -> bool:
@@ -1896,6 +1949,30 @@ class URL(os.PathLike):
 
 
 _EMPTY_URL = URL()
+
+
+def _portable_file_path(path: str) -> str:
+    """Replace absolute home / tmpdir prefixes with portable tokens.
+
+    Operates on the ``path`` component of a ``file://`` URL (e.g.
+    ``/home/user/.yggdrasil/cache/...``).
+    """
+    home = _HOME_PATH
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    tmp = _TMPDIR_PATH
+    if path.startswith(tmp):
+        return "$TMP" + path[len(tmp):]
+    return path
+
+
+def _expand_file_path(path: str) -> str:
+    """Expand portable tokens back to absolute paths."""
+    if path.startswith("~/") or path == "~":
+        return _HOME_PATH + path[1:]
+    if path.startswith("$TMP/") or path == "$TMP":
+        return _TMPDIR_PATH + path[4:]
+    return path
 
 
 # ===========================================================================
