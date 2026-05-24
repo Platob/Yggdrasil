@@ -600,7 +600,7 @@ class TestInitWidgets:
 
         dd = next(c for c in dbutils.widgets.calls if c[0] == "dropdown")
         assert dd[1][0] == "color"
-        assert dd[1][2] == ("red", "blue")
+        assert dd[1][2] == ("RED", "BLUE")
 
     def test_datetime_widget_isoformat(self) -> None:
         import datetime as dt

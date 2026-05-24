@@ -573,11 +573,11 @@ class SystemParameters(MappingABC):
                 return value.strftime("%Y-%m-%d")
         if widget_type is WidgetType.MULTISELECT and isinstance(value, (list, tuple, set, frozenset)):
             return ",".join(
-                v.value if isinstance(v, Enum) else str(v)
+                v.name if isinstance(v, Enum) else str(v)
                 for v in value
             )
         if isinstance(value, Enum):
-            return str(value.value)
+            return value.name
         return str(value)
 
     @classmethod
@@ -594,10 +594,10 @@ class SystemParameters(MappingABC):
         if field_type is bool:
             options = ["true", "false"]
         elif isinstance(field_type, type) and issubclass(field_type, Enum):
-            options = [str(e.value) for e in field_type]
+            options = [e.name for e in field_type]
         elif isinstance(default, (list, set, tuple, frozenset)) and default:
             options = [
-                v.value if isinstance(v, Enum) else str(v)
+                v.name if isinstance(v, Enum) else str(v)
                 for v in default
             ]
         else:
@@ -605,13 +605,16 @@ class SystemParameters(MappingABC):
         if not options:
             options = [ALL_VALUES_TAG]
 
+        default_str = cls._format_widget_default(default, widget_type)
+        if default_str not in options:
+            default_str = options[0]
         label = nice_label(name)
         if widget_type is WidgetType.DROPDOWN:
-            dbutils.widgets.dropdown(name, options[0], options, label)
+            dbutils.widgets.dropdown(name, default_str, options, label)
         elif widget_type is WidgetType.COMBOBOX:
-            dbutils.widgets.combobox(name, options[0], options, label)
+            dbutils.widgets.combobox(name, default_str, options, label)
         elif widget_type is WidgetType.MULTISELECT:
-            dbutils.widgets.multiselect(name, options[0], options, label)
+            dbutils.widgets.multiselect(name, default_str, options, label)
         else:  # TEXT and DATETIME both use text widgets.
             dbutils.widgets.text(
                 name,
