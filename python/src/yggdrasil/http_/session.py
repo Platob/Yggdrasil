@@ -3061,11 +3061,9 @@ class HTTPSession(Session):
     ) -> "SparkDataFrame":
         """Stage 3 on Spark: scatter misses to workers via mapInArrow.
 
-        Requests are pickled with their session detached so the full
-        ``send_config`` (including per-request ``raise_error``) survives
-        the Spark serialization boundary.  Each pickled blob travels as
-        a single ``large_binary`` column; workers unpickle, re-attach the
-        broadcast session, and fan out via ``send_many``.
+        Requests cross the wire as an Arrow table with the canonical
+        :data:`~yggdrasil.io.request.REQUEST_SCHEMA` — deterministic
+        columns, no pickled Python objects in the row payload.
 
         The driver-side :class:`Session` itself is pickled once with
         :func:`pickle.dumps` and that bytes blob travels with the
@@ -3112,11 +3110,11 @@ class HTTPSession(Session):
             len(misses),
         )
 
-        # Pickle each request with session detached — preserves the full
-        # send_config (raise_error, cache configs, etc.) across Spark.
-        pickled_requests = [pickle.dumps(r.detach_session()) for r in misses]
-        request_table = pa.table(
-            {"_pkl": pa.array(pickled_requests, type=pa.large_binary())},
+        # One C++-side struct walk turns the request list into a single
+        # Arrow table that matches REQUEST_SCHEMA column-for-column.
+        # No per-row pickle, no closure capture of ``self``.
+        request_table = pa.Table.from_batches(
+            [PreparedRequest.values_to_arrow_batch(misses)]
         )
 
         # Spread requests across many partitions so mapInArrow scatters
@@ -3181,22 +3179,20 @@ class HTTPSession(Session):
                 session = pickle.loads(self_serialized)
                 partition_config = worker_send_config
             for batch in batches:
-                pkl_col = batch.column("_pkl")
-                partition_requests = [
-                    pickle.loads(pkl_col[i].as_py())
-                    for i in range(batch.num_rows)
-                ]
+                partition_requests = list(PreparedRequest.from_arrow(batch))
                 if not partition_requests:
                     continue
 
-                responses = list(session.send_many(
-                    iter(partition_requests), partition_config,
-                ))
-                if responses:
-                    yield from rechunk_arrow_batches(
-                        (r.to_arrow_batch(parse=False) for r in responses),
-                        byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
-                    )
+                def _row_batches() -> Iterator[pa.RecordBatch]:
+                    for resp in session.send_many(
+                        iter(partition_requests), partition_config,
+                    ):
+                        yield resp.to_arrow_batch(parse=False)
+
+                yield from rechunk_arrow_batches(
+                    _row_batches(),
+                    byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
+                )
 
         result_df = request_df.mapInArrow(
             _send_partition, schema=response_spark_schema,
