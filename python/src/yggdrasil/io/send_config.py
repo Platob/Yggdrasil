@@ -60,7 +60,6 @@ _SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
         "wait",
         "raise_error",
-        "stream",
         "remote_cache",
         "local_cache",
         "cache_only",
@@ -951,7 +950,6 @@ class SendConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _SEND_CONFIG_FIELDS
 
     raise_error: bool = True
-    stream: bool = True
     wait: WaitingConfig = field(default=DEFAULT_WAITING_CONFIG)
     remote_cache: CacheConfig | None = None
     local_cache: CacheConfig | None = None
@@ -980,7 +978,6 @@ class SendConfig(_ConfigBase):
     def __getstate__(self):
         return {
             "raise_error": self.raise_error,
-            "stream": self.stream,
             "wait": self.wait,
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
@@ -991,7 +988,6 @@ class SendConfig(_ConfigBase):
 
     def __setstate__(self, state):
         object.__setattr__(self, "raise_error", state.get("raise_error", True))
-        object.__setattr__(self, "stream", state.get("stream", True))
         object.__setattr__(self, "wait", state.get("wait", DEFAULT_WAITING_CONFIG))
         object.__setattr__(self, "remote_cache", state.get("remote_cache"))
         object.__setattr__(self, "local_cache", state.get("local_cache"))

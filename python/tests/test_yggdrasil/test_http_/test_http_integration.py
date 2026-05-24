@@ -684,13 +684,14 @@ class TestLocalCacheFolderPerHost:
 class TestSendConfig:
 
     def test_from__accepts_dict(self) -> None:
-        cfg = SendConfig.from_({"raise_error": False, "stream": False})
+        cfg = SendConfig.from_({"raise_error": False})
         assert cfg.raise_error is False
 
     def test_from__accepts_send_config(self) -> None:
         base = SendConfig(raise_error=False)
-        merged = SendConfig.from_(base, stream=False)
+        merged = SendConfig.from_(base, cache_only=True)
         assert merged.raise_error is False
+        assert merged.cache_only is True
 
     def test_local_cache_folder_default(self) -> None:
         cfg = CacheConfig()
