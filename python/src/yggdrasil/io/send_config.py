@@ -64,7 +64,6 @@ _SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
         "local_cache",
         "cache_only",
         "spark_session",
-        "as_tabular",
     }
 )
 
@@ -954,7 +953,6 @@ class SendConfig(_ConfigBase):
     remote_cache: CacheConfig | None = None
     local_cache: CacheConfig | None = None
     cache_only: bool = False
-    as_tabular: bool = False
     spark_session: Optional["SparkSession"] = field(
         default=None,
         hash=False,
@@ -982,7 +980,6 @@ class SendConfig(_ConfigBase):
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
             "cache_only": self.cache_only,
-            "as_tabular": self.as_tabular,
             "spark_session": None,
         }
 
@@ -992,7 +989,6 @@ class SendConfig(_ConfigBase):
         object.__setattr__(self, "remote_cache", state.get("remote_cache"))
         object.__setattr__(self, "local_cache", state.get("local_cache"))
         object.__setattr__(self, "cache_only", state.get("cache_only", False))
-        object.__setattr__(self, "as_tabular", state.get("as_tabular", False))
         object.__setattr__(self, "spark_session", None)
 
     @classmethod

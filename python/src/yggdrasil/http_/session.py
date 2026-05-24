@@ -1008,9 +1008,6 @@ class HTTPSession(Session):
         """Prepare, dispatch, and (optionally) await the response.
 
         Single-request entry point — always returns a :class:`Response`.
-        :class:`SendConfig.as_tabular` is accepted for API symmetry with
-        :meth:`send_many` but ignored here: a one-row tabular is what
-        :meth:`send_many` already produces, so wrapping a single send
         adds no value.
 
         When ``spark_session`` is bound (or ``True`` / ``...`` resolved
@@ -1477,18 +1474,14 @@ class HTTPSession(Session):
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         cache_only: bool = False,
-        as_tabular: bool = False,
         spark_session: Optional["SparkSession"] = None,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
         max_batch_ttl: float | None = None,
         **options,
-    ) -> "Iterator[Response] | Tabular":
+    ) -> Iterator[Response]:
         """Stream responses for a batch of requests.
-
-        Yields :class:`Response` objects one at a time by default.
-        ``as_tabular=True`` concatenates into a single :class:`Tabular`.
 
         Batch orchestration kwargs (``batch_size``, ``ordered``,
         ``max_in_flight``, ``max_batch_ttl``) control chunking and
@@ -1502,7 +1495,6 @@ class HTTPSession(Session):
             remote_cache=remote_cache,
             local_cache=local_cache,
             cache_only=cache_only,
-            as_tabular=as_tabular,
             spark_session=spark_session,
             **options,
         )
@@ -1515,30 +1507,14 @@ class HTTPSession(Session):
             batch_kw["max_in_flight"] = max_in_flight
         if max_batch_ttl is not None:
             batch_kw["max_batch_ttl"] = max_batch_ttl
+
         def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
             for r in reqs:
                 if r.send_config is None:
                     r.send_config = cfg
                 yield r
 
-        stamped = _stamp(requests)
-        if not cfg.as_tabular:
-            return self._send_many(stamped, **batch_kw)
-
-        spark = cfg.spark_session
-        accumulator: HTTPResponseBatch | None = None
-        for batch in self._send_many_batches(stamped, **batch_kw):
-            if accumulator is None:
-                accumulator = batch
-            else:
-                accumulator.extend(batch)
-        if accumulator is None:
-            if spark is not None:
-                from yggdrasil.http_.response_batch import spark_to_tabular
-                return spark_to_tabular(self._cached_empty_spark_frame(spark))
-            from yggdrasil.arrow.tabular import ArrowTabular
-            return ArrowTabular(RESPONSE_ARROW_SCHEMA.empty_table())
-        return accumulator.to_tabular(spark)
+        return self._send_many(_stamp(requests), **batch_kw)
 
     # ------------------------------------------------------------------ #
     # send_many — staged pipeline                                         #
