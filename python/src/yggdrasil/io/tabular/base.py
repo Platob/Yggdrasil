@@ -1236,11 +1236,13 @@ class Tabular(ABC, Generic[O]):
         """Read into an in-memory :class:`Tabular`.
 
         When ``options.spark_session`` is set, reads via
-        :meth:`read_spark_frame` and wraps in a :class:`Dataset`.
+        :meth:`_read_spark_frame` and wraps in a :class:`Dataset`.
         Otherwise materializes Arrow batches into :class:`ArrowTabular`.
         Returns ``None`` when empty.
         """
-        options = self.check_options(options, overrides=locals())
+        return self._read_table(self.check_options(options, overrides=locals()))
+
+    def _read_table(self, options: O) -> "Tabular | None":
         spark = getattr(options, "spark_session", None) if options is not None else None
         if spark is not None:
             from yggdrasil.spark.tabular import Dataset as _Dataset
