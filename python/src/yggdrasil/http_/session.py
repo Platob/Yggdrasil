@@ -2320,9 +2320,9 @@ class HTTPSession(Session):
                     new_hits = [_synthetic_not_found(r) for r in misses]
                 elif misses and spark is not None:
                     new_hits = self._spark_fetch_misses(misses, config, spark)
-                    if remote_holder is not None:
-                        _rcfg = {r.public_url_hash: r.remote_cache_config for r in misses}
-                        self._spark_persist_remote(new_hits, _rcfg, spark=spark)
+                    rc = reqs[0].remote_cache_config
+                    if remote_holder is not None and rc is not None:
+                        self._spark_persist_remote(new_hits, rc, spark=spark)
                 elif misses:
                     new_list: list[Response] = []
                     for response in self._fetch_misses(
@@ -2378,173 +2378,57 @@ class HTTPSession(Session):
     def _spark_persist_remote(
         self,
         new_responses_df: "SparkDataFrame",
-        key_to_remote_cfg: Mapping[int, CacheConfig],
+        cfg: CacheConfig,
         *,
         spark: "SparkSession",
     ) -> None:
-        """Stage 4 on Spark: per-request bulk-insert into the remote cache.
+        """Stage 4 on Spark: bulk-insert ok responses into the remote cache.
 
-        Mirrors :meth:`_persist_remote`: each ``public_url_hash`` resolves
-        to its effective :class:`CacheConfig` via ``key_to_remote_cfg``,
-        groups bucket by :meth:`_remote_write_group_key`, and each group's
-        insert runs concurrently. The Spark frame is persisted once when
-        more than one group fires so the network fetch behind it doesn't
-        re-execute per group; single-group inserts keep the legacy
-        zero-persist plan.
-
-        Before inserting, APPEND-mode writes are de-duplicated against the
-        existing remote rows via a ``left_anti`` join on the response
-        ``(partition_key, public_hash)`` keys — the remote table stores
-        anonymized requests (cf. ``_persist_remote``), so a row whose
-        hash already lives in the cache is suppressed rather than
-        re-inserted. UPSERT mode keeps its read-free fast path and
-        relies on ``match_by`` to collapse duplicates server-side.
+        APPEND-mode writes are de-duplicated against existing rows via
+        a ``left_anti`` join on ``(partition_key, public_hash)``.
         """
+        if not cfg.remote_cache_enabled:
+            return
         from pyspark.sql import functions as F
 
-        # Bucket request hashes by their effective remote-cache config's
-        # write group. Disabled configs drop out here so the persist
-        # path never fires for them.
-        groups: dict[tuple, tuple[CacheConfig, list[int]]] = {}
-        for cfg_key, eff in key_to_remote_cfg.items():
-            if eff is None or not eff.remote_cache_enabled:
-                continue
-            gkey = self._remote_write_group_key(eff)
-            if gkey not in groups:
-                groups[gkey] = (eff, [])
-            groups[gkey][1].append(cfg_key)
-
-        if not groups:
-            LOGGER.info(
-                "Spark stage 4: no remote-cache groups to persist "
-                "(all configs disabled or missing)",
-            )
-            return
-
-        LOGGER.info(
-            "Spark stage 4: persisting into %d remote-cache group(s) — %s",
-            len(groups),
-            ", ".join(
-                f"{cfg.tabular.full_name(safe=True)} "
-                f"(mode={cfg.mode.name}, hashes=%d)" % len(hashes)
-                for (_gkey, (cfg, hashes)) in groups.items()
-            ),
-        )
-
+        table_name = cfg.tabular.full_name(safe=True)
         ok_df = new_responses_df.where(
             (F.col("status_code") >= 200)
             & (F.col("status_code") < 300)
         )
 
-        # Persist only when more than one group will read ``ok_df`` —
-        # otherwise the single insert action is the one and only
-        # evaluation and we save the storage round trip. Route the
-        # cache through :class:`yggdrasil.spark.tabular.Dataset`
-        # so backends that reject ``persist`` (Databricks Connect
-        # serverless raises ``[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST
-        # TABLE``) fall through to the un-cached frame instead of
-        # crashing stage 4 — pass two then runs twice, but the
-        # alternative is a hard failure on serverless compute.
-        multi_group = len(groups) > 1
-        ok_dataset: "Dataset | None" = None
-        if multi_group:
-            from yggdrasil.spark.tabular import Dataset
+        if cfg.mode != Mode.UPSERT:
+            try:
+                wanted = [
+                    row["partition_key"]
+                    for row in ok_df.select("partition_key").distinct().collect()
+                ]
+            except Exception:
+                wanted = []
 
-            ok_dataset = Dataset(frame=ok_df).cache()
-            ok_df = ok_dataset.frame
+            try:
+                if wanted:
+                    literals = ", ".join(str(int(v)) for v in wanted)
+                    existing = spark.sql(
+                        "SELECT DISTINCT partition_key, public_hash "
+                        f"FROM {table_name} WHERE partition_key IN ({literals})"
+                    )
+                else:
+                    existing = spark.sql(
+                        "SELECT DISTINCT partition_key, public_hash "
+                        f"FROM {table_name}"
+                    )
+                ok_df = ok_df.join(existing, on=["partition_key", "public_hash"], how="left_anti")
+            except Exception as exc:
+                if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
+                    raise
 
-        # When every key in the chunk's cfg map collapses onto one
-        # group, the inserted frame IS the whole ``ok_df``. With any
-        # disabled / split-out keys present we have to filter by
-        # ``request_public_url_hash`` so dropped requests don't leak
-        # into the surviving group's insert.
-        covers_chunk = (
-            len(groups) == 1
-            and sum(len(hs) for _, (_, hs) in groups.items())
-            == len(key_to_remote_cfg)
+        LOGGER.info(
+            "%s ok response(s) into remote cache %s (spark, mode=%s)",
+            "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
+            table_name, cfg.mode.name,
         )
-
-        def _insert_one(cfg: CacheConfig, hashes: list[int]) -> None:
-            table_name = cfg.tabular.full_name(safe=True)
-            if covers_chunk:
-                df = ok_df
-            else:
-                df = ok_df.where(
-                    F.col("request_public_url_hash").isin(hashes)
-                )
-
-            if cfg.mode != Mode.UPSERT:
-                try:
-                    wanted_partitions = [
-                        row["partition_key"]
-                        for row in df.select("partition_key").distinct().collect()
-                    ]
-                except Exception:
-                    wanted_partitions = []
-
-                LOGGER.info(
-                    "Spark dedup for %s: checking %d partition(s) "
-                    "against existing rows",
-                    table_name, len(wanted_partitions),
-                )
-
-                try:
-                    if wanted_partitions:
-                        literals = ", ".join(str(int(v)) for v in wanted_partitions)
-                        existing_df = spark.sql(
-                            "SELECT DISTINCT partition_key, public_hash "
-                            f"FROM {table_name} WHERE partition_key IN ({literals})"
-                        )
-                    else:
-                        existing_df = spark.sql(
-                            "SELECT DISTINCT partition_key, public_hash "
-                            f"FROM {table_name}"
-                        )
-                except Exception as exc:
-                    if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
-                        raise
-                    LOGGER.info(
-                        "Spark dedup for %s: table not found — "
-                        "skipping dedup (first insert)",
-                        table_name,
-                    )
-                    existing_df = None
-
-                if existing_df is not None:
-                    df = df.join(
-                        existing_df,
-                        on=["partition_key", "public_hash"],
-                        how="left_anti",
-                    )
-
-            LOGGER.info(
-                "%s ok response(s) into remote cache %s "
-                "(spark insert, mode=%s, hashes=%d)",
-                "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
-                table_name, cfg.mode.name, len(hashes),
-            )
-            _insert_cache(
-                cfg.tabular, cfg, df,
-                spark_session=spark,
-                raise_error=True,
-            )
-
-        try:
-            self._run_concurrently(
-                [
-                    lambda c=cfg, hs=hashes: _insert_one(c, hs)
-                    for (_gkey, (cfg, hashes)) in groups.items()
-                ],
-                thread_name_prefix="ygg-spark-remote-cache-insert",
-            )
-            LOGGER.info(
-                "Spark stage 4 completed: persisted into %d "
-                "remote-cache group(s)",
-                len(groups),
-            )
-        finally:
-            if ok_dataset is not None:
-                ok_dataset.unpersist()
+        _insert_cache(cfg.tabular, cfg, ok_df, spark_session=spark, raise_error=True)
 
     def _spark_fetch_misses(
         self,
