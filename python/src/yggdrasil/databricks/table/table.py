@@ -1407,6 +1407,7 @@ class Table(DatabricksPath):
             wait=options.wait,
             return_data=options.return_data,
             safe_merge=options.safe_merge,
+            spark_session=getattr(options, "spark_session", None),
         )
 
     # Properties

@@ -2352,6 +2352,13 @@ class HTTPSession(Session):
                 groups[gkey] = (eff, [])
             groups[gkey][1].append(response)
 
+        if not groups:
+            LOGGER.info(
+                "Stage 4: no remote-cache groups to persist "
+                "(all configs disabled or missing)",
+            )
+            return
+
         def _insert_one(
             mode: "Mode",
             cfg: "CacheConfig",
@@ -2780,6 +2787,14 @@ class HTTPSession(Session):
                 else:
                     local_misses.append(r)
 
+            if spark_misses or local_misses:
+                LOGGER.info(
+                    "Stage 3 miss partition for chunk #%d: "
+                    "spark=%d, local=%d (total=%d)",
+                    chunk_index, len(spark_misses),
+                    len(local_misses), len(after_remote),
+                )
+
             spark_new_hits: "SparkDataFrame | None" = None
             if spark_misses:
                 req_spark = spark_misses[0].send_config_or_default.spark_session
@@ -2925,7 +2940,21 @@ class HTTPSession(Session):
             groups[gkey][1].append(cfg_key)
 
         if not groups:
+            LOGGER.info(
+                "Spark stage 4: no remote-cache groups to persist "
+                "(all configs disabled or missing)",
+            )
             return
+
+        LOGGER.info(
+            "Spark stage 4: persisting into %d remote-cache group(s) — %s",
+            len(groups),
+            ", ".join(
+                f"{cfg.tabular.full_name(safe=True)} "
+                f"(mode={cfg.mode.name}, hashes=%d)" % len(hashes)
+                for (_gkey, (cfg, hashes)) in groups.items()
+            ),
+        )
 
         ok_df = new_responses_df.where(
             (F.col("status_code") >= 200)
@@ -2961,6 +2990,7 @@ class HTTPSession(Session):
         )
 
         def _insert_one(cfg: CacheConfig, hashes: list[int]) -> None:
+            table_name = cfg.tabular.full_name(safe=True)
             if covers_chunk:
                 df = ok_df
             else:
@@ -2969,7 +2999,6 @@ class HTTPSession(Session):
                 )
 
             if cfg.mode != Mode.UPSERT:
-                table_name = cfg.tabular.full_name(safe=True)
                 try:
                     wanted_partitions = [
                         row["partition_key"]
@@ -2977,6 +3006,13 @@ class HTTPSession(Session):
                     ]
                 except Exception:
                     wanted_partitions = []
+
+                LOGGER.info(
+                    "Spark dedup for %s: checking %d partition(s) "
+                    "against existing rows",
+                    table_name, len(wanted_partitions),
+                )
+
                 try:
                     if wanted_partitions:
                         literals = ", ".join(str(int(v)) for v in wanted_partitions)
@@ -2992,6 +3028,11 @@ class HTTPSession(Session):
                 except Exception as exc:
                     if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
                         raise
+                    LOGGER.info(
+                        "Spark dedup for %s: table not found — "
+                        "skipping dedup (first insert)",
+                        table_name,
+                    )
                     existing_df = None
 
                 if existing_df is not None:
@@ -3002,15 +3043,11 @@ class HTTPSession(Session):
                     )
 
             LOGGER.info(
-                "%s ok response(s) into remote cache %r (spark insert)",
+                "%s ok response(s) into remote cache %s "
+                "(spark insert, mode=%s, hashes=%d)",
                 "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
-                cfg.tabular,
+                table_name, cfg.mode.name, len(hashes),
             )
-            # Same unified surface every other cache write path
-            # uses — ``_insert_cache`` dispatches the SparkDataFrame
-            # through :meth:`Tabular.write_spark_frame`. The
-            # ``left_anti`` dedup above already narrowed the frame
-            # so ``prune_values`` would be redundant here.
             _insert_cache(
                 cfg.tabular, cfg, df,
                 spark_session=spark,
@@ -3024,6 +3061,11 @@ class HTTPSession(Session):
                     for (_gkey, (cfg, hashes)) in groups.items()
                 ],
                 thread_name_prefix="ygg-spark-remote-cache-insert",
+            )
+            LOGGER.info(
+                "Spark stage 4 completed: persisted into %d "
+                "remote-cache group(s)",
+                len(groups),
             )
         finally:
             if ok_dataset is not None:
@@ -3182,6 +3224,11 @@ class HTTPSession(Session):
         # cache table (double-counting them as fresh hits).
         try:
             result_df = result_df.cache()
+            LOGGER.info(
+                "Spark stage 3 completed: cached mapInArrow result "
+                "for %d miss(es) across %d partition(s)",
+                len(misses), n_parts,
+            )
         except Exception:  # noqa: BLE001
             LOGGER.warning(
                 "Failed to cache stage-3 mapInArrow result; downstream "
