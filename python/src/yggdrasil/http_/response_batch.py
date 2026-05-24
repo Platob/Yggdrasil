@@ -39,7 +39,7 @@ def _union(a: Optional[Tabular], b: Optional[Tabular]) -> Optional[Tabular]:
     return a.union(b)
 
 
-class HTTPResponseBatch:
+class HTTPResponseBatch(Tabular):
     """Origin-tagged view of a batch of responses.
 
     Three optional :class:`Tabular` buckets:
@@ -48,11 +48,9 @@ class HTTPResponseBatch:
     - ``remote`` — served from the remote cache.
     - ``new``    — fetched from the network.
 
-    Iteration yields :class:`Response` objects with ``local_cached`` /
-    ``remote_cached`` stamped per origin.
+    Also a :class:`Tabular` itself — ``read_arrow_batches`` chains
+    all buckets, ``read_spark_frame`` unions Spark frames directly.
     """
-
-    __slots__ = ("local", "remote", "new", "misses", "failed")
 
     def __init__(
         self,
@@ -63,6 +61,7 @@ class HTTPResponseBatch:
         misses: "list | None" = None,
         failed: "list | None" = None,
     ) -> None:
+        super().__init__()
         self.local: Optional[Tabular] = local
         self.remote: Optional[Tabular] = remote
         if isinstance(new, list):
@@ -91,35 +90,29 @@ class HTTPResponseBatch:
     def is_spark(self) -> bool:
         return any(isinstance(h, Dataset) for h in self._holders())
 
-    def tabular(self) -> Optional[Tabular]:
-        """Union all non-empty buckets into one :class:`Tabular`."""
-        holders = self._holders()
-        if not holders:
-            return None
-        result = holders[0]
-        for h in holders[1:]:
-            result = result.union(h)
-        return result
+    # ------------------------------------------------------------------
+    # Tabular implementation
+    # ------------------------------------------------------------------
 
-    def read_spark_frame(
-        self,
-        spark: "SparkSession",
-    ) -> "SparkDataFrame":
-        """Union all buckets into one Spark DataFrame.
+    def _collect_schema(self, options=None):
+        return RESPONSE_SCHEMA
 
-        Spark-backed holders (:class:`Dataset`) return their frame
-        directly — no collect. Arrow-backed holders are lifted via
-        ``spark.createDataFrame``. Buckets are unioned with
-        ``unionByName(allowMissingColumns=True)``.
-        """
+    def _read_arrow_batches(self, options=None):
+        for holder in self._holders():
+            yield from holder.read_arrow_batches(options=options)
+
+    def _write_arrow_batches(self, batches, options=None):
+        raise NotImplementedError("HTTPResponseBatch is read-only")
+
+    def _read_spark_frame(self, options=None):
+        from yggdrasil.environ import PyEnv
+        spark = getattr(options, "spark_session", None) or PyEnv.spark_session(create=True)
         result = None
         for holder in self._holders():
             if isinstance(holder, Dataset) and holder.frame is not None:
                 df = holder.frame
             else:
-                df = spark.createDataFrame(
-                    holder.read_arrow_table(),
-                )
+                df = spark.createDataFrame(holder.read_arrow_table())
             result = df if result is None else result.unionByName(
                 df, allowMissingColumns=True,
             )
