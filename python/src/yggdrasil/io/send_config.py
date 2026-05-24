@@ -9,12 +9,12 @@ from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Op
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
 from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.data.enums import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.path import Path
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession

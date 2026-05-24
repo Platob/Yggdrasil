@@ -57,7 +57,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfig,
     WaitingConfigArg,
 )
-from yggdrasil.data.enums import Codec, Codecs, MediaType, MediaTypes, MimeType, MimeTypes, Mode
+from yggdrasil.data.enums import MediaTypes, Mode
 from yggdrasil.io.authorization.base import Authorization
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
