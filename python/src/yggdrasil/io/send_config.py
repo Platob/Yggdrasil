@@ -998,11 +998,7 @@ class SendConfig(_ConfigBase):
         try:
             if arg is None:
                 if not overrides:
-                    if default is ...:
-                        raise ValueError(
-                            f"{cls.__name__}.from_ expects a {cls.__name__}, Mapping, or None; "
-                        )
-                    return default
+                    return default if default is not ... else cls.default()
                 if cls._matches_default(overrides):
                     return cls.default()
                 return cls.parse_mapping(overrides)

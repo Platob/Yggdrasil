@@ -1066,7 +1066,7 @@ class HTTPSession(Session):
         if not start:
             return self._build_idle_response(request, cfg)
         if cfg.spark_session is not None:
-            for response in self._send_many(iter([request]), cfg):
+            for response in self._send_many(iter([request])):
                 return response
         return self._send(request)
 
@@ -1520,9 +1520,16 @@ class HTTPSession(Session):
             batch_kw["max_in_flight"] = max_in_flight
         if max_batch_ttl is not None:
             batch_kw["max_batch_ttl"] = max_batch_ttl
+        def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
+            for r in reqs:
+                if r.send_config is None:
+                    r.send_config = cfg
+                yield r
+
+        stamped = _stamp(requests)
         if cfg.as_tabular:
-            return self._send_many_as_tabular(requests, cfg, **batch_kw)
-        return self._send_many(requests, cfg, **batch_kw)
+            return self._send_many_as_tabular(stamped, cfg, **batch_kw)
+        return self._send_many(stamped, **batch_kw)
 
     def _send_many_as_tabular(
         self,
@@ -1530,17 +1537,10 @@ class HTTPSession(Session):
         config: SendConfig,
         **batch_kw: Any,
     ) -> "Tabular":
-        """Drain :meth:`_send_many_batches` and concat into one :class:`Tabular`.
-
-        Spark mode unions per-chunk :class:`SparkDataFrame` lazily via
-        :meth:`HTTPResponseBatch.extend` then wraps the result through
-        :meth:`HTTPResponseBatch.to_tabular`, so no executor job fires
-        until the caller triggers an action. Python mode concatenates
-        Arrow record batches at the end of the stream.
-        """
+        """Drain :meth:`_send_many_batches` and concat into one :class:`Tabular`."""
         spark = config.spark_session
         accumulator: HTTPResponseBatch | None = None
-        for batch in self._send_many_batches(requests, config, **batch_kw):
+        for batch in self._send_many_batches(requests, **batch_kw):
             if accumulator is None:
                 accumulator = batch
             else:
@@ -2278,6 +2278,8 @@ class HTTPSession(Session):
                 continue
 
             chunk_index += 1
+            config = chunk[0].send_config_or_default
+            spark = config.spark_session
 
             # Pre-group requests by cache holder.
             local_map = self._group_by_cache(chunk, "local_cache_config")
