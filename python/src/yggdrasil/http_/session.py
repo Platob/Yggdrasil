@@ -1742,7 +1742,7 @@ class HTTPSession(Session):
         """
         cfg = getattr(requests[0], attr)
         predicate = cfg.make_batch_lookup_predicate(requests)
-        opts = CastOptions(predicate=predicate, spark_session=spark_session)
+        opts = CastOptions(predicate=predicate, spark_session=spark_session, target=RESPONSE_SCHEMA)
 
         if spark_session is not None:
             try:
