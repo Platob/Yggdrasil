@@ -2304,74 +2304,35 @@ class HTTPSession(Session):
 
             if to_fetch and config.cache_only:
                 new_hits = [_synthetic_not_found(r) for r in to_fetch]
-                LOGGER.info(
-                    "send_many chunk #%d: cache_only=True, synthesising "
-                    "%d 404 response(s)",
-                    chunk_index, len(to_fetch),
-                )
+            elif to_fetch and spark is not None:
+                new_hits = self._spark_fetch_misses(to_fetch, config, spark)
+                _remote_cfg = {
+                    r.public_url_hash: r.remote_cache_config
+                    for r in to_fetch
+                }
+                self._spark_persist_remote(new_hits, _remote_cfg, spark=spark)
             elif to_fetch:
-                spark_misses: list[PreparedRequest] = []
-                local_misses: list[PreparedRequest] = []
-                for r in to_fetch:
-                    if r.send_config_or_default.spark_session is not None:
-                        spark_misses.append(r)
-                    else:
-                        local_misses.append(r)
-
-                spark_new_hits: "SparkDataFrame | None" = None
-                if spark_misses:
-                    spark_new_hits = self._spark_fetch_misses(
-                        spark_misses, config,
-                        spark_misses[0].send_config_or_default.spark_session,
-                    )
-
                 new_list: list[Response] = []
-                if local_misses:
-                    for response in self._fetch_misses(
-                        local_misses, config,
-                        ordered=ordered, max_in_flight=max_in_flight,
-                    ):
-                        if response.ok:
-                            new_list.append(response)
-                        elif config.raise_error:
-                            failed.append(response)
+                for response in self._fetch_misses(
+                    to_fetch, config,
+                    ordered=ordered, max_in_flight=max_in_flight,
+                ):
+                    if response.ok:
+                        new_list.append(response)
+                    elif config.raise_error:
+                        failed.append(response)
 
-                # --- Writeback: persist network results to caches ---
-                stage4: "list[Callable[[], Any]]" = []
-                if spark_new_hits is not None:
-                    _spark_hits = spark_new_hits
-                    _spark_remote_cfg = {
-                        r.public_url_hash: r.remote_cache_config
-                        for r in spark_misses
-                    }
-                    stage4.append(
-                        lambda: self._spark_persist_remote(
-                            _spark_hits,
-                            _spark_remote_cfg,
-                            spark=spark_misses[0].send_config_or_default.spark_session,
-                        )
-                    )
                 if new_list:
-                    _local_hits = new_list
+                    _hits = new_list
                     _lmap = local_map
-                    stage4.append(lambda: self._persist_remote(_local_hits))
-                    stage4.append(lambda: self._backfill_local_cache(
-                        responses_to_tabular(_local_hits), _lmap,
-                    ))
-                if stage4:
-                    self._run_concurrently(
-                        stage4, thread_name_prefix="ygg-stage4",
-                    )
+                    self._run_concurrently([
+                        lambda: self._persist_remote(_hits),
+                        lambda: self._backfill_local_cache(
+                            responses_to_tabular(_hits), _lmap,
+                        ),
+                    ], thread_name_prefix="ygg-stage4")
 
-                if spark_new_hits is not None and new_list:
-                    from yggdrasil.io.response import Response as _Resp
-                    for r in _Resp.from_records(spark_new_hits.toArrow()):
-                        new_list.append(r)
-                    new_hits = new_list
-                elif spark_new_hits is not None:
-                    new_hits = spark_new_hits
-                else:
-                    new_hits = new_list or None
+                new_hits = new_list or None
 
             cache_hits = len(chunk) - len(to_fetch)
             net_count = len(new_hits) if isinstance(new_hits, list) else 0
