@@ -1159,8 +1159,8 @@ class Tabular(ABC, Generic[O]):
             n_rows += batch.num_rows
             yield batch
         logger.debug(
-            "%s read %d batches / %d rows",
-            type(self).__name__,
+            "%r read %d batches / %d rows",
+            self,
             n_batches,
             n_rows,
         )
