@@ -101,6 +101,12 @@ LOGGER = logging.getLogger(__name__)
 # single row across batches.
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
+# Rechunk byte target for paginated responses assembled by
+# ``_combine_paginated_pages``.  Keeps the IPC file's record batches
+# at a predictable size instead of flushing the whole concatenation as
+# a single oversized batch.
+_PAGINATED_RECHUNK_BYTE_SIZE: int = 128 * 1024 * 1024
+
 
 # Local cache is a partitioned tabular tree backed by
 # :class:`yggdrasil.io.nested.folder_path.FolderPath`:
@@ -1468,13 +1474,17 @@ class HTTPSession(Session):
             _, page_resp = job_result.result
             frames.append(page_resp.to_polars(parse=True, lazy=False))
 
-        final_df = pl.concat(frames, how="diagonal_relaxed", rechunk=True)
+        final_df = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
+        combined_table = final_df.to_arrow(compat_level=pl.CompatLevel.newest())
 
         new_holder = Memory()
         new_holder.media_type = MediaTypes.ARROW_IPC
         with ArrowIPCFile(holder=new_holder, owns_holder=False, mode="wb") as new_buffer:
-            new_buffer.write_arrow_table(
-                final_df.to_arrow(compat_level=pl.CompatLevel.newest()),
+            new_buffer.write_arrow_batches(
+                rechunk_arrow_batches(
+                    combined_table.to_batches(),
+                    byte_size=_PAGINATED_RECHUNK_BYTE_SIZE,
+                ),
                 compression="zstd",
             )
 
