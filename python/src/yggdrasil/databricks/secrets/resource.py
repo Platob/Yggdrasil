@@ -229,7 +229,7 @@ class Scope(DatabricksResource):
         existing = self.permission(target.principal)
         if existing == target:
             LOGGER.debug(
-                "ACL %r already set on scope %r — skipping put_acl", target, self,
+                "ACL %r already set on scope %r — skipping update", target, self,
             )
             return existing
 

@@ -638,8 +638,8 @@ class VolumePath(DatabricksPath):
                     executor.shutdown(wait=True)
 
         logger.info(
-            "files.delete_directory %s (recursive=%s)",
-            self.api_path,
+            "Deleted volume directory %r (recursive=%s)",
+            self,
             recursive,
         )
 

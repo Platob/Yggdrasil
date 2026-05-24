@@ -297,7 +297,7 @@ class Jobs(DatabricksService):
         try:
             info = UserInfo.current()
         except Exception:  # noqa: BLE001 — best-effort
-            LOGGER.debug("userinfo_defaults: UserInfo.current() failed", exc_info=True)
+            LOGGER.debug("UserInfo.current() failed — skipping userinfo defaults", exc_info=True)
             return {}
         return userinfo_job_settings(
             info,

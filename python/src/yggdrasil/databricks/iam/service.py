@@ -349,7 +349,7 @@ class IAMUsers(IAM):
                     self.reset_local_cache()
                     raise
                 else:
-                    logger.exception(e)
+                    logger.debug("Resolving current IAM user failed — falling back to runtime user", exc_info=True)
                     return IAMUser.databricks_runtime()
 
         return self.client.lazy_property(
@@ -379,6 +379,6 @@ class IAMUsers(IAM):
 
         if local_cache:
             os.remove(local_cache)
-            logger.info("Reset local OAuth cache at path %s", local_cache)
+            logger.info("Reset local OAuth cache at path %r", local_cache)
         else:
             logger.info("No local OAuth cache found to reset")

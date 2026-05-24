@@ -134,7 +134,7 @@ def userinfo_git_source(info: "UserInfo") -> Optional[GitSource]:
     provider = _GIT_PROVIDER_BY_HOST.get(host)
     if provider is None:
         LOGGER.debug(
-            "userinfo_git_source: no GitProvider mapping for host %r — "
+            "No GitProvider mapping for host %r — "
             "skipping git_source default", host,
         )
         return None

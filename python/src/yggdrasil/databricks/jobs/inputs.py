@@ -299,7 +299,7 @@ def task_parameters(
             # path but no notebook entry point. Fall back to widgets
             # if any are declared, otherwise carry on with argv-only.
             LOGGER.debug(
-                "task_parameters: getCurrentBindings() unavailable (%s) — "
+                "getCurrentBindings() unavailable (%s) — "
                 "falling back to argv + env only", exc,
             )
     # argv wins on collision: an explicit ``--key=cli`` is the caller

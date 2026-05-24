@@ -150,7 +150,7 @@ class Secrets(DatabricksService):
         # carries the same base64 we'd otherwise upload, so b64 equality is the
         # safest cheap fingerprint we can compute client-side.
         if target_b64 and existing.b64 == target_b64:
-            LOGGER.debug("Secret %r already at desired value — skipping put_secret", secret)
+            LOGGER.debug("Secret %r already at desired value — skipping update", secret)
             secret.update_timestamp = existing.update_timestamp
             if permissions:
                 secret.scope.update(permissions=permissions)
