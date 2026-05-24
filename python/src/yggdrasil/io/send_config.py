@@ -339,17 +339,18 @@ class CacheConfig(_ConfigBase):
 
         tab = self.tabular
         if tab is not None:
-            if isinstance(tab, (str, pathlib.PurePath, Path)):
-                from yggdrasil.io.nested.folder_path import FolderPath
+            from yggdrasil.io.nested.folder_path import FolderPath
+            if isinstance(tab, FolderPath):
+                pass
+            elif isinstance(tab, (str, pathlib.PurePath, Path)):
                 object.__setattr__(
                     self, "tabular", FolderPath(path=Path.from_(tab)),
                 )
-            elif not isinstance(tab, Holder):
-                pass
-            else:
+            elif isinstance(tab, Holder):
                 object.__setattr__(
-                    self, "tabular", Holder.from_(tab),
+                    self, "tabular", FolderPath(path=tab) if tab.is_local else tab,
                 )
+            # Non-Holder Tabular (remote backends, test doubles) kept as-is
 
     def __getstate__(self):
         # Project local FolderPath caches down to their URL string for

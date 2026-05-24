@@ -179,8 +179,6 @@ class _FakeRemoteTabular(Tabular):
     def _read_arrow_batches(self, options: Any = None, **kwargs: Any) -> Iterator[pa.RecordBatch]:
         predicate = getattr(options, "predicate", None)
         self.predicates.append(predicate)
-        if self.raise_table_not_found and not self.created:
-            raise RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] table missing")
         batches = list(self.rows)
         if predicate is None:
             return iter(batches)
