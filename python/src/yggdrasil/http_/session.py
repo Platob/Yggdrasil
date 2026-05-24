@@ -1209,6 +1209,7 @@ class HTTPSession(Session):
         bypass it. Travels with the session into Spark workers via
         ``__getstate__`` / ``__setstate__``.
         """
+        request.attach_session(self)
         request.sent_at = dt.datetime.now(dt.timezone.utc)
         if self.headers:
             if request.headers is None:
@@ -3606,7 +3607,7 @@ class HTTPSession(Session):
         if send_kwargs:
             send_config = SendConfig.from_(send_config, **send_kwargs)
 
-        return PreparedRequest.prepare(
+        request = PreparedRequest.prepare(
             method=method,
             url=full_url,
             headers=headers,
@@ -3618,3 +3619,5 @@ class HTTPSession(Session):
             remote_cache_config=remote_cache_config,
             send_config=send_config,
         )
+        request.attach_session(self)
+        return request
