@@ -2167,11 +2167,20 @@ class HTTPSession(Session):
             max_in_flight or pool.max_workers,
             ordered,
         )
+
+        def _miss_config(r: PreparedRequest) -> SendConfig:
+            req_sc = r.send_config
+            if req_sc is not None and req_sc.raise_error != config.raise_error:
+                return dataclasses.replace(
+                    miss_send_config, raise_error=req_sc.raise_error,
+                )
+            return miss_send_config
+
         for result in pool.as_completed(
             (
                 Job.make(
                     self._send,
-                    r.copy(send_config=miss_send_config),
+                    r.copy(send_config=_miss_config(r)),
                 )
                 for r in misses
             ),
@@ -2459,13 +2468,20 @@ class HTTPSession(Session):
 
         In Spark mode ``raise_error`` is applied at the driver-iteration
         boundary so a single failure doesn't poison a whole partition.
+        Per-request overrides take precedence over the session-level config.
         """
         is_spark = config.spark_session is not None
         for batch in self._send_many_batches(requests, config, **batch_kw):
             for holder in batch.parts():
                 for response in Response.from_records(holder.read_records()):
-                    if is_spark and config.raise_error and not response.ok:
-                        response.raise_for_status()
+                    if is_spark and not response.ok:
+                        req_sc = response.request.send_config
+                        should_raise = (
+                            req_sc.raise_error if req_sc is not None
+                            else config.raise_error
+                        )
+                        if should_raise:
+                            response.raise_for_status()
                     yield response
 
     def send_many_batches(
@@ -2604,8 +2620,8 @@ class HTTPSession(Session):
 
             # Enrich: stamp the session-level send_config on every
             # request that doesn't carry a per-request override.
-            # Per-request cache configs are preserved (same rule as
-            # single send()).
+            # Per-request cache configs and raise_error are preserved
+            # (same rule as single send()).
             for r in chunk:
                 req_sc = r.send_config
                 if req_sc is None:
@@ -2616,6 +2632,8 @@ class HTTPSession(Session):
                         merge_back["local_cache"] = req_sc.local_cache
                     if req_sc.remote_cache is not None:
                         merge_back["remote_cache"] = req_sc.remote_cache
+                    if req_sc.raise_error != config.raise_error:
+                        merge_back["raise_error"] = req_sc.raise_error
                     base = dataclasses.replace(config, **merge_back) if merge_back else config
                     if base is not req_sc:
                         r.send_config = base
@@ -2795,8 +2813,14 @@ class HTTPSession(Session):
                 ):
                     if response.ok:
                         new_list.append(response)
-                    elif config.raise_error:
-                        failed.append(response)
+                    else:
+                        req_sc = response.request.send_config
+                        should_raise = (
+                            req_sc.raise_error if req_sc is not None
+                            else config.raise_error
+                        )
+                        if should_raise:
+                            failed.append(response)
 
             new_hits = new_list or None
 
