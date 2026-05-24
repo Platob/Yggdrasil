@@ -1592,14 +1592,18 @@ class HTTPSession(Session):
     def _group_by_holders(
         batch: list[PreparedRequest],
     ) -> dict[tuple["IO | None", "IO | None"], list[PreparedRequest]]:
-        """Group requests by ``(local_holder, remote_holder)`` pair."""
+        """Group requests by ``(local_holder, remote_holder)`` pair.
+
+        UPSERT-mode configs are treated as ``None`` so they skip
+        the cache read and go straight to network.
+        """
         groups: dict[tuple["IO | None", "IO | None"], list[PreparedRequest]] = {}
         for r in batch:
             lc = r.local_cache_config
             rc = r.remote_cache_config
             key = (
-                lc.tabular if lc is not None else None,
-                rc.tabular if rc is not None else None,
+                lc.tabular if lc is not None and lc.mode != Mode.UPSERT else None,
+                rc.tabular if rc is not None and rc.mode != Mode.UPSERT else None,
             )
             groups.setdefault(key, []).append(r)
         return groups
@@ -1610,7 +1614,7 @@ class HTTPSession(Session):
         requests: list[PreparedRequest],
         attr: str,
     ) -> tuple["Tabular | None", list[PreparedRequest]]:
-        """Read cache hits from a single holder.
+        """Read cache hits from a single holder, matching per request.
 
         Returns ``(hits_tabular, misses)``.
         """
@@ -1619,7 +1623,33 @@ class HTTPSession(Session):
         tab = holder.read_table(options=CastOptions(predicate=predicate))
         if tab is None:
             return None, list(requests)
-        return tab, []
+
+        request_tuple = cfg.request_tuple
+        lookup_keys = [request_tuple(r) for r in requests]
+
+        result_map: dict[tuple, Response] = {}
+        for response in Response.from_arrow_tabular(tab.read_arrow_batches()):
+            req = response.request
+            if req is None:
+                continue
+            key = request_tuple(req)
+            existing = result_map.get(key)
+            if existing is None or response.received_at >= existing.received_at:
+                result_map[key] = response
+
+        hits: list[Response] = []
+        misses: list[PreparedRequest] = []
+        filter_response = cfg.filter_response
+        for req, key in zip(requests, lookup_keys):
+            candidate = result_map.get(key)
+            if candidate is not None and filter_response(candidate, request=req):
+                hits.append(candidate)
+            else:
+                misses.append(req)
+
+        if not hits:
+            return None, misses
+        return responses_to_tabular(hits), misses
 
     def _lookup_cached(
         self,
@@ -2134,37 +2164,20 @@ class HTTPSession(Session):
 
     def _mirror_local_hits_to_remote(
         self,
-        local_hits: "list[Response]",
+        local_hits: "Tabular",
+        remote_cfg: CacheConfig,
     ) -> None:
-        """Bulk-upsert local-cache hits into the remote cache.
-
-        Activation is gated on the *remote* config — local-only
-        sessions skip it entirely. Each response's remote cache config
-        is read from ``response.request.remote_cache_config``.
-        """
-        if not local_hits:
+        """Bulk-upsert local-cache hits into the remote cache."""
+        if not remote_cfg.mirror_local_to_remote:
             return
-
-        keep: list[Response] = []
-        for response in local_hits:
-            req = response.request
-            if req is None:
-                continue
-            eff = req.remote_cache_config
-            if eff is None or not eff.remote_cache_enabled:
-                continue
-            if not eff.mirror_local_to_remote:
-                continue
-            keep.append(response)
-
-        if not keep:
+        if not remote_cfg.remote_cache_enabled:
             return
-
-        LOGGER.info(
-            "Mirroring %d local-cache hit(s) to remote cache",
-            len(keep),
-        )
-        self._persist_remote(keep)
+        batches = list(local_hits.read_arrow_batches())
+        if not batches or all(b.num_rows == 0 for b in batches):
+            return
+        table = pa.Table.from_batches(batches)
+        LOGGER.info("Mirroring %d local-cache hit(s) to remote cache", table.num_rows)
+        _insert_cache(remote_cfg.tabular, remote_cfg, table)
 
     def _send_many(
         self,
@@ -2295,9 +2308,9 @@ class HTTPSession(Session):
                         )
 
                 if local_hits is not None and remote_holder is not None:
-                    self._mirror_local_hits_to_remote(list(
-                        Response.from_arrow_tabular(local_hits.read_arrow_batches())
-                    ))
+                    rc = reqs[0].remote_cache_config
+                    if rc is not None:
+                        self._mirror_local_hits_to_remote(local_hits, rc)
 
                 # --- Network fetch for misses ---
                 new_hits: "list[Response] | SparkDataFrame | None" = None

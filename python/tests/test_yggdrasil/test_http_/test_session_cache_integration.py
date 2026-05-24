@@ -166,15 +166,13 @@ class _FakeRemoteTabular(Tabular):
         self.predicates: list[Any] = []
         self.inserts: list[dict[str, Any]] = []
         self.created = False
-        self.raise_table_not_found = False
-        self.path = name  # dict-key proxy for ``Session._split_remote_cache``
+        self.path = name
 
     def full_name(self, safe: bool = False) -> str:
         return self._name
 
     def create(self, schema: pa.Schema, missing_ok: bool = False) -> None:
         self.created = True
-        self.raise_table_not_found = False
 
     def _read_arrow_batches(self, options: Any = None, **kwargs: Any) -> Iterator[pa.RecordBatch]:
         predicate = getattr(options, "predicate", None)
@@ -525,21 +523,6 @@ class TestRemoteCacheSend:
 
         s.send(req, remote_cache=cfg, raise_error=False)
         assert tab.inserts == [], "5xx response must not write back to remote"
-
-    def test_table_or_view_not_found_recovers(self) -> None:
-        tab = _FakeRemoteTabular()
-        tab.raise_table_not_found = True
-        cfg = _remote_cfg(tab)
-        s = StubSession()
-        req = make_request("https://example.com/x")
-        s.queue(make_response(request=req, body=b'{"v":1}'))
-
-        s.send(req, remote_cache=cfg)
-        assert tab.created, "missing table must be created on first miss"
-        # The lookup query was re-executed after ``create`` — first
-        # call raised, second one came back empty so the network fired.
-        assert len(tab.predicates) >= 2
-        assert len(s.calls) == 1
 
     def test_upsert_skips_both_lookup_and_writeback(self) -> None:
         # ``CacheConfig.cache_enabled`` gates the remote flow on

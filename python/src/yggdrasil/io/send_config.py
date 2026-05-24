@@ -415,7 +415,9 @@ class CacheConfig(_ConfigBase):
         tab = self.tabular
         if tab is None:
             return None
-        return tab
+        if hasattr(tab, "path"):
+            return str(tab.path.url)
+        return None
 
     @classmethod
     def from_(
@@ -618,6 +620,9 @@ class CacheConfig(_ConfigBase):
         Used as the per-config key for grouping cache hits in
         :class:`yggdrasil.http_.response_batch.HTTPResponseBatch`.
         """
+        tab = self.tabular
+        if tab is not None and hasattr(tab, "path"):
+            return tab.path
         root = _DEFAULT_CACHE_ROOT
         base_url = getattr(session, "base_url", None) if session is not None else None
         host = getattr(base_url, "host", None) if base_url is not None else None

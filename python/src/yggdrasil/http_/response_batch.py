@@ -309,8 +309,17 @@ class HTTPResponseBatch:
         return list(self.iter_responses())
 
     def iter_responses(self) -> Iterator[Response]:
-        for holder in self._holders():
-            yield from Response.from_records(holder.read_records())
+        for label, holder in (
+            ("local", self._local),
+            ("remote", self._remote),
+            ("new", self._new),
+        ):
+            if holder is None:
+                continue
+            for response in Response.from_records(holder.read_records()):
+                response.local_cached = (label == "local")
+                response.remote_cached = (label == "remote")
+                yield response
 
     # ------------------------------------------------------------------
     # Mutation / merge
