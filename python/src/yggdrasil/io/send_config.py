@@ -337,9 +337,11 @@ class CacheConfig(_ConfigBase):
             if not self.received_from:
                 object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
 
-        object.__setattr__(
-            self, "tabular", Holder.from_(self.tabular, default=None),
-        )
+        tab = self.tabular
+        if tab is not None:
+            object.__setattr__(
+                self, "tabular", Holder.from_(tab),
+            )
 
     def __getstate__(self):
         # Project local FolderPath caches down to their URL string for
