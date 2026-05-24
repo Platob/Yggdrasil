@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Iterator, Optional
 
 from yggdrasil.io.tabular import ArrowTabular, Dataset
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
@@ -99,6 +99,34 @@ class HTTPResponseBatch:
         result = holders[0]
         for h in holders[1:]:
             result = result.union(h)
+        return result
+
+    def read_spark_frame(
+        self,
+        spark: "SparkSession",
+    ) -> "SparkDataFrame":
+        """Union all buckets into one Spark DataFrame.
+
+        Spark-backed holders (:class:`Dataset`) return their frame
+        directly — no collect. Arrow-backed holders are lifted via
+        ``spark.createDataFrame``. Buckets are unioned with
+        ``unionByName(allowMissingColumns=True)``.
+        """
+        result = None
+        for holder in self._holders():
+            if isinstance(holder, Dataset) and holder.frame is not None:
+                df = holder.frame
+            else:
+                df = spark.createDataFrame(
+                    holder.read_arrow_table(),
+                )
+            result = df if result is None else result.unionByName(
+                df, allowMissingColumns=True,
+            )
+        if result is None:
+            return spark.createDataFrame(
+                [], schema=RESPONSE_SCHEMA.to_spark_schema(),
+            )
         return result
 
     # ------------------------------------------------------------------
