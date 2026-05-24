@@ -2518,12 +2518,14 @@ class HTTPSession(Session):
 
         if is_spark:
             self._enable_fair_spark_scheduler(spark)
-            eff_batch_size = batch_size or max_batch_size or 1024
+
+        pool = self.job_pool
+        if batch_size:
+            eff_batch_size = batch_size
+        elif is_spark:
+            eff_batch_size = max_batch_size or 1024
         else:
-            pool = self.job_pool
-            eff_batch_size = batch_size or min(
-                max_batch_size or 1024, pool.max_workers * 10
-            )
+            eff_batch_size = min(max_batch_size or 1024, pool.max_workers * 10)
 
         ttl = max_batch_ttl
 
@@ -2588,9 +2590,28 @@ class HTTPSession(Session):
                 continue
 
             chunk_index += 1
+
+            # Enrich: stamp the session-level send_config on every
+            # request that doesn't carry a per-request override.
+            # Per-request cache configs are preserved (same rule as
+            # single send()).
+            for r in chunk:
+                req_sc = r.send_config
+                if req_sc is None:
+                    r.send_config = config
+                else:
+                    merge_back: dict[str, Any] = {}
+                    if req_sc.local_cache is not None:
+                        merge_back["local_cache"] = req_sc.local_cache
+                    if req_sc.remote_cache is not None:
+                        merge_back["remote_cache"] = req_sc.remote_cache
+                    base = dataclasses.replace(config, **merge_back) if merge_back else config
+                    if base is not req_sc:
+                        r.send_config = base
+
             LOGGER.debug(
                 "Processing send_many chunk #%d (requests=%d, mode=%s)",
-                chunk_index, len(chunk), "spark" if is_spark else "python",
+                chunk_index, len(chunk), "spark" if is_spark else "mixed/python",
             )
 
             # Snapshot per-request effective configs BEFORE stage 1 so
@@ -2627,33 +2648,20 @@ class HTTPSession(Session):
             local_flat: list[Response] = [
                 r for hits in local_hits_by_path.values() for r in hits
             ]
-            local_hits: "list[Response] | SparkDataFrame | None"
-            if not local_flat:
-                local_hits = None
-            elif is_spark:
-                local_hits = self._responses_to_spark(local_flat, spark)
-            else:
-                local_hits = local_flat
+            local_hits: "list[Response] | None" = local_flat or None
             # Remote hits: dict keyed by ``CacheConfig.table.full_name``
             # internally so :meth:`_backfill_local_cache` knows which
             # rows came from which table; collapsed into one bucket at
             # the :class:`HTTPResponseBatch` boundary.
-            remote_hits_by_table: (
-                "dict[str, list[Response]] | dict[str, SparkDataFrame]"
-            ) = {}
+            remote_hits_by_table: "dict[str, list[Response]]" = {}
             new_hits: "list[Response] | SparkDataFrame | None" = None
 
             if not after_local:
-                # Even when every request is a local hit we may still
-                # owe the remote a diff — call the mirror before the
-                # early return so an all-cache batch keeps the remote
-                # in sync without ever hitting the network.
-                if not is_spark:
-                    self._mirror_local_hits_to_remote(
-                        local_hits_by_path,
-                        key_to_remote_cfg,
-                        session_remote_cfg,
-                    )
+                self._mirror_local_hits_to_remote(
+                    local_hits_by_path,
+                    key_to_remote_cfg,
+                    session_remote_cfg,
+                )
                 local_count = len(local_flat)
                 total_local += local_count
                 LOGGER.info(
@@ -2676,55 +2684,26 @@ class HTTPSession(Session):
                 continue
 
             # --- Stage 2: remote cache ---
-            # Python path drains the StatementResult into Response
-            # objects. Spark path keeps the result as a Spark DataFrame
-            # (via :meth:`_split_remote_cache_spark`) so ``remote_hits``
-            # never collects to the driver and downstream callers can
-            # union it with stage 3's Spark output.
-            if is_spark:
-                remote_hits_by_table, after_remote = self._split_remote_cache_spark(
-                    after_local,
-                    session_remote_cfg,
-                    spark=spark,
-                    key_to_remote_cfg=key_to_remote_cfg,
-                )
-                # Local-cache backfill from a Spark frame would force a
-                # toLocalIterator on the driver — skip it on the spark
-                # path, matching how stage 3/4 keep network results
-                # frame-resident. Drivers that want a hot local cache
-                # should use the Python path explicitly.
-            else:
-                remote_hits_by_table, after_remote = self._split_remote_cache(
-                    after_local,
-                    session_remote_cfg,
-                    spark_session=spark,
-                    key_to_remote_cfg=key_to_remote_cfg,
-                )
-                # Backfill local cache with remote hits using each request's
-                # effective local config — not the session-level fallback.
-                # Flatten the per-table split here: the local cache
-                # doesn't care which remote table sourced a row, only
-                # the response-to-request mapping by URL.
-                self._backfill_local_cache(
-                    [
-                        r
-                        for table_hits in remote_hits_by_table.values()
-                        for r in table_hits
-                    ],
-                    key_to_local_cfg,
-                    session_local_cfg,
-                )
-                # Mirror local-cache hits to remote in bulk before any
-                # network fetch fires, when the remote config opts in.
-                # The remote MERGE deduplicates on the partition / public
-                # hash so this is idempotent for rows the remote already
-                # knows about — net effect is "diff sync" of any local
-                # entries the remote was missing.
-                self._mirror_local_hits_to_remote(
-                    local_hits_by_path,
-                    key_to_remote_cfg,
-                    session_remote_cfg,
-                )
+            remote_hits_by_table, after_remote = self._split_remote_cache(
+                after_local,
+                session_remote_cfg,
+                spark_session=spark,
+                key_to_remote_cfg=key_to_remote_cfg,
+            )
+            self._backfill_local_cache(
+                [
+                    r
+                    for table_hits in remote_hits_by_table.values()
+                    for r in table_hits
+                ],
+                key_to_local_cfg,
+                session_local_cfg,
+            )
+            self._mirror_local_hits_to_remote(
+                local_hits_by_path,
+                key_to_remote_cfg,
+                session_remote_cfg,
+            )
 
             # Collapse the per-table remote split into one bucket for
             # :class:`HTTPResponseBatch`. Python lists chain; Spark frames
@@ -2733,30 +2712,22 @@ class HTTPSession(Session):
 
             if not after_remote:
                 local_count = len(local_flat)
-                if is_spark:
-                    remote_count = -1  # Spark frame — count not materialised
-                else:
-                    remote_count = sum(
-                        len(v) for v in remote_hits_by_table.values()  # type: ignore[union-attr]
-                    )
-                    total_remote += remote_count
+                remote_count = sum(
+                    len(v) for v in remote_hits_by_table.values()
+                )
+                total_remote += remote_count
                 total_local += local_count
-                if is_spark:
-                    remote_breakdown = ", ".join(
-                        f"{tkey}=<spark>" for tkey in remote_hits_by_table
-                    )
-                else:
-                    remote_breakdown = ", ".join(
-                        f"{tkey}={len(v)}"
-                        for tkey, v in remote_hits_by_table.items()  # type: ignore[union-attr]
-                    )
+                remote_breakdown = ", ".join(
+                    f"{tkey}={len(v)}"
+                    for tkey, v in remote_hits_by_table.items()
+                )
                 LOGGER.info(
                     "Completed send_many chunk #%d (requests=%d, "
                     "local_hits=%d, remote_hits=%s, network=0, failed=0) "
                     "— short-circuited on remote cache; no requests sent "
                     "(local_paths=%s, remote_tables=%s)",
                     chunk_index, len(chunk), local_count,
-                    "<spark>" if remote_count < 0 else remote_count,
+                    remote_count,
                     ", ".join(
                         f"{p!r}={len(v)}"
                         for p, v in local_hits_by_path.items()
@@ -2772,10 +2743,6 @@ class HTTPSession(Session):
                 continue
 
             # --- Stage 3: fetch misses ---
-            # ``cache_only`` skips the network fan-out entirely: drop
-            # the remaining misses from the stream and emit just what
-            # the caches answered. No writeback either — there are no
-            # new hits to persist.
             failed: list[Response] = []
             if config.cache_only:
                 synthetic = [_synthetic_not_found(r) for r in after_remote]
@@ -2791,100 +2758,95 @@ class HTTPSession(Session):
                     spark=spark,
                 )
                 continue
-            if is_spark:
-                # Network results stay in Spark — never collected to
-                # the driver. raise_error doesn't short-circuit a
-                # partial mapInArrow batch; callers filter on
-                # response_status_code if they care.
-                new_hits = self._spark_fetch_misses(after_remote, config, spark)
-            else:
-                new_list: list[Response] = []
+
+            # Partition misses by per-request mode so the same chunk
+            # can contain both local-mode and Spark-mode requests.
+            spark_misses: list[PreparedRequest] = []
+            local_misses: list[PreparedRequest] = []
+            for r in after_remote:
+                if r.send_config_or_default.spark_session is not None:
+                    spark_misses.append(r)
+                else:
+                    local_misses.append(r)
+
+            spark_new_hits: "SparkDataFrame | None" = None
+            if spark_misses:
+                req_spark = spark_misses[0].send_config_or_default.spark_session
+                spark_new_hits = self._spark_fetch_misses(
+                    spark_misses, config, req_spark,
+                )
+
+            new_list: list[Response] = []
+            if local_misses:
                 for response in self._fetch_misses(
-                    after_remote, config,
+                    local_misses, config,
                     ordered=ordered, max_in_flight=max_in_flight,
                 ):
                     if response.ok:
                         new_list.append(response)
                     elif config.raise_error:
                         failed.append(response)
-                new_hits = new_list
+
+            new_hits = new_list or None
 
             # --- Stage 4: bulk remote writeback ---
-            if is_spark:
-                # ``_insert_cache`` routes the Spark DataFrame through
-                # :meth:`Tabular.write_spark_frame` so the lazy DF
-                # crosses straight to the backend without materialising
-                # on the driver. Per-request overrides ride through
-                # ``key_to_remote_cfg`` — mirrors the non-Spark
-                # ``_persist_remote`` so a chunk targeting multiple
-                # remote tables fans out instead of collapsing
-                # onto the session-level cfg.
-                if new_hits is not None:
-                    self._spark_persist_remote(
-                        new_hits,
+            stage4: "list[Callable[[], Any]]" = []
+            if spark_new_hits is not None:
+                _spark_hits = spark_new_hits
+                stage4.append(
+                    lambda: self._spark_persist_remote(
+                        _spark_hits,
                         key_to_remote_cfg,
                         session_remote_cfg,
-                        spark=spark,
+                        spark=spark_misses[0].send_config_or_default.spark_session,
                     )
-            else:
-                # Remote and local writebacks touch independent
-                # backends — different tables / different folders —
-                # so run them concurrently rather than head-to-tail.
-                # Each side is itself parallel-per-table /
-                # parallel-per-cache-root; this top-level fan-out
-                # just lets the local disk writes overlap with the
-                # remote network round trips.
-                stage4: "list[Callable[[], Any]]" = []
-                if new_hits:
-                    stage4.append(
-                        lambda: self._persist_remote(
-                            new_hits,
-                            key_to_remote_cfg,
-                            session_remote_cfg,
-                        )
-                    )
-                # Stage 3 workers no longer write the local cache per
-                # response; bulk-upsert the new hits in one write per
-                # effective cache root. ``_backfill_local_cache``
-                # groups responses by their per-request local config,
-                # writes the table in UPSERT mode (or APPEND when the
-                # config asks for it), and triggers a pruned optimize
-                # bounded by the touched partitions — same end state
-                # as the prior per-worker write + post-batch optimize,
-                # but with one bulk write per cache root.
-                if isinstance(new_hits, list) and new_hits:
-                    stage4.append(
-                        lambda: self._backfill_local_cache(
-                            new_hits,
-                            key_to_local_cfg,
-                            session_local_cfg,
-                        )
-                    )
-                self._run_concurrently(
-                    stage4, thread_name_prefix="ygg-stage4",
                 )
+            if new_list:
+                _local_hits = new_list
+                stage4.append(
+                    lambda: self._persist_remote(
+                        _local_hits,
+                        key_to_remote_cfg,
+                        session_remote_cfg,
+                    )
+                )
+                stage4.append(
+                    lambda: self._backfill_local_cache(
+                        _local_hits,
+                        key_to_local_cfg,
+                        session_local_cfg,
+                    )
+                )
+            self._run_concurrently(
+                stage4, thread_name_prefix="ygg-stage4",
+            )
+
+            # Merge Spark and local new_hits into the batch.  When
+            # both modes produced results, collect the Spark frame to
+            # a list so the batch stays in a single engine.
+            if spark_new_hits is not None and new_list:
+                from yggdrasil.io.response import Response as _Resp
+                for r in _Resp.from_records(spark_new_hits.toArrow()):
+                    new_list.append(r)
+                new_hits = new_list
+            elif spark_new_hits is not None:
+                new_hits = spark_new_hits
 
             local_count = len(local_flat)
             total_local += local_count
-            if is_spark:
-                remote_count_log: "int | str" = "<spark>"
-                network_count_log: "int | str" = "<spark>"
-            else:
-                remote_count = sum(
-                    len(v) for v in remote_hits_by_table.values()  # type: ignore[union-attr]
-                )
-                total_remote += remote_count
-                remote_count_log = remote_count
-                net_count = len(new_hits) if isinstance(new_hits, list) else 0
-                total_network += net_count
-                network_count_log = net_count
+            remote_count = sum(len(v) for v in remote_hits_by_table.values())
+            total_remote += remote_count
+            net_count = len(new_hits) if isinstance(new_hits, list) else 0
+            spark_count = len(spark_misses) if spark_misses else 0
+            total_network += net_count + spark_count
             failed_count = len(failed)
             total_failed += failed_count
             LOGGER.info(
                 "Completed send_many chunk #%d (requests=%d, "
-                "local_hits=%d, remote_hits=%s, network=%s, failed=%d)",
+                "local_hits=%d, remote_hits=%d, network=%d, "
+                "spark=%d, failed=%d)",
                 chunk_index, len(chunk), local_count,
-                remote_count_log, network_count_log, failed_count,
+                remote_count, net_count, spark_count, failed_count,
             )
 
             yield HTTPResponseBatch(
@@ -2894,22 +2856,15 @@ class HTTPSession(Session):
                 spark=spark,
             )
 
-            if not is_spark and config.raise_error and failed:
+            if config.raise_error and failed:
                 failed[-1].raise_for_status()
 
-        if is_spark:
-            LOGGER.info(
-                "Finished send_many pipeline (chunks=%d, mode=spark) "
-                "— per-bucket counts deferred to Spark action",
-                chunk_index,
-            )
-        else:
-            LOGGER.info(
-                "Finished send_many pipeline (chunks=%d, local_hits=%d, "
-                "remote_hits=%d, network=%d, failed=%d)",
-                chunk_index, total_local, total_remote,
-                total_network, total_failed,
-            )
+        LOGGER.info(
+            "Finished send_many pipeline (chunks=%d, local_hits=%d, "
+            "remote_hits=%d, network=%d, failed=%d)",
+            chunk_index, total_local, total_remote,
+            total_network, total_failed,
+        )
 
     # ------------------------------------------------------------------ #
     # Spark stage 3 / 4 helpers                                           #
