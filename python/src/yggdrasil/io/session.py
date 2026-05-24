@@ -331,6 +331,5 @@ class Session(Singleton, ABC):
                 url_path = (getattr(base_url, "path", "") or "").strip("/")
                 folder = root / host / url_path if url_path else root / host
             path = Path.from_(folder)
-            path.mkdir(parents=True, exist_ok=True)
             self._local_cache: "FolderPath" = FolderPath(path=path)
             return self._local_cache
