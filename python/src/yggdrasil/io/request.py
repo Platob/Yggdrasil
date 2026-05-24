@@ -345,6 +345,7 @@ class PreparedRequest:
         remote_cache_config: Optional["CacheConfig"] = None,
         sender: Optional[UserInfo] = None,
         auth: Optional[Authorization] = None,
+        send_config: Optional["SendConfig"] = None,
     ) -> None:
         self.method = method or "GET"
         self.url = URL.from_(url)
@@ -360,7 +361,7 @@ class PreparedRequest:
         # a ``timedelta``, a path string, a live ``Tabular`` — instead of
         # constructing the dataclass by hand. ``None`` stays ``None`` so the
         # session-level fallback still wins.
-        from .send_config import CacheConfig as _CacheConfig
+        from .send_config import CacheConfig as _CacheConfig, SendConfig as _SendConfig
         self.local_cache_config = (
             _CacheConfig.from_(local_cache_config)
             if local_cache_config is not None else None
@@ -368,6 +369,10 @@ class PreparedRequest:
         self.remote_cache_config = (
             _CacheConfig.from_(remote_cache_config)
             if remote_cache_config is not None else None
+        )
+        self.send_config: SendConfig | None = (
+            _SendConfig.from_(send_config, default=None)
+            if send_config is not None else None
         )
         self._sender: UserInfo | None = (
             _coerce_userinfo(sender) if sender is not None else _default_sender()
@@ -411,6 +416,10 @@ class PreparedRequest:
         for cfg in (self.remote_cache_config, self.local_cache_config):
             if cfg is not None:
                 return cfg.mode
+        if self.send_config is not None:
+            for cfg in (self.send_config.remote_cache, self.send_config.local_cache):
+                if cfg is not None:
+                    return cfg.mode
         return None
 
     @mode.setter
@@ -589,7 +598,8 @@ class PreparedRequest:
                 )
             from yggdrasil.http_ import HTTPSession
             self.attach_session(HTTPSession())
-        return self._session.send(self, config, **kwargs)
+        effective = config if config is not None else self.send_config
+        return self._session.send(self, effective, **kwargs)
 
     @classmethod
     def from_(
@@ -748,6 +758,7 @@ class PreparedRequest:
         compress_codec: Optional[Codec] = GZIP,
         sender: Optional[UserInfo | Mapping[str, Any]] = None,
         auth: Optional[Authorization] = None,
+        send_config: Optional["SendConfig"] = None,
     ) -> "PreparedRequest":
         parsed_url = URL.from_(url, normalize=normalize)
         out_headers: dict[str, str] = _string_dict(headers)
@@ -793,6 +804,7 @@ class PreparedRequest:
             remote_cache_config=remote_cache_config,
             sender=_coerce_userinfo(sender),
             auth=auth,
+            send_config=send_config,
         )
 
     def copy(
@@ -808,6 +820,7 @@ class PreparedRequest:
         remote_cache_config: Optional["CacheConfig"] = ...,
         sender: Optional[UserInfo] = ...,
         auth: Optional[Authorization] = ...,
+        send_config: Optional["SendConfig"] = ...,
         normalize: bool = True,
         copy_buffer: bool = False,
     ) -> "PreparedRequest":
@@ -842,6 +855,7 @@ class PreparedRequest:
             remote_cache_config=self.remote_cache_config if remote_cache_config is ... else remote_cache_config,
             sender=new_sender,
             auth=new_auth,
+            send_config=self.send_config if send_config is ... else send_config,
         )
 
     @property

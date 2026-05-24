@@ -1009,13 +1009,13 @@ class HTTPSession(Session):
         request: PreparedRequest,
         config: SendConfig | Mapping[str, Any] | None = None,
         *,
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        stream: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        cache_only: bool = False,
-        spark_session: Optional["SparkSession"] = None,
+        wait: WaitingConfigArg = ...,
+        raise_error: bool = ...,
+        stream: bool = ...,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        cache_only: bool = ...,
+        spark_session: Optional["SparkSession"] = ...,
         start: bool = True,
         **options,
     ) -> Response:
@@ -1042,18 +1042,28 @@ class HTTPSession(Session):
         need an idle :class:`Response` (the network call is
         synchronous), so the base raises a clean
         ``NotImplementedError`` via :meth:`_build_idle_response`.
+
+        Per-request :attr:`PreparedRequest.send_config` is used as the
+        base when no explicit *config* is passed — explicit kwargs
+        still override individual fields.
         """
-        cfg = SendConfig.from_(
-            config,
-            wait=wait,
-            raise_error=raise_error,
-            stream=stream,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            cache_only=cache_only,
-            spark_session=spark_session,
-            **options,
-        )
+        overrides: dict[str, Any] = {**options}
+        if wait is not ...:
+            overrides["wait"] = wait
+        if raise_error is not ...:
+            overrides["raise_error"] = raise_error
+        if stream is not ...:
+            overrides["stream"] = stream
+        if remote_cache is not ...:
+            overrides["remote_cache"] = remote_cache
+        if local_cache is not ...:
+            overrides["local_cache"] = local_cache
+        if cache_only is not ...:
+            overrides["cache_only"] = cache_only
+        if spark_session is not ...:
+            overrides["spark_session"] = spark_session
+        base = config if config is not None else request.send_config
+        cfg = SendConfig.from_(base, **overrides)
         if not start:
             return self._build_idle_response(request, cfg)
         if cfg.spark_session is not None:
@@ -3687,6 +3697,7 @@ class HTTPSession(Session):
         *,
         json: Any | None = None,
         normalize: bool = True,
+        send_config: SendConfig | None = None,
     ) -> PreparedRequest:
         full_url: URL | str | None = url
 
@@ -3708,5 +3719,6 @@ class HTTPSession(Session):
             json=json,
             normalize=normalize,
             local_cache_config=local_cache_config,
-            remote_cache_config=remote_cache_config
+            remote_cache_config=remote_cache_config,
+            send_config=send_config,
         )
