@@ -1587,85 +1587,49 @@ class HTTPSession(Session):
             cfg.anonymize,
         )
 
-    def _split_local_cache(
-        self,
+    @staticmethod
+    def _group_by_cache(
         batch: list[PreparedRequest],
-    ) -> tuple["Tabular | None", list[PreparedRequest]]:
-        """Stage 1: scan the local cache.
+        attr: str,
+    ) -> dict["IO | None", list[PreparedRequest]]:
+        """Group requests by their cache holder.
 
-        Returns ``(hits_tabular, misses)``. Hits are wrapped in an
-        :class:`ArrowTabular`; ``None`` when everything misses.
-        UPSERT entries bypass the read entirely (always miss).
+        *attr* is ``"local_cache_config"`` or ``"remote_cache_config"``.
+        Requests without a config land under the ``None`` key.
         """
-        cached, uncached = [], []
+        groups: dict["IO | None", list[PreparedRequest]] = {}
         for r in batch:
-            if r.local_cache_config:
-                cached.append(r)
-            else:
-                uncached.append(r)
+            cfg = getattr(r, attr, None)
+            holder = cfg.tabular if cfg is not None else None
+            groups.setdefault(holder, []).append(r)
+        return groups
 
-        if not cached:
-            return None, uncached
-
-        tab, caches = None, {}
-        for r in cached:
-            holder: IO = r.local_cache_config.tabular
-            caches.setdefault(holder, []).append(r)
-
-        for holder, requests in caches.items():
-            predicate = (
-                requests[0].local_cache_config
-                .make_batch_lookup_predicate(requests)
-            )
-
-            new_tab = holder.read_table(options=CastOptions(predicate=predicate))
-
-            if tab is None:
-                tab = new_tab
-            else:
-                tab = tab.union(new_tab)
-
-        return tab, uncached
-
-    def _split_remote_cache(
+    def _read_cache_hits(
         self,
-        batch: list[PreparedRequest],
+        cache_map: dict["IO | None", list[PreparedRequest]],
+        attr: str,
     ) -> tuple["Tabular | None", list[PreparedRequest]]:
-        """Stage 2: scan the remote cache.
+        """Read cache hits from grouped holders.
 
-        Returns ``(hits_tabular, misses)``. Hits are wrapped in a
-        :class:`Tabular`; ``None`` when everything misses.
-        UPSERT entries bypass the read entirely (always miss).
+        Returns ``(hits_tabular, misses)``. The ``None`` key in
+        *cache_map* carries requests with no cache — they pass
+        through as misses untouched.
         """
-        cached, uncached = [], []
-        for r in batch:
-            if r.remote_cache_config:
-                cached.append(r)
-            else:
-                uncached.append(r)
+        misses = list(cache_map.get(None) or ())
+        tab: "Tabular | None" = None
 
-        if not cached:
-            return None, uncached
-
-        tab, caches = None, {}
-        for r in cached:
-            holder: IO = r.remote_cache_config.tabular
-            caches.setdefault(holder, []).append(r)
-
-        for holder, requests in caches.items():
-            predicate = (
-                requests[0].remote_cache_config
-                .make_batch_lookup_predicate(requests)
-            )
-
+        for holder, requests in cache_map.items():
+            if holder is None:
+                continue
+            cfg = getattr(requests[0], attr)
+            predicate = cfg.make_batch_lookup_predicate(requests)
             new_tab = holder.read_table(options=CastOptions(predicate=predicate))
+            if new_tab is None:
+                misses.extend(requests)
+                continue
+            tab = new_tab if tab is None else tab.union(new_tab)
 
-            if tab is None:
-                tab = new_tab
-            else:
-                tab = tab.union(new_tab)
-
-        return tab, uncached
+        return tab, misses
 
     def _lookup_cached(
         self,
@@ -2097,31 +2061,20 @@ class HTTPSession(Session):
     def _backfill_local_cache(
         self,
         data: "Tabular",
-        requests: list[PreparedRequest],
+        local_cache_map: dict["IO | None", list[PreparedRequest]],
     ) -> None:
-        """Write cache hits back to the local cache.
-
-        Groups *requests* by their local cache holder and writes the
-        corresponding rows from *data* into each holder via
-        :func:`_insert_cache`.
-        """
-        holders: dict[IO, CacheConfig] = {}
-        for req in requests:
-            eff = req.local_cache_config
-            if eff is None or eff.tabular is None:
-                continue
-            holders.setdefault(eff.tabular, eff)
-
-        if not holders:
-            return
-
+        """Write cache hits back to the local cache holders in *local_cache_map*."""
         batches = list(data.read_arrow_batches())
-        for holder, cfg in holders.items():
-            table = pa.Table.from_batches(batches) if batches else None
-            if table is not None:
-                Job.make(
-                    _insert_cache, holder, cfg, table,
-                ).fire_and_forget()
+        if not batches:
+            return
+        table = pa.Table.from_batches(batches)
+        for holder, requests in local_cache_map.items():
+            if holder is None:
+                continue
+            cfg = requests[0].local_cache_config
+            Job.make(
+                _insert_cache, holder, cfg, table,
+            ).fire_and_forget()
 
     def _persist_remote(
         self,
@@ -2326,19 +2279,19 @@ class HTTPSession(Session):
 
             chunk_index += 1
 
+            # Pre-group requests by cache holder.
+            local_map = self._group_by_cache(chunk, "local_cache_config")
+            remote_map = self._group_by_cache(chunk, "remote_cache_config")
+
             # --- Cached path: local → remote → network for misses ---
-            local_hits, to_fetch = self._split_local_cache(chunk)
+            local_hits, to_fetch = self._read_cache_hits(local_map, "local_cache_config")
             remote_hits: "Tabular | None" = None
 
             if to_fetch:
-                before_remote = to_fetch
-                remote_hits, to_fetch = self._split_remote_cache(to_fetch)
+                remote_map_misses = self._group_by_cache(to_fetch, "remote_cache_config")
+                remote_hits, to_fetch = self._read_cache_hits(remote_map_misses, "remote_cache_config")
                 if remote_hits is not None:
-                    miss_ids = {id(r) for r in to_fetch}
-                    self._backfill_local_cache(
-                        remote_hits,
-                        [r for r in before_remote if id(r) not in miss_ids],
-                    )
+                    self._backfill_local_cache(remote_hits, local_map)
 
             if local_hits is not None:
                 self._mirror_local_hits_to_remote(list(
@@ -2398,10 +2351,10 @@ class HTTPSession(Session):
                     )
                 if new_list:
                     _local_hits = new_list
-                    _local_reqs = local_misses
+                    _lmap = local_map
                     stage4.append(lambda: self._persist_remote(_local_hits))
                     stage4.append(lambda: self._backfill_local_cache(
-                        responses_to_tabular(_local_hits), _local_reqs,
+                        responses_to_tabular(_local_hits), _lmap,
                     ))
                 if stage4:
                     self._run_concurrently(
