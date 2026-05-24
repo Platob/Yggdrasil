@@ -1564,6 +1564,124 @@ class HTTPSession(Session):
     #      cache configs are honoured exactly                            #
     # ------------------------------------------------------------------ #
 
+    def _send_batch(
+        self,
+        local_holder: "IO | None",
+        remote_holder: "IO | None",
+        reqs: list[PreparedRequest],
+        *,
+        config: SendConfig,
+        spark: "Optional[SparkSession]" = None,
+        ordered: bool = False,
+        max_in_flight: int | None = None,
+    ) -> HTTPResponseBatch:
+        """Process one holder group: local cache → remote cache → network."""
+        local_hits: "Tabular | None" = None
+        remote_hits: "Tabular | None" = None
+        misses = reqs
+
+        if local_holder is not None:
+            local_hits, misses = self._read_holder(
+                local_holder, reqs, "local_cache_config",
+            )
+
+        if remote_holder is not None and misses:
+            remote_hits, misses = self._read_holder(
+                remote_holder, misses, "remote_cache_config",
+            )
+            if remote_hits is not None and local_holder is not None:
+                self._backfill_local_cache(
+                    remote_hits, {local_holder: reqs},
+                )
+
+        if local_hits is not None and remote_holder is not None:
+            rc = reqs[0].remote_cache_config
+            if rc is not None:
+                self._mirror_local_hits_to_remote(local_hits, rc)
+
+        if not misses or config.cache_only:
+            new_hits = [_synthetic_not_found(r) for r in misses] if misses else None
+            return HTTPResponseBatch(
+                local_hits=local_hits, remote_hits=remote_hits,
+                new_hits=new_hits, spark=spark, misses=misses,
+            )
+
+        if spark is not None:
+            return self._send_spark_batch(
+                local_hits, remote_hits, reqs, misses,
+                config=config, spark=spark,
+                local_holder=local_holder, remote_holder=remote_holder,
+            )
+        return self._send_local_batch(
+            local_hits, remote_hits, reqs, misses,
+            config=config,
+            local_holder=local_holder, remote_holder=remote_holder,
+            ordered=ordered, max_in_flight=max_in_flight,
+        )
+
+    def _send_local_batch(
+        self,
+        local_hits: "Tabular | None",
+        remote_hits: "Tabular | None",
+        reqs: list[PreparedRequest],
+        misses: list[PreparedRequest],
+        *,
+        config: SendConfig,
+        local_holder: "IO | None",
+        remote_holder: "IO | None",
+        ordered: bool = False,
+        max_in_flight: int | None = None,
+    ) -> HTTPResponseBatch:
+        """Fetch misses via the thread pool and write back to caches."""
+        new_list: list[Response] = []
+        failed: list[Response] = []
+        for response in self._fetch_misses(
+            misses, config, ordered=ordered, max_in_flight=max_in_flight,
+        ):
+            if response.ok:
+                new_list.append(response)
+            elif config.raise_error:
+                failed.append(response)
+
+        if new_list:
+            _hits = new_list
+            wb: list[Callable] = []
+            if remote_holder is not None:
+                wb.append(lambda: self._persist_remote(_hits))
+            if local_holder is not None:
+                wb.append(lambda: self._backfill_local_cache(
+                    responses_to_tabular(_hits), {local_holder: reqs},
+                ))
+            if wb:
+                self._run_concurrently(wb, thread_name_prefix="ygg-wb")
+
+        return HTTPResponseBatch(
+            local_hits=local_hits, remote_hits=remote_hits,
+            new_hits=new_list or None, misses=misses, failed=failed,
+        )
+
+    def _send_spark_batch(
+        self,
+        local_hits: "Tabular | None",
+        remote_hits: "Tabular | None",
+        reqs: list[PreparedRequest],
+        misses: list[PreparedRequest],
+        *,
+        config: SendConfig,
+        spark: "SparkSession",
+        local_holder: "IO | None",
+        remote_holder: "IO | None",
+    ) -> HTTPResponseBatch:
+        """Fetch misses via Spark mapInArrow and persist to remote cache."""
+        new_hits = self._spark_fetch_misses(misses, config, spark)
+        rc = reqs[0].remote_cache_config
+        if remote_holder is not None and rc is not None:
+            self._spark_persist_remote(new_hits, rc, spark=spark)
+        return HTTPResponseBatch(
+            local_hits=local_hits, remote_hits=remote_hits,
+            new_hits=new_hits, spark=spark, misses=misses,
+        )
+
     @staticmethod
     def _remote_write_group_key(cfg: CacheConfig) -> tuple:
         """Identity used to group responses for a single bulk remote insert.
@@ -1971,83 +2089,17 @@ class HTTPSession(Session):
             groups = self._group_by_holders(chunk)
 
             for (local_holder, remote_holder), reqs in groups.items():
-                local_hits: "Tabular | None" = None
-                remote_hits: "Tabular | None" = None
-                misses = reqs
-
-                # --- Local cache ---
-                if local_holder is not None:
-                    local_hits, misses = self._read_holder(
-                        local_holder, reqs, "local_cache_config",
-                    )
-
-                # --- Remote cache (on local misses) ---
-                if remote_holder is not None and misses:
-                    remote_hits, misses = self._read_holder(
-                        remote_holder, misses, "remote_cache_config",
-                    )
-                    if remote_hits is not None and local_holder is not None:
-                        self._backfill_local_cache(
-                            remote_hits,
-                            {local_holder: reqs},
-                        )
-
-                if local_hits is not None and remote_holder is not None:
-                    rc = reqs[0].remote_cache_config
-                    if rc is not None:
-                        self._mirror_local_hits_to_remote(local_hits, rc)
-
-                # --- Network fetch for misses ---
-                new_hits: "list[Response] | SparkDataFrame | None" = None
-                failed: list[Response] = []
-
-                if misses and config.cache_only:
-                    new_hits = [_synthetic_not_found(r) for r in misses]
-                elif misses and spark is not None:
-                    new_hits = self._spark_fetch_misses(misses, config, spark)
-                    rc = reqs[0].remote_cache_config
-                    if remote_holder is not None and rc is not None:
-                        self._spark_persist_remote(new_hits, rc, spark=spark)
-                elif misses:
-                    new_list: list[Response] = []
-                    for response in self._fetch_misses(
-                        misses, config,
-                        ordered=ordered, max_in_flight=max_in_flight,
-                    ):
-                        if response.ok:
-                            new_list.append(response)
-                        elif config.raise_error:
-                            failed.append(response)
-
-                    if new_list:
-                        _hits = new_list
-                        wb: list[Callable] = []
-                        if remote_holder is not None:
-                            wb.append(lambda: self._persist_remote(_hits))
-                        if local_holder is not None:
-                            _lmap = {local_holder: reqs}
-                            wb.append(lambda: self._backfill_local_cache(
-                                responses_to_tabular(_hits), _lmap,
-                            ))
-                        if wb:
-                            self._run_concurrently(wb, thread_name_prefix="ygg-wb")
-
-                    new_hits = new_list or None
-
-                net_count = len(new_hits) if isinstance(new_hits, list) else 0
-                total_cache_hits += len(reqs) - len(misses)
-                total_network += net_count
-                total_failed += len(failed)
-
-                yield HTTPResponseBatch(
-                    local_hits=local_hits,
-                    remote_hits=remote_hits,
-                    new_hits=new_hits,
-                    spark=spark,
+                batch = self._send_batch(
+                    local_holder, remote_holder, reqs,
+                    config=config, spark=spark,
+                    ordered=ordered, max_in_flight=max_in_flight,
                 )
-
-                if config.raise_error and failed:
-                    failed[-1].raise_for_status()
+                total_cache_hits += len(reqs) - len(batch.misses)
+                total_network += batch.counts.get("new", 0)
+                total_failed += len(batch.failed)
+                yield batch
+                if config.raise_error and batch.failed:
+                    batch.failed[-1].raise_for_status()
 
         LOGGER.info(
             "Finished send_many pipeline (chunks=%d, cache_hits=%d, "

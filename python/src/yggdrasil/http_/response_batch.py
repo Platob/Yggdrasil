@@ -151,6 +151,8 @@ class HTTPResponseBatch:
         "_remote",
         "_new",
         "spark",
+        "misses",
+        "failed",
     )
 
     def __init__(
@@ -160,11 +162,15 @@ class HTTPResponseBatch:
         new_hits: BucketInput = None,
         *,
         spark: Optional["SparkSession"] = None,
+        misses: "list | None" = None,
+        failed: "list | None" = None,
     ) -> None:
         self.spark: Optional["SparkSession"] = spark
         self._local: Optional[Tabular] = _coerce_bucket(local_hits)
         self._remote: Optional[Tabular] = _coerce_bucket(remote_hits)
         self._new: Optional[Tabular] = _coerce_bucket(new_hits)
+        self.misses: list = misses or []
+        self.failed: list = failed or []
 
     def __repr__(self) -> str:
         return (
