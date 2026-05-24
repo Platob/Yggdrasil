@@ -239,6 +239,7 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         # "default = grow the file" behaviour while letting callers
         # opt into key-aware writes purely via ``match_by``.
         action = options.mode
+        _skip_existing = self.holder_is_overwrite
         if action is Mode.AUTO:
             action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
         elif action is Mode.TRUNCATE:
@@ -248,7 +249,7 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         # would only see "no bytes left to read at the cursor" and
         # would mis-fire after an earlier write parked the cursor at
         # EOF. APPEND-into-recently-written is the canonical case.
-        has_existing = self.size_known and self.size > 0
+        has_existing = not _skip_existing and self.size_known and self.size > 0
 
         if action is Mode.IGNORE:
             if has_existing:

@@ -114,6 +114,18 @@ _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
 
+def _synthetic_not_found(request: PreparedRequest) -> Response:
+    """Build a synthetic 404 response for a cache-only miss."""
+    return Response(
+        request=request,
+        status_code=404,
+        headers={"Content-Type": "application/json"},
+        tags={"synthetic": "cache_only_miss"},
+        buffer=b'{"error": "not found in cache"}',
+        received_at=dt.datetime.now(dt.timezone.utc),
+    )
+
+
 def _insert_cache(
     tabular: Any,
     cache_cfg: CacheConfig,
@@ -1263,17 +1275,12 @@ class HTTPSession(Session):
         # --- 3. No cache hit — perform actual request ---
         # ``cache_only`` callers opted out of the network fallback. The
         # cache lookups above already ran; reaching here means both
-        # missed, so raise instead of crossing the wire.
+        # missed, so return a synthetic 404 instead of crossing the wire.
         if config.cache_only:
-            local_enabled = effective_local_cfg.local_cache_enabled if effective_local_cfg is not None else False
-            remote_enabled = effective_remote_cfg.remote_cache_enabled if effective_remote_cfg is not None else False
-            raise LookupError(
-                f"cache_only=True but no cached response for {request.method} "
-                f"{request.url} (local_cache_enabled="
-                f"{local_enabled}, "
-                f"remote_cache_enabled="
-                f"{remote_enabled})."
-            )
+            response = _synthetic_not_found(request)
+            if config.raise_error:
+                response.raise_for_status()
+            return response
 
         request = self.prepare_request_before_send(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
@@ -2851,15 +2858,16 @@ class HTTPSession(Session):
             # new hits to persist.
             failed: list[Response] = []
             if config.cache_only:
+                synthetic = [_synthetic_not_found(r) for r in after_remote]
                 LOGGER.info(
-                    "send_many chunk #%d: cache_only=True, dropping "
-                    "%d miss(es) without fetching",
+                    "send_many chunk #%d: cache_only=True, synthesising "
+                    "%d 404 response(s) for miss(es)",
                     chunk_index, len(after_remote),
                 )
                 yield HTTPResponseBatch(
                     local_hits=local_hits,
                     remote_hits=remote_hits,
-                    new_hits=new_hits,
+                    new_hits=synthetic,
                     spark=spark,
                 )
                 continue

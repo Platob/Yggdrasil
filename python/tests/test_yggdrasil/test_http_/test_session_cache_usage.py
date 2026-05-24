@@ -162,30 +162,36 @@ class TestCacheOnlyNoNetwork:
         assert len(s.calls) == 0
         assert out.local_cached is True
 
-    def test_single_send_cache_only_miss_raises(self, tmp_path) -> None:
+    def test_single_send_cache_only_miss_returns_synthetic_404(self, tmp_path) -> None:
         cache = _local_cfg(tmp_path)
         req = make_request("https://example.com/co/miss")
 
         s = StubSession()
-        with pytest.raises(LookupError):
-            s.send(req, local_cache=cache, cache_only=True)
+        out = s.send(req, local_cache=cache, cache_only=True, raise_error=False)
+        assert out.status_code == 404
+        assert out.tags.get("synthetic") == "cache_only_miss"
         assert len(s.calls) == 0, "cache_only miss must not fall back to network"
 
-    def test_send_many_cache_only_drops_misses(self, tmp_path) -> None:
-        """``send_many(cache_only=True)`` yields only the cached hits;
-        misses fall off the stream with zero network touches."""
+    def test_send_many_cache_only_synthesises_404_for_misses(self, tmp_path) -> None:
+        """``send_many(cache_only=True)`` yields cached hits and synthetic
+        404 responses for misses, with zero network touches."""
         cache = _local_cfg(tmp_path)
         hit = make_request("https://example.com/co/yes")
         miss = make_request("https://example.com/co/no")
         _seed_local(cache, make_response(request=hit, body=b'{"v":"hit"}'))
 
         s = StubSession()
-        out = list(s.send_many(iter([hit, miss]), local_cache=cache, cache_only=True))
+        out = list(s.send_many(iter([hit, miss]), local_cache=cache, cache_only=True, raise_error=False))
 
         assert len(s.calls) == 0, "cache_only must never touch the network"
-        assert len(out) == 1
-        assert out[0].json() == {"v": "hit"}
-        assert out[0].local_cached is True
+        assert len(out) == 2
+        cached = [r for r in out if r.status_code == 200]
+        synthetic = [r for r in out if r.status_code == 404]
+        assert len(cached) == 1
+        assert cached[0].json() == {"v": "hit"}
+        assert cached[0].local_cached is True
+        assert len(synthetic) == 1
+        assert synthetic[0].tags.get("synthetic") == "cache_only_miss"
 
 
 # ===========================================================================

@@ -1700,6 +1700,15 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             return self._active().size_known
         return True
 
+    @property
+    def holder_is_overwrite(self) -> bool:
+        """``True`` when the backing holder was opened in OVERWRITE mode.
+
+        Primitives use this to skip append checks: the holder was
+        already truncated so there is no existing data to merge with.
+        """
+        return self._parent is not None and self._parent._mode is Mode.OVERWRITE
+
     def is_empty(self):
         return self.size == 0
 

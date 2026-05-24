@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 
+from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MediaType, MimeType
@@ -69,6 +70,36 @@ from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tag_index_columns(table: pa.Table) -> pa.Table:
+    """Stamp ``index_key`` + ``index_key_level`` on pandas index columns."""
+    raw = (table.schema.metadata or {}).get(b"pandas")
+    if not raw:
+        return table
+    import yggdrasil.pickle.json as ygg_json
+    pmeta = ygg_json.loads(raw)
+    index_levels: dict[str, int] = {
+        e: pos
+        for pos, e in enumerate(pmeta.get("index_columns", ()))
+        if isinstance(e, str)
+    }
+    if not index_levels:
+        return table
+    tagged: list[pa.Field] = []
+    for f in table.schema:
+        level = index_levels.get(f.name)
+        if level is not None:
+            merged = dict(f.metadata or {})
+            merged[_Field._TAG_KEY_INDEX_KEY] = b"true"
+            merged[_Field._TAG_KEY_INDEX_KEY_LEVEL] = str(level).encode("ascii")
+            tagged.append(f.with_metadata(merged))
+        else:
+            tagged.append(f)
+    return pa.Table.from_arrays(
+        list(table.itercolumns()),
+        schema=pa.schema(tagged, metadata=None),
+    )
 
 if TYPE_CHECKING:
     import pandas
@@ -1444,7 +1475,29 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _read_pandas_frame(self, options: O) -> "pandas.DataFrame":
-        return self._read_arrow_table(options).to_pandas()
+        table = self._read_arrow_table(options)
+        df = table.to_pandas()
+        levels: list[tuple[int, str]] = []
+        for f in table.schema:
+            meta = f.metadata
+            if not meta or not meta.get(_Field._TAG_KEY_INDEX_KEY):
+                continue
+            raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
+            try:
+                pos = int(raw_level) if raw_level is not None else 0
+            except (TypeError, ValueError):
+                pos = 0
+            levels.append((pos, f.name))
+        if levels:
+            levels.sort()
+            names = [name for _, name in levels]
+            df = df.set_index(names)
+            df.index.names = [
+                None if isinstance(n, str) and n.startswith("__index_level_")
+                else n
+                for n in df.index.names
+            ]
+        return df
 
     def write_pandas_frame(
         self,
@@ -1526,6 +1579,8 @@ class Tabular(ABC, Generic[O]):
 
         try:
             casted = pa.Table.from_pandas(frame, preserve_index=include_index)
+            if include_index:
+                casted = _tag_index_columns(casted)
             self._write_arrow_table(casted, options)
         except (pa.ArrowException, TypeError, ValueError):
             # pyarrow's pandas bridge raises ``pa.ArrowException``
