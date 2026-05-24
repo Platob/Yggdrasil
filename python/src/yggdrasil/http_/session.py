@@ -2188,7 +2188,7 @@ class HTTPSession(Session):
             (
                 Job.make(
                     self._send,
-                    r.copy(remote_cache_config=None, local_cache_config=None),
+                    r.copy(send_config=None),
                     miss_send_config,
                 )
                 for r in misses

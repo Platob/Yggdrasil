@@ -525,7 +525,7 @@ class TestLocalCacheIntegration:
         empty_dir.mkdir()
         req_cache = CacheConfig(tabular=str(empty_dir), mode=Mode.APPEND)
         req = make_request("https://example.com/x").copy(
-            local_cache_config=req_cache,
+            send_config=SendConfig(local_cache=req_cache),
         )
 
         out = s.send(req, local_cache=session_cache)

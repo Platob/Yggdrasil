@@ -316,6 +316,35 @@ def _coerce_userinfo(value: Any) -> UserInfo | None:
     return None
 
 
+def _fold_cache_into_send_config(
+    send_config: "SendConfig | None",
+    local_cache_config: "CacheConfig | None",
+    remote_cache_config: "CacheConfig | None",
+) -> "SendConfig | None":
+    """Fold convenience ``local_cache_config`` / ``remote_cache_config``
+    kwargs into a :class:`SendConfig`, creating one when needed.
+
+    Used by :meth:`PreparedRequest.prepare` and
+    :meth:`PreparedRequest.copy` so callers can still pass per-request
+    cache configs as positional sugar while the canonical storage is
+    :attr:`PreparedRequest.send_config`.
+    """
+    if local_cache_config is None and remote_cache_config is None:
+        return send_config
+    import dataclasses
+    from .send_config import CacheConfig as _CacheConfig, SendConfig as _SendConfig
+    lc = _CacheConfig.from_(local_cache_config) if local_cache_config is not None else None
+    rc = _CacheConfig.from_(remote_cache_config) if remote_cache_config is not None else None
+    if send_config is not None:
+        overrides: dict[str, Any] = {}
+        if lc is not None:
+            overrides["local_cache"] = lc
+        if rc is not None:
+            overrides["remote_cache"] = rc
+        return dataclasses.replace(send_config, **overrides) if overrides else send_config
+    return _SendConfig(local_cache=lc, remote_cache=rc)
+
+
 class PreparedRequest:
     """Immutable-ish request descriptor — fields are normalized in __init__.
 
@@ -341,8 +370,6 @@ class PreparedRequest:
         tags: MutableMapping[str, str],
         buffer: Optional[Holder],
         sent_at: Optional[dt.datetime],
-        local_cache_config: Optional["CacheConfig"] = None,
-        remote_cache_config: Optional["CacheConfig"] = None,
         sender: Optional[UserInfo] = None,
         auth: Optional[Authorization] = None,
         send_config: Optional["SendConfig"] = None,
@@ -356,20 +383,7 @@ class PreparedRequest:
             else dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
         )
         self.buffer: Optional[Holder] = _coerce_request_buffer(buffer)
-        # Coerce the per-request cache configs through ``CacheConfig.from_``
-        # so callers can pass shorthand — a number of seconds (TTL window),
-        # a ``timedelta``, a path string, a live ``Tabular`` — instead of
-        # constructing the dataclass by hand. ``None`` stays ``None`` so the
-        # session-level fallback still wins.
-        from .send_config import CacheConfig as _CacheConfig, SendConfig as _SendConfig
-        self.local_cache_config = (
-            _CacheConfig.from_(local_cache_config)
-            if local_cache_config is not None else None
-        )
-        self.remote_cache_config = (
-            _CacheConfig.from_(remote_cache_config)
-            if remote_cache_config is not None else None
-        )
+        from .send_config import SendConfig as _SendConfig
         self.send_config: SendConfig | None = (
             _SendConfig.from_(send_config, default=None)
             if send_config is not None else None
@@ -399,6 +413,18 @@ class PreparedRequest:
         return self._sender
 
     @property
+    def local_cache_config(self) -> "CacheConfig | None":
+        """Per-request local :class:`CacheConfig`, delegated to :attr:`send_config`."""
+        sc = self.send_config
+        return sc.local_cache if sc is not None else None
+
+    @property
+    def remote_cache_config(self) -> "CacheConfig | None":
+        """Per-request remote :class:`CacheConfig`, delegated to :attr:`send_config`."""
+        sc = self.send_config
+        return sc.remote_cache if sc is not None else None
+
+    @property
     def mode(self) -> "Mode | None":
         """Effective cache :class:`Mode` for this request, or ``None``.
 
@@ -416,10 +442,6 @@ class PreparedRequest:
         for cfg in (self.remote_cache_config, self.local_cache_config):
             if cfg is not None:
                 return cfg.mode
-        if self.send_config is not None:
-            for cfg in (self.send_config.remote_cache, self.send_config.local_cache):
-                if cfg is not None:
-                    return cfg.mode
         return None
 
     @mode.setter
@@ -433,14 +455,12 @@ class PreparedRequest:
         1. records the requested mode on the request (so a cache-aware
            session that hasn't injected a :class:`CacheConfig` yet still
            sees the override when it builds one);
-        2. rebuilds whichever of :attr:`local_cache_config` /
-           :attr:`remote_cache_config` is set (both are frozen
-           dataclasses) via their ``merge`` helper so the live configs
-           agree with the new mode.
+        2. when :attr:`send_config` carries cache configs, rebuilds them
+           via their ``merge`` helper so the live configs agree with
+           the new mode.
 
         Assigning ``None`` clears the override and leaves any attached
-        cache configs untouched (use the ``*_cache_config`` setters
-        directly to drop those).
+        cache configs untouched.
         """
         from yggdrasil.data.enums import Mode as _Mode
 
@@ -454,10 +474,17 @@ class PreparedRequest:
                 f"Valid values: {[m.name for m in _Mode]}"
             )
         self._mode = mode
-        if self.remote_cache_config is not None and self.remote_cache_config.mode != mode:
-            self.remote_cache_config = self.remote_cache_config.merge(mode=mode)
-        if self.local_cache_config is not None and self.local_cache_config.mode != mode:
-            self.local_cache_config = self.local_cache_config.merge(mode=mode)
+        if self.send_config is not None:
+            import dataclasses
+            overrides: dict[str, Any] = {}
+            rc = self.send_config.remote_cache
+            if rc is not None and rc.mode != mode:
+                overrides["remote_cache"] = rc.merge(mode=mode)
+            lc = self.send_config.local_cache
+            if lc is not None and lc.mode != mode:
+                overrides["local_cache"] = lc.merge(mode=mode)
+            if overrides:
+                self.send_config = dataclasses.replace(self.send_config, **overrides)
 
     def with_sender(self, sender: UserInfo | Mapping[str, Any] | None) -> "PreparedRequest":
         """Return a copy of this request with :attr:`sender` replaced.
@@ -749,8 +776,6 @@ class PreparedRequest:
         headers: Optional[MutableMapping[str, str]] = None,
         body: Optional[Any] = None,
         tags: Optional[Mapping[str, str]] = None,
-        local_cache_config: Optional[CacheConfig] = None,
-        remote_cache_config: Optional[CacheConfig] = None,
         *,
         json: Optional[Any] = None,
         normalize: bool = True,
@@ -759,6 +784,8 @@ class PreparedRequest:
         sender: Optional[UserInfo | Mapping[str, Any]] = None,
         auth: Optional[Authorization] = None,
         send_config: Optional["SendConfig"] = None,
+        local_cache_config: Optional[CacheConfig] = None,
+        remote_cache_config: Optional[CacheConfig] = None,
     ) -> "PreparedRequest":
         parsed_url = URL.from_(url, normalize=normalize)
         out_headers: dict[str, str] = _string_dict(headers)
@@ -790,6 +817,10 @@ class PreparedRequest:
                 from yggdrasil.http_ import HTTPRequest
                 out_class = HTTPRequest
 
+        effective_send_config = _fold_cache_into_send_config(
+            send_config, local_cache_config, remote_cache_config,
+        )
+
         return out_class(
             method=str(method),
             url=parsed_url,
@@ -800,11 +831,9 @@ class PreparedRequest:
             tags=_string_dict(tags),
             buffer=request_body,
             sent_at=0,
-            local_cache_config=local_cache_config,
-            remote_cache_config=remote_cache_config,
             sender=_coerce_userinfo(sender),
             auth=auth,
-            send_config=send_config,
+            send_config=effective_send_config,
         )
 
     def copy(
@@ -816,11 +845,11 @@ class PreparedRequest:
         buffer: Optional[Holder] = ...,
         tags: Optional[Mapping[str, str]] = None,
         sent_at: int | None = None,
-        local_cache_config: Optional["CacheConfig"] = ...,
-        remote_cache_config: Optional["CacheConfig"] = ...,
         sender: Optional[UserInfo] = ...,
         auth: Optional[Authorization] = ...,
         send_config: Optional["SendConfig"] = ...,
+        local_cache_config: Optional["CacheConfig"] = ...,
+        remote_cache_config: Optional["CacheConfig"] = ...,
         normalize: bool = True,
         copy_buffer: bool = False,
     ) -> "PreparedRequest":
@@ -844,6 +873,13 @@ class PreparedRequest:
         new_sender = self.sender if sender is ... else _coerce_userinfo(sender)
         new_auth = self._auth if auth is ... else auth
 
+        base_send_config = self.send_config if send_config is ... else send_config
+        effective_send_config = _fold_cache_into_send_config(
+            base_send_config,
+            self.local_cache_config if local_cache_config is ... else local_cache_config,
+            self.remote_cache_config if remote_cache_config is ... else remote_cache_config,
+        ) if local_cache_config is not ... or remote_cache_config is not ... else base_send_config
+
         return self.__class__(
             method=self.method if method is None else str(method),
             url=new_url,
@@ -851,11 +887,9 @@ class PreparedRequest:
             tags=new_tags,
             buffer=new_buffer,
             sent_at=self.sent_at if sent_at is None else any_to_datetime(sent_at),
-            local_cache_config=self.local_cache_config if local_cache_config is ... else local_cache_config,
-            remote_cache_config=self.remote_cache_config if remote_cache_config is ... else remote_cache_config,
             sender=new_sender,
             auth=new_auth,
-            send_config=self.send_config if send_config is ... else send_config,
+            send_config=effective_send_config,
         )
 
     @property
