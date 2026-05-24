@@ -274,6 +274,45 @@ class TestPrepareRequestBeforeSend:
 
         assert req.headers is None or "Authorization" not in req.headers
 
+    def test_prepare_attaches_session_to_request(self):
+        s = HTTPSession(base_url="https://api.example.com")
+        req = make_request("https://api.example.com/x")
+        assert req.session is None
+
+        s.prepare_request_before_send(req)
+
+        assert req.session is s
+
+    def test_prepare_overwrites_previous_session(self):
+        s1 = HTTPSession(base_url="https://one.example.com")
+        s2 = HTTPSession(base_url="https://two.example.com")
+        req = make_request("https://one.example.com/x")
+        req.attach_session(s1)
+
+        s2.prepare_request_before_send(req)
+
+        assert req.session is s2
+
+
+# ---------------------------------------------------------------------------
+# prepare_request — session factory attaches itself
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareRequestAttachesSession:
+
+    def test_prepare_request_attaches_session(self):
+        s = HTTPSession(base_url="https://api.example.com")
+        req = s.prepare_request("GET", "/endpoint")
+        assert req.session is s
+
+    def test_prepare_request_with_params_attaches_session(self):
+        s = HTTPSession(base_url="https://api.example.com")
+        req = s.prepare_request(
+            "POST", "/data", params={"page": "1"}, body=b"{}",
+        )
+        assert req.session is s
+
 
 # ---------------------------------------------------------------------------
 # 403 retry in HTTPSession._local_send
