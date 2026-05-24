@@ -229,18 +229,6 @@ REQUEST_SCHEMA["_pkl"] = schema_field(
     },
 ).autotag()
 
-REQUEST_SCHEMA["raise_error"] = schema_field(
-    "raise_error",
-    pa.bool_(),
-    nullable=True,
-    metadata={
-        "comment": "Per-request raise_error override from SendConfig. Null means "
-                   "inherit from the session-level config; explicit True/False "
-                   "survives the Arrow serialization boundary so Spark workers "
-                   "respect per-request error-handling intent.",
-    },
-).autotag()
-
 # Propagate schema-level ``primary_key`` / ``partition_by`` down to
 # the matching children (consumes those metadata keys in place).
 REQUEST_SCHEMA = REQUEST_SCHEMA.autotag()
@@ -1198,9 +1186,6 @@ class PreparedRequest:
             # leaves it null so writers don't pay for a pickle dump
             # when the structured columns are enough.
             return None
-        if key == "raise_error":
-            sc = self.send_config
-            return sc.raise_error if sc is not None else None
         raise KeyError(key)
 
     def _build_tags_value(self) -> dict[str, str]:
@@ -1468,7 +1453,7 @@ class PreparedRequest:
         headers_value = get("headers")
         sent_at_value = get("sent_at")
 
-        req = cls.from_mapping(
+        return cls.from_mapping(
             {
                 "method":   get("method") or "GET",
                 "url":      url_value,
@@ -1480,11 +1465,6 @@ class PreparedRequest:
             },
             normalize=normalize,
         )
-        raise_error = get("raise_error")
-        if raise_error is not None:
-            from .send_config import SendConfig as _SendConfig
-            req.send_config = _SendConfig(raise_error=raise_error)
-        return req
 
     def apply(
         self,
