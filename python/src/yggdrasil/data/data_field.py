@@ -587,6 +587,7 @@ class Field(BaseChildrenFields):
     _TAG_KEY_FOREIGN_KEY: ClassVar[bytes] = TAG_PREFIX + b"foreign_key"
     _TAG_KEY_CONSTRAINT_KEY: ClassVar[bytes] = TAG_PREFIX + b"constraint_key"
     _TAG_KEY_SORTED: ClassVar[bytes] = TAG_PREFIX + b"sorted"
+    _TAG_KEY_INDEXED: ClassVar[bytes] = TAG_PREFIX + b"indexed"
 
     # Tag-flag → short token shown in pretty_format. Order is the
     # display order in the bracketed marker group; only flags whose
@@ -599,6 +600,7 @@ class Field(BaseChildrenFields):
         (b"partition_by", "partition"),
         (b"cluster_by", "cluster"),
         (b"sorted", "sorted"),
+        (b"indexed", "indexed"),
     )
     # Tag names handled by ``_PRETTY_TAG_FLAGS``. Anything stored under
     # ``TAG_PREFIX + <name>`` that isn't in this set is treated as a
@@ -1440,6 +1442,10 @@ class Field(BaseChildrenFields):
         md = self.metadata
         return bool(md and md.get(self._TAG_KEY_SORTED))
 
+    @property
+    def indexed(self) -> bool:
+        md = self.metadata
+        return bool(md and md.get(self._TAG_KEY_INDEXED))
 
     @property
     def comment(self) -> str | None:
@@ -1640,6 +1646,8 @@ class Field(BaseChildrenFields):
     def with_sorted(self, value: bool = True, inplace: bool = False) -> "Field":
         return self._with_tag_flag(b"sorted", value, inplace)
 
+    def with_indexed(self, value: bool = True, inplace: bool = False) -> "Field":
+        return self._with_tag_flag(b"indexed", value, inplace)
 
     # ==================================================================
     # Builders — `with_*` mutators, `copy`, `merge_with`, `autotag`
@@ -2687,12 +2695,23 @@ class Field(BaseChildrenFields):
         pd = pandas_module()
 
         if isinstance(obj, pd.DataFrame):
-            return cls(
-                name=DEFAULT_FIELD_NAME,
-                dtype=DataType.from_pandas(obj),
-                nullable=False,
-                metadata=None,
+            table = pa.Table.from_pandas(obj)
+            raw_meta = (table.schema.metadata or {}).get(b"pandas")
+            index_names: set[str] = set()
+            if raw_meta:
+                from yggdrasil.pickle import json as ygg_json
+                pmeta = ygg_json.loads(raw_meta)
+                index_names = {
+                    e for e in pmeta.get("index_columns", ()) if isinstance(e, str)
+                }
+            struct_field = cls.from_arrow_schema(
+                table.schema.remove_metadata(),
             )
+            if index_names:
+                for child in struct_field.fields:
+                    if child.name in index_names:
+                        child.with_indexed(True, inplace=True)
+            return struct_field
 
         if isinstance(obj, pd.Series):
             nullable = bool(obj.isna().any())
@@ -2709,7 +2728,7 @@ class Field(BaseChildrenFields):
                 name=obj.name or DEFAULT_FIELD_NAME,
                 dtype=DataType.from_pandas(obj),
                 nullable=nullable,
-                metadata=None,
+                tags={b"indexed": b"true"},
             )
 
         return cls(

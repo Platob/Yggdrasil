@@ -62,13 +62,42 @@ from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 
+from yggdrasil.data.constants import TAG_PREFIX
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MediaType, MimeType
+
+_TAG_KEY_INDEXED: bytes = TAG_PREFIX + b"indexed"
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tag_index_columns(table: pa.Table) -> pa.Table:
+    """Stamp ``t:indexed=true`` on columns that are pandas index levels."""
+    raw = (table.schema.metadata or {}).get(b"pandas")
+    if not raw:
+        return table
+    import yggdrasil.pickle.json as ygg_json
+    pmeta = ygg_json.loads(raw)
+    index_names: set[str] = {
+        e for e in pmeta.get("index_columns", ()) if isinstance(e, str)
+    }
+    if not index_names:
+        return table
+    tagged: list[pa.Field] = []
+    for f in table.schema:
+        if f.name in index_names:
+            merged = dict(f.metadata or {})
+            merged[_TAG_KEY_INDEXED] = b"true"
+            tagged.append(f.with_metadata(merged))
+        else:
+            tagged.append(f)
+    return pa.Table.from_arrays(
+        list(table.itercolumns()),
+        schema=pa.schema(tagged, metadata=None),
+    )
 
 if TYPE_CHECKING:
     import pandas
@@ -1444,7 +1473,20 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _read_pandas_frame(self, options: O) -> "pandas.DataFrame":
-        return self._read_arrow_table(options).to_pandas()
+        table = self._read_arrow_table(options)
+        df = table.to_pandas()
+        indexed = [
+            f.name for f in table.schema
+            if (f.metadata or {}).get(_TAG_KEY_INDEXED)
+        ]
+        if indexed:
+            df = df.set_index(indexed)
+            df.index.names = [
+                None if isinstance(n, str) and n.startswith("__index_level_")
+                else n
+                for n in df.index.names
+            ]
+        return df
 
     def write_pandas_frame(
         self,
@@ -1526,6 +1568,8 @@ class Tabular(ABC, Generic[O]):
 
         try:
             casted = pa.Table.from_pandas(frame, preserve_index=include_index)
+            if include_index:
+                casted = _tag_index_columns(casted)
             self._write_arrow_table(casted, options)
         except (pa.ArrowException, TypeError, ValueError):
             # pyarrow's pandas bridge raises ``pa.ArrowException``

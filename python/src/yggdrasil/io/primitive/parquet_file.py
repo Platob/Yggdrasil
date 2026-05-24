@@ -33,6 +33,7 @@ import pyarrow.parquet as pq
 
 from yggdrasil.arrow.ops import upsert_arrow_batches
 from yggdrasil.data.constants import TAG_PREFIX
+from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MimeTypes, Mode
@@ -492,6 +493,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                 continue
             merged = dict(arrow_field.metadata or {})
             merged[_PANDAS_INDEX_LEVEL_KEY] = str(level).encode("ascii")
+            merged[_Field._TAG_KEY_INDEXED] = b"true"
             tagged_fields.append(arrow_field.with_metadata(merged))
 
         enriched = pa.Table.from_arrays(

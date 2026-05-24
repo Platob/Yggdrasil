@@ -46,6 +46,60 @@ class TestFromPandas(PandasTestCase):
         )
 
 
+class TestFromPandasIndexMetadata(PandasTestCase):
+
+    def test_named_index_tags_child_as_indexed(self) -> None:
+        df = self.pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+        df.index = self.pd.Index([10, 20], name="pk")
+
+        out = Field.from_pandas(df)
+
+        children = {f.name: f for f in out.fields}
+        self.assertIn("pk", children)
+        self.assertTrue(children["pk"].indexed)
+        self.assertFalse(children["a"].indexed)
+        self.assertFalse(children["b"].indexed)
+
+    def test_multi_index_tags_all_levels(self) -> None:
+        idx = self.pd.MultiIndex.from_tuples(
+            [("x", 1), ("y", 2)], names=["k1", "k2"],
+        )
+        df = self.pd.DataFrame({"v": [10, 20]}, index=idx)
+
+        out = Field.from_pandas(df)
+
+        children = {f.name: f for f in out.fields}
+        self.assertTrue(children["k1"].indexed)
+        self.assertTrue(children["k2"].indexed)
+        self.assertFalse(children["v"].indexed)
+
+    def test_default_range_index_has_no_indexed_tag(self) -> None:
+        df = self.pd.DataFrame({"a": [1, 2]})
+
+        out = Field.from_pandas(df)
+
+        for child in out.fields:
+            self.assertFalse(child.indexed)
+
+    def test_index_object_tagged_as_indexed(self) -> None:
+        idx = self.pd.Index([10, 20, 30], name="pk")
+
+        out = Field.from_pandas(idx)
+
+        self.assertTrue(out.indexed)
+        self.assertEqual(out.name, "pk")
+
+    def test_unnamed_non_range_index_tags_placeholder(self) -> None:
+        df = self.pd.DataFrame({"a": [1, 2]}, index=[10, 20])
+
+        out = Field.from_pandas(df)
+
+        children = {f.name: f for f in out.fields}
+        indexed_children = [f for f in out.fields if f.indexed]
+        self.assertEqual(len(indexed_children), 1)
+        self.assertFalse(children["a"].indexed)
+
+
 class TestFromPolars(PolarsTestCase):
 
     def test_series_keeps_name_and_promotes_to_string(self) -> None:

@@ -230,8 +230,8 @@ class TestPandasIndexRoundTrip(__import__(
         # well-known ``Field.tags`` accessor.
         ygg_schema = Field.from_arrow_schema(schema)
         children_by_name = {f.name: f for f in ygg_schema.fields}
-        assert dict(children_by_name["k1"].tags) == {b"pandas_index_level": b"0"}
-        assert dict(children_by_name["k2"].tags) == {b"pandas_index_level": b"1"}
+        assert dict(children_by_name["k1"].tags) == {b"pandas_index_level": b"0", b"indexed": b"true"}
+        assert dict(children_by_name["k2"].tags) == {b"pandas_index_level": b"1", b"indexed": b"true"}
         assert not children_by_name["v"].tags
 
     def test_default_range_index_skips_index_column(self) -> None:
