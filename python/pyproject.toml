@@ -121,6 +121,7 @@ Documentation = "https://platob.github.io/Yggdrasil/"
 [project.scripts]
 ygg-api = "yggdrasil.fastapi.main:main"
 ygg-genie = "yggdrasil.cli.databricks.genie:main"
+ygg-databricks = "yggdrasil.databricks.cli:main"
 
 # ── setuptools ────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
