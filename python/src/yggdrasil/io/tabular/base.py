@@ -1227,25 +1227,20 @@ class Tabular(ABC, Generic[O]):
 
     def read_table(
         self, options: "O | None" = None, **kwargs: Any,
-    ) -> "Tabular":
-        """Read into a pyarrow :class:`pa.Table`.
+    ) -> "Tabular | None":
+        """Read into an in-memory :class:`ArrowTabular`.
 
-        Pyarrow is the only hard runtime dependency, so it's the
-        portable default. Callers that want a different engine can
-        ask for :meth:`read_polars_frame` / :meth:`read_spark_frame`
-        explicitly.
+        Materializes all batches through :meth:`read_arrow_batches`
+        (with *options* applied) and wraps them in an
+        :class:`ArrowTabular`. Returns ``None`` when the source is
+        empty after filtering.
         """
         options = self.check_options(options, overrides=locals())
-
-        result = self
-
-        if options is None:
-            return result
-
-        if options.predicate:
-            result = result.filter(predicate=options.predicate)
-
-        return result
+        batches = list(self.read_arrow_batches(options=options))
+        if not batches or all(b.num_rows == 0 for b in batches):
+            return None
+        from yggdrasil.arrow.tabular import ArrowTabular
+        return ArrowTabular(batches)
 
     def write_table(
         self,

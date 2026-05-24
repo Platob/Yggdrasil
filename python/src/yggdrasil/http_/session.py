@@ -1606,19 +1606,25 @@ class HTTPSession(Session):
 
     def _read_holder(
         self,
-        holder: IO,
+        holder: "IO | Any",
         requests: list[PreparedRequest],
         attr: str,
     ) -> tuple["Tabular | None", list[PreparedRequest]]:
         """Read cache hits from a single holder.
 
-        Returns ``(hits_tabular, misses)``.
+        Returns ``(hits_tabular, misses)``. Uses ``read_table`` when
+        available (materializes into ArrowTabular), falls back to
+        ``read_arrow_batches`` for duck-typed backends.
         """
         cfg = getattr(requests[0], attr)
         predicate = cfg.make_batch_lookup_predicate(requests)
-        batches = list(holder.read_arrow_batches(
-            options=CastOptions(predicate=predicate),
-        ))
+        opts = CastOptions(predicate=predicate)
+        if hasattr(holder, "read_table"):
+            tab = holder.read_table(options=opts)
+            if tab is None:
+                return None, list(requests)
+            return tab, []
+        batches = list(holder.read_arrow_batches(options=opts))
         if not batches or all(b.num_rows == 0 for b in batches):
             return None, list(requests)
         from yggdrasil.arrow.tabular import ArrowTabular
