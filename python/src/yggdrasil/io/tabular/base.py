@@ -2111,6 +2111,22 @@ class Tabular(ABC, Generic[O]):
         """
         return _default_filter(self, predicate=predicate)
 
+    def cast(self, schema: "Schema") -> "Tabular":
+        """Cast rows to *schema*, returning a new :class:`Tabular`.
+
+        Each batch is cast through
+        :meth:`Schema.cast_arrow_batch_iterator`. The result is an
+        :class:`ArrowTabular` with the target schema applied.
+        """
+        from yggdrasil.arrow.tabular import ArrowTabular as _ArrowTabular
+
+        batches = list(schema.cast_arrow_batch_iterator(
+            self.read_arrow_batches(),
+        ))
+        if not batches:
+            return _ArrowTabular(schema.to_arrow_schema().empty_table())
+        return _ArrowTabular(batches)
+
     # ==================================================================
     # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.
     # ==================================================================
