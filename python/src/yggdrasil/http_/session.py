@@ -856,7 +856,6 @@ class HTTPSession(Session):
         cache_cfg: CacheConfig,
         *,
         source: str,
-        spark_session: Optional["SparkSession"] = None,
     ) -> Optional[Response]:
         """Resolve one request against a cache backend (local or remote).
 
@@ -897,7 +896,7 @@ class HTTPSession(Session):
             else request.anonymize(mode=cache_cfg.anonymize)
         )
         predicate = cache_cfg.make_lookup_predicate(request=lookup_request)
-        opts = CastOptions(predicate=predicate, spark_session=spark_session)
+        opts = CastOptions(predicate=predicate, spark_session=request.send_config_or_default.spark_session)
         batches = self._read_cache_batches(tabular, opts)
 
         best: Optional[Response] = None
@@ -924,7 +923,6 @@ class HTTPSession(Session):
         *,
         source: str,
         tabular: Any = None,
-        spark_session: Optional["SparkSession"] = None,
         mode: Optional[Mode] = None,
         async_write: "bool | None" = None,
     ) -> None:
@@ -969,6 +967,8 @@ class HTTPSession(Session):
         )
         if async_write is None:
             async_write = (source == "local")
+        req = response.request
+        spark = req.send_config_or_default.spark_session if req is not None else None
         if async_write:
             Job.make(
                 _insert_cache,
@@ -976,7 +976,7 @@ class HTTPSession(Session):
                 cache_cfg,
                 batch,
                 mode=mode,
-                spark_session=spark_session,
+                spark_session=spark,
                 prune_values=prune_values,
             ).fire_and_forget()
         else:
@@ -985,7 +985,7 @@ class HTTPSession(Session):
                 cache_cfg,
                 batch,
                 mode=mode,
-                spark_session=spark_session,
+                spark_session=spark,
                 prune_values=prune_values,
             )
 
@@ -1268,10 +1268,7 @@ class HTTPSession(Session):
             and remote_cfg.mode != Mode.UPSERT
         ):
             remote_response = self._load_cached_response(
-                request,
-                remote_cfg,
-                source="remote",
-                spark_session=config.spark_session,
+                request, remote_cfg, source="remote",
             )
             if remote_response is not None:
                 if local_cache_tabular is not None:
@@ -1307,10 +1304,7 @@ class HTTPSession(Session):
 
         if remote_cfg is not None and remote_cfg.remote_cache_enabled:
             self._store_cached_response(
-                response,
-                remote_cfg,
-                source="remote",
-                spark_session=config.spark_session,
+                response, remote_cfg, source="remote",
             )
 
         if config.raise_error:
@@ -1674,8 +1668,6 @@ class HTTPSession(Session):
     def _split_remote_cache(
         self,
         requests: list[PreparedRequest],
-        *,
-        spark_session: Optional["SparkSession"] = None,
     ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
         """Stage 2: scan the remote cache.
 
@@ -1707,7 +1699,7 @@ class HTTPSession(Session):
         for tkey, t_reqs in table_to_reqs.items():
             t_cfg = table_to_cfg[tkey]
             t_hits, t_misses = self._lookup_cached(
-                t_cfg, t_reqs, source="remote", spark_session=spark_session,
+                t_cfg, t_reqs, source="remote",
             )
             if t_hits:
                 hits[tkey] = t_hits
@@ -1729,7 +1721,6 @@ class HTTPSession(Session):
         requests: list[PreparedRequest],
         *,
         source: str,
-        spark_session: Optional["SparkSession"] = None,
     ) -> tuple[list[Response], list[PreparedRequest]]:
         """Batch-lookup *requests* against any cache backend.
 
@@ -1769,6 +1760,7 @@ class HTTPSession(Session):
             lookup_batch = [r.anonymize(mode=cfg.anonymize) for r in requests]
 
         predicate = cfg.make_batch_lookup_predicate(requests=lookup_batch)
+        spark_session = requests[0].send_config_or_default.spark_session if requests else None
         opts = CastOptions(predicate=predicate, spark_session=spark_session)
         batches = self._read_cache_batches(tabular, opts)
 
@@ -2552,7 +2544,6 @@ class HTTPSession(Session):
             # --- Stage 2: remote cache ---
             remote_hits_by_table, after_remote = self._split_remote_cache(
                 after_local,
-                spark_session=spark,
             )
             self._backfill_local_cache([
                 r
