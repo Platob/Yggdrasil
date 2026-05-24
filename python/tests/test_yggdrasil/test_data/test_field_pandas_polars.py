@@ -48,7 +48,7 @@ class TestFromPandas(PandasTestCase):
 
 class TestFromPandasIndexMetadata(PandasTestCase):
 
-    def test_named_index_tags_child_as_indexed(self) -> None:
+    def test_named_index_tags_child_as_index_key(self) -> None:
         df = self.pd.DataFrame({"a": [1, 2], "b": [3, 4]})
         df.index = self.pd.Index([10, 20], name="pk")
 
@@ -56,9 +56,10 @@ class TestFromPandasIndexMetadata(PandasTestCase):
 
         children = {f.name: f for f in out.fields}
         self.assertIn("pk", children)
-        self.assertTrue(children["pk"].indexed)
-        self.assertFalse(children["a"].indexed)
-        self.assertFalse(children["b"].indexed)
+        self.assertTrue(children["pk"].index_key)
+        self.assertEqual(children["pk"].index_key_level, 0)
+        self.assertFalse(children["a"].index_key)
+        self.assertFalse(children["b"].index_key)
 
     def test_multi_index_tags_all_levels(self) -> None:
         idx = self.pd.MultiIndex.from_tuples(
@@ -69,24 +70,26 @@ class TestFromPandasIndexMetadata(PandasTestCase):
         out = Field.from_pandas(df)
 
         children = {f.name: f for f in out.fields}
-        self.assertTrue(children["k1"].indexed)
-        self.assertTrue(children["k2"].indexed)
-        self.assertFalse(children["v"].indexed)
+        self.assertTrue(children["k1"].index_key)
+        self.assertEqual(children["k1"].index_key_level, 0)
+        self.assertTrue(children["k2"].index_key)
+        self.assertEqual(children["k2"].index_key_level, 1)
+        self.assertFalse(children["v"].index_key)
 
-    def test_default_range_index_has_no_indexed_tag(self) -> None:
+    def test_default_range_index_has_no_index_key_tag(self) -> None:
         df = self.pd.DataFrame({"a": [1, 2]})
 
         out = Field.from_pandas(df)
 
         for child in out.fields:
-            self.assertFalse(child.indexed)
+            self.assertFalse(child.index_key)
 
-    def test_index_object_tagged_as_indexed(self) -> None:
+    def test_index_object_tagged_as_index_key(self) -> None:
         idx = self.pd.Index([10, 20, 30], name="pk")
 
         out = Field.from_pandas(idx)
 
-        self.assertTrue(out.indexed)
+        self.assertTrue(out.index_key)
         self.assertEqual(out.name, "pk")
 
     def test_unnamed_non_range_index_tags_placeholder(self) -> None:
@@ -95,9 +98,22 @@ class TestFromPandasIndexMetadata(PandasTestCase):
         out = Field.from_pandas(df)
 
         children = {f.name: f for f in out.fields}
-        indexed_children = [f for f in out.fields if f.indexed]
-        self.assertEqual(len(indexed_children), 1)
-        self.assertFalse(children["a"].indexed)
+        index_children = [f for f in out.fields if f.index_key]
+        self.assertEqual(len(index_children), 1)
+        self.assertFalse(children["a"].index_key)
+
+    def test_check_pandas_indexes_promotes_index_columns(self) -> None:
+        df = self.pd.DataFrame({"a": [1, 2], "pk": [10, 20], "v": [3, 4]})
+        field = Field.from_pandas(df)
+        for child in field.fields:
+            if child.name == "pk":
+                child.with_index_key(True, level=0, inplace=True)
+
+        result = field.check_pandas_indexes(df)
+
+        self.assertEqual(result.index.name, "pk")
+        self.assertEqual(list(result.index), [10, 20])
+        self.assertNotIn("pk", result.columns)
 
 
 class TestFromPolars(PolarsTestCase):

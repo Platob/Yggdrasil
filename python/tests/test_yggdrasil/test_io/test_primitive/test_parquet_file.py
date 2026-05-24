@@ -194,18 +194,11 @@ class TestPandasIndexRoundTrip(__import__(
         self.assertFrameEqual(result, df, check_index=True)
         assert result.index.name == "custom_idx"
 
-    def test_schema_carries_pandas_index_level_tag(self) -> None:
-        """Each materialised index level lands as a tagged Field in the schema.
-
-        The on-disk per-field metadata is the canonical channel — every
-        engine that walks the schema (polars, spark, the cast registry)
-        sees ``Field.tags["pandas_index_level"]`` and knows which
-        columns to treat as the pandas index.
-        """
+    def test_schema_carries_index_key_tags(self) -> None:
+        """Each materialised index level lands as a tagged Field in the schema."""
         import pyarrow.parquet as pq
         from io import BytesIO
         from yggdrasil.data.data_field import Field
-        from yggdrasil.io.primitive.parquet_file import _PANDAS_INDEX_LEVEL_KEY
 
         df = self.df(
             {"v": [10, 20, 30]},
@@ -218,27 +211,27 @@ class TestPandasIndexRoundTrip(__import__(
 
         schema = pq.ParquetFile(BytesIO(mem.to_bytes())).schema_arrow
 
-        # b'pandas' is stripped — the yggdrasil tags own the round-trip.
         assert b"pandas" not in (schema.metadata or {})
 
-        # Per-field tag carries the level position in ASCII bytes.
-        assert schema.field("k1").metadata[_PANDAS_INDEX_LEVEL_KEY] == b"0"
-        assert schema.field("k2").metadata[_PANDAS_INDEX_LEVEL_KEY] == b"1"
+        assert schema.field("k1").metadata[Field._TAG_KEY_INDEX_KEY] == b"true"
+        assert schema.field("k1").metadata[Field._TAG_KEY_INDEX_KEY_LEVEL] == b"0"
+        assert schema.field("k2").metadata[Field._TAG_KEY_INDEX_KEY] == b"true"
+        assert schema.field("k2").metadata[Field._TAG_KEY_INDEX_KEY_LEVEL] == b"1"
         assert schema.field("v").metadata is None
 
-        # The yggdrasil Schema view exposes the tag through the
-        # well-known ``Field.tags`` accessor.
         ygg_schema = Field.from_arrow_schema(schema)
         children_by_name = {f.name: f for f in ygg_schema.fields}
-        assert dict(children_by_name["k1"].tags) == {b"pandas_index_level": b"0", b"indexed": b"true"}
-        assert dict(children_by_name["k2"].tags) == {b"pandas_index_level": b"1", b"indexed": b"true"}
-        assert not children_by_name["v"].tags
+        assert children_by_name["k1"].index_key is True
+        assert children_by_name["k1"].index_key_level == 0
+        assert children_by_name["k2"].index_key is True
+        assert children_by_name["k2"].index_key_level == 1
+        assert not children_by_name["v"].index_key
 
     def test_default_range_index_skips_index_column(self) -> None:
         """Default RangeIndex(0, N) doesn't materialise — no synthetic column."""
         import pyarrow.parquet as pq
         from io import BytesIO
-        from yggdrasil.io.primitive.parquet_file import _PANDAS_INDEX_LEVEL_KEY
+        from yggdrasil.data.data_field import Field
 
         df = self.df({"a": [1, 2, 3]})
         mem = Memory()
@@ -246,10 +239,9 @@ class TestPandasIndexRoundTrip(__import__(
 
         schema = pq.ParquetFile(BytesIO(mem.to_bytes())).schema_arrow
         assert schema.names == ["a"]
-        # No field carries the index-level tag.
         for name in schema.names:
             meta = schema.field(name).metadata or {}
-            assert _PANDAS_INDEX_LEVEL_KEY not in meta
+            assert Field._TAG_KEY_INDEX_KEY not in meta
 
 
 class TestPandasAppendUpsert(__import__(
@@ -259,7 +251,7 @@ class TestPandasAppendUpsert(__import__(
 
     The Parquet writer's merge modes read the existing footer's
     schema, bind it as the target, and route incoming batches through
-    the cast — the pandas_index_level Field tags survive that hop, so
+    the cast — the index_key Field tags survive that hop, so
     a chain of pandas writes lands with the index reconstructed on
     read.
     """
@@ -301,9 +293,8 @@ class TestPandasAppendUpsert(__import__(
         import pyarrow.parquet as pq
         from io import BytesIO
         from yggdrasil.data.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import (
-            ParquetOptions, _PANDAS_INDEX_LEVEL_KEY,
-        )
+        from yggdrasil.data.data_field import Field
+        from yggdrasil.io.primitive.parquet_file import ParquetOptions
 
         df1 = self.df({"v": [1, 2]}, index=self.pd.Index([10, 20], name="i"))
         df2 = self.df({"v": [3, 4]}, index=self.pd.Index([30, 40], name="i"))
@@ -317,7 +308,7 @@ class TestPandasAppendUpsert(__import__(
         schema = pq.ParquetFile(BytesIO(mem.to_bytes())).schema_arrow
         # b'pandas' is stripped — the yggdrasil tag is still the source of truth.
         assert b"pandas" not in (schema.metadata or {})
-        assert schema.field("i").metadata[_PANDAS_INDEX_LEVEL_KEY] == b"0"
+        assert schema.field("i").metadata[Field._TAG_KEY_INDEX_KEY_LEVEL] == b"0"
 
     def test_upsert_pandas_frames_by_key(self) -> None:
         """UPSERT with match_by replaces existing rows; incoming wins."""
@@ -373,9 +364,8 @@ class TestPandasAppendUpsert(__import__(
         import pyarrow.parquet as pq
         from io import BytesIO
         from yggdrasil.data.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import (
-            ParquetOptions, _PANDAS_INDEX_LEVEL_KEY,
-        )
+        from yggdrasil.data.data_field import Field
+        from yggdrasil.io.primitive.parquet_file import ParquetOptions
 
         df = self.df({"v": [1, 2]}, index=self.pd.Index([10, 20], name="i"))
 
@@ -388,7 +378,7 @@ class TestPandasAppendUpsert(__import__(
         )
 
         schema = pq.ParquetFile(BytesIO(mem.to_bytes())).schema_arrow
-        assert schema.field("i").metadata[_PANDAS_INDEX_LEVEL_KEY] == b"0"
+        assert schema.field("i").metadata[Field._TAG_KEY_INDEX_KEY_LEVEL] == b"0"
 
         result = self._read(mem)
         self.assertFrameEqual(result, df, check_index=True)

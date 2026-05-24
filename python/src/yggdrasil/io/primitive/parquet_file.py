@@ -32,7 +32,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.arrow.ops import upsert_arrow_batches
-from yggdrasil.data.constants import TAG_PREFIX
 from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
@@ -46,21 +45,6 @@ if TYPE_CHECKING:
     import polars as pl
     import pyarrow.dataset as pds
 
-
-#: Tag name (sans :data:`TAG_PREFIX`) that marks a column as a pandas
-#: index level — exposed to consumers as
-#: ``Field.tags[b"pandas_index_level"]``. The value is the level
-#: position encoded as ASCII bytes (``b"0"``, ``b"1"``, …). This tag
-#: is the canonical channel for the pandas-index round-trip,
-#: replacing pyarrow's ``b"pandas"`` JSON blob — every engine that
-#: walks a yggdrasil :class:`Schema` (polars, spark, …) sees the
-#: index intent the same way pandas does.
-_PANDAS_INDEX_LEVEL_KEY_NAME: bytes = b"pandas_index_level"
-
-#: Pre-computed full metadata key (``TAG_PREFIX + tag name``) for the
-#: index-level tag. Reading per-field metadata directly is the
-#: hot-path access pattern across the codebase.
-_PANDAS_INDEX_LEVEL_KEY: bytes = TAG_PREFIX + _PANDAS_INDEX_LEVEL_KEY_NAME
 
 #: Placeholder column-name prefix pyarrow uses for index levels that
 #: had no ``name`` on the source DataFrame (``__index_level_0__`` for
@@ -437,7 +421,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         ``preserve_index=True`` materialises every index level as a
         real column (named after the level, or ``__index_level_N__``
         when the level was unnamed). Each materialised column then
-        gets a :data:`_PANDAS_INDEX_LEVEL_KEY` per-field tag carrying
+        gets an ``index_key`` + ``index_key_level`` per-field tag carrying
         its level position, and pyarrow's ``b"pandas"`` JSON blob is
         stripped — the yggdrasil schema is now the single source of
         truth for the round-trip, visible to every engine that reads
@@ -492,8 +476,8 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                 tagged_fields.append(arrow_field)
                 continue
             merged = dict(arrow_field.metadata or {})
-            merged[_PANDAS_INDEX_LEVEL_KEY] = str(level).encode("ascii")
-            merged[_Field._TAG_KEY_INDEXED] = b"true"
+            merged[_Field._TAG_KEY_INDEX_KEY] = b"true"
+            merged[_Field._TAG_KEY_INDEX_KEY_LEVEL] = str(level).encode("ascii")
             tagged_fields.append(arrow_field.with_metadata(merged))
 
         enriched = pa.Table.from_arrays(
@@ -503,20 +487,14 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         self._write_arrow_table(enriched, options)
 
     def _read_pandas_frame(self, options: ParquetOptions) -> "pandas.DataFrame":
-        """Restore the pandas index from :data:`_PANDAS_INDEX_LEVEL_KEY`.
+        """Restore the pandas index from ``index_key`` / ``index_key_level`` tags.
 
         Reads the arrow table (parquet preserves per-field metadata
-        end-to-end), collects every field carrying an index-level
-        tag, materialises the DataFrame, and promotes the tagged
-        columns into the index via ``set_index`` in level order.
-        ``__index_level_N__`` placeholder names — pyarrow's stand-in
-        for an unnamed index level — are mapped back to ``None`` so
-        the round-trip matches the source frame.
-
-        When no field carries the tag the result is whatever the
-        base path produced — a plain default ``RangeIndex`` for our
-        own writes, or whatever ``to_pandas()`` infers for parquet
-        produced by other tools.
+        end-to-end), collects every field carrying an index-key tag,
+        materialises the DataFrame, and promotes the tagged columns
+        into the index via ``set_index`` in level order.
+        ``__index_level_N__`` placeholder names are mapped back to
+        ``None`` so the round-trip matches the source frame.
         """
         table = self._read_arrow_table(options)
 
@@ -525,13 +503,14 @@ class ParquetFile(IO[bytes, ParquetOptions]):
             meta = arrow_field.metadata
             if not meta:
                 continue
-            raw = meta.get(_PANDAS_INDEX_LEVEL_KEY)
-            if raw is None:
+            if not meta.get(_Field._TAG_KEY_INDEX_KEY):
                 continue
+            raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
             try:
-                levels.append((int(raw), arrow_field.name))
+                pos = int(raw_level) if raw_level is not None else 0
             except (TypeError, ValueError):
-                continue
+                pos = 0
+            levels.append((pos, arrow_field.name))
 
         df = table.to_pandas()
         if not levels:

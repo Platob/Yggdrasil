@@ -587,7 +587,8 @@ class Field(BaseChildrenFields):
     _TAG_KEY_FOREIGN_KEY: ClassVar[bytes] = TAG_PREFIX + b"foreign_key"
     _TAG_KEY_CONSTRAINT_KEY: ClassVar[bytes] = TAG_PREFIX + b"constraint_key"
     _TAG_KEY_SORTED: ClassVar[bytes] = TAG_PREFIX + b"sorted"
-    _TAG_KEY_INDEXED: ClassVar[bytes] = TAG_PREFIX + b"indexed"
+    _TAG_KEY_INDEX_KEY: ClassVar[bytes] = TAG_PREFIX + b"index_key"
+    _TAG_KEY_INDEX_KEY_LEVEL: ClassVar[bytes] = TAG_PREFIX + b"index_key_level"
 
     # Tag-flag → short token shown in pretty_format. Order is the
     # display order in the bracketed marker group; only flags whose
@@ -600,7 +601,7 @@ class Field(BaseChildrenFields):
         (b"partition_by", "partition"),
         (b"cluster_by", "cluster"),
         (b"sorted", "sorted"),
-        (b"indexed", "indexed"),
+        (b"index_key", "IK"),
     )
     # Tag names handled by ``_PRETTY_TAG_FLAGS``. Anything stored under
     # ``TAG_PREFIX + <name>`` that isn't in this set is treated as a
@@ -1443,9 +1444,22 @@ class Field(BaseChildrenFields):
         return bool(md and md.get(self._TAG_KEY_SORTED))
 
     @property
-    def indexed(self) -> bool:
+    def index_key(self) -> bool:
         md = self.metadata
-        return bool(md and md.get(self._TAG_KEY_INDEXED))
+        return bool(md and md.get(self._TAG_KEY_INDEX_KEY))
+
+    @property
+    def index_key_level(self) -> int | None:
+        md = self.metadata
+        if not md:
+            return None
+        raw = md.get(self._TAG_KEY_INDEX_KEY_LEVEL)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
 
     @property
     def comment(self) -> str | None:
@@ -1646,8 +1660,13 @@ class Field(BaseChildrenFields):
     def with_sorted(self, value: bool = True, inplace: bool = False) -> "Field":
         return self._with_tag_flag(b"sorted", value, inplace)
 
-    def with_indexed(self, value: bool = True, inplace: bool = False) -> "Field":
-        return self._with_tag_flag(b"indexed", value, inplace)
+    def with_index_key(self, value: bool = True, level: int | None = None, inplace: bool = False) -> "Field":
+        result = self._with_tag_flag(b"index_key", value, inplace)
+        if value and level is not None:
+            result._set_tag_value(b"index_key_level", str(level))
+        elif not value:
+            result._unset_tag_value(b"index_key_level")
+        return result
 
     # ==================================================================
     # Builders — `with_*` mutators, `copy`, `merge_with`, `autotag`
@@ -2697,20 +2716,23 @@ class Field(BaseChildrenFields):
         if isinstance(obj, pd.DataFrame):
             table = pa.Table.from_pandas(obj)
             raw_meta = (table.schema.metadata or {}).get(b"pandas")
-            index_names: set[str] = set()
+            index_levels: dict[str, int] = {}
             if raw_meta:
                 from yggdrasil.pickle import json as ygg_json
                 pmeta = ygg_json.loads(raw_meta)
-                index_names = {
-                    e for e in pmeta.get("index_columns", ()) if isinstance(e, str)
+                index_levels = {
+                    e: pos
+                    for pos, e in enumerate(pmeta.get("index_columns", ()))
+                    if isinstance(e, str)
                 }
             struct_field = cls.from_arrow_schema(
                 table.schema.remove_metadata(),
             )
-            if index_names:
+            if index_levels:
                 for child in struct_field.fields:
-                    if child.name in index_names:
-                        child.with_indexed(True, inplace=True)
+                    level = index_levels.get(child.name)
+                    if level is not None:
+                        child.with_index_key(True, level=level, inplace=True)
             return struct_field
 
         if isinstance(obj, pd.Series):
@@ -2728,7 +2750,7 @@ class Field(BaseChildrenFields):
                 name=obj.name or DEFAULT_FIELD_NAME,
                 dtype=DataType.from_pandas(obj),
                 nullable=nullable,
-                tags={b"indexed": b"true"},
+                tags={b"index_key": b"true"},
             )
 
         return cls(
@@ -3426,16 +3448,13 @@ class Field(BaseChildrenFields):
     ) -> Any:
         """Cast any pandas object — dispatch by shape.
 
-        DataFrame → :meth:`cast_pandas_tabular`,
+        DataFrame → :meth:`cast_pandas_tabular` + index check,
         Series → :meth:`cast_pandas_series`.
-
-        Index isn't handled here: indices aren't data payload in the
-        DataIO sense, and ``pa.Table.from_pandas`` carries them via
-        ``preserve_index`` at the caller's discretion.
         """
         pd = pandas_module()
         if isinstance(obj, pd.DataFrame):
-            return self.cast_pandas_tabular(obj, options=options, **more)
+            casted = self.cast_pandas_tabular(obj, options=options, **more)
+            return self.check_pandas_indexes(casted)
         if isinstance(obj, pd.Series):
             return self.cast_pandas_series(obj, options=options, **more)
         raise TypeError(
@@ -4104,6 +4123,41 @@ class Field(BaseChildrenFields):
             f"Field.finalize_pandas: expected pd.DataFrame/pd.Series, "
             f"got {type(obj).__name__}"
         )
+
+    def check_pandas_indexes(self, obj: Any) -> Any:
+        """Promote columns tagged ``index_key`` to the DataFrame index.
+
+        Collects children with :attr:`index_key` set, sorted by
+        :attr:`index_key_level`, and calls ``set_index`` on the
+        DataFrame. ``__index_level_N__`` placeholder names are mapped
+        back to ``None`` so the round-trip matches the source.
+
+        For a Series whose field is itself tagged ``index_key``, the
+        Series is returned as-is — the caller decides how to attach it
+        as an index.
+
+        Passthrough when no children carry the tag or when the object
+        is not a DataFrame.
+        """
+        pd = pandas_module()
+        if isinstance(obj, pd.DataFrame) and self.fields:
+            levels: list[tuple[int, str]] = []
+            for child in self.fields:
+                if child.index_key:
+                    level = child.index_key_level
+                    levels.append((level if level is not None else 0, child.name))
+            if levels:
+                levels.sort()
+                names = [name for _, name in levels]
+                present = [n for n in names if n in obj.columns]
+                if present:
+                    obj = obj.set_index(present)
+                    obj.index.names = [
+                        None if isinstance(n, str) and n.startswith("__index_level_")
+                        else n
+                        for n in obj.index.names
+                    ]
+        return obj
 
     def finalize_spark_column(
         self,
