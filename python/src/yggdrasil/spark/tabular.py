@@ -432,11 +432,9 @@ class Dataset(Tabular[CastOptions]):
             f"OVERWRITE / APPEND / IGNORE; got {action!r}."
         )
 
-    def _union(self, other: "Tabular", *, schema_mode: "Any" = None) -> "Dataset":
+    def _union(self, other: "Tabular", *, mode: "Mode" = ...) -> "Dataset":
         other_frame = other._native_spark_frame()
         if other_frame is None:
-            from yggdrasil.data.enums import Mode
-            mode = Mode.from_(schema_mode) if schema_mode is not None else Mode.IGNORE
             merged = self.collect_schema().merge_with(
                 other.collect_schema(), mode=mode,
             )
