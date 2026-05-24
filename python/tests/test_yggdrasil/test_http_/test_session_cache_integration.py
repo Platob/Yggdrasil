@@ -55,6 +55,7 @@ from yggdrasil.data.enums import Mode
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, SendConfig
 from yggdrasil.io.session import Session
+from yggdrasil.io.tabular import Tabular
 
 from ._helpers import StubSession, make_request, make_response
 
@@ -155,20 +156,11 @@ def _wait_for_local(cache: CacheConfig, *, count: int = 1, timeout: float = 5.0)
 # ---------------------------------------------------------------------------
 
 
-class _FakeRemoteTabular:
-    """In-memory Tabular double for the remote-cache flow.
-
-    Holds seeded rows (a list of :class:`pa.RecordBatch`) and
-    records every ``read_arrow_batches`` predicate, every ``insert``
-    call, and whether ``create`` was called. Insert appends new
-    batches into ``rows`` so a subsequent lookup returns everything
-    that was written. Read translates ``options.predicate`` into a
-    pyarrow row-level filter via
-    :meth:`Predicate.filter_arrow_batches` — same shape every real
-    :class:`Tabular` backend implements internally.
-    """
+class _FakeRemoteTabular(Tabular):
+    """In-memory Tabular double for the remote-cache flow."""
 
     def __init__(self, name: str = "ws.cache.responses") -> None:
+        super().__init__()
         self._name = name
         self.rows: list[pa.RecordBatch] = []
         self.predicates: list[Any] = []
@@ -184,11 +176,8 @@ class _FakeRemoteTabular:
         self.created = True
         self.raise_table_not_found = False
 
-    def read_arrow_batches(self, options: Any = None, **kwargs: Any) -> Iterator[pa.RecordBatch]:
+    def _read_arrow_batches(self, options: Any = None, **kwargs: Any) -> Iterator[pa.RecordBatch]:
         predicate = getattr(options, "predicate", None)
-        # Record the predicate before the missing-table guard so the
-        # create-and-retry path's two attempts both leave a trail
-        # (the create-on-first-miss recovery test inspects the count).
         self.predicates.append(predicate)
         if self.raise_table_not_found and not self.created:
             raise RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] table missing")
@@ -197,20 +186,12 @@ class _FakeRemoteTabular:
             return iter(batches)
         return predicate.filter_arrow_batches(iter(batches))
 
-    def write_arrow_batches(
+    def _write_arrow_batches(
         self,
         batches: Any,
         options: Any = None,
         **kwargs: Any,
     ) -> None:
-        """Unified write surface — what ``Session._insert_cache`` calls.
-
-        Mirrors the real :class:`Tabular.write_arrow_batches` contract:
-        accepts an iterable of :class:`pa.RecordBatch`, reads write
-        knobs (``mode``, ``match_by``, ``wait``, ``prune_values``)
-        from :class:`CastOptions`. Records the call in ``self.inserts``
-        so existing test assertions continue to work.
-        """
         new_batches: list[pa.RecordBatch] = []
         for entry in batches:
             if isinstance(entry, pa.Table):
