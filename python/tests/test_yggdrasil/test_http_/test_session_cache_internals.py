@@ -61,9 +61,8 @@ class _StubTabular(Tabular):
     def __init__(self, name: str) -> None:
         super().__init__()
         self._name = name
-
-    def full_name(self, safe: bool = False) -> str:
-        return self._name
+        from yggdrasil.io.url import URL
+        self.url = URL.from_(name)
 
     def _read_arrow_batches(self, options=None): return iter(())
     def _write_arrow_batches(self, batches, options=None): pass

@@ -1693,16 +1693,11 @@ class HTTPSession(Session):
 
     @staticmethod
     def _remote_write_group_key(cfg: CacheConfig) -> tuple:
-        """Identity used to group responses for a single bulk remote insert.
-
-        Two responses can share an insert iff every config dimension that
-        affects the write call is identical: target table, mode, match-by
-        columns, wait flag, and anonymize mode. Without all five, distinct
-        per-request configs get silently collapsed onto whichever config
-        landed in the bucket first.
-        """
+        """Identity used to group responses for a single bulk remote insert."""
+        tab = cfg.tabular
+        tab_key = tab.url if hasattr(tab, "url") else id(tab)
         return (
-            cfg.tabular.full_name(safe=True),
+            tab_key,
             cfg.mode,
             tuple(cfg.match_by) if cfg.match_by else (),
             bool(cfg.wait),
