@@ -106,24 +106,14 @@ class BundleCommand:
         )
 
     @classmethod
-    def _build_client(cls, args: argparse.Namespace) -> "DatabricksClient":
-        from yggdrasil.databricks.client import DatabricksClient
-
-        kwargs: dict[str, Any] = {}
-        for attr in ("host", "token", "profile"):
-            val = getattr(args, attr, None)
-            if val is not None:
-                kwargs[attr] = val
-        return DatabricksClient(**kwargs)
-
-    @classmethod
-    def _handle_deploy(cls, args: argparse.Namespace) -> int:
-        from .deploy import deploy
+    def _build_client_for_bundle(
+        cls, args: argparse.Namespace, build_client: Any,
+    ) -> "DatabricksClient":
+        from .config import load_bundle, resolve_target
 
         bundle_path = cls._resolve_bundle_path(args)
         target = getattr(args, "target", None)
 
-        from .config import resolve_target, load_bundle
         raw = load_bundle(bundle_path)
         target_cfg, _ = resolve_target(raw, target)
 
@@ -131,26 +121,29 @@ class BundleCommand:
         if workspace_cfg.get("host") and not getattr(args, "host", None):
             args.host = workspace_cfg["host"]
 
-        client = cls._build_client(args)
+        return build_client(args)
+
+    @classmethod
+    def _handle_deploy(cls, args: argparse.Namespace, build_client: Any) -> int:
+        from .deploy import deploy
+
+        bundle_path = cls._resolve_bundle_path(args)
+        target = getattr(args, "target", None)
+        client = cls._build_client_for_bundle(args, build_client)
         return deploy(bundle_path, target, client=client)
 
     @classmethod
-    def _handle_run(cls, args: argparse.Namespace) -> int:
+    def _handle_run(cls, args: argparse.Namespace, build_client: Any) -> int:
         import sys
 
         from .config import load_bundle, resolve_target
 
         bundle_path = cls._resolve_bundle_path(args)
         target = getattr(args, "target", None)
+        client = cls._build_client_for_bundle(args, build_client)
 
         raw = load_bundle(bundle_path)
-        target_cfg, resolved = resolve_target(raw, target)
-
-        workspace_cfg = target_cfg.get("workspace") or {}
-        if workspace_cfg.get("host") and not getattr(args, "host", None):
-            args.host = workspace_cfg["host"]
-
-        client = cls._build_client(args)
+        _, resolved = resolve_target(raw, target)
 
         resources = resolved.get("resources") or {}
         jobs_cfg = resources.get("jobs") or {}
@@ -190,27 +183,33 @@ class BundleCommand:
         return 0
 
     @classmethod
-    def _handle_validate(cls, args: argparse.Namespace) -> int:
+    def _handle_validate(cls, args: argparse.Namespace, build_client: Any) -> int:
         import sys
 
         from .config import load_bundle, resolve_target
+        from .resources import RESOURCE_DEPLOYERS
 
         bundle_path = cls._resolve_bundle_path(args)
         target = getattr(args, "target", None)
 
         raw = load_bundle(bundle_path)
-        target_cfg, resolved = resolve_target(raw, target)
+        _, resolved = resolve_target(raw, target)
 
         bundle_name = (resolved.get("bundle") or {}).get("name", "unnamed")
         resources = resolved.get("resources") or {}
-        jobs_cfg = resources.get("jobs") or {}
 
         sys.stderr.write(f"Bundle {bundle_name!r} is valid.\n")
         sys.stderr.write(f"  Target: {target or 'default'}\n")
-        sys.stderr.write(f"  Jobs: {', '.join(jobs_cfg) or '(none)'}\n")
 
-        for job_key, job_cfg in jobs_cfg.items():
-            tasks = job_cfg.get("tasks") or []
-            sys.stderr.write(f"    {job_key}: {len(tasks)} task(s)\n")
+        for rtype in RESOURCE_DEPLOYERS:
+            entries = resources.get(rtype) or {}
+            if entries:
+                sys.stderr.write(f"  {rtype}:\n")
+                for key, cfg in entries.items():
+                    detail = ""
+                    if rtype == "jobs":
+                        tasks = cfg.get("tasks") or []
+                        detail = f" ({len(tasks)} task(s))"
+                    sys.stderr.write(f"    {key}{detail}\n")
 
         return 0

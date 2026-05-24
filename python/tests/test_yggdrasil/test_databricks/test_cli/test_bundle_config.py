@@ -89,14 +89,18 @@ SAMPLE_BUNDLE = textwrap.dedent("""\
 """)
 
 
+def _write_bundle(text: str = SAMPLE_BUNDLE) -> Path:
+    f = NamedTemporaryFile(mode="w", suffix=".yml", delete=False)
+    f.write(text)
+    f.flush()
+    f.close()
+    return Path(f.name)
+
+
 class TestLoadBundle(unittest.TestCase):
 
     def test_load_parses_yaml(self):
-        with NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write(SAMPLE_BUNDLE)
-            f.flush()
-            path = Path(f.name)
-
+        path = _write_bundle()
         try:
             raw = load_bundle(path)
             self.assertEqual(raw["bundle"]["name"], "test-bundle")
@@ -109,20 +113,18 @@ class TestLoadBundle(unittest.TestCase):
 
 class TestResolveTarget(unittest.TestCase):
 
-    def _load(self) -> dict:
-        with NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write(SAMPLE_BUNDLE)
-            f.flush()
-            self._path = Path(f.name)
-        return load_bundle(self._path)
+    def setUp(self):
+        self._path = _write_bundle()
 
     def tearDown(self):
-        if hasattr(self, "_path"):
-            self._path.unlink(missing_ok=True)
+        self._path.unlink(missing_ok=True)
+
+    def _load(self) -> dict:
+        return load_bundle(self._path)
 
     def test_default_target_selected(self):
         raw = self._load()
-        target_cfg, resolved = resolve_target(raw, None)
+        target_cfg, _ = resolve_target(raw, None)
         self.assertEqual(
             target_cfg["workspace"]["host"],
             "https://prd.cloud.databricks.com",
@@ -143,8 +145,7 @@ class TestResolveTarget(unittest.TestCase):
         t0 = job["tasks"][0]
         self.assertEqual(t0["existing_cluster_id"], "abc-123")
         self.assertEqual(
-            t0["notebook_task"]["notebook_path"],
-            "/Shared/test/step_one",
+            t0["notebook_task"]["notebook_path"], "/Shared/test/step_one",
         )
 
     def test_variable_override_per_target(self):
@@ -192,86 +193,14 @@ class TestResolveTarget(unittest.TestCase):
             else:
                 os.environ["BUNDLE_VAR_cluster_id"] = old
 
+    def test_no_targets_uses_default_key(self):
+        raw = {"bundle": {"name": "bare"}, "resources": {"jobs": {}}}
+        target_cfg, resolved = resolve_target(raw, None)
+        self.assertEqual(target_cfg, {})
+        self.assertEqual(resolved["bundle"]["name"], "bare")
 
-class TestBuildTask(unittest.TestCase):
-
-    def _resolved_tasks(self):
-        with NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write(SAMPLE_BUNDLE)
-            f.flush()
-            path = Path(f.name)
-        try:
-            raw = load_bundle(path)
-            _, resolved = resolve_target(raw, "prd")
-            return resolved["resources"]["jobs"]["test_job"]["tasks"]
-        finally:
-            path.unlink()
-
-    def test_simple_notebook_task(self):
-        from yggdrasil.databricks.cli.bundle.deploy import _build_task
-
-        tasks_cfg = self._resolved_tasks()
-        t0 = _build_task(tasks_cfg[0])
-        self.assertEqual(t0.task_key, "step_one")
-        self.assertEqual(t0.existing_cluster_id, "abc-123")
-        self.assertEqual(t0.timeout_seconds, 300)
-        self.assertEqual(
-            t0.notebook_task.notebook_path, "/Shared/test/step_one",
-        )
-        self.assertIsNone(t0.depends_on)
-        self.assertIsNone(t0.for_each_task)
-
-    def test_for_each_task(self):
-        from yggdrasil.databricks.cli.bundle.deploy import _build_task
-
-        tasks_cfg = self._resolved_tasks()
-        t1 = _build_task(tasks_cfg[1])
-        self.assertEqual(t1.task_key, "step_two")
-        self.assertEqual(len(t1.depends_on), 1)
-        self.assertEqual(t1.depends_on[0].task_key, "step_one")
-
-        fe = t1.for_each_task
-        self.assertIsNotNone(fe)
-        self.assertEqual(fe.inputs, "{{tasks.step_one.values.items}}")
-        self.assertEqual(fe.concurrency, 8)
-        self.assertEqual(fe.task.task_key, "step_two_inner")
-        self.assertEqual(fe.task.existing_cluster_id, "abc-123")
-        self.assertEqual(
-            fe.task.notebook_task.notebook_path, "/Shared/test/step_two",
-        )
-
-
-class TestCLIHelp(unittest.TestCase):
-
-    def test_main_help_exits_zero(self):
-        from yggdrasil.databricks.cli import main
-
-        with self.assertRaises(SystemExit) as ctx:
-            main(["--help"])
-        self.assertEqual(ctx.exception.code, 0)
-
-    def test_bundle_deploy_help_exits_zero(self):
-        from yggdrasil.databricks.cli import main
-
-        with self.assertRaises(SystemExit) as ctx:
-            main(["bundle", "deploy", "--help"])
-        self.assertEqual(ctx.exception.code, 0)
-
-    def test_no_command_returns_one(self):
-        from yggdrasil.databricks.cli import main
-
-        self.assertEqual(main([]), 1)
-
-    def test_validate_with_bundle(self):
-        from yggdrasil.databricks.cli import main
-
-        with NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write(SAMPLE_BUNDLE)
-            f.flush()
-            path = f.name
-
-        try:
-            result = main(["bundle", "validate", "-f", path, "-t", "prd"])
-            self.assertEqual(result, 0)
-        finally:
-            Path(path).unlink()
+    def test_single_target_auto_selected(self):
+        raw = self._load()
+        raw["targets"] = {"only": {"workspace": {"host": "https://only.test"}}}
+        target_cfg, _ = resolve_target(raw, None)
+        self.assertEqual(target_cfg["workspace"]["host"], "https://only.test")

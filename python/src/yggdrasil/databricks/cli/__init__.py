@@ -8,21 +8,45 @@ operation through the yggdrasil service layer
 
 Currently supported:
 
-- ``ygg-databricks bundle deploy [-t <target>]`` — parse a
-  ``databricks.yml`` bundle, sync workspace files, and upsert jobs.
+- ``ygg-databricks bundle deploy [-t <target>]``
+- ``ygg-databricks jobs list/get/create/delete/run``
+- ``ygg-databricks clusters list/get/create/delete``
+- ``ygg-databricks warehouses list/get/create/delete``
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from .bundle import BundleCommand
+from .services import (
+    ClustersCommand,
+    JobsCommand,
+    WarehousesCommand,
+)
 
 __all__ = ["main"]
 
 LOGGER = logging.getLogger(__name__)
+
+_CLIENT_FLAGS: tuple[tuple[str, str, dict[str, Any]], ...] = (
+    ("--host", "host", {"help": "Workspace URL (env: DATABRICKS_HOST)"}),
+    ("--token", "token", {"help": "Personal access token (env: DATABRICKS_TOKEN)"}),
+    ("--profile", "profile", {"help": "Profile in ~/.databrickscfg"}),
+)
+
+
+def _build_client(args: argparse.Namespace) -> "DatabricksClient":
+    from yggdrasil.databricks.client import DatabricksClient
+
+    kwargs: dict[str, Any] = {}
+    for _flag, dest, _meta in _CLIENT_FLAGS:
+        val = getattr(args, dest, None)
+        if val is not None:
+            kwargs[dest] = val
+    return DatabricksClient(**kwargs)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -36,8 +60,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Set yggdrasil logger to DEBUG.",
     )
 
+    client_grp = parser.add_argument_group("Databricks client")
+    for flag, dest, kwargs in _CLIENT_FLAGS:
+        client_grp.add_argument(flag, dest=dest, default=None, **kwargs)
+
     subparsers = parser.add_subparsers(dest="command")
     BundleCommand.register(subparsers)
+    JobsCommand.register(subparsers)
+    ClustersCommand.register(subparsers)
+    WarehousesCommand.register(subparsers)
 
     args = parser.parse_args(argv)
 
@@ -55,7 +86,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     try:
-        return handler(args)
+        return handler(args, _build_client)
     except KeyboardInterrupt:
         sys.stderr.write("\nInterrupted.\n")
         return 130
