@@ -103,7 +103,7 @@ def sniff_script(source: str) -> tuple[set[str], set[str]]:
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        LOGGER.debug("sniff_script: source did not parse; returning empty sets")
+        LOGGER.debug("Source did not parse — returning empty sets")
         return set(), set()
 
     imports: set[str] = set()

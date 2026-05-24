@@ -55,8 +55,13 @@ class Secrets(DatabricksService):
     def list_scopes(self) -> list["Scope"]:
         from .resource import Scope
 
+        LOGGER.debug("Listing secret scopes")
+
         api = self.client.workspace_client().secrets
-        return [Scope(service=self, key=s.name) for s in api.list_scopes()]
+        result = [Scope(service=self, key=s.name) for s in api.list_scopes()]
+
+        LOGGER.debug("Listed %d secret scopes", len(result))
+        return result
 
     def create_scope(
         self,
@@ -150,7 +155,7 @@ class Secrets(DatabricksService):
         # carries the same base64 we'd otherwise upload, so b64 equality is the
         # safest cheap fingerprint we can compute client-side.
         if target_b64 and existing.b64 == target_b64:
-            LOGGER.debug("Secret %r already at desired value — skipping put_secret", secret)
+            LOGGER.debug("Secret %r already at desired value — skipping update", secret)
             secret.update_timestamp = existing.update_timestamp
             if permissions:
                 secret.scope.update(permissions=permissions)

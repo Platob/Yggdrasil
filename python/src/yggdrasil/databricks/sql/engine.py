@@ -471,8 +471,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
             )
             if retry is not None:
                 logger.debug(
-                    "Ignoring retry on Spark execution path; Spark statements "
-                    "use driver-side retry, not StatementResult.retry()."
+                    "Ignoring retry config for Spark statement — "
+                    "driver-side retry applies"
                 )
         else:
             prepared = WarehousePreparedStatement.prepare(
@@ -523,8 +523,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
         if engine_choice == "spark":
             if retry is not None:
                 logger.debug(
-                    "Ignoring retry on Spark execution path; Spark statements "
-                    "use driver-side retry, not StatementResult.retry()."
+                    "Ignoring retry config for Spark statement — "
+                    "driver-side retry applies"
                 )
             return self.spark.execute_many(
                 statements,
