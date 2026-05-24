@@ -66,6 +66,7 @@ from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.enums import MediaType, MimeType, Mode, ModeLike
+from yggdrasil.environ import PyEnv
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 
 
@@ -1243,11 +1244,13 @@ class Tabular(ABC, Generic[O]):
         return self._read_table(self.check_options(options, overrides=locals()))
 
     def _read_table(self, options: O) -> "Tabular | None":
-        spark = getattr(options, "spark_session", None) if options is not None else None
-        if spark is not None:
+        spark = options.spark_session
+
+        if spark is not None or PyEnv.in_databricks():
             from yggdrasil.spark.tabular import Dataset as _Dataset
             df = self._read_spark_frame(options)
             return _Dataset(frame=df) if df is not None else None
+
         batches = list(self.read_arrow_batches(options=options))
         if not batches or all(b.num_rows == 0 for b in batches):
             return None
