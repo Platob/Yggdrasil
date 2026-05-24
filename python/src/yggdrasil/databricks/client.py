@@ -1490,6 +1490,47 @@ class DatabricksClient(Singleton, URLBased):
             byte_size=byte_size,
         )
 
+    def deploy(
+        self,
+        bundle: "str | Path",
+        *,
+        target: "str | None" = None,
+    ) -> int:
+        """Deploy a Databricks Asset Bundle to this workspace.
+
+        Parses the bundle YAML, resolves the target, syncs workspace
+        files, and upserts every resource defined under ``resources:``.
+
+        *bundle* is a path to a ``databricks.yml`` file or a directory
+        containing one. When a directory is given, the standard bundle
+        filenames are probed (``databricks.yml``, ``databricks.yaml``,
+        ``bundle.yml``, ``bundle.yaml``).
+
+        Returns an exit code (0 on success).
+        """
+        from .cli.bundle.deploy import deploy as _deploy
+
+        bundle_path = Path(bundle) if not isinstance(bundle, Path) else bundle
+
+        if bundle_path.is_dir():
+            _BUNDLE_FILENAMES = (
+                "databricks.yml", "databricks.yaml",
+                "bundle.yml", "bundle.yaml",
+            )
+            for name in _BUNDLE_FILENAMES:
+                candidate = bundle_path / name
+                if candidate.exists():
+                    bundle_path = candidate
+                    break
+            else:
+                raise FileNotFoundError(
+                    f"No bundle file found in {bundle_path}. "
+                    f"Expected one of: {', '.join(_BUNDLE_FILENAMES)}. "
+                    f"Pass the path to the YAML file explicitly."
+                )
+
+        return _deploy(bundle_path, target, client=self)
+
     @property
     def entity_tags(self) -> "EntityTags":
         cached = self.__dict__.get("_entity_tags")
