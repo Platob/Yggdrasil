@@ -190,18 +190,11 @@ class TestSparkPersistRemote:
 
 class TestPinSparkSnapshot:
 
-    def test_pin_caches_and_freezes_count(self, spark) -> None:
-        from yggdrasil.http_.response_batch import spark_to_tabular
+    def test_dataset_wraps_empty_frame(self, spark) -> None:
+        from yggdrasil.io.tabular import Dataset
 
         schema = RESPONSE_SCHEMA.to_spark_schema()
         df = spark.createDataFrame([], schema=schema)
-        tab = spark_to_tabular(df)
+        tab = Dataset(df)
         assert tab is not None
-
-    def test_pin_survives_persist_failure(self, spark, monkeypatch) -> None:
-        from yggdrasil.http_.response_batch import spark_to_tabular
-
-        schema = RESPONSE_SCHEMA.to_spark_schema()
-        df = spark.createDataFrame([], schema=schema)
-        tab = spark_to_tabular(df)
-        assert tab is not None
+        assert tab.frame is df

@@ -1594,8 +1594,8 @@ class HTTPSession(Session):
                 )
             new_hits = [_synthetic_not_found(r) for r in misses] if misses else None
             return HTTPResponseBatch(
-                local_hits=local_hits, remote_hits=remote_hits,
-                new_hits=new_hits, spark=spark, misses=misses,
+                local=local_hits, remote=remote_hits,
+                new=new_hits, misses=misses,
             )
 
         LOGGER.debug(
@@ -1660,8 +1660,8 @@ class HTTPSession(Session):
                 self._run_concurrently(wb, thread_name_prefix="ygg-wb")
 
         return HTTPResponseBatch(
-            local_hits=local_hits, remote_hits=remote_hits,
-            new_hits=new_list or None, misses=misses, failed=failed,
+            local=local_hits, remote=remote_hits,
+            new=new_list or None, misses=misses, failed=failed,
         )
 
     def _send_spark_batch(
@@ -1685,8 +1685,8 @@ class HTTPSession(Session):
             LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
             self._spark_persist_remote(new_hits, rc, spark=spark)
         return HTTPResponseBatch(
-            local_hits=local_hits, remote_hits=remote_hits,
-            new_hits=new_hits, spark=spark, misses=misses,
+            local=local_hits, remote=remote_hits,
+            new=new_hits, misses=misses,
         )
 
     @staticmethod
