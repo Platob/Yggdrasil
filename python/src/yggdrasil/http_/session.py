@@ -1522,20 +1522,12 @@ class HTTPSession(Session):
                 yield r
 
         stamped = _stamp(requests)
-        if cfg.as_tabular:
-            return self._send_many_as_tabular(stamped, cfg, **batch_kw)
-        return self._send_many(stamped, **batch_kw)
+        if not cfg.as_tabular:
+            return self._send_many(stamped, **batch_kw)
 
-    def _send_many_as_tabular(
-        self,
-        requests: Iterator[PreparedRequest],
-        config: SendConfig,
-        **batch_kw: Any,
-    ) -> "Tabular":
-        """Drain :meth:`_send_many_batches` and concat into one :class:`Tabular`."""
-        spark = config.spark_session
+        spark = cfg.spark_session
         accumulator: HTTPResponseBatch | None = None
-        for batch in self._send_many_batches(requests, **batch_kw):
+        for batch in self._send_many_batches(stamped, **batch_kw):
             if accumulator is None:
                 accumulator = batch
             else:
@@ -1544,11 +1536,8 @@ class HTTPSession(Session):
             if spark is not None:
                 from yggdrasil.http_.response_batch import spark_to_tabular
                 return spark_to_tabular(self._cached_empty_spark_frame(spark))
-            from yggdrasil.io.tabular import ArrowTabular
-            return ArrowTabular(
-                RESPONSE_ARROW_SCHEMA.empty_table(),
-                schema=RESPONSE_ARROW_SCHEMA,
-            )
+            from yggdrasil.arrow.tabular import ArrowTabular
+            return ArrowTabular(RESPONSE_ARROW_SCHEMA.empty_table())
         return accumulator.to_tabular(spark)
 
     # ------------------------------------------------------------------ #
