@@ -263,8 +263,10 @@ class XLSXSheetFile(IO[bytes, XlsxOptions]):
         """
         target_name = self.sheet_name
         action = options.mode
-        _holder_overwrite = self._xlsx_parent._mode is Mode.OVERWRITE
-        _has_existing = not _holder_overwrite and self._xlsx_parent.size > 0
+        _has_existing = (
+            not self._xlsx_parent.holder_is_overwrite
+            and self._xlsx_parent.size > 0
+        )
         if action is Mode.IGNORE and _has_existing:
             return
         if action is Mode.ERROR_IF_EXISTS and _has_existing:
