@@ -654,35 +654,37 @@ class Tabular(ABC, Generic[O]):
         *,
         media_type: "MediaType | MimeType | str | None" = None,
         default: Any = ...,
+        as_folder: bool = False,
         **kwargs: Any,
-    ) -> "Tabular":
-        """Coerce *obj* into a :class:`Tabular` leaf for read/write.
+    ) -> "Tabular | None":
+        """Coerce *obj* into a :class:`Tabular`.
 
         Routes:
 
-        * :class:`Tabular` (incl. :class:`Holder` / :class:`Path` /
-          :class:`Memory` / :class:`IO`) — returned as-is. When
-          *media_type* is supplied and *obj* is a :class:`Holder`,
-          :meth:`Holder.for_holder` is invoked so the caller can
-          override the format leaf the holder's stamped MediaType
-          would otherwise dispatch to.
+        * ``None`` — returns *default* (``None`` when
+          ``default=None``).
+        * :class:`Tabular` — returned as-is. When *as_folder* is
+          ``True`` and *obj* is a local :class:`Path`, wraps it in
+          a :class:`FolderPath`.
         * ``str`` / :class:`os.PathLike` — coerced via
-          :meth:`Path.from_`, which scheme-dispatches to the right
-          concrete subclass (:class:`LocalPath`, :class:`S3Path`,
-          :class:`DatabricksPath`, …). Strings are accepted only when
-          path-shaped (see :func:`is_tabular_source`); plain content
-          strings raise.
-        * File-like objects (anything with a callable ``read``
-          returning ``bytes``) — drained into a :class:`Memory`
-          holder; *media_type* is required since a raw byte stream
-          has no URL extension to sniff.
+          :class:`Path.from_`. When *as_folder* is ``True``,
+          wraps in :class:`FolderPath`.
+        * File-like objects — drained into :class:`Memory`;
+          *media_type* required.
 
         Falls back to *default* on unrecognised shapes when supplied;
-        otherwise raises :class:`TypeError` with the offending type.
+        otherwise raises :class:`TypeError`.
         """
+        if obj is None:
+            return default if default is not ... else None
+
         from yggdrasil.io.holder import Holder
 
         if isinstance(obj, Tabular):
+            if as_folder and isinstance(obj, Holder) and obj.is_local:
+                from yggdrasil.io.nested.folder_path import FolderPath
+                if not isinstance(obj, FolderPath):
+                    return FolderPath(path=obj)
             if media_type is not None and isinstance(obj, Holder):
                 return Holder.for_holder(obj, media_type=media_type, **kwargs)
             return obj
@@ -698,6 +700,9 @@ class Tabular(ABC, Generic[O]):
                 )
             from yggdrasil.io.path import Path as YggPath
             path = YggPath.from_(obj)
+            if as_folder:
+                from yggdrasil.io.nested.folder_path import FolderPath
+                return FolderPath(path=path)
             if media_type is not None:
                 return Holder.for_holder(path, media_type=media_type, **kwargs)
             return path
