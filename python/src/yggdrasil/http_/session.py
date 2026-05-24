@@ -1629,16 +1629,16 @@ class HTTPSession(Session):
     def _split_remote_cache(
         self,
         batch: list[PreparedRequest],
-    ) -> tuple[Tabular, list[PreparedRequest]]:
+    ) -> tuple["Tabular | None", list[PreparedRequest]]:
         """Stage 2: scan the remote cache.
 
-        UPSERT requests bypass the read entirely (always misses, refetch).
-        Non-UPSERT requests are grouped by their effective cache table so we
-        execute exactly one batch SQL lookup per table.
+        Returns ``(hits_tabular, misses)``. Hits are wrapped in a
+        :class:`Tabular`; ``None`` when everything misses.
+        UPSERT entries bypass the read entirely (always miss).
         """
         cached, uncached = [], []
         for r in batch:
-            if r.local_cache_config:
+            if r.remote_cache_config:
                 cached.append(r)
             else:
                 uncached.append(r)
@@ -1648,12 +1648,12 @@ class HTTPSession(Session):
 
         tab, caches = None, {}
         for r in cached:
-            holder: IO = r.local_cache_config.tabular
+            holder: IO = r.remote_cache_config.tabular
             caches.setdefault(holder, []).append(r)
 
         for holder, requests in caches.items():
             predicate = (
-                requests[0].local_cache_config
+                requests[0].remote_cache_config
                 .make_batch_lookup_predicate(requests)
             )
 
@@ -2292,8 +2292,7 @@ class HTTPSession(Session):
 
         ttl = max_batch_ttl
         chunk_index = 0
-        total_local = 0
-        total_remote = 0
+        total_cache_hits = 0
         total_network = 0
         total_failed = 0
 
@@ -2341,22 +2340,20 @@ class HTTPSession(Session):
             chunk_index += 1
 
             # --- Cached path: local → remote → network for misses ---
-            remote_hits: "Tabular | list[Response] | None" = None
-            local_hits, cache_misses = self._split_local_cache(chunk)
+            local_hits, to_fetch = self._split_local_cache(chunk)
+            remote_hits: "Tabular | None" = None
 
-            if cache_misses:
-                remote_hits_by_table, cache_misses = self._split_remote_cache(cache_misses)
-                self._backfill_local_cache(remote_flat)
-                remote_hits = self._flatten_remote_hits(remote_hits_by_table)
+            if to_fetch:
+                remote_hits, to_fetch = self._split_remote_cache(to_fetch)
+                if remote_hits is not None:
+                    self._backfill_local_cache(list(
+                        Response.from_arrow_tabular(remote_hits.read_arrow_batches())
+                    ))
 
             if local_hits is not None:
-                local_responses = list(
+                self._mirror_local_hits_to_remote(list(
                     Response.from_arrow_tabular(local_hits.read_arrow_batches())
-                )
-                self._mirror_local_hits_to_remote(local_responses)
-
-            # --- Network: uncached requests + cache misses ---
-            to_fetch = uncached + cache_misses
+                ))
             new_hits: "list[Response] | SparkDataFrame | None" = None
             failed: list[Response] = []
 
@@ -2428,18 +2425,16 @@ class HTTPSession(Session):
                 else:
                     new_hits = new_list or None
 
-            local_count = local_hits.num_rows if local_hits is not None else 0
-            remote_count = len(remote_hits) if isinstance(remote_hits, list) else 0
+            cache_hits = len(chunk) - len(to_fetch)
             net_count = len(new_hits) if isinstance(new_hits, list) else 0
-            total_local += local_count
-            total_remote += remote_count
+            total_cache_hits += cache_hits
             total_network += net_count
             total_failed += len(failed)
             LOGGER.info(
                 "Completed send_many chunk #%d (requests=%d, "
-                "local_hits=%d, remote_hits=%d, network=%d, failed=%d)",
-                chunk_index, len(chunk), local_count,
-                remote_count, net_count, len(failed),
+                "cache_hits=%d, network=%d, failed=%d)",
+                chunk_index, len(chunk), cache_hits,
+                net_count, len(failed),
             )
 
             yield HTTPResponseBatch(
@@ -2453,9 +2448,9 @@ class HTTPSession(Session):
                 failed[-1].raise_for_status()
 
         LOGGER.info(
-            "Finished send_many pipeline (chunks=%d, local_hits=%d, "
-            "remote_hits=%d, network=%d, failed=%d)",
-            chunk_index, total_local, total_remote,
+            "Finished send_many pipeline (chunks=%d, cache_hits=%d, "
+            "network=%d, failed=%d)",
+            chunk_index, total_cache_hits,
             total_network, total_failed,
         )
 
