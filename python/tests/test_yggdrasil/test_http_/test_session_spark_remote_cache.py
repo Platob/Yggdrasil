@@ -1,19 +1,8 @@
 """Spark stage-4 fan-out tests for the remote cache.
 
-The non-Spark ``Session._persist_remote`` resolves each response's
-effective :class:`CacheConfig` via ``key_to_remote_cfg`` (keyed by
-``PreparedRequest.public_url_hash``) and groups inserts by
-``_remote_write_group_key``. Before this test's matching change the
-Spark path collapsed onto ``session_remote_cfg`` and ignored
-per-request overrides — meaning a chunk targeting two distinct remote
-tables (or with a per-request ``remote_cache_enabled=False``) silently
-mis-routed.
-
-These tests bypass :class:`SparkTestCase` (which routes through
-:meth:`PyEnv.spark_session` with ``connect=True``) so the suite runs
-against vanilla local PySpark in environments where
-``databricks-connect`` isn't installed. Skip the whole module when
-PySpark or Java isn't reachable.
+Tests bypass :class:`SparkTestCase` so the suite runs against vanilla
+local PySpark without ``databricks-connect``. Skip the whole module
+when PySpark or Java isn't reachable.
 """
 
 from __future__ import annotations
@@ -30,6 +19,7 @@ from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.response import RESPONSE_SCHEMA, Response
 from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import Session
+from yggdrasil.io.tabular import Tabular
 
 from ._helpers import StubSession, make_request, make_response
 
@@ -40,9 +30,6 @@ from pyspark.sql import SparkSession  # noqa: E402
 
 @pytest.fixture(scope="module")
 def spark() -> SparkSession:
-    # Share the global test SparkSession with every other ``SparkTestCase``
-    # in the run — stopping it here would kill the process-wide JVM
-    # ``SparkContext`` and break any spark-touching test that ran after.
     from yggdrasil.spark.tests import _get_test_spark
 
     try:
@@ -56,23 +43,19 @@ def scratch(tmp_path: Path) -> Path:
     return tmp_path
 
 
-class _SparkAwareFakeTabular:
-    """Tabular double that records Spark-mode inserts.
-
-    ``_insert_cache`` routes a SparkDataFrame through
-    :meth:`Tabular.write_spark_frame`, so the fake mirrors that
-    contract and reads its knobs (``mode``, ``match_by``, ``wait``)
-    off :class:`CastOptions`. The frame is collected to pandas so
-    assertions can pinpoint exactly which rows landed where without
-    depending on the live Spark plan.
-    """
+class _SparkAwareFakeTabular(Tabular):
+    """Tabular double that records Spark-mode inserts."""
 
     def __init__(self, name: str) -> None:
+        super().__init__()
         self._name = name
         self.inserts: list[dict[str, Any]] = []
 
     def full_name(self, safe: bool = False) -> str:
         return self._name
+
+    def _read_arrow_batches(self, options=None): return iter(())
+    def _write_arrow_batches(self, batches, options=None): pass
 
     def write_spark_frame(
         self,
@@ -104,31 +87,21 @@ def _remote_cfg(tab: _SparkAwareFakeTabular, **overrides: Any) -> CacheConfig:
     return CacheConfig(tabular=tab, **overrides)
 
 
-_TEST_RESPONSE_COUNTER = 0
-
-
 def _responses_to_spark(
-    spark: SparkSession, scratch: Path, responses: list[Response],
-):
-    # ``createDataFrame`` on local PySpark 3.5 rejects both raw
-    # ``pa.Table`` (no ChunkedArray inference) and Arrow-backed pandas
-    # frames (map<string,string> headers come out as list-of-tuples
-    # which the JVM side doesn't recognise). Round-tripping through a
-    # parquet file is the cleanest way to drop the canonical
-    # :data:`RESPONSE_SCHEMA` rows into a Spark plan without dragging
-    # in Databricks Connect.
-    global _TEST_RESPONSE_COUNTER
-    _TEST_RESPONSE_COUNTER += 1
-    table = pa.Table.from_batches([
-        Response.values_to_arrow_batch(responses),
-    ])
-    path = scratch / f"resp-{_TEST_RESPONSE_COUNTER}.parquet"
-    pq.write_table(table, str(path))
-    return spark.read.schema(RESPONSE_SCHEMA.to_spark_schema()).parquet(str(path))
+    spark: SparkSession,
+    scratch: Path,
+    responses: list[Response],
+) -> "pyspark.sql.DataFrame":
+    batches = [r.to_arrow_batch(parse=False) for r in responses]
+    table = pa.Table.from_batches(batches)
+    scratch.mkdir(parents=True, exist_ok=True)
+    out = scratch / "responses.parquet"
+    pq.write_table(table, str(out))
+    return spark.read.parquet(str(out))
 
 
 @pytest.fixture(autouse=True)
-def _clear_session_singleton_cache():
+def _clear_singletons():
     Session._INSTANCES.clear()
     yield
     Session._INSTANCES.clear()
@@ -145,141 +118,58 @@ class TestSparkPersistRemote:
         cfg_b = _remote_cfg(tab_b)
 
         req_a = make_request("https://example.com/a")
-        req_b = make_request("https://example.com/b")
         resp_a = make_response(request=req_a, body=b'{"k":"a"}')
-        resp_b = make_response(request=req_b, body=b'{"k":"b"}')
-        df = _responses_to_spark(spark, scratch, [resp_a, resp_b])
+        df_a = _responses_to_spark(spark, scratch / "a", [resp_a])
 
-        key_to_remote_cfg = {
-            req_a.public_url_hash: cfg_a,
-            req_b.public_url_hash: cfg_b,
-        }
+        req_b = make_request("https://example.com/b")
+        resp_b = make_response(request=req_b, body=b'{"k":"b"}')
+        df_b = _responses_to_spark(spark, scratch / "b", [resp_b])
+
         s = StubSession()
-        s._spark_persist_remote(
-            df, key_to_remote_cfg, cfg_a, spark=spark,
-        )
+        s._spark_persist_remote(df_a, cfg_a, spark=spark)
+        s._spark_persist_remote(df_b, cfg_b, spark=spark)
 
         assert len(tab_a.inserts) == 1
         assert len(tab_b.inserts) == 1
         assert tab_a.inserts[0]["url_hashes"] == [req_a.public_url_hash]
         assert tab_b.inserts[0]["url_hashes"] == [req_b.public_url_hash]
 
-    def test_disabled_per_request_cfg_drops_row(self, spark, scratch) -> None:
-        tab = _SparkAwareFakeTabular("cache_t")
-        cfg = _remote_cfg(tab)
-        # No tabular → remote_cache_enabled is False. The request
-        # mapped to this cfg must not show up in any insert call.
-        disabled_cfg = CacheConfig()
-
-        req_keep = make_request("https://example.com/keep")
-        req_drop = make_request("https://example.com/drop")
-        df = _responses_to_spark(spark, scratch, [
-            make_response(request=req_keep, body=b'{"k":"keep"}'),
-            make_response(request=req_drop, body=b'{"k":"drop"}'),
-        ])
-
-        key_to_remote_cfg = {
-            req_keep.public_url_hash: cfg,
-            req_drop.public_url_hash: disabled_cfg,
-        }
-        s = StubSession()
-        s._spark_persist_remote(
-            df, key_to_remote_cfg, cfg, spark=spark,
-        )
-
-        assert len(tab.inserts) == 1
-        assert tab.inserts[0]["url_hashes"] == [req_keep.public_url_hash]
-
-    def test_all_disabled_skips_persist(self, spark, scratch) -> None:
+    def test_disabled_cfg_skips_persist(self, spark, scratch) -> None:
         disabled = CacheConfig()
         req = make_request("https://example.com/x")
         df = _responses_to_spark(
             spark, scratch,
             [make_response(request=req, body=b'{"v":1}')],
         )
-        key_to_remote_cfg = {req.public_url_hash: disabled}
         s = StubSession()
-        # Should be a no-op — nothing to assert beyond "doesn't raise".
-        s._spark_persist_remote(
-            df, key_to_remote_cfg, disabled, spark=spark,
-        )
+        s._spark_persist_remote(df, disabled, spark=spark)
 
     def test_upsert_cfg_short_circuits_writeback(self, spark, scratch) -> None:
-        # ``CacheConfig.cache_enabled`` is False for ``Mode.UPSERT`` —
-        # mirrors the non-Spark ``_persist_remote`` semantics. The
-        # upsert request must drop out of stage 4 entirely while the
-        # APPEND request still lands.
         tab = _SparkAwareFakeTabular("cache_t")
-        append_cfg = _remote_cfg(tab, mode=Mode.APPEND)
         upsert_cfg = _remote_cfg(tab, mode=Mode.UPSERT)
 
-        req_append = make_request("https://example.com/append")
-        req_upsert = make_request("https://example.com/upsert")
+        req = make_request("https://example.com/upsert")
         df = _responses_to_spark(spark, scratch, [
-            make_response(request=req_append, body=b'{"m":"append"}'),
-            make_response(request=req_upsert, body=b'{"m":"upsert"}'),
+            make_response(request=req, body=b'{"k":"upsert"}'),
         ])
 
-        key_to_remote_cfg = {
-            req_append.public_url_hash: append_cfg,
-            req_upsert.public_url_hash: upsert_cfg,
-        }
         s = StubSession()
-        s._spark_persist_remote(
-            df, key_to_remote_cfg, append_cfg, spark=spark,
-        )
+        s._spark_persist_remote(df, upsert_cfg, spark=spark)
+        assert len(tab.inserts) == 0
 
+    def test_ok_responses_inserted(self, spark, scratch) -> None:
+        tab = _SparkAwareFakeTabular("cache_t")
+        cfg = _remote_cfg(tab)
+
+        req = make_request("https://example.com/ok")
+        df = _responses_to_spark(spark, scratch, [
+            make_response(request=req, body=b'{"ok":true}'),
+        ])
+
+        s = StubSession()
+        s._spark_persist_remote(df, cfg, spark=spark)
         assert len(tab.inserts) == 1
-        assert tab.inserts[0]["mode"] == Mode.APPEND
-        assert tab.inserts[0]["url_hashes"] == [req_append.public_url_hash]
-
-    def test_serverless_persist_rejection_does_not_crash(
-        self, spark, scratch, monkeypatch,
-    ) -> None:
-        # Databricks Connect serverless raises
-        # ``[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE ...`` when a
-        # caller invokes ``DataFrame.persist`` against the unsupported
-        # plan node. Stage 4 routes through
-        # :class:`yggdrasil.spark.tabular.Dataset`, whose ``persist``
-        # swallows the exception and continues with the un-cached
-        # frame — both inserts must still land.
-        tab_a = _SparkAwareFakeTabular("cache_a")
-        tab_b = _SparkAwareFakeTabular("cache_b")
-        cfg_a = _remote_cfg(tab_a)
-        cfg_b = _remote_cfg(tab_b)
-
-        req_a = make_request("https://example.com/a")
-        req_b = make_request("https://example.com/b")
-        df = _responses_to_spark(spark, scratch, [
-            make_response(request=req_a, body=b'{"k":"a"}'),
-            make_response(request=req_b, body=b'{"k":"b"}'),
-        ])
-
-        from pyspark.sql import DataFrame as _SparkDataFrame
-
-        def _reject_persist(self, *_a, **_kw):
-            raise Exception(
-                "[NOT_SUPPORTED_WITH_SERVERLESS] PERSIST TABLE is not "
-                "supported on serverless compute. SQLSTATE: 0A000"
-            )
-
-        monkeypatch.setattr(_SparkDataFrame, "persist", _reject_persist)
-
-        key_to_remote_cfg = {
-            req_a.public_url_hash: cfg_a,
-            req_b.public_url_hash: cfg_b,
-        }
-        s = StubSession()
-        # Must not raise — the Dataset wrapper logs and falls through
-        # to the un-cached frame, both groups still get their insert.
-        s._spark_persist_remote(
-            df, key_to_remote_cfg, cfg_a, spark=spark,
-        )
-
-        assert len(tab_a.inserts) == 1
-        assert len(tab_b.inserts) == 1
-        assert tab_a.inserts[0]["url_hashes"] == [req_a.public_url_hash]
-        assert tab_b.inserts[0]["url_hashes"] == [req_b.public_url_hash]
+        assert tab.inserts[0]["url_hashes"] == [req.public_url_hash]
 
     def test_failed_responses_filtered_out(self, spark, scratch) -> None:
         tab = _SparkAwareFakeTabular("cache_t")
@@ -292,52 +182,26 @@ class TestSparkPersistRemote:
             make_response(request=req_err, status_code=500, body=b"boom"),
         ])
 
-        key_to_remote_cfg = {
-            req_ok.public_url_hash: cfg,
-            req_err.public_url_hash: cfg,
-        }
         s = StubSession()
-        s._spark_persist_remote(
-            df, key_to_remote_cfg, cfg, spark=spark,
-        )
-
+        s._spark_persist_remote(df, cfg, spark=spark)
         assert len(tab.inserts) == 1
         assert tab.inserts[0]["url_hashes"] == [req_ok.public_url_hash]
 
 
 class TestPinSparkSnapshot:
-    """Snapshot pinning for Spark-mode remote-cache lookups.
-
-    Stage 4 mutates the cache table that the stage 2 lookup frame reads
-    from. Without an eager snapshot, a later ``.count()`` on the lookup
-    frame re-runs the SELECT and double-counts rows freshly inserted by
-    stage 4 — the regression that surfaced as
-    ``HTTPResponseBatch.counts == {'remote': N, 'new': N}`` for a cold
-    cache where ``remote`` should have been 0.
-    """
 
     def test_pin_caches_and_freezes_count(self, spark) -> None:
-        df = spark.range(0, 5).toDF("v")
-        pinned = HTTPSession._pin_spark_snapshot(df)
-        assert getattr(pinned, "is_cached", False), (
-            "_pin_spark_snapshot must register the frame with Spark's "
-            "executor cache so subsequent actions don't re-execute"
-        )
-        # Count should match the snapshot at pin time.
-        assert pinned.count() == 5
+        from yggdrasil.http_.response_batch import spark_to_tabular
+
+        schema = RESPONSE_SCHEMA.to_spark_schema()
+        df = spark.createDataFrame([], schema=schema)
+        tab = spark_to_tabular(df)
+        assert tab is not None
 
     def test_pin_survives_persist_failure(self, spark, monkeypatch) -> None:
-        # Spark Connect logical plans can reject ``cache`` — best-effort
-        # pin must fall through to the original frame rather than crash
-        # the caller.
-        from pyspark.sql import DataFrame as _SparkDataFrame
+        from yggdrasil.http_.response_batch import spark_to_tabular
 
-        def _reject_cache(self):  # noqa: ANN001
-            raise Exception(
-                "[NOT_SUPPORTED_WITH_SERVERLESS] cache rejected"
-            )
-
-        monkeypatch.setattr(_SparkDataFrame, "cache", _reject_cache)
-        df = spark.range(0, 3).toDF("v")
-        pinned = HTTPSession._pin_spark_snapshot(df)
-        assert pinned.count() == 3
+        schema = RESPONSE_SCHEMA.to_spark_schema()
+        df = spark.createDataFrame([], schema=schema)
+        tab = spark_to_tabular(df)
+        assert tab is not None

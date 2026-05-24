@@ -980,6 +980,7 @@ class SendConfig(_ConfigBase):
     def __getstate__(self):
         return {
             "raise_error": self.raise_error,
+            "stream": self.stream,
             "wait": self.wait,
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
@@ -989,11 +990,11 @@ class SendConfig(_ConfigBase):
         }
 
     def __setstate__(self, state):
-        object.__setattr__(self, "raise_error", state["raise_error"])
-        object.__setattr__(self, "stream", state["stream"])
-        object.__setattr__(self, "wait", state["wait"])
-        object.__setattr__(self, "remote_cache", state["remote_cache"])
-        object.__setattr__(self, "local_cache", state["local_cache"])
+        object.__setattr__(self, "raise_error", state.get("raise_error", True))
+        object.__setattr__(self, "stream", state.get("stream", True))
+        object.__setattr__(self, "wait", state.get("wait", DEFAULT_WAITING_CONFIG))
+        object.__setattr__(self, "remote_cache", state.get("remote_cache"))
+        object.__setattr__(self, "local_cache", state.get("local_cache"))
         object.__setattr__(self, "cache_only", state.get("cache_only", False))
         object.__setattr__(self, "as_tabular", state.get("as_tabular", False))
         object.__setattr__(self, "spark_session", None)
