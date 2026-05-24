@@ -69,6 +69,7 @@ from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig, _request_column_sql_name
 from yggdrasil.io.session import Session
+from yggdrasil.http_.response_batch import responses_to_tabular
 from yggdrasil.io.url import URL
 from .exceptions import (
     LocationParseError,
@@ -2095,46 +2096,32 @@ class HTTPSession(Session):
 
     def _backfill_local_cache(
         self,
-        responses: list[Response],
+        data: "Tabular",
+        requests: list[PreparedRequest],
     ) -> None:
-        """Write remote-cache hits back to the partitioned local cache.
+        """Write cache hits back to the local cache.
 
-        Each response's local cache config is read from
-        ``response.request.local_cache_config``. Responses are bucketed
-        by their effective cache folder; each bucket fans out one Arrow
-        batch routed through :meth:`FolderPath._write_arrow_batches`.
+        Groups *requests* by their local cache holder and writes the
+        corresponding rows from *data* into each holder via
+        :func:`_insert_cache`.
         """
-        from yggdrasil.io.response import Response as _Response
-
-        groups: dict[Path, tuple[CacheConfig, list[Response]]] = {}
-        for response in responses:
-            req = response.request
-            if req is None:
-                continue
+        holders: dict[IO, CacheConfig] = {}
+        for req in requests:
             eff = req.local_cache_config
-            if eff is not None:
-                eff = eff.prebuild(session=self)
-            if eff is None or not eff.local_cache_enabled:
+            if eff is None or eff.tabular is None:
                 continue
-            root = eff.local_cache_folder(session=self)
-            bucket = groups.get(root)
-            if bucket is None:
-                groups[root] = (eff, [response])
-            else:
-                bucket[1].append(response)
+            holders.setdefault(eff.tabular, eff)
 
-        for root, (eff, group_responses) in groups.items():
-            tabular = eff.cache_tabular(session=self)
-            # One C++ struct walk per bucket beats N per-response
-            # writes — same shape :meth:`_persist_remote` uses on
-            # the SQL side. The folder's ``_write_arrow_batches``
-            # splits the batch back out by ``partition_key`` so each
-            # response still lands under its own
-            # ``partition_key=<v>/`` directory.
-            batch = _Response.values_to_arrow_batch(group_responses)
-            Job.make(
-                _insert_cache, tabular, eff, batch,
-            ).fire_and_forget()
+        if not holders:
+            return
+
+        batches = list(data.read_arrow_batches())
+        for holder, cfg in holders.items():
+            table = pa.Table.from_batches(batches) if batches else None
+            if table is not None:
+                Job.make(
+                    _insert_cache, holder, cfg, table,
+                ).fire_and_forget()
 
     def _persist_remote(
         self,
@@ -2344,11 +2331,14 @@ class HTTPSession(Session):
             remote_hits: "Tabular | None" = None
 
             if to_fetch:
+                before_remote = to_fetch
                 remote_hits, to_fetch = self._split_remote_cache(to_fetch)
                 if remote_hits is not None:
-                    self._backfill_local_cache(list(
-                        Response.from_arrow_tabular(remote_hits.read_arrow_batches())
-                    ))
+                    miss_ids = {id(r) for r in to_fetch}
+                    self._backfill_local_cache(
+                        remote_hits,
+                        [r for r in before_remote if id(r) not in miss_ids],
+                    )
 
             if local_hits is not None:
                 self._mirror_local_hits_to_remote(list(
@@ -2408,8 +2398,11 @@ class HTTPSession(Session):
                     )
                 if new_list:
                     _local_hits = new_list
+                    _local_reqs = local_misses
                     stage4.append(lambda: self._persist_remote(_local_hits))
-                    stage4.append(lambda: self._backfill_local_cache(_local_hits))
+                    stage4.append(lambda: self._backfill_local_cache(
+                        responses_to_tabular(_local_hits), _local_reqs,
+                    ))
                 if stage4:
                     self._run_concurrently(
                         stage4, thread_name_prefix="ygg-stage4",
