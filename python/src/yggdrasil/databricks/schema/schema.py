@@ -52,11 +52,11 @@ from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schemas import Schemas
-    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.catalog.catalog import UCCatalog
     from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.table.table import Table
 
-__all__ = ["Schema"]
+__all__ = ["UCSchema"]
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ def _normalize_privileges(
         yield normalized
 
 
-class Schema(DatabricksPath, Singleton):
+class UCSchema(DatabricksPath, Singleton):
     """A single Unity Catalog schema — lifecycle, table navigation, tags.
 
     Identity is ``(client, catalog_name, schema_name)``: two callers
@@ -184,7 +184,7 @@ class Schema(DatabricksPath, Singleton):
         if singleton_ttl is ...:
             singleton_ttl = cls._SINGLETON_TTL
 
-        def _allocate() -> "Schema":
+        def _allocate() -> "UCSchema":
             return object.__new__(cls)
 
         if singleton_ttl is ...:
@@ -340,7 +340,7 @@ class Schema(DatabricksPath, Singleton):
         return MimeTypes.DATABRICKS_UNITY_CATALOG_SCHEMA
 
     @classmethod
-    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Schema":
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "UCSchema":
         """Build a :class:`Schema` from a ``dbfs+volume:///cat/sch`` URL.
 
         Used by the :class:`DatabricksPath` dispatcher when a caller
@@ -435,7 +435,7 @@ class Schema(DatabricksPath, Singleton):
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
 
-    def clear(self) -> "Schema":
+    def clear(self) -> "UCSchema":
         """Public alias for :meth:`_reset_cache`; returns ``self``."""
         self._reset_cache()
         return self
@@ -491,9 +491,9 @@ class Schema(DatabricksPath, Singleton):
     # ── navigation ────────────────────────────────────────────────────────────
 
     @property
-    def catalog(self) -> "Catalog":
-        """Navigate up to the parent :class:`Catalog`."""
-        from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
+    def catalog(self) -> "UCCatalog":
+        """Navigate up to the parent :class:`UCCatalog`."""
+        from yggdrasil.databricks.catalog.catalog import UCCatalog as _Catalog
         return _Catalog(service=self.service, catalog_name=self.catalog_name)
 
     def table(self, name: str) -> "Table":
@@ -525,7 +525,7 @@ class Schema(DatabricksPath, Singleton):
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
         missing_ok: bool = True,
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Create this schema in Unity Catalog.
 
         Args:
@@ -565,7 +565,7 @@ class Schema(DatabricksPath, Singleton):
         comment: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Create this schema if it does not already exist, then return ``self``."""
         if not self.exists:
             self.create(
@@ -582,7 +582,7 @@ class Schema(DatabricksPath, Singleton):
         force: bool = False,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Delete this schema from Unity Catalog.
 
         Args:
@@ -652,7 +652,7 @@ class Schema(DatabricksPath, Singleton):
         *,
         tag_collation: str | None = DEFAULT_TAG_COLLATION,
         mode: ModeLike | None = None,
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Apply schema-level tags via the UC ``entity_tag_assignments`` API.
 
         ``tag_collation`` is accepted for API compatibility and ignored —
@@ -678,7 +678,7 @@ class Schema(DatabricksPath, Singleton):
         tag_keys: Iterable[str],
         *,
         if_exists: bool = True,
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Delete schema-level tag assignments by key."""
         self.client.entity_tags.delete_entity_tags(
             entity_type="schemas",
@@ -749,7 +749,7 @@ class Schema(DatabricksPath, Singleton):
         self,
         principal: str,
         privileges: "str | Privilege | Iterable[str | Privilege]",
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Add one or more privileges for *principal* on this schema.
 
         Privileges may be passed as :class:`Privilege` enums or as
@@ -770,7 +770,7 @@ class Schema(DatabricksPath, Singleton):
         self,
         principal: str,
         privileges: "str | Privilege | Iterable[str | Privilege]",
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Remove one or more privileges for *principal* on this schema."""
         return self.update_permissions(
             changes=[PermissionsChange(
@@ -783,7 +783,7 @@ class Schema(DatabricksPath, Singleton):
         self,
         principal: str,
         privileges: "str | Privilege | Iterable[str | Privilege]",
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Replace *principal*'s direct grants on this schema with
         exactly *privileges*.
 
@@ -814,7 +814,7 @@ class Schema(DatabricksPath, Singleton):
     def update_permissions(
         self,
         changes: "Iterable[PermissionsChange | Mapping[str, Any]]",
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Apply a batch of ``PermissionsChange`` to this schema.
 
         Accepts :class:`PermissionsChange` instances or plain mappings
@@ -863,7 +863,7 @@ class Schema(DatabricksPath, Singleton):
         comment: str | None = None,
         owner: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
-    ) -> "Schema":
+    ) -> "UCSchema":
         """Update schema metadata in-place and refresh the local cache."""
         kwargs: dict[str, Any] = {}
         if comment is not None:
@@ -885,7 +885,7 @@ class Schema(DatabricksPath, Singleton):
 
     # ── rename ────────────────────────────────────────────────────────────────
 
-    def rename(self, new_name: str) -> "Schema":
+    def rename(self, new_name: str) -> "UCSchema":
         """Rename this schema in-place (``ALTER SCHEMA … RENAME TO …``).
 
         The catalog parent is unchanged; *new_name* is the unqualified schema name.
@@ -920,3 +920,7 @@ class Schema(DatabricksPath, Singleton):
         object.__setattr__(self, "_infos", info)
         object.__setattr__(self, "_infos_fetched_at", time.time())
         return self
+
+
+# Backwards-compat alias so existing ``from … import Schema`` keeps working.
+Schema = UCSchema

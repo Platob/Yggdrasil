@@ -9,12 +9,12 @@ from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Op
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
 from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.data.enums import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.path import Path
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -23,7 +23,12 @@ if TYPE_CHECKING:
     from yggdrasil.io.session import Session
 
 
-__all__ = ["CacheConfig", "SendConfig", "SendManyConfig"]
+__all__ = ["CacheConfig", "SendConfig"]
+
+
+# Module-level cached paths — avoids repeated syscalls in hot paths
+# (``local_cache_folder`` is called per-request in the batch pipeline).
+_DEFAULT_CACHE_ROOT: pathlib.Path = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
 
 
 # Identity-by-default — ``public_url_hash`` is the URL-based identity
@@ -63,18 +68,6 @@ _SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
         "as_tabular",
     }
 )
-
-_SEND_MANY_CONFIG_FIELDS: frozenset[str] = _SEND_CONFIG_FIELDS | frozenset(
-    {
-        "normalize",
-        "batch_size",
-        "ordered",
-        "max_in_flight",
-        "max_batch_size",
-        "max_batch_ttl",
-    }
-)
-
 
 # Default cap on how long the batcher will wait for an upstream
 # request iterator to fill a chunk before flushing what it has
@@ -465,7 +458,9 @@ class CacheConfig(_ConfigBase):
         """URL string of the local cache root, or ``None`` for non-local.
 
         Local cache (FolderPath) carries an addressable path; remote
-        backends are dropped from the pickle wire format.
+        backends are dropped from the pickle wire format.  Path
+        portability across environments (home / tmpdir differences)
+        is handled transparently by :class:`URL.__getstate__`.
         """
         tab = self.tabular
         if tab is None:
@@ -724,7 +719,7 @@ class CacheConfig(_ConfigBase):
         """
         if self.is_local:
             return self.tabular.path
-        root = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
+        root = _DEFAULT_CACHE_ROOT
         base_url = getattr(session, "base_url", None) if session is not None else None
         host = getattr(base_url, "host", None) if base_url is not None else None
         if not host:
@@ -1140,140 +1135,3 @@ class SendConfig(_ConfigBase):
             return default
 
 
-@dataclass(frozen=True, slots=True)
-class SendManyConfig(_ConfigBase):
-    _FIELD_NAMES: ClassVar[frozenset[str]] = _SEND_MANY_CONFIG_FIELDS
-
-    wait: WaitingConfigArg = None
-    raise_error: bool = True
-    stream: bool = True
-    remote_cache: CacheConfig | None = None
-    local_cache: CacheConfig | None = None
-    cache_only: bool = False
-    # See :class:`SendConfig.as_tabular` — controls whether
-    # ``Session.send_many`` returns an ``Iterator[Response]`` (False)
-    # or one concatenated :class:`Tabular` (True).
-    as_tabular: bool = False
-    spark_session: Optional["SparkSession"] = field(
-        default=None,
-        hash=False,
-        compare=False,
-        repr=False,
-    )
-
-    normalize: bool | None = None
-    batch_size: int | None = None
-    ordered: bool = False
-    max_in_flight: int | None = None
-    max_batch_size: int | None = None
-    max_batch_ttl: float | None = DEFAULT_MAX_BATCH_TTL
-
-    def __post_init__(self):
-        object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
-        rc = self.remote_cache
-        if rc is not None:
-            object.__setattr__(self, "remote_cache", CacheConfig.from_(rc))
-        lc = self.local_cache
-        if lc is not None:
-            object.__setattr__(self, "local_cache", CacheConfig.from_(lc))
-        spark = self.spark_session
-        if spark is True or spark is ...:
-            spark = PyEnv.spark_session()
-        object.__setattr__(self, "spark_session", spark)
-
-    def __getstate__(self):
-        return {
-            "wait": self.wait,
-            "raise_error": self.raise_error,
-            "stream": self.stream,
-            "remote_cache": self.remote_cache,
-            "local_cache": self.local_cache,
-            "cache_only": self.cache_only,
-            "as_tabular": self.as_tabular,
-            "normalize": self.normalize,
-            "batch_size": self.batch_size,
-            "ordered": self.ordered,
-            "max_in_flight": self.max_in_flight,
-            "max_batch_size": self.max_batch_size,
-            "max_batch_ttl": self.max_batch_ttl,
-            "spark_session": None,
-        }
-
-    def __setstate__(self, state):
-        object.__setattr__(self, "wait", state["wait"])
-        object.__setattr__(self, "raise_error", state["raise_error"])
-        object.__setattr__(self, "stream", state["stream"])
-        object.__setattr__(self, "remote_cache", state["remote_cache"])
-        object.__setattr__(self, "local_cache", state["local_cache"])
-        object.__setattr__(self, "cache_only", state.get("cache_only", False))
-        object.__setattr__(self, "as_tabular", state.get("as_tabular", False))
-        object.__setattr__(self, "normalize", state["normalize"])
-        object.__setattr__(self, "batch_size", state["batch_size"])
-        object.__setattr__(self, "ordered", state["ordered"])
-        object.__setattr__(self, "max_in_flight", state["max_in_flight"])
-        object.__setattr__(self, "max_batch_size", state.get("max_batch_size"))
-        object.__setattr__(
-            self, "max_batch_ttl", state.get("max_batch_ttl", DEFAULT_MAX_BATCH_TTL),
-        )
-        object.__setattr__(self, "spark_session", state["spark_session"])
-
-    @classmethod
-    def from_(
-        cls,
-        arg: "SendManyConfig | SendConfig | Mapping[str, Any] | None",
-        *,
-        default: Any = ...,
-        **overrides: Any,
-    ) -> "SendManyConfig":
-        try:
-            if arg is None:
-                if not overrides or cls._matches_default(overrides):
-                    return cls.default()
-                return cls(**overrides)
-            if isinstance(arg, cls):
-                return arg.merge(**overrides) if overrides else arg
-            if isinstance(arg, SendConfig):
-                base = {
-                    "wait": arg.wait,
-                    "raise_error": arg.raise_error,
-                    "stream": arg.stream,
-                    "remote_cache": arg.remote_cache,
-                    "local_cache": arg.local_cache,
-                    "cache_only": arg.cache_only,
-                    "as_tabular": arg.as_tabular,
-                    "spark_session": arg.spark_session,
-                }
-                # Overrides win, but a None override means "no opinion" — fall back
-                # to the base value so we don't silently clobber the parent config.
-                for key, value in overrides.items():
-                    if value is not None:
-                        base[key] = value
-                return cls.parse_mapping(base)
-            if isinstance(arg, Mapping):
-                return cls.parse_mapping(arg, **overrides)
-            raise TypeError(
-                f"{cls.__name__}.from_ expects a {cls.__name__}, SendConfig, "
-                f"Mapping, or None; got {type(arg).__name__!r}"
-            )
-        except (TypeError, ValueError):
-            if default is ...:
-                raise
-            return default
-
-    def to_send_config(
-        self,
-        with_remote_cache: bool = True,
-        with_local_cache: bool = True,
-        with_spark: bool = False,
-        raise_error: bool | None = None
-    ) -> SendConfig:
-        return SendConfig(
-            wait=self.wait,
-            raise_error=self.raise_error if raise_error is None else raise_error,
-            stream=self.stream,
-            remote_cache=self.remote_cache if with_remote_cache else CacheConfig(),
-            local_cache=self.local_cache if with_local_cache else CacheConfig(),
-            cache_only=self.cache_only,
-            as_tabular=self.as_tabular,
-            spark_session=self.spark_session if with_spark else None,
-        )

@@ -54,7 +54,7 @@ from databricks.sdk.errors import (
 )
 from databricks.sdk.service.catalog import Privilege
 
-from yggdrasil.databricks.schema.schema import Schema
+from yggdrasil.databricks.schema.schema import UCSchema
 from yggdrasil.databricks.schema.schemas import Schemas, _SCHEMA_INFO_CACHE
 
 from . import DatabricksIntegrationCase
@@ -87,7 +87,7 @@ class _SchemaFixture(DatabricksIntegrationCase):
 
     catalog_name: ClassVar[str]
     schema_name: ClassVar[str]
-    schema: ClassVar[Schema]
+    schema: ClassVar[UCSchema]
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -297,7 +297,7 @@ class TestSchemasCollectionIntegration(_SchemaFixture):
         # Two-part dotted name → Schema; collapses to the same instance.
         svc = self.client.schemas(catalog_name=self.catalog_name)
         sch = svc[f"{self.catalog_name}.{self.schema_name}"]
-        self.assertIsInstance(sch, Schema)
+        self.assertIsInstance(sch, UCSchema)
         self.assertIs(sch, self.schema)
         # One-part shorthand uses the bound default catalog.
         sch2 = svc[self.schema_name]
@@ -517,7 +517,7 @@ class TestSchemaRenameIntegration(DatabricksIntegrationCase):
 
     catalog_name: ClassVar[str]
     initial_name: ClassVar[str]
-    schema: ClassVar[Schema]
+    schema: ClassVar[UCSchema]
 
     @classmethod
     def setUpClass(cls) -> None:

@@ -53,6 +53,17 @@ BucketInput = Union[
 # Coercion helpers — one shape in, one Optional[Tabular] out
 # ---------------------------------------------------------------------------
 
+def _union_holders(
+    mine: Optional[Tabular],
+    theirs: Optional[Tabular],
+) -> Optional[Tabular]:
+    if theirs is None:
+        return mine
+    if mine is None:
+        return theirs
+    return mine.union(theirs)
+
+
 def responses_to_tabular(responses: list[Response]) -> ArrowTabular:
     """Wrap a non-empty list of :class:`Response` in an :class:`ArrowTabular`.
 
@@ -306,48 +317,16 @@ class HTTPResponseBatch:
     # ------------------------------------------------------------------
 
     def extend(self, other: "HTTPResponseBatch") -> "HTTPResponseBatch":
-        """Merge another batch in place. Returns self for chaining.
+        """Merge another batch in place via :meth:`Tabular.union`.
 
-        Per-bucket merges append the other side's rows into the
-        matching holder. Both sides must agree on engine — Python
-        merges append Arrow batches, Spark merges union Spark frames
-        via ``unionByName``. Mixing engines is rejected because it
-        would force a hidden Spark conversion at merge time. A
-        ``None`` bucket on either side is treated as empty: the other
-        side wins.
+        ``None`` on either side is treated as empty: the other side
+        wins. Engine mixing (Arrow + Spark) is handled transparently
+        by :meth:`Tabular.union`.
         """
-        if self.is_spark != other.is_spark:
-            raise TypeError(
-                "extend() requires both batches in the same engine. "
-                "Lift one side with `to_dataframe()` (or rebuild Python-side) "
-                "before merging across modes."
-            )
-
-        self._local = self._merge_holders(self._local, other._local)
-        self._remote = self._merge_holders(self._remote, other._remote)
-        self._new = self._merge_holders(self._new, other._new)
+        self._local = _union_holders(self._local, other._local)
+        self._remote = _union_holders(self._remote, other._remote)
+        self._new = _union_holders(self._new, other._new)
         return self
-
-    @staticmethod
-    def _merge_holders(
-        mine: Optional[Tabular],
-        theirs: Optional[Tabular],
-    ) -> Optional[Tabular]:
-        from yggdrasil.data.enums import Mode
-
-        if theirs is None:
-            return mine
-        if mine is None:
-            return theirs
-        if isinstance(theirs, Dataset) and theirs.frame is not None:
-            if isinstance(mine, Dataset) and mine.frame is not None:
-                mine.frame = mine.frame.unionByName(
-                    theirs.frame, allowMissingColumns=True,
-                )
-                return mine
-            return theirs
-        mine.write_arrow_batches(theirs.read_arrow_batches(), mode=Mode.APPEND)
-        return mine
 
     # ------------------------------------------------------------------
     # Spark interop
@@ -375,10 +354,10 @@ class HTTPResponseBatch:
                 RESPONSE_ARROW_SCHEMA.empty_table(),
                 schema=RESPONSE_ARROW_SCHEMA,
             )
-        batches = []
-        for holder in holders:
-            batches.extend(holder.read_arrow_batches())
-        return ArrowTabular(batches, schema=RESPONSE_ARROW_SCHEMA)
+        result = holders[0]
+        for h in holders[1:]:
+            result = result.union(h)
+        return result
 
     def to_dataframe(
         self,

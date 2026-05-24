@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import unittest
 
-from yggdrasil.databricks.catalog.catalog import Catalog
+from yggdrasil.databricks.catalog.catalog import UCCatalog
 from yggdrasil.databricks.catalog.catalogs import Catalogs
 from yggdrasil.databricks.client import DatabricksClient
-from yggdrasil.databricks.schema.schema import Schema
+from yggdrasil.databricks.schema.schema import UCSchema
 from yggdrasil.databricks.schema.schemas import Schemas
 from yggdrasil.databricks.table.table import Table
 from yggdrasil.databricks.table.tables import Tables
@@ -28,8 +28,8 @@ from yggdrasil.databricks.volume.volumes import Volumes
 
 def _reset_caches() -> None:
     DatabricksClient._INSTANCES.clear()
-    Catalog._INSTANCES.clear()
-    Schema._INSTANCES.clear()
+    UCCatalog._INSTANCES.clear()
+    UCSchema._INSTANCES.clear()
     Table._INSTANCES.clear()
     Volume._INSTANCES.clear()
 
@@ -63,16 +63,16 @@ class TestCatalogSingleton(unittest.TestCase):
     def test_same_client_same_name(self) -> None:
         client = DatabricksClient(host="https://x.com", token="t")
         svc = Catalogs(client=client)
-        a = Catalog(service=svc, catalog_name="main")
-        b = Catalog(service=svc, catalog_name="main")
+        a = UCCatalog(service=svc, catalog_name="main")
+        b = UCCatalog(service=svc, catalog_name="main")
         self.assertIs(a, b)
 
     def test_different_clients_different_instances(self) -> None:
         client_a = DatabricksClient(host="https://x.com", token="tA")
         client_b = DatabricksClient(host="https://x.com", token="tB")
         # Different clients on the same host — must own distinct catalogs.
-        a = Catalog(service=Catalogs(client=client_a), catalog_name="main")
-        b = Catalog(service=Catalogs(client=client_b), catalog_name="main")
+        a = UCCatalog(service=Catalogs(client=client_a), catalog_name="main")
+        b = UCCatalog(service=Catalogs(client=client_b), catalog_name="main")
         self.assertIsNot(a, b)
         self.assertIs(a.client, client_a)
         self.assertIs(b.client, client_b)
@@ -80,8 +80,8 @@ class TestCatalogSingleton(unittest.TestCase):
     def test_different_names_different_instances(self) -> None:
         client = DatabricksClient(host="https://x.com", token="t")
         svc = Catalogs(client=client)
-        a = Catalog(service=svc, catalog_name="main")
-        b = Catalog(service=svc, catalog_name="other")
+        a = UCCatalog(service=svc, catalog_name="main")
+        b = UCCatalog(service=svc, catalog_name="other")
         self.assertIsNot(a, b)
         self.assertEqual(a.catalog_name, "main")
         self.assertEqual(b.catalog_name, "other")
@@ -95,18 +95,18 @@ class TestSchemaSingleton(unittest.TestCase):
     def test_same_client_same_names(self) -> None:
         client = DatabricksClient(host="https://x.com", token="t")
         svc = Schemas(client=client)
-        a = Schema(service=svc, catalog_name="main", schema_name="sales")
-        b = Schema(service=svc, catalog_name="main", schema_name="sales")
+        a = UCSchema(service=svc, catalog_name="main", schema_name="sales")
+        b = UCSchema(service=svc, catalog_name="main", schema_name="sales")
         self.assertIs(a, b)
 
     def test_different_clients_different_instances(self) -> None:
         client_a = DatabricksClient(host="https://x.com", token="tA")
         client_b = DatabricksClient(host="https://x.com", token="tB")
-        a = Schema(
+        a = UCSchema(
             service=Schemas(client=client_a),
             catalog_name="main", schema_name="sales",
         )
-        b = Schema(
+        b = UCSchema(
             service=Schemas(client=client_b),
             catalog_name="main", schema_name="sales",
         )
@@ -117,8 +117,8 @@ class TestSchemaSingleton(unittest.TestCase):
     def test_different_schema_names_different_instances(self) -> None:
         client = DatabricksClient(host="https://x.com", token="t")
         svc = Schemas(client=client)
-        a = Schema(service=svc, catalog_name="main", schema_name="sales")
-        b = Schema(service=svc, catalog_name="main", schema_name="reporting")
+        a = UCSchema(service=svc, catalog_name="main", schema_name="sales")
+        b = UCSchema(service=svc, catalog_name="main", schema_name="reporting")
         self.assertIsNot(a, b)
 
 
@@ -234,7 +234,7 @@ class TestParentNavigationReturnsSingleton(unittest.TestCase):
             service=Tables(client=client),
             catalog_name="main", schema_name="sales", table_name="orders",
         )
-        direct = Catalog(service=client.catalogs, catalog_name="main")
+        direct = UCCatalog(service=client.catalogs, catalog_name="main")
         self.assertIs(table.catalog, direct)
 
     def test_table_schema_is_singleton_schema(self) -> None:
@@ -243,7 +243,7 @@ class TestParentNavigationReturnsSingleton(unittest.TestCase):
             service=Tables(client=client),
             catalog_name="main", schema_name="sales", table_name="orders",
         )
-        direct = Schema(
+        direct = UCSchema(
             service=client.schemas, catalog_name="main", schema_name="sales",
         )
         self.assertIs(table.schema, direct)
@@ -254,7 +254,7 @@ class TestParentNavigationReturnsSingleton(unittest.TestCase):
             service=Volumes(client=client),
             catalog_name="main", schema_name="sales", volume_name="staging",
         )
-        direct = Catalog(service=client.catalogs, catalog_name="main")
+        direct = UCCatalog(service=client.catalogs, catalog_name="main")
         self.assertIs(vol.catalog, direct)
 
     def test_volume_schema_is_singleton_schema(self) -> None:
@@ -263,7 +263,7 @@ class TestParentNavigationReturnsSingleton(unittest.TestCase):
             service=Volumes(client=client),
             catalog_name="main", schema_name="sales", volume_name="staging",
         )
-        direct = Schema(
+        direct = UCSchema(
             service=client.schemas, catalog_name="main", schema_name="sales",
         )
         self.assertIs(vol.schema, direct)

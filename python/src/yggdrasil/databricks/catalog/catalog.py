@@ -48,15 +48,15 @@ from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks
 if TYPE_CHECKING:
     from yggdrasil.databricks.catalog.catalogs import Catalogs
     from yggdrasil.databricks.client import DatabricksClient
-    from yggdrasil.databricks.schema.schema import Schema
+    from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.databricks.table.table import Table
 
-__all__ = ["Catalog"]
+__all__ = ["UCCatalog"]
 
 logger = logging.getLogger(__name__)
 
 
-class Catalog(DatabricksPath, Singleton):
+class UCCatalog(DatabricksPath, Singleton):
     """A single Unity Catalog catalog — lifecycle, schema navigation, tags.
 
     Identity is ``(client, catalog_name)``: two callers asking for
@@ -127,7 +127,7 @@ class Catalog(DatabricksPath, Singleton):
         # has nothing useful to add — and chaining through it would
         # also re-enter :class:`Singleton.__new__` from the MRO,
         # collapsing every allocation onto the empty-key singleton.
-        def _allocate() -> "Catalog":
+        def _allocate() -> "UCCatalog":
             return object.__new__(cls)
 
         if singleton_ttl is ...:
@@ -276,7 +276,7 @@ class Catalog(DatabricksPath, Singleton):
         return MimeTypes.DATABRICKS_UNITY_CATALOG_CATALOG
 
     @classmethod
-    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Catalog":
+    def from_url(cls, url: "URL | str", **kwargs: Any) -> "UCCatalog":
         """Build a :class:`Catalog` from a ``dbfs+volume:///cat`` /
         ``dbfs+catalog:///cat`` URL.
 
@@ -330,7 +330,7 @@ class Catalog(DatabricksPath, Singleton):
 
     # ── dict-like navigation ──────────────────────────────────────────────────
 
-    def __getitem__(self, name: str) -> "Schema":
+    def __getitem__(self, name: str) -> "UCSchema":
         """``catalog["schema_name"]`` → :class:`Schema`."""
         return self.schema(name)
 
@@ -338,7 +338,7 @@ class Catalog(DatabricksPath, Singleton):
         """``catalog["old_schema"] = "new_schema"`` renames a child schema."""
         self.schema(name).rename(new_name)
 
-    def __iter__(self) -> Iterator["Schema"]:
+    def __iter__(self) -> Iterator["UCSchema"]:
         """Iterate over every schema in this catalog."""
         return self.schemas()
 
@@ -368,7 +368,7 @@ class Catalog(DatabricksPath, Singleton):
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
 
-    def clear(self) -> "Catalog":
+    def clear(self) -> "UCCatalog":
         """Public alias for :meth:`_reset_cache`; returns ``self``."""
         self._reset_cache()
         return self
@@ -419,22 +419,22 @@ class Catalog(DatabricksPath, Singleton):
 
     # ── navigation ────────────────────────────────────────────────────────────
 
-    def schema(self, name: str) -> "Schema":
+    def schema(self, name: str) -> "UCSchema":
         """Return a :class:`Schema` bound to this catalog.
 
         Args:
             name: Schema name (unqualified).
         """
-        from yggdrasil.databricks.schema.schema import Schema as _Schema
+        from yggdrasil.databricks.schema.schema import UCSchema as _Schema
         return _Schema(
             service=self.service,
             catalog_name=self.catalog_name,
             schema_name=name,
         )
 
-    def schemas(self) -> Iterator["Schema"]:
+    def schemas(self) -> Iterator["UCSchema"]:
         """Iterate over every schema in this catalog (single API call)."""
-        from yggdrasil.databricks.schema.schema import Schema as _Schema
+        from yggdrasil.databricks.schema.schema import UCSchema as _Schema
         logger.debug("Listing schemas in catalog %r", self)
         for info in self.client.workspace_client().schemas.list(catalog_name=self.catalog_name):
             s = _Schema(
@@ -491,7 +491,7 @@ class Catalog(DatabricksPath, Singleton):
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
         missing_ok: bool = True,
-    ) -> "Catalog":
+    ) -> "UCCatalog":
         """Create this catalog in Unity Catalog.
 
         Args:
@@ -530,7 +530,7 @@ class Catalog(DatabricksPath, Singleton):
         comment: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
-    ) -> "Catalog":
+    ) -> "UCCatalog":
         """Create this catalog if it does not already exist, then return ``self``."""
         if not self.exists:
             self.create(
@@ -547,7 +547,7 @@ class Catalog(DatabricksPath, Singleton):
         force: bool = False,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
-    ) -> "Catalog":
+    ) -> "UCCatalog":
         """Delete this catalog from Unity Catalog.
 
         Args:
@@ -614,7 +614,7 @@ class Catalog(DatabricksPath, Singleton):
         *,
         tag_collation: str | None = DEFAULT_TAG_COLLATION,
         mode: ModeLike | None = None,
-    ) -> "Catalog":
+    ) -> "UCCatalog":
         """Apply catalog-level tags via the UC ``entity_tag_assignments`` API.
 
         ``tag_collation`` is accepted for API compatibility and ignored —
@@ -640,7 +640,7 @@ class Catalog(DatabricksPath, Singleton):
         tag_keys: Iterable[str],
         *,
         if_exists: bool = True,
-    ) -> "Catalog":
+    ) -> "UCCatalog":
         """Delete catalog-level tag assignments by key."""
         self.client.entity_tags.delete_entity_tags(
             entity_type="catalogs",
@@ -666,7 +666,7 @@ class Catalog(DatabricksPath, Singleton):
         comment: str | None = None,
         owner: str | None = None,
         properties: Optional[Mapping[str, str]] = None,
-    ) -> "Catalog":
+    ) -> "UCCatalog":
         """Update catalog metadata in-place and refresh the local cache."""
         kwargs: dict[str, Any] = {}
         if comment is not None:
@@ -688,7 +688,7 @@ class Catalog(DatabricksPath, Singleton):
 
     # ── rename ────────────────────────────────────────────────────────────────
 
-    def rename(self, new_name: str) -> "Catalog":
+    def rename(self, new_name: str) -> "UCCatalog":
         """Rename this catalog in-place (``ALTER CATALOG … RENAME TO …``)."""
         new_name = (new_name or "").strip().strip("`")
         if not new_name:
@@ -717,3 +717,7 @@ class Catalog(DatabricksPath, Singleton):
         object.__setattr__(self, "_infos", info)
         object.__setattr__(self, "_infos_fetched_at", time.time())
         return self
+
+
+# Backwards-compat alias so existing ``from … import Catalog`` keeps working.
+Catalog = UCCatalog

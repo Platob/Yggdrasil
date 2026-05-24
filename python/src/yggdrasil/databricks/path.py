@@ -221,13 +221,13 @@ def _resolve_databricks_subclass(
         parts = [p for p in (candidate.path or "/").lstrip("/").split("/") if p]
         depth = len(parts)
         if depth == 1:
-            from yggdrasil.databricks.catalog.catalog import Catalog
+            from yggdrasil.databricks.catalog.catalog import UCCatalog
 
-            return Catalog, candidate
+            return UCCatalog, candidate
         if depth == 2:
-            from yggdrasil.databricks.schema.schema import Schema
+            from yggdrasil.databricks.schema.schema import UCSchema
 
-            return Schema, candidate
+            return UCSchema, candidate
         if depth == 3:
             from yggdrasil.databricks.volume.volume import Volume
 
@@ -251,14 +251,14 @@ def _resolve_databricks_subclass(
         # ``dbfs+catalog:///cat`` — explicit catalog URL form. Routes
         # to the same :class:`Catalog` resource the volume-path dispatch
         # picks for ``dbfs+volume:///cat``.
-        from yggdrasil.databricks.catalog.catalog import Catalog
+        from yggdrasil.databricks.catalog.catalog import UCCatalog
 
-        return Catalog, candidate
+        return UCCatalog, candidate
     if scheme == Scheme.DATABRICKS_SCHEMA.value:
         # ``dbfs+schema:///cat/sch`` — explicit schema URL form.
-        from yggdrasil.databricks.schema.schema import Schema
+        from yggdrasil.databricks.schema.schema import UCSchema
 
-        return Schema, candidate
+        return UCSchema, candidate
 
     # Unknown scheme (or empty) — let the caller's intended class
     # decide. DBFSPath is the safe default for the un-qualified

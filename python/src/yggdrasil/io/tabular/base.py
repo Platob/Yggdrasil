@@ -65,7 +65,7 @@ import pyarrow as pa
 from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MediaType, MimeType
+from yggdrasil.data.enums import MediaType, MimeType, Mode, ModeLike
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 
 
@@ -1400,6 +1400,59 @@ class Tabular(ABC, Generic[O]):
 
         if options.sync_metadata:
             self._commit_metadata()
+
+    # ==================================================================
+    # Union
+    # ==================================================================
+
+    def union(self, other: "Any", *, mode: "ModeLike | None" = None) -> "Tabular":
+        """Return a Tabular representing ``self UNION ALL other``.
+
+        *mode* controls how mismatched schemas are reconciled:
+
+        - ``Mode.IGNORE`` (default) — keep ``self``'s schema; extra
+          columns in *other* are dropped, missing ones are filled null.
+        - ``Mode.APPEND`` — widen to the superset schema (every field
+          from both sides survives).
+
+        Concrete subclasses override :meth:`_union` for in-place
+        mutation (Arrow batch append, Spark ``unionByName``).  The
+        base falls back to :class:`UnionTabular`.
+
+        Accepts :class:`Tabular`, ``pa.RecordBatch``, ``pa.Table``,
+        ``list[Response]``, or a Spark DataFrame.
+        ``None`` returns ``self`` unchanged.
+        """
+        resolved: Mode = Mode.from_(mode, default=Mode.IGNORE)
+        if other is None:
+            return self
+        if isinstance(other, Tabular):
+            return self._union(other, mode=resolved)
+        if isinstance(other, (pa.RecordBatch, pa.Table)):
+            from yggdrasil.arrow.tabular import ArrowTabular
+            return self._union(ArrowTabular(other), mode=resolved)
+        if isinstance(other, list):
+            from yggdrasil.arrow.tabular import ArrowTabular
+            from yggdrasil.io.response import Response as _Resp
+            batches = [r.to_arrow_batch(parse=False) for r in other if isinstance(r, _Resp)]
+            if not batches:
+                return self
+            return self._union(ArrowTabular(*batches), mode=resolved)
+        if hasattr(other, "unionByName"):
+            try:
+                from yggdrasil.spark.tabular import Dataset
+                return self._union(Dataset(frame=other), mode=resolved)
+            except ImportError:
+                pass
+        raise TypeError(
+            f"{type(self).__name__}.union does not accept "
+            f"{type(other).__name__!r}"
+        )
+
+    def _union(self, other: "Tabular", *, mode: Mode = Mode.IGNORE) -> "Tabular":
+        """Engine-specific union hook.  Override in subclasses."""
+        from .union import UnionTabular
+        return UnionTabular([self, other])
 
     # ==================================================================
     # Polars

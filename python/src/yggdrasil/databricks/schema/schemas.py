@@ -36,9 +36,9 @@ from databricks.sdk.service.catalog import SchemaInfo
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
-from yggdrasil.databricks.catalog.catalog import Catalog
+from yggdrasil.databricks.catalog.catalog import UCCatalog
 from yggdrasil.databricks.column.column import Column
-from yggdrasil.databricks.schema.schema import Schema
+from yggdrasil.databricks.schema.schema import UCSchema
 from yggdrasil.databricks.sql.sql_utils import is_glob_pattern, name_matcher
 from yggdrasil.databricks.table.table import Table
 
@@ -113,7 +113,7 @@ class Schemas(DatabricksService):
 
     # ── dict-like navigation ──────────────────────────────────────────────────
 
-    def __getitem__(self, name: str) -> Union[Schema, Table, Column]:
+    def __getitem__(self, name: str) -> Union[UCSchema, Table, Column]:
         """Route a 1-, 2-, 3-, or 4-part dotted name to the right resource.
 
         * ``schemas["sales"]``                      → :class:`Schema`  (uses ``self.catalog_name``)
@@ -148,7 +148,7 @@ class Schemas(DatabricksService):
         """
         self[name].rename(new_name)
 
-    def __iter__(self) -> Iterator[Schema]:
+    def __iter__(self) -> Iterator[UCSchema]:
         """Iterate over schemas in the resolved catalog scope (``self.list()``)."""
         return self.list()
 
@@ -160,8 +160,8 @@ class Schemas(DatabricksService):
         *,
         catalog_name: str | None = None,
         schema_name: str | None = None,
-    ) -> Schema:
-        """Return a :class:`Schema` bound to this service.
+    ) -> UCSchema:
+        """Return a :class:`UCSchema` bound to this service.
 
         Uses the module-level cache when available.
 
@@ -179,7 +179,7 @@ class Schemas(DatabricksService):
         assert c, "No catalog_name: supply it explicitly or set it on the Schemas service"
         assert s, "No schema_name: supply it explicitly or set it on the Schemas service"
 
-        sch = Schema(service=self, catalog_name=c, schema_name=s)
+        sch = UCSchema(service=self, catalog_name=c, schema_name=s)
         cached = _SCHEMA_INFO_CACHE.get(self._cache_key(c, s))
         if cached is not None:
             object.__setattr__(sch, "_infos", cached)
@@ -210,7 +210,7 @@ class Schemas(DatabricksService):
             table_name=table_name,
         )
 
-    def catalog(self, name: str | None = None) -> Catalog:
+    def catalog(self, name: str | None = None) -> UCCatalog:
         """Return a :class:`Catalog` using this service's client.
 
         Args:
@@ -228,7 +228,7 @@ class Schemas(DatabricksService):
         *,
         catalog_name: str | None = None,
         use_cache: bool = True,
-    ) -> Iterator[Schema]:
+    ) -> Iterator[UCSchema]:
         """Iterate over visible schemas, optionally scoped to a catalog.
 
         Args:
@@ -263,7 +263,7 @@ class Schemas(DatabricksService):
             if matcher is not None and not matcher(info.name):
                 continue
 
-            sch = Schema(
+            sch = UCSchema(
                 service=self,
                 catalog_name=info.catalog_name,
                 schema_name=info.name,
@@ -306,7 +306,7 @@ class Schemas(DatabricksService):
         schema_name: str | None = None,
         raise_error: bool = True,
         cache_ttl: float | None = 300.0,
-    ) -> Optional[Schema]:
+    ) -> Optional[UCSchema]:
         """Resolve a schema by name.
 
         Caching is controlled by ``cache_ttl``.  Set ``cache_ttl=None`` to
@@ -333,7 +333,7 @@ class Schemas(DatabricksService):
         if cache_ttl is not None:
             cached = _SCHEMA_INFO_CACHE.get(cache_key)
             if cached is not None:
-                sch = Schema(service=self, catalog_name=c, schema_name=s)
+                sch = UCSchema(service=self, catalog_name=c, schema_name=s)
                 object.__setattr__(sch, "_infos", cached)
                 object.__setattr__(sch, "_infos_fetched_at", time.time())
                 return sch
@@ -343,7 +343,7 @@ class Schemas(DatabricksService):
         if info is None:
             return None
 
-        sch = Schema(
+        sch = UCSchema(
             service=self,
             catalog_name=info.catalog_name,
             schema_name=info.name,
@@ -404,14 +404,14 @@ class Schemas(DatabricksService):
 
     def invalidate(
         self,
-        schema: Schema | str | None = None,
+        schema: UCSchema | str | None = None,
         *,
         catalog_name: Optional[str] = None,
         schema_name: Optional[str] = None,
     ) -> None:
         """Evict one entry from the module-level schema-info cache."""
         if schema is not None:
-            if isinstance(schema, Schema):
+            if isinstance(schema, UCSchema):
                 catalog_name = schema.catalog_name
                 schema_name = schema.schema_name
             else:

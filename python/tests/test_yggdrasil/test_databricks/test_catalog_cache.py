@@ -30,18 +30,18 @@ def _clear_caches():
 
 @pytest.fixture(autouse=True)
 def _clear_catalog_singletons():
-    from yggdrasil.databricks.catalog.catalog import Catalog
-    Catalog._INSTANCES.clear()
+    from yggdrasil.databricks.catalog.catalog import UCCatalog
+    UCCatalog._INSTANCES.clear()
     yield
-    Catalog._INSTANCES.clear()
+    UCCatalog._INSTANCES.clear()
 
 
 @pytest.fixture(autouse=True)
 def _clear_schema_singletons():
-    from yggdrasil.databricks.schema.schema import Schema
-    Schema._INSTANCES.clear()
+    from yggdrasil.databricks.schema.schema import UCSchema
+    UCSchema._INSTANCES.clear()
     yield
-    Schema._INSTANCES.clear()
+    UCSchema._INSTANCES.clear()
 
 
 def _mock_client(host: str = "adb-test.azuredatabricks.net") -> MagicMock:

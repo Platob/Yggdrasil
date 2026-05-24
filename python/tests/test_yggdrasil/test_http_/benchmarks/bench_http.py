@@ -40,7 +40,7 @@ from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import SendConfig, SendManyConfig
+from yggdrasil.io.send_config import SendConfig
 
 
 # ---------------------------------------------------------------------------
@@ -395,8 +395,8 @@ def _session_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=50_000,
     ))
     out.append(_time_one(
-        "SendManyConfig.from_(None)",
-        lambda: SendManyConfig.from_(None),
+        "SendConfig.from_(None)",
+        lambda: SendConfig.from_(None),
         repeat=repeat, inner=20_000,
     ))
 
@@ -488,7 +488,7 @@ def _session_scenarios(repeat: int) -> list[dict]:
     # ``prepare_request_before_send``, cache short-circuits, post hooks)
     # without involving a socket.
     class _FakeHTTPSession(HTTPSession):
-        def _local_send(self, request, config):  # type: ignore[override]
+        def _local_send(self, request):  # type: ignore[override]
             resp = Response(
                 request=request,
                 status_code=200,

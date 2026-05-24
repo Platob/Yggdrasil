@@ -74,7 +74,7 @@ class TestPreparedRequestPickle:
         # All declared __dict__ fields land in the payload
         for key in (
             "method", "url", "headers", "tags", "buffer",
-            "sent_at", "local_cache_config", "remote_cache_config", "_sender",
+            "sent_at", "_sender",
         ):
             assert key in state, f"missing {key!r} in pickle state"
 

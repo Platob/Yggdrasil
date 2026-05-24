@@ -236,7 +236,7 @@ def scenarios(repeat: int, n: int) -> list[dict]:
 
     # ---- Underlying lift (one chunk's worth of responses → SparkDataFrame) ----
     canned_responses = [
-        session._local_send(req, SendConfig.check_arg(None))
+        session._local_send(req)
         for req in requests
     ]
     out.append(_time_one(

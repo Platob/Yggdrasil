@@ -31,9 +31,9 @@ from .table import Table, _VIEW_TABLE_TYPES
 from ...data import Mode, ModeLike
 
 if TYPE_CHECKING:
-    from yggdrasil.databricks.catalog.catalog import Catalog
+    from yggdrasil.databricks.catalog.catalog import UCCatalog
     from yggdrasil.databricks.column.column import Column
-    from yggdrasil.databricks.schema.schema import Schema
+    from yggdrasil.databricks.schema.schema import UCSchema
 
 __all__ = ["Tables"]
 
@@ -249,13 +249,13 @@ class Tables(DatabricksService):
             table_name=table_name or view_name,
         )
 
-    def catalog(self, name: str | None = None) -> "Catalog":
-        """Return a :class:`Catalog` using this service's client.
+    def catalog(self, name: str | None = None) -> "UCCatalog":
+        """Return a :class:`UCCatalog` using this service's client.
 
         Args:
             name: Catalog name (falls back to ``self.catalog_name``).
         """
-        from yggdrasil.databricks.catalog.catalog import Catalog as _Catalog
+        from yggdrasil.databricks.catalog.catalog import UCCatalog as _Catalog
         from yggdrasil.databricks.catalog.catalogs import Catalogs
         return _Catalog(
             service=Catalogs(client=self.client),
@@ -268,8 +268,8 @@ class Tables(DatabricksService):
         *,
         catalog_name: str | None = None,
         schema_name: str | None = None,
-    ) -> "Schema":
-        """Return a :class:`Schema` using this service's client.
+    ) -> "UCSchema":
+        """Return a :class:`UCSchema` using this service's client.
 
         Args:
             name:         Two-part ``"catalog.schema"`` name (optional if
@@ -277,7 +277,7 @@ class Tables(DatabricksService):
             catalog_name: Override catalog (falls back to ``self.catalog_name``).
             schema_name:  Override schema (falls back to ``self.schema_name``).
         """
-        from yggdrasil.databricks.schema.schema import Schema as _Schema
+        from yggdrasil.databricks.schema.schema import UCSchema as _Schema
         from yggdrasil.databricks.catalog.catalogs import Catalogs
 
         if name and "." in name:

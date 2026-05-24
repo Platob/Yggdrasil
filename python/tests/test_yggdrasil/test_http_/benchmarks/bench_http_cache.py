@@ -577,7 +577,7 @@ class _StubBenchSession(HTTPSession):
         super().__init__(*args, **kwargs)
         self._response = response
 
-    def _local_send(self, request: PreparedRequest, config) -> Response:
+    def _local_send(self, request: PreparedRequest) -> Response:
         # Hand back a fresh shallow copy so the caller can stamp
         # ``response.request`` without mutating the bench template
         # across iterations.

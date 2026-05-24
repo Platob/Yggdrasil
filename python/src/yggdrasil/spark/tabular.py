@@ -432,6 +432,18 @@ class Dataset(Tabular[CastOptions]):
             f"OVERWRITE / APPEND / IGNORE; got {action!r}."
         )
 
+    def _union(self, other: "Tabular", *, mode: "Mode" = ...) -> "Dataset":
+        other_frame = other._native_spark_frame()
+        if other_frame is None:
+            merged = self.collect_schema().merge_with(
+                other.collect_schema(), mode=mode,
+            )
+            other_frame = other.read_spark_frame(target=merged)
+        self.frame = self._frame.unionByName(
+            other_frame, allowMissingColumns=True,
+        )
+        return self
+
     # ------------------------------------------------------------------
     # Arrow read / write — collects on read, builds Spark on write
     # ------------------------------------------------------------------

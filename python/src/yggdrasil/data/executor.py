@@ -341,7 +341,7 @@ class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
     # Session abstract hooks — SQL executors don't speak HTTP
     # ------------------------------------------------------------------
 
-    def _local_send(self, request: Any, config: Any) -> Any:
+    def _local_send(self, request: Any) -> Any:
         """Stubs out the HTTP local-send hook from :class:`Session`.
 
         :class:`StatementExecutor` IS a :class:`Session` (singleton +

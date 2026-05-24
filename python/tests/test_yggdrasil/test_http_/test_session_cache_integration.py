@@ -53,7 +53,7 @@ import pytest
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import CacheConfig
+from yggdrasil.io.send_config import CacheConfig, SendConfig
 from yggdrasil.io.session import Session
 
 from ._helpers import StubSession, make_request, make_response
@@ -358,7 +358,7 @@ class TestLocalCacheSend:
 
         alt = tmp_path / "alt"
         alt.mkdir()
-        req = seed_req.copy(local_cache_config=_local_cfg(alt))
+        req = seed_req.copy(send_config=SendConfig(local_cache=_local_cfg(alt)))
 
         s = StubSession()
         s.queue(make_response(request=req, body=b'{"v":"network"}'))
@@ -459,10 +459,10 @@ class TestLocalCacheSendMany:
         session_cache = _local_cfg(tmp_path / "session")
 
         a = make_request("https://example.com/a").copy(
-            local_cache_config=_local_cfg(a_dir),
+            send_config=SendConfig(local_cache=_local_cfg(a_dir)),
         )
         b = make_request("https://example.com/b").copy(
-            local_cache_config=_local_cfg(b_dir),
+            send_config=SendConfig(local_cache=_local_cfg(b_dir)),
         )
 
         s = StubSession()
@@ -589,7 +589,7 @@ class TestRemoteCacheSend:
         req = make_request("https://example.com/x")
         _seed_remote(tab_a, make_response(request=req, body=b'{"v":"a"}'))
 
-        req_with_override = req.copy(remote_cache_config=_remote_cfg(tab_b))
+        req_with_override = req.copy(send_config=SendConfig(remote_cache=_remote_cfg(tab_b)))
         s = StubSession()
         s.queue(make_response(request=req_with_override, body=b'{"v":"network"}'))
 
@@ -648,10 +648,10 @@ class TestRemoteCacheSendMany:
         tab_b = _FakeRemoteTabular(name="ws.b.responses")
 
         req_a = make_request("https://example.com/a").copy(
-            remote_cache_config=_remote_cfg(tab_a),
+            send_config=SendConfig(remote_cache=_remote_cfg(tab_a)),
         )
         req_b = make_request("https://example.com/b").copy(
-            remote_cache_config=_remote_cfg(tab_b),
+            send_config=SendConfig(remote_cache=_remote_cfg(tab_b)),
         )
         _seed_remote(tab_a, make_response(request=req_a, body=b'{"k":"a"}'))
         _seed_remote(tab_b, make_response(request=req_b, body=b'{"k":"b"}'))
@@ -672,10 +672,10 @@ class TestRemoteCacheSendMany:
         upsert_cfg = _remote_cfg(tab, mode=Mode.UPSERT)
 
         a = make_request("https://example.com/a").copy(
-            remote_cache_config=append_cfg,
+            send_config=SendConfig(remote_cache=append_cfg),
         )
         b = make_request("https://example.com/b").copy(
-            remote_cache_config=upsert_cfg,
+            send_config=SendConfig(remote_cache=upsert_cfg),
         )
         s = StubSession()
         s.queue(
