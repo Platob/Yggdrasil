@@ -435,8 +435,12 @@ class Dataset(Tabular[CastOptions]):
     def _union(self, other: "Tabular", *, schema_mode: "Any" = None) -> "Dataset":
         other_frame = other._native_spark_frame()
         if other_frame is None:
-            arrow_table = other._read_arrow_table(CastOptions())
-            other_frame = self._frame.sparkSession.createDataFrame(arrow_table)
+            from yggdrasil.data.enums import Mode
+            mode = Mode.from_(schema_mode) if schema_mode is not None else Mode.IGNORE
+            merged = self.collect_schema().merge_with(
+                other.collect_schema(), mode=mode,
+            )
+            other_frame = other.read_spark_dataset(target=merged).frame
         self.frame = self._frame.unionByName(
             other_frame, allowMissingColumns=True,
         )
