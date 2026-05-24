@@ -180,6 +180,12 @@ class Mode(IntEnum):
         if hit is not None:
             return hit
 
+        # Stringified integer value (e.g. "3" from a widget dropdown).
+        try:
+            return cls(int(normalized))
+        except (ValueError, KeyError):
+            pass
+
         # OS-mode parser. Handles the full open() grammar including
         # `+` variants ("rb+", "wt+", "ab+") and any character order
         # ("r+b" / "+rb"). Raises ValueError if the string isn't a

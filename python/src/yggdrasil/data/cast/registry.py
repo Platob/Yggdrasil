@@ -383,13 +383,14 @@ def convert(
             except (TypeError, ValueError, KeyError, AttributeError):
                 pass
 
+    if target_is_type and issubclass(target_hint, enum.Enum):
+        return convert_to_python_enum(value, target_hint, options=options)  # type: ignore[return-value]
+
     conv = find_converter(type(value), target_hint)
     if conv is not None:
         return conv(value, options)  # type: ignore[return-value]
 
     if target_is_type:
-        if issubclass(target_hint, enum.Enum):
-            return convert_to_python_enum(value, target_hint, options=options)  # type: ignore[return-value]
         if dataclasses.is_dataclass(target_hint):
             return convert_to_python_dataclass(value, target_hint, options=options)  # type: ignore[return-value]
 
