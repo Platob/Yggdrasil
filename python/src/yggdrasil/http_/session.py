@@ -1602,9 +1602,8 @@ class HTTPSession(Session):
     def _effective_local_cfg(
         self,
         request: PreparedRequest,
-        session_cfg: CacheConfig | None,
     ) -> CacheConfig | None:
-        cfg = request.local_cache_config or session_cfg
+        cfg = request.local_cache_config
         if cfg is None:
             return None
         return cfg.prebuild(session=self)
@@ -1612,9 +1611,8 @@ class HTTPSession(Session):
     def _effective_remote_cfg(
         self,
         request: PreparedRequest,
-        session_cfg: CacheConfig | None,
     ) -> CacheConfig | None:
-        return request.remote_cache_config or session_cfg
+        return request.remote_cache_config
 
     @staticmethod
     def _remote_write_group_key(cfg: CacheConfig) -> tuple:
@@ -1637,7 +1635,6 @@ class HTTPSession(Session):
     def _split_local_cache(
         self,
         batch: list[PreparedRequest],
-        session_local_cfg: CacheConfig,
         *,
         key_to_local_cfg: Optional[Mapping[int, CacheConfig]] = None,
     ) -> tuple[dict[Path, list[Response]], list[PreparedRequest]]:
@@ -1673,10 +1670,7 @@ class HTTPSession(Session):
         hits: dict[Path, list[Response]] = {}
         misses: list[PreparedRequest] = []
 
-        if (session_local_cfg is None or not session_local_cfg.local_cache_enabled) and not any(
-            r.local_cache_config for r in batch
-        ):
-            # Cheap path: no local cache anywhere in this batch.
+        if not any(r.local_cache_config for r in batch):
             return hits, list(batch)
 
         # Single-pass classify: UPSERT → miss, APPEND with local cache
@@ -1689,7 +1683,7 @@ class HTTPSession(Session):
                 key_to_local_cfg.get(req.public_url_hash)
                 if key_to_local_cfg is not None
                 else None
-            ) or self._effective_local_cfg(req, session_local_cfg)
+            ) or self._effective_local_cfg(req)
             if eff is None or not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
@@ -1720,7 +1714,6 @@ class HTTPSession(Session):
     def _split_remote_cache(
         self,
         requests: list[PreparedRequest],
-        session_remote_cfg: CacheConfig,
         *,
         spark_session: Optional["SparkSession"] = None,
         key_to_remote_cfg: Optional[Mapping[int, CacheConfig]] = None,
@@ -1756,7 +1749,7 @@ class HTTPSession(Session):
                 key_to_remote_cfg.get(req.public_url_hash)
                 if key_to_remote_cfg is not None
                 else None
-            ) or self._effective_remote_cfg(req, session_remote_cfg)
+            ) or self._effective_remote_cfg(req)
             if t_cfg is None or t_cfg.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
@@ -1965,7 +1958,6 @@ class HTTPSession(Session):
     def _split_remote_cache_spark(
         self,
         requests: list[PreparedRequest],
-        session_remote_cfg: CacheConfig,
         *,
         key_to_remote_cfg: Optional[Mapping[int, CacheConfig]] = None,
         spark: "SparkSession",
@@ -1990,7 +1982,7 @@ class HTTPSession(Session):
                 key_to_remote_cfg.get(req.public_url_hash)
                 if key_to_remote_cfg is not None
                 else None
-            ) or self._effective_remote_cfg(req, session_remote_cfg)
+            ) or self._effective_remote_cfg(req)
             if t_cfg is None or t_cfg.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
@@ -2260,7 +2252,6 @@ class HTTPSession(Session):
         self,
         responses: list[Response],
         key_to_local_cfg: Mapping[int, CacheConfig],
-        session_local_cfg: CacheConfig,
     ) -> None:
         """Write remote-cache hits back to the partitioned local cache.
 
@@ -2289,8 +2280,6 @@ class HTTPSession(Session):
             req = response.request
             cfg_key = req.public_url_hash if req is not None else None
             eff = key_to_local_cfg.get(cfg_key) if cfg_key is not None else None
-            if eff is None:
-                eff = session_local_cfg
             if eff is None or not eff.local_cache_enabled:
                 continue
             root = eff.local_cache_folder(session=self)
@@ -2317,7 +2306,6 @@ class HTTPSession(Session):
         self,
         responses: list[Response],
         key_to_remote_cfg: Mapping[int, CacheConfig],
-        session_remote_cfg: CacheConfig,
     ) -> None:
         """Stage 4: bulk-insert successful responses into the remote cache.
 
@@ -2343,8 +2331,6 @@ class HTTPSession(Session):
             req = response.request
             cfg_key = req.public_url_hash if req is not None else None
             eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
-            if eff is None:
-                eff = session_remote_cfg
             if eff is None or not eff.remote_cache_enabled:
                 continue
             gkey = self._remote_write_group_key(eff)
@@ -2398,7 +2384,6 @@ class HTTPSession(Session):
         self,
         local_hits_by_path: Mapping[Path, "list[Response]"],
         key_to_remote_cfg: Mapping[int, CacheConfig],
-        session_remote_cfg: CacheConfig,
     ) -> None:
         """Bulk-upsert local-cache hits into the remote cache.
 
@@ -2439,8 +2424,6 @@ class HTTPSession(Session):
             req = response.request
             cfg_key = req.public_url_hash if req is not None else None
             eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
-            if eff is None:
-                eff = session_remote_cfg
             if eff is None or not eff.remote_cache_enabled:
                 continue
             if not eff.mirror_local_to_remote:
@@ -2454,7 +2437,7 @@ class HTTPSession(Session):
             "Mirroring %d local-cache hit(s) to remote cache",
             len(keep),
         )
-        self._persist_remote(keep, key_to_remote_cfg, session_remote_cfg)
+        self._persist_remote(keep, key_to_remote_cfg)
 
     def _send_many(
         self,
@@ -2530,10 +2513,6 @@ class HTTPSession(Session):
         spark = config.spark_session
         is_spark = spark is not None
 
-        session_remote_cfg = config.remote_cache
-        _lc = config.local_cache
-        session_local_cfg = _lc.prebuild(session=self) if _lc is not None else None
-
         if is_spark:
             self._enable_fair_spark_scheduler(spark)
 
@@ -2547,6 +2526,8 @@ class HTTPSession(Session):
 
         ttl = max_batch_ttl
 
+        _lc = config.local_cache
+        _rc = config.remote_cache
         LOGGER.debug(
             "Starting send_many pipeline (mode=%s, batch_size=%d, "
             "max_in_flight=%s, ttl=%s, ordered=%s, "
@@ -2556,8 +2537,8 @@ class HTTPSession(Session):
             max_in_flight,
             ttl,
             ordered,
-            session_local_cfg.local_cache_enabled if session_local_cfg is not None else False,
-            session_remote_cfg.remote_cache_enabled if session_remote_cfg is not None else False,
+            _lc.local_cache_enabled if _lc is not None else False,
+            _rc.remote_cache_enabled if _rc is not None else False,
         )
 
         chunk_index = 0
@@ -2648,12 +2629,12 @@ class HTTPSession(Session):
             key_to_local_cfg: dict[int, CacheConfig] = {}
             for r in chunk:
                 k = r.public_url_hash
-                key_to_remote_cfg[k] = self._effective_remote_cfg(r, session_remote_cfg)
-                key_to_local_cfg[k] = self._effective_local_cfg(r, session_local_cfg)
+                key_to_remote_cfg[k] = self._effective_remote_cfg(r)
+                key_to_local_cfg[k] = self._effective_local_cfg(r)
 
             # --- Stage 1: local cache ---
             local_hits_by_path, after_local = self._split_local_cache(
-                chunk, session_local_cfg, key_to_local_cfg=key_to_local_cfg,
+                chunk, key_to_local_cfg=key_to_local_cfg,
             )
             # Flatten across cache-folder paths into a single bucket
             # for :class:`HTTPResponseBatch`. On the spark path, lift the
@@ -2678,7 +2659,6 @@ class HTTPSession(Session):
                 self._mirror_local_hits_to_remote(
                     local_hits_by_path,
                     key_to_remote_cfg,
-                    session_remote_cfg,
                 )
                 local_count = len(local_flat)
                 total_local += local_count
@@ -2704,7 +2684,6 @@ class HTTPSession(Session):
             # --- Stage 2: remote cache ---
             remote_hits_by_table, after_remote = self._split_remote_cache(
                 after_local,
-                session_remote_cfg,
                 spark_session=spark,
                 key_to_remote_cfg=key_to_remote_cfg,
             )
@@ -2715,12 +2694,10 @@ class HTTPSession(Session):
                     for r in table_hits
                 ],
                 key_to_local_cfg,
-                session_local_cfg,
             )
             self._mirror_local_hits_to_remote(
                 local_hits_by_path,
                 key_to_remote_cfg,
-                session_remote_cfg,
             )
 
             # Collapse the per-table remote split into one bucket for
@@ -2823,7 +2800,6 @@ class HTTPSession(Session):
                     lambda: self._spark_persist_remote(
                         _spark_hits,
                         key_to_remote_cfg,
-                        session_remote_cfg,
                         spark=spark_misses[0].send_config_or_default.spark_session,
                     )
                 )
@@ -2833,14 +2809,12 @@ class HTTPSession(Session):
                     lambda: self._persist_remote(
                         _local_hits,
                         key_to_remote_cfg,
-                        session_remote_cfg,
                     )
                 )
                 stage4.append(
                     lambda: self._backfill_local_cache(
                         _local_hits,
                         key_to_local_cfg,
-                        session_local_cfg,
                     )
                 )
             self._run_concurrently(
@@ -2900,20 +2874,18 @@ class HTTPSession(Session):
         self,
         new_responses_df: "SparkDataFrame",
         key_to_remote_cfg: Mapping[int, CacheConfig],
-        session_remote_cfg: CacheConfig,
         *,
         spark: "SparkSession",
     ) -> None:
         """Stage 4 on Spark: per-request bulk-insert into the remote cache.
 
         Mirrors :meth:`_persist_remote`: each ``public_url_hash`` resolves
-        to its effective :class:`CacheConfig` via ``key_to_remote_cfg``
-        (falling back to ``session_remote_cfg``), groups bucket by
-        :meth:`_remote_write_group_key`, and each group's insert runs
-        concurrently. The Spark frame is persisted once when more than
-        one group fires so the network fetch behind it doesn't re-execute
-        per group; single-group inserts keep the legacy zero-persist
-        plan.
+        to its effective :class:`CacheConfig` via ``key_to_remote_cfg``,
+        groups bucket by :meth:`_remote_write_group_key`, and each group's
+        insert runs concurrently. The Spark frame is persisted once when
+        more than one group fires so the network fetch behind it doesn't
+        re-execute per group; single-group inserts keep the legacy
+        zero-persist plan.
 
         Before inserting, APPEND-mode writes are de-duplicated against the
         existing remote rows via a ``left_anti`` join on the response
@@ -2930,8 +2902,6 @@ class HTTPSession(Session):
         # path never fires for them.
         groups: dict[tuple, tuple[CacheConfig, list[int]]] = {}
         for cfg_key, eff in key_to_remote_cfg.items():
-            if eff is None:
-                eff = session_remote_cfg
             if eff is None or not eff.remote_cache_enabled:
                 continue
             gkey = self._remote_write_group_key(eff)
