@@ -167,11 +167,14 @@ class Scope(DatabricksResource):
         if not self.key:
             raise ValueError("Scope must have a key to list secrets")
 
+        LOGGER.debug("Listing secrets in scope %r", self)
+
         api = self.client.workspace_client().secrets
 
         try:
             metas = list(api.list_secrets(scope=self.key))
         except NotFound:
+            LOGGER.debug("Scope %r not found — returning empty list", self)
             return []
 
         out: list[Secret] = []
@@ -185,33 +188,44 @@ class Scope(DatabricksResource):
                     update_timestamp=any_to_datetime(ts) if ts else None,
                 )
             )
+        LOGGER.debug("Listed %d secrets in scope %r", len(out), self)
         return out
 
     def list_permissions(self) -> list[Permission]:
         if not self.key:
             raise ValueError("Scope must have a key to list permissions")
 
+        LOGGER.debug("Listing permissions on scope %r", self)
+
         api = self.client.workspace_client().secrets
 
         try:
             items = list(api.list_acls(scope=self.key))
         except NotFound:
+            LOGGER.debug("Scope %r not found — returning empty list", self)
             return []
 
-        return [Permission.from_(item) for item in items]
+        result = [Permission.from_(item) for item in items]
+        LOGGER.debug("Listed %d permissions on scope %r", len(result), self)
+        return result
 
     def permission(self, principal: str) -> Optional[Permission]:
         if not self.key:
             raise ValueError("Scope must have a key to read a permission")
+
+        LOGGER.debug("Fetching permission for principal %r on scope %r", principal, self)
 
         api = self.client.workspace_client().secrets
 
         try:
             item = api.get_acl(scope=self.key, principal=principal)
         except NotFound:
+            LOGGER.debug("No permission for principal %r on scope %r", principal, self)
             return None
 
-        return Permission.from_(item)
+        result = Permission.from_(item)
+        LOGGER.debug("Fetched permission %r on scope %r", result, self)
+        return result
 
     def set_permission(
         self,
@@ -471,13 +485,16 @@ class Secret(DatabricksResource):
 
     def refresh(self, raise_error: bool = True) -> "Secret":
         if self.scope and self.key:
+            LOGGER.debug("Fetching secret %r", self)
             try:
                 infos = self.client.workspace_client().secrets.get_secret(scope=self.scope.key, key=self.key)
             except NotFound:
+                LOGGER.debug("Secret %r not found", self)
                 if raise_error:
                     raise
                 else:
                     return self
+            LOGGER.info("Fetched secret %r", self)
             return self.set_details(infos)
         return self
 

@@ -55,8 +55,13 @@ class Secrets(DatabricksService):
     def list_scopes(self) -> list["Scope"]:
         from .resource import Scope
 
+        LOGGER.debug("Listing secret scopes")
+
         api = self.client.workspace_client().secrets
-        return [Scope(service=self, key=s.name) for s in api.list_scopes()]
+        result = [Scope(service=self, key=s.name) for s in api.list_scopes()]
+
+        LOGGER.debug("Listed %d secret scopes", len(result))
+        return result
 
     def create_scope(
         self,
