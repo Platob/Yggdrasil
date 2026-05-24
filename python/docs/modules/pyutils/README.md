@@ -95,3 +95,74 @@ def fetch_pages(page: int) -> list:
 all_items = [item for page in fetch_pages(range(1, 21)) for item in page]
 print(f"Total: {len(all_items)} items")
 ```
+
+---
+
+## Retry with backoff, jitter, and timeout
+
+```python
+import random
+from yggdrasil.pyutils import retry
+
+# Jitter avoids thundering-herd when many workers retry simultaneously
+@retry(
+    exceptions=(ConnectionError, TimeoutError),
+    tries=5,
+    delay=0.5,
+    backoff=2.0,
+    max_delay=30.0,
+    jitter=lambda d: d + random.uniform(0, 0.5),
+)
+def call_api(endpoint: str) -> dict:
+    from yggdrasil.http_ import HTTPSession
+    return HTTPSession().get(endpoint).json()
+
+# Total-timeout variant: give up after 60 seconds regardless of tries
+@retry(tries=20, delay=1.0, backoff=1.5, timeout=60.0)
+def poll_until_ready(resource_id: str) -> dict:
+    from yggdrasil.http_ import HTTPSession
+    resp = HTTPSession().get(f"https://api.example.com/resources/{resource_id}")
+    if resp.status == 202:
+        raise RuntimeError("Still pending")
+    resp.raise_for_status()
+    return resp.json()
+```
+
+---
+
+## Async retry
+
+`@retry` works transparently with `async def`:
+
+```python
+import asyncio
+from yggdrasil.pyutils import retry
+
+@retry(tries=3, delay=0.2, backoff=2)
+async def async_fetch(url: str) -> bytes:
+    import aiohttp
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url) as r:
+            return await r.read()
+
+result = asyncio.run(async_fetch("https://example.com"))
+```
+
+---
+
+## Parallelize with error collection
+
+```python
+from yggdrasil.pyutils import parallelize
+
+def safe_process(item: dict) -> dict | None:
+    try:
+        return {"id": item["id"], "result": item["value"] * 2}
+    except Exception as e:
+        print(f"Failed {item['id']}: {e}")
+        return None
+
+items = [{"id": i, "value": i * 1.5} for i in range(100)]
+results = [r for r in parallelize(safe_process, items, max_workers=8) if r is not None]
+print(f"Processed {len(results)}/{len(items)} successfully")
+```

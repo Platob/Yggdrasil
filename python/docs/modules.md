@@ -6,11 +6,11 @@ This index reflects the current package layout under [`python/src/yggdrasil`](ht
 
 | Module | Purpose | Page |
 |---|---|---|
-| `yggdrasil.data` | Cast registry, `CastOptions`, `DataType`, `Field`/`Schema`, `DataTable`, normalized enums | [types](modules/types/README.md) |
-| `yggdrasil.data.cast` | Converter registry, dispatch, options | [types](modules/types/README.md) |
-| `yggdrasil.arrow` | Arrow type inference and casting helpers | [arrow](modules/arrow/README.md) |
-| `yggdrasil.dataclasses` | Dataclass → Arrow field, `ExpiringDict`, `WaitingConfig`, `Singleton` | [dataclasses](modules/dataclasses/README.md) |
-| `yggdrasil.exceptions` | `YGGException` hierarchy — `CastError`, `HTTPError`, and all HTTP status types | [exceptions](modules/exceptions/README.md) |
+| `yggdrasil.data` | Cast registry, `CastOptions`, `DataType`, `Field`/`Schema`, `DataTable`, normalized enums, geo types, schema set-ops | [types](modules/types/README.md) |
+| `yggdrasil.data.cast` | Converter registry, dispatch, `register_converter`, `convert`, `CastOptions` | [types](modules/types/README.md) |
+| `yggdrasil.arrow` | Arrow type inference, casting, `pyarrow.compute` patterns, IPC streaming, TestCase | [arrow](modules/arrow/README.md) |
+| `yggdrasil.dataclasses` | `ExpiringDict` (TTL cache), `WaitingDict`, `@yggdataclass`, `WaitingConfig`, `Singleton` | [dataclasses](modules/dataclasses/README.md) |
+| `yggdrasil.exceptions` | `YGGException` hierarchy — `CastError`, `HTTPError`, all HTTP status types, re-raise helpers | [exceptions](modules/exceptions/README.md) |
 
 ## Dataframe engines
 
@@ -26,8 +26,8 @@ Engines register their converters **on import** — pull them in once at startup
 
 | Module | Purpose | Page |
 |---|---|---|
-| `yggdrasil.io` | `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`, codecs, media types | [io](modules/io/README.md) |
-| `yggdrasil.http_` | `HTTPSession` (preferred HTTP client) | [http_](modules/http_/README.md) |
+| `yggdrasil.io` | `URL` (rich API), `BytesIO`, `SendConfig`/`SendManyConfig`/`CacheConfig`, primitive formats, Delta log reader | [io](modules/io/README.md) |
+| `yggdrasil.http_` | `HTTPSession` — auth subclassing, retry, batch dispatch, streaming, Arrow conversion | [http_](modules/http_/README.md) |
 
 ## Serialization
 
@@ -87,11 +87,11 @@ Engines register their converters **on import** — pull them in once at startup
 
 | Module | Purpose | Page |
 |---|---|---|
-| `yggdrasil.pyutils` | `retry`, `parallelize` | [pyutils](modules/pyutils/README.md) |
-| `yggdrasil.concurrent` | `Job`, `AsyncJob`, `ThreadJob`, `JobPoolExecutor` | [concurrent](modules/concurrent/README.md) |
-| `yggdrasil.environ` | Runtime import / install logic | [optional libs](modules/libs/README.md) |
+| `yggdrasil.pyutils` | `@retry` (backoff, jitter, timeout, async), `@parallelize` | [pyutils](modules/pyutils/README.md) |
+| `yggdrasil.concurrent` | `Job`, `AsyncJob`, `ThreadJob`, `JobPoolExecutor` with backpressure and ordered/completion modes | [concurrent](modules/concurrent/README.md) |
+| `yggdrasil.environ` | `PyEnv`, `cached_from_import`, runtime import/install logic | [optional libs](modules/libs/README.md) |
 | `yggdrasil.fastapi` | FastAPI service powering the Power Query connector | [API Reference](api/index.md) |
-| `yggdrasil.blake3` / `yggdrasil.xxhash` | Optional hashing | — |
+| `yggdrasil.blake3` / `yggdrasil.xxhash` | Optional hashing (guarded via `lib.py`) | — |
 
 ## See also
 

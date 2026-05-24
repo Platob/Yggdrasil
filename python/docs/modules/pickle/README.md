@@ -160,3 +160,85 @@ buf = io.BytesIO()
 s.write_to(buf)
 buf.seek(0)
 ```
+
+---
+
+## JSON — rich types reference
+
+`yggdrasil.pickle.json` handles these types natively without a custom encoder:
+
+| Python type | JSON representation |
+|---|---|
+| `datetime.datetime` | ISO 8601 string (`"2026-05-01T12:00:00+00:00"`) |
+| `datetime.date` | ISO 8601 string (`"2026-05-01"`) |
+| `datetime.time` | ISO 8601 string (`"12:00:00"`) |
+| `uuid.UUID` | Lowercase UUID string |
+| `pathlib.Path` | POSIX string |
+| `decimal.Decimal` | JSON number |
+| `set`, `frozenset` | JSON array |
+| `Enum` | member `.value` |
+| `@dataclass` | JSON object (field names → values) |
+| `NamedTuple` | JSON array |
+| `bytes` | base-64 string |
+| `Mapping` | JSON object |
+
+---
+
+## JSON — use orjson directly in hot paths
+
+For maximum throughput in tight loops where type coercions aren't needed, bypass the wrapper and call `orjson` directly:
+
+```python
+import orjson
+
+# No default hook — fastest path for plain dicts/lists/primitives
+blob: bytes = orjson.dumps({"rows": [1, 2, 3]})
+obj = orjson.loads(blob)
+```
+
+Use `yggdrasil.pickle.json` everywhere else (richer type support, consistent defaults).
+
+---
+
+## Serialization in a Spark context
+
+Because `yggdrasil.pickle` wraps cloudpickle (when installed), it can serialize closures, lambdas, and locally-defined classes — which standard `pickle` cannot:
+
+```python
+from yggdrasil.pickle import dumps, loads
+
+multiplier = 3
+
+def apply_multiplier(x: int) -> int:
+    return x * multiplier   # closure over `multiplier`
+
+# cloudpickle captures the closure; stdlib pickle would fail
+blob = dumps(apply_multiplier)
+fn = loads(blob)
+print(fn(7))   # 21 — works even in a different process
+```
+
+---
+
+## HTTP API round-trip with JSON
+
+```python
+from yggdrasil.pickle.json import dumps, loads
+from yggdrasil.http_ import HTTPSession
+import datetime, uuid
+
+payload = {
+    "request_id": uuid.uuid4(),
+    "submitted_at": datetime.datetime.now(tz=datetime.timezone.utc),
+    "items": [{"sku": "A1", "qty": 10}, {"sku": "B2", "qty": 5}],
+}
+
+http = HTTPSession()
+resp = http.post(
+    "https://api.example.com/orders",
+    data=dumps(payload),
+    headers={"content-type": "application/json"},
+)
+result = loads(resp.content)
+print(result)
+```

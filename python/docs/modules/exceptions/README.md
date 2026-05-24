@@ -150,3 +150,77 @@ from .http import NotFoundError
 class WidgetNotFoundError(NotFoundError):
     """Raised when a widget cannot be found by ID."""
 ```
+
+---
+
+## Re-raise from a third-party SDK exception
+
+When wrapping a vendor SDK, catch the vendor exception and translate it to the matching yggdrasil type. Keep the original traceback via `raise ... from exc`:
+
+```python
+from yggdrasil.exceptions import NotFoundError, ForbiddenError, YGGException
+
+try:
+    result = some_vendor_sdk.get_resource(resource_id)
+except some_vendor_sdk.ResourceNotFoundError as exc:
+    raise NotFoundError(f"Resource {resource_id!r} does not exist") from exc
+except some_vendor_sdk.PermissionDeniedError as exc:
+    raise ForbiddenError(f"No permission to access {resource_id!r}") from exc
+```
+
+---
+
+## Retry on specific HTTP status codes
+
+```python
+from yggdrasil.exceptions import TooManyRequests, ServiceUnavailable, ServerError
+from yggdrasil.pyutils import retry
+from yggdrasil.http_ import HTTPSession
+
+http = HTTPSession()
+
+@retry(exceptions=(TooManyRequests, ServiceUnavailable), tries=5, delay=1.0, backoff=2)
+def fetch_with_retry(url: str) -> dict:
+    resp = http.get(url)
+    resp.raise_for_status()   # raises the right HTTPStatusError subclass
+    return resp.json()
+
+data = fetch_with_retry("https://api.example.com/data")
+```
+
+---
+
+## Graceful degradation pattern
+
+```python
+from yggdrasil.exceptions import NotFoundError, ForbiddenError, HTTPStatusError
+
+def load_remote_schema(url: str) -> dict | None:
+    from yggdrasil.http_ import HTTPSession
+    try:
+        return HTTPSession().get(url).json()
+    except NotFoundError:
+        return None          # schema not published yet — use default
+    except ForbiddenError:
+        return None          # no access — use cached version
+    except HTTPStatusError as exc:
+        raise               # unexpected status — let it propagate
+```
+
+---
+
+## Error message convention
+
+Every exception raised by yggdrasil follows a consistent pattern — what you passed, what was expected, and what to try next:
+
+```python
+from yggdrasil.exceptions import CastError
+
+# Good error message shape:
+raise CastError(
+    f"Cannot cast {type(value).__name__!r} to {target!r}. "
+    f"Got {value!r}. "
+    f"Expected one of: {valid_values!r}. "
+    f"Try: convert(value, target, options=CastOptions(strict=False))"
+)
+```

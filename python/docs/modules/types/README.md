@@ -222,3 +222,139 @@ from yggdrasil.lazy_imports import pandas
 | Spark | `yggdrasil.spark.cast` — `cast_spark_dataframe`, `any_to_spark_dataframe`, `spark_dataframe_to_arrow` |
 
 See [engine cast helpers](cast/README.md) for the per-engine surface.
+
+---
+
+## Schema building for DDL (tags-driven)
+
+```python
+from yggdrasil.data import field, Schema
+
+orders_schema = Schema([
+    field("order_id",     "int64",  nullable=False, tags={"primary_key": True}),
+    field("customer_id",  "int64",  nullable=False, tags={"foreign_key": True},
+          metadata={"references": "main.customers.customers(id)"}),
+    field("amount",       "decimal(18,2)"),
+    field("currency_iso", "string"),
+    field("placed_at_utc","timestamp[us, UTC]"),
+    field("region",       "string", tags={"partition_by": True}),
+], name="orders")
+
+# Export to Arrow schema (preserves all metadata)
+print(orders_schema.to_arrow_schema())
+
+# Export to Spark StructType
+print(orders_schema.to_spark_schema())
+```
+
+---
+
+## Schema evolution: merge two versions
+
+```python
+from yggdrasil.data import field, Schema
+
+v1 = Schema([field("id", "int64"), field("name", "string")], name="users")
+v2 = Schema([field("id", "int64"), field("name", "string"), field("email", "string")], name="users")
+
+# Merge: v1 + v2, upcasting nullability differences
+merged = v1.merge_with(v2, upcast=True)
+print(merged.fields)   # id, name, email (email nullable=True)
+```
+
+---
+
+## Schema set operations
+
+```python
+from yggdrasil.data import field, Schema
+
+a = Schema([field("id", "int64"), field("name", "string"), field("score", "float64")], name="a")
+b = Schema([field("id", "int64"), field("name", "string"), field("rank", "int32")], name="b")
+
+# Intersection (common columns)
+common = a & b
+print([f.name for f in common.fields])   # ['id', 'name']
+
+# Union (all columns from both)
+union = a | b
+print([f.name for f in union.fields])   # ['id', 'name', 'score', 'rank']
+
+# Difference (in a but not b)
+diff = a - b
+print([f.name for f in diff.fields])   # ['score']
+```
+
+---
+
+## Geo point fields
+
+```python
+from yggdrasil.data import geo_point, GEO_POINT_TYPE, is_geo_point_type
+
+# Canonical struct type: {lat: float64 not-null, lon: float64 not-null}
+t = GEO_POINT_TYPE
+print(is_geo_point_type(t))   # True
+
+# Build a field of this type
+from yggdrasil.data import field
+origin = geo_point("origin")         # Field('origin', struct<lat: float64, lon: float64>)
+dest   = geo_point("destination")
+
+# Use in a schema
+from yggdrasil.data import Schema
+route_schema = Schema([
+    field("flight_id", "string"),
+    origin,
+    dest,
+    field("distance_km", "float64"),
+], name="routes")
+print(route_schema.to_arrow_schema())
+```
+
+---
+
+## DataType round-trip across engines
+
+```python
+import datetime as dt
+import pyarrow as pa
+import polars as pl
+from yggdrasil.data.types.base import DataType
+
+# Python hint → DataType → Arrow / Polars / Spark
+ts = DataType.from_pytype(dt.datetime)
+print(ts.to_arrow())   # timestamp[us, tz=UTC]
+print(ts.to_polars())  # Polars Datetime[us, UTC]
+
+nested = DataType.from_pytype(list[dict[str, float]])
+print(nested.to_arrow())   # list<map<string, double>>
+
+# Arrow type → DataType → Polars
+dt_from_arrow = DataType.from_arrow(pa.large_string())
+print(dt_from_arrow.to_polars())   # Utf8
+print(dt_from_arrow.to_arrow())    # string  (normalized to non-large)
+```
+
+---
+
+## Validate with convert()
+
+```python
+from yggdrasil.data.cast.registry import convert
+from yggdrasil.data.cast.options import CastOptions
+import pyarrow as pa
+
+schema = pa.schema([
+    pa.field("id",    pa.int64(),  nullable=False),
+    pa.field("score", pa.float64()),
+    pa.field("label", pa.string()),
+])
+
+raw = pa.table({"id": ["1", "2"], "score": ["9.1", "8.7"], "label": ["a", "b"]})
+typed = convert(raw, pa.Table, CastOptions(target=schema))
+print(typed.schema)
+# id: int64 not null
+# score: double
+# label: string
+```

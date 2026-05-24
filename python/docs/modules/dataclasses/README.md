@@ -169,3 +169,101 @@ result = safe_fn("bad")   # ValueError stored, not raised
 if safe_fn.last_error is not None:
     print("Failed:", safe_fn.last_error)
 ```
+
+---
+
+## ExpiringDict — advanced patterns
+
+### Bounded cache with eviction callback
+
+```python
+from yggdrasil.dataclasses import ExpiringDict
+import datetime
+
+def close_handle(key: str, value) -> None:
+    """Called when an entry expires or is evicted."""
+    value.close()
+
+# LRU-style bounded cache: at most 100 entries, 10-minute TTL, evict on remove
+handle_cache: ExpiringDict[str, object] = ExpiringDict(
+    default_ttl=datetime.timedelta(minutes=10),
+    max_size=100,
+    on_evict=close_handle,
+)
+```
+
+### Thread-safe atomic get-or-set
+
+```python
+from yggdrasil.dataclasses import ExpiringDict
+
+_schema_cache: ExpiringDict[str, dict] = ExpiringDict(default_ttl=300)
+
+def get_schema(table_name: str) -> dict:
+    def _load(name: str) -> dict:
+        # Expensive remote call — executed at most once per key per TTL window
+        return fetch_schema_from_catalog(name)
+    return _schema_cache.get_or_set(table_name, _load, table_name)
+```
+
+### Process-lifetime singleton registry
+
+```python
+from yggdrasil.dataclasses import ExpiringDict
+
+# No TTL — entries live for the process lifetime
+_INSTANCES: ExpiringDict[tuple, object] = ExpiringDict(default_ttl=None)
+```
+
+---
+
+## Arrow-aware dataclasses (`yggdrasil.dataclasses.dataclass`)
+
+The `@yggdataclass` decorator extends `@dataclass` with Arrow field inference, enabling direct schema export from a typed Python class:
+
+```python
+from yggdrasil.dataclasses import yggdataclass, dataclass_to_arrow_schema
+import pyarrow as pa
+from typing import Optional
+
+@yggdataclass
+class Trade:
+    trade_id:   str
+    symbol:     str
+    quantity:   int
+    price:      float
+    currency:   str = "USD"
+    settled:    Optional[bool] = None
+
+schema = dataclass_to_arrow_schema(Trade)
+print(schema)
+# trade_id: string not null
+# symbol: string not null
+# quantity: int64 not null
+# price: double not null
+# currency: string not null
+# settled: bool
+
+# Build an Arrow table from a list of Trade objects
+trades = [Trade("T1", "AAPL", 100, 175.50), Trade("T2", "GOOG", 50, 140.20)]
+tbl = pa.Table.from_pylist([t.__dict__ for t in trades], schema=schema)
+print(tbl)
+```
+
+---
+
+## WaitingDict — value-producer cache (async resolution)
+
+```python
+from yggdrasil.dataclasses import WaitingDict
+
+# Cache that resolves values asynchronously — callers block until the value is ready
+pending: WaitingDict[str, bytes] = WaitingDict()
+
+# Producer side (e.g. background thread)
+pending.set("job-123", b"result-payload")
+
+# Consumer side (blocks until the value is available)
+result = pending.get("job-123", timeout=30.0)
+print(len(result), "bytes")
+```

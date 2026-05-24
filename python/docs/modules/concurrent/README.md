@@ -116,3 +116,121 @@ with JobPoolExecutor(max_workers=8) as pool:
     for result in pool.as_completed(jobs):
         process(result.value)
 ```
+
+---
+
+## Ordered vs. completion-order
+
+```python
+from yggdrasil.concurrent import Job, JobPoolExecutor
+import time, random
+
+def slow(i: int) -> int:
+    time.sleep(random.uniform(0.05, 0.3))
+    return i * i
+
+jobs = [Job.make(slow, i) for i in range(10)]
+
+# Completion order (default) — faster, but output order varies
+with JobPoolExecutor(max_workers=4) as pool:
+    for res in pool.as_completed(jobs, ordered=False):
+        print("finished:", res.value)
+
+# Submission order — output always [0, 1, 4, 9, 16, ...]
+with JobPoolExecutor(max_workers=4) as pool:
+    for res in pool.as_completed(jobs, ordered=True):
+        print("ordered:", res.value)
+```
+
+---
+
+## Cancel-on-exit for infinite streams
+
+When the job source is a live generator (e.g. reading from a message queue), use `cancel_on_exit=True` so in-flight futures are cancelled when you break out of the loop:
+
+```python
+from yggdrasil.concurrent import Job, JobPoolExecutor
+
+def message_source():
+    while True:
+        msg = queue.poll(timeout=1.0)
+        if msg:
+            yield Job.make(process_message, msg)
+
+with JobPoolExecutor(max_workers=8, max_in_flight=20) as pool:
+    for result in pool.as_completed(
+        message_source(),
+        cancel_on_exit=True,      # cancel queued futures on break/exception
+        shutdown_on_exit=True,
+    ):
+        if result.exception:
+            log_error(result.exception)
+        else:
+            sink.write(result.value)
+```
+
+---
+
+## Collect errors without short-circuit
+
+```python
+from yggdrasil.concurrent import Job, JobPoolExecutor
+
+def risky(i: int) -> int:
+    if i % 3 == 0:
+        raise ValueError(f"bad input {i}")
+    return i * 2
+
+jobs = [Job.make(risky, i) for i in range(12)]
+
+successes, failures = [], []
+with JobPoolExecutor(max_workers=4) as pool:
+    for res in pool.as_completed(jobs, raise_error=False):
+        if res.exception:
+            failures.append((res.job, res.exception))
+        else:
+            successes.append(res.value)
+
+print(f"OK: {len(successes)}, Failed: {len(failures)}")
+for job, exc in failures:
+    print(f"  {job}: {exc}")
+```
+
+---
+
+## Multi-stage pipeline: fetch → parse → write
+
+```python
+from yggdrasil.concurrent import Job, JobPoolExecutor
+from yggdrasil.http_ import HTTPSession
+import pyarrow as pa
+from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+http = HTTPSession()
+
+def fetch(page: int) -> bytes:
+    return http.get("https://api.example.com/records", params={"page": page}).content
+
+def parse(raw: bytes) -> pa.Table:
+    import pyarrow.json as paj
+    return paj.read_json(pa.py_buffer(raw))
+
+# Stage 1: concurrent fetch
+fetch_jobs = [Job.make(fetch, p) for p in range(1, 21)]
+raw_pages = []
+with JobPoolExecutor(max_workers=8) as pool:
+    for res in pool.as_completed(fetch_jobs, ordered=True):
+        raw_pages.append(res.value)
+
+# Stage 2: concurrent parse
+parse_jobs = [Job.make(parse, raw) for raw in raw_pages]
+tables = []
+with JobPoolExecutor(max_workers=4) as pool:
+    for res in pool.as_completed(parse_jobs, ordered=True):
+        tables.append(res.value)
+
+# Stage 3: write
+result = pa.concat_tables(tables)
+ParquetFile("/tmp/records.parquet").write(result)
+print(f"Wrote {result.num_rows} rows")
+```

@@ -196,3 +196,143 @@ polars_df  = convert(arrow_src, pl.DataFrame)
 pandas_df  = convert(polars_df, pd.DataFrame)
 arrow_back = convert(pandas_df, pa.Table)
 ```
+
+---
+
+## Polars — vectorised expressions (no row loops)
+
+```python
+import polars as pl
+import pyarrow as pa
+from yggdrasil.polars.cast import polars_dataframe_to_arrow_table
+
+df = pl.DataFrame({
+    "raw_price": ["1,234.56", "2,345.67", "not-a-number", "789.00"],
+    "currency":  ["USD", "EUR", None, "GBP"],
+})
+
+cleaned = (
+    df
+    .with_columns([
+        pl.col("raw_price")
+          .str.replace_all(",", "")
+          .cast(pl.Float64, strict=False)
+          .alias("price"),
+        pl.col("currency").fill_null("USD"),
+    ])
+    .drop("raw_price")
+    .filter(pl.col("price").is_not_null())
+)
+
+# Back to Arrow for downstream — zero copy
+arrow_out = polars_dataframe_to_arrow_table(cleaned)
+print(arrow_out)
+```
+
+---
+
+## Polars — JSON decoding without Python loops
+
+```python
+import polars as pl
+
+# Decode a column of JSON strings vectorially
+df = pl.DataFrame({"payload": ['{"id":1,"v":2.5}', '{"id":2,"v":3.1}']})
+decoded = df.with_columns(
+    pl.col("payload").str.json_decode(pl.Struct({"id": pl.Int64, "v": pl.Float64}))
+      .alias("parsed")
+).unnest("parsed")
+print(decoded)
+# ┌─────┬─────┐
+# │ id  │ v   │
+```
+
+---
+
+## pandas — vectorised string normalization
+
+```python
+import pandas as pd
+import pyarrow as pa
+from yggdrasil.pandas.cast import pandas_dataframe_to_arrow_table
+
+df = pd.DataFrame({
+    "name":  ["  Alice ", "BOB", None, "carol"],
+    "score": ["9.1", "bad", "8.7", "7.4"],
+})
+
+cleaned = df.copy()
+cleaned["name"]  = df["name"].str.strip().str.title()
+cleaned["score"] = pd.to_numeric(df["score"], errors="coerce")
+
+arrow = pandas_dataframe_to_arrow_table(cleaned.dropna(subset=["score"]))
+print(arrow)
+```
+
+---
+
+## Spark — Dataset API for distributed transforms
+
+```python
+from yggdrasil.spark.tabular import Dataset
+from yggdrasil.data import field, Schema
+import pyarrow as pa
+
+output_schema = Schema([
+    field("event_id",   "string"),
+    field("user_id",    "int64"),
+    field("revenue",    "float64"),
+    field("currency",   "string"),
+], name="events")
+
+def transform(batch: dict) -> list[dict]:
+    return [
+        {
+            "event_id": row["id"],
+            "user_id":  int(row["user"]),
+            "revenue":  float(row["amount"]),
+            "currency": row.get("ccy", "USD"),
+        }
+        for row in batch
+    ]
+
+# Distribute over Spark executors with Arrow bridge
+ds = Dataset.from_iterable(
+    [{"id": f"e{i}", "user": i % 100, "amount": i * 1.5} for i in range(10_000)],
+    schema=output_schema,
+    spark_session=spark,
+)
+result = ds.map(transform, schema=output_schema).toArrow()
+print(result.num_rows)
+```
+
+---
+
+## Spark — Spark TestCase shared session
+
+```python
+from yggdrasil.spark.tests import SparkTestCase
+import pyarrow as pa
+
+class TestEventTransform(SparkTestCase):
+    def test_revenue_aggregation(self):
+        raw = self.spark.createDataFrame([
+            {"event": "purchase", "amount": 10.0},
+            {"event": "purchase", "amount": 20.0},
+            {"event": "refund",   "amount": -5.0},
+        ])
+
+        from pyspark.sql import functions as F
+        result = (
+            raw.groupBy("event")
+               .agg(F.sum("amount").alias("total"))
+               .orderBy("event")
+        )
+        self.assertSparkEqual(
+            result,
+            self.spark.createDataFrame([
+                {"event": "purchase", "total": 30.0},
+                {"event": "refund",   "total": -5.0},
+            ]),
+        )
+```
