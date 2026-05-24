@@ -432,19 +432,14 @@ class Dataset(Tabular[CastOptions]):
             f"OVERWRITE / APPEND / IGNORE; got {action!r}."
         )
 
-    def _union(self, other: "Tabular") -> "Dataset":
+    def _union(self, other: "Tabular", *, schema_mode: "Any" = None) -> "Dataset":
         other_frame = other._native_spark_frame()
-        if other_frame is not None:
-            self.frame = self._frame.unionByName(
-                other_frame, allowMissingColumns=True,
-            )
-        else:
-            spark = self._frame.sparkSession
-            for batch in other.read_arrow_batches():
-                df = spark.createDataFrame(batch.to_pandas())
-                self.frame = self._frame.unionByName(
-                    df, allowMissingColumns=True,
-                )
+        if other_frame is None:
+            arrow_table = other._read_arrow_table(CastOptions())
+            other_frame = self._frame.sparkSession.createDataFrame(arrow_table)
+        self.frame = self._frame.unionByName(
+            other_frame, allowMissingColumns=True,
+        )
         return self
 
     # ------------------------------------------------------------------

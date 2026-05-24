@@ -1405,38 +1405,47 @@ class Tabular(ABC, Generic[O]):
     # Union
     # ==================================================================
 
-    def union(self, other: "Any") -> "Tabular":
+    def union(self, other: "Any", *, schema_mode: "Any" = None) -> "Tabular":
         """Return a Tabular representing ``self UNION ALL other``.
 
-        Concrete subclasses override :meth:`_union` to provide an
-        engine-optimized path (e.g. in-place batch append for
-        :class:`ArrowTabular`, ``unionByName`` for
-        :class:`Dataset`).  The base implementation wraps both sides
-        in a :class:`UnionTabular`.
+        *schema_mode* controls how mismatched schemas are reconciled:
 
-        Accepts any :class:`Tabular`, a ``list[Response]``, a
-        ``pa.RecordBatch``, a ``pa.Table``, or a Spark DataFrame.
+        - ``Mode.IGNORE`` (default) — keep ``self``'s schema; extra
+          columns in *other* are dropped, missing ones are filled null.
+        - ``Mode.APPEND`` — widen to the superset schema (every field
+          from both sides survives).
+
+        Concrete subclasses override :meth:`_union` for in-place
+        mutation (Arrow batch append, Spark ``unionByName``).  The
+        base falls back to :class:`UnionTabular`.
+
+        Accepts :class:`Tabular`, ``pa.RecordBatch``, ``pa.Table``,
+        ``list[Response]``, or a Spark DataFrame.
         ``None`` returns ``self`` unchanged.
         """
+        from yggdrasil.data.enums import Mode as _Mode
+        if schema_mode is None:
+            schema_mode = _Mode.IGNORE
+        else:
+            schema_mode = _Mode.from_(schema_mode)
         if other is None:
             return self
         if isinstance(other, Tabular):
-            return self._union(other)
-        # pa.RecordBatch / pa.Table / list / SparkDataFrame → coerce
-        # via the concrete subclass's ingest path if available,
-        # otherwise fall back to UnionTabular.
+            return self._union(other, schema_mode=schema_mode)
         if isinstance(other, (pa.RecordBatch, pa.Table)):
             from yggdrasil.arrow.tabular import ArrowTabular
-            return self._union(ArrowTabular(other))
+            return self._union(ArrowTabular(other), schema_mode=schema_mode)
         if isinstance(other, list):
             from yggdrasil.arrow.tabular import ArrowTabular
             from yggdrasil.io.response import Response as _Resp
             batches = [r.to_arrow_batch(parse=False) for r in other if isinstance(r, _Resp)]
-            return self._union(ArrowTabular(*batches)) if batches else self
+            if not batches:
+                return self
+            return self._union(ArrowTabular(*batches), schema_mode=schema_mode)
         if hasattr(other, "unionByName"):
             try:
                 from yggdrasil.spark.tabular import Dataset
-                return self._union(Dataset(frame=other))
+                return self._union(Dataset(frame=other), schema_mode=schema_mode)
             except ImportError:
                 pass
         raise TypeError(
@@ -1444,7 +1453,7 @@ class Tabular(ABC, Generic[O]):
             f"{type(other).__name__!r}"
         )
 
-    def _union(self, other: "Tabular") -> "Tabular":
+    def _union(self, other: "Tabular", *, schema_mode: "Any" = None) -> "Tabular":
         """Engine-specific union hook.  Override in subclasses."""
         from .union import UnionTabular
         return UnionTabular([self, other])
