@@ -531,10 +531,10 @@ class SystemParameters(MappingABC):
         except Exception:
             spark = None
         if spark is not None:
-            spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
-            spark.conf.set("spark.databricks.delta.merge.enableLowShuffle", "true")
-            spark.conf.set("spark.databricks.delta.merge.optimizeInsertOnlyMerge", "true")
-            spark.conf.set("spark.sql.session.timeZone", "UTC")
+            try:
+                spark.conf.set("spark.sql.session.timeZone", "UTC")
+            except Exception:
+                pass
         return cls()
 
     @staticmethod
