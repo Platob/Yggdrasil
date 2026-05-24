@@ -1402,6 +1402,54 @@ class Tabular(ABC, Generic[O]):
             self._commit_metadata()
 
     # ==================================================================
+    # Union
+    # ==================================================================
+
+    def union(self, other: "Any") -> "Tabular":
+        """Return a Tabular representing ``self UNION ALL other``.
+
+        Concrete subclasses override :meth:`_union` to provide an
+        engine-optimized path (e.g. in-place batch append for
+        :class:`ArrowTabular`, ``unionByName`` for
+        :class:`Dataset`).  The base implementation wraps both sides
+        in a :class:`UnionTabular`.
+
+        Accepts any :class:`Tabular`, a ``list[Response]``, a
+        ``pa.RecordBatch``, a ``pa.Table``, or a Spark DataFrame.
+        ``None`` returns ``self`` unchanged.
+        """
+        if other is None:
+            return self
+        if isinstance(other, Tabular):
+            return self._union(other)
+        # pa.RecordBatch / pa.Table / list / SparkDataFrame → coerce
+        # via the concrete subclass's ingest path if available,
+        # otherwise fall back to UnionTabular.
+        if isinstance(other, (pa.RecordBatch, pa.Table)):
+            from yggdrasil.arrow.tabular import ArrowTabular
+            return self._union(ArrowTabular(other))
+        if isinstance(other, list):
+            from yggdrasil.arrow.tabular import ArrowTabular
+            from yggdrasil.io.response import Response as _Resp
+            batches = [r.to_arrow_batch(parse=False) for r in other if isinstance(r, _Resp)]
+            return self._union(ArrowTabular(*batches)) if batches else self
+        if hasattr(other, "unionByName"):
+            try:
+                from yggdrasil.spark.tabular import Dataset
+                return self._union(Dataset(frame=other))
+            except ImportError:
+                pass
+        raise TypeError(
+            f"{type(self).__name__}.union does not accept "
+            f"{type(other).__name__!r}"
+        )
+
+    def _union(self, other: "Tabular") -> "Tabular":
+        """Engine-specific union hook.  Override in subclasses."""
+        from .union import UnionTabular
+        return UnionTabular([self, other])
+
+    # ==================================================================
     # Polars
     # ==================================================================
 

@@ -500,6 +500,12 @@ class ArrowTabular(Tabular[CastOptions]):
         # one-spill-per-record-batch.
         self._maybe_spill()
 
+    def _union(self, other: "Tabular") -> "ArrowTabular":
+        for batch in other.read_arrow_batches():
+            self._append_batch(batch)
+        self._maybe_spill()
+        return self
+
     # ------------------------------------------------------------------
     # Spill machinery
     # ------------------------------------------------------------------
