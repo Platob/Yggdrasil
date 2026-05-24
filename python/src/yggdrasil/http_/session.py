@@ -1599,21 +1599,6 @@ class HTTPSession(Session):
     #      cache configs are honoured exactly                            #
     # ------------------------------------------------------------------ #
 
-    def _effective_local_cfg(
-        self,
-        request: PreparedRequest,
-    ) -> CacheConfig | None:
-        cfg = request.local_cache_config
-        if cfg is None:
-            return None
-        return cfg.prebuild(session=self)
-
-    def _effective_remote_cfg(
-        self,
-        request: PreparedRequest,
-    ) -> CacheConfig | None:
-        return request.remote_cache_config
-
     @staticmethod
     def _remote_write_group_key(cfg: CacheConfig) -> tuple:
         """Identity used to group responses for a single bulk remote insert.
@@ -1635,8 +1620,6 @@ class HTTPSession(Session):
     def _split_local_cache(
         self,
         batch: list[PreparedRequest],
-        *,
-        key_to_local_cfg: Optional[Mapping[int, CacheConfig]] = None,
     ) -> tuple[dict[Path, list[Response]], list[PreparedRequest]]:
         """Stage 1: scan the local cache.
 
@@ -1647,25 +1630,6 @@ class HTTPSession(Session):
         cache root — mirrors :meth:`_split_remote_cache`'s
         "one SQL per table" shape so the lookup cost scales with
         backend, not with request count.
-
-        Each per-folder read builds its predicate via
-        :meth:`CacheConfig.make_batch_lookup_predicate`. The
-        partition ``IN (...)`` clause flows through
-        :meth:`FolderPath.iter_children`'s candidate probe so the
-        listing stays at one ``stat`` per distinct ``partition_key``
-        — no ``iterdir`` over the full cache tree.
-
-        Hits are grouped by the resolved cache :class:`Path` so the
-        per-config split survives all the way to
-        :class:`HTTPResponseBatch.local_hits`. The dict key is the live
-        :class:`Path` (hashable, singleton-keyed) so two distinct
-        backends with the same ``full_path()`` string don't collide.
-
-        ``key_to_local_cfg`` is the per-request effective-config map
-        :meth:`_send_many_batches` builds once at the top of a chunk.
-        When passed, the per-request resolution short-circuits to a
-        dict lookup; otherwise we resolve on the fly (used by callers
-        that don't precompute, e.g. unit tests).
         """
         hits: dict[Path, list[Response]] = {}
         misses: list[PreparedRequest] = []
@@ -1673,17 +1637,13 @@ class HTTPSession(Session):
         if not any(r.local_cache_config for r in batch):
             return hits, list(batch)
 
-        # Single-pass classify: UPSERT → miss, APPEND with local cache
-        # → bucket by cache folder root, anything else → miss.
         path_to_cfg: dict[Path, CacheConfig] = {}
         path_to_reqs: dict[Path, list[PreparedRequest]] = {}
 
         for req in batch:
-            eff = (
-                key_to_local_cfg.get(req.public_url_hash)
-                if key_to_local_cfg is not None
-                else None
-            ) or self._effective_local_cfg(req)
+            eff = req.local_cache_config
+            if eff is not None:
+                eff = eff.prebuild(session=self)
             if eff is None or not eff.local_cache_enabled or eff.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
@@ -1716,40 +1676,20 @@ class HTTPSession(Session):
         requests: list[PreparedRequest],
         *,
         spark_session: Optional["SparkSession"] = None,
-        key_to_remote_cfg: Optional[Mapping[int, CacheConfig]] = None,
     ) -> tuple[dict[str, list[Response]], list[PreparedRequest]]:
         """Stage 2: scan the remote cache.
 
         UPSERT requests bypass the read entirely (always misses, refetch).
         Non-UPSERT requests are grouped by their effective cache table so we
         execute exactly one batch SQL lookup per table.
-
-        Returns hits as a per-table mapping keyed by
-        ``CacheConfig.table.full_name(safe=True)`` so the downstream
-        :class:`HTTPResponseBatch` can preserve which table answered which
-        subset of the batch — collapsing them back into one bucket
-        would lose that provenance.
-
-        ``key_to_remote_cfg`` is the per-request effective-config map
-        precomputed by :meth:`_send_many_batches` so we don't pay a
-        per-request override resolution twice (snapshot + this stage);
-        absent, we resolve on the fly.
         """
-        # Single-pass classify: UPSERT → miss, APPEND with remote cache
-        # → bucket by table, anything else → miss. Replaces a previous
-        # O(N^2) shape that built ``upsert_reqs`` and then re-walked
-        # ``requests`` with ``if req in upsert_reqs`` per element.
         hits: dict[str, list[Response]] = {}
         misses: list[PreparedRequest] = []
         table_to_cfg: dict[str, CacheConfig] = {}
         table_to_reqs: dict[str, list[PreparedRequest]] = {}
 
         for req in requests:
-            t_cfg = (
-                key_to_remote_cfg.get(req.public_url_hash)
-                if key_to_remote_cfg is not None
-                else None
-            ) or self._effective_remote_cfg(req)
+            t_cfg = req.remote_cache_config
             if t_cfg is None or t_cfg.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
@@ -1959,7 +1899,6 @@ class HTTPSession(Session):
         self,
         requests: list[PreparedRequest],
         *,
-        key_to_remote_cfg: Optional[Mapping[int, CacheConfig]] = None,
         spark: "SparkSession",
     ) -> tuple[dict[str, "SparkDataFrame"], list[PreparedRequest]]:
         """Spark variant of :meth:`_split_remote_cache`.
@@ -1973,16 +1912,11 @@ class HTTPSession(Session):
         because the driver needs concrete request objects to scatter
         through stage 3.
         """
-        # Single-pass classify mirrors :meth:`_split_remote_cache`.
         misses: list[PreparedRequest] = []
         table_to_cfg: dict[str, CacheConfig] = {}
         table_to_reqs: dict[str, list[PreparedRequest]] = {}
         for req in requests:
-            t_cfg = (
-                key_to_remote_cfg.get(req.public_url_hash)
-                if key_to_remote_cfg is not None
-                else None
-            ) or self._effective_remote_cfg(req)
+            t_cfg = req.remote_cache_config
             if t_cfg is None or t_cfg.mode == Mode.UPSERT:
                 misses.append(req)
                 continue
@@ -2251,35 +2185,24 @@ class HTTPSession(Session):
     def _backfill_local_cache(
         self,
         responses: list[Response],
-        key_to_local_cfg: Mapping[int, CacheConfig],
     ) -> None:
         """Write remote-cache hits back to the partitioned local cache.
 
-        Each response is stored against its originating request's
-        effective local config (looked up by ``public_url_hash``) —
-        using the session-level config for every response would be
-        wrong whenever a request carries a custom per-request local
-        cache. Keying by ``public_url_hash`` (already cached on
-        :class:`PreparedRequest`) instead of the anonymized URL
-        string costs one cached attribute read per response in
-        place of a full ``request.anonymize(mode="remove")`` rebuild.
-
-        Responses are bucketed by their effective cache folder; each
-        bucket fans out one Arrow batch built from
-        :meth:`Response.values_to_arrow_batch` and routed through
-        :meth:`FolderPath._write_arrow_batches` with
-        ``partition_columns=("partition_key",)`` — so a bucket of N
-        responses spread across K distinct ``partition_key`` values
-        lands K part files, one per partition directory, in a single
-        fire-and-forget job.
+        Each response's local cache config is read from
+        ``response.request.local_cache_config``. Responses are bucketed
+        by their effective cache folder; each bucket fans out one Arrow
+        batch routed through :meth:`FolderPath._write_arrow_batches`.
         """
         from yggdrasil.io.response import Response as _Response
 
         groups: dict[Path, tuple[CacheConfig, list[Response]]] = {}
         for response in responses:
             req = response.request
-            cfg_key = req.public_url_hash if req is not None else None
-            eff = key_to_local_cfg.get(cfg_key) if cfg_key is not None else None
+            if req is None:
+                continue
+            eff = req.local_cache_config
+            if eff is not None:
+                eff = eff.prebuild(session=self)
             if eff is None or not eff.local_cache_enabled:
                 continue
             root = eff.local_cache_folder(session=self)
@@ -2305,32 +2228,20 @@ class HTTPSession(Session):
     def _persist_remote(
         self,
         responses: list[Response],
-        key_to_remote_cfg: Mapping[int, CacheConfig],
     ) -> None:
         """Stage 4: bulk-insert successful responses into the remote cache.
 
-        Responses are bucketed by the full write-group key
-        (table, mode, match_by, wait, anonymize) so that distinct per-request
-        configs targeting the same table never get collapsed onto a single
-        insert with the wrong parameters. Distinct write groups (i.e.
-        distinct remote tables / modes) run their inserts concurrently
-        — the underlying SQL clients are thread-safe per-statement, so
-        a batch fanning out to several remote tables doesn't have to
-        serialize the network round trips head-to-tail.
+        Each response's remote cache config is read from
+        ``response.request.remote_cache_config``. Responses are bucketed
+        by the full write-group key (table, mode, match_by, wait,
+        anonymize) so distinct per-request configs don't get collapsed.
         """
         groups: dict[tuple, tuple[CacheConfig, list[Response]]] = {}
         for response in responses:
-            # Per-request lookup keys ride on ``public_url_hash`` —
-            # already cached on :class:`PreparedRequest` and stable
-            # across the ``request.copy(...)`` worker scatter — so we
-            # don't pay an ``anonymize()`` rebuild per response just to
-            # turn the URL into a dict key. Match-by/identity all hash
-            # through the ``public_*`` columns so anonymizing the row
-            # before insert isn't required to keep cache lookups
-            # consistent.
             req = response.request
-            cfg_key = req.public_url_hash if req is not None else None
-            eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
+            if req is None:
+                continue
+            eff = req.remote_cache_config
             if eff is None or not eff.remote_cache_enabled:
                 continue
             gkey = self._remote_write_group_key(eff)
@@ -2383,26 +2294,12 @@ class HTTPSession(Session):
     def _mirror_local_hits_to_remote(
         self,
         local_hits_by_path: Mapping[Path, "list[Response]"],
-        key_to_remote_cfg: Mapping[int, CacheConfig],
     ) -> None:
         """Bulk-upsert local-cache hits into the remote cache.
 
-        Runs between stage 2 (remote cache lookup) and stage 3
-        (network fetch) when ``CacheConfig.mirror_local_to_remote``
-        is set on the active remote config. The "diff" is implicit:
-        the remote MERGE handles deduplication on
-        ``(partition_key, public_hash)`` so hits the remote already
-        knows about become idempotent no-ops, and only genuinely new
-        rows land. Coupled with stage 4's network-driven persist,
-        this keeps the remote cache eventually-consistent with the
-        local one without forcing a network call to repopulate.
-
         Activation is gated on the *remote* config — local-only
-        sessions skip it entirely. Per-request remote config
-        overrides are honoured the same way :meth:`_persist_remote`
-        honours them: the URL-keyed map fed in by
-        :meth:`_send_many_batches` is the source of truth, with the
-        session-level config as the fallback.
+        sessions skip it entirely. Each response's remote cache config
+        is read from ``response.request.remote_cache_config``.
         """
         if not local_hits_by_path:
             return
@@ -2413,17 +2310,12 @@ class HTTPSession(Session):
         if not flat:
             return
 
-        # Filter down to responses whose effective remote cache is
-        # both enabled AND opted into the mirror — keeps a session
-        # that toggles the flag for one cache from accidentally
-        # syncing into another. Keyed by ``public_url_hash`` so the
-        # per-response lookup is a cached attribute read instead of a
-        # full ``request.anonymize(mode="remove")`` rebuild.
         keep: list[Response] = []
         for response in flat:
             req = response.request
-            cfg_key = req.public_url_hash if req is not None else None
-            eff = key_to_remote_cfg.get(cfg_key) if cfg_key is not None else None
+            if req is None:
+                continue
+            eff = req.remote_cache_config
             if eff is None or not eff.remote_cache_enabled:
                 continue
             if not eff.mirror_local_to_remote:
@@ -2437,7 +2329,7 @@ class HTTPSession(Session):
             "Mirroring %d local-cache hit(s) to remote cache",
             len(keep),
         )
-        self._persist_remote(keep, key_to_remote_cfg)
+        self._persist_remote(keep)
 
     def _send_many(
         self,
@@ -2613,29 +2505,8 @@ class HTTPSession(Session):
                 chunk_index, len(chunk), "spark" if is_spark else "mixed/python",
             )
 
-            # Snapshot per-request effective configs BEFORE stage 1 so
-            # every downstream stage (split_local_cache, split_remote_cache,
-            # _persist_remote, _backfill_local_cache,
-            # _mirror_local_hits_to_remote) reads from the same map
-            # instead of calling :meth:`_effective_local_cfg` /
-            # :meth:`_effective_remote_cfg` per request per stage.
-            # Keyed by ``PreparedRequest.public_url_hash`` — a cached
-            # xxh3_64 of ``(method, url.anonymize('remove'))`` — so
-            # the snapshot survives the ``request.copy(...)`` scatter
-            # in :meth:`_fetch_misses`. Building it once up front is
-            # also what kills the old O(N^2) ``if req in upsert_reqs``
-            # shape in stage 2 — every request resolves exactly once.
-            key_to_remote_cfg: dict[int, CacheConfig] = {}
-            key_to_local_cfg: dict[int, CacheConfig] = {}
-            for r in chunk:
-                k = r.public_url_hash
-                key_to_remote_cfg[k] = self._effective_remote_cfg(r)
-                key_to_local_cfg[k] = self._effective_local_cfg(r)
-
             # --- Stage 1: local cache ---
-            local_hits_by_path, after_local = self._split_local_cache(
-                chunk, key_to_local_cfg=key_to_local_cfg,
-            )
+            local_hits_by_path, after_local = self._split_local_cache(chunk)
             # Flatten across cache-folder paths into a single bucket
             # for :class:`HTTPResponseBatch`. On the spark path, lift the
             # flat list to a Spark frame once so every bucket
@@ -2656,10 +2527,7 @@ class HTTPSession(Session):
             new_hits: "list[Response] | SparkDataFrame | None" = None
 
             if not after_local:
-                self._mirror_local_hits_to_remote(
-                    local_hits_by_path,
-                    key_to_remote_cfg,
-                )
+                self._mirror_local_hits_to_remote(local_hits_by_path)
                 local_count = len(local_flat)
                 total_local += local_count
                 LOGGER.info(
@@ -2685,20 +2553,13 @@ class HTTPSession(Session):
             remote_hits_by_table, after_remote = self._split_remote_cache(
                 after_local,
                 spark_session=spark,
-                key_to_remote_cfg=key_to_remote_cfg,
             )
-            self._backfill_local_cache(
-                [
-                    r
-                    for table_hits in remote_hits_by_table.values()
-                    for r in table_hits
-                ],
-                key_to_local_cfg,
-            )
-            self._mirror_local_hits_to_remote(
-                local_hits_by_path,
-                key_to_remote_cfg,
-            )
+            self._backfill_local_cache([
+                r
+                for table_hits in remote_hits_by_table.values()
+                for r in table_hits
+            ])
+            self._mirror_local_hits_to_remote(local_hits_by_path)
 
             # Collapse the per-table remote split into one bucket for
             # :class:`HTTPResponseBatch`. Python lists chain; Spark frames
@@ -2796,26 +2657,24 @@ class HTTPSession(Session):
             stage4: "list[Callable[[], Any]]" = []
             if spark_new_hits is not None:
                 _spark_hits = spark_new_hits
+                _spark_remote_cfg = {
+                    r.public_url_hash: r.remote_cache_config
+                    for r in spark_misses
+                }
                 stage4.append(
                     lambda: self._spark_persist_remote(
                         _spark_hits,
-                        key_to_remote_cfg,
+                        _spark_remote_cfg,
                         spark=spark_misses[0].send_config_or_default.spark_session,
                     )
                 )
             if new_list:
                 _local_hits = new_list
                 stage4.append(
-                    lambda: self._persist_remote(
-                        _local_hits,
-                        key_to_remote_cfg,
-                    )
+                    lambda: self._persist_remote(_local_hits)
                 )
                 stage4.append(
-                    lambda: self._backfill_local_cache(
-                        _local_hits,
-                        key_to_local_cfg,
-                    )
+                    lambda: self._backfill_local_cache(_local_hits)
                 )
             self._run_concurrently(
                 stage4, thread_name_prefix="ygg-stage4",
