@@ -15,10 +15,10 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io.path import Path
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
+from yggdrasil.io.tabular.base import Tabular
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
-    from yggdrasil.io.tabular import Tabular
     from yggdrasil.io.response import Response
     from yggdrasil.io.session import Session
 
@@ -388,11 +388,15 @@ class CacheConfig(_ConfigBase):
         # exercises (``_StubTabular.full_name``, …) still flow
         # through without being mis-coerced to a FolderPath.
         tab = self.tabular
-        if isinstance(tab, (Path, pathlib.PurePath, str)):
+        if isinstance(tab, (pathlib.PurePath, str)) or (
+            isinstance(tab, Path) and not tab.is_remote_path
+        ):
             from yggdrasil.io.nested.folder_path import FolderPath
-            object.__setattr__(
-                self, "tabular", FolderPath(path=Path.from_(tab)),
-            )
+            if not isinstance(tab, FolderPath):
+                object.__setattr__(
+                    self, "tabular",
+                    FolderPath(path=tab if isinstance(tab, Path) else Path.from_(tab)),
+                )
 
     def __getstate__(self):
         # Project local FolderPath caches down to their URL string for
@@ -520,16 +524,11 @@ class CacheConfig(_ConfigBase):
                     overrides["received_from"] = received_to - ttl
 
             else:
-                # Non-temporal arg → cache backend. ``Holder.from_`` is the
-                # canonical IO dispatch parser: bytes → :class:`Memory`,
-                # path-like str / ``pathlib`` / :class:`URL` → the
-                # scheme-matched storage class, an already-built IO /
-                # :class:`Tabular` (FolderPath, Databricks Table, …) →
-                # identity passthrough. ``__post_init__`` still wraps a
-                # bare :class:`Path` into a :class:`FolderPath` so the
-                # stored ``tabular`` is always a live :class:`Tabular`.
-                from yggdrasil.io.holder import Holder
-                overrides["tabular"] = Holder.from_(arg)
+                tab = Tabular.from_(arg)
+                if isinstance(tab, Path) and not getattr(tab, "is_remote_path", False):
+                    from yggdrasil.io.nested.folder_path import FolderPath
+                    tab = FolderPath(path=tab)
+                overrides["tabular"] = tab
 
             return cls.parse_mapping(overrides) if overrides else cls.default()
         except (TypeError, ValueError):
