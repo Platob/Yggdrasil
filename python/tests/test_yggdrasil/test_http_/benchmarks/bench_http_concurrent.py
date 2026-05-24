@@ -61,7 +61,7 @@ os.environ["PYTHONPATH"] = (
 
 from yggdrasil.http_ import HTTPSession  # noqa: E402
 from yggdrasil.io.request import PreparedRequest  # noqa: E402
-from yggdrasil.io.send_config import SendManyConfig  # noqa: E402
+from yggdrasil.io.send_config import SendConfig  # noqa: E402
 
 from _bench_http_server import start_bench_server  # noqa: E402
 
@@ -111,7 +111,7 @@ def _drain_send_many(session: HTTPSession, requests: list[PreparedRequest]) -> i
     the pipeline plan and exit. Returns the response count so the
     caller can sanity-check the run.
     """
-    cfg = SendManyConfig.check_arg(None, raise_error=False)
+    cfg = SendConfig.from_(None, raise_error=False)
     count = 0
     for _ in session.send_many(iter(requests), cfg):
         count += 1

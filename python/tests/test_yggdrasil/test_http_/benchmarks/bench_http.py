@@ -40,7 +40,7 @@ from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import SendConfig, SendManyConfig
+from yggdrasil.io.send_config import SendConfig
 
 
 # ---------------------------------------------------------------------------
@@ -395,8 +395,8 @@ def _session_scenarios(repeat: int) -> list[dict]:
         repeat=repeat, inner=50_000,
     ))
     out.append(_time_one(
-        "SendManyConfig.from_(None)",
-        lambda: SendManyConfig.from_(None),
+        "SendConfig.from_(None)",
+        lambda: SendConfig.from_(None),
         repeat=repeat, inner=20_000,
     ))
 

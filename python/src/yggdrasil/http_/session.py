@@ -67,7 +67,7 @@ from yggdrasil.io.primitive import ArrowIPCFile
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
 from yggdrasil.http_.response_batch import HTTPResponseBatch
-from yggdrasil.io.send_config import CacheConfig, SendConfig, SendManyConfig, _request_column_sql_name
+from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig, _request_column_sql_name
 from yggdrasil.io.session import Session
 from yggdrasil.io.url import URL
 
@@ -1080,8 +1080,7 @@ class HTTPSession(Session):
         if not start:
             return self._build_idle_response(request, cfg)
         if cfg.spark_session is not None:
-            many_cfg = SendManyConfig.from_(cfg)
-            for response in self._send_many(iter([request]), many_cfg):
+            for response in self._send_many(iter([request]), cfg):
                 return response
         return self._send(request)
 
@@ -1493,75 +1492,62 @@ class HTTPSession(Session):
     def send_many(
         self,
         requests: Iterator[PreparedRequest],
-        config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
+        config: SendConfig | Mapping[str, Any] | None = None,
         *,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
-        normalize: bool | None = None,
         stream: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         cache_only: bool = False,
         as_tabular: bool = False,
+        spark_session: Optional["SparkSession"] = None,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
         max_batch_ttl: float | None = None,
-        spark_session: Optional["SparkSession"] = None,
         **options,
     ) -> "Iterator[Response] | Tabular":
-        """Stream responses one at a time, in both Python and Spark modes.
+        """Stream responses for a batch of requests.
 
-        Default (``as_tabular=False``) yields :class:`Response` objects
-        one at a time. Spark-backed buckets stream through the holder's
-        :meth:`Tabular.read_records`, which for :class:`Dataset` uses
-        ``df.toLocalIterator()`` — rows leave the executors one at a
-        time, so the driver memory footprint stays bounded even for
-        large network-fetch batches.
+        Yields :class:`Response` objects one at a time by default.
+        ``as_tabular=True`` concatenates into a single :class:`Tabular`.
 
-        ``as_tabular=True`` drains the same staged pipeline via
-        :meth:`send_many_batches` and concatenates every per-chunk
-        :class:`HTTPResponseBatch` into one :class:`Tabular`:
-        :class:`ArrowTabular` in Python mode, a :class:`Dataset`
-        wrapping a lazy union of per-chunk Spark frames when
-        ``spark_session`` is bound (set the latter to ``True`` /
-        ``...`` to auto-discover the active session via
-        :meth:`PyEnv.spark_session`). Callers that want the per-bucket
-        origin breakdown should consume :meth:`send_many_batches`
-        directly.
-
-        ``max_batch_ttl`` (default :data:`DEFAULT_MAX_BATCH_TTL`,
-        300 s) caps how long the batcher will wait for ``requests`` to
-        produce a full chunk before flushing what it has — bounds tail
-        latency when the upstream iterator is slow. ``None`` disables
-        the time cap; the batch only closes when ``batch_size`` is
-        reached or the iterator is exhausted.
+        Batch orchestration kwargs (``batch_size``, ``ordered``,
+        ``max_in_flight``, ``max_batch_ttl``) control chunking and
+        concurrency; everything else is folded into a :class:`SendConfig`
+        that gets stamped on each request.
         """
-        cfg = SendManyConfig.from_(
+        cfg = SendConfig.from_(
             config,
             wait=wait,
             raise_error=raise_error,
-            normalize=normalize,
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
             cache_only=cache_only,
             as_tabular=as_tabular,
-            batch_size=batch_size,
-            ordered=ordered,
-            max_in_flight=max_in_flight,
-            max_batch_ttl=max_batch_ttl,
             spark_session=spark_session,
             **options,
         )
+        batch_kw: dict[str, Any] = {}
+        if batch_size is not None:
+            batch_kw["batch_size"] = batch_size
+        if ordered:
+            batch_kw["ordered"] = ordered
+        if max_in_flight is not None:
+            batch_kw["max_in_flight"] = max_in_flight
+        if max_batch_ttl is not None:
+            batch_kw["max_batch_ttl"] = max_batch_ttl
         if cfg.as_tabular:
-            return self._send_many_as_tabular(requests, config=cfg)
-        return self._send_many(requests, config=cfg)
+            return self._send_many_as_tabular(requests, cfg, **batch_kw)
+        return self._send_many(requests, cfg, **batch_kw)
 
     def _send_many_as_tabular(
         self,
         requests: Iterator[PreparedRequest],
-        config: SendManyConfig,
+        config: SendConfig,
+        **batch_kw: Any,
     ) -> "Tabular":
         """Drain :meth:`_send_many_batches` and concat into one :class:`Tabular`.
 
@@ -1573,7 +1559,7 @@ class HTTPSession(Session):
         """
         spark = config.spark_session
         accumulator: HTTPResponseBatch | None = None
-        for batch in self._send_many_batches(requests, config):
+        for batch in self._send_many_batches(requests, config, **batch_kw):
             if accumulator is None:
                 accumulator = batch
             else:
@@ -2148,17 +2134,17 @@ class HTTPSession(Session):
     def _fetch_misses(
         self,
         misses: list[PreparedRequest],
-        config: SendManyConfig,
+        config: SendConfig,
+        *,
+        ordered: bool = False,
+        max_in_flight: int | None = None,
     ) -> Iterator[Response]:
-        """Stage 3: send misses through the job pool.
-
-        Returns the raw `Response` stream — caller decides what to do with
-        ok/error responses (yield them, persist them, raise).
-        """
-        miss_send_config = config.to_send_config(
-            with_remote_cache=False,
-            with_local_cache=False,
-            with_spark=False,
+        """Stage 3: send misses through the job pool."""
+        miss_send_config = dataclasses.replace(
+            config,
+            remote_cache=None,
+            local_cache=None,
+            spark_session=None,
             raise_error=False,
         )
 
@@ -2167,8 +2153,8 @@ class HTTPSession(Session):
             "Fetching %d send_many miss(es) through job pool "
             "(max_in_flight=%d, ordered=%s)",
             len(misses),
-            config.max_in_flight or pool.max_workers,
-            config.ordered,
+            max_in_flight or pool.max_workers,
+            ordered,
         )
         for result in pool.as_completed(
             (
@@ -2178,8 +2164,8 @@ class HTTPSession(Session):
                 )
                 for r in misses
             ),
-            ordered=config.ordered,
-            max_in_flight=config.max_in_flight or self.pool_maxsize,
+            ordered=ordered,
+            max_in_flight=max_in_flight or self.pool_maxsize,
             cancel_on_exit=False,
             shutdown_on_exit=False,
             raise_error=True,
@@ -2455,35 +2441,16 @@ class HTTPSession(Session):
     def _send_many(
         self,
         requests: Iterator[PreparedRequest],
-        config: SendManyConfig,
+        config: SendConfig,
+        **batch_kw: Any,
     ) -> Iterator[Response]:
         """Stream responses, flattening the per-chunk :class:`HTTPResponseBatch`.
 
-        Iteration order matches :class:`HTTPResponseBatch.parts`: local hits
-        first, then remote hits, then network fetches. Callers that need
-        the origin breakdown should use :meth:`send_many_batches`
-        instead.
-
-        Works in both Python and Spark modes. Spark-backed buckets are
-        drained via the holder's :meth:`Tabular.read_records`, which
-        for :class:`Dataset` uses ``df.toLocalIterator()`` — rows
-        stream from the executors one at a time, so the driver memory
-        footprint stays bounded even for large network-fetch batches.
-        :class:`HTTPResponseBatch.__iter__` rejects Spark mode (it would
-        force a ``df.toArrow()`` collect); going through the holders
-        sidesteps that guard.
-
-        In Spark mode the executor-side fetch runs with
-        ``raise_error=False`` so a single failure can't poison a whole
-        ``mapInArrow`` partition — the failing rows ride back to the
-        driver as ordinary :class:`Response` objects. ``raise_error``
-        is applied here at the driver-iteration boundary instead, so
-        the first non-OK row surfaces as a real
-        :exc:`HTTPError` to the caller without losing the rest of the
-        batch to a partial-collect.
+        In Spark mode ``raise_error`` is applied at the driver-iteration
+        boundary so a single failure doesn't poison a whole partition.
         """
         is_spark = config.spark_session is not None
-        for batch in self._send_many_batches(requests, config):
+        for batch in self._send_many_batches(requests, config, **batch_kw):
             for holder in batch.parts():
                 for response in Response.from_records(holder.read_records()):
                     if is_spark and config.raise_error and not response.ok:
@@ -2493,83 +2460,55 @@ class HTTPSession(Session):
     def send_many_batches(
         self,
         requests: Iterator[PreparedRequest],
-        config: SendManyConfig | SendConfig | Mapping[str, Any] | None = None,
+        config: SendConfig | Mapping[str, Any] | None = None,
         *,
         wait: WaitingConfigArg = None,
         raise_error: bool = True,
-        normalize: bool | None = None,
         stream: bool = True,
         remote_cache: CacheConfig | Mapping[str, Any] | None = None,
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         cache_only: bool = False,
         as_tabular: bool = False,
+        spark_session: Optional["SparkSession"] = None,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
         max_batch_ttl: float | None = None,
-        spark_session: Optional["SparkSession"] = None,
         **options,
     ) -> Iterator[HTTPResponseBatch]:
-        """Yield one :class:`HTTPResponseBatch` per processed chunk.
-
-        Public entry point: both Python and Spark modes yield the same
-        ``Iterator[HTTPResponseBatch]`` shape, chunked the same way, so
-        downstream consumers can stream partial results uniformly. Each
-        yielded batch carries schema-bearing holders even when a stage
-        produced no rows — the schema is preserved for empty results.
-
-        ``max_batch_ttl`` (default :data:`DEFAULT_MAX_BATCH_TTL`,
-        300 s) caps how long the batcher waits for ``requests`` to
-        fill one chunk before flushing what's accumulated — keeps
-        downstream stages moving when the upstream iterator is slow.
-        ``None`` disables the time cap.
-        """
-        cfg = SendManyConfig.from_(
+        """Yield one :class:`HTTPResponseBatch` per processed chunk."""
+        cfg = SendConfig.from_(
             config,
             wait=wait,
             raise_error=raise_error,
-            normalize=normalize,
             stream=stream,
             remote_cache=remote_cache,
             local_cache=local_cache,
             cache_only=cache_only,
             as_tabular=as_tabular,
+            spark_session=spark_session,
+            **options,
+        )
+        yield from self._send_many_batches(
+            requests, cfg,
             batch_size=batch_size,
             ordered=ordered,
             max_in_flight=max_in_flight,
             max_batch_ttl=max_batch_ttl,
-            spark_session=spark_session,
-            **options,
         )
-        yield from self._send_many_batches(requests, cfg)
 
     def _send_many_batches(
         self,
         requests: Iterator[PreparedRequest],
-        config: SendManyConfig,
+        config: SendConfig,
+        *,
+        batch_size: int | None = None,
+        max_batch_size: int | None = None,
+        max_in_flight: int | None = None,
+        ordered: bool = False,
+        max_batch_ttl: float | None = DEFAULT_MAX_BATCH_TTL,
     ) -> Iterator[HTTPResponseBatch]:
-        """Yield one :class:`HTTPResponseBatch` per processed chunk.
-
-        Single pipeline for both Python and Spark modes — the only
-        differences are stage 3 (fetch misses through the local job
-        pool vs. ``mapInArrow`` over executors) and stage 4 (per-row
-        Arrow insert vs. lazy Spark insert). Mode is picked from
-        ``config.spark_session``.
-
-        Both modes chunk requests by ``batch_size`` and yield one
-        :class:`HTTPResponseBatch` per chunk so callers see the same
-        streaming shape regardless of engine. In Spark mode each chunk
-        produces its own ``mapInArrow`` job — pass a larger
-        ``batch_size`` (or ``max_batch_size``) when you'd rather
-        amortise scheduler overhead across a single bulk fetch. Empty
-        buckets are returned as schema-bearing holders so a chunk that
-        fully short-circuited on local cache still advertises the
-        response schema for ``remote_hits`` / ``new_hits``.
-        """
-        # ``SendManyConfig.__post_init__`` already resolved ``True`` /
-        # ``...`` to a live :class:`SparkSession` (or ``None``) via
-        # :meth:`PyEnv.spark_session`, so a simple non-None check is
-        # enough to pick the engine.
+        """Yield one :class:`HTTPResponseBatch` per processed chunk."""
         spark = config.spark_session
         is_spark = spark is not None
 
@@ -2578,39 +2517,25 @@ class HTTPSession(Session):
         session_local_cfg = _lc.prebuild(session=self) if _lc is not None else None
 
         if is_spark:
-            # FAIR scheduling lets the concurrent stage-4 inserts
-            # (and any upstream Spark jobs the cache flow kicks off)
-            # share executor slots instead of queueing strictly FIFO
-            # behind whichever job won the race. ``spark.conf.set``
-            # is best-effort: some Spark builds reject runtime
-            # changes to scheduler-mode and we don't want a managed
-            # cluster's policy to fail the request flow.
             self._enable_fair_spark_scheduler(spark)
-            # Spark mode has no driver-side thread pool to scale the
-            # default against — fall back to ``max_batch_size`` (or
-            # 1024) so each chunk maps to one ``mapInArrow`` scatter
-            # of bounded width. Callers who want a single mega-chunk
-            # (preserving the original bulk-fetch optimisation) can
-            # pass an explicit ``batch_size`` larger than their
-            # request count.
-            batch_size = config.batch_size or config.max_batch_size or 1024
+            eff_batch_size = batch_size or max_batch_size or 1024
         else:
             pool = self.job_pool
-            batch_size = config.batch_size or min(
-                config.max_batch_size or 1024, pool.max_workers * 10
+            eff_batch_size = batch_size or min(
+                max_batch_size or 1024, pool.max_workers * 10
             )
 
-        ttl = config.max_batch_ttl
+        ttl = max_batch_ttl
 
         LOGGER.debug(
             "Starting send_many pipeline (mode=%s, batch_size=%d, "
             "max_in_flight=%s, ttl=%s, ordered=%s, "
             "local_cache=%s, remote_cache=%s)",
             "spark" if is_spark else "python",
-            batch_size,
-            config.max_in_flight,
+            eff_batch_size,
+            max_in_flight,
             ttl,
-            config.ordered,
+            ordered,
             session_local_cfg.local_cache_enabled if session_local_cfg is not None else False,
             session_remote_cfg.remote_cache_enabled if session_remote_cfg is not None else False,
         )
@@ -2656,7 +2581,7 @@ class HTTPSession(Session):
             if buf:
                 yield buf
 
-        chunks = _batched(requests, batch_size, ttl)
+        chunks = _batched(requests, eff_batch_size, ttl)
 
         for chunk in chunks:
             if not chunk:
@@ -2874,7 +2799,10 @@ class HTTPSession(Session):
                 new_hits = self._spark_fetch_misses(after_remote, config, spark)
             else:
                 new_list: list[Response] = []
-                for response in self._fetch_misses(after_remote, config):
+                for response in self._fetch_misses(
+                    after_remote, config,
+                    ordered=ordered, max_in_flight=max_in_flight,
+                ):
                     if response.ok:
                         new_list.append(response)
                     elif config.raise_error:
@@ -3138,7 +3066,7 @@ class HTTPSession(Session):
     def _spark_fetch_misses(
         self,
         misses: list[PreparedRequest],
-        config: SendManyConfig,
+        config: SendConfig,
         spark: "SparkSession",
     ) -> "SparkDataFrame":
         """Stage 3 on Spark: scatter misses to workers via mapInArrow.
@@ -3225,10 +3153,10 @@ class HTTPSession(Session):
         # Worker-side send config: local cache with 15-min TTL keeps
         # the executor's disk cache bounded; no remote cache — the
         # driver handles remote persistence in stage 4.
-        worker_send_config = config.to_send_config(
-            with_remote_cache=False,
-            with_local_cache=True,
-            with_spark=False,
+        worker_send_config = dataclasses.replace(
+            config,
+            remote_cache=None,
+            spark_session=None,
             raise_error=False,
         )
         lc = worker_send_config.local_cache
