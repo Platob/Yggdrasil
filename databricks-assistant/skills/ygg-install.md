@@ -17,6 +17,19 @@ dbutils.library.restartPython()
 - Add `[data]` when you need pandas + numpy + sqlglot.
 - Add `[http]` when you need HTTP session features for API ingestion.
 
+### Remove extra index URLs
+
+Databricks clusters often have extra index URLs configured that slow
+down resolution or fail to resolve. Strip them before installing:
+
+```python
+import os
+for key in ("PIP_EXTRA_INDEX_URL", "UV_EXTRA_INDEX_URL"):
+    os.environ.pop(key, None)
+%pip install "ygg[databricks]"
+dbutils.library.restartPython()
+```
+
 ### Pin a version
 
 ```python
