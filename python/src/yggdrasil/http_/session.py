@@ -2492,211 +2492,131 @@ class HTTPSession(Session):
                     if base is not req_sc:
                         r.send_config = base
 
+            # Split: requests with cache config (tabular) vs bare network.
+            uncached: list[PreparedRequest] = []
+            cached: list[PreparedRequest] = []
+            for r in chunk:
+                if r.local_cache_config or r.remote_cache_config:
+                    cached.append(r)
+                else:
+                    uncached.append(r)
+
             LOGGER.debug(
-                "Processing send_many chunk #%d (requests=%d, mode=%s)",
-                chunk_index, len(chunk), "spark" if is_spark else "mixed/python",
+                "Processing send_many chunk #%d (requests=%d, "
+                "cached=%d, uncached=%d, mode=%s)",
+                chunk_index, len(chunk), len(cached), len(uncached),
+                "spark" if is_spark else "python",
             )
 
-            # --- Stage 1: local cache ---
-            local_hits_by_path, after_local = self._split_local_cache(chunk)
-            # Flatten across cache-folder paths into a single bucket
-            # for :class:`HTTPResponseBatch`. On the spark path, lift the
-            # flat list to a Spark frame once so every bucket
-            # downstream is frame-resident — matches stage 2/3 and
-            # lets the caller union holders without a per-bucket type
-            # switch. ``local_hits_by_path`` stays a per-path dict
-            # internally because :meth:`_mirror_local_hits_to_remote`
-            # walks it before stage 3.
-            local_flat: list[Response] = [
-                r for hits in local_hits_by_path.values() for r in hits
-            ]
-            local_hits: "list[Response] | None" = local_flat or None
-            # Remote hits: dict keyed by ``CacheConfig.table.full_name``
-            # internally so :meth:`_backfill_local_cache` knows which
-            # rows came from which table; collapsed into one bucket at
-            # the :class:`HTTPResponseBatch` boundary.
-            remote_hits_by_table: "dict[str, list[Response]]" = {}
-            new_hits: "list[Response] | SparkDataFrame | None" = None
+            # --- Cached path: local → remote → network for misses ---
+            local_hits: "list[Response] | None" = None
+            remote_hits: "list[Response] | None" = None
+            local_hits_by_path: "dict[Path, list[Response]]" = {}
+            cache_misses: list[PreparedRequest] = list(cached)
 
-            if not after_local:
+            if cached:
+                local_hits_by_path, cache_misses = self._split_local_cache(cached)
+                local_flat = [r for hits in local_hits_by_path.values() for r in hits]
+                local_hits = local_flat or None
+
+                if cache_misses:
+                    remote_hits_by_table, cache_misses = self._split_remote_cache(
+                        cache_misses,
+                    )
+                    self._backfill_local_cache([
+                        r
+                        for table_hits in remote_hits_by_table.values()
+                        for r in table_hits
+                    ])
+                    remote_hits = self._flatten_remote_hits(remote_hits_by_table)
+
                 self._mirror_local_hits_to_remote(local_hits_by_path)
-                local_count = len(local_flat)
-                total_local += local_count
-                LOGGER.info(
-                    "Completed send_many chunk #%d (requests=%d, "
-                    "local_hits=%d, remote_hits=0, network=0, failed=0) "
-                    "— fully short-circuited on local cache; "
-                    "no requests sent (local_paths=%s)",
-                    chunk_index, len(chunk), local_count,
-                    ", ".join(
-                        f"{p!r}={len(v)}"
-                        for p, v in local_hits_by_path.items()
-                    ),
-                )
-                yield HTTPResponseBatch(
-                    local_hits=local_hits,
-                    remote_hits=None,
-                    new_hits=new_hits,
-                    spark=spark,
-                )
-                continue
 
-            # --- Stage 2: remote cache ---
-            remote_hits_by_table, after_remote = self._split_remote_cache(
-                after_local,
-            )
-            self._backfill_local_cache([
-                r
-                for table_hits in remote_hits_by_table.values()
-                for r in table_hits
-            ])
-            self._mirror_local_hits_to_remote(local_hits_by_path)
-
-            # Collapse the per-table remote split into one bucket for
-            # :class:`HTTPResponseBatch`. Python lists chain; Spark frames
-            # union via ``unionByName(allowMissingColumns=True)``.
-            remote_hits = self._flatten_remote_hits(remote_hits_by_table)
-
-            if not after_remote:
-                local_count = len(local_flat)
-                remote_count = sum(
-                    len(v) for v in remote_hits_by_table.values()
-                )
-                total_remote += remote_count
-                total_local += local_count
-                remote_breakdown = ", ".join(
-                    f"{tkey}={len(v)}"
-                    for tkey, v in remote_hits_by_table.items()
-                )
-                LOGGER.info(
-                    "Completed send_many chunk #%d (requests=%d, "
-                    "local_hits=%d, remote_hits=%s, network=0, failed=0) "
-                    "— short-circuited on remote cache; no requests sent "
-                    "(local_paths=%s, remote_tables=%s)",
-                    chunk_index, len(chunk), local_count,
-                    remote_count,
-                    ", ".join(
-                        f"{p!r}={len(v)}"
-                        for p, v in local_hits_by_path.items()
-                    ) or "none",
-                    remote_breakdown or "none",
-                )
-                yield HTTPResponseBatch(
-                    local_hits=local_hits,
-                    remote_hits=remote_hits,
-                    new_hits=new_hits,
-                    spark=spark,
-                )
-                continue
-
-            # --- Stage 3: fetch misses ---
+            # --- Network: uncached requests + cache misses ---
+            to_fetch = uncached + cache_misses
+            new_hits: "list[Response] | SparkDataFrame | None" = None
             failed: list[Response] = []
-            if config.cache_only:
-                synthetic = [_synthetic_not_found(r) for r in after_remote]
+
+            if to_fetch and config.cache_only:
+                new_hits = [_synthetic_not_found(r) for r in to_fetch]
                 LOGGER.info(
                     "send_many chunk #%d: cache_only=True, synthesising "
-                    "%d 404 response(s) for miss(es)",
-                    chunk_index, len(after_remote),
+                    "%d 404 response(s)",
+                    chunk_index, len(to_fetch),
                 )
-                yield HTTPResponseBatch(
-                    local_hits=local_hits,
-                    remote_hits=remote_hits,
-                    new_hits=synthetic,
-                    spark=spark,
-                )
-                continue
+            elif to_fetch:
+                spark_misses: list[PreparedRequest] = []
+                local_misses: list[PreparedRequest] = []
+                for r in to_fetch:
+                    if r.send_config_or_default.spark_session is not None:
+                        spark_misses.append(r)
+                    else:
+                        local_misses.append(r)
 
-            # Partition misses by per-request mode so the same chunk
-            # can contain both local-mode and Spark-mode requests.
-            spark_misses: list[PreparedRequest] = []
-            local_misses: list[PreparedRequest] = []
-            for r in after_remote:
-                if r.send_config_or_default.spark_session is not None:
-                    spark_misses.append(r)
-                else:
-                    local_misses.append(r)
-
-            if spark_misses or local_misses:
-                LOGGER.info(
-                    "Stage 3 miss partition for chunk #%d: "
-                    "spark=%d, local=%d (total=%d)",
-                    chunk_index, len(spark_misses),
-                    len(local_misses), len(after_remote),
-                )
-
-            spark_new_hits: "SparkDataFrame | None" = None
-            if spark_misses:
-                req_spark = spark_misses[0].send_config_or_default.spark_session
-                spark_new_hits = self._spark_fetch_misses(
-                    spark_misses, config, req_spark,
-                )
-
-            new_list: list[Response] = []
-            if local_misses:
-                for response in self._fetch_misses(
-                    local_misses, config,
-                    ordered=ordered, max_in_flight=max_in_flight,
-                ):
-                    if response.ok:
-                        new_list.append(response)
-                    elif config.raise_error:
-                        failed.append(response)
-
-            new_hits = new_list or None
-
-            # --- Stage 4: bulk remote writeback ---
-            stage4: "list[Callable[[], Any]]" = []
-            if spark_new_hits is not None:
-                _spark_hits = spark_new_hits
-                _spark_remote_cfg = {
-                    r.public_url_hash: r.remote_cache_config
-                    for r in spark_misses
-                }
-                stage4.append(
-                    lambda: self._spark_persist_remote(
-                        _spark_hits,
-                        _spark_remote_cfg,
-                        spark=spark_misses[0].send_config_or_default.spark_session,
+                spark_new_hits: "SparkDataFrame | None" = None
+                if spark_misses:
+                    spark_new_hits = self._spark_fetch_misses(
+                        spark_misses, config,
+                        spark_misses[0].send_config_or_default.spark_session,
                     )
-                )
-            if new_list:
-                _local_hits = new_list
-                stage4.append(
-                    lambda: self._persist_remote(_local_hits)
-                )
-                stage4.append(
-                    lambda: self._backfill_local_cache(_local_hits)
-                )
-            self._run_concurrently(
-                stage4, thread_name_prefix="ygg-stage4",
-            )
 
-            # Merge Spark and local new_hits into the batch.  When
-            # both modes produced results, collect the Spark frame to
-            # a list so the batch stays in a single engine.
-            if spark_new_hits is not None and new_list:
-                from yggdrasil.io.response import Response as _Resp
-                for r in _Resp.from_records(spark_new_hits.toArrow()):
-                    new_list.append(r)
-                new_hits = new_list
-            elif spark_new_hits is not None:
-                new_hits = spark_new_hits
+                new_list: list[Response] = []
+                if local_misses:
+                    for response in self._fetch_misses(
+                        local_misses, config,
+                        ordered=ordered, max_in_flight=max_in_flight,
+                    ):
+                        if response.ok:
+                            new_list.append(response)
+                        elif config.raise_error:
+                            failed.append(response)
 
-            local_count = len(local_flat)
-            total_local += local_count
-            remote_count = sum(len(v) for v in remote_hits_by_table.values())
-            total_remote += remote_count
+                # --- Writeback: persist network results to caches ---
+                stage4: "list[Callable[[], Any]]" = []
+                if spark_new_hits is not None:
+                    _spark_hits = spark_new_hits
+                    _spark_remote_cfg = {
+                        r.public_url_hash: r.remote_cache_config
+                        for r in spark_misses
+                    }
+                    stage4.append(
+                        lambda: self._spark_persist_remote(
+                            _spark_hits,
+                            _spark_remote_cfg,
+                            spark=spark_misses[0].send_config_or_default.spark_session,
+                        )
+                    )
+                if new_list:
+                    _local_hits = new_list
+                    stage4.append(lambda: self._persist_remote(_local_hits))
+                    stage4.append(lambda: self._backfill_local_cache(_local_hits))
+                if stage4:
+                    self._run_concurrently(
+                        stage4, thread_name_prefix="ygg-stage4",
+                    )
+
+                if spark_new_hits is not None and new_list:
+                    from yggdrasil.io.response import Response as _Resp
+                    for r in _Resp.from_records(spark_new_hits.toArrow()):
+                        new_list.append(r)
+                    new_hits = new_list
+                elif spark_new_hits is not None:
+                    new_hits = spark_new_hits
+                else:
+                    new_hits = new_list or None
+
+            local_count = len(local_hits) if local_hits else 0
+            remote_count = len(remote_hits) if isinstance(remote_hits, list) else 0
             net_count = len(new_hits) if isinstance(new_hits, list) else 0
-            spark_count = len(spark_misses) if spark_misses else 0
-            total_network += net_count + spark_count
-            failed_count = len(failed)
-            total_failed += failed_count
+            total_local += local_count
+            total_remote += remote_count
+            total_network += net_count
+            total_failed += len(failed)
             LOGGER.info(
                 "Completed send_many chunk #%d (requests=%d, "
-                "local_hits=%d, remote_hits=%d, network=%d, "
-                "spark=%d, failed=%d)",
+                "local_hits=%d, remote_hits=%d, network=%d, failed=%d)",
                 chunk_index, len(chunk), local_count,
-                remote_count, net_count, spark_count, failed_count,
+                remote_count, net_count, len(failed),
             )
 
             yield HTTPResponseBatch(
