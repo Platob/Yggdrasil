@@ -339,9 +339,17 @@ class CacheConfig(_ConfigBase):
 
         tab = self.tabular
         if tab is not None:
-            object.__setattr__(
-                self, "tabular", Holder.from_(tab),
-            )
+            if isinstance(tab, (str, pathlib.PurePath, Path)):
+                from yggdrasil.io.nested.folder_path import FolderPath
+                object.__setattr__(
+                    self, "tabular", FolderPath(path=Path.from_(tab)),
+                )
+            elif not isinstance(tab, Holder):
+                pass
+            else:
+                object.__setattr__(
+                    self, "tabular", Holder.from_(tab),
+                )
 
     def __getstate__(self):
         # Project local FolderPath caches down to their URL string for
@@ -487,17 +495,21 @@ class CacheConfig(_ConfigBase):
 
     @property
     def cache_enabled(self):
-        return self.received_from is not None or self.received_to is not None
+        return self.mode in (Mode.APPEND, Mode.AUTO)
 
     @property
     def local_cache_enabled(self):
         if not self.cache_enabled:
             return False
+        if self.tabular is not None:
+            return True
         return self.received_from is not None or self.received_to is not None
 
     @property
     def remote_cache_enabled(self):
-        return self.cache_enabled
+        if not self.cache_enabled:
+            return False
+        return self.tabular is not None
 
     @property
     def match_by(self) -> list[str]:

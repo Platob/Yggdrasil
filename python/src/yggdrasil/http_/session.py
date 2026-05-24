@@ -1430,6 +1430,7 @@ class HTTPSession(Session):
                     page_num=pn,
                     body_seed=body_seed,
                     wait_cfg=wait_cfg,
+                    stream=request.send_config_or_default.stream,
                     raise_error=raise_error,
                 )
 
@@ -1615,10 +1616,13 @@ class HTTPSession(Session):
         """
         cfg = getattr(requests[0], attr)
         predicate = cfg.make_batch_lookup_predicate(requests)
-        tab = holder.read_table(options=CastOptions(predicate=predicate))
-        if tab is None:
+        batches = list(holder.read_arrow_batches(
+            options=CastOptions(predicate=predicate),
+        ))
+        if not batches or all(b.num_rows == 0 for b in batches):
             return None, list(requests)
-        return tab, []
+        from yggdrasil.arrow.tabular import ArrowTabular
+        return ArrowTabular(batches), []
 
     def _lookup_cached(
         self,

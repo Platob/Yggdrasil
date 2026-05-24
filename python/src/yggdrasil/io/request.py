@@ -432,7 +432,7 @@ class PreparedRequest:
         if config is None:
             return None
 
-        if config.mode is Mode.APPEND or config.mode is Mode.AUTO:
+        if config.mode not in (Mode.APPEND, Mode.AUTO, Mode.UPSERT):
             return None
 
         if (
