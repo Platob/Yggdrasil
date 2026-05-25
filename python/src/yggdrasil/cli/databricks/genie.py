@@ -48,6 +48,7 @@ _SLASH_HELP: dict[str, str] = {
     "/defaults": "Show the active GenieDefaults dataclass.",
     "/tools": "List registered agent tools.",
     "/output-dir": "Print the local output directory.",
+    "/log [level]": "Show or set log level (debug, info, warning, error).",
 }
 
 
@@ -139,6 +140,7 @@ class GenieCLI(DatabricksCLI):
             "defaults": self._cmd_defaults,
             "tools": self._cmd_tools,
             "output-dir": self._cmd_output_dir,
+            "log": self._cmd_log,
         }
 
     # ------------------------------------------------------------------ #
@@ -319,6 +321,7 @@ class GenieCLI(DatabricksCLI):
         was supplied, fall back to a single-shot ask + exit (no REPL
         prompt). Otherwise drop into the REPL.
         """
+        self._setup_logging()
         if not self._ensure_connected():
             return 2
 
@@ -331,6 +334,21 @@ class GenieCLI(DatabricksCLI):
         if question is not None:
             return self.ask_once(question)
         return self.run_repl()
+
+    # ------------------------------------------------------------------ #
+    # Logging
+    # ------------------------------------------------------------------ #
+    _YGG_LOGGER = logging.getLogger("yggdrasil")
+
+    def _setup_logging(self) -> None:
+        if not logging.root.handlers:
+            logging.basicConfig(
+                level=logging.WARNING,
+                format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        if not getattr(self.args, "debug", False):
+            self._YGG_LOGGER.setLevel(logging.INFO)
 
     # ------------------------------------------------------------------ #
     # Credential setup
@@ -530,6 +548,13 @@ class GenieCLI(DatabricksCLI):
             LOGGER.debug("ask failed", exc_info=True)
             return
         self.conversation_id = answer.conversation_id or self.conversation_id
+        preview = (answer.text or "").splitlines()[0][:120] if answer.text else "(no text)"
+        LOGGER.info(
+            "Genie answered (status=%s, msg=%s): %s",
+            getattr(answer.status, "name", answer.status),
+            answer.message_id,
+            preview,
+        )
         self._render_answer(answer)
 
     def _prompt_space(self) -> bool:
@@ -772,6 +797,19 @@ class GenieCLI(DatabricksCLI):
 
     def _cmd_output_dir(self, _args: list[str]) -> None:
         self.out(f"  {self.agent.output_dir}")
+
+    def _cmd_log(self, args: list[str]) -> None:
+        if not args:
+            current = logging.getLevelName(self._YGG_LOGGER.level)
+            self.info(f"  yggdrasil log level: {current}")
+            return
+        name = args[0].upper()
+        level = getattr(logging, name, None)
+        if level is None or not isinstance(level, int):
+            self.error(f"  unknown level {args[0]!r} — use debug, info, warning, error")
+            return
+        self._YGG_LOGGER.setLevel(level)
+        self.success(f"  yggdrasil log level → {name}")
 
     # ------------------------------------------------------------------ #
     # Rendering
