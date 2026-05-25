@@ -346,22 +346,21 @@ class GenieCLI(DatabricksCLI):
         return self._prompt_credentials()
 
     def _prompt_credentials(self) -> bool:
-        """Interactively ask for host + token and rebuild the client."""
+        """Interactively ask for host (+ optional token) and rebuild the client."""
         from yggdrasil.databricks.client import DatabricksClient
 
         try:
             host = self.input_fn(
-                self.style.cyan("  host ") + self.style.dim("(e.g. https://adb-123.7.azuredatabricks.net): "),
+                self.style.cyan("  host ")
+                + self.style.dim("(e.g. https://adb-123.7.azuredatabricks.net): "),
             ).strip()
             if not host:
                 self.error("  host is required.")
                 return False
             token = self.input_fn(
-                self.style.cyan("  token ") + self.style.dim("(PAT): "),
-            ).strip()
-            if not token:
-                self.error("  token is required.")
-                return False
+                self.style.cyan("  token ")
+                + self.style.dim("(PAT, empty for browser SSO): "),
+            ).strip() or None
         except (EOFError, KeyboardInterrupt):
             self.out("")
             return False
@@ -369,7 +368,7 @@ class GenieCLI(DatabricksCLI):
         try:
             self.client = DatabricksClient(host=host, token=token)
             self.client.make_config()
-            self.success("  connected.")
+            self.success(f"  connected to {host}")
             return True
         except Exception as exc:
             self.error(f"  failed: {exc}")
