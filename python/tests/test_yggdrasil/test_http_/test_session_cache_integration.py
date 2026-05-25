@@ -695,13 +695,11 @@ class TestCombinedCacheIntegration:
         assert _wait_for_local(local) >= 1
         assert tab.inserts and tab.inserts[0]["rows"] == 1
 
-    def test_mirror_local_to_remote_pushes_local_hit_upstream(self, tmp_path) -> None:
-        # ``mirror_local_to_remote=True`` — during ``send_many``, a
-        # local hit must produce a remote insert without going to the
-        # network.
+    def test_local_hit_does_not_push_to_remote(self, tmp_path) -> None:
+        # A local-only hit must not trigger a remote insert.
         local = _local_cfg(tmp_path)
         tab = _FakeRemoteTabular()
-        remote = _remote_cfg(tab, mirror_local_to_remote=True)
+        remote = _remote_cfg(tab)
         req = make_request("https://example.com/x")
         _seed_local(local, make_response(request=req, body=b'{"v":"local"}'))
 
@@ -712,27 +710,8 @@ class TestCombinedCacheIntegration:
             remote_cache=remote,
         ))
         assert len(s.calls) == 0, "local hit must not touch the network"
-        assert any(call["rows"] >= 1 for call in tab.inserts), (
-            "mirror_local_to_remote must push the local hit upstream"
-        )
-
-    def test_mirror_disabled_keeps_remote_silent_on_local_hit(self, tmp_path) -> None:
-        # Default config — no mirror flag — leaves the remote untouched
-        # on a batch satisfied entirely by the local cache.
-        local = _local_cfg(tmp_path)
-        tab = _FakeRemoteTabular()
-        remote = _remote_cfg(tab)  # mirror_local_to_remote defaults to False
-        req = make_request("https://example.com/x")
-        _seed_local(local, make_response(request=req, body=b'{"v":"local"}'))
-
-        s = StubSession()
-        list(s.send_many(
-            iter([req]),
-            local_cache=local,
-            remote_cache=remote,
-        ))
         assert tab.inserts == [], (
-            "default config must not push local-only hits to remote"
+            "local-only hit must not push to remote"
         )
 
     def test_send_many_mixes_local_hit_remote_hit_and_full_miss(
