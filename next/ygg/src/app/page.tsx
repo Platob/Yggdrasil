@@ -218,7 +218,7 @@ function InterstellarCanvas() {
   );
 }
 
-// ─── Services ────────────────────────────────────────────────────────────────
+// ─── Services ──────────────────────────────────────────���─────────────────────
 
 const SERVICES = [
   {
@@ -230,6 +230,17 @@ const SERVICES = [
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
         <rect x="3" y="3" width="18" height="18" rx="2" />
         <path d="M9 9h.01M15 9h.01M9 15h6" />
+      </svg>
+    ),
+  },
+  {
+    id: "msg",
+    name: "Messaging",
+    tag: "Active",
+    href: "/msg",
+    icon: (
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
       </svg>
     ),
   },
@@ -342,7 +353,7 @@ export default function WelcomePage() {
           </div>
 
           {/* Service constellation */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 w-full max-w-2xl">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 w-full max-w-3xl">
             {SERVICES.map((s) => (
               <Link
                 key={s.id}

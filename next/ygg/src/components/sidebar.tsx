@@ -29,16 +29,6 @@ const NAV_ITEMS = [
     ),
     description: "Run code"
   },
-  { 
-    href: "/bot/chat", 
-    label: "Chat", 
-    icon: (
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-      </svg>
-    ),
-    description: "Messaging"
-  },
 ];
 
 export function Sidebar() {
@@ -95,8 +85,17 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Back to Home */}
-      <div className="p-3 border-t border-border">
+      {/* Cross-links */}
+      <div className="p-3 border-t border-border space-y-0.5">
+        <Link
+          href="/msg"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-muted hover:text-foreground hover:bg-card-hover transition-colors"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+          Messaging
+        </Link>
         <Link
           href="/"
           className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-muted hover:text-foreground hover:bg-card-hover transition-colors"
@@ -104,7 +103,7 @@ export function Sidebar() {
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M19 12H5M12 19l-7-7 7-7" />
           </svg>
-          Back to Home
+          Home
         </Link>
       </div>
 
