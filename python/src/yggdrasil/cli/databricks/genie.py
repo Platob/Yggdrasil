@@ -11,6 +11,7 @@ The REPL itself is intentionally stdlib-only — no ``rich`` /
 to Genie; lines starting with ``/`` are local slash commands routed
 through :meth:`GenieCLI.dispatch`.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -66,6 +67,7 @@ class _Style:
     YELLOW = "\x1b[33m"
     RED = "\x1b[31m"
     MAGENTA = "\x1b[35m"
+    ERASE_LINE = "\x1b[2K"
 
     def __init__(self, enabled: bool):
         self.enabled = enabled and sys.stdout.isatty()
@@ -75,13 +77,93 @@ class _Style:
             return text
         return f"{code}{text}{self.RESET}"
 
-    def dim(self, t: str) -> str: return self(self.DIM, t)
-    def bold(self, t: str) -> str: return self(self.BOLD, t)
-    def cyan(self, t: str) -> str: return self(self.CYAN, t)
-    def green(self, t: str) -> str: return self(self.GREEN, t)
-    def yellow(self, t: str) -> str: return self(self.YELLOW, t)
-    def red(self, t: str) -> str: return self(self.RED, t)
-    def magenta(self, t: str) -> str: return self(self.MAGENTA, t)
+    def dim(self, t: str) -> str:
+        return self(self.DIM, t)
+
+    def bold(self, t: str) -> str:
+        return self(self.BOLD, t)
+
+    def cyan(self, t: str) -> str:
+        return self(self.CYAN, t)
+
+    def green(self, t: str) -> str:
+        return self(self.GREEN, t)
+
+    def yellow(self, t: str) -> str:
+        return self(self.YELLOW, t)
+
+    def red(self, t: str) -> str:
+        return self(self.RED, t)
+
+    def magenta(self, t: str) -> str:
+        return self(self.MAGENTA, t)
+
+
+class _StatusLine:
+    """Single-line status display that overwrites itself on each update.
+
+    Writes ``\\r`` + erase-line + the new text so the terminal shows only
+    the latest status.  :meth:`finish` prints a final line with a newline
+    so subsequent output starts on a fresh row.
+    """
+
+    def __init__(self, style: _Style):
+        self._style = style
+        self._active = False
+
+    def update(self, text: str) -> None:
+        if self._style.enabled:
+            sys.stdout.write(f"\r{_Style.ERASE_LINE}  {text}")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write(f"  {text}\n")
+            sys.stdout.flush()
+        self._active = True
+
+    def finish(self, text: str) -> None:
+        if self._style.enabled and self._active:
+            sys.stdout.write(f"\r{_Style.ERASE_LINE}  {text}\n")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write(f"  {text}\n")
+            sys.stdout.flush()
+        self._active = False
+
+    def clear(self) -> None:
+        if self._style.enabled and self._active:
+            sys.stdout.write(f"\r{_Style.ERASE_LINE}")
+            sys.stdout.flush()
+        self._active = False
+
+
+class _StatusLineHandler(logging.Handler):
+    """Logging handler that routes INFO to the status line (overwrite mode).
+
+    WARNING and above print a persistent line so errors stay visible.
+    DEBUG is suppressed entirely in non-debug mode.
+    """
+
+    def __init__(self, status: _StatusLine, style: _Style):
+        super().__init__()
+        self._status = status
+        self._style = style
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            if record.levelno >= logging.WARNING:
+                self._status.finish(
+                    self._style.yellow(msg)
+                    if record.levelno == logging.WARNING
+                    else self._style.red(msg)
+                )
+            elif record.levelno >= logging.INFO:
+                self._status.update(self._style.dim(msg))
+        except Exception:
+            self.handleError(record)
+
+
+_ISSUE_URL = "https://github.com/Platob/Yggdrasil"
 
 
 class GenieCLI(DatabricksCLI):
@@ -123,6 +205,7 @@ class GenieCLI(DatabricksCLI):
         self.input_fn = input_fn
         self.output_fn = output_fn
         self.conversation_id: Optional[str] = None
+        self._status = _StatusLine(self.style)
         self.commands: dict[str, Callable[[list[str]], Optional[bool]]] = {
             "help": self._cmd_help,
             "quit": self._cmd_quit,
@@ -152,85 +235,122 @@ class GenieCLI(DatabricksCLI):
     def add_service_arguments(cls, parser: argparse.ArgumentParser) -> None:
         genie_grp = parser.add_argument_group("Genie defaults")
         genie_grp.add_argument(
-            "--space-id", dest="space_id", default=None,
+            "--space-id",
+            dest="space_id",
+            default=None,
             help="Genie space id (skips auto-pick).",
         )
         genie_grp.add_argument(
-            "--space-name", dest="space_name", default=None,
+            "--space-name",
+            dest="space_name",
+            default=None,
             help="Bias space auto-pick by exact title match.",
         )
         genie_grp.add_argument(
-            "--warehouse-id", dest="warehouse_id", default=None,
+            "--warehouse-id",
+            dest="warehouse_id",
+            default=None,
             help="SQL warehouse id used to materialise Genie's query results.",
         )
         genie_grp.add_argument(
-            "--auto-pick-space", dest="auto_pick_space", default=None,
+            "--auto-pick-space",
+            dest="auto_pick_space",
+            default=None,
             action=argparse.BooleanOptionalAction,
             help="Allow Genie to pick a space when --space-id is unset (default on).",
         )
         genie_grp.add_argument(
-            "--auto-create-space", dest="auto_create_space", default=None,
+            "--auto-create-space",
+            dest="auto_create_space",
+            default=None,
             action=argparse.BooleanOptionalAction,
             help="Create a default Genie space when none resolves (off by default).",
         )
         genie_grp.add_argument(
-            "--cleanup-dead-spaces", dest="cleanup_dead_spaces", default=None,
+            "--cleanup-dead-spaces",
+            dest="cleanup_dead_spaces",
+            default=None,
             action=argparse.BooleanOptionalAction,
             help="Trash duplicate managed-title spaces on ensure_space() (off by default).",
         )
         genie_grp.add_argument(
-            "--managed-space-title", dest="managed_space_title", default=None,
+            "--managed-space-title",
+            dest="managed_space_title",
+            default=None,
             help="Title used for auto-created and cleanup-tracked spaces.",
         )
         genie_grp.add_argument(
-            "--managed-space-table", dest="managed_space_tables",
-            action="append", default=None, metavar="CATALOG.SCHEMA.TABLE",
+            "--managed-space-table",
+            dest="managed_space_tables",
+            action="append",
+            default=None,
+            metavar="CATALOG.SCHEMA.TABLE",
             help="Table to expose in an auto-created space (repeatable).",
         )
 
         agent_grp = parser.add_argument_group("Agent")
         agent_grp.add_argument(
-            "--output-dir", dest="output_dir", default=None,
+            "--output-dir",
+            dest="output_dir",
+            default=None,
             help="Where to save artifacts (default: $XDG_CACHE_HOME/yggdrasil/genie).",
         )
         agent_grp.add_argument(
-            "--auto-save", dest="auto_save", default=None,
+            "--auto-save",
+            dest="auto_save",
+            default=None,
             action=argparse.BooleanOptionalAction,
             help="Save Genie's query result after every reply.",
         )
         agent_grp.add_argument(
-            "--auto-save-format", dest="auto_save_format", default=None,
+            "--auto-save-format",
+            dest="auto_save_format",
+            default=None,
             choices=["parquet", "csv", "arrow", "json", "text"],
             help="Format used by --auto-save (default parquet).",
         )
 
         repl_grp = parser.add_argument_group("REPL")
         repl_grp.add_argument(
-            "-q", "--question", dest="question", default=None,
+            "-q",
+            "--question",
+            dest="question",
+            default=None,
             help="Ask one question, print the reply, exit (no REPL).",
         )
         repl_grp.add_argument(
-            "--no-color", dest="color", default=True, action="store_false",
+            "--no-color",
+            dest="color",
+            default=True,
+            action="store_false",
             help="Disable ANSI colors.",
         )
 
         deploy_grp = parser.add_argument_group("Workspace skill deployment")
         deploy_grp.add_argument(
-            "--deploy-skills", dest="deploy_skills", default=False,
+            "--deploy-skills",
+            dest="deploy_skills",
+            default=False,
             action="store_true",
             help="Upload assistant skills + instructions to the workspace, then exit.",
         )
         deploy_grp.add_argument(
-            "--skills-dir", dest="skills_dir", default=None,
+            "--skills-dir",
+            dest="skills_dir",
+            default=None,
             help="Source directory for skills (default: $YGG_SKILLS_DIR, "
-                 "else ./databricks-assistant).",
+            "else ./databricks-assistant).",
         )
         deploy_grp.add_argument(
-            "--deploy-target", dest="deploy_target", default=None,
+            "--deploy-target",
+            dest="deploy_target",
+            default=None,
             help="Workspace target path (default: /Workspace/Users/<me>/.ygg/databricks-assistant).",
         )
         deploy_grp.add_argument(
-            "--deploy-overwrite", dest="deploy_overwrite", default=True,
+            "--deploy-overwrite",
+            dest="deploy_overwrite",
+            default=True,
             action=argparse.BooleanOptionalAction,
             help="Overwrite existing files at the target (default on).",
         )
@@ -239,7 +359,9 @@ class GenieCLI(DatabricksCLI):
     # Defaults wiring
     # ------------------------------------------------------------------ #
     @staticmethod
-    def defaults_from_args(args: argparse.Namespace, base: "GenieDefaults") -> "GenieDefaults":
+    def defaults_from_args(
+        args: argparse.Namespace, base: "GenieDefaults"
+    ) -> "GenieDefaults":
         """Merge CLI overrides into a base :class:`GenieDefaults`."""
         updates: dict[str, Any] = {}
         if getattr(args, "space_id", None) is not None:
@@ -343,26 +465,39 @@ class GenieCLI(DatabricksCLI):
     _YGG_LOGGER = logging.getLogger("yggdrasil")
 
     def _setup_logging(self) -> None:
-        if not logging.root.handlers:
-            logging.basicConfig(
-                level=logging.WARNING,
-                format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-                datefmt="%H:%M:%S",
-            )
-        if not getattr(self.args, "debug", False):
+        debug = getattr(self.args, "debug", False)
+
+        if debug:
+            if not logging.root.handlers:
+                logging.basicConfig(
+                    level=logging.WARNING,
+                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+                    datefmt="%H:%M:%S",
+                )
+        else:
+            handler = _StatusLineHandler(self._status, self.style)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            self._YGG_LOGGER.handlers = [handler]
+            self._YGG_LOGGER.propagate = False
             self._YGG_LOGGER.setLevel(logging.INFO)
             logging.getLogger("databricks.sdk").setLevel(logging.ERROR)
 
     # ------------------------------------------------------------------ #
     # Credential setup
     # ------------------------------------------------------------------ #
-    _CREDS_FILE = Path(
-        os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache",
-    ) / "yggdrasil" / "genie" / ".credentials.json"
+    _CREDS_FILE = (
+        Path(
+            os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache",
+        )
+        / "yggdrasil"
+        / "genie"
+        / ".credentials.json"
+    )
 
     def _load_saved_creds(self) -> "dict[str, str | None]":
         try:
             import json
+
             return json.loads(self._CREDS_FILE.read_text("utf-8"))
         except Exception:
             return {}
@@ -370,9 +505,11 @@ class GenieCLI(DatabricksCLI):
     def _save_creds(self, host: str, token: "str | None") -> None:
         try:
             import json
+
             self._CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
             self._CREDS_FILE.write_text(
-                json.dumps({"host": host, "token": token}), "utf-8",
+                json.dumps({"host": host, "token": token}),
+                "utf-8",
             )
         except Exception:
             pass
@@ -388,8 +525,10 @@ class GenieCLI(DatabricksCLI):
         if saved.get("host"):
             try:
                 from yggdrasil.databricks.client import DatabricksClient
+
                 self.client = DatabricksClient(
-                    host=saved["host"], token=saved.get("token"),
+                    host=saved["host"],
+                    token=saved.get("token"),
                 )
                 self.client.make_config()
                 self.success(f"  connected to {saved['host']} (saved credentials)")
@@ -408,17 +547,25 @@ class GenieCLI(DatabricksCLI):
         prefill_hint = f", default={saved_host}" if saved_host else ""
 
         try:
-            host = self.input_fn(
-                self.style.cyan("  host ")
-                + self.style.dim(f"(e.g. https://adb-123.7.azuredatabricks.net{prefill_hint}): "),
-            ).strip() or saved_host
+            host = (
+                self.input_fn(
+                    self.style.cyan("  host ")
+                    + self.style.dim(
+                        f"(e.g. https://adb-123.7.azuredatabricks.net{prefill_hint}): "
+                    ),
+                ).strip()
+                or saved_host
+            )
             if not host:
                 self.error("  host is required.")
                 return False
-            token = self.input_fn(
-                self.style.cyan("  token ")
-                + self.style.dim("(PAT, empty for browser SSO): "),
-            ).strip() or None
+            token = (
+                self.input_fn(
+                    self.style.cyan("  token ")
+                    + self.style.dim("(PAT, empty for browser SSO): "),
+                ).strip()
+                or None
+            )
         except (EOFError, KeyboardInterrupt):
             self.out("")
             return False
@@ -526,8 +673,10 @@ class GenieCLI(DatabricksCLI):
             if user_name:
                 return f"/Workspace/Users/{user_name}/.ygg/databricks-assistant"
         except Exception:
-            LOGGER.debug("Could not resolve current user; falling back to /Workspace/Shared",
-                         exc_info=True)
+            LOGGER.debug(
+                "Could not resolve current user; falling back to /Workspace/Shared",
+                exc_info=True,
+            )
         return "/Workspace/Shared/.ygg/databricks-assistant"
 
     def _upload_one(self, src, dest: str, *, overwrite: bool) -> None:
@@ -571,13 +720,14 @@ class GenieCLI(DatabricksCLI):
         return 0
 
     def ask(self, question: str) -> None:
-        self.info("  asking Genie…")
+        self._status.update(self.style.dim("asking Genie…"))
         try:
             answer = self.agent.run(question, conversation_id=self.conversation_id)
         except KeyboardInterrupt:
-            self.warn("  interrupted.")
+            self._status.finish(self.style.yellow("interrupted."))
             return
         except ValueError as exc:
+            self._status.clear()
             msg = str(exc)
             if "auto-pick" in msg and self._prompt_space():
                 self.ask(question)
@@ -585,22 +735,69 @@ class GenieCLI(DatabricksCLI):
             if "managed_space_tables" in msg and self._prompt_tables():
                 self.ask(question)
                 return
-            self.error(f"  error: {exc}")
-            LOGGER.debug("ask failed", exc_info=True)
+            self._handle_error(exc)
             return
         except Exception as exc:
-            self.error(f"  error: {type(exc).__name__}: {exc}")
-            LOGGER.debug("ask failed", exc_info=True)
+            self._status.clear()
+            self._handle_error(exc)
             return
+        self._status.clear()
         self.conversation_id = answer.conversation_id or self.conversation_id
-        preview = (answer.text or "").splitlines()[0][:120] if answer.text else "(no text)"
-        LOGGER.info(
-            "Genie answered (status=%s, msg=%s): %s",
-            getattr(answer.status, "name", answer.status),
-            answer.message_id,
-            preview,
-        )
         self._render_answer(answer)
+
+    def _handle_error(self, exc: Exception) -> None:
+        """Display the error and offer to create a GitHub issue."""
+        error_type = type(exc).__name__
+        error_msg = str(exc)
+        first_line = error_msg.splitlines()[0] if error_msg else error_type
+        self.error(f"  {error_type}: {first_line}")
+        LOGGER.debug("ask failed", exc_info=True)
+
+        from yggdrasil.exceptions import YGGException
+
+        if isinstance(exc, YGGException):
+            self.info(f"  this is a known yggdrasil error type ({error_type})")
+
+        self.out("")
+        try:
+            choice = (
+                self.input_fn(
+                    self.style.dim("  create issue at ")
+                    + self.style.cyan(_ISSUE_URL)
+                    + self.style.dim("? (y/N) "),
+                )
+                .strip()
+                .lower()
+            )
+        except (EOFError, KeyboardInterrupt):
+            self.out("")
+            return
+        if choice in ("y", "yes"):
+            import urllib.parse
+
+            title = urllib.parse.quote(f"[ygg-genie] {error_type}: {first_line[:80]}")
+            body = urllib.parse.quote(
+                f"## Error\n\n```\n{error_type}: {error_msg}\n```\n\n"
+                f"## Context\n\n- Command: `ygg-genie`\n"
+                f"- yggdrasil version: {self._get_version()}\n"
+            )
+            url = f"{_ISSUE_URL}/issues/new?title={title}&body={body}"
+            self.out(f"  {self.style.cyan(url)}")
+            try:
+                import webbrowser
+
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _get_version() -> str:
+        try:
+            from yggdrasil.version import __version__
+
+            return __version__
+        except Exception:
+            return "unknown"
 
     def _prompt_space(self) -> bool:
         """List available Genie spaces and let the user pick one."""
@@ -632,10 +829,18 @@ class GenieCLI(DatabricksCLI):
                 if 0 <= idx < len(spaces):
                     picked = spaces[idx]
                     self.genie.defaults = _dc_replace(
-                        self.defaults, space_id=picked.space_id,
+                        self.defaults,
+                        space_id=picked.space_id,
                     )
-                    title = getattr(picked._details, "title", None) if picked._details else None
-                    self.success(f"  using space {picked.space_id}" + (f" ({title})" if title else ""))
+                    title = (
+                        getattr(picked._details, "title", None)
+                        if picked._details
+                        else None
+                    )
+                    self.success(
+                        f"  using space {picked.space_id}"
+                        + (f" ({title})" if title else "")
+                    )
                     return True
             except ValueError:
                 pass
@@ -677,9 +882,12 @@ class GenieCLI(DatabricksCLI):
                     pass
             if not wh_id:
                 try:
-                    wh_id = self.input_fn(
-                        self.style.cyan("  warehouse id: "),
-                    ).strip() or None
+                    wh_id = (
+                        self.input_fn(
+                            self.style.cyan("  warehouse id: "),
+                        ).strip()
+                        or None
+                    )
                 except (EOFError, KeyboardInterrupt):
                     self.out("")
                     return False
@@ -737,13 +945,16 @@ class GenieCLI(DatabricksCLI):
             tables = tuple(t.strip() for t in raw.split(",") if t.strip())
 
         self.genie.defaults = _dc_replace(
-            self.defaults, managed_space_tables=tables,
+            self.defaults,
+            managed_space_tables=tables,
         )
         self.info(f"  tables: {', '.join(tables)}")
         return True
 
     def _resolve_table_choices(
-        self, raw: str, available: list,
+        self,
+        raw: str,
+        available: list,
     ) -> "tuple[str, ...] | None":
         parts = [p.strip() for p in raw.split(",") if p.strip()]
         tables: list[str] = []
@@ -836,7 +1047,9 @@ class GenieCLI(DatabricksCLI):
         path = args[1] if len(args) >= 2 else None
         result = self.agent.save(last, format=fmt, path=path)
         if result is None:
-            self.warn("  no query attachment to save — try '/save json' for metadata only.")
+            self.warn(
+                "  no query attachment to save — try '/save json' for metadata only."
+            )
         else:
             self.success(f"  saved → {result}")
 

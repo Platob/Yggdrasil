@@ -18,6 +18,7 @@ from databricks.sdk.service.dashboards import (
     TextAttachment,
 )
 
+from yggdrasil.data.enums.state import State
 from yggdrasil.databricks.genie import AgentResult, AgentStep, AutonomousAgent
 from yggdrasil.databricks.genie.profiles import (
     INGESTION_CLUSTER,
@@ -92,17 +93,17 @@ class AutonomousAgentTestCase(DatabricksTestCase):
 class TestAgentStep(AutonomousAgentTestCase):
     def test_step_pending_by_default(self):
         step = AgentStep(action="do something")
-        self.assertEqual(step.status, "pending")
+        self.assertEqual(step.state, State.PENDING)
         self.assertFalse(step.succeeded)
         self.assertFalse(step.failed)
 
     def test_step_done(self):
-        step = AgentStep(action="did it", status="done", result="ok")
+        step = AgentStep(action="did it", state=State.SUCCEEDED, result="ok")
         self.assertTrue(step.succeeded)
         self.assertFalse(step.failed)
 
     def test_step_failed(self):
-        step = AgentStep(action="oops", status="failed", error="boom")
+        step = AgentStep(action="oops", state=State.FAILED, error="boom")
         self.assertFalse(step.succeeded)
         self.assertTrue(step.failed)
 
@@ -112,28 +113,35 @@ class TestAgentResult(AutonomousAgentTestCase):
         r = AgentResult(
             goal="Create tables",
             steps=[
-                AgentStep(action="step 1", status="done"),
-                AgentStep(action="step 2", status="failed", error="oops"),
+                AgentStep(action="step 1", state=State.SUCCEEDED),
+                AgentStep(action="step 2", state=State.FAILED, error="oops"),
             ],
             conclusion="Partially done",
-            succeeded=False,
+            state=State.FAILED,
         )
         summary = r.summary()
         self.assertIn("Create tables", summary)
-        self.assertIn("failed", summary)
+        self.assertIn("FAILED", summary)
         self.assertIn("1/2", summary)
 
     def test_completed_and_failed_steps(self):
         r = AgentResult(
             goal="test",
             steps=[
-                AgentStep(action="a", status="done"),
-                AgentStep(action="b", status="failed"),
-                AgentStep(action="c", status="done"),
+                AgentStep(action="a", state=State.SUCCEEDED),
+                AgentStep(action="b", state=State.FAILED),
+                AgentStep(action="c", state=State.SUCCEEDED),
             ],
         )
         self.assertEqual(len(r.completed_steps), 2)
         self.assertEqual(len(r.failed_steps), 1)
+
+    def test_result_uses_state_enum(self):
+        r = AgentResult(goal="test")
+        self.assertEqual(r.state, State.RUNNING)
+        self.assertFalse(r.succeeded)
+        r.state = State.SUCCEEDED
+        self.assertTrue(r.succeeded)
 
 
 # ----------------------------------------------------------------------- #

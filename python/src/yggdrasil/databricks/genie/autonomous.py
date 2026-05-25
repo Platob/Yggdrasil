@@ -39,6 +39,8 @@ from typing import (
     Sequence,
 )
 
+from yggdrasil.data.enums.state import State
+
 from .agent import GenieAgent
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -74,15 +76,15 @@ class AgentStep:
     kwargs: Dict[str, Any] = field(default_factory=dict)
     result: Any = None
     error: Optional[str] = None
-    status: str = "pending"
+    state: State = State.PENDING
 
     @property
     def succeeded(self) -> bool:
-        return self.status == "done"
+        return self.state.is_succeeded
 
     @property
     def failed(self) -> bool:
-        return self.status == "failed"
+        return self.state.is_failed
 
 
 @dataclass
@@ -92,7 +94,11 @@ class AgentResult:
     goal: str
     steps: list[AgentStep] = field(default_factory=list)
     conclusion: str = ""
-    succeeded: bool = False
+    state: State = State.RUNNING
+
+    @property
+    def succeeded(self) -> bool:
+        return self.state.is_succeeded
 
     @property
     def failed_steps(self) -> list[AgentStep]:
@@ -105,10 +111,9 @@ class AgentResult:
     def summary(self) -> str:
         done = len(self.completed_steps)
         total = len(self.steps)
-        status = "succeeded" if self.succeeded else "failed"
         return (
             f"Goal: {self.goal}\n"
-            f"Status: {status} ({done}/{total} steps completed)\n"
+            f"State: {self.state.name} ({done}/{total} steps completed)\n"
             f"Conclusion: {self.conclusion}"
         )
 
@@ -261,13 +266,16 @@ class AutonomousAgent(GenieAgent):
         else:
             evaluation = self._evaluate(goal, result, context)
             result.conclusion = evaluation
-            result.succeeded = True
+            result.state = State.SUCCEEDED
+
+        if not result.succeeded:
+            result.state = State.FAILED
 
         LOGGER.info(
-            "Agent %r finished goal %r (succeeded=%s, steps=%d)",
+            "Agent %r finished goal %r (state=%s, steps=%d)",
             self.name,
             goal,
-            result.succeeded,
+            result.state.name,
             len(result.steps),
         )
         return result
@@ -524,23 +532,24 @@ class AutonomousAgent(GenieAgent):
     def _execute_step(self, step: AgentStep) -> AgentStep:
         """Execute a single planned step."""
         if step.tool == "_done":
-            step.status = "done"
+            step.state = State.SUCCEEDED
             step.result = step.action
             return step
 
         if step.tool is None or step.tool not in self.tools:
-            step.status = "failed"
+            step.state = State.FAILED
             step.error = (
                 f"Unknown tool {step.tool!r}; registered: {sorted(self.tools)!r}"
             )
             return step
 
+        step.state = State.RUNNING
         LOGGER.debug("Executing step: %s (tool=%r)", step.action, step.tool)
         try:
             step.result = self.run_tool(step.tool, *step.args, **step.kwargs)
-            step.status = "done"
+            step.state = State.SUCCEEDED
         except Exception as exc:
-            step.status = "failed"
+            step.state = State.FAILED
             step.error = f"{type(exc).__name__}: {exc}"
             LOGGER.debug("Step execution failed: %s", exc)
         return step
@@ -556,8 +565,8 @@ class AutonomousAgent(GenieAgent):
     ) -> str:
         """Ask Genie to evaluate whether the goal is met."""
         steps_summary = "\n".join(
-            f"  {i+1}. [{s.status}] {s.action}"
-            + (f" → {s.result!r}" if s.result and s.status == "done" else "")
+            f"  {i+1}. [{s.state.name}] {s.action}"
+            + (f" → {s.result!r}" if s.result and s.succeeded else "")
             + (f" ✗ {s.error}" if s.error else "")
             for i, s in enumerate(result.steps)
         )
