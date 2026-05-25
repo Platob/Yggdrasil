@@ -1390,12 +1390,12 @@ class HTTPSession(Session):
         requests: Iterator[PreparedRequest],
         config: SendConfig | Mapping[str, Any] | None = None,
         *,
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        cache_only: bool = False,
-        spark_session: Optional["SparkSession"] = None,
+        wait: WaitingConfigArg = ...,
+        raise_error: bool = ...,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        cache_only: bool = ...,
+        spark_session: Optional["SparkSession"] = ...,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
@@ -1408,17 +1408,28 @@ class HTTPSession(Session):
         ``max_in_flight``, ``max_batch_ttl``) control chunking and
         concurrency; everything else is folded into a :class:`SendConfig`
         that gets stamped on each request.
+
+        Send-config kwargs default to ``...`` (Ellipsis).  When left
+        unset the per-request :attr:`PreparedRequest.send_config` is
+        preserved; an explicit value overrides that field on every
+        request in the batch.
         """
-        cfg = SendConfig.from_(
-            config,
-            wait=wait,
-            raise_error=raise_error,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            cache_only=cache_only,
-            spark_session=spark_session,
-            **options,
-        )
+        overrides: dict[str, Any] = {**options}
+        if wait is not ...:
+            overrides["wait"] = wait
+        if raise_error is not ...:
+            overrides["raise_error"] = raise_error
+        if remote_cache is not ...:
+            overrides["remote_cache"] = remote_cache
+        if local_cache is not ...:
+            overrides["local_cache"] = local_cache
+        if cache_only is not ...:
+            overrides["cache_only"] = cache_only
+        if spark_session is not ...:
+            overrides["spark_session"] = spark_session
+
+        cfg = SendConfig.from_(config, **overrides)
+
         batch_kw: dict[str, Any] = {}
         if batch_size is not None:
             batch_kw["batch_size"] = batch_size
@@ -1437,6 +1448,19 @@ class HTTPSession(Session):
             for r in reqs:
                 if r.send_config is None:
                     r.send_config = cfg
+                elif overrides:
+                    req_sc = r.send_config
+                    merged = SendConfig.from_(req_sc, **overrides)
+                    # Per-request cache configs always win over
+                    # call-level overrides.
+                    merge_back: dict[str, Any] = {}
+                    if req_sc.local_cache is not None:
+                        merge_back["local_cache"] = req_sc.local_cache
+                    if req_sc.remote_cache is not None:
+                        merge_back["remote_cache"] = req_sc.remote_cache
+                    if merge_back:
+                        merged = dataclasses.replace(merged, **merge_back)
+                    r.send_config = merged
                 yield r
 
         return self._send_many(_stamp(requests), **batch_kw)
@@ -1949,17 +1973,59 @@ class HTTPSession(Session):
         self,
         requests: Iterator[PreparedRequest],
         *,
+        wait: WaitingConfigArg = ...,
+        raise_error: bool = ...,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        cache_only: bool = ...,
+        spark_session: Optional["SparkSession"] = ...,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
         max_batch_ttl: float | None = None,
-        **options,
     ) -> Iterator[HTTPResponseBatch]:
-        """Yield one :class:`HTTPResponseBatch` per processed chunk."""
-        if options:
-            def it():
-                for r in requests:
-                    r.send_config = r.send_config_or_default()
+        """Yield one :class:`HTTPResponseBatch` per processed chunk.
+
+        Send-config kwargs default to ``...`` (Ellipsis).  When left
+        unset the per-request :attr:`PreparedRequest.send_config` is
+        preserved; an explicit value overrides that field on every
+        request in the batch.
+        """
+        overrides: dict[str, Any] = {}
+        if wait is not ...:
+            overrides["wait"] = wait
+        if raise_error is not ...:
+            overrides["raise_error"] = raise_error
+        if remote_cache is not ...:
+            overrides["remote_cache"] = remote_cache
+        if local_cache is not ...:
+            overrides["local_cache"] = local_cache
+        if cache_only is not ...:
+            overrides["cache_only"] = cache_only
+        if spark_session is not ...:
+            overrides["spark_session"] = spark_session
+
+        if overrides:
+            cfg = SendConfig.from_(None, **overrides)
+
+            def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
+                for r in reqs:
+                    if r.send_config is None:
+                        r.send_config = cfg
+                    else:
+                        req_sc = r.send_config
+                        merged = SendConfig.from_(req_sc, **overrides)
+                        merge_back: dict[str, Any] = {}
+                        if req_sc.local_cache is not None:
+                            merge_back["local_cache"] = req_sc.local_cache
+                        if req_sc.remote_cache is not None:
+                            merge_back["remote_cache"] = req_sc.remote_cache
+                        if merge_back:
+                            merged = dataclasses.replace(merged, **merge_back)
+                        r.send_config = merged
+                    yield r
+
+            requests = _stamp(requests)
 
         yield from self._send_many_batches(
             requests,
