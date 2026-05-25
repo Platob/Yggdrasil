@@ -1393,8 +1393,8 @@ class Tabular(ABC, Generic[O]):
                     yield batch
             self._write_arrow_batches(_counted(), options)
             logger.debug(
-                "%s wrote %d batches / %d rows (mode=%s)",
-                type(self).__name__,
+                "%r wrote %d batches / %d rows (mode=%s)",
+                self,
                 n_batches,
                 n_rows,
                 options.mode.name,

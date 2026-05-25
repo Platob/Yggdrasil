@@ -873,6 +873,7 @@ class HTTPSession(Session):
         *,
         mode: Optional[Mode] = None,
         async_write: bool = False,
+        received_at: dt.datetime | None = None,
     ) -> None:
         """Persist one response to a cache backend.
 
@@ -887,6 +888,8 @@ class HTTPSession(Session):
         if tabular is None:
             return
         req = response.request
+        if received_at is not None:
+            response.received_at = received_at
         batch = response.to_arrow_batch(parse=False)
         prune_values = _cache_prune_values_for(batch)
         spark = req.send_config_or_default.spark_session if req is not None else None
@@ -1175,7 +1178,11 @@ class HTTPSession(Session):
         remote_response = self._load_cached_response(request, config.remote_cache)
         if remote_response is not None:
             self._store_cached_response(
-                remote_response, config.local_cache, async_write=True,
+                remote_response,
+                config.local_cache,
+                async_write=True,
+                received_at=dt.datetime.now(dt.timezone.utc),
+                mode=Mode.OVERWRITE
             )
             if config.raise_error:
                 remote_response.raise_for_status()

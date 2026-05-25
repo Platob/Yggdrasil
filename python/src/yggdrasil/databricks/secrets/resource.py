@@ -525,17 +525,17 @@ class Secret(Singleton, DatabricksResource):
 
     def refresh(self, raise_error: bool = True) -> "Secret":
         if self.scope and self.key:
-            LOGGER.debug("Fetching secret %r", self)
+            LOGGER.debug("Fetching secret value %r", self)
             try:
                 infos = self.client.workspace_client().secrets.get_secret(scope=self.scope.key, key=self.key)
             except NotFound:
-                LOGGER.debug("Secret %r not found", self)
+                LOGGER.warning("Secret %r not found", self)
                 if raise_error:
                     raise
                 else:
                     return self
             self._value_fetched_at = time.monotonic()
-            LOGGER.info("Fetched secret %r", self)
+            LOGGER.info("Fetched secret value %r", self)
             return self.set_details(infos)
         return self
 
