@@ -1,9 +1,25 @@
 "use client";
 
 import { useEffect, useState, use } from "react";
-import { node as api, type DagEntry, type DagRunEntry } from "@/lib/api";
+import { node as api, type DagEntry, type DagRunEntry, type FunctionEntry, type EnvironmentEntry } from "@/lib/api";
 import { formatRelative, formatDuration } from "@/lib/time";
 import Link from "next/link";
+
+// ── Custom SVG Icons ──────────────────────────────────────────
+const EnvIcon = ({ size = 14, className = "" }: { size?: number; className?: string }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className={className}>
+    <path d="M12 2l8 4.5v9L12 20l-8-4.5v-9L12 2z"/>
+    <path d="M12 7l5 2.8v5.4L12 18l-5-2.8V9.8L12 7z" strokeOpacity="0.5"/>
+    <line x1="12" y1="2" x2="12" y2="7" strokeOpacity="0.3"/>
+  </svg>
+);
+
+const FuncIcon = ({ size = 14, className = "" }: { size?: number; className?: string }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={className}>
+    <path d="M6 4h4l2 6 4 10h4"/>
+    <path d="M6 20h4l4-10"/>
+  </svg>
+);
 
 function statusColor(status: string): string {
   switch (status) {
@@ -33,7 +49,7 @@ interface StepResult {
   error?: string | null;
 }
 
-function StepResultDetail({ stepId, data }: { stepId: string; data: StepResult }) {
+function StepResultDetail({ stepId, data, fnName, envName }: { stepId: string; data: StepResult; fnName?: string; envName?: string }) {
   const [expanded, setExpanded] = useState(false);
   const stepStatus = data.status || "unknown";
 
@@ -51,6 +67,18 @@ function StepResultDetail({ stepId, data }: { stepId: string; data: StepResult }
         >
           {stepStatus}
         </span>
+        {fnName && (
+          <span className="flex items-center gap-1 text-xs text-primary/80">
+            <FuncIcon size={14} className="shrink-0" />
+            <span className="hidden sm:inline font-mono">{fnName}</span>
+          </span>
+        )}
+        {envName && (
+          <span className="flex items-center gap-1 text-xs text-muted">
+            <EnvIcon size={14} className="shrink-0" />
+            <span className="hidden sm:inline font-mono">{envName}</span>
+          </span>
+        )}
         {data.duration != null && (
           <span className="ml-auto text-xs font-mono text-muted">{formatDuration(data.duration)}</span>
         )}
@@ -104,6 +132,8 @@ export default function DagDetailPage({ params }: { params: Promise<{ id: string
   const numericId = parseInt(id, 10);
   const [dag, setDag] = useState<DagEntry | null>(null);
   const [runs, setRuns] = useState<DagRunEntry[]>([]);
+  const [functions, setFunctions] = useState<FunctionEntry[]>([]);
+  const [environments, setEnvironments] = useState<EnvironmentEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -117,12 +147,17 @@ export default function DagDetailPage({ params }: { params: Promise<{ id: string
     setLoading(true);
     setError(null);
     try {
-      const [dagData, runsData] = await Promise.all([
+      const [dagData, runsData, fnData, envData] = await Promise.allSettled([
         api.getDag(numericId),
         api.listDagRuns(numericId),
+        api.listFunctions(),
+        api.listEnvironments(),
       ]);
-      setDag(dagData.dag);
-      setRuns(runsData.runs);
+      if (dagData.status === "fulfilled") setDag(dagData.value.dag);
+      else setError("Failed to load DAG");
+      if (runsData.status === "fulfilled") setRuns(runsData.value.runs);
+      if (fnData.status === "fulfilled") setFunctions(fnData.value.functions);
+      if (envData.status === "fulfilled") setEnvironments(envData.value.environments);
     } catch {
       setError("Failed to load DAG");
     }
@@ -254,22 +289,25 @@ export default function DagDetailPage({ params }: { params: Promise<{ id: string
                       )}
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1 text-xs">
-                    <div>
-                      <span className="text-muted">Function</span>
-                      <p className="font-mono text-foreground-dim">#{step.ref.function_id}</p>
-                    </div>
+                  <div className="flex flex-wrap items-center gap-4 text-xs">
+                    <span className="flex items-center gap-1 text-primary/80">
+                      <FuncIcon size={14} className="shrink-0" />
+                      <span className="hidden sm:inline font-mono">
+                        {functions.find((f) => f.id === step.ref.function_id)?.name ?? `#${step.ref.function_id}`}
+                      </span>
+                    </span>
                     {step.ref.environment_id != null && (
-                      <div>
-                        <span className="text-muted">Environment</span>
-                        <p className="font-mono text-foreground-dim">#{step.ref.environment_id}</p>
-                      </div>
+                      <span className="flex items-center gap-1 text-muted">
+                        <EnvIcon size={14} className="shrink-0" />
+                        <span className="hidden sm:inline font-mono">
+                          {environments.find((e) => e.id === step.ref.environment_id)?.name ?? `#${step.ref.environment_id}`}
+                        </span>
+                      </span>
                     )}
                     {step.ref.node_url && (
-                      <div>
-                        <span className="text-muted">Node</span>
-                        <p className="font-mono text-foreground-dim text-[11px] truncate">{step.ref.node_url}</p>
-                      </div>
+                      <span className="text-muted font-mono text-[11px] truncate">
+                        {step.ref.node_url}
+                      </span>
                     )}
                   </div>
                   {Object.keys(step.ref.args).length > 0 && (
@@ -358,13 +396,20 @@ export default function DagDetailPage({ params }: { params: Promise<{ id: string
                     <span className="text-[10px] uppercase tracking-wider text-muted">Per-Step Results</span>
                     {Object.keys(run.step_results).length > 0 ? (
                       <div className="space-y-2 mt-2">
-                        {Object.entries(run.step_results).map(([stepId, stepData]) => (
-                          <StepResultDetail
-                            key={stepId}
-                            stepId={stepId}
-                            data={(stepData as StepResult) || {}}
-                          />
-                        ))}
+                        {Object.entries(run.step_results).map(([stepId, stepData]) => {
+                          const step = dag?.steps.find((s) => s.id === stepId);
+                          const fnName = step ? functions.find((f) => f.id === step.ref.function_id)?.name : undefined;
+                          const envName = step?.ref.environment_id != null ? environments.find((e) => e.id === step.ref.environment_id)?.name : undefined;
+                          return (
+                            <StepResultDetail
+                              key={stepId}
+                              stepId={stepId}
+                              data={(stepData as StepResult) || {}}
+                              fnName={fnName}
+                              envName={envName}
+                            />
+                          );
+                        })}
                       </div>
                     ) : (
                       <p className="text-xs text-muted mt-1">No step results captured.</p>

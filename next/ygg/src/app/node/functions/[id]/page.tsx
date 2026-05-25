@@ -1,9 +1,25 @@
 "use client";
 
 import { useEffect, useState, useRef, use, useCallback } from "react";
-import { node as api, type FunctionEntry, type RunEntry } from "@/lib/api";
+import { node as api, type FunctionEntry, type RunEntry, type EnvironmentEntry } from "@/lib/api";
 import { formatRelative, formatDuration } from "@/lib/time";
 import Link from "next/link";
+
+// ── Custom SVG Icons ──────────────────────────────────────────
+const EnvIcon = ({ size = 14, className = "" }: { size?: number; className?: string }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className={className}>
+    <path d="M12 2l8 4.5v9L12 20l-8-4.5v-9L12 2z"/>
+    <path d="M12 7l5 2.8v5.4L12 18l-5-2.8V9.8L12 7z" strokeOpacity="0.5"/>
+    <line x1="12" y1="2" x2="12" y2="7" strokeOpacity="0.3"/>
+  </svg>
+);
+
+const FuncIcon = ({ size = 14, className = "" }: { size?: number; className?: string }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={className}>
+    <path d="M6 4h4l2 6 4 10h4"/>
+    <path d="M6 20h4l4-10"/>
+  </svg>
+);
 
 // -- Demo data --
 const DEMO_FUNCTION: FunctionEntry = {
@@ -145,6 +161,7 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
   const numericId = parseInt(id, 10);
   const [fn, setFn] = useState<FunctionEntry | null>(null);
   const [runs, setRuns] = useState<RunEntry[]>([]);
+  const [environments, setEnvironments] = useState<EnvironmentEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -159,12 +176,16 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
     setLoading(true);
     setError(null);
     try {
-      const [fnData, runsData] = await Promise.all([
+      const [fnData, runsData, envData] = await Promise.allSettled([
         api.getFunction(numericId),
         api.listFunctionRuns(numericId),
+        api.listEnvironments(),
       ]);
-      setFn(fnData.function);
-      setRuns(runsData.runs);
+      if (fnData.status === "fulfilled") setFn(fnData.value.function);
+      else { setFn(DEMO_FUNCTION); setError("Node unavailable - showing demo data"); }
+      if (runsData.status === "fulfilled") setRuns(runsData.value.runs);
+      else setRuns(DEMO_RUNS);
+      if (envData.status === "fulfilled") setEnvironments(envData.value.environments);
     } catch {
       setError("Node unavailable - showing demo data");
       setFn(DEMO_FUNCTION);
@@ -313,7 +334,7 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
                 >
                   <div className={statusDotClass(run.status)} />
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-3 flex-wrap">
                       <span
                         className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
                         style={{ color: statusColor(run.status), background: `color-mix(in srgb, ${statusColor(run.status)} 15%, transparent)` }}
@@ -321,6 +342,22 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
                         {run.status}
                       </span>
                       <span className="font-mono text-xs text-foreground-dim">#{run.id}</span>
+                      {/* Function name + icon */}
+                      {fn && (
+                        <span className="flex items-center gap-1 text-xs text-primary/80">
+                          <FuncIcon size={14} className="shrink-0" />
+                          <span className="hidden sm:inline font-mono">{fn.name}</span>
+                        </span>
+                      )}
+                      {/* Environment name + icon */}
+                      {run.environment_id != null && (
+                        <span className="flex items-center gap-1 text-xs text-muted">
+                          <EnvIcon size={14} className="shrink-0" />
+                          <span className="hidden sm:inline font-mono">
+                            {environments.find((e) => e.id === run.environment_id)?.name ?? `#${run.environment_id}`}
+                          </span>
+                        </span>
+                      )}
                     </div>
                   </div>
                   <div className="text-right text-xs text-muted shrink-0 space-y-0.5">
