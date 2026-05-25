@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
@@ -50,6 +51,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await call_next(request)
 
     register_exception_handlers(app)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
     prefix = settings.api_prefix
