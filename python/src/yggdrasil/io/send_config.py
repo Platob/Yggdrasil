@@ -342,30 +342,16 @@ class CacheConfig(_ConfigBase):
             )
 
     def __getstate__(self):
-        # Project local FolderPath caches down to their URL string for
-        # transport — keeps the payload free of bound backend handles
-        # (Databricks client on a :class:`VolumePath`, boto3 client on
-        # an :class:`S3Path`, …) so the dataclass survives Spark /
-        # multiprocessing / Power Query worker boundaries without
-        # dragging unpicklable live state. :meth:`__setstate__`
-        # rehydrates by rebuilding the FolderPath, which is
-        # Singleton-cached so the receiving side coalesces onto the
-        # same live instance as any other config pointing there.
-        #
-        # Remote :class:`Tabular` backends (Databricks Table, …) are
-        # dropped on pickle — they wrap live SDK clients that don't
-        # cross process boundaries; the receiver rebuilds them from
-        # session-level config.
-        local_url = self._local_cache_url()
         return {
             "mode": self.mode,
             "wait": self.wait,
-            "tabular_url": local_url,
+            "tabular": self.tabular,
             "request_by": self.request_by,
             "response_by": self.response_by,
             "received_from": self.received_from,
             "received_to": self.received_to,
             "received_ttl": self.received_ttl,
+            "anonymize": self.anonymize,
             "mirror_local_to_remote": self.mirror_local_to_remote,
             "cleanup_ttl": self.cleanup_ttl,
         }
@@ -378,18 +364,15 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "received_from", state["received_from"])
         object.__setattr__(self, "received_to", state["received_to"])
         object.__setattr__(self, "received_ttl", state["received_ttl"])
-        # Rehydrate local FolderPath from its URL string; remote
-        # backends are reattached out-of-band by the receiver.
-        # Accept the legacy ``path`` key from snapshots taken before
-        # the unification so old pickled payloads still load.
-        tabular_url = state.get("tabular_url", state.get("path"))
-        if tabular_url is not None:
-            from yggdrasil.io.nested.folder_path import FolderPath
-            object.__setattr__(
-                self, "tabular", FolderPath(path=Path.from_(tabular_url)),
-            )
-        else:
-            object.__setattr__(self, "tabular", None)
+        # Legacy payloads stored a URL string under "tabular_url" or
+        # "path" instead of the live Holder.
+        tabular = state.get("tabular")
+        if tabular is None:
+            tabular_url = state.get("tabular_url", state.get("path"))
+            if tabular_url is not None:
+                from yggdrasil.io.nested.folder_path import FolderPath
+                tabular = FolderPath(path=Path.from_(tabular_url))
+        object.__setattr__(self, "tabular", tabular)
         object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
         object.__setattr__(
             self, "mirror_local_to_remote",
@@ -400,21 +383,6 @@ class CacheConfig(_ConfigBase):
             state.get("cleanup_ttl", dt.timedelta(days=1)),
         )
         object.__setattr__(self, "_derived", None)
-
-    def _local_cache_url(self) -> "str | None":
-        """URL string of the local cache root, or ``None`` for non-local.
-
-        Local cache (FolderPath) carries an addressable path; remote
-        backends are dropped from the pickle wire format.  Path
-        portability across environments (home / tmpdir differences)
-        is handled transparently by :class:`URL.__getstate__`.
-        """
-        tab = self.tabular
-        if tab is None:
-            return None
-        if hasattr(tab, "path"):
-            return str(tab.path.url)
-        return None
 
     @classmethod
     def from_(
