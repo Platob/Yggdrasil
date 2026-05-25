@@ -264,18 +264,16 @@ class TestLocalCacheSend:
         time.sleep(0.2)
         assert _wait_for_local(cache, timeout=0.1) == 0
 
-    def test_upsert_skips_lookup_and_refetches(self, tmp_path) -> None:
+    def test_upsert_reads_cache_and_persists(self, tmp_path) -> None:
         cache = _local_cfg(tmp_path, mode=Mode.UPSERT)
         req = make_request("https://example.com/x")
         _seed_local(cache, make_response(request=req, body=b'{"v":"cached"}'))
 
         s = StubSession()
-        s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
-
         out = s.send(req, local_cache=cache)
-        # UPSERT bypasses the read — the network must fire.
-        assert len(s.calls) == 1
-        assert out.json() == {"v": "fresh"}
+        # UPSERT reads from cache like any other mode.
+        assert len(s.calls) == 0
+        assert out.json() == {"v": "cached"}
 
     def test_received_window_filters_stale_row(self, tmp_path) -> None:
         cache = _local_cfg(
@@ -513,22 +511,21 @@ class TestRemoteCacheSend:
         s.send(req, remote_cache=cfg, raise_error=False)
         assert tab.inserts == [], "5xx response must not write back to remote"
 
-    def test_upsert_skips_lookup_but_persists(self) -> None:
-        # UPSERT bypasses the cache read (always goes to the network)
-        # but still persists the response for downstream consumers.
+    def test_upsert_reads_then_persists(self) -> None:
+        # UPSERT reads from cache like any other mode and persists
+        # the response back with UPSERT semantics.
         tab = _FakeRemoteTabular()
         cfg = _remote_cfg(tab, mode=Mode.UPSERT)
-        req = make_request("https://example.com/x")
-        _seed_remote(tab, make_response(request=req, body=b'{"v":"old"}'))
 
+        # Miss case: no seeded row → network fetch → persist.
+        req = make_request("https://example.com/x")
         s = StubSession()
         s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
         out = s.send(req, remote_cache=cfg)
 
-        assert len(s.calls) == 1, "UPSERT must always go to the network"
+        assert len(s.calls) == 1, "miss must hit the network"
         assert out.json() == {"v": "fresh"}
-        assert tab.predicates == [], "UPSERT must not issue a lookup query"
-        assert len(tab.inserts) == 1, "UPSERT must persist the fresh response"
+        assert len(tab.inserts) == 1
         assert tab.inserts[0]["mode"] == Mode.UPSERT
 
     def test_per_request_override_routes_to_alt_table(self) -> None:

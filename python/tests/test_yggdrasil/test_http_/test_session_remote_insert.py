@@ -233,9 +233,8 @@ class TestSendManyRemoteInsert:
         assert inserted_a == 1, f"tab_a should have 1 insert, got {inserted_a}"
         assert inserted_b == 1, f"tab_b should have 1 insert, got {inserted_b}"
 
-    def test_upsert_mode_skips_lookup_but_persists_in_send_many(self):
-        """UPSERT mode in send_many skips the cache lookup but still
-        persists the response."""
+    def test_upsert_mode_reads_and_persists_in_send_many(self):
+        """UPSERT mode in send_many reads from cache and persists."""
         tab = FakeTable()
         cfg = _cache(tab, mode=Mode.UPSERT)
 
@@ -245,8 +244,8 @@ class TestSendManyRemoteInsert:
 
         list(s.send_many(iter([req]), remote_cache=cfg))
 
-        assert len(s.calls) == 1, "UPSERT must fetch from network"
-        assert len(tab.lookups) == 0, "UPSERT must not lookup"
+        assert len(s.calls) == 1, "miss must fetch from network"
+        assert len(tab.lookups) == 1, "UPSERT reads from cache"
         assert len(tab.inserts) == 1, "UPSERT must persist the response"
         assert tab.inserts[0]["mode"] == Mode.UPSERT
 
@@ -298,11 +297,11 @@ class TestSendManyRemoteInsert:
 
 
 class TestSendManyUpsertOverwritePersist:
-    """UPSERT and OVERWRITE modes skip the cache read but still write
-    back to remote (and local) caches."""
+    """All modes read from cache then write back with their own
+    semantics.  The mode is passed through to the insert call."""
 
     def test_upsert_single_send_persists(self):
-        """Single send() with UPSERT skips read but persists."""
+        """Single send() with UPSERT reads and persists."""
         tab = FakeTable()
         cfg = _cache(tab, mode=Mode.UPSERT)
         req = make_request("https://api.example.com/u")
@@ -312,7 +311,7 @@ class TestSendManyUpsertOverwritePersist:
         s.send(req, remote_cache=cfg)
 
         assert len(s.calls) == 1
-        assert len(tab.lookups) == 0, "UPSERT must not look up"
+        assert len(tab.lookups) == 1, "UPSERT reads from cache"
         assert len(tab.inserts) == 1
         assert tab.inserts[0]["mode"] == Mode.UPSERT
         assert tab.inserts[0]["rows"] == 1
@@ -332,7 +331,7 @@ class TestSendManyUpsertOverwritePersist:
         assert tab.inserts[0]["mode"] == Mode.OVERWRITE
 
     def test_upsert_send_many_persists(self):
-        """send_many with UPSERT skips cache read but persists."""
+        """send_many with UPSERT reads and persists."""
         tab = FakeTable()
         cfg = _cache(tab, mode=Mode.UPSERT)
 
@@ -347,7 +346,7 @@ class TestSendManyUpsertOverwritePersist:
         list(s.send_many(iter(reqs), remote_cache=cfg))
 
         assert len(s.calls) == 2
-        assert len(tab.lookups) == 0, "UPSERT must not look up"
+        assert len(tab.lookups) == 1, "UPSERT reads from cache"
         total = sum(i["rows"] for i in tab.inserts)
         assert total == 2, "both responses must be persisted"
         assert all(i["mode"] == Mode.UPSERT for i in tab.inserts)

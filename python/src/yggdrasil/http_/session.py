@@ -825,7 +825,7 @@ class HTTPSession(Session):
         Returns ``None`` when *cache_cfg* is disabled, the mode
         disables reads, or no matching response exists.
         """
-        if cache_cfg is None or not cache_cfg.cache_read_enabled:
+        if cache_cfg is None or not cache_cfg.cache_enabled:
             return None
         tabular = cache_cfg.tabular
         if tabular is None:
@@ -1484,6 +1484,8 @@ class HTTPSession(Session):
         remote_holder: "IO | None",
         reqs: list[PreparedRequest],
         *,
+        local_mode: "Mode | None" = None,
+        remote_mode: "Mode | None" = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
@@ -1491,16 +1493,14 @@ class HTTPSession(Session):
         spark = reqs[0].send_config_or_default.spark_session if reqs else None
         n = len(reqs)
         LOGGER.debug(
-            "Processing batch (requests=%d, local=%r, remote=%r)",
-            n, local_holder, remote_holder,
+            "Processing batch (requests=%d, local=%r [%s], remote=%r [%s])",
+            n, local_holder, local_mode, remote_holder, remote_mode,
         )
         local_hits: "Tabular | None" = None
         remote_hits: "Tabular | None" = None
         misses = reqs
-        lc = reqs[0].local_cache_config if reqs else None
-        rc = reqs[0].remote_cache_config if reqs else None
 
-        if local_holder is not None and lc is not None and lc.cache_read_enabled:
+        if local_holder is not None:
             local_hits, misses = self._read_holder(
                 local_holder, reqs, "local_cache_config",
                 spark_session=spark,
@@ -1512,7 +1512,7 @@ class HTTPSession(Session):
                     local_count, n, local_holder,
                 )
 
-        if remote_holder is not None and rc is not None and rc.cache_read_enabled and misses:
+        if remote_holder is not None and misses:
             before = len(misses)
             remote_hits, misses = self._read_holder(
                 remote_holder, misses, "remote_cache_config",
@@ -2115,10 +2115,10 @@ class HTTPSession(Session):
                 chunk_index, len(chunk), len(groups),
             )
 
-            for key, reqs in groups.items():
-                local_holder, remote_holder = key[0], key[1]
+            for (local_holder, remote_holder, local_mode, remote_mode, _), reqs in groups.items():
                 batch = self._send_batch(
                     local_holder, remote_holder, reqs,
+                    local_mode=local_mode, remote_mode=remote_mode,
                     ordered=ordered, max_in_flight=max_in_flight,
                 )
                 total_cache_hits += len(reqs) - len(batch.misses)
