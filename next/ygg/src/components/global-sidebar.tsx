@@ -199,11 +199,11 @@ export function GlobalSidebar({ onCollapse }: { onCollapse?: (collapsed: boolean
     >
       {/* ── Logo + collapse button ── */}
       <div
-        className="flex items-center h-14 shrink-0 px-3"
+        className="flex items-center justify-between h-14 shrink-0 px-3 relative"
         style={{ borderBottom: "1px solid var(--sidebar-border)" }}
       >
         {!collapsed && (
-          <Link href="/" className="flex items-center gap-2.5 flex-1 min-w-0 mr-1">
+          <Link href="/" className="flex items-center gap-2.5 flex-1 min-w-0">
             <YggdrasilLogo size={22} className="text-primary shrink-0" />
             <span className="font-bold text-sm tracking-widest uppercase truncate" style={{ color: "var(--foreground)" }}>
               Yggdrasil
@@ -217,11 +217,14 @@ export function GlobalSidebar({ onCollapse }: { onCollapse?: (collapsed: boolean
             </Link>
           </div>
         )}
+        
+        {/* Collapse button - positioned on the right edge */}
         <button
           onClick={toggleCollapse}
-          className="shrink-0 rounded-md p-1 transition-colors"
-          style={{ color: "var(--muted)" }}
+          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-md p-1.5 transition-all hover:bg-border/20"
+          style={{ color: "var(--muted-foreground)" }}
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={collapsed ? "Expand" : "Collapse"}
         >
           {collapsed ? Icon.chevronRight : Icon.chevronLeft}
         </button>
