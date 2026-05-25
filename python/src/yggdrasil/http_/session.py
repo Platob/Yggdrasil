@@ -1604,6 +1604,18 @@ class HTTPSession(Session):
             len(new_list), len(failed),
         )
 
+        if new_list and remote_hits is not None:
+            existing = remote_hits.read_arrow_table()
+            if existing.num_rows > 0:
+                existing_keys = set(zip(
+                    existing.column("public_hash").to_pylist(),
+                    existing.column("body_hash").to_pylist(),
+                ))
+                new_list = [
+                    r for r in new_list
+                    if (r.public_hash, r.body_hash) not in existing_keys
+                ]
+
         if new_list:
             _hits = new_list
             wb: list[Callable] = []
