@@ -4,6 +4,22 @@ import { useEffect, useState } from "react";
 import { node as api, type DagEntry, type DagStep, type DagEdge, type FunctionEntry, type EnvironmentEntry } from "@/lib/api";
 import Link from "next/link";
 
+// ── Custom SVG Icons ──────────────────────────────────────────
+const EnvIcon = ({ size = 14, className = "" }: { size?: number; className?: string }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className={className}>
+    <path d="M12 2l8 4.5v9L12 20l-8-4.5v-9L12 2z"/>
+    <path d="M12 7l5 2.8v5.4L12 18l-5-2.8V9.8L12 7z" strokeOpacity="0.5"/>
+    <line x1="12" y1="2" x2="12" y2="7" strokeOpacity="0.3"/>
+  </svg>
+);
+
+const FuncIcon = ({ size = 14, className = "" }: { size?: number; className?: string }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={className}>
+    <path d="M6 4h4l2 6 4 10h4"/>
+    <path d="M6 20h4l4-10"/>
+  </svg>
+);
+
 // -- Demo data --
 const DEMO_DAGS: DagEntry[] = [
   {
@@ -44,8 +60,10 @@ const DEMO_DAGS: DagEntry[] = [
 interface StepDraft {
   name: string;
   function_id: number | null;
+  is_dag: boolean;
   environment_id: number | null;
   depends_on: string[];
+  args_override: string;
 }
 
 interface EdgeDraft {
@@ -66,8 +84,12 @@ export default function DagsPage() {
   // Form state
   const [formName, setFormName] = useState("");
   const [formDescription, setFormDescription] = useState("");
+  const [formDefaultEnvId, setFormDefaultEnvId] = useState<number | null>(null);
+  const [formDefaultArgs, setFormDefaultArgs] = useState("");
   const [formSteps, setFormSteps] = useState<StepDraft[]>([]);
   const [formEdges, setFormEdges] = useState<EdgeDraft[]>([]);
+  const [formCron, setFormCron] = useState("");
+  const [formCronEnabled, setFormCronEnabled] = useState(false);
   const [formSubmitting, setFormSubmitting] = useState(false);
 
   useEffect(() => {
@@ -102,26 +124,31 @@ export default function DagsPage() {
   }
 
   function addStep() {
-    setFormSteps([...formSteps, { name: "", function_id: null, environment_id: null, depends_on: [] }]);
+    setFormSteps([...formSteps, { name: "", function_id: null, is_dag: false, environment_id: null, depends_on: [], args_override: "" }]);
   }
 
   function removeStep(idx: number) {
     const removed = formSteps[idx];
     const updated = formSteps.filter((_, i) => i !== idx);
-    // Clean up depends_on references
     const cleaned = updated.map((s) => ({
       ...s,
       depends_on: s.depends_on.filter((d) => d !== removed.name),
     }));
     setFormSteps(cleaned);
-    // Clean up edges referencing removed step
     setFormEdges(formEdges.filter((e) => e.from_step !== removed.name && e.to_step !== removed.name));
+  }
+
+  function moveStep(idx: number, direction: "up" | "down") {
+    const newIdx = direction === "up" ? idx - 1 : idx + 1;
+    if (newIdx < 0 || newIdx >= formSteps.length) return;
+    const updated = [...formSteps];
+    [updated[idx], updated[newIdx]] = [updated[newIdx], updated[idx]];
+    setFormSteps(updated);
   }
 
   function updateStep(idx: number, patch: Partial<StepDraft>) {
     const oldName = formSteps[idx].name;
     const updated = formSteps.map((s, i) => i === idx ? { ...s, ...patch } : s);
-    // If name changed, update depends_on and edges
     if (patch.name && patch.name !== oldName && oldName) {
       const newName = patch.name;
       const fixed = updated.map((s) => ({
@@ -146,14 +173,12 @@ export default function DagsPage() {
       : [...step.depends_on, depName];
     updateStep(stepIdx, { depends_on: deps });
 
-    // Auto-create edge placeholder for new dependencies
     if (!step.depends_on.includes(depName)) {
       const existingEdge = formEdges.find((e) => e.from_step === depName && e.to_step === step.name);
       if (!existingEdge && step.name) {
         setFormEdges([...formEdges, { from_step: depName, to_step: step.name, output_key: "output", input_key: "input" }]);
       }
     } else {
-      // Remove edge when dependency removed
       setFormEdges(formEdges.filter((e) => !(e.from_step === depName && e.to_step === step.name)));
     }
   }
@@ -166,34 +191,55 @@ export default function DagsPage() {
     e.preventDefault();
     setFormSubmitting(true);
     try {
+      let defaultArgs: Record<string, unknown> = {};
+      if (formDefaultArgs.trim()) {
+        try { defaultArgs = JSON.parse(formDefaultArgs); } catch { /* ignore invalid json */ }
+      }
+
       const steps: DagStep[] = formSteps
         .filter((s) => s.name && s.function_id != null)
-        .map((s) => ({
-          id: s.name,
-          ref: {
-            node_url: null,
-            function_id: s.function_id!,
-            environment_id: s.environment_id,
-            args: {},
-          },
-          depends_on: s.depends_on,
-        }));
+        .map((s) => {
+          let stepArgs: Record<string, unknown> = { ...defaultArgs };
+          if (s.args_override.trim()) {
+            try { stepArgs = { ...stepArgs, ...JSON.parse(s.args_override) }; } catch { /* skip */ }
+          }
+          return {
+            id: s.name,
+            ref: {
+              node_url: null,
+              function_id: s.function_id!,
+              environment_id: s.environment_id ?? formDefaultEnvId,
+              args: stepArgs,
+            },
+            depends_on: s.depends_on,
+          };
+        });
 
       const edges: DagEdge[] = formEdges.filter(
         (e) => e.from_step && e.to_step && e.output_key && e.input_key
       );
 
+      // Build description with cron info if enabled
+      let description = formDescription;
+      if (formCronEnabled && formCron.trim()) {
+        description = `[cron: ${formCron.trim()}] ${description}`;
+      }
+
       await api.createDag({
         name: formName,
-        description: formDescription,
+        description,
         steps,
         edges,
       });
       setShowForm(false);
       setFormName("");
       setFormDescription("");
+      setFormDefaultEnvId(null);
+      setFormDefaultArgs("");
       setFormSteps([]);
       setFormEdges([]);
+      setFormCron("");
+      setFormCronEnabled(false);
       await loadDags();
     } catch (err) {
       setError(`Create failed: ${err}`);
@@ -212,7 +258,6 @@ export default function DagsPage() {
     );
   }
 
-  // Available step names for dependency selection
   const stepNames = formSteps.map((s) => s.name).filter(Boolean);
 
   return (
@@ -238,12 +283,12 @@ export default function DagsPage() {
         </div>
       </div>
 
-      {/* Creation Form with Step Builder */}
+      {/* Interactive DAG Builder */}
       {showForm && (
         <form onSubmit={handleCreate} className="nordic-card p-5 space-y-5">
           <h2 className="text-sm font-semibold text-foreground">Create DAG</h2>
 
-          {/* Name + Description */}
+          {/* DAG Header: name + description */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs text-muted mb-1.5">Name</label>
@@ -258,17 +303,46 @@ export default function DagsPage() {
             </div>
             <div>
               <label className="block text-xs text-muted mb-1.5">Description</label>
-              <input
-                type="text"
+              <textarea
                 value={formDescription}
                 onChange={(e) => setFormDescription(e.target.value)}
                 className="input-nordic w-full text-sm"
+                rows={2}
                 placeholder="What does this pipeline do?"
               />
             </div>
           </div>
 
-          {/* Steps */}
+          {/* Default Environment + Default Args */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Default Environment</label>
+              <select
+                value={formDefaultEnvId ?? ""}
+                onChange={(e) => setFormDefaultEnvId(e.target.value ? parseInt(e.target.value, 10) : null)}
+                className="input-nordic w-full text-sm"
+              >
+                <option value="">None</option>
+                {environments.map((env) => (
+                  <option key={env.id} value={env.id}>{env.name}</option>
+                ))}
+              </select>
+              <p className="text-[10px] text-muted mt-1">Inherited by steps unless overridden</p>
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Default Args (JSON)</label>
+              <textarea
+                value={formDefaultArgs}
+                onChange={(e) => setFormDefaultArgs(e.target.value)}
+                className="input-nordic w-full text-sm font-mono"
+                rows={2}
+                placeholder='{"key": "value"}'
+              />
+              <p className="text-[10px] text-muted mt-1">Passed to all steps unless overridden</p>
+            </div>
+          </div>
+
+          {/* Step Builder */}
           <div>
             <div className="flex items-center justify-between mb-3">
               <label className="text-xs font-medium text-muted uppercase tracking-wider">Steps</label>
@@ -279,19 +353,18 @@ export default function DagsPage() {
 
             {formSteps.length === 0 && (
               <div className="border border-dashed border-border rounded-lg p-4 text-center">
-                <p className="text-xs text-muted">No steps yet. Click "Add Step" to build your pipeline.</p>
+                <p className="text-xs text-muted">No steps yet. Click &quot;Add Step&quot; to build your pipeline.</p>
               </div>
             )}
 
-            <div className="space-y-3">
+            <div className="space-y-1">
               {formSteps.map((step, idx) => {
-                // Available deps: all steps before this one that have a name
                 const availableDeps = stepNames.filter((n) => n !== step.name);
 
                 return (
                   <div key={idx} className="relative">
-                    {/* Dependency arrow visual */}
-                    {idx > 0 && step.depends_on.length > 0 && (
+                    {/* Down-arrow connector between steps */}
+                    {idx > 0 && (
                       <div className="flex justify-center py-1">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-primary/40">
                           <line x1="8" y1="0" x2="8" y2="12" />
@@ -300,77 +373,170 @@ export default function DagsPage() {
                       </div>
                     )}
 
+                    {/* Step Card */}
                     <div className="bg-card border border-border rounded-lg p-4">
                       <div className="flex items-start gap-3">
-                        <span className="text-xs font-mono text-muted mt-1.5 shrink-0">#{idx + 1}</span>
-                        <div className="flex-1 grid grid-cols-1 md:grid-cols-4 gap-3">
-                          {/* Step name */}
+                        {/* Reorder buttons */}
+                        <div className="flex flex-col gap-0.5 shrink-0 mt-1">
+                          <button
+                            type="button"
+                            onClick={() => moveStep(idx, "up")}
+                            disabled={idx === 0}
+                            className="text-muted hover:text-foreground disabled:opacity-20 transition-colors"
+                          >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="18 15 12 9 6 15"/></svg>
+                          </button>
+                          <span className="text-[9px] font-mono text-muted text-center">#{idx + 1}</span>
+                          <button
+                            type="button"
+                            onClick={() => moveStep(idx, "down")}
+                            disabled={idx === formSteps.length - 1}
+                            className="text-muted hover:text-foreground disabled:opacity-20 transition-colors"
+                          >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9"/></svg>
+                          </button>
+                        </div>
+
+                        <div className="flex-1 space-y-3">
+                          {/* Row 1: name + function/DAG selector + environment */}
+                          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                            {/* Step name */}
+                            <div>
+                              <label className="block text-[10px] text-muted mb-1">Step Name</label>
+                              <input
+                                type="text"
+                                value={step.name}
+                                onChange={(e) => updateStep(idx, { name: e.target.value.replace(/\s/g, "_") })}
+                                className="input-nordic w-full text-xs font-mono"
+                                placeholder="step_name"
+                                required
+                              />
+                            </div>
+
+                            {/* Function / DAG selector */}
+                            <div>
+                              <label className="block text-[10px] text-muted mb-1">
+                                {step.is_dag ? (
+                                  <span className="flex items-center gap-1">Sub-DAG</span>
+                                ) : (
+                                  <span className="flex items-center gap-1"><FuncIcon size={10} /> Function</span>
+                                )}
+                              </label>
+                              <select
+                                value={step.is_dag ? `dag:${step.function_id ?? ""}` : String(step.function_id ?? "")}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  if (val.startsWith("dag:")) {
+                                    const dagId = val.replace("dag:", "");
+                                    updateStep(idx, { function_id: dagId ? parseInt(dagId, 10) : null, is_dag: true });
+                                  } else {
+                                    updateStep(idx, { function_id: val ? parseInt(val, 10) : null, is_dag: false });
+                                  }
+                                }}
+                                className="input-nordic w-full text-xs"
+                                required
+                              >
+                                <option value="">Select...</option>
+                                <optgroup label="Functions">
+                                  {functions.map((fn) => (
+                                    <option key={`fn-${fn.id}`} value={String(fn.id)}>{fn.name}</option>
+                                  ))}
+                                </optgroup>
+                                {dags.length > 0 && (
+                                  <optgroup label="Sub-DAGs">
+                                    {dags.map((d) => (
+                                      <option key={`dag-${d.id}`} value={`dag:${d.id}`}>dag: {d.name}</option>
+                                    ))}
+                                  </optgroup>
+                                )}
+                              </select>
+                            </div>
+
+                            {/* Environment override */}
+                            <div>
+                              <label className="block text-[10px] text-muted mb-1">
+                                <span className="flex items-center gap-1"><EnvIcon size={10} /> Environment</span>
+                              </label>
+                              <select
+                                value={step.environment_id ?? ""}
+                                onChange={(e) => updateStep(idx, { environment_id: e.target.value ? parseInt(e.target.value, 10) : null })}
+                                className="input-nordic w-full text-xs"
+                              >
+                                <option value="">{formDefaultEnvId ? "Inherit default" : "None"}</option>
+                                {environments.map((env) => (
+                                  <option key={env.id} value={env.id}>{env.name}</option>
+                                ))}
+                              </select>
+                            </div>
+
+                            {/* Depends on */}
+                            <div>
+                              <label className="block text-[10px] text-muted mb-1">Depends On</label>
+                              {availableDeps.length === 0 ? (
+                                <span className="text-[10px] text-muted italic">No prior steps</span>
+                              ) : (
+                                <div className="flex flex-wrap gap-1">
+                                  {availableDeps.map((dep) => (
+                                    <button
+                                      key={dep}
+                                      type="button"
+                                      onClick={() => toggleDependency(idx, dep)}
+                                      className={`text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                                        step.depends_on.includes(dep)
+                                          ? "bg-primary/15 border-primary/30 text-primary"
+                                          : "bg-border/30 border-border text-muted hover:border-primary/30"
+                                      }`}
+                                    >
+                                      {dep}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Row 2: Args override (optional) */}
                           <div>
-                            <label className="block text-[10px] text-muted mb-1">Step Name</label>
+                            <label className="block text-[10px] text-muted mb-1">Args Override (JSON, optional)</label>
                             <input
                               type="text"
-                              value={step.name}
-                              onChange={(e) => updateStep(idx, { name: e.target.value.replace(/\s/g, "_") })}
+                              value={step.args_override}
+                              onChange={(e) => updateStep(idx, { args_override: e.target.value })}
                               className="input-nordic w-full text-xs font-mono"
-                              placeholder="step_name"
-                              required
+                              placeholder='{"key": "override_value"}'
                             />
                           </div>
 
-                          {/* Function selector */}
-                          <div>
-                            <label className="block text-[10px] text-muted mb-1">Function</label>
-                            <select
-                              value={step.function_id ?? ""}
-                              onChange={(e) => updateStep(idx, { function_id: e.target.value ? parseInt(e.target.value, 10) : null })}
-                              className="input-nordic w-full text-xs"
-                              required
-                            >
-                              <option value="">Select...</option>
-                              {functions.map((fn) => (
-                                <option key={fn.id} value={fn.id}>{fn.name}</option>
-                              ))}
-                            </select>
-                          </div>
-
-                          {/* Environment selector */}
-                          <div>
-                            <label className="block text-[10px] text-muted mb-1">Environment</label>
-                            <select
-                              value={step.environment_id ?? ""}
-                              onChange={(e) => updateStep(idx, { environment_id: e.target.value ? parseInt(e.target.value, 10) : null })}
-                              className="input-nordic w-full text-xs"
-                            >
-                              <option value="">Default</option>
-                              {environments.map((env) => (
-                                <option key={env.id} value={env.id}>{env.name}</option>
-                              ))}
-                            </select>
-                          </div>
-
-                          {/* Depends on */}
-                          <div>
-                            <label className="block text-[10px] text-muted mb-1">Depends On</label>
-                            {availableDeps.length === 0 ? (
-                              <span className="text-[10px] text-muted italic">No prior steps</span>
-                            ) : (
-                              <div className="flex flex-wrap gap-1">
-                                {availableDeps.map((dep) => (
-                                  <button
-                                    key={dep}
-                                    type="button"
-                                    onClick={() => toggleDependency(idx, dep)}
-                                    className={`text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                                      step.depends_on.includes(dep)
-                                        ? "bg-primary/15 border-primary/30 text-primary"
-                                        : "bg-border/30 border-border text-muted hover:border-primary/30"
-                                    }`}
-                                  >
-                                    {dep}
-                                  </button>
-                                ))}
-                              </div>
+                          {/* Step info badges */}
+                          <div className="flex flex-wrap gap-2">
+                            {step.function_id != null && !step.is_dag && (
+                              <span className="flex items-center gap-1 text-[10px] font-mono text-primary/70 bg-primary/5 px-1.5 py-0.5 rounded border border-primary/15">
+                                <FuncIcon size={12} />
+                                <span className="hidden sm:inline">{functions.find((f) => f.id === step.function_id)?.name ?? `#${step.function_id}`}</span>
+                              </span>
                             )}
+                            {step.function_id != null && step.is_dag && (
+                              <span className="flex items-center gap-1 text-[10px] font-mono text-warning/80 bg-warning/5 px-1.5 py-0.5 rounded border border-warning/15">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <circle cx="5" cy="6" r="3"/><circle cx="19" cy="6" r="3"/><circle cx="12" cy="18" r="3"/>
+                                  <line x1="7.5" y1="7.5" x2="10.5" y2="16.5"/><line x1="16.5" y1="7.5" x2="13.5" y2="16.5"/>
+                                </svg>
+                                <span className="hidden sm:inline">{dags.find((d) => d.id === step.function_id)?.name ?? `dag #${step.function_id}`}</span>
+                              </span>
+                            )}
+                            {(step.environment_id ?? formDefaultEnvId) != null && (
+                              <span className="flex items-center gap-1 text-[10px] font-mono text-muted bg-border/30 px-1.5 py-0.5 rounded border border-border">
+                                <EnvIcon size={12} />
+                                <span className="hidden sm:inline">
+                                  {environments.find((e) => e.id === (step.environment_id ?? formDefaultEnvId))?.name ?? `#${step.environment_id ?? formDefaultEnvId}`}
+                                </span>
+                              </span>
+                            )}
+                            {step.depends_on.map((dep) => (
+                              <span key={dep} className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20">
+                                {dep}
+                              </span>
+                            ))}
                           </div>
                         </div>
 
@@ -426,6 +592,38 @@ export default function DagsPage() {
             </div>
           )}
 
+          {/* Schedule Section */}
+          <div>
+            <label className="text-xs font-medium text-muted uppercase tracking-wider mb-3 block">Schedule</label>
+            <div className="bg-card border border-border rounded-lg p-4 space-y-3">
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setFormCronEnabled(!formCronEnabled)}
+                  className={`relative w-9 h-5 rounded-full transition-colors ${formCronEnabled ? "bg-primary" : "bg-border"}`}
+                >
+                  <span
+                    className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${formCronEnabled ? "translate-x-4" : "translate-x-0"}`}
+                  />
+                </button>
+                <span className="text-xs text-foreground">Enable scheduled runs</span>
+              </div>
+              {formCronEnabled && (
+                <div>
+                  <label className="block text-[10px] text-muted mb-1">Cron Expression</label>
+                  <input
+                    type="text"
+                    value={formCron}
+                    onChange={(e) => setFormCron(e.target.value)}
+                    className="input-nordic w-full text-sm font-mono"
+                    placeholder="*/5 * * * *"
+                  />
+                  <p className="text-[10px] text-muted mt-1">Standard cron format: minute hour day month weekday</p>
+                </div>
+              )}
+            </div>
+          </div>
+
           <div className="flex justify-end">
             <button type="submit" className="btn-primary text-sm" disabled={formSubmitting || formSteps.length === 0}>
               {formSubmitting ? "Creating..." : "Create DAG"}
@@ -464,8 +662,9 @@ export default function DagsPage() {
                         <polyline points="12 5 12 19" /><polyline points="19 12 12 19 5 12" />
                       </svg>
                     )}
-                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20">
-                      {step.id}
+                    <span className="flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20">
+                      <FuncIcon size={10} />
+                      <span className="hidden sm:inline">{step.id}</span>
                     </span>
                   </div>
                 ))}

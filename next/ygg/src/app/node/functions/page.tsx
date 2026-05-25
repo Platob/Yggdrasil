@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { node as api, type FunctionEntry, type EnvironmentEntry } from "@/lib/api";
+import { node as api, type FunctionEntry, type EnvironmentEntry, type NodeInfo } from "@/lib/api";
+import { formatRelative } from "@/lib/time";
 import Link from "next/link";
 
 // ── Demo data ────────────────────────────────────────────────
@@ -86,9 +87,17 @@ export default function FunctionsPage() {
   const [formEnvId, setFormEnvId] = useState<number | null>(null);
   const [formSubmitting, setFormSubmitting] = useState(false);
 
+  // Clone modal state
+  const [cloneTarget, setCloneTarget] = useState<FunctionEntry | null>(null);
+  const [cloneName, setCloneName] = useState("");
+  const [cloneNodeId, setCloneNodeId] = useState("");
+  const [cloning, setCloning] = useState(false);
+  const [nodes, setNodes] = useState<NodeInfo[]>([]);
+
   useEffect(() => {
     loadFunctions();
     loadEnvironments();
+    loadNodes();
   }, []);
 
   async function loadFunctions() {
