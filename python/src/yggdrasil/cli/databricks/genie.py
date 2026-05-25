@@ -538,7 +538,11 @@ class GenieCLI(DatabricksCLI):
             self.warn("  interrupted.")
             return
         except ValueError as exc:
-            if "auto-pick" in str(exc) and self._prompt_space():
+            msg = str(exc)
+            if "auto-pick" in msg and self._prompt_space():
+                self.ask(question)
+                return
+            if "managed_space_tables" in msg and self._prompt_tables():
                 self.ask(question)
                 return
             self.error(f"  error: {exc}")
@@ -649,6 +653,30 @@ class GenieCLI(DatabricksCLI):
             auto_create_space=True,
         )
         self.info("  creating space…")
+        return True
+
+    def _prompt_tables(self) -> bool:
+        """Ask the user which tables to expose in the Genie space."""
+        self.info("  Genie needs at least one table to create a space.")
+        try:
+            raw = self.input_fn(
+                self.style.cyan("  tables ")
+                + self.style.dim("(catalog.schema.table, comma-separated): "),
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            self.out("")
+            return False
+        if not raw:
+            self.error("  at least one table is required.")
+            return False
+        tables = tuple(t.strip() for t in raw.split(",") if t.strip())
+        if not tables:
+            self.error("  at least one table is required.")
+            return False
+        self.genie.defaults = _dc_replace(
+            self.defaults, managed_space_tables=tables,
+        )
+        self.info(f"  tables: {', '.join(tables)}")
         return True
 
     # ------------------------------------------------------------------ #
