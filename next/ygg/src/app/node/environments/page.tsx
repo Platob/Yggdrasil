@@ -412,9 +412,24 @@ export default function EnvironmentsPage() {
       </div>
 
       {environments.length === 0 && (
-        <div className="nordic-card p-8 text-center">
-          <p className="text-muted text-sm">No environments configured yet.</p>
-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-4">
+        <div className="nordic-card p-6 space-y-4">
+          <h2 className="text-sm font-semibold text-foreground">Python Environments</h2>
+          <p className="text-sm text-muted">Manage isolated Python environments with uv.</p>
+
+          <div className="code-block p-3 text-xs">
+            <p className="text-muted mb-1"># Create an environment via decorator</p>
+            <p>@function(environment=&quot;ml-env&quot;)</p>
+            <p>def train(data):</p>
+            <p>    import torch  # available in ml-env</p>
+            <p>    return model.train(data)</p>
+          </div>
+
+          <div className="code-block p-3 text-xs">
+            <p className="text-muted mb-1"># Each environment auto-installs yggdrasil + uv</p>
+            <p>run = train.with_env(&quot;ml-env&quot;)(data)</p>
+          </div>
+
+          <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-2">
             Create your first environment
           </button>
         </div>

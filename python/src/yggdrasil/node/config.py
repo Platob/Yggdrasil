@@ -81,6 +81,14 @@ class Settings:
         return self.data_root / "jobs"
 
     @property
+    def files_root(self) -> Path:
+        return self.data_root / "files"
+
+    @property
+    def mirrors_root(self) -> Path:
+        return self.node_home / "mirrors"
+
+    @property
     def cache_root(self) -> Path:
         return self.node_home / "cache"
 

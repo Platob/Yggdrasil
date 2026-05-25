@@ -63,6 +63,12 @@ class NodePath:
     When ``node_url`` is None, operates directly on the local filesystem
     within the node's data directory.  When ``node_url`` is set, uses
     HTTP calls to the remote node's ``/api/fs`` endpoints.
+
+    Supports ``npfs://`` protocol URLs::
+
+        npfs://node-host:port/path/to/content
+        npfs://localhost:8100/data/input.csv
+        npfs:///local/path  (triple slash = local node)
     """
 
     __slots__ = ("_path", "_node_url", "_root")
@@ -85,6 +91,84 @@ class NodePath:
             self._root = get_settings().data_root / "files"
         else:
             self._root = _root
+
+    # ── NPFS Protocol URL support ────────────────────────────
+
+    @classmethod
+    def from_url(cls, url: str) -> "NodePath":
+        """Parse npfs://host:port/path URL.
+
+        Supports:
+        - ``npfs://host:port/path`` — remote node
+        - ``npfs:///path`` — local node (triple slash)
+        - Plain paths (no scheme) — treated as local
+        """
+        if url.startswith("npfs://"):
+            parsed = urlparse(url)
+            host = parsed.hostname or ""
+            port = parsed.port or 8100
+            path = parsed.path.lstrip("/")
+            if not host or _is_local_url(f"http://{host}:{port}"):
+                return cls(path)
+            return cls(path, node_url=f"http://{host}:{port}")
+        return cls(url)
+
+    def to_url(self) -> str:
+        """Convert to npfs:// URL.
+
+        Local paths use triple-slash (``npfs:///path``).
+        Remote paths include host and port.
+        """
+        if self.is_local:
+            return f"npfs:///{self._path}"
+        parsed = urlparse(self._node_url)
+        return f"npfs://{parsed.hostname}:{parsed.port or 8100}/{self._path}"
+
+    @classmethod
+    def from_(cls, value) -> "NodePath | None":
+        """Polymorphic constructor — accepts str, NodePath, None.
+
+        Returns None if value is None, passes through NodePath instances,
+        and parses strings as npfs:// URLs or plain paths.
+        """
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return value
+        return cls.from_url(str(value))
+
+    # ── Mirror support ───────────────────────────────────────
+
+    def _get_node_home(self) -> Path:
+        """Get the node home directory."""
+        from .config import get_settings
+        return get_settings().node_home
+
+    def mirror_local(self) -> "NodePath":
+        """Get the local mirror path for a remote resource.
+
+        Remote files are mirrored under .ygg/mirrors/{node_id}/.
+        Local paths return self unchanged.
+        """
+        if self.is_local:
+            return self
+        parsed = urlparse(self._node_url)
+        node_id = f"{parsed.hostname}_{parsed.port or 8100}"
+        mirror_root = self._get_node_home() / "mirrors" / node_id
+        return NodePath(str(self._path), _root=mirror_root)
+
+    def sync_from_remote(self) -> "NodePath":
+        """Download remote file to local mirror.
+
+        For local paths, returns self unchanged. For remote paths,
+        fetches the content and writes it to the local mirror location.
+        """
+        if self.is_local:
+            return self
+        local = self.mirror_local()
+        data = self.read_bytes()
+        local.write_bytes(data)
+        return local
 
     @property
     def is_local(self) -> bool:

@@ -33,23 +33,25 @@ def client(settings):
 
 
 class TestFilesystemListDir:
-    def test_list_empty_root(self, client):
+    def test_list_root_has_defaults(self, client):
         resp = client.get("/api/fs/ls")
         assert resp.status_code == 200
         data = resp.json()
         assert data["node_id"] == "test-node-001"
-        assert data["path"] == ""
-        assert data["entries"] == []
+        names = [e["name"] for e in data["entries"]]
+        for d in ("data", "cache", "logs"):
+            assert d in names, f"{d} missing from root listing"
 
     def test_list_with_files(self, client, settings):
-        # Create some files in the fs root
-        fs_root = settings.data_root / "files"
-        fs_root.mkdir(parents=True, exist_ok=True)
-        (fs_root / "hello.txt").write_text("hi")
-        (fs_root / "subdir").mkdir()
-        (fs_root / "subdir" / "nested.txt").write_text("nested")
+        # Create some files in a subdirectory of node home
+        fs_root = settings.node_home
+        test_dir = fs_root / "workspace"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        (test_dir / "hello.txt").write_text("hi")
+        (test_dir / "subdir").mkdir()
+        (test_dir / "subdir" / "nested.txt").write_text("nested")
 
-        resp = client.get("/api/fs/ls")
+        resp = client.get("/api/fs/ls", params={"path": "workspace"})
         assert resp.status_code == 200
         data = resp.json()
         entries = data["entries"]
@@ -61,7 +63,7 @@ class TestFilesystemListDir:
         assert entries[1]["is_dir"] is False
 
     def test_list_subdirectory(self, client, settings):
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         fs_root.mkdir(parents=True, exist_ok=True)
         (fs_root / "mydir").mkdir()
         (fs_root / "mydir" / "a.txt").write_text("aaa")
@@ -139,7 +141,7 @@ class TestFilesystemReadWrite:
 
 class TestFilesystemDelete:
     def test_delete_file(self, client, settings):
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         fs_root.mkdir(parents=True, exist_ok=True)
         (fs_root / "doomed.txt").write_text("bye")
 
@@ -148,7 +150,7 @@ class TestFilesystemDelete:
         assert not (fs_root / "doomed.txt").exists()
 
     def test_delete_directory(self, client, settings):
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         d = fs_root / "dir_to_rm"
         d.mkdir(parents=True, exist_ok=True)
         (d / "inner.txt").write_text("x")
@@ -164,7 +166,7 @@ class TestFilesystemDelete:
 
 class TestFilesystemMove:
     def test_move_file(self, client, settings):
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         fs_root.mkdir(parents=True, exist_ok=True)
         (fs_root / "src.txt").write_text("moving")
 
@@ -194,13 +196,13 @@ class TestFilesystemMkdir:
         assert info["is_dir"] is True
         assert info["name"] == "dir"
 
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         assert (fs_root / "new" / "nested" / "dir").is_dir()
 
 
 class TestFilesystemStat:
     def test_stat_file(self, client, settings):
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         fs_root.mkdir(parents=True, exist_ok=True)
         (fs_root / "info.txt").write_text("data")
 
@@ -219,7 +221,7 @@ class TestFilesystemStat:
 
 class TestFilesystemStream:
     def test_stream_download(self, client, settings):
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         fs_root.mkdir(parents=True, exist_ok=True)
         content = b"streaming content " * 100
         (fs_root / "big.bin").write_bytes(content)
@@ -240,7 +242,7 @@ class TestFilesystemStream:
         info = resp.json()
         assert info["name"] == "uploaded.bin"
 
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         assert (fs_root / "uploaded.bin").read_bytes() == payload
 
 
@@ -256,7 +258,7 @@ class TestFilesystemSecurity:
 
     def test_move_source_traversal(self, client, settings):
         # Create a file within root to have a valid dest
-        fs_root = settings.data_root / "files"
+        fs_root = settings.node_home
         fs_root.mkdir(parents=True, exist_ok=True)
         (fs_root / "legit.txt").write_text("ok")
 

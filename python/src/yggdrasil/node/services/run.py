@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import os
 import platform
 import resource as resource_mod
 import subprocess
@@ -185,6 +186,7 @@ class RunService:
         python_bin = env_python or sys.executable
         t0 = time.monotonic()
         tmp = None
+        outputs_file = None
 
         try:
             # Write function code to a temp file
@@ -197,6 +199,20 @@ class RunService:
             tmp.flush()
             tmp.close()
 
+            # Create outputs file for structured DAG outputs
+            outputs_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False,
+            )
+            outputs_file.close()
+
+            # Build subprocess environment with ygg runtime variables
+            env = os.environ.copy()
+            env["YGG_RUNTIME_VERSION"] = self.settings.app_version
+            env["YGG_NODE_ID"] = self.settings.node_id
+            env["YGG_NODE_PORT"] = str(self.settings.port)
+            env["__ygg_inputs__"] = json.dumps(args)
+            env["__ygg_outputs_file__"] = outputs_file.name
+
             preexec_fn = self._make_preexec_fn(max_memory_mb)
 
             proc = subprocess.run(
@@ -206,10 +222,21 @@ class RunService:
                 stderr=subprocess.PIPE,
                 timeout=timeout,
                 preexec_fn=preexec_fn,
+                env=env,
             )
 
             duration = round(time.monotonic() - t0, 3)
             status = "completed" if proc.returncode == 0 else "failed"
+
+            # Read structured outputs if any were written
+            result: Any = None
+            outputs_path = Path(outputs_file.name)
+            if outputs_path.exists() and outputs_path.stat().st_size > 0:
+                try:
+                    with open(outputs_path) as f:
+                        result = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
 
             entry = self._update_entry(
                 run_id,
@@ -219,6 +246,7 @@ class RunService:
                 returncode=proc.returncode,
                 stdout=proc.stdout or None,
                 stderr=proc.stderr or None,
+                result=result,
             )
 
             LOGGER.info("Run %r %s (rc=%s, %.2fs)", run_id, status, proc.returncode, duration)
@@ -251,6 +279,8 @@ class RunService:
         finally:
             if tmp is not None:
                 Path(tmp.name).unlink(missing_ok=True)
+            if outputs_file is not None:
+                Path(outputs_file.name).unlink(missing_ok=True)
 
     def _update_entry(self, run_id: int, **updates) -> RunEntry:
         with self._lock:

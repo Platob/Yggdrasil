@@ -423,9 +423,41 @@ export default function FunctionsPage() {
       </div>
 
       {functions.length === 0 && (
-        <div className="nordic-card p-8 text-center">
-          <p className="text-muted text-sm">No functions registered yet.</p>
-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-4">
+        <div className="nordic-card p-6 space-y-4">
+          <h2 className="text-sm font-semibold text-foreground">Getting Started</h2>
+          <p className="text-sm text-muted">Create and run distributed functions with Yggdrasil.</p>
+
+          <div className="space-y-3">
+            <div className="code-block p-3 text-xs">
+              <p className="text-muted mb-1"># Install yggdrasil</p>
+              <p>pip install &quot;yggdrasil[node]&quot;</p>
+            </div>
+
+            <div className="code-block p-3 text-xs">
+              <p className="text-muted mb-1"># Start the node server</p>
+              <p>ygg node serve</p>
+            </div>
+
+            <div className="code-block p-3 text-xs">
+              <p className="text-muted mb-1"># Use the @function decorator</p>
+              <p>from yggdrasil.node import function</p>
+              <p></p>
+              <p>@function</p>
+              <p>def process(data: list) -&gt; dict:</p>
+              <p>    return {'{'}&quot;count&quot;: len(data){'}'}</p>
+              <p></p>
+              <p># Execute — returns a Future-like FunctionRun</p>
+              <p>run = process([1, 2, 3])</p>
+              <p>result = run.wait()</p>
+            </div>
+
+            <div className="code-block p-3 text-xs">
+              <p className="text-muted mb-1"># Run on a remote node</p>
+              <p>run = process.on(&quot;http://node-2:8100&quot;)([1, 2, 3])</p>
+            </div>
+          </div>
+
+          <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-2">
             Create your first function
           </button>
         </div>

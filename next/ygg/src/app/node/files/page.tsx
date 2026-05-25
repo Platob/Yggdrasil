@@ -4,12 +4,21 @@ import { useEffect, useState, useCallback } from "react";
 import { node as api, type FileInfo } from "@/lib/api";
 import { formatRelative } from "@/lib/time";
 
+// -- Default directories for node_home --
+const DEFAULT_DIRS = ["tmp", "downloads", "documents", "data", "logs", "cache", "mirrors"];
+
 // -- Format file size --
 function formatSize(bytes: number): string {
   if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
   return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+// -- Build npfs URL from path --
+function npfsUrl(path: string): string {
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  return `npfs://${normalized}`;
 }
 
 // -- Icons --
@@ -25,6 +34,12 @@ const FileIcon = () => (
   </svg>
 );
 
+const CopyIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>
+);
+
 export default function FilesPage() {
   const [currentPath, setCurrentPath] = useState("");
   const [entries, setEntries] = useState<FileInfo[]>([]);
@@ -34,6 +49,7 @@ export default function FilesPage() {
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
 
   const loadDir = useCallback(async (path: string) => {
     setLoading(true);
@@ -127,10 +143,36 @@ export default function FilesPage() {
     setDeleting(null);
   }
 
+  function copyNpfsUrl(path: string) {
+    const url = npfsUrl(path);
+    navigator.clipboard.writeText(url);
+    setCopiedPath(path);
+    setTimeout(() => setCopiedPath(null), 2000);
+  }
+
   // Build breadcrumb parts
   const breadcrumbs = currentPath
     ? currentPath.split("/").filter(Boolean)
     : [];
+
+  // Merge default directories with entries at root level
+  const displayEntries = (() => {
+    if (currentPath === "" || currentPath === "/") {
+      const existingNames = new Set(entries.map((e) => e.name));
+      const defaultDirEntries: FileInfo[] = DEFAULT_DIRS
+        .filter((name) => !existingNames.has(name))
+        .map((name) => ({
+          path: `/${name}`,
+          name,
+          is_dir: true,
+          size: 0,
+          modified_at: "",
+          created_at: "",
+        }));
+      return [...entries, ...defaultDirEntries];
+    }
+    return entries;
+  })();
 
   return (
     <div className="p-6 space-y-6 animate-in">
@@ -157,11 +199,12 @@ export default function FilesPage() {
         </div>
       </div>
 
-      {/* Breadcrumb */}
+      {/* Breadcrumb with npfs:// path */}
       <div className="flex items-center gap-1 text-xs font-mono">
+        <span className="text-muted select-none">npfs://</span>
         <button
           onClick={() => navigateTo("")}
-          className="text-primary hover:underline px-1"
+          className="text-primary hover:underline px-0.5"
         >
           /
         </button>
@@ -202,7 +245,16 @@ export default function FilesPage() {
       {viewingFile && (
         <div className="nordic-card overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-            <span className="font-mono text-xs text-foreground truncate">{viewingFile.path}</span>
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-mono text-xs text-foreground truncate">{viewingFile.path}</span>
+              <button
+                onClick={() => copyNpfsUrl(viewingFile.path)}
+                className="text-muted hover:text-primary transition-colors shrink-0"
+                title={`Copy ${npfsUrl(viewingFile.path)}`}
+              >
+                <CopyIcon />
+              </button>
+            </div>
             <button onClick={() => setViewingFile(null)} className="btn-ghost text-xs">Close</button>
           </div>
           <pre className="p-4 text-xs font-mono text-foreground-dim overflow-auto max-h-[500px] whitespace-pre-wrap">{viewingFile.content}</pre>
@@ -232,14 +284,14 @@ export default function FilesPage() {
             </button>
           )}
 
-          {entries.length === 0 && !currentPath && (
+          {displayEntries.length === 0 && !currentPath && (
             <div className="p-8 text-center">
               <p className="text-sm text-muted">Empty directory</p>
             </div>
           )}
 
           {/* Sort: directories first, then files */}
-          {[...entries]
+          {[...displayEntries]
             .sort((a, b) => {
               if (a.is_dir && !b.is_dir) return -1;
               if (!a.is_dir && b.is_dir) return 1;
@@ -263,8 +315,26 @@ export default function FilesPage() {
                   {entry.is_dir ? "--" : formatSize(entry.size)}
                 </span>
                 <span className="text-[10px] text-muted shrink-0 w-20 text-right">
-                  {formatRelative(entry.modified_at)}
+                  {entry.modified_at ? formatRelative(entry.modified_at) : "--"}
                 </span>
+                {/* Copy npfs:// URL button */}
+                <button
+                  onClick={() => copyNpfsUrl(entry.path)}
+                  className={`transition-colors shrink-0 ${
+                    copiedPath === entry.path
+                      ? "text-success"
+                      : "text-muted hover:text-primary opacity-0 group-hover:opacity-100"
+                  }`}
+                  title={npfsUrl(entry.path)}
+                >
+                  {copiedPath === entry.path ? (
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                  ) : (
+                    <CopyIcon />
+                  )}
+                </button>
                 <button
                   onClick={() => handleDelete(entry)}
                   disabled={deleting === entry.path}

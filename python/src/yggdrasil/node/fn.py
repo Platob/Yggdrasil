@@ -71,7 +71,7 @@ import time
 import urllib.request
 from typing import Any, Callable, TypeVar, overload
 
-__all__ = ["function", "dag", "FunctionHandle", "FunctionRun", "DagHandle"]
+__all__ = ["function", "dag", "FunctionHandle", "FunctionRun", "DagHandle", "get_input", "set_output"]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -348,7 +348,15 @@ class FunctionHandle:
         functools.update_wrapper(self, func)
 
     def __call__(self, *args: Any, **kwargs: Any) -> FunctionRun:
-        """Execute the function, returns a Future-like FunctionRun."""
+        """Execute the function, returns a Future-like FunctionRun.
+
+        If running inside a ygg runtime (YGG_RUNTIME_VERSION is set) and
+        no explicit remote node is targeted, executes locally in-process
+        without network round-trips.
+        """
+        # If we're inside a ygg runtime, execute locally without network
+        if os.environ.get("YGG_RUNTIME_VERSION") and self._node_url is None:
+            return self._execute_local(*args, **kwargs)
         self._ensure_registered()
         # Build args dict from function signature
         sig = inspect.signature(self._func)
@@ -363,6 +371,30 @@ class FunctionHandle:
             environment_id=self._environment_id,
             node_url=self._node_url,
         )
+
+    def _execute_local(self, *args: Any, **kwargs: Any) -> FunctionRun:
+        """Execute directly in-process when running inside ygg runtime.
+
+        Bypasses network registration and HTTP submission for lower latency
+        when the function is already running on a ygg node.
+        """
+        from yggdrasil.data.enums.state import State
+
+        run = FunctionRun.__new__(FunctionRun)
+        run.run_id = 0
+        run.node_url = ""
+        run.function_id = 0
+        run._entry = {}
+        try:
+            result = self._func(*args, **kwargs)
+            run._state = State.SUCCEEDED
+            run._result = result
+            run._exception = None
+        except Exception as e:
+            run._state = State.FAILED
+            run._result = None
+            run._exception = e
+        return run
 
     def with_env(self, env: str | int) -> "FunctionHandle":
         """Return a copy targeting a specific environment.
@@ -725,3 +757,52 @@ def function(
         return decorator(func)
     # Called with arguments: @function(name="foo")
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# DAG communication helpers
+# ---------------------------------------------------------------------------
+
+
+def get_input(key: str = "input", default: Any = None) -> Any:
+    """Get input passed from a previous DAG step.
+
+    When running as part of a DAG, previous step outputs are injected
+    as JSON in the ``__ygg_inputs__`` env var.
+
+    Args:
+        key: The key to look up in the inputs dict.
+        default: Value to return if the key is not found.
+
+    Returns:
+        The value for the given key, or *default*.
+    """
+    raw = os.environ.get("__ygg_inputs__")
+    if not raw:
+        return default
+    inputs = json.loads(raw)
+    return inputs.get(key, default)
+
+
+def set_output(key: str = "result", value: Any = None) -> None:
+    """Set output for the next DAG step.
+
+    Writes to the file specified by ``__ygg_outputs_file__`` which the
+    runtime reads after execution to collect structured outputs.
+
+    Args:
+        key: The output key name.
+        value: The value to store (must be JSON-serializable).
+    """
+    outputs_file = os.environ.get("__ygg_outputs_file__")
+    if outputs_file:
+        existing: dict[str, Any] = {}
+        if os.path.exists(outputs_file):
+            try:
+                with open(outputs_file) as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        existing[key] = value
+        with open(outputs_file, "w") as f:
+            json.dump(existing, f)

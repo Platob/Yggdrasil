@@ -701,9 +701,32 @@ export default function DagsPage() {
       </div>
 
       {dags.length === 0 && (
-        <div className="nordic-card p-8 text-center">
-          <p className="text-muted text-sm">No DAGs defined yet.</p>
-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-4">
+        <div className="nordic-card p-6 space-y-4">
+          <h2 className="text-sm font-semibold text-foreground">Build Pipelines</h2>
+          <p className="text-sm text-muted">Chain functions into DAGs that run across nodes.</p>
+
+          <div className="code-block p-3 text-xs">
+            <p className="text-muted mb-1"># Chain functions with &gt;&gt; operator</p>
+            <p>from yggdrasil.node import function, dag</p>
+            <p></p>
+            <p>@function</p>
+            <p>def extract(source: str) -&gt; list:</p>
+            <p>    return [1, 2, 3]</p>
+            <p></p>
+            <p>@function</p>
+            <p>def transform(data: list) -&gt; list:</p>
+            <p>    return [x * 2 for x in data]</p>
+            <p></p>
+            <p>@function</p>
+            <p>def load(data: list) -&gt; int:</p>
+            <p>    return sum(data)</p>
+            <p></p>
+            <p># Build and run the pipeline</p>
+            <p>pipeline = dag(&quot;etl&quot;, extract &gt;&gt; transform &gt;&gt; load)</p>
+            <p>result = pipeline().wait()</p>
+          </div>
+
+          <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-2">
             Create your first DAG
           </button>
         </div>

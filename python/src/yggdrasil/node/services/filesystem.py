@@ -21,12 +21,22 @@ LOGGER = logging.getLogger(__name__)
 
 
 class FilesystemService:
-    """Manage files within the node's data directory."""
+    """Manage files within the node's home directory.
+
+    The filesystem root is ``node_home`` so users can browse all node data.
+    Path traversal protection prevents access above this root.
+    """
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._root = settings.data_root / "files"
+        self._root = settings.node_home
         self._root.mkdir(parents=True, exist_ok=True)
+        # Create default Linux-style hierarchy under node_home
+        for d in (
+            "data/files", "data/files/tmp", "data/files/downloads",
+            "data/files/documents", "data/files/data", "mirrors", "logs", "cache",
+        ):
+            (self._root / d).mkdir(parents=True, exist_ok=True)
 
     def _resolve(self, path: str) -> Path:
         """Resolve path relative to root, prevent directory traversal."""
