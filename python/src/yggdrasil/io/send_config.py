@@ -751,25 +751,27 @@ class CacheConfig(_ConfigBase):
         self,
         response: "Response | None" = None,
     ) -> "Any | None":
-        """Build the response-side / time-window predicate as an :class:`Expression`.
+        """Build the response-side match predicate as an :class:`Expression`.
 
         Carries the response-side match keys (when *response* is
-        supplied) plus the configured ``received_*`` window. Returns
-        ``None`` when no clauses apply so callers can compose with
-        :func:`all_of` cleanly.
+        supplied). Returns ``None`` when no clauses apply so callers
+        can compose with :func:`all_of` cleanly.
+
+        ``received_from`` / ``received_to`` are NOT included — they
+        are staleness checks applied post-read by
+        :meth:`filter_response`, not identity filters. Baking them
+        into the predicate would reject backfilled rows whose
+        original ``received_at`` falls outside the window.
         """
+        if response is None:
+            return None
         from yggdrasil.execution.expr import all_of, col
 
         clauses: list[Any] = []
-        if response is not None:
-            for key, value in self.response_values(response).items():
-                clauses.append(
-                    col(key).is_null() if value is None else col(key) == value
-                )
-        if self.received_from is not None:
-            clauses.append(col("received_at") >= self.received_from)
-        if self.received_to is not None:
-            clauses.append(col("received_at") < self.received_to)
+        for key, value in self.response_values(response).items():
+            clauses.append(
+                col(key).is_null() if value is None else col(key) == value
+            )
         if not clauses:
             return None
         if len(clauses) == 1:
@@ -820,9 +822,8 @@ class CacheConfig(_ConfigBase):
         """Batch :class:`Predicate` for the cache read.
 
         Shape: ``partition_key IN (<distinct keys>)`` AND
-        ``(req1_match) OR (req2_match) OR …`` AND the
-        response/time-window clause. Returns ``None`` when the
-        batch is empty and no time window applies.
+        ``(req1_match) OR (req2_match) OR …``. Returns ``None``
+        when the batch is empty.
 
         Drives both backends through :meth:`Tabular.read_arrow_batches`:
         :class:`FolderPath` lets :meth:`iter_children` probe candidate

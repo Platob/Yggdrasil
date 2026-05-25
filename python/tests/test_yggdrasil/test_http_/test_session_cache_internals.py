@@ -184,7 +184,7 @@ class TestCacheLookupPredicates:
             r.partition_key for r in reqs
         )
 
-    def test_received_window_lands_in_predicate(self) -> None:
+    def test_received_window_not_in_predicate(self) -> None:
         import datetime as dt
 
         from_ts = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
@@ -192,10 +192,7 @@ class TestCacheLookupPredicates:
         cfg = self._cfg(received_from=from_ts, received_to=to_ts)
         req = make_request("https://example.com/x")
         pred = cfg.make_lookup_predicate(request=req)
-        # The ``received_at`` time-window clauses survive into the
-        # predicate's free-column set; the actual bounds round-trip
-        # via the predicate's AST nodes.
-        assert "received_at" in self._free_columns(pred)
+        assert "received_at" not in self._free_columns(pred)
 
     def test_empty_batch_predicate_is_none(self) -> None:
         cfg = self._cfg()
