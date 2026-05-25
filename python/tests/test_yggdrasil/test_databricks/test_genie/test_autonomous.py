@@ -479,6 +479,8 @@ class TestAutonomousTools(AutonomousAgentTestCase):
             "accomplish", "fork", "fork_many", "execute_plan", "parallel",
             "step_results", "children",
             "create_job", "run_and_wait",
+            "fetch", "fetch_text", "fetch_json", "fetch_many",
+            "scrape_links", "open_browser", "fetch_entsoe_zones",
         ):
             self.assertIn(name, self.agent.tools, msg=name)
 
@@ -659,3 +661,58 @@ class TestDescribeTools(AutonomousAgentTestCase):
         formatted = self.agent._format_context(ctx)
         self.assertIn("main", formatted)
         self.assertIn("(none)", formatted)
+
+
+# ----------------------------------------------------------------------- #
+# Web / HTTP tools
+# ----------------------------------------------------------------------- #
+class TestWebTools(AutonomousAgentTestCase):
+    def test_get_http_session_cached(self):
+        s1 = self.agent._get_http_session()
+        s2 = self.agent._get_http_session()
+        self.assertIs(s1, s2)
+
+    def test_scrape_links_extracts_hrefs(self):
+        from unittest.mock import patch as _patch
+
+        html = '<a href="https://example.com">Link</a> <a href="/page">Other</a>'
+        with _patch.object(self.agent, "fetch_text", return_value=html):
+            links = self.agent.scrape_links("http://test.com")
+        self.assertEqual(links, ["https://example.com", "/page"])
+
+    def test_open_browser_via_tool(self):
+        from unittest.mock import patch as _patch
+
+        with _patch("webbrowser.open", return_value=True) as mock_open:
+            result = self.agent.run_tool("open_browser", "https://example.com")
+        mock_open.assert_called_once_with("https://example.com")
+        self.assertTrue(result)
+
+    def test_web_tools_registered(self):
+        for name in ("fetch", "fetch_text", "fetch_json", "fetch_many",
+                      "scrape_links", "open_browser", "fetch_entsoe_zones"):
+            self.assertIn(name, self.agent.tools, msg=name)
+
+
+# ----------------------------------------------------------------------- #
+# User-scoped space title
+# ----------------------------------------------------------------------- #
+class TestUserScopedSpaceTitle(AutonomousAgentTestCase):
+    def test_resolve_managed_title_includes_username(self):
+        from unittest.mock import patch as _patch
+
+        with _patch.object(
+            self.client, "user_scoped_name", return_value="alice"
+        ):
+            title = self.genie._resolve_managed_title()
+        self.assertIn("alice", title)
+        self.assertIn("Yggdrasil Genie", title)
+
+    def test_resolve_managed_title_falls_back_on_error(self):
+        from unittest.mock import patch as _patch
+
+        with _patch.object(
+            self.client, "user_scoped_name", side_effect=RuntimeError("no user")
+        ):
+            title = self.genie._resolve_managed_title()
+        self.assertEqual(title, "Yggdrasil Genie")

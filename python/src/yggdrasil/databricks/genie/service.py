@@ -26,6 +26,7 @@ inherits them::
         wait=WaitingConfig.from_(300),
     )
 """
+
 from __future__ import annotations
 
 import logging
@@ -86,7 +87,9 @@ class Genie(DatabricksService):
         defaults: Optional[GenieDefaults] = None,
     ):
         super().__init__(client=client)
-        self.defaults: GenieDefaults = defaults if defaults is not None else GenieDefaults()
+        self.defaults: GenieDefaults = (
+            defaults if defaults is not None else GenieDefaults()
+        )
         self._agent: "Optional[GenieAgent]" = None
         self._autonomous_agent: "Optional[AutonomousAgent]" = None
 
@@ -170,7 +173,9 @@ class Genie(DatabricksService):
         if conversation_id:
             LOGGER.debug(
                 "Creating Genie message in space %s on conversation %s (len=%d)",
-                space_id, conversation_id, len(question),
+                space_id,
+                conversation_id,
+                len(question),
             )
             waiter = self.api.create_message(
                 space_id=space_id,
@@ -182,7 +187,8 @@ class Genie(DatabricksService):
         else:
             LOGGER.debug(
                 "Starting Genie conversation in space %s (len=%d)",
-                space_id, len(question),
+                space_id,
+                len(question),
             )
             waiter = self.api.start_conversation(
                 space_id=space_id,
@@ -229,9 +235,15 @@ class Genie(DatabricksService):
     def find_space(self, *, name: str) -> Optional[GenieSpace]:
         """Return the first space whose title matches ``name``, or ``None``."""
         for space in self.list_spaces():
-            title = getattr(space.details, "title", None) if space._details is not None else None
+            title = (
+                getattr(space.details, "title", None)
+                if space._details is not None
+                else None
+            )
             if title is None:
-                title = getattr(self.api.get_space(space_id=space.space_id), "title", None)
+                title = getattr(
+                    self.api.get_space(space_id=space.space_id), "title", None
+                )
             if title == name:
                 return space
         return None
@@ -373,11 +385,29 @@ class Genie(DatabricksService):
                 continue
             LOGGER.info(
                 "Trashing dead Genie space %r (duplicate of survivor %r, title=%r)",
-                sid, survivor, title,
+                sid,
+                survivor,
+                title,
             )
             self.api.trash_space(space_id=sid)
             trashed.append(sid)
         return trashed
+
+    def _resolve_managed_title(self) -> str:
+        """Build the managed space title, scoped to the current user.
+
+        Returns ``"Yggdrasil Genie — <username>"`` so each user gets
+        their own auto-created space.  Falls back to the plain default
+        when the identity can't be resolved.
+        """
+        base = self.defaults.managed_space_title or DEFAULT_MANAGED_SPACE_TITLE
+        try:
+            slug = self.client.user_scoped_name("", separator="").strip("-")
+            if slug:
+                return f"{base} — {slug}"
+        except Exception:
+            pass
+        return base
 
     def _create_managed_space(self) -> GenieSpace:
         """Create a Genie space using the ``managed_space_*`` defaults.
@@ -398,16 +428,17 @@ class Genie(DatabricksService):
             tables=self.defaults.managed_space_tables,
             text_instructions=self.defaults.managed_space_instructions,
         )
+        title = self._resolve_managed_title()
         LOGGER.info(
             "Creating Genie space %r (tables=%r, warehouse_id=%r)",
-            self.defaults.managed_space_title,
+            title,
             tuple(self.defaults.managed_space_tables),
             wh_id,
         )
         return self.create_space(
             warehouse_id=wh_id,
             serialized_space=serialized,
-            title=self.defaults.managed_space_title or DEFAULT_MANAGED_SPACE_TITLE,
+            title=title,
             description=self.defaults.managed_space_description,
             parent_path=self.defaults.managed_space_parent_path,
         )
@@ -477,15 +508,18 @@ class Genie(DatabricksService):
     def _pick_space_id(self) -> Optional[str]:
         # Resolution priority:
         # 1. Exact match on ``defaults.space_name`` (explicit caller intent).
-        # 2. Exact match on ``defaults.managed_space_title`` (re-pick the
-        #    space we previously auto-created, even after the process
-        #    restarts and lost its in-memory ``defaults.space_id``).
-        # 3. First listed space — only when neither bias is set, so we
+        # 2. Exact match on the user-scoped managed title (re-pick the
+        #    space we previously auto-created for this user).
+        # 3. Exact match on the base managed title (fallback for spaces
+        #    created before user-scoping was added).
+        # 4. First listed space — only when neither bias is set, so we
         #    never silently switch a configured workspace.
         wanted_title = self.defaults.space_name
-        managed_title = self.defaults.managed_space_title
+        user_title = self._resolve_managed_title()
+        base_title = self.defaults.managed_space_title
         first_id: Optional[str] = None
-        managed_id: Optional[str] = None
+        user_managed_id: Optional[str] = None
+        base_managed_id: Optional[str] = None
 
         for space in self.list_spaces():
             title = getattr(space._details, "title", None) if space._details else None
@@ -495,9 +529,11 @@ class Genie(DatabricksService):
                 continue
             if first_id is None:
                 first_id = space.space_id
-            if managed_id is None and managed_title and title == managed_title:
-                managed_id = space.space_id
+            if user_managed_id is None and title == user_title:
+                user_managed_id = space.space_id
+            if base_managed_id is None and base_title and title == base_title:
+                base_managed_id = space.space_id
 
         if wanted_title is not None:
             return None
-        return managed_id or first_id
+        return user_managed_id or base_managed_id or first_id

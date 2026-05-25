@@ -978,6 +978,89 @@ class AutonomousAgent(GenieAgent):
         return "\n".join(parts) or "  (empty workspace)"
 
     # ------------------------------------------------------------------ #
+    # Web / HTTP tools
+    # ------------------------------------------------------------------ #
+    def _get_http_session(self) -> Any:
+        """Return a shared HTTPSession for web operations."""
+        if not hasattr(self, "_http_session") or self._http_session is None:
+            from yggdrasil.http_ import HTTPSession
+
+            self._http_session = HTTPSession()
+        return self._http_session
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        cache: bool = True,
+    ) -> Any:
+        """Fetch a URL and return the response.
+
+        Uses the shared :class:`HTTPSession` with caching enabled by
+        default.  The response is the full ``HTTPResponse`` object —
+        call ``.text`` for the body, ``.status_code`` for the status.
+        """
+        session = self._get_http_session()
+        LOGGER.info("Fetching %s %s", method, url)
+        return session.request(method, url, headers=headers or {})
+
+    def fetch_text(self, url: str, **kwargs: Any) -> str:
+        """Fetch a URL and return the response body as text."""
+        response = self.fetch(url, **kwargs)
+        return response.text
+
+    def fetch_json(self, url: str, **kwargs: Any) -> Any:
+        """Fetch a URL and return the parsed JSON response."""
+        response = self.fetch(url, **kwargs)
+        from yggdrasil.pickle import json as ygg_json
+
+        return ygg_json.loads(response.data)
+
+    def scrape_links(self, url: str) -> list[str]:
+        """Fetch a page and extract all ``<a href="...">`` links."""
+        import re
+
+        text = self.fetch_text(url)
+        return re.findall(r'href=["\']([^"\']+)["\']', text)
+
+    def open_browser(self, url: str) -> bool:
+        """Open a URL in the user's default browser."""
+        import webbrowser
+
+        LOGGER.info("Opening browser: %s", url)
+        return webbrowser.open(url)
+
+    def fetch_entsoe_zones(self) -> Any:
+        """Fetch ENTSO-E bidding zones via the official EIC CSV."""
+        from yggdrasil.data.enums.geozone.entsoe import fetch_entsoe_bidding_zones
+
+        session = self._get_http_session()
+        zones = fetch_entsoe_bidding_zones(session=session)
+        LOGGER.info("Fetched %d ENTSO-E bidding zones", len(zones))
+        return zones
+
+    def fetch_many(
+        self,
+        urls: Sequence[str],
+        *,
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        max_workers: Optional[int] = None,
+    ) -> list[Any]:
+        """Fetch multiple URLs concurrently."""
+        from yggdrasil.io.request import PreparedRequest
+
+        session = self._get_http_session()
+        requests = [
+            PreparedRequest.prepare(method=method, url=u, headers=headers or {})
+            for u in urls
+        ]
+        LOGGER.info("Fetching %d URLs concurrently", len(requests))
+        return list(session.send_many(requests))
+
+    # ------------------------------------------------------------------ #
     # Tool registry
     # ------------------------------------------------------------------ #
     def _register_autonomous_tools(self) -> None:
@@ -1013,6 +1096,15 @@ class AutonomousAgent(GenieAgent):
         self.tools["parallel"] = self.parallel
         self.tools["step_results"] = lambda: self.step_results
         self.tools["children"] = lambda: list(self.children)
+
+        # Web / HTTP
+        self.tools["fetch"] = self.fetch
+        self.tools["fetch_text"] = self.fetch_text
+        self.tools["fetch_json"] = self.fetch_json
+        self.tools["fetch_many"] = self.fetch_many
+        self.tools["scrape_links"] = self.scrape_links
+        self.tools["open_browser"] = self.open_browser
+        self.tools["fetch_entsoe_zones"] = self.fetch_entsoe_zones
 
         # Workflow
         self.tools["create_job"] = lambda name, tasks, **kw: (
