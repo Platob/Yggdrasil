@@ -78,7 +78,7 @@ class Volume(DatabricksResource, Singleton):
     use.
     """
 
-    DEFAULT_INFO_TTL: ClassVar[float] = 300.0  # 5 minutes
+    DEFAULT_INFO_TTL: ClassVar[float] = 1800.0  # 30 minutes
 
     # Per-class singleton cache so this surface stays separate from
     # the rest of the project's :class:`Singleton` users.

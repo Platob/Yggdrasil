@@ -3483,6 +3483,7 @@ class Table(DatabricksPath):
 
         prune_values = prune_values or {}
         output_data: "Tabular | None" = None
+        staging.volume.create()
         staging.write_table(data, cast_options, mode=Mode.OVERWRITE)
         if return_data:
             output_data = staging.read_arrow_table()

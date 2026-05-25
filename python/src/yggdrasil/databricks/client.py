@@ -151,6 +151,7 @@ _STATIC_DEFAULTS: dict[str, Any] = {
     "max_connections_per_pool": _DEFAULT_MAX_CONNECTIONS_PER_POOL,
     "product": "yggdrasil",
     "product_version": ygg_version,
+    "skip_verify": False
 }
 
 
@@ -426,6 +427,7 @@ class DatabricksClient(Singleton, URLBased):
         max_connections_per_pool: Any = ...,
         product: Any = ...,
         product_version: Any = ...,
+        skip_verify: Any = ...,
         singleton_ttl: "int | None" = ...,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor
@@ -467,6 +469,7 @@ class DatabricksClient(Singleton, URLBased):
             max_connections_per_pool=max_connections_per_pool,
             product=product,
             product_version=product_version,
+            skip_verify=skip_verify
         )
         for name, value in resolved.items():
             self.__dict__[name] = value
@@ -864,6 +867,7 @@ class DatabricksClient(Singleton, URLBased):
                 max_connections_per_pool=self.max_connections_per_pool,
                 product=self.product,
                 product_version=self.product_version,
+                skip_verify=self.skip_verify,
             )
         except Exception as e:
             raise ValueError(self._diagnose_config_error(e, client_type, host)) from e
