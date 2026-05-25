@@ -526,6 +526,104 @@ class TestGenieEnsureSpace(GenieTestCase):
         self.assertIn("auto_create_space", str(ctx.exception))
 
 
+class TestResolveTableIdentifiers(GenieTestCase):
+    """``Genie.resolve_table_identifiers`` resolves short names."""
+
+    def _make_table_mock(self, catalog, schema, table):
+        m = MagicMock()
+        m.catalog_name = catalog
+        m.schema_name = schema
+        m.table_name = table
+        return m
+
+    def test_fully_qualified_passes_through(self):
+        result = self.genie.resolve_table_identifiers(
+            ("main.sales.orders",),
+        )
+        self.assertEqual(result, ("main.sales.orders",))
+
+    def test_single_part_resolves_unique_match(self):
+        self.workspace_client.tables.list.return_value = [
+            MagicMock(
+                name="trading_tgp_prd",
+                catalog_name="trading",
+                schema_name="tgp",
+                table_id="t1",
+            ),
+        ]
+        tbl = self._make_table_mock("trading", "tgp", "trading_tgp_prd")
+        self.client.tables.list_tables = MagicMock(return_value=iter([tbl]))
+
+        result = self.genie.resolve_table_identifiers(
+            ("trading_tgp_prd",),
+        )
+        self.assertEqual(result, ("trading.tgp.trading_tgp_prd",))
+
+    def test_two_part_resolves_unique_match(self):
+        tbl = self._make_table_mock("main", "sales", "orders")
+        self.client.tables.list_tables = MagicMock(return_value=iter([tbl]))
+
+        result = self.genie.resolve_table_identifiers(
+            ("sales.orders",),
+        )
+        self.assertEqual(result, ("main.sales.orders",))
+
+    def test_single_part_no_match_raises(self):
+        self.client.tables.list_tables = MagicMock(return_value=iter([]))
+
+        with self.assertRaises(ValueError) as ctx:
+            self.genie.resolve_table_identifiers(("nonexistent",))
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_single_part_ambiguous_raises(self):
+        tbl1 = self._make_table_mock("cat_a", "s1", "orders")
+        tbl2 = self._make_table_mock("cat_b", "s2", "orders")
+        self.client.tables.list_tables = MagicMock(
+            return_value=iter([tbl1, tbl2]),
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            self.genie.resolve_table_identifiers(("orders",))
+        self.assertIn("ambiguous", str(ctx.exception).lower())
+        self.assertIn("cat_a.s1.orders", str(ctx.exception))
+        self.assertIn("cat_b.s2.orders", str(ctx.exception))
+
+    def test_mixed_short_and_qualified(self):
+        tbl = self._make_table_mock("prd", "data", "events")
+        self.client.tables.list_tables = MagicMock(return_value=iter([tbl]))
+
+        result = self.genie.resolve_table_identifiers(
+            ("main.sales.orders", "events"),
+        )
+        self.assertEqual(
+            result,
+            ("main.sales.orders", "prd.data.events"),
+        )
+
+    def test_auto_create_resolves_short_names(self):
+        self.genie.defaults = replace(
+            self.genie.defaults,
+            auto_create_space=True,
+            warehouse_id="wh-1",
+            managed_space_tables=("trading_tgp_prd",),
+        )
+        self.genie_api.list_spaces.return_value = MagicMock(spaces=[])
+
+        tbl = self._make_table_mock("trading", "tgp", "trading_tgp_prd")
+        self.client.tables.list_tables = MagicMock(return_value=iter([tbl]))
+
+        created = MagicMock(
+            space_id="new-id",
+            title=DEFAULT_MANAGED_SPACE_TITLE,
+        )
+        self.genie_api.create_space.return_value = created
+
+        space = self.genie.ensure_space()
+        self.assertEqual(space.space_id, "new-id")
+        call = self.genie_api.create_space.call_args
+        self.assertIn("trading.tgp.trading_tgp_prd", call.kwargs["serialized_space"])
+
+
 class TestGenieCleanupDeadSpaces(GenieTestCase):
     """Duplicate managed-title spaces get trashed."""
 

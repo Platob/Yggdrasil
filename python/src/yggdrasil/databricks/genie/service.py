@@ -409,6 +409,61 @@ class Genie(DatabricksService):
             pass
         return base
 
+    def resolve_table_identifiers(
+        self,
+        tables: "tuple[str, ...] | list[str]",
+    ) -> "tuple[str, ...]":
+        """Resolve short table names to fully-qualified ``catalog.schema.table``.
+
+        Identifiers that already contain three dotted parts pass through
+        unchanged.  Shorter names (``"orders"``, ``"sales.orders"``) are
+        looked up via :meth:`Tables.list_tables` across all visible
+        catalogs and schemas.  When exactly one match is found it is used;
+        when zero or multiple matches are found, a helpful error is raised.
+        """
+        resolved: list[str] = []
+        for ident in tables:
+            parts = [p.strip().strip("`") for p in ident.split(".")]
+            if len(parts) >= 3:
+                resolved.append(ident)
+                continue
+
+            if len(parts) == 2:
+                schema_filter, table_filter = parts
+            else:
+                schema_filter, table_filter = None, parts[0]
+
+            matches: list[str] = []
+            for tbl in self.client.tables.list_tables(
+                name=table_filter,
+                catalog_name=None,
+                schema_name=schema_filter,
+            ):
+                matches.append(
+                    f"{tbl.catalog_name}.{tbl.schema_name}.{tbl.table_name}"
+                )
+
+            if len(matches) == 1:
+                LOGGER.info(
+                    "Resolved table %r to %r",
+                    ident,
+                    matches[0],
+                )
+                resolved.append(matches[0])
+            elif len(matches) == 0:
+                raise ValueError(
+                    f"Table {ident!r} not found in any catalog/schema. "
+                    "Pass a fully-qualified 'catalog.schema.table' name, or "
+                    "check that the table exists and you have access."
+                )
+            else:
+                raise ValueError(
+                    f"Table {ident!r} is ambiguous — found {len(matches)} "
+                    f"matches: {matches!r}. Pass a fully-qualified "
+                    "'catalog.schema.table' name to disambiguate."
+                )
+        return tuple(resolved)
+
     def _create_managed_space(self) -> GenieSpace:
         """Create a Genie space using the ``managed_space_*`` defaults.
 
@@ -421,18 +476,21 @@ class Genie(DatabricksService):
                 "Genie.defaults.managed_space_tables — Genie requires at "
                 "least one fully-qualified `catalog.schema.table` to expose."
             )
+        resolved_tables = self.resolve_table_identifiers(
+            self.defaults.managed_space_tables,
+        )
         wh_id = self.defaults.warehouse_id
         if not wh_id:
             wh_id = self.resolve_warehouse().warehouse_id
         serialized = build_serialized_space(
-            tables=self.defaults.managed_space_tables,
+            tables=resolved_tables,
             text_instructions=self.defaults.managed_space_instructions,
         )
         title = self._resolve_managed_title()
         LOGGER.info(
             "Creating Genie space %r (tables=%r, warehouse_id=%r)",
             title,
-            tuple(self.defaults.managed_space_tables),
+            resolved_tables,
             wh_id,
         )
         return self.create_space(

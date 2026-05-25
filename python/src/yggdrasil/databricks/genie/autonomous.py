@@ -933,8 +933,9 @@ class AutonomousAgent(GenieAgent):
         """
         from .resources import build_serialized_space
 
+        resolved_tables = self.service.resolve_table_identifiers(list(tables))
         serialized = build_serialized_space(
-            tables=list(tables),
+            tables=list(resolved_tables),
             text_instructions=list(instructions),
         )
         space = self.service.create_space(
