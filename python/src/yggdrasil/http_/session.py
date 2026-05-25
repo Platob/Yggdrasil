@@ -843,10 +843,8 @@ class HTTPSession(Session):
         :meth:`CacheConfig.make_lookup_predicate`, push it through
         :meth:`Tabular.read_arrow_batches`, client-side dedup by
         ``received_at`` (APPEND-mode caches can hold multiple rows
-        per identity), filter on
-        :meth:`CacheConfig.filter_response`, and stamp the matching
-        ``local_cached`` / ``remote_cached`` flag for downstream
-        provenance.
+        per identity), and filter on
+        :meth:`CacheConfig.filter_response`.
 
         Skips the per-request :meth:`PreparedRequest.anonymize` pass
         when ``cache_cfg.request_by_is_public`` holds — the
@@ -892,8 +890,6 @@ class HTTPSession(Session):
                 source, request.method, request.url, tabular,
                 best.status_code, best.received_at,
             )
-            best.local_cached = (source == "local")
-            best.remote_cached = (source == "remote")
         return best
 
     def _store_cached_response(

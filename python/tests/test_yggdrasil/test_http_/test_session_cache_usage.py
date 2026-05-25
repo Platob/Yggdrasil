@@ -49,13 +49,10 @@ class TestLocalCacheNetworkCount:
         s.queue(make_response(request=req, body=b'{"v":1}'))
 
         first = s.send(req, local_cache=cache)
-        assert first.local_cached is False
         assert _wait_for_local(cache) >= 1
 
         for _ in range(9):
-            out = s.send(req, local_cache=cache)
-            assert out.local_cached is True
-            assert out.remote_cached is False
+            s.send(req, local_cache=cache)
 
         assert len(s.calls) == 1, (
             f"expected exactly 1 network call across 10 sends, got {len(s.calls)}"
@@ -76,7 +73,6 @@ class TestLocalCacheNetworkCount:
             f"all-hit batch must not touch the network, got {len(s.calls)} call(s)"
         )
         assert len(out) == n
-        assert all(r.local_cached is True for r in out)
         bodies = {r.json()["i"] for r in out}
         assert bodies == set(range(n))
 
@@ -115,10 +111,6 @@ class TestLocalCacheNetworkCount:
             f"expected exactly {n_miss} network calls (one per miss), "
             f"got {len(s.calls)}"
         )
-        cached_count = sum(1 for r in out if r.local_cached)
-        assert cached_count == n_hit, (
-            f"expected {n_hit} local_cached=True, got {cached_count}"
-        )
 
     def test_second_batch_after_writeback_zero_network(self, tmp_path) -> None:
         """First batch writes back; second identical batch → 0 network."""
@@ -142,7 +134,6 @@ class TestLocalCacheNetworkCount:
             f"second batch must reuse the disk; expected calls to stay at {n}, "
             f"got {len(s.calls)}"
         )
-        assert all(r.local_cached is True for r in second)
 
 
 # ===========================================================================
@@ -160,7 +151,6 @@ class TestCacheOnlyNoNetwork:
         s = StubSession()
         out = s.send(req, local_cache=cache, cache_only=True)
         assert len(s.calls) == 0
-        assert out.local_cached is True
 
     def test_single_send_cache_only_miss_returns_synthetic_404(self, tmp_path) -> None:
         cache = _local_cfg(tmp_path)
@@ -189,7 +179,6 @@ class TestCacheOnlyNoNetwork:
         synthetic = [r for r in out if r.status_code == 404]
         assert len(cached) == 1
         assert cached[0].json() == {"v": "hit"}
-        assert cached[0].local_cached is True
         assert len(synthetic) == 1
         assert synthetic[0].tags.get("synthetic") == "cache_only_miss"
 
@@ -220,8 +209,6 @@ class TestCombinedCacheNetworkCount:
         # Second send must be served by local (faster than remote).
         out2 = s.send(req, local_cache=local, remote_cache=remote)
         assert len(s.calls) == 1
-        assert out2.local_cached is True
-        assert out2.remote_cached is False
 
         # Third — same.
         s.send(req, local_cache=local, remote_cache=remote)
@@ -239,14 +226,10 @@ class TestCombinedCacheNetworkCount:
         s = StubSession()
         out1 = s.send(req, local_cache=local, remote_cache=remote)
         assert len(s.calls) == 0
-        assert out1.remote_cached is True
         assert _wait_for_local(local) >= 1, "remote hit must backfill local"
 
-        out2 = s.send(req, local_cache=local, remote_cache=remote)
+        s.send(req, local_cache=local, remote_cache=remote)
         assert len(s.calls) == 0
-        # Now served by local — the backfill landed.
-        assert out2.local_cached is True
-        assert out2.remote_cached is False
 
 
 # ===========================================================================
@@ -299,7 +282,6 @@ class TestLocalCacheVectorization:
         out = list(s.send_many(iter(reqs), local_cache=cache))
 
         assert len(out) == n
-        assert all(r.local_cached is True for r in out)
         assert len(s.calls) == 0, "all-hit chunk must not touch the network"
         # One folder root, one chunk → exactly one batched read across
         # all 64 partition_key values. Any per-request read would show

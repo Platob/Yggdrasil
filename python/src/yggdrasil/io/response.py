@@ -454,31 +454,6 @@ RESPONSE_SCHEMA["received_at"] = schema_field(
     metadata={"comment": "UTC timestamp when the response was captured"},
 ).autotag()
 
-RESPONSE_SCHEMA["local_cached"] = schema_field(
-    "local_cached",
-    pa.bool_(),
-    nullable=False,
-    metadata={
-        "comment": "True when this response was served from the on-disk "
-                   "fast-path local cache. Set at read time by the "
-                   "Session; the persisted value is whatever the response "
-                   "carried at write time and is always overridden when "
-                   "re-read through a cache layer.",
-    },
-).autotag()
-
-RESPONSE_SCHEMA["remote_cached"] = schema_field(
-    "remote_cached",
-    pa.bool_(),
-    nullable=False,
-    metadata={
-        "comment": "True when this response was served from the remote "
-                   "SQL/Tabular cache. Set at read time by the Session — "
-                   "see ``local_cached`` for the local-layer counterpart. "
-                   "Both False means a network fetch.",
-    },
-).autotag()
-
 RESPONSE_SCHEMA["partition_key"] = schema_field(
     "partition_key",
     pa.int64(),
@@ -587,8 +562,7 @@ class Response(Tabular["ResponseOptions"]):
     # Slot-style field set (kept here as the source of truth for
     # :meth:`__getstate__` / :meth:`__setstate__`):
     #   request, status_code, headers, tags, buffer, received_at,
-    #   local_cached, remote_cached, _receiver, _session, _cache,
-    #   _cache_token.
+    #   _receiver, _session, _cache, _cache_token.
 
     # Instance attributes that don't survive pickling — excluded by
     # ``__getstate__`` and reset by ``__setstate__``. Subclasses extend.
@@ -607,8 +581,6 @@ class Response(Tabular["ResponseOptions"]):
         "tags",
         "buffer",
         "received_at",
-        "local_cached",
-        "remote_cached",
         "_receiver",
     })
 
@@ -621,9 +593,6 @@ class Response(Tabular["ResponseOptions"]):
         buffer: Holder,
         received_at: dt.datetime,
         receiver: Optional[UserInfo] = None,
-        *,
-        local_cached: bool = False,
-        remote_cached: bool = False,
     ) -> None:
         super().__init__()
         self.request = request
@@ -632,14 +601,6 @@ class Response(Tabular["ResponseOptions"]):
         self.tags = _string_dict(tags)
         self.received_at = any_to_datetime(received_at)
         self.buffer = _coerce_buffer(buffer)
-        # Lifecycle origin flags. ``local_cached`` is True when the
-        # response came off the on-disk fast-path cache;
-        # ``remote_cached`` when it came off the remote SQL/Tabular
-        # cache. Both False = network fetch. Persisted with the row so
-        # Spark consumers can predicate on them; the Session always
-        # overrides on read so stale mirror-write values don't leak.
-        self.local_cached = bool(local_cached)
-        self.remote_cached = bool(remote_cached)
         self._receiver: UserInfo | None = (
             _coerce_userinfo(receiver) if receiver is not None else _default_sender()
         )
@@ -796,8 +757,6 @@ class Response(Tabular["ResponseOptions"]):
             headers.version if headers is not None else 0,
             id(buffer),
             buffer.size if buffer is not None else -1,
-            self.local_cached,
-            self.remote_cached,
         )
 
     def _cached(self, name: str, compute: Callable[[], Any]) -> Any:
@@ -898,16 +857,6 @@ class Response(Tabular["ResponseOptions"]):
         received_at = _parse_received_at(obj)
         tags = _parse_response_tags(obj)
         receiver = _parse_receiver(obj)
-        local_cached_raw = get_from_dict(obj, keys=("local_cached",), prefix=None)
-        local_cached = (
-            bool(local_cached_raw)
-            if local_cached_raw not in (MISSING, None) else False
-        )
-        remote_cached_raw = get_from_dict(obj, keys=("remote_cached",), prefix=None)
-        remote_cached = (
-            bool(remote_cached_raw)
-            if remote_cached_raw not in (MISSING, None) else False
-        )
 
         if normalize:
             headers = Headers.from_(headers).normalized(body=buffer, is_request=False)
@@ -926,8 +875,6 @@ class Response(Tabular["ResponseOptions"]):
                     buffer=buffer,
                     received_at=received_at,
                     receiver=receiver,
-                    local_cached=local_cached,
-                    remote_cached=remote_cached,
                 )
 
         return cls(
@@ -938,8 +885,6 @@ class Response(Tabular["ResponseOptions"]):
             buffer=buffer,
             received_at=received_at,
             receiver=receiver,
-            local_cached=local_cached,
-            remote_cached=remote_cached,
         )
 
     # ------------------------------------------------------------------
@@ -1244,10 +1189,6 @@ class Response(Tabular["ResponseOptions"]):
             return self.body_hash
         if key == "received_at":
             return self.received_at
-        if key == "local_cached":
-            return bool(self.local_cached)
-        if key == "remote_cached":
-            return bool(self.remote_cached)
         if key == "partition_key":
             return self.partition_key
         if key == "_pkl":
@@ -1347,8 +1288,6 @@ class Response(Tabular["ResponseOptions"]):
             buffer=self.buffer,
             received_at=self.received_at,
             receiver=self._receiver,
-            local_cached=self.local_cached,
-            remote_cached=self.remote_cached,
         )
 
     # ------------------------------------------------------------------
@@ -1635,8 +1574,6 @@ class Response(Tabular["ResponseOptions"]):
             buffer=buffer,
             received_at=get("received_at") or 0,
             receiver=receiver,
-            local_cached=bool(get("local_cached") or False),
-            remote_cached=bool(get("remote_cached") or False),
         )
 
     # ------------------------------------------------------------------

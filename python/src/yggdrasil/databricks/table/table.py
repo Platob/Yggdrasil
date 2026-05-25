@@ -493,9 +493,56 @@ def _build_column_projection(
     user query).
     """
     parts: list[str] = []
+    alias = quote_ident(source_alias) if source_alias else None
     for f in fields:
         col = quote_ident(f.name)
-        parts.append(f"{source_alias}.{col}" if source_alias else col)
+        parts.append(f"{alias}.{col}" if alias else col)
+    return ", ".join(parts)
+
+
+def _build_cast_column_projection(
+    target_fields: "Iterable[Field]",
+    *,
+    source: "Field | None" = None,
+    source_alias: str,
+) -> str:
+    """Build a SELECT projection that CASTs source columns to target Spark types.
+
+    For each target field:
+
+    * **present in source, same type** — bare ``alias.`col``` (no CAST)
+    * **present in source, different type** —
+      ``CAST(alias.`col` AS <spark_type>)``
+    * **missing from source** —
+      ``CAST(NULL AS <spark_type>) AS `col```
+
+    *source* is the :class:`Field` describing the source schema.
+    Child lookup uses :meth:`Field.get` — no intermediate dict.
+    When a source child's Spark type matches the target's, the CAST
+    is skipped. When *source* is ``None`` every target column is
+    assumed present with an unknown type (always CAST).
+    """
+    alias = quote_ident(source_alias)
+    parts: list[str] = []
+    for f in target_fields:
+        col = quote_ident(f.name)
+        target_spark = f.to_spark_name(
+            with_name=False, with_nullable=False, with_comment=False,
+        )
+        src = source.get(f.name) if source is not None else ...
+
+        if src is None:
+            parts.append(f"CAST(NULL AS {target_spark}) AS {col}")
+        elif src is ...:
+            parts.append(f"CAST({alias}.{col} AS {target_spark})")
+        else:
+            source_spark = src.to_spark_name(
+                with_name=False, with_nullable=False, with_comment=False,
+            )
+            if source_spark == target_spark:
+                parts.append(f"{alias}.{col}")
+            else:
+                parts.append(f"CAST({alias}.{col} AS {target_spark})")
     return ", ".join(parts)
 
 
@@ -3293,7 +3340,11 @@ class Table(DatabricksPath):
         )
 
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
-            return self.sql_insert(data, spark_session=spark_session, **common)
+            return self.sql_insert(
+                data, spark_session=spark_session,
+                schema_mode=schema_mode, cast_options=cast_options,
+                **common,
+            )
 
         if spark_session is None:
             session_attr = getattr(data, "sparkSession", None)
@@ -3745,6 +3796,8 @@ class Table(DatabricksPath):
         statement: "PreparedStatement | StatementResult | str",
         *,
         mode: Mode | str | None = None,
+        schema_mode: Mode | str | None = None,
+        cast_options: Optional[CastOptions] = None,
         match_by: Optional[list[str]] = None,
         update_column_names: Optional[list[str]] = None,
         wait: WaitingConfigArg = True,
@@ -3793,6 +3846,7 @@ class Table(DatabricksPath):
             cached = spark_df if spark_df is not None else statement.to_arrow_table()
             return self.insert_into(
                 data=cached, spark_session=spark_session,
+                cast_options=cast_options,
                 return_data=return_data, **common,
             )
 
@@ -3807,15 +3861,15 @@ class Table(DatabricksPath):
             df = spark_session.sql(text)
             return self.spark_insert(
                 data=df, spark_session=spark_session,
+                schema_mode=schema_mode,
+                cast_options=cast_options,
                 return_data=return_data, **common,
             )
 
-        batch = self._sql_insert_warehouse_fallback(statement, **common)
+        batch = self._sql_insert_warehouse_fallback(
+            statement, schema_mode=schema_mode, cast_options=cast_options, **common,
+        )
         if return_data and isinstance(statement, StatementResult):
-            # The warehouse path doesn't materialise rows on its own,
-            # but the caller's :class:`StatementResult` is already a
-            # :class:`Tabular` over the same source query — hand it
-            # back so ``return_data=True`` stays consistent across paths.
             return statement
         return batch
 
@@ -3825,6 +3879,8 @@ class Table(DatabricksPath):
         *,
         engine: Optional[Literal["api", "spark"]] = None,
         mode: Mode | str | None,
+        schema_mode: Mode | str | None = None,
+        cast_options: Optional[CastOptions] = None,
         match_by: Optional[list[str]],
         update_column_names: Optional[list[str]],
         wait: WaitingConfigArg,
@@ -3844,15 +3900,24 @@ class Table(DatabricksPath):
         source_prepared = WarehousePreparedStatement.from_(base)
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
+        cast_options = CastOptions.check(options=cast_options)
 
         if mode_enum == Mode.OVERWRITE and not match_by:
             self.delete(wait=True, missing_ok=True, delete_staging=False, delete_job=False)
 
         if not self.exists:
-            raise ValueError(
-                "sql_insert requires the target table to exist; "
-                f"{self.full_name()!r} was not found."
-            )
+            target_field = cast_options.target
+            if target_field is not None:
+                self.create(
+                    target_field,
+                    mode=schema_mode,
+                )
+            else:
+                raise ValueError(
+                    "sql_insert requires the target table to exist or "
+                    "cast_options.target to be set; "
+                    f"{self.full_name()!r} was not found."
+                )
 
         target_location = self.full_name(safe=True)
         existing_schema = self.collect_schema()
@@ -3862,9 +3927,13 @@ class Table(DatabricksPath):
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
 
-        source_projection = _build_column_projection(fields, source_alias="raw_src")
+        source_projection = _build_cast_column_projection(
+            fields,
+            source=cast_options.source if cast_options.source and cast_options.source.children else None,
+            source_alias="raw_src",
+        )
         source_sql = (
-            f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS raw_src"
+            f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS {quote_ident('raw_src')}"
         )
 
         prune_predicates = _build_prune_predicate(

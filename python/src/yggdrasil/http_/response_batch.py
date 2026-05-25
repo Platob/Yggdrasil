@@ -165,10 +165,7 @@ class HTTPResponseBatch(Tabular):
         ):
             if holder is None:
                 continue
-            for response in Response.from_records(holder.read_records()):
-                response.local_cached = (label == "local")
-                response.remote_cached = (label == "remote")
-                yield response
+            yield from Response.from_records(holder.read_records())
 
     # ------------------------------------------------------------------
     # Merge
