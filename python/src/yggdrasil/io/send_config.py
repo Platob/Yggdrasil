@@ -9,7 +9,6 @@ from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Op
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
 from yggdrasil.data.enums import Mode
-from yggdrasil.dataclasses import DEFAULT_WAITING_CONFIG
 from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.holder import Holder
@@ -949,7 +948,7 @@ class SendConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _SEND_CONFIG_FIELDS
 
     raise_error: bool = True
-    wait: WaitingConfig = field(default=DEFAULT_WAITING_CONFIG)
+    wait: WaitingConfig | None = None
     remote_cache: CacheConfig | None = None
     local_cache: CacheConfig | None = None
     cache_only: bool = False
@@ -961,7 +960,9 @@ class SendConfig(_ConfigBase):
     )
 
     def __post_init__(self):
-        object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
+        w = self.wait
+        if w is not None:
+            object.__setattr__(self, "wait", WaitingConfig.from_(w))
         rc = self.remote_cache
         if rc is not None:
             object.__setattr__(self, "remote_cache", CacheConfig.from_(rc))
@@ -985,7 +986,7 @@ class SendConfig(_ConfigBase):
 
     def __setstate__(self, state):
         object.__setattr__(self, "raise_error", state.get("raise_error", True))
-        object.__setattr__(self, "wait", state.get("wait", DEFAULT_WAITING_CONFIG))
+        object.__setattr__(self, "wait", state.get("wait"))
         object.__setattr__(self, "remote_cache", state.get("remote_cache"))
         object.__setattr__(self, "local_cache", state.get("local_cache"))
         object.__setattr__(self, "cache_only", state.get("cache_only", False))

@@ -71,7 +71,7 @@ class WaitingConfig:
 
         return Timeout(
             total=self.timeout * 2,
-            connect=self.timeout,
+            connect=min(self.timeout, 30.0),
             read=self.timeout
         )
 
