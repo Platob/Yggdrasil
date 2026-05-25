@@ -623,6 +623,57 @@ class TestResolveTableIdentifiers(GenieTestCase):
         call = self.genie_api.create_space.call_args
         self.assertIn("trading.tgp.trading_tgp_prd", call.kwargs["serialized_space"])
 
+    def test_create_space_with_tables_resolves_and_builds(self):
+        """``genie.create_space(tables=["trading_tgp_prd"])`` works end-to-end."""
+        self.genie.defaults = replace(
+            self.genie.defaults, warehouse_id="wh-1",
+        )
+        tbl = self._make_table_mock("trading", "tgp", "trading_tgp_prd")
+        self.client.tables.list_tables = MagicMock(return_value=iter([tbl]))
+
+        created = MagicMock(space_id="direct-id")
+        self.genie_api.create_space.return_value = created
+
+        space = self.genie.create_space(
+            tables=["trading_tgp_prd"],
+            title="My Space",
+        )
+        self.assertEqual(space.space_id, "direct-id")
+        call = self.genie_api.create_space.call_args
+        self.assertIn("trading.tgp.trading_tgp_prd", call.kwargs["serialized_space"])
+        self.assertEqual(call.kwargs["title"], "My Space")
+
+    def test_create_space_with_tables_and_instructions(self):
+        self.genie.defaults = replace(
+            self.genie.defaults, warehouse_id="wh-1",
+        )
+        created = MagicMock(space_id="s1")
+        self.genie_api.create_space.return_value = created
+
+        space = self.genie.create_space(
+            tables=["main.sales.orders"],
+            instructions=["Be brief.", "Use USD."],
+        )
+        self.assertEqual(space.space_id, "s1")
+        payload = self.genie_api.create_space.call_args.kwargs["serialized_space"]
+        self.assertIn("main.sales.orders", payload)
+        self.assertIn("Be brief.", payload)
+        self.assertIn("Use USD.", payload)
+
+    def test_create_space_rejects_tables_and_serialized_space(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.genie.create_space(
+                tables=["main.sales.orders"],
+                serialized_space='{"version": 1}',
+                warehouse_id="wh-1",
+            )
+        self.assertIn("not both", str(ctx.exception))
+
+    def test_create_space_requires_tables_or_serialized_space(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.genie.create_space(warehouse_id="wh-1")
+        self.assertIn("required", str(ctx.exception))
+
 
 class TestGenieCleanupDeadSpaces(GenieTestCase):
     """Duplicate managed-title spaces get trashed."""

@@ -927,20 +927,14 @@ class AutonomousAgent(GenieAgent):
     ) -> Any:
         """Create a Genie space wired to the given tables.
 
-        A thin wrapper around :meth:`Genie.create_space` that builds the
-        ``serialized_space`` payload from the table list and pins the
-        space on the agent's defaults.
+        Table names are resolved via
+        :meth:`Genie.resolve_table_identifiers` — short names like
+        ``"orders"`` or ``"sales.orders"`` are looked up automatically.
         """
-        from .resources import build_serialized_space
-
-        resolved_tables = self.service.resolve_table_identifiers(list(tables))
-        serialized = build_serialized_space(
-            tables=list(resolved_tables),
-            text_instructions=list(instructions),
-        )
         space = self.service.create_space(
+            tables=list(tables),
+            instructions=list(instructions),
             warehouse_id=warehouse_id,
-            serialized_space=serialized,
             title=title or f"Autonomous Agent — {self.name}",
         )
         self.service.defaults = _dc_replace(
