@@ -112,6 +112,20 @@ class BotClient:
         )
         return loads(data)
 
+    def _resolve_func(self, func: Callable | str) -> tuple[str, float, list[str] | None]:
+        if callable(func) and hasattr(func, "_remote_key"):
+            return (
+                func._remote_key,
+                getattr(func, "_remote_timeout", None) or self.timeout,
+                getattr(func, "_remote_modules", None),
+            )
+        if isinstance(func, str):
+            return func, self.timeout, None
+        raise TypeError(
+            f"Expected a @remote-decorated function or a string key, "
+            f"got {type(func).__name__}"
+        )
+
     def call(
         self,
         func: Callable | str,
@@ -119,23 +133,17 @@ class BotClient:
         **kwargs: Any,
     ) -> Any:
         """Call a @remote function on the bot server."""
-        if callable(func) and hasattr(func, "_remote_key"):
-            func_key = func._remote_key
-            timeout = getattr(func, "_remote_timeout", None) or self.timeout
-        elif isinstance(func, str):
-            func_key = func
-            timeout = self.timeout
-        else:
-            raise TypeError(
-                f"Expected a @remote-decorated function or a string key, "
-                f"got {type(func).__name__}"
-            )
+        func_key, timeout, modules = self._resolve_func(func)
 
-        payload = serialize_pickle({
+        call_payload: dict[str, Any] = {
             "func": func_key,
             "args": args,
             "kwargs": kwargs,
-        })
+        }
+        if modules:
+            call_payload["modules"] = modules
+
+        payload = serialize_pickle(call_payload)
 
         data, content_type, resp_headers = self._post(
             "/call",
@@ -153,24 +161,18 @@ class BotClient:
         **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
         """Call a @remote function and stream Arrow batches back."""
-        if callable(func) and hasattr(func, "_remote_key"):
-            func_key = func._remote_key
-            timeout = getattr(func, "_remote_timeout", None) or self.timeout
-        elif isinstance(func, str):
-            func_key = func
-            timeout = self.timeout
-        else:
-            raise TypeError(
-                f"Expected a @remote-decorated function or a string key, "
-                f"got {type(func).__name__}"
-            )
+        func_key, timeout, modules = self._resolve_func(func)
 
-        payload = serialize_pickle({
+        call_payload: dict[str, Any] = {
             "func": func_key,
             "args": args,
             "kwargs": kwargs,
             "stream": True,
-        })
+        }
+        if modules:
+            call_payload["modules"] = modules
+
+        payload = serialize_pickle(call_payload)
 
         data, content_type, resp_headers = self._post(
             "/call",

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import io
 import logging
 from typing import Any, Iterator
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
-
-from yggdrasil.pickle.ser.constants import CODEC_NONE, CODEC_ZSTD, CODEC_ZLIB
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +26,18 @@ try:
 except ImportError:
     pd = None
     _PANDAS_TYPES = ()
+
+# Cache pickle imports at module level to avoid per-call import overhead.
+_ygg_dumps = None
+_ygg_loads = None
+
+
+def _ensure_pickle():
+    global _ygg_dumps, _ygg_loads
+    if _ygg_dumps is None:
+        from yggdrasil.pickle import dumps, loads
+        _ygg_dumps = dumps
+        _ygg_loads = loads
 
 
 def is_tabular(obj: Any) -> bool:
@@ -75,19 +84,15 @@ def write_arrow_stream_chunked(
     table: pa.Table,
     max_chunksize: int = 65536,
 ) -> Iterator[bytes]:
-    buf = io.BytesIO()
-    writer = ipc.RecordBatchStreamWriter(buf, table.schema)
-    for batch in table.to_batches(max_chunksize=max_chunksize):
-        writer.write_batch(batch)
-        chunk = buf.getvalue()
-        if chunk:
-            yield chunk
-            buf.seek(0)
-            buf.truncate()
-    writer.close()
-    tail = buf.getvalue()
-    if tail:
-        yield tail
+    yield write_arrow_stream_bytes(table)
+
+
+def write_arrow_stream_bytes(table: pa.Table) -> bytes:
+    sink = pa.BufferOutputStream()
+    with ipc.RecordBatchStreamWriter(sink, table.schema) as writer:
+        for batch in table.to_batches(max_chunksize=65536):
+            writer.write_batch(batch)
+    return sink.getvalue().to_pybytes()
 
 
 def read_arrow_stream(data: bytes) -> pa.Table:
@@ -95,53 +100,26 @@ def read_arrow_stream(data: bytes) -> pa.Table:
     return reader.read_all()
 
 
-def arrow_schema_to_metadata(schema: pa.Schema) -> dict[str, str]:
-    fields = []
-    for f in schema:
-        fields.append({
-            "name": f.name,
-            "type": str(f.type),
-            "nullable": f.nullable,
-        })
-    return {"x-arrow-fields": str(fields)}
-
-
 # -- Pickle transport (compressed) -----------------------------------------
 
 def serialize_pickle(obj: Any) -> bytes:
-    from yggdrasil.pickle import dumps
-    return dumps(obj)
+    _ensure_pickle()
+    return _ygg_dumps(obj)
 
 
 def deserialize_pickle(data: bytes) -> Any:
-    from yggdrasil.pickle import loads
-    return loads(data)
-
-
-def serialize_call(func_name: str, args: tuple, kwargs: dict) -> bytes:
-    from yggdrasil.pickle import dumps
-    return dumps({
-        "func": func_name,
-        "args": args,
-        "kwargs": kwargs,
-    })
-
-
-def deserialize_call(data: bytes) -> tuple[str, tuple, dict]:
-    from yggdrasil.pickle import loads
-    payload = loads(data)
-    return payload["func"], tuple(payload["args"]), dict(payload["kwargs"])
+    _ensure_pickle()
+    return _ygg_loads(data)
 
 
 def serialize_result(obj: Any) -> tuple[bytes, str]:
     if is_tabular(obj):
         table = to_arrow_table(obj)
-        chunks = list(write_arrow_stream(table))
-        return b"".join(chunks), CONTENT_TYPE_ARROW_STREAM
+        return write_arrow_stream_bytes(table), CONTENT_TYPE_ARROW_STREAM
     return serialize_pickle(obj), CONTENT_TYPE_PICKLE
 
 
 def deserialize_result(data: bytes, content_type: str) -> Any:
-    if content_type == CONTENT_TYPE_ARROW_STREAM:
+    if CONTENT_TYPE_ARROW_STREAM in content_type:
         return read_arrow_stream(data)
     return deserialize_pickle(data)

@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from yggdrasil.bot.app import create_app
 from yggdrasil.bot.config import Settings
-from yggdrasil.bot.remote import _REGISTRY, remote
+from yggdrasil.bot.remote import _REGISTRY, _RemoteSpec, ensure_modules, remote
 from yggdrasil.bot.transport import (
     CONTENT_TYPE_ARROW_STREAM,
     CONTENT_TYPE_PICKLE,
@@ -73,7 +73,9 @@ class TestRemoteDecorator(unittest.TestCase):
     def test_registry(self):
         key = add._remote_key
         self.assertIn(key, _REGISTRY)
-        self.assertIs(_REGISTRY[key], add._remote_func)
+        spec = _REGISTRY[key]
+        self.assertIsInstance(spec, _RemoteSpec)
+        self.assertIs(spec.func, add._remote_func)
 
     def test_custom_name(self):
         self.assertEqual(multiply._remote_key, "custom:multiply")
@@ -208,6 +210,48 @@ class TestCallEndpoint(unittest.TestCase):
         result = deserialize_pickle(resp.content)
         self.assertEqual(len(result), 3)
         self.assertEqual(result[0]["a"], 1)
+
+
+class TestModuleAutoInstall(unittest.TestCase):
+    def test_ensure_modules_already_installed(self):
+        spec = _RemoteSpec(func=lambda: None, key="test:noop", timeout=None, modules=["sys", "os"])
+        ensure_modules(spec)
+
+    def test_ensure_modules_empty(self):
+        spec = _RemoteSpec(func=lambda: None, key="test:noop", timeout=None, modules=None)
+        ensure_modules(spec)
+
+    def test_ensure_modules_no_list(self):
+        spec = _RemoteSpec(func=lambda: None, key="test:noop", timeout=None, modules=[])
+        ensure_modules(spec)
+
+    def test_remote_with_modules_decorator(self):
+        @remote(modules=["json", "os"])
+        def needs_modules() -> str:
+            return "ok"
+
+        self.assertEqual(needs_modules(), "ok")
+        self.assertEqual(needs_modules._remote_modules, ["json", "os"])
+
+    def test_call_with_modules_metadata(self):
+        @remote(name="test:with_mods", modules=["json"])
+        def with_mods() -> str:
+            import json
+            return json.dumps({"ok": True})
+
+        settings = Settings(allow_remote=True)
+        app = create_app(settings)
+        client = TestClient(app)
+
+        payload = serialize_pickle({
+            "func": "test:with_mods",
+            "args": (),
+            "kwargs": {},
+        })
+        resp = client.post("/api/call", content=payload, headers={"Content-Type": CONTENT_TYPE_PICKLE})
+        self.assertEqual(resp.status_code, 200)
+        result = deserialize_pickle(resp.content)
+        self.assertEqual(result, '{"ok": true}')
 
 
 class TestPolarsTransport(unittest.TestCase):

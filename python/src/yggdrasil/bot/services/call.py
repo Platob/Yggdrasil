@@ -1,28 +1,25 @@
 from __future__ import annotations
 
-import datetime as dt
+import collections.abc
 import logging
 import time
 import uuid
 from functools import partial
-from typing import Any, Iterator
-
-import pyarrow as pa
+from typing import Any
 
 from fastapi.concurrency import run_in_threadpool
 
 from ..config import Settings
-from ..exceptions import BotError, NotFoundError
-from ..remote import get_registered, list_registered
+from ..exceptions import NotFoundError
+from ..remote import ensure_modules, get_registered, list_registered
 from ..transport import (
     CONTENT_TYPE_ARROW_STREAM,
     CONTENT_TYPE_PICKLE,
     deserialize_pickle,
     is_tabular,
     serialize_pickle,
-    serialize_result,
     to_arrow_table,
-    write_arrow_stream,
+    write_arrow_stream_bytes,
     write_arrow_stream_chunked,
 )
 
@@ -40,29 +37,29 @@ class CallService:
         self,
         body: bytes,
         accept: str | None = None,
-    ) -> tuple[bytes | Iterator[bytes], str, dict[str, str]]:
-        """Deserialize call payload, execute, serialize result.
-
-        Returns (body_bytes_or_iterator, content_type, extra_headers).
-        """
+    ) -> tuple[bytes | collections.abc.Iterator, str, dict[str, str]]:
         payload = deserialize_pickle(body)
         func_key = payload["func"]
         args = tuple(payload.get("args", ()))
         kwargs = dict(payload.get("kwargs", {}))
         want_stream = payload.get("stream", False)
+        extra_modules = payload.get("modules")
 
-        func = get_registered(func_key)
-        if func is None:
+        spec = get_registered(func_key)
+        if spec is None:
             raise NotFoundError(
                 f"Function {func_key!r} is not registered on this node. "
                 f"Available: {list(list_registered())}"
             )
 
+        if spec.modules or extra_modules:
+            await self._run(self._ensure_deps, spec, extra_modules)
+
         call_id = uuid.uuid4().hex[:12]
         LOGGER.info("Executing call %r (id=%s)", func_key, call_id)
 
         t0 = time.monotonic()
-        result = await self._run(func, *args, **kwargs)
+        result = await self._run(spec.func, *args, **kwargs)
         duration = time.monotonic() - t0
 
         LOGGER.info("Completed call %r (id=%s, %.2fs)", func_key, call_id, duration)
@@ -83,10 +80,9 @@ class CallService:
             table = to_arrow_table(result)
             headers["X-Arrow-Num-Rows"] = str(table.num_rows)
             headers["X-Arrow-Num-Columns"] = str(table.num_columns)
-            field_info = ",".join(
+            headers["X-Arrow-Schema"] = ",".join(
                 f"{f.name}:{f.type}" for f in table.schema
             )
-            headers["X-Arrow-Schema"] = field_info
 
             if prefer_stream:
                 return (
@@ -95,11 +91,21 @@ class CallService:
                     headers,
                 )
 
-            chunks = list(write_arrow_stream(table))
-            return b"".join(chunks), CONTENT_TYPE_ARROW_STREAM, headers
+            return (
+                write_arrow_stream_bytes(table),
+                CONTENT_TYPE_ARROW_STREAM,
+                headers,
+            )
 
-        result_bytes = serialize_pickle(result)
-        return result_bytes, CONTENT_TYPE_PICKLE, headers
+        return serialize_pickle(result), CONTENT_TYPE_PICKLE, headers
+
+    @staticmethod
+    def _ensure_deps(spec, extra_modules: list[str] | None) -> None:
+        ensure_modules(spec)
+        if extra_modules:
+            from yggdrasil.bot.remote import _RemoteSpec
+            tmp = _RemoteSpec(func=spec.func, key=spec.key, timeout=spec.timeout, modules=extra_modules)
+            ensure_modules(tmp)
 
     def get_registry(self) -> dict[str, str]:
         return list_registered()

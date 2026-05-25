@@ -9,7 +9,23 @@ LOGGER = logging.getLogger(__name__)
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-_REGISTRY: dict[str, Callable[..., Any]] = {}
+_REGISTRY: dict[str, _RemoteSpec] = {}
+
+
+class _RemoteSpec:
+    __slots__ = ("func", "key", "timeout", "modules")
+
+    def __init__(
+        self,
+        func: Callable,
+        key: str,
+        timeout: float | None,
+        modules: list[str] | None,
+    ) -> None:
+        self.func = func
+        self.key = key
+        self.timeout = timeout
+        self.modules = modules or []
 
 
 def _func_key(func: Callable) -> str:
@@ -23,7 +39,12 @@ def remote(func: F) -> F: ...
 
 
 @overload
-def remote(*, name: str | None = ..., timeout: float | None = ...) -> Callable[[F], F]: ...
+def remote(
+    *,
+    name: str | None = ...,
+    timeout: float | None = ...,
+    modules: list[str] | None = ...,
+) -> Callable[[F], F]: ...
 
 
 def remote(
@@ -31,6 +52,7 @@ def remote(
     *,
     name: str | None = None,
     timeout: float | None = None,
+    modules: list[str] | None = None,
 ) -> F | Callable[[F], F]:
     """Register a function for remote execution via a bot server.
 
@@ -40,18 +62,22 @@ def remote(
         def compute(x: int, y: int) -> int:
             return x + y
 
-        # With options
-        @remote(timeout=30)
-        def slow_compute(data: list) -> dict:
+        @remote(timeout=30, modules=["numpy", "scipy"])
+        def ml_predict(data: list) -> dict:
+            import numpy as np
             ...
 
+    ``modules`` lists pip packages the function needs. When called on a
+    bot node that lacks them, the server auto-installs before execution.
+
     The decorated function works normally when called locally.
-    Use ``BotClient.call(func, *args, **kwargs)`` to invoke it
-    on a remote bot node.
+    Use ``BotClient.call(func, *args, **kwargs)`` to invoke it on a
+    remote bot node.
     """
     def _wrap(f: F) -> F:
         key = name or _func_key(f)
-        _REGISTRY[key] = f
+        spec = _RemoteSpec(func=f, key=key, timeout=timeout, modules=modules)
+        _REGISTRY[key] = spec
 
         @functools.wraps(f)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -60,6 +86,7 @@ def remote(
         wrapper._remote_key = key  # type: ignore[attr-defined]
         wrapper._remote_timeout = timeout  # type: ignore[attr-defined]
         wrapper._remote_func = f  # type: ignore[attr-defined]
+        wrapper._remote_modules = modules  # type: ignore[attr-defined]
         return wrapper  # type: ignore[return-value]
 
     if func is not None:
@@ -67,13 +94,37 @@ def remote(
     return _wrap
 
 
-def get_registered(key: str) -> Callable[..., Any] | None:
+def get_registered(key: str) -> _RemoteSpec | None:
     return _REGISTRY.get(key)
 
 
 def list_registered() -> dict[str, str]:
     result = {}
-    for key, func in _REGISTRY.items():
-        sig = inspect.signature(func)
+    for key, spec in _REGISTRY.items():
+        sig = inspect.signature(spec.func)
         result[key] = str(sig)
     return result
+
+
+def ensure_modules(spec: _RemoteSpec) -> None:
+    """Auto-install any modules declared by the @remote spec."""
+    if not spec.modules:
+        return
+
+    for mod_name in spec.modules:
+        try:
+            __import__(mod_name.replace("-", "_").split("[")[0])
+        except ImportError:
+            LOGGER.info("Auto-installing module %r for %r", mod_name, spec.key)
+            try:
+                from yggdrasil.environ.environment import PyEnv
+                PyEnv.current().install(mod_name, wait=True, raise_error=True)
+            except Exception:
+                import subprocess, sys
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", mod_name],
+                    check=True,
+                    capture_output=True,
+                )
+            __import__(mod_name.replace("-", "_").split("[")[0])
+            LOGGER.info("Installed module %r", mod_name)
