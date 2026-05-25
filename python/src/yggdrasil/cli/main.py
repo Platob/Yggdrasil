@@ -2,7 +2,8 @@
 
 Subcommands::
 
-    ygg bot serve       Start YGGBOT server (foreground)
+    ygg bot serve       Start YGGBOT server + frontend (foreground)
+    ygg bot front       Start frontend only (Next.js dev server)
     ygg bot run         Call a @remote function
     ygg bot chat        Open YGGCHAT terminal
     ygg bot status      Show running bot status
@@ -40,11 +41,17 @@ def _build_parser() -> argparse.ArgumentParser:
     bot = sub.add_parser("bot", help="YGGBOT server and remote execution.")
     bot_sub = bot.add_subparsers(dest="bot_action")
 
-    serve = bot_sub.add_parser("serve", help="Start YGGBOT server (foreground).")
+    serve = bot_sub.add_parser("serve", help="Start YGGBOT server + frontend (foreground).")
     serve.add_argument("--host", default=None, help="Bind host (default: 0.0.0.0).")
     serve.add_argument("--port", type=int, default=None, help="Bind port (auto-scans if busy).")
     serve.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
+    serve.add_argument("--no-front", action="store_true", default=False, help="Skip launching the frontend.")
     serve.set_defaults(handler=_bot_serve)
+
+    front = bot_sub.add_parser("front", help="Start frontend dev server only.")
+    front.add_argument("--port", type=int, default=None, help="Frontend port (default: 3000).")
+    front.add_argument("--bot-port", type=int, default=None, help="Bot API port to proxy to.")
+    front.set_defaults(handler=_bot_front)
 
     run = bot_sub.add_parser("run", help="Call a @remote function.")
     run.add_argument("func", help="Function key (e.g. 'mymodule:my_func').")
@@ -78,9 +85,55 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _start_frontend(settings, *, bot_port: int, front_port: int | None = None) -> "subprocess.Popen | None":
+    import os
+    import shutil
+    import subprocess
+
+    front_home = settings.front_home
+    if not (front_home / "package.json").exists():
+        from yggdrasil.cli.style import dim, out, yellow
+        out(f"  {yellow('skip')}  frontend not found at {dim(str(front_home))}\n")
+        return None
+
+    npm = shutil.which("npm")
+    if npm is None:
+        from yggdrasil.cli.style import dim, out, yellow
+        out(f"  {yellow('skip')}  npm not found — install Node.js to serve the frontend\n")
+        return None
+
+    if not (front_home / "node_modules").exists():
+        from yggdrasil.cli.style import Spinner
+        with Spinner("installing frontend dependencies...", color="33") as sp:
+            subprocess.run(
+                [npm, "install"],
+                cwd=str(front_home),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            sp.stop()
+
+    from yggdrasil.bot.config import _find_open_port
+    port = front_port or _find_open_port(settings.front_port, settings.front_port + 100)
+
+    env = {**os.environ, "YGG_BOT_PORT": str(bot_port), "PORT": str(port)}
+    proc = subprocess.Popen(
+        [npm, "run", "dev", "--", "--port", str(port)],
+        cwd=str(front_home),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    from yggdrasil.cli.style import bold, cyan, out
+    out(f"  {cyan('front')} {bold(f'http://localhost:{port}')}\n")
+    return proc
+
+
 def _bot_serve(args: argparse.Namespace) -> int:
     import os
-    from yggdrasil.cli.style import Spinner, print_logo
+    from yggdrasil.cli.style import print_logo
 
     print_logo("YGGBOT")
 
@@ -102,10 +155,45 @@ def _bot_serve(args: argparse.Namespace) -> int:
     from yggdrasil.cli.style import bold, cyan, dim, out
     out(f"  {cyan('node')}  {bold(settings.node_id)}\n")
     out(f"  {cyan('home')}  {dim(str(settings.bot_home))}\n")
-    out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n\n")
+    out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n")
+
+    front_proc = None
+    if not args.no_front:
+        front_proc = _start_frontend(settings, bot_port=port)
+    out("\n")
 
     import uvicorn
-    uvicorn.run("yggdrasil.bot.app:app", host=host, port=port, reload=args.reload)
+    try:
+        uvicorn.run("yggdrasil.bot.app:app", host=host, port=port, reload=args.reload)
+    finally:
+        if front_proc is not None:
+            front_proc.terminate()
+            front_proc.wait(timeout=5)
+    return 0
+
+
+def _bot_front(args: argparse.Namespace) -> int:
+    import signal
+
+    from yggdrasil.bot.config import get_settings
+    from yggdrasil.cli.style import print_logo
+
+    print_logo("YGGBOT")
+    settings = get_settings()
+
+    bot_port = args.bot_port or settings.port
+    proc = _start_frontend(settings, bot_port=bot_port, front_port=args.port)
+    if proc is None:
+        return 1
+
+    from yggdrasil.cli.style import dim, out
+    out(f"  {dim('Press Ctrl+C to stop.')}\n\n")
+
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
     return 0
 
 

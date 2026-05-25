@@ -39,12 +39,17 @@ def _find_open_port(start: int = 8100, end: int = 8200) -> int:
         return s.getsockname()[1]
 
 
+def _default_front_home() -> Path:
+    return Path(__file__).resolve().parents[4] / "next" / "ygg"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     app_name: str = "yggdrasil-bot"
     app_version: str = "0.1.0"
     host: str = "0.0.0.0"
     port: int = 8100
+    front_port: int = 3000
     allow_remote: bool = True
     docs_url: str = "/docs"
     redoc_url: str = "/redoc"
@@ -52,6 +57,7 @@ class Settings:
     api_prefix: str = "/api"
     node_id: str = field(default_factory=_default_node_id)
     bot_home: Path = field(default_factory=_bot_home)
+    front_home: Path = field(default_factory=_default_front_home)
     max_cmd_timeout: float = 300.0
     max_python_timeout: float = 600.0
     max_concurrent_jobs: int = 16
@@ -96,6 +102,7 @@ def get_settings() -> Settings:
         app_version=os.getenv("YGG_BOT_APP_VERSION", "0.1.0"),
         host=os.getenv("YGG_BOT_HOST", "0.0.0.0"),
         port=int(os.getenv("YGG_BOT_PORT", "8100")),
+        front_port=int(os.getenv("YGG_BOT_FRONT_PORT", "3000")),
         allow_remote=_as_bool(os.getenv("YGG_BOT_ALLOW_REMOTE"), True),
         docs_url=os.getenv("YGG_BOT_DOCS_URL", "/docs"),
         redoc_url=os.getenv("YGG_BOT_REDOC_URL", "/redoc"),
@@ -104,6 +111,9 @@ def get_settings() -> Settings:
         node_id=_default_node_id(),
         bot_home=Path(
             os.getenv("YGG_BOT_HOME", str(_bot_home()))
+        ).expanduser().resolve(),
+        front_home=Path(
+            os.getenv("YGG_BOT_FRONT_HOME", str(_default_front_home()))
         ).expanduser().resolve(),
         max_cmd_timeout=float(os.getenv("YGG_BOT_MAX_CMD_TIMEOUT", "300")),
         max_python_timeout=float(os.getenv("YGG_BOT_MAX_PYTHON_TIMEOUT", "600")),
