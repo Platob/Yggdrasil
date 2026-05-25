@@ -91,6 +91,8 @@ Same applies to pandas, spark, and Databricks-related modules — always import 
 
 The only **hard** runtime deps are `pyarrow>=20`, `polars>=1.3`, `xxhash`, and `orjson>=3.10`. Base installs must keep working without anything else.
 
+See [optional libs](../modules/libs/README.md) for the full attribute and probe-helper reference.
+
 ## Schema intent across boundaries
 
 Names, order, nullability, metadata, nested structure, precision/scale, and timezone intent are **part of the user contract**. Don't drop them unless the API documents the loss. The cast registry preserves them by default; engine bridges round-trip through Arrow rather than each engine's native parser to avoid silent drift.

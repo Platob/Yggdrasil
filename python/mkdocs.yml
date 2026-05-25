@@ -207,9 +207,12 @@ nav:
       - Utilities:
           - pyutils: modules/pyutils/README.md
           - concurrent: modules/concurrent/README.md
+          - environ: modules/environ/README.md
           - optional libs: modules/libs/README.md
           - extension helpers: modules/libs/extensions/README.md
           - deltalake (status): modules/deltalake/README.md
+      - Service:
+          - fastapi: modules/fastapi/README.md
   - API Reference:
       - Overview: api/index.md
       - Browse: reference/

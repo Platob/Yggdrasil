@@ -154,5 +154,7 @@ See the [Databricks guide](guides/databricks.md) for full workflows.
 - [Casting guide](guides/casting.md) — scalar, tabular, and engine-specific casting.
 - [IO & HTTP](guides/io-http.md) — buffers, URLs, sessions, batch dispatch.
 - [Databricks](guides/databricks.md) — SQL, compute, files, secrets, IAM, Genie.
+- [environ](modules/environ/README.md) — `PyEnv`, `runtime_import_module`, `SystemParameters`.
+- [fastapi](modules/fastapi/README.md) — FastAPI service for the Power Query connector.
 - [Module walkthrough](modules.md) — curated index of focused module pages.
 - [API Reference](api/index.md) — generated from the `yggdrasil` source tree.

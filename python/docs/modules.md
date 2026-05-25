@@ -55,7 +55,7 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.databricks.fs` | DBFS / Volume / Workspace files | [fs](modules/databricks/fs/README.md) |
 | `yggdrasil.databricks.secrets` | Scope/secret helpers | [secrets](modules/databricks/secrets/README.md) |
 | `yggdrasil.databricks.iam` | Users + groups (workspace/account) | [iam](modules/databricks/iam/README.md) |
-| `yggdrasil.databricks.jobs` | Typed `NotebookConfig` widgets | [jobs](modules/databricks/jobs/README.md) |
+| `yggdrasil.databricks.jobs` | `NotebookConfig`, `Job`, `JobTask`, `TaskParameters`, dependency introspection | [jobs](modules/databricks/jobs/README.md) |
 | `yggdrasil.databricks.workflow` | Workflow service: jobs, tasks, schedules | [workflow](modules/databricks/workflow/README.md) |
 | `yggdrasil.databricks.account` | Account-level service | [account](modules/databricks/account/README.md) |
 | `yggdrasil.databricks.genie` | Conversational analytics | [genie](modules/databricks/genie/README.md) |
@@ -89,8 +89,8 @@ Engines register their converters **on import** — pull them in once at startup
 |---|---|---|
 | `yggdrasil.pyutils` | `retry`, `parallelize` | [pyutils](modules/pyutils/README.md) |
 | `yggdrasil.concurrent` | `Job`, `AsyncJob`, `ThreadJob`, `JobPoolExecutor` | [concurrent](modules/concurrent/README.md) |
-| `yggdrasil.environ` | Runtime import / install logic | [optional libs](modules/libs/README.md) |
-| `yggdrasil.fastapi` | FastAPI service powering the Power Query connector | [API Reference](api/index.md) |
+| `yggdrasil.environ` | `PyEnv` venv/package lifecycle, `runtime_import_module`, `SystemParameters` | [environ](modules/environ/README.md) |
+| `yggdrasil.fastapi` | FastAPI service powering the Power Query connector | [fastapi](modules/fastapi/README.md) |
 | `yggdrasil.blake3` / `yggdrasil.xxhash` | Optional hashing | — |
 
 ## See also
