@@ -364,7 +364,7 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
 
     out.append(_time_one(
         "Session._load_cached_response (local hit)",
-        lambda: SESSION._load_cached_response(REQ, CFG_LOCAL, source="local"),
+        lambda: SESSION._load_cached_response(REQ, CFG_LOCAL),
         repeat=repeat, inner=500,
     ))
 
@@ -376,20 +376,15 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
     _ = miss_req.public_hash
     out.append(_time_one(
         "Session._load_cached_response (local miss)",
-        lambda: SESSION._load_cached_response(miss_req, CFG_LOCAL, source="local"),
+        lambda: SESSION._load_cached_response(miss_req, CFG_LOCAL),
         repeat=repeat, inner=2_000,
     ))
 
-    # Use a dedicated folder so the fire-and-forget writeback queue
-    # doesn't accumulate part files in the shared CFG_LOCAL — every
-    # subsequent inner iteration would otherwise pay an iterdir over
-    # the running total of written parts.
     store_cfg = CacheConfig(tabular=tempfile.mkdtemp(prefix="ygg-bench-store-"))
-    store_tabular = store_cfg.cache_tabular()
     out.append(_time_one(
         "Session._store_cached_response (local, fire-and-forget)",
         lambda: SESSION._store_cached_response(
-            RESP, store_cfg, source="local", tabular=store_tabular,
+            RESP, store_cfg, async_write=True,
         ),
         repeat=repeat, inner=500,
     ))

@@ -27,7 +27,7 @@ __all__ = ["CacheConfig", "SendConfig"]
 
 # Module-level cached paths — avoids repeated syscalls in hot paths
 # (``local_cache_folder`` is called per-request in the batch pipeline).
-_DEFAULT_CACHE_ROOT: pathlib.Path = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
+_DEFAULT_CACHE_ROOT: pathlib.Path = pathlib.Path.home() / ".cache" / "http" / "response"
 
 
 # Identity-by-default — ``public_url_hash`` is the URL-based identity
@@ -342,30 +342,16 @@ class CacheConfig(_ConfigBase):
             )
 
     def __getstate__(self):
-        # Project local FolderPath caches down to their URL string for
-        # transport — keeps the payload free of bound backend handles
-        # (Databricks client on a :class:`VolumePath`, boto3 client on
-        # an :class:`S3Path`, …) so the dataclass survives Spark /
-        # multiprocessing / Power Query worker boundaries without
-        # dragging unpicklable live state. :meth:`__setstate__`
-        # rehydrates by rebuilding the FolderPath, which is
-        # Singleton-cached so the receiving side coalesces onto the
-        # same live instance as any other config pointing there.
-        #
-        # Remote :class:`Tabular` backends (Databricks Table, …) are
-        # dropped on pickle — they wrap live SDK clients that don't
-        # cross process boundaries; the receiver rebuilds them from
-        # session-level config.
-        local_url = self._local_cache_url()
         return {
             "mode": self.mode,
             "wait": self.wait,
-            "tabular_url": local_url,
+            "tabular": self.tabular,
             "request_by": self.request_by,
             "response_by": self.response_by,
             "received_from": self.received_from,
             "received_to": self.received_to,
             "received_ttl": self.received_ttl,
+            "anonymize": self.anonymize,
             "mirror_local_to_remote": self.mirror_local_to_remote,
             "cleanup_ttl": self.cleanup_ttl,
         }
@@ -378,18 +364,15 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "received_from", state["received_from"])
         object.__setattr__(self, "received_to", state["received_to"])
         object.__setattr__(self, "received_ttl", state["received_ttl"])
-        # Rehydrate local FolderPath from its URL string; remote
-        # backends are reattached out-of-band by the receiver.
-        # Accept the legacy ``path`` key from snapshots taken before
-        # the unification so old pickled payloads still load.
-        tabular_url = state.get("tabular_url", state.get("path"))
-        if tabular_url is not None:
-            from yggdrasil.io.nested.folder_path import FolderPath
-            object.__setattr__(
-                self, "tabular", FolderPath(path=Path.from_(tabular_url)),
-            )
-        else:
-            object.__setattr__(self, "tabular", None)
+        # Legacy payloads stored a URL string under "tabular_url" or
+        # "path" instead of the live Holder.
+        tabular = state.get("tabular")
+        if tabular is None:
+            tabular_url = state.get("tabular_url", state.get("path"))
+            if tabular_url is not None:
+                from yggdrasil.io.nested.folder_path import FolderPath
+                tabular = FolderPath(path=Path.from_(tabular_url))
+        object.__setattr__(self, "tabular", tabular)
         object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
         object.__setattr__(
             self, "mirror_local_to_remote",
@@ -400,21 +383,6 @@ class CacheConfig(_ConfigBase):
             state.get("cleanup_ttl", dt.timedelta(days=1)),
         )
         object.__setattr__(self, "_derived", None)
-
-    def _local_cache_url(self) -> "str | None":
-        """URL string of the local cache root, or ``None`` for non-local.
-
-        Local cache (FolderPath) carries an addressable path; remote
-        backends are dropped from the pickle wire format.  Path
-        portability across environments (home / tmpdir differences)
-        is handled transparently by :class:`URL.__getstate__`.
-        """
-        tab = self.tabular
-        if tab is None:
-            return None
-        if hasattr(tab, "path"):
-            return str(tab.path.url)
-        return None
 
     @classmethod
     def from_(
@@ -492,11 +460,7 @@ class CacheConfig(_ConfigBase):
 
     @property
     def local_cache_enabled(self):
-        if not self.cache_enabled:
-            return False
-        if self.tabular is not None:
-            return True
-        return self.received_from is not None or self.received_to is not None
+        return self.cache_enabled
 
     @property
     def remote_cache_enabled(self):
@@ -606,7 +570,7 @@ class CacheConfig(_ConfigBase):
         :attr:`tabular` is local (any :class:`yggdrasil.io.path.Path`
         subclass — LocalPath on disk, VolumePath on a Databricks
         Volume, S3Path on a bucket, …); otherwise builds the default
-        LocalPath under ``~/.yggdrasil/cache/response``, suffixed
+        LocalPath under ``~/.cache/http/response``, suffixed
         with the session's ``base_url`` host + path when one is
         available so different APIs sharing the same machine don't
         collide on disk:
@@ -671,29 +635,6 @@ class CacheConfig(_ConfigBase):
         # or pickling.
         object.__setattr__(self, "tabular", tabular)
         return tabular
-
-    def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
-        """Materialise :attr:`tabular` for local-cache configs.
-
-        After this call the session-level cache flow can reach for
-        ``cfg.tabular`` directly without a ``cache_tabular(session)``
-        dance. Symmetric to remote configs which always ship with a
-        prebuilt :attr:`tabular`.
-
-        No-op when :attr:`tabular` is already set or
-        :attr:`local_cache_enabled` is False (mode disables the
-        cache, no ``received_*`` window, etc).
-
-        Returns ``self`` so callers can chain
-        ``cfg.prebuild(session)`` at the entry of
-        :meth:`Session._send_many_batches`.
-        """
-        if self.tabular is not None:
-            return self
-        if not self.local_cache_enabled:
-            return self
-        self.cache_tabular(session=session)
-        return self
 
     def request_values(
         self,
@@ -810,25 +751,27 @@ class CacheConfig(_ConfigBase):
         self,
         response: "Response | None" = None,
     ) -> "Any | None":
-        """Build the response-side / time-window predicate as an :class:`Expression`.
+        """Build the response-side match predicate as an :class:`Expression`.
 
         Carries the response-side match keys (when *response* is
-        supplied) plus the configured ``received_*`` window. Returns
-        ``None`` when no clauses apply so callers can compose with
-        :func:`all_of` cleanly.
+        supplied). Returns ``None`` when no clauses apply so callers
+        can compose with :func:`all_of` cleanly.
+
+        ``received_from`` / ``received_to`` are NOT included — they
+        are staleness checks applied post-read by
+        :meth:`filter_response`, not identity filters. Baking them
+        into the predicate would reject backfilled rows whose
+        original ``received_at`` falls outside the window.
         """
+        if response is None:
+            return None
         from yggdrasil.execution.expr import all_of, col
 
         clauses: list[Any] = []
-        if response is not None:
-            for key, value in self.response_values(response).items():
-                clauses.append(
-                    col(key).is_null() if value is None else col(key) == value
-                )
-        if self.received_from is not None:
-            clauses.append(col("received_at") >= self.received_from)
-        if self.received_to is not None:
-            clauses.append(col("received_at") < self.received_to)
+        for key, value in self.response_values(response).items():
+            clauses.append(
+                col(key).is_null() if value is None else col(key) == value
+            )
         if not clauses:
             return None
         if len(clauses) == 1:
@@ -879,9 +822,8 @@ class CacheConfig(_ConfigBase):
         """Batch :class:`Predicate` for the cache read.
 
         Shape: ``partition_key IN (<distinct keys>)`` AND
-        ``(req1_match) OR (req2_match) OR …`` AND the
-        response/time-window clause. Returns ``None`` when the
-        batch is empty and no time window applies.
+        ``(req1_match) OR (req2_match) OR …``. Returns ``None``
+        when the batch is empty.
 
         Drives both backends through :meth:`Tabular.read_arrow_batches`:
         :class:`FolderPath` lets :meth:`iter_children` probe candidate

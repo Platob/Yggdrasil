@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shlex
 import sys
 from dataclasses import replace as _dc_replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 from yggdrasil.cli.databricks.base import DatabricksCLI
@@ -33,6 +35,7 @@ LOGGER = logging.getLogger(__name__)
 _SLASH_HELP: dict[str, str] = {
     "/help": "Show this list of commands.",
     "/quit, /exit": "Leave the REPL.",
+    "/login": "Configure Databricks credentials (host + token).",
     "/clear": "Clear the screen.",
     "/reset": "Start a fresh Genie conversation (does NOT clear local history).",
     "/history": "Print every Q & A from this session.",
@@ -47,6 +50,7 @@ _SLASH_HELP: dict[str, str] = {
     "/defaults": "Show the active GenieDefaults dataclass.",
     "/tools": "List registered agent tools.",
     "/output-dir": "Print the local output directory.",
+    "/log [level]": "Show or set log level (debug, info, warning, error).",
 }
 
 
@@ -123,6 +127,7 @@ class GenieCLI(DatabricksCLI):
             "help": self._cmd_help,
             "quit": self._cmd_quit,
             "exit": self._cmd_quit,
+            "login": self._cmd_login,
             "clear": self._cmd_clear,
             "reset": self._cmd_reset,
             "history": self._cmd_history,
@@ -137,6 +142,7 @@ class GenieCLI(DatabricksCLI):
             "defaults": self._cmd_defaults,
             "tools": self._cmd_tools,
             "output-dir": self._cmd_output_dir,
+            "log": self._cmd_log,
         }
 
     # ------------------------------------------------------------------ #
@@ -317,7 +323,10 @@ class GenieCLI(DatabricksCLI):
         was supplied, fall back to a single-shot ask + exit (no REPL
         prompt). Otherwise drop into the REPL.
         """
-        # Merge CLI flags into the Genie service's defaults once on entry.
+        self._setup_logging()
+        if not self._ensure_connected():
+            return 2
+
         self.genie.defaults = self.defaults_from_args(self.args, self.genie.defaults)
 
         if getattr(self.args, "deploy_skills", False):
@@ -327,6 +336,102 @@ class GenieCLI(DatabricksCLI):
         if question is not None:
             return self.ask_once(question)
         return self.run_repl()
+
+    # ------------------------------------------------------------------ #
+    # Logging
+    # ------------------------------------------------------------------ #
+    _YGG_LOGGER = logging.getLogger("yggdrasil")
+
+    def _setup_logging(self) -> None:
+        if not logging.root.handlers:
+            logging.basicConfig(
+                level=logging.WARNING,
+                format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        if not getattr(self.args, "debug", False):
+            self._YGG_LOGGER.setLevel(logging.INFO)
+            logging.getLogger("databricks.sdk").setLevel(logging.ERROR)
+
+    # ------------------------------------------------------------------ #
+    # Credential setup
+    # ------------------------------------------------------------------ #
+    _CREDS_FILE = Path(
+        os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache",
+    ) / "yggdrasil" / "genie" / ".credentials.json"
+
+    def _load_saved_creds(self) -> "dict[str, str | None]":
+        try:
+            import json
+            return json.loads(self._CREDS_FILE.read_text("utf-8"))
+        except Exception:
+            return {}
+
+    def _save_creds(self, host: str, token: "str | None") -> None:
+        try:
+            import json
+            self._CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._CREDS_FILE.write_text(
+                json.dumps({"host": host, "token": token}), "utf-8",
+            )
+        except Exception:
+            pass
+
+    def _ensure_connected(self) -> bool:
+        """Validate the client can reach Databricks, prompting on failure."""
+        try:
+            self.client.make_config()
+            return True
+        except Exception:
+            pass
+        saved = self._load_saved_creds()
+        if saved.get("host"):
+            try:
+                from yggdrasil.databricks.client import DatabricksClient
+                self.client = DatabricksClient(
+                    host=saved["host"], token=saved.get("token"),
+                )
+                self.client.make_config()
+                self.success(f"  connected to {saved['host']} (saved credentials)")
+                return True
+            except Exception:
+                pass
+        self.warn("  Databricks credentials not configured.")
+        return self._prompt_credentials()
+
+    def _prompt_credentials(self) -> bool:
+        """Interactively ask for host (+ optional token) and rebuild the client."""
+        from yggdrasil.databricks.client import DatabricksClient
+
+        saved = self._load_saved_creds()
+        saved_host = saved.get("host") or ""
+        prefill_hint = f", default={saved_host}" if saved_host else ""
+
+        try:
+            host = self.input_fn(
+                self.style.cyan("  host ")
+                + self.style.dim(f"(e.g. https://adb-123.7.azuredatabricks.net{prefill_hint}): "),
+            ).strip() or saved_host
+            if not host:
+                self.error("  host is required.")
+                return False
+            token = self.input_fn(
+                self.style.cyan("  token ")
+                + self.style.dim("(PAT, empty for browser SSO): "),
+            ).strip() or None
+        except (EOFError, KeyboardInterrupt):
+            self.out("")
+            return False
+
+        try:
+            self.client = DatabricksClient(host=host, token=token)
+            self.client.make_config()
+            self._save_creds(host, token)
+            self.success(f"  connected to {host}")
+            return True
+        except Exception as exc:
+            self.error(f"  failed: {exc}")
+            return False
 
     # ------------------------------------------------------------------ #
     # Workspace skill deployment
@@ -472,12 +577,189 @@ class GenieCLI(DatabricksCLI):
         except KeyboardInterrupt:
             self.warn("  interrupted.")
             return
-        except Exception as exc:  # surface SDK / auth / 4xx errors cleanly
+        except ValueError as exc:
+            msg = str(exc)
+            if "auto-pick" in msg and self._prompt_space():
+                self.ask(question)
+                return
+            if "managed_space_tables" in msg and self._prompt_tables():
+                self.ask(question)
+                return
+            self.error(f"  error: {exc}")
+            LOGGER.debug("ask failed", exc_info=True)
+            return
+        except Exception as exc:
             self.error(f"  error: {type(exc).__name__}: {exc}")
             LOGGER.debug("ask failed", exc_info=True)
             return
         self.conversation_id = answer.conversation_id or self.conversation_id
+        preview = (answer.text or "").splitlines()[0][:120] if answer.text else "(no text)"
+        LOGGER.info(
+            "Genie answered (status=%s, msg=%s): %s",
+            getattr(answer.status, "name", answer.status),
+            answer.message_id,
+            preview,
+        )
         self._render_answer(answer)
+
+    def _prompt_space(self) -> bool:
+        """List available Genie spaces and let the user pick one."""
+        try:
+            spaces = list(self.genie.list_spaces())
+        except Exception:
+            spaces = []
+
+        if spaces:
+            self.out("")
+            self.info("  Available Genie spaces:")
+            for i, sp in enumerate(spaces, 1):
+                title = getattr(sp._details, "title", None) if sp._details else None
+                label = f"{sp.space_id}"
+                if title:
+                    label += f"  {title}"
+                self.out(f"  {self.style.dim(f'{i:>3}.')} {label}")
+            self.out("")
+            try:
+                choice = self.input_fn(
+                    self.style.cyan("  pick a space ")
+                    + self.style.dim(f"(1-{len(spaces)}): "),
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                self.out("")
+                return False
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(spaces):
+                    picked = spaces[idx]
+                    self.genie.defaults = _dc_replace(
+                        self.defaults, space_id=picked.space_id,
+                    )
+                    title = getattr(picked._details, "title", None) if picked._details else None
+                    self.success(f"  using space {picked.space_id}" + (f" ({title})" if title else ""))
+                    return True
+            except ValueError:
+                pass
+            self.error(f"  invalid choice: {choice!r}")
+            return False
+        else:
+            self.warn("  no Genie spaces found — creating one.")
+            return self._prompt_create_space()
+
+    def _prompt_create_space(self) -> bool:
+        """Prompt for a warehouse, auto-create a Genie space."""
+        try:
+            warehouses = list(self.client.warehouses.list())
+        except Exception:
+            warehouses = []
+
+        wh_id = self.defaults.warehouse_id
+        if not wh_id:
+            if warehouses:
+                self.out("")
+                self.info("  Available warehouses:")
+                for i, wh in enumerate(warehouses, 1):
+                    name = getattr(wh, "name", None) or getattr(wh, "warehouse_id", "?")
+                    self.out(f"  {self.style.dim(f'{i:>3}.')} {name}")
+                self.out("")
+                try:
+                    choice = self.input_fn(
+                        self.style.cyan("  pick a warehouse ")
+                        + self.style.dim(f"(1-{len(warehouses)}): "),
+                    ).strip()
+                except (EOFError, KeyboardInterrupt):
+                    self.out("")
+                    return False
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(warehouses):
+                        wh_id = warehouses[idx].warehouse_id
+                except (ValueError, AttributeError):
+                    pass
+            if not wh_id:
+                try:
+                    wh_id = self.input_fn(
+                        self.style.cyan("  warehouse id: "),
+                    ).strip() or None
+                except (EOFError, KeyboardInterrupt):
+                    self.out("")
+                    return False
+            if not wh_id:
+                self.error("  warehouse id is required to create a space.")
+                return False
+
+        self.genie.defaults = _dc_replace(
+            self.defaults,
+            warehouse_id=wh_id,
+            auto_create_space=True,
+        )
+        self.info("  creating space…")
+        return True
+
+    def _prompt_tables(self) -> bool:
+        """List tables from the catalog and let the user pick."""
+        self.info("  Genie needs at least one table to create a space.")
+        try:
+            available = list(self.client.tables.list())
+        except Exception:
+            available = []
+
+        if available:
+            self.out("")
+            for i, t in enumerate(available, 1):
+                self.out(f"  {self.style.dim(f'{i:>3}.')} {t}")
+            self.out("")
+            try:
+                raw = self.input_fn(
+                    self.style.cyan("  tables ")
+                    + self.style.dim(f"(numbers or names, comma-sep, empty=all): "),
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                self.out("")
+                return False
+            if not raw:
+                tables = tuple(str(t) for t in available)
+            else:
+                tables = self._resolve_table_choices(raw, available)
+                if not tables:
+                    return False
+        else:
+            try:
+                raw = self.input_fn(
+                    self.style.cyan("  tables ")
+                    + self.style.dim("(catalog.schema.table, comma-separated): "),
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                self.out("")
+                return False
+            if not raw:
+                self.error("  at least one table is required.")
+                return False
+            tables = tuple(t.strip() for t in raw.split(",") if t.strip())
+
+        self.genie.defaults = _dc_replace(
+            self.defaults, managed_space_tables=tables,
+        )
+        self.info(f"  tables: {', '.join(tables)}")
+        return True
+
+    def _resolve_table_choices(
+        self, raw: str, available: list,
+    ) -> "tuple[str, ...] | None":
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        tables: list[str] = []
+        for part in parts:
+            try:
+                idx = int(part) - 1
+                if 0 <= idx < len(available):
+                    tables.append(str(available[idx]))
+                    continue
+            except ValueError:
+                pass
+            tables.append(part)
+        if not tables:
+            self.error("  at least one table is required.")
+            return None
+        return tuple(tables)
 
     # ------------------------------------------------------------------ #
     # Slash dispatch
@@ -517,6 +799,9 @@ class GenieCLI(DatabricksCLI):
     def _cmd_quit(self, _args: list[str]) -> bool:
         self.info("bye.")
         return True
+
+    def _cmd_login(self, _args: list[str]) -> None:
+        self._prompt_credentials()
 
     def _cmd_clear(self, _args: list[str]) -> None:
         if self.style.enabled:
@@ -623,6 +908,19 @@ class GenieCLI(DatabricksCLI):
 
     def _cmd_output_dir(self, _args: list[str]) -> None:
         self.out(f"  {self.agent.output_dir}")
+
+    def _cmd_log(self, args: list[str]) -> None:
+        if not args:
+            current = logging.getLevelName(self._YGG_LOGGER.level)
+            self.info(f"  yggdrasil log level: {current}")
+            return
+        name = args[0].upper()
+        level = getattr(logging, name, None)
+        if level is None or not isinstance(level, int):
+            self.error(f"  unknown level {args[0]!r} — use debug, info, warning, error")
+            return
+        self._YGG_LOGGER.setLevel(level)
+        self.success(f"  yggdrasil log level → {name}")
 
     # ------------------------------------------------------------------ #
     # Rendering

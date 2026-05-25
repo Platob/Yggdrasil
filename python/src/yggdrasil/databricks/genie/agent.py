@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from .resources import GenieAnswer
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..client import DatabricksClient
     from .service import Genie
 
 
@@ -398,6 +399,10 @@ class GenieAgent:
         LOGGER.debug("Invoking Genie agent tool %r (args=%d, kwargs=%d)", name, len(args), len(kwargs))
         return fn(*args, **kwargs)
 
+    @property
+    def client(self) -> "DatabricksClient":
+        return self.service.client
+
     def _register_default_tools(self) -> None:
         # Materialisation
         self.tools["arrow_table"] = lambda ans: ans.arrow_table()
@@ -428,3 +433,54 @@ class GenieAgent:
         self.tools["last"] = self.last
         self.tools["reset"] = self.reset
         self.tools["defaults"] = lambda: asdict(self.service.defaults)
+
+        self._register_platform_tools()
+
+    def _register_platform_tools(self) -> None:
+        """Expose the DatabricksClient surface as agent tools."""
+        c = self
+
+        # SQL
+        self.tools["sql"] = lambda statement, **k: c.client.sql.execute(statement, **k)
+        self.tools["sql_arrow"] = lambda statement, **k: (
+            c.client.sql.execute(statement, **k).read_arrow_table()
+        )
+
+        # Tables
+        self.tools["list_tables"] = lambda schema: c.client.tables.list(schema)
+        self.tools["table_schema"] = lambda name: c.client.tables[name].collect_schema()
+        self.tools["read_table"] = lambda name, **k: c.client.sql.execute(
+            f"SELECT * FROM {name}", **k,
+        ).read_arrow_table()
+        self.tools["write_table"] = lambda data, name, **k: (
+            c.client.tables[name].write_table(data, **k)
+        )
+
+        # Catalogs / schemas
+        self.tools["list_catalogs"] = lambda: c.client.catalogs.list()
+        self.tools["list_schemas"] = lambda catalog: c.client.schemas.list(catalog)
+
+        # Secrets
+        self.tools["get_secret"] = lambda scope, key: (
+            c.client.secrets[f"{scope}/{key}"].svalue()
+        )
+        self.tools["set_secret"] = lambda scope, key, value: (
+            c.client.secrets.create_secret(key=key, value=value, scope=scope)
+        )
+        self.tools["list_secrets"] = lambda scope: c.client.secrets.list_secrets(scope)
+        self.tools["list_scopes"] = lambda: c.client.secrets.list_scopes()
+
+        # Jobs
+        self.tools["list_jobs"] = lambda **k: c.client.jobs.list(**k)
+        self.tools["run_job"] = lambda job_id, **k: c.client.jobs[job_id].run(**k)
+        self.tools["job_runs"] = lambda job_id, **k: c.client.jobs[job_id].runs(**k)
+
+        # Warehouses
+        self.tools["list_warehouses"] = lambda: c.client.warehouses.list()
+
+        # Volumes
+        self.tools["list_volumes"] = lambda schema: c.client.volumes.list(schema)
+
+        # Dataset (Spark)
+        self.tools["dataset"] = lambda sql_or_table, **k: c.client.dataset(sql_or_table, **k)
+        self.tools["parallelize"] = lambda fn, inputs, **k: c.client.parallelize(fn, inputs, **k)

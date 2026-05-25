@@ -1476,13 +1476,6 @@ class Response(Tabular["ResponseOptions"]):
             picks = [n for n in response_cols if n in available_set]
             if not picks:
                 continue
-            # Per-cell ``[i].as_py()`` outperforms ``column.to_pylist()``
-            # on the typical 1-row cache batch: the per-row endpoint here
-            # carries nested (struct / list / map) columns whose full-array
-            # ``to_pylist`` walk costs more than a single scalar pull off
-            # one chunk position. Vectorising helps once batches have
-            # more than a handful of rows, but the dominant local-cache
-            # hit shape is exactly one row.
             cols = {n: rb.column(n) for n in picks}
             for i in range(rb.num_rows):
                 yield cls._from_arrow_row(cols, i, normalize=normalize)

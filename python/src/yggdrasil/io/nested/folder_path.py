@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import logging
 import time
 from collections.abc import Mapping
 from threading import RLock
@@ -158,6 +159,9 @@ class FolderOptions(CastOptions):
             )
         if coerced is not self.child_media_type:
             object.__setattr__(self, "child_media_type", coerced)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class FolderPath(IO[bytes, FolderOptions]):
@@ -666,15 +670,12 @@ class FolderPath(IO[bytes, FolderOptions]):
         sink = pa.BufferOutputStream()
         with pa.ipc.new_file(sink, arrow_schema):
             pass  # zero-row file, schema-only
+        sidecar = self.path / self.YGGMETA_DIRNAME / self.YGGMETA_SCHEMA_FILENAME
         try:
-            (
-                self.path
-                / self.YGGMETA_DIRNAME
-                / self.YGGMETA_SCHEMA_FILENAME
-            ).write_bytes(sink.getvalue().to_pybytes(), overwrite=True)
+            sidecar.write_bytes(sink.getvalue().to_pybytes(), overwrite=True)
+            LOGGER.debug("Persisted schema sidecar to %r", sidecar)
         except Exception:
-            # Sidecar is opportunistic — never fail the data write.
-            pass
+            LOGGER.debug("Schema sidecar write failed for %r", sidecar, exc_info=True)
 
     # ==================================================================
     # Children — read
@@ -1100,26 +1101,30 @@ class FolderPath(IO[bytes, FolderOptions]):
         drops to the remaining partitions (or to a flat write when
         the schema's partition set is exhausted).
         """
+        yielded = False
+        for batch in self._read_arrow_batches_inner(options):
+            yielded = True
+            yield batch
+        if not yielded:
+            schema = self._schema_cache
+            if schema is ... or not schema:
+                schema = options.target
+            if schema and hasattr(schema, "to_arrow_schema"):
+                arrow_schema = schema.to_arrow_schema()
+                yield pa.RecordBatch.from_pydict(
+                    {f.name: pa.array([], type=f.type) for f in arrow_schema},
+                    schema=arrow_schema,
+                )
+
+    def _read_arrow_batches_inner(
+        self, options: FolderOptions,
+    ) -> Iterator[pa.RecordBatch]:
         predicate = options.predicate
-        # Mutualise the predicate AST walk across the whole read
-        # subtree. :meth:`_free_cols_for` checks this folder and
-        # every ``tabular_parent`` for a cached entry keyed by
-        # ``id(predicate)`` — the candidate-probe loop yields fresh
-        # child FolderPaths, but they all share the same root and the
-        # same predicate instance, so the walk happens exactly once
-        # per ``read_arrow_batches`` call instead of N times per
-        # iter_children iteration.
         free_cols = self._free_cols_for(predicate)
         if self._should_prune_by_predicate(options, free_cols=free_cols):
+            LOGGER.debug("Pruned read from %r — predicate eliminates partition", self)
             return
 
-        # Leaf-partition data cache: a folder bound to a ``<col>=<val>/``
-        # path (non-empty :attr:`static_values`) holds the actual file
-        # leaves for that partition. We cache the union of their
-        # unfiltered batches keyed by the partition's full URL — every
-        # subsequent read of the same partition skips the file
-        # opens / IPC parse and pays only the row-level filter cost
-        # on already-in-memory batches.
         cache_key = self._partition_cache_key()
         if cache_key is not None:
             cached = self._PARTITION_DATA_CACHE.get(cache_key)
@@ -1165,17 +1170,19 @@ class FolderPath(IO[bytes, FolderOptions]):
                 kept = predicate.filter_arrow_batch(batch)
                 if kept.num_rows > 0:
                     yield kept
+                elif batch.num_rows > 0:
+                    LOGGER.debug(
+                        "Predicate filtered %d row(s) to 0 in %r",
+                        batch.num_rows, self,
+                    )
 
         if accumulated is not None and cache_key is not None:
-            # Detach the cached batches from any mmap-backed buffer
-            # the leaf reader may have handed up — without this, a
-            # subsequent file close / re-write (e.g. an OVERWRITE on
-            # the same partition) could yank the bytes out from under
-            # the cached batch and a later cache hit would see zero
-            # rows. ``concat_batches`` materialises into in-memory
-            # buffers when given a single chunk, owned independently
-            # of the source file.
             if accumulated:
+                total = sum(b.num_rows for b in accumulated)
+                LOGGER.debug(
+                    "Caching %d batch(es) / %d row(s) for partition %r",
+                    len(accumulated), total, cache_key,
+                )
                 self._PARTITION_DATA_CACHE.set(
                     cache_key, (pa.Table.from_batches(accumulated)
                                  .combine_chunks()
@@ -1238,6 +1245,11 @@ class FolderPath(IO[bytes, FolderOptions]):
             kept = predicate.filter_arrow_batch(batch)
             if kept.num_rows > 0:
                 yield kept
+            elif batch.num_rows > 0:
+                LOGGER.debug(
+                    "Predicate filtered %d cached row(s) to 0",
+                    batch.num_rows,
+                )
 
     def _free_cols_for(self, predicate: "Predicate") -> "tuple[str, ...] | None":
         """Memoised :func:`free_columns` lookup keyed by ``id(predicate)``.
@@ -1375,19 +1387,19 @@ class FolderPath(IO[bytes, FolderOptions]):
         # so the call collapses to a no-op there.
         self._invalidate_partition_cache()
 
-        # Materialise the input once. The partition split needs to
-        # see every batch at once (per-batch splitting scatters one
-        # part file per (batch, value) pair into the same partition
-        # directory), and even the flat-write branch needs the first
-        # batch's schema for the ``.ygg/`` sidecar — buffering up
-        # front is the simplest path that serves both.
         materialised = [b for b in batches if b.num_rows > 0]
         if not materialised:
+            LOGGER.debug("Writing to %r — no non-empty batches, skipping", self)
             return
         first = materialised[0]
+        total_rows = sum(b.num_rows for b in materialised)
         first_schema = self._schema_for_arrow(first.schema)
 
         action = self._resolve_action(options.mode)
+        LOGGER.debug(
+            "Writing %d batch(es) / %d row(s) to %r (mode=%s)",
+            len(materialised), total_rows, self, action,
+        )
         if action is Mode.OVERWRITE:
             from yggdrasil.data.schema import Schema
             self._schema_cache = Schema.empty()
@@ -1461,7 +1473,12 @@ class FolderPath(IO[bytes, FolderOptions]):
             # parquet writer already releases the GIL during the
             # encode that's actually parallelisable. Keep the inline
             # loop until a workload appears where parallelism wins.
-            for scalar in pc.unique(column.combine_chunks()):
+            unique_values = pc.unique(column.combine_chunks())
+            LOGGER.debug(
+                "Partitioning %d row(s) by %r into %d partition(s) in %r",
+                table.num_rows, head, len(unique_values), self,
+            )
+            for scalar in unique_values:
                 value = scalar.as_py()
                 mask = (
                     pc.equal(column, scalar) if value is not None
@@ -1584,6 +1601,7 @@ class FolderPath(IO[bytes, FolderOptions]):
             return
 
         child = self.make_child(options=options)
+        LOGGER.debug("Writing part %r in %r", child, self)
         child.write_arrow_batches(
             _chain_first(first, batch_iter),
             options=_leaf_options(child),
@@ -1759,15 +1777,25 @@ class FolderPath(IO[bytes, FolderOptions]):
         (the ``.ygg/`` sidecar, transient ``.tmp`` fragments) stay
         — :meth:`_persist_schema` immediately re-stamps the
         sidecar after the parent finishes the write.
+
+        Singleton-cached child FolderPaths have their schema cache
+        reset so :meth:`_persist_schema` re-stamps their sidecar
+        after the recursive write recreates them.
         """
         for entry in self.path.iterdir():
             if entry.name.startswith("."):
                 continue
             try:
-                # ``Path.remove(recursive=True)`` handles both files
-                # and directories (rmtree-style for dirs); the call
-                # is best-effort so a transient race with a sibling
-                # writer doesn't poison the overwrite.
+                is_dir = entry.is_dir()
+            except Exception:
+                is_dir = False
+            if is_dir:
+                child = self._INSTANCES.get(
+                    type(self)._singleton_key(path=entry),
+                )
+                if child is not None:
+                    child._schema_cache = ...
+            try:
                 entry.remove(recursive=True, missing_ok=True)
             except Exception:
                 pass
