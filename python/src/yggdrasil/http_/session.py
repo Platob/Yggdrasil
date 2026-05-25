@@ -1562,10 +1562,12 @@ class HTTPSession(Session):
                 local_hits, remote_hits, reqs, misses,
                 spark=spark,
                 local_holder=local_holder, remote_holder=remote_holder,
+                local_mode=local_mode,
             )
         return self._send_local_batch(
             local_hits, remote_hits, reqs, misses,
             local_holder=local_holder, remote_holder=remote_holder,
+            local_mode=local_mode,
             ordered=ordered, max_in_flight=max_in_flight,
         )
 
@@ -1578,6 +1580,7 @@ class HTTPSession(Session):
         *,
         local_holder: "IO | None",
         remote_holder: "IO | None",
+        local_mode: "Mode | None" = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
@@ -1606,6 +1609,7 @@ class HTTPSession(Session):
             if local_holder is not None:
                 wb.append(lambda: self._backfill_local_cache(
                     responses_to_tabular(_hits), {local_holder: reqs},
+                    mode=local_mode,
                 ))
             if wb:
                 LOGGER.debug(
@@ -1629,6 +1633,7 @@ class HTTPSession(Session):
         spark: "SparkSession",
         local_holder: "IO | None",
         remote_holder: "IO | None",
+        local_mode: "Mode | None" = None,
     ) -> HTTPResponseBatch:
         """Fetch misses via Spark mapInArrow and persist to remote cache."""
         LOGGER.info(
