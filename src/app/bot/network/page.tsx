@@ -138,9 +138,7 @@ function ConnectionLines({ bots }: { bots: BotNode[] }) {
           <bufferGeometry>
             <bufferAttribute
               attach="attributes-position"
-              count={2}
-              array={new Float32Array([...points[0].toArray(), ...points[1].toArray()])}
-              itemSize={3}
+              args={[new Float32Array([...points[0].toArray(), ...points[1].toArray()]), 3]}
             />
           </bufferGeometry>
           <lineBasicMaterial color="#f26b3a" transparent opacity={0.3} />

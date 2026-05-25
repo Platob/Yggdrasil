@@ -12,17 +12,12 @@ export function ServiceLayout({ children }: { children: React.ReactNode }) {
     if (saved === "true") setCollapsed(true);
   }, []);
 
-  // Observe DOM mutations on the aside width as a shared signal
   useEffect(() => {
-    const check = () => {
-      const saved = localStorage.getItem("ygg-sidebar-collapsed");
-      setCollapsed(saved === "true");
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === "ygg-sidebar-collapsed") setCollapsed(e.newValue === "true");
     };
-    // Poll on animation frame — only active while tab is visible, very cheap
-    let raf: number;
-    const loop = () => { check(); raf = requestAnimationFrame(loop); };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   const marginLeft = collapsed ? "56px" : "224px";

@@ -15,6 +15,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!src/lib/
 lib64/
 parts/
 sdist/
@@ -218,3 +219,8 @@ __marimo__/
 # and ``python/*/`` is the result of an unquoted-glob accident).
 /python/data.qqq
 /python/\*/
+
+# Next.js
+.next/
+out/
+node_modules/

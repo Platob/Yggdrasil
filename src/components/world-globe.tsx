@@ -193,9 +193,7 @@ function NodeSpikes({
               <bufferGeometry>
                 <bufferAttribute
                   attach="attributes-position"
-                  count={2}
-                  array={new Float32Array([...pos.toArray(), ...endPos.toArray()])}
-                  itemSize={3}
+                  args={[new Float32Array([...pos.toArray(), ...endPos.toArray()]), 3]}
                 />
               </bufferGeometry>
               <lineBasicMaterial color={col} transparent opacity={selected ? 1 : 0.7} />
