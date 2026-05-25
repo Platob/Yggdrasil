@@ -1607,7 +1607,8 @@ class HTTPSession(Session):
             _hits = new_list
             wb: list[Callable] = []
             if remote_holder is not None:
-                wb.append(lambda: self._persist_remote(_hits))
+                rc = misses[0].remote_cache_config
+                wb.append(lambda: self._persist_remote(remote_holder, _hits, rc))
             if local_holder is not None:
                 wb.append(lambda: self._backfill_local_cache(
                     responses_to_tabular(_hits), {local_holder: reqs},
@@ -1649,19 +1650,6 @@ class HTTPSession(Session):
         return HTTPResponseBatch(
             local=local_hits, remote=remote_hits,
             new=new_hits, misses=misses,
-        )
-
-    @staticmethod
-    def _remote_write_group_key(cfg: CacheConfig) -> tuple:
-        """Identity used to group responses for a single bulk remote insert."""
-        tab = cfg.tabular
-        tab_key = tab.url if hasattr(tab, "url") else id(tab)
-        return (
-            tab_key,
-            cfg.mode,
-            tuple(cfg.match_by) if cfg.match_by else (),
-            bool(cfg.wait),
-            cfg.anonymize,
         )
 
     @staticmethod
@@ -1889,70 +1877,25 @@ class HTTPSession(Session):
                 mode=mode,
             ).fire_and_forget()
 
+    @staticmethod
     def _persist_remote(
-        self,
+        holder: "Tabular",
         responses: list[Response],
+        config: "CacheConfig",
     ) -> None:
-        """Stage 4: bulk-insert successful responses into the remote cache.
-
-        Each response's remote cache config is read from
-        ``response.request.remote_cache_config``. Responses are bucketed
-        by the full write-group key (table, mode, match_by, wait,
-        anonymize) so distinct per-request configs don't get collapsed.
-        """
-        groups: dict[tuple, tuple[CacheConfig, list[Response]]] = {}
-        for response in responses:
-            req = response.request
-            if req is None:
-                continue
-            eff = req.remote_cache_config
-            if eff is None or not eff.remote_cache_enabled:
-                continue
-            gkey = self._remote_write_group_key(eff)
-            if gkey not in groups:
-                groups[gkey] = (eff, [])
-            groups[gkey][1].append(response)
-
-        if not groups:
-            LOGGER.info(
-                "Stage 4: no remote-cache groups to persist "
-                "(all configs disabled or missing)",
-            )
-            return
-
-        def _insert_one(
-            mode: "Mode",
-            cfg: "CacheConfig",
-            group_responses: "list[Response]",
-        ) -> None:
-            LOGGER.info(
-                "%s %d response(s) in remote cache %r",
-                "Upserting" if mode == Mode.UPSERT else "Persisting",
-                len(group_responses),
-                cfg.tabular,
-            )
-            # One C++ struct walk over the whole group beats N
-            # per-row builds + an outer ``combine_chunks`` concat —
-            # see :meth:`Response.values_to_arrow_batch`. The result
-            # is a single chunked-on-construction batch wrapped in a
-            # one-element table so the downstream
-            # ``batches["partition_key"]`` slot lookup keeps working.
-            batches = pa.Table.from_batches(
-                [Response.values_to_arrow_batch(group_responses)]
-            )
-            _insert_cache(
-                cfg.tabular, cfg, batches,
-                mode=mode,
-                prune_values=_cache_prune_values_for(batches),
-                raise_error=True,
-            )
-
-        self._run_concurrently(
-            [
-                lambda m=gkey[1], c=cfg, r=group_responses: _insert_one(m, c, r)
-                for gkey, (cfg, group_responses) in groups.items()
-            ],
-            thread_name_prefix="ygg-remote-cache-insert",
+        """Stage 4: bulk-insert successful responses into the remote cache."""
+        LOGGER.info(
+            "Persisting %d response(s) to remote cache %r",
+            len(responses), holder,
+        )
+        batches = pa.Table.from_batches(
+            [Response.values_to_arrow_batch(responses)]
+        )
+        _insert_cache(
+            holder, config, batches,
+            mode=config.mode,
+            prune_values=_cache_prune_values_for(batches),
+            raise_error=True,
         )
 
     def _send_many(
