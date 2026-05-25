@@ -64,24 +64,17 @@ def _http_post(url: str, body: dict | None = None, timeout: float = 10.0) -> dic
 # -- Banner & typing animation ---------------------------------------------
 
 def _build_banner() -> str:
-    o = _CSI + "38;5;208m"  # orange like the logo
+    o = _CSI + "38;5;208m"
+    b = _CSI + "1m"
     d = _CSI + "2m"
-    c = _CSI + "1m"
     r = _RESET
     return (
         f"\n"
-        f"  {o}        \\  |  /{r}\n"
-        f"  {o}     \\   \\ | /   /{r}\n"
-        f"  {o}      `. ,\\|/, .`{r}\n"
-        f"  {o}       '.,\\|/,.'{r}\n"
-        f"  {o}     -- --{c}|{o}-- --{r}\n"
-        f"  {o}       ,'/|\\`,.{r}\n"
-        f"  {o}      .' /|\\ `.{r}\n"
-        f"  {d}         /|\\{r}\n"
-        f"  {d}        / | \\{r}\n"
-        f"  {d}    ___/  |  \\___{r}\n"
-        f"  {d}   ~   ~  ~  ~   ~{r}\n"
-        f"  {c}    Y G G D R A S I L{r} {d}chat{r}\n"
+        f"  {o} __   __ ___ ___ {r}\n"
+        f"  {o} \\ \\ / // __/ __| {r}\n"
+        f"  {o}  \\ V /| (_ | (_ | {r}\n"
+        f"  {o}   |_|  \\___|\\___| {r}\n"
+        f"  {d}            chat{r}\n"
         f"\n"
     )
 

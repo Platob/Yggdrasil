@@ -11,6 +11,7 @@ pip install ygg
 Add what you need:
 
 ```bash
+pip install "ygg[bot]"         # bot server, remote execution, mesh chat
 pip install "ygg[bigdata]"     # pyspark
 pip install "ygg[databricks]"  # databricks-sdk
 pip install "ygg[api]"         # fastapi + uvicorn + pydantic
