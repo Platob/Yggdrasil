@@ -25,6 +25,7 @@ __all__ = [
 LOGGER = logging.getLogger(__name__)
 _CREATE_ARG_NAMES = set(inspect.signature(ClustersAPI.create).parameters.keys())
 
+_CLUSTER_ID_RE = re.compile(r"^\d{4}-\d{6}-[a-z0-9]{8}$")
 # host -> ExpiringDict(cluster_name -> cluster_id)
 NAME_ID_CACHE: dict[str, ExpiringDict] = {}
 NAMED_CLUSTERS: ExpiringDict[str, "Cluster"] = ExpiringDict(default_ttl=7200.0)
@@ -282,7 +283,13 @@ class Clusters(DatabricksService):
             if not new_details.data_security_mode:
                 new_details.data_security_mode = DataSecurityMode.DATA_SECURITY_MODE_DEDICATED
 
-        if not new_details.node_type_id:
+        if new_details.instance_pool_id:
+            new_details.node_type_id = None
+            new_details.driver_node_type_id = None
+            new_details.enable_elastic_disk = None
+            new_details.aws_attributes = None
+            new_details.gcp_attributes = None
+        elif not new_details.node_type_id:
             from yggdrasil.data.enums import NodeType
             new_details.node_type_id = NodeType.DEFAULT.value
 
@@ -311,8 +318,56 @@ class Clusters(DatabricksService):
 
         return new_details
 
+    def get_or_create(
+        self,
+        obj: Any = None,
+        *,
+        cluster_id: str | None = None,
+        cluster_name: str | None = None,
+    ):
+        # Positional shortcut: accept a Cluster, an ID, or a name.
+        if obj is not None:
+            from .cluster import Cluster
+
+            if isinstance(obj, Cluster):
+                return obj
+            if isinstance(obj, str):
+                if _CLUSTER_ID_RE.match(obj):
+                    cluster_id = cluster_id or obj
+                else:
+                    cluster_name = cluster_name or obj
+            else:
+                raise TypeError(
+                    f"obj must be Cluster | str | None, got {type(obj).__name__}"
+                )
+
+        found = self.find_cluster(
+            cluster_id=cluster_id,
+            cluster_name=cluster_name,
+            raise_error=False,
+        )
+
+        if found is not None:
+            return found
+
+        if not libraries:
+            libraries = ["ygg[databricks]"]
+        else:
+            libraries = list(libraries) + ["ygg[databricks]"]
+
+        return self.create(
+            cluster_name=cluster_name,
+            libraries=libraries,
+            wait=wait,
+            permissions=permissions,
+            single_user_name=single_user_name,
+            **cluster_spec
+        )
+
     def create_or_update(
         self,
+        obj: Any = None,
+        *,
         cluster_id: str | None = None,
         cluster_name: str | None = None,
         single_user_name: str | None = None,
@@ -321,6 +376,22 @@ class Clusters(DatabricksService):
         wait: WaitingConfigArg = True,
         **cluster_spec: Any,
     ):
+        # Positional shortcut: accept a Cluster, an ID, or a name.
+        if obj is not None:
+            from .cluster import Cluster
+
+            if isinstance(obj, Cluster):
+                return obj
+            if isinstance(obj, str):
+                if _CLUSTER_ID_RE.match(obj):
+                    cluster_id = cluster_id or obj
+                else:
+                    cluster_name = cluster_name or obj
+            else:
+                raise TypeError(
+                    f"obj must be Cluster | str | None, got {type(obj).__name__}"
+                )
+
         found = self.find_cluster(
             cluster_id=cluster_id,
             cluster_name=cluster_name,
@@ -329,14 +400,23 @@ class Clusters(DatabricksService):
 
         if found is not None:
             return found.update(
-                cluster_name=cluster_name, libraries=libraries, wait=wait,
+                cluster_name=cluster_name,
+                libraries=libraries,
+                wait=wait,
                 permissions=permissions,
                 single_user_name=single_user_name,
                 **cluster_spec
             )
 
+        if not libraries:
+            libraries = ["ygg[databricks]"]
+        else:
+            libraries = list(libraries) + ["ygg[databricks]"]
+
         return self.create(
-            cluster_name=cluster_name, libraries=libraries, wait=wait,
+            cluster_name=cluster_name,
+            libraries=libraries,
+            wait=wait,
             permissions=permissions,
             single_user_name=single_user_name,
             **cluster_spec
