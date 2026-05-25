@@ -4,10 +4,13 @@
 
 This frontend uses a **mythic Nordic aesthetic** inspired by the Yggdrasil World Tree.
 
-### Brand Colors
+### Brand Colors (Black, White, Grey, Red, Orange, Coral)
 - **Primary**: `#f26b3a` (Coral/Orange) - from the Yggdrasil logo
-- **Background**: `#0c0c0f` (Deep charcoal/void)
-- **Accent**: `#5b9bd5` (Nordic ice blue) - for contrast only
+- **Secondary**: `#dc2626` (Deep Red) - for emphasis
+- **Accent**: `#fb923c` (Warm Coral) - highlights
+- **Background**: `#050507` (Pure black void)
+- **Foreground**: `#ffffff` (Pure white)
+- **Muted**: `#525252` / `#737373` (Grey tones)
 
 ### Design Principles
 1. **Dark, atmospheric** - deep blacks and charcoals evoke Norse mythology
@@ -24,18 +27,25 @@ This frontend uses a **mythic Nordic aesthetic** inspired by the Yggdrasil World
 
 ### Logo
 - Import from `@/components/logo` 
-- `<YggdrasilLogo />` - SVG tree icon
+- `<YggdrasilLogo />` - Static SVG tree icon
+- `<AnimatedYggdrasilTree />` - Large animated tree with draw-on effects
 - `<YggdrasilBrand />` - logo + wordmark combo
 
 ### CSS Classes in `globals.css`
 - `.nordic-card` - Card with border, rounded corners, hover state
+- `.constellation-card` - Service card with hover glow and gradient
 - `.btn-primary` - Primary button with gradient and glow
+- `.btn-secondary` - Border button with hover fill
 - `.btn-ghost` - Ghost button for secondary actions  
 - `.input-nordic` - Styled input with focus ring
 - `.code-block` - Code/pre block styling
-- `.glow-primary` - Animated glow effect
-- `.pulse-primary` - Pulse animation for loading states
-- `.rune-border` - Decorative gradient border (use sparingly)
+- `.glow-intense` - Intense animated glow for hero elements
+- `.pulse-glow` - Subtle pulsing glow for background orbs
+- `.float` - Gentle floating animation
+- `.twinkle` - Star twinkling animation
+- `.constellation-line` - Animated SVG line for connections
+- `.gradient-text` - Multi-color gradient text
+- `.star-field`, `.star` - Star background elements
 
 ## Architecture Overview
 
@@ -152,17 +162,49 @@ src/
 │   │   ├── health/
 │   │   ├── config/
 │   │   └── cache/
-│   ├── layout.tsx
-│   ├── page.tsx       # Dashboard
-│   ├── chat/
-│   └── execute/
+│   ├── bot/           # Bot control dashboard (with sidebar)
+│   │   ├── layout.tsx # Sidebar wrapper
+│   │   ├── page.tsx   # Dashboard
+│   │   ├── execute/   # Code execution
+│   │   └── chat/      # Messaging
+│   ├── layout.tsx     # Root layout (minimal)
+│   ├── page.tsx       # Welcome/landing page (animated tree, constellations)
+│   └── globals.css
 ├── components/
-│   └── sidebar.tsx
+│   ├── logo.tsx       # AnimatedYggdrasilTree, YggdrasilLogo, YggdrasilBrand
+│   └── sidebar.tsx    # Bot dashboard sidebar
 └── lib/
     ├── api.ts         # Frontend API client (both backends)
     ├── bot-client.ts  # Server-side bot API client
     └── utils.ts       # Shared utilities
 ```
+
+## Route Structure
+
+| Route | Description |
+|-------|-------------|
+| `/` | Welcome landing page with animated tree and service constellation |
+| `/bot` | Bot dashboard - node overview, stats |
+| `/bot/execute` | Python/shell code execution |
+| `/bot/chat` | Real-time messaging channels |
+| `/trading` | Trading service (coming soon) |
+| `/data` | Data streams service (coming soon) |
+| `/agents` | AI Agents service (coming soon) |
+
+## Services Constellation
+
+The welcome page displays services as a "constellation" - interconnected nodes representing different Yggdrasil capabilities:
+
+1. **Bot Control** (`/bot`) - Active, the main dashboard
+2. **Trading** - Coming soon, market data & execution
+3. **Data Streams** - Coming soon, real-time feeds & analytics
+4. **AI Agents** - Coming soon, autonomous workflows
+
+To add a new service:
+1. Add to `SERVICES` array in `src/app/page.tsx`
+2. Add connections in `CONNECTIONS` array
+3. Create route at `src/app/[service-name]/`
+4. Set `comingSoon: false` when ready
 
 ## Feature Implementation Checklist
 
