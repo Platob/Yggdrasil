@@ -1,44 +1,27 @@
-# Yggdrasil Frontend — Agent Instructions
+# Yggdrasil Frontend
 
-Read `node_modules/next/dist/docs/` before writing Next.js code — this version has breaking changes.
+Next.js 16 + React 19 + Tailwind v4. Read `node_modules/next/dist/docs/` — breaking changes from training data.
 
-## Architecture
+## API
 
-- **React 19 + Next.js 16 + Tailwind v4**
-- Bot API proxied via `/api/bot/*` → FastAPI at `BOT_API_URL` (see `next.config.ts`)
-- Next.js API routes at `/api/*` for caching, aggregation, config
-- `GlobalSidebar` in root layout — all pages get sidebar + dark/light toggle
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `src/lib/api.ts` | Client API: `bot.*` (proxied) and `api.*` (local) |
-| `src/lib/bot-client.ts` | Server-side bot API client for route handlers |
-| `src/components/global-sidebar.tsx` | Sidebar with nav, theme toggle, status |
-| `src/components/service-layout.tsx` | Sidebar + content wrapper |
-| `src/app/globals.css` | Design tokens (CSS vars), dark/light themes |
-| `next.config.ts` | Bot API proxy rewrite config |
-
-## Design System
-
-- **Brand**: `#f26b3a` (coral/orange) — `var(--primary)`
-- **Dark default**, light via `.light` class on `<html>`
-- **CSS classes**: `.nordic-card`, `.btn-primary`, `.btn-ghost`, `.input-nordic`, `.status-dot`
-- **Logo**: `import { YggdrasilLogo } from "@/components/logo"`
+- **Bot proxy**: `/api/bot/*` → FastAPI (configured in `next.config.ts`)
+- **Client**: `import { bot } from "@/lib/api"` — `bot.getNodeInfo()`, `bot.getPeers()`, `bot.executePython()`, etc.
+- **Server-side**: `import { botFetch } from "@/lib/bot-client"` for route handlers
 
 ## Routes
 
-| Route | Description |
-|-------|-------------|
-| `/` | Welcome page with interactive 3D globe |
-| `/bot` | Bot dashboard — metrics, processes, system info |
-| `/bot/execute` | Python/shell code execution |
+| Route | Page |
+|-------|------|
+| `/` | 3D globe welcome |
+| `/bot` | Network overview — node grid, closest neighbors |
+| `/bot/[id]` | Node detail — resource graphs, processes |
 | `/bot/network` | 3D network visualization |
-| `/msg` | Real-time messaging channels |
+| `/bot/execute` | Code execution |
+| `/msg` | Messaging channels |
 
-## Adding a Service
+## Design
 
-1. Add to `SERVICES` in `src/components/global-sidebar.tsx`
-2. Create route at `src/app/[service-name]/`
-3. Layout is inherited from root — no need to wrap in `ServiceLayout`
+- Brand: `#f26b3a` (coral) = `var(--primary)`
+- Dark default, `.light` class toggles theme
+- Cards: `.nordic-card` or `bg-card border border-border rounded-xl`
+- Sidebar: `GlobalSidebar` in root layout, all pages inherit it

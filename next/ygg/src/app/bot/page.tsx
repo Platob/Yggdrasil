@@ -1,271 +1,166 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState } from "react";
 import { bot, type NodeInfo } from "@/lib/api";
 import { YggdrasilLogo } from "@/components/logo";
+import Link from "next/link";
 
-// ── Types ────────────────────────────────────────────────────
-interface SystemMetrics {
-  cpu: number;        // 0-100
-  ram: number;        // 0-100
-  ramUsed: number;    // GB
-  ramTotal: number;   // GB
-  gpu: number;        // 0-100
-  gpuMemUsed: number; // GB
-  gpuMemTotal: number;// GB
-  gpuName: string;
+// ── Haversine distance helper ────────────────────────────────
+function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371; // km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-interface ProcessInfo {
-  pid: number;
-  name: string;
-  cpu: number;
-  ram: number;
-  status: string;
+// ── Format uptime ────────────────────────────────────────────
+function formatUptime(s: number): string {
+  const sec = Math.floor(s);
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return `${h}h ${m}m`;
 }
 
-// ── Mock data generators (replace with real API calls) ───────
-function generateMockMetrics(): SystemMetrics {
-  return {
-    cpu: Math.random() * 60 + 10,
-    ram: Math.random() * 40 + 30,
-    ramUsed: 8 + Math.random() * 6,
-    ramTotal: 32,
-    gpu: Math.random() * 50 + 5,
-    gpuMemUsed: 2 + Math.random() * 4,
-    gpuMemTotal: 12,
-    gpuName: "NVIDIA RTX 4090",
-  };
-}
-
-function generateMockProcesses(): ProcessInfo[] {
-  const names = ["python", "yggdrasil", "node", "chromium", "nvdriver", "postgres"];
-  return names.map((name, i) => ({
-    pid: 1000 + i * 123,
-    name,
-    cpu: Math.random() * 25,
-    ram: Math.random() * 500 + 50,
-    status: Math.random() > 0.1 ? "running" : "sleeping",
-  })).sort((a, b) => b.cpu - a.cpu);
-}
-
-// ── Time Plot Component ──────────────────────────────────────
-const HISTORY_SIZE = 60; // 60 data points
-
-function TimePlot({
-  data,
-  color,
-  label,
-  value,
-  unit,
-  secondaryValue,
-  secondaryLabel,
-}: {
-  data: number[];
-  color: string;
-  label: string;
-  value: number;
-  unit: string;
-  secondaryValue?: string;
-  secondaryLabel?: string;
-}) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.scale(dpr, dpr);
-
-    const w = rect.width;
-    const h = rect.height;
-    const padding = { top: 8, right: 8, bottom: 8, left: 8 };
-    const plotW = w - padding.left - padding.right;
-    const plotH = h - padding.top - padding.bottom;
-
-    // Clear
-    ctx.clearRect(0, 0, w, h);
-
-    // Grid lines
-    ctx.strokeStyle = "rgba(255,255,255,0.05)";
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-      const y = padding.top + (plotH / 4) * i;
-      ctx.beginPath();
-      ctx.moveTo(padding.left, y);
-      ctx.lineTo(w - padding.right, y);
-      ctx.stroke();
-    }
-
-    // Fill gradient
-    const gradient = ctx.createLinearGradient(0, padding.top, 0, h - padding.bottom);
-    gradient.addColorStop(0, color + "40");
-    gradient.addColorStop(1, color + "00");
-
-    // Draw filled area
-    ctx.beginPath();
-    ctx.moveTo(padding.left, h - padding.bottom);
-    data.forEach((val, i) => {
-      const x = padding.left + (i / (HISTORY_SIZE - 1)) * plotW;
-      const y = padding.top + plotH - (val / 100) * plotH;
-      if (i === 0) ctx.lineTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    ctx.lineTo(padding.left + plotW, h - padding.bottom);
-    ctx.closePath();
-    ctx.fillStyle = gradient;
-    ctx.fill();
-
-    // Draw line
-    ctx.beginPath();
-    data.forEach((val, i) => {
-      const x = padding.left + (i / (HISTORY_SIZE - 1)) * plotW;
-      const y = padding.top + plotH - (val / 100) * plotH;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.stroke();
-
-    // Current value dot
-    if (data.length > 0) {
-      const lastVal = data[data.length - 1];
-      const x = padding.left + plotW;
-      const y = padding.top + plotH - (lastVal / 100) * plotH;
-      ctx.beginPath();
-      ctx.arc(x, y, 4, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(x, y, 6, 0, Math.PI * 2);
-      ctx.strokeStyle = color + "60";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    }
-  }, [data, color]);
-
+// ── Node Card Component ──────────────────────────────────────
+function NodeCard({ node, distance }: { node: NodeInfo; distance?: number }) {
   return (
-    <div className="nordic-card p-4 flex flex-col h-full">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-medium text-muted uppercase tracking-wider">{label}</span>
-        <div className="text-right">
-          <span className="text-lg font-mono font-semibold" style={{ color }}>{value.toFixed(1)}{unit}</span>
-          {secondaryValue && (
-            <span className="text-[10px] text-muted ml-2">{secondaryLabel}: {secondaryValue}</span>
-          )}
+    <Link
+      href={`/bot/${encodeURIComponent(node.node_id)}`}
+      className="bg-card border border-border rounded-xl p-4 hover:border-primary/50 hover:bg-card-hover transition-all duration-200 group"
+    >
+      <div className="flex items-start justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <div className="status-dot online" />
+          <span className="font-mono text-sm text-foreground font-medium group-hover:text-primary transition-colors truncate max-w-[180px]">
+            {node.node_id}
+          </span>
+        </div>
+        <span className="text-[10px] font-mono text-muted bg-border/50 px-1.5 py-0.5 rounded">
+          v{node.version}
+        </span>
+      </div>
+
+      <div className="space-y-1.5 text-xs">
+        <div className="flex items-center justify-between">
+          <span className="text-muted">Host</span>
+          <span className="font-mono text-foreground">{node.host}:{node.port}</span>
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-muted">Uptime</span>
+          <span className="text-foreground">{formatUptime(node.uptime)}</span>
+        </div>
+        {node.lat != null && node.lon != null && (
+          <div className="flex items-center justify-between">
+            <span className="text-muted">Location</span>
+            <span className="font-mono text-primary text-[11px]">
+              {node.lat.toFixed(2)}, {node.lon.toFixed(2)}
+            </span>
+          </div>
+        )}
+        {distance != null && (
+          <div className="flex items-center justify-between">
+            <span className="text-muted">Distance</span>
+            <span className="font-mono text-primary text-[11px]">
+              {distance < 1 ? `${(distance * 1000).toFixed(0)} m` : distance < 100 ? `${distance.toFixed(1)} km` : `${distance.toFixed(0)} km`}
+            </span>
+          </div>
+        )}
+        <div className="flex items-center justify-between pt-1">
+          <span className="text-muted">Functions</span>
+          <span className="text-foreground">{node.functions.length}</span>
         </div>
       </div>
-      <div className="flex-1 min-h-[100px]">
-        <canvas ref={canvasRef} className="w-full h-full" style={{ display: "block" }} />
-      </div>
-    </div>
+    </Link>
   );
 }
 
-// ── Process List Component ───────────────────────────────────
-function ProcessList({ processes }: { processes: ProcessInfo[] }) {
-  return (
-    <div className="nordic-card p-4">
-      <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">Active Processes</h3>
-      <div className="space-y-1">
-        <div className="grid grid-cols-[1fr_60px_80px_70px] gap-2 text-[10px] text-muted uppercase tracking-wider pb-2 border-b border-border">
-          <span>Name</span>
-          <span className="text-right">PID</span>
-          <span className="text-right">CPU %</span>
-          <span className="text-right">RAM MB</span>
-        </div>
-        <div className="max-h-[200px] overflow-y-auto space-y-0.5">
-          {processes.map((p) => (
-            <div key={p.pid} className="grid grid-cols-[1fr_60px_80px_70px] gap-2 py-1.5 text-sm hover:bg-card-hover rounded transition-colors">
-              <span className="font-mono text-foreground truncate">{p.name}</span>
-              <span className="font-mono text-muted text-right">{p.pid}</span>
-              <span className="font-mono text-right" style={{ color: p.cpu > 50 ? "var(--destructive)" : p.cpu > 20 ? "var(--warning)" : "var(--success)" }}>
-                {p.cpu.toFixed(1)}%
-              </span>
-              <span className="font-mono text-muted text-right">{p.ram.toFixed(0)}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
+// ── Main Network Overview Dashboard ─────────────────────────
+export default function NetworkOverview() {
+  const [selfNode, setSelfNode] = useState<NodeInfo | null>(null);
+  const [peers, setPeers] = useState<NodeInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-// ── Main Dashboard ───────────────────────────────────────────
-export default function BotDashboard() {
-  const [node, setNode] = useState<NodeInfo | null>(null);
-  const [demoMode, setDemoMode] = useState(false);
-  const [refreshRate, setRefreshRate] = useState(1000);
-  const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
-  const [processes, setProcesses] = useState<ProcessInfo[]>([]);
-  
-  // History buffers
-  const [cpuHistory, setCpuHistory] = useState<number[]>(Array(HISTORY_SIZE).fill(0));
-  const [ramHistory, setRamHistory] = useState<number[]>(Array(HISTORY_SIZE).fill(0));
-  const [gpuHistory, setGpuHistory] = useState<number[]>(Array(HISTORY_SIZE).fill(0));
-
-  // Fetch node info once - fallback to demo mode if bot unavailable
   useEffect(() => {
-    bot.getNodeInfo()
-      .then(setNode)
-      .catch(() => {
-        // Bot unavailable - enter demo mode
-        setDemoMode(true);
-        setNode({
-          node_id: "demo-node-001",
-          host: "localhost",
+    async function loadNetwork() {
+      setLoading(true);
+      setError(null);
+
+      try {
+        // Fetch self info
+        const self = await bot.getNodeInfo();
+        setSelfNode(self);
+
+        // Fetch peers
+        try {
+          const peersData = await bot.getPeers();
+          setPeers(peersData.peers);
+        } catch {
+          // Peers endpoint may not be available yet — just show self
+          setPeers([]);
+        }
+      } catch {
+        // Bot entirely unavailable — show demo data
+        setError("Bot unavailable - showing demo data");
+        const demoSelf: NodeInfo = {
+          node_id: "ygg-node-alpha",
+          host: "192.168.1.10",
           port: 8100,
-          version: "0.1.0-demo",
-          uptime: 3600,
-          channels: ["general"],
-          functions: ["echo", "ping", "execute"],
-        });
-      });
+          version: "0.3.1",
+          uptime: 86400,
+          channels: ["general", "alerts"],
+          functions: ["echo", "ping", "execute", "deploy"],
+          lat: 48.8566,
+          lon: 2.3522,
+        };
+        const demoPeers: NodeInfo[] = [
+          { node_id: "ygg-node-beta", host: "10.0.2.15", port: 8100, version: "0.3.1", uptime: 43200, channels: ["general"], functions: ["echo", "ping"], lat: 51.5074, lon: -0.1278 },
+          { node_id: "ygg-node-gamma", host: "172.16.0.5", port: 8100, version: "0.3.0", uptime: 7200, channels: ["general", "data"], functions: ["echo", "stream"], lat: 40.7128, lon: -74.0060 },
+          { node_id: "ygg-node-delta", host: "10.0.3.22", port: 8100, version: "0.3.1", uptime: 172800, channels: ["general"], functions: ["echo", "ping", "monitor"], lat: 35.6762, lon: 139.6503 },
+          { node_id: "ygg-node-epsilon", host: "192.168.5.8", port: 8100, version: "0.2.9", uptime: 3600, channels: ["alerts"], functions: ["echo"], lat: 52.5200, lon: 13.4050 },
+          { node_id: "ygg-node-zeta", host: "10.0.1.100", port: 8100, version: "0.3.1", uptime: 259200, channels: ["general", "trading"], functions: ["echo", "ping", "trade", "analyze"], lat: 37.7749, lon: -122.4194 },
+        ];
+        setSelfNode(demoSelf);
+        setPeers(demoPeers);
+      }
+
+      setLoading(false);
+    }
+    loadNetwork();
   }, []);
 
-  // Periodic metrics fetch
-  const fetchMetrics = useCallback(() => {
-    // TODO: Replace with real API call when bot is connected: bot.getSystemMetrics()
-    const m = generateMockMetrics();
-    setMetrics(m);
-    setCpuHistory((prev) => [...prev.slice(1), m.cpu]);
-    setRamHistory((prev) => [...prev.slice(1), m.ram]);
-    setGpuHistory((prev) => [...prev.slice(1), m.gpu]);
-    
-    // TODO: Replace with real API call: bot.getProcesses()
-    setProcesses(generateMockProcesses());
-  }, []);
-
-  useEffect(() => {
-    fetchMetrics();
-    const interval = setInterval(fetchMetrics, refreshRate);
-    return () => clearInterval(interval);
-  }, [refreshRate, fetchMetrics]);
-
-  if (!node || !metrics) {
+  if (loading) {
     return (
       <div className="flex items-center justify-center h-[80vh]">
         <div className="text-center animate-in">
           <YggdrasilLogo size={48} className="mx-auto mb-4" />
-          <p className="text-primary font-mono text-sm pulse-primary">Connecting to Yggdrasil...</p>
+          <p className="text-primary font-mono text-sm pulse-primary">Scanning network...</p>
         </div>
       </div>
     );
   }
 
-  const currentUser = typeof window !== "undefined" ? (process.env.USER || "user") : "user";
+  // All nodes = self + peers
+  const allNodes: NodeInfo[] = selfNode ? [selfNode, ...peers] : peers;
+
+  // Closest neighbors: sorted by haversine distance from self
+  const closestNeighbors = (() => {
+    if (!selfNode || selfNode.lat == null || selfNode.lon == null) return [];
+    return peers
+      .filter((p) => p.lat != null && p.lon != null)
+      .map((p) => ({
+        node: p,
+        distance: haversine(selfNode.lat!, selfNode.lon!, p.lat!, p.lon!),
+      }))
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, 5);
+  })();
 
   return (
-    <div className="p-6 space-y-6 animate-in">
+    <div className="p-6 space-y-8 animate-in">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex items-center gap-4">
@@ -273,107 +168,56 @@ export default function BotDashboard() {
             <YggdrasilLogo size={28} />
           </div>
           <div>
-            <h1 className="text-xl font-bold text-foreground">Bot Control</h1>
-            <div className="flex items-center gap-3 text-sm text-muted mt-0.5">
-              <span className="font-mono">{node.node_id}</span>
-              <span className="text-border">|</span>
-              <span>{currentUser}@{node.host}</span>
-            </div>
+            <h1 className="text-xl font-bold text-foreground">Network Overview</h1>
+            <p className="text-sm text-muted mt-0.5">
+              {allNodes.length} node{allNodes.length !== 1 ? "s" : ""} in the network
+            </p>
           </div>
         </div>
-        
-        {/* Status + Refresh Rate */}
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-muted">Refresh:</span>
-            <select
-              value={refreshRate}
-              onChange={(e) => setRefreshRate(Number(e.target.value))}
-              className="bg-card border border-border rounded px-2 py-1 text-xs font-mono text-foreground focus:outline-none focus:border-primary"
-            >
-              <option value={500}>500ms</option>
-              <option value={1000}>1s</option>
-              <option value={2000}>2s</option>
-              <option value={5000}>5s</option>
-            </select>
+
+        {error && (
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-warning/10 border border-warning/20">
+            <div className="status-dot pending" />
+            <span className="text-xs font-medium text-warning">{error}</span>
           </div>
-          <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full ${demoMode ? "bg-warning/10 border border-warning/20" : "bg-success/10 border border-success/20"}`}>
-            <div className={`status-dot ${demoMode ? "pending" : "online"}`} />
-            <span className={`text-xs font-medium ${demoMode ? "text-warning" : "text-success"}`}>
-              {demoMode ? "Demo Mode" : "Online"}
-            </span>
+        )}
+      </div>
+
+      {/* All Nodes Grid */}
+      <section>
+        <h2 className="text-xs font-medium text-muted uppercase tracking-wider mb-4">All Nodes</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {allNodes.map((node) => (
+            <NodeCard key={node.node_id} node={node} />
+          ))}
+        </div>
+      </section>
+
+      {/* Closest Neighbors */}
+      {closestNeighbors.length > 0 && (
+        <section>
+          <h2 className="text-xs font-medium text-muted uppercase tracking-wider mb-4">Closest Neighbors</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {closestNeighbors.map(({ node, distance }) => (
+              <NodeCard key={node.node_id} node={node} distance={distance} />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Recent Activity Placeholder */}
+      <section>
+        <h2 className="text-xs font-medium text-muted uppercase tracking-wider mb-4">Recent Activity</h2>
+        <div className="bg-card border border-border rounded-xl p-6">
+          <div className="flex flex-col items-center justify-center py-6 text-center">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-muted mb-3">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+            </svg>
+            <p className="text-sm text-muted">Activity feed coming soon</p>
+            <p className="text-xs text-muted/60 mt-1">Network events, messages, and function calls will appear here</p>
           </div>
         </div>
-      </div>
-
-      {/* Resource Usage Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <TimePlot
-          data={cpuHistory}
-          color="#f26b3a"
-          label="CPU Usage"
-          value={metrics.cpu}
-          unit="%"
-        />
-        <TimePlot
-          data={ramHistory}
-          color="#5b9bd5"
-          label="Memory"
-          value={metrics.ram}
-          unit="%"
-          secondaryValue={`${metrics.ramUsed.toFixed(1)}/${metrics.ramTotal}GB`}
-          secondaryLabel="Used"
-        />
-        <TimePlot
-          data={gpuHistory}
-          color="#4ade80"
-          label="GPU"
-          value={metrics.gpu}
-          unit="%"
-          secondaryValue={metrics.gpuName}
-          secondaryLabel=""
-        />
-      </div>
-
-      {/* Bottom Section */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Process List */}
-        <ProcessList processes={processes} />
-
-        {/* System Info */}
-        <div className="nordic-card p-4">
-          <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">System Info</h3>
-          <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
-            <InfoRow label="Node ID" value={node.node_id} mono />
-            <InfoRow label="Version" value={node.version} mono />
-            <InfoRow label="Host" value={`${node.host}:${node.port}`} mono />
-            <InfoRow label="Uptime" value={formatUptime(node.uptime)} />
-            <InfoRow label="Latitude" value="48.8566" mono primary />
-            <InfoRow label="Longitude" value="2.3522" mono primary />
-            <InfoRow label="RAM Total" value={`${metrics.ramTotal} GB`} />
-            <InfoRow label="GPU" value={metrics.gpuName} />
-            <InfoRow label="GPU Memory" value={`${metrics.gpuMemUsed.toFixed(1)}/${metrics.gpuMemTotal} GB`} />
-            <InfoRow label="Functions" value={`${node.functions.length} registered`} />
-          </div>
-        </div>
-      </div>
+      </section>
     </div>
   );
-}
-
-function InfoRow({ label, value, mono, primary }: { label: string; value: string; mono?: boolean; primary?: boolean }) {
-  return (
-    <div>
-      <span className="text-muted text-xs">{label}</span>
-      <p className={`truncate ${mono ? "font-mono text-xs" : ""} ${primary ? "text-primary" : "text-foreground"}`}>{value}</p>
-    </div>
-  );
-}
-
-function formatUptime(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-  const hours = Math.floor(seconds / 3600);
-  const mins = Math.floor((seconds % 3600) / 60);
-  return `${hours}h ${mins}m`;
 }

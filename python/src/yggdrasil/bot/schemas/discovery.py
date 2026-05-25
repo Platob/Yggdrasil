@@ -13,6 +13,8 @@ class NodeInfo(StrictModel):
     uptime: float = 0.0
     channels: list[str] = Field(default_factory=list)
     functions: list[str] = Field(default_factory=list)
+    lat: float | None = None
+    lon: float | None = None
 
 
 class HelloRequest(StrictModel):
@@ -20,6 +22,8 @@ class HelloRequest(StrictModel):
     host: str
     port: int
     version: str = "0.1.0"
+    lat: float | None = None
+    lon: float | None = None
 
 
 class HelloResponse(StrictModel):
@@ -27,6 +31,8 @@ class HelloResponse(StrictModel):
     host: str
     port: int
     version: str
+    lat: float | None = None
+    lon: float | None = None
     peers: list[NodeInfo] = Field(default_factory=list)
 
 

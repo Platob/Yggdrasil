@@ -61,6 +61,14 @@ export interface NodeInfo {
   uptime: number;
   channels: string[];
   functions: string[];
+  lat: number | null;
+  lon: number | null;
+}
+
+// -- Peers --
+export interface PeersResponse {
+  node_id: string;
+  peers: NodeInfo[];
 }
 
 // -- Next.js API types --
@@ -160,6 +168,9 @@ export const bot = {
 
   // Node info (direct)
   getNodeInfo: (): Promise<NodeInfo> => fetchJSON(`${BOT_BASE}/hello`),
+
+  // Peers
+  getPeers: (): Promise<PeersResponse> => fetchJSON(`${BOT_BASE}/hello/peers`),
 
   // Registry
   getRegistry: (): Promise<Record<string, string>> => fetchJSON(`${BOT_BASE}/call/registry`),

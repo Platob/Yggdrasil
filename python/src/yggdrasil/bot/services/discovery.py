@@ -17,13 +17,23 @@ _PEER_TTL = 300  # seconds
 
 
 class _Peer:
-    __slots__ = ("node_id", "host", "port", "version", "last_seen")
+    __slots__ = ("node_id", "host", "port", "version", "lat", "lon", "last_seen")
 
-    def __init__(self, node_id: str, host: str, port: int, version: str) -> None:
+    def __init__(
+        self,
+        node_id: str,
+        host: str,
+        port: int,
+        version: str,
+        lat: float | None = None,
+        lon: float | None = None,
+    ) -> None:
         self.node_id = node_id
         self.host = host
         self.port = port
         self.version = version
+        self.lat = lat
+        self.lon = lon
         self.last_seen: float = time.monotonic()
 
     def touch(self) -> None:
@@ -35,6 +45,8 @@ class _Peer:
             host=self.host,
             port=self.port,
             version=self.version,
+            lat=self.lat,
+            lon=self.lon,
         )
 
 
@@ -57,23 +69,32 @@ class DiscoveryService:
                     host=req.host,
                     port=req.port,
                     version=req.version,
+                    lat=req.lat,
+                    lon=req.lon,
                 )
                 self._peers[req.node_id] = peer
             else:
                 peer.host = req.host
                 peer.port = req.port
                 peer.version = req.version
+                peer.lat = req.lat
+                peer.lon = req.lon
                 peer.touch()
             peers = [p.to_node_info() for p in self._peers.values()]
 
         if not existing:
             LOGGER.info("Registered new peer %r (%s:%d)", req.node_id, req.host, req.port)
 
+        from ..geo import get_location
+        lat, lon = get_location()
+
         return HelloResponse(
             node_id=self.settings.node_id,
             host=self.settings.host,
             port=self.settings.port,
             version=self.settings.app_version,
+            lat=lat,
+            lon=lon,
             peers=peers,
         )
 
@@ -84,9 +105,12 @@ class DiscoveryService:
         return PeerListResponse(node_id=self.settings.node_id, peers=peers)
 
     async def get_self_info(self) -> NodeInfo:
+        from ..geo import get_location
+
         uptime = time.monotonic() - self._start_time
         channels = self._get_channels()
         functions = sorted(list_registered().keys())
+        lat, lon = get_location()
         return NodeInfo(
             node_id=self.settings.node_id,
             host=self.settings.host,
@@ -95,18 +119,25 @@ class DiscoveryService:
             uptime=uptime,
             channels=channels,
             functions=functions,
+            lat=lat,
+            lon=lon,
         )
 
     async def discover_friends(self, targets: list[str]) -> PeerListResponse:
         if not targets:
             return PeerListResponse(node_id=self.settings.node_id, peers=[])
 
+        from ..geo import get_location
+
         discovered: list[NodeInfo] = []
+        lat, lon = get_location()
         payload = json.dumps({
             "node_id": self.settings.node_id,
             "host": self.settings.host,
             "port": self.settings.port,
             "version": self.settings.app_version,
+            "lat": lat,
+            "lon": lon,
         }).encode()
 
         def _contact(url: str) -> NodeInfo | None:
@@ -125,6 +156,8 @@ class DiscoveryService:
                     host=data["host"],
                     port=data["port"],
                     version=data["version"],
+                    lat=data.get("lat"),
+                    lon=data.get("lon"),
                 )
             except Exception as exc:
                 LOGGER.debug("Failed to contact %r: %s", url, exc)
@@ -145,6 +178,8 @@ class DiscoveryService:
                                 host=result.host,
                                 port=result.port,
                                 version=result.version,
+                                lat=result.lat,
+                                lon=result.lon,
                             )
                             self._peers[result.node_id] = peer
                             LOGGER.info(
@@ -152,6 +187,8 @@ class DiscoveryService:
                                 result.node_id, result.host, result.port,
                             )
                         else:
+                            peer.lat = result.lat
+                            peer.lon = result.lon
                             peer.touch()
 
         return PeerListResponse(node_id=self.settings.node_id, peers=discovered)

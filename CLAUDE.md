@@ -1,86 +1,79 @@
-# Yggdrasil — Project Instructions
+# Yggdrasil
+
+Distributed bot framework — Python backend, Next.js frontend, Nordic dark UI.
 
 ## Principles
 
-1. **One exception hierarchy** — all exceptions derive from `YGGException`. API server errors use `yggdrasil.exceptions.api.APIError` and its subclasses. Never define ad-hoc exception classes in feature modules.
-2. **Owner maintains Python backends** — do not rewrite FastAPI or bot service logic without being asked. Frontend and CLI are fair game.
-3. **Dark Nordic aesthetic** — the brand color is `#f26b3a` (coral/orange). Dark backgrounds, subtle glows, monospace for data.
-4. **Prefer existing utilities** — check `yggdrasil.exceptions`, `yggdrasil.pyutils`, `yggdrasil.cli.style` before writing new helpers.
+1. **Exceptions** — derive from `YGGException`. API errors use `yggdrasil.exceptions.api` (`NotFoundError`, `ConflictError`, etc). No ad-hoc exception classes.
+2. **Services own logic** — routers are thin (validate → call service → return). Business rules live in `services/`.
+3. **Schemas are contracts** — all request/response types in `schemas/`. Use `StrictModel` (extra="forbid").
+4. **POC mode** — ship fast, iterate. No legacy compat shims.
 
-## Repository Layout
-
-```
-python/src/yggdrasil/     Python library + services
-  bot/                    Bot server (FastAPI on port 8100)
-  fastapi/                Standalone FastAPI service (port 8000)
-  cli/                    CLI entry point: ygg
-  exceptions/             Centralized exception hierarchy
-    base.py               YGGException root
-    http.py               HTTP client errors (4xx/5xx with Response)
-    api.py                API server errors (detail + status_code)
-  databricks/             Databricks integrations
-next/ygg/                 Next.js frontend (React 19, Tailwind v4)
-```
-
-## Exception System
+## Layout
 
 ```
-YGGException
-├── APIError              API server errors (bot + fastapi)
-│   ├── BadRequestError       400
-│   ├── UnauthorizedError     401
-│   ├── ForbiddenError        403
-│   ├── NotFoundError         404
-│   ├── ConflictError         409
-│   ├── TimeoutError          408
-│   └── UnprocessableError    422
-├── HTTPError             HTTP client errors (with Response object)
-│   ├── ClientError           4xx (BadRequest, NotFoundError, ...)
-│   └── ServerError           5xx (InternalServerError, ...)
-└── CastError             Arrow/Pandas type cast failures
+python/src/yggdrasil/
+  bot/                  Bot server (FastAPI, default :8100)
+    routers/            Thin HTTP handlers
+    services/           Business logic
+    schemas/            Pydantic models (StrictModel)
+    geo.py              IP geolocation (lat/lon)
+  fastapi/              Standalone FastAPI service (:8000)
+  cli/                  ygg CLI (argparse)
+  exceptions/
+    api.py              APIError → NotFoundError, ConflictError, ...
+    http.py             HTTP client errors (with Response object)
+  databricks/           Databricks SDK integrations
+next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
+  src/app/bot/          Bot dashboard pages
+  src/app/bot/[id]/     Single-node detail view
+  src/app/msg/          Messaging
+  src/lib/api.ts        API client (bot.* + api.* namespaces)
 ```
 
-**Raising in services:**
+## Bot API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/hello` | GET | Self node info (NodeInfo with lat/lon) |
+| `/api/hello` | POST | Register peer, returns peers list |
+| `/api/hello/peers` | GET | All known peers |
+| `/api/hello/discover` | POST | Discover peers from URL list |
+| `/api/python` | POST | Execute Python code |
+| `/api/cmd` | POST | Execute shell command |
+| `/api/messenger` | POST | Send message |
+| `/api/messenger/channels` | GET | List channels |
+| `/api/call/registry` | GET | List @remote functions |
+| `/api/call/{func}` | POST | Call a remote function |
+
+## Frontend Routes
+
+| Route | Description |
+|-------|-------------|
+| `/` | Welcome — interactive 3D globe |
+| `/bot` | Network overview — all nodes, closest neighbors |
+| `/bot/{id}` | Node detail — resource graphs, processes, system info |
+| `/bot/network` | 3D network map |
+| `/bot/execute` | Python/shell execution |
+| `/msg` | Real-time messaging |
+
+## Exceptions
+
 ```python
-from yggdrasil.exceptions.api import NotFoundError, ConflictError
+from yggdrasil.exceptions.api import NotFoundError, ConflictError, register_api_exception_handlers
 raise NotFoundError(f"Channel {name!r} not found")
-raise ConflictError(f"Channel {name!r} already exists")
+register_api_exception_handlers(app)  # wire into FastAPI
 ```
 
-**Registering handlers in app:**
-```python
-from yggdrasil.exceptions.api import register_api_exception_handlers
-register_api_exception_handlers(app)
-```
+## CLI
 
-## CLI Commands
+`ygg bot serve` — bot + frontend | `ygg bot front` — frontend only
+`ygg bot serve --no-front` — bot only | `ygg bot status/stop` — manage daemon
 
-| Command | Description |
-|---------|-------------|
-| `ygg bot serve` | Start bot + frontend (foreground) |
-| `ygg bot serve --no-front` | Bot only, no frontend |
-| `ygg bot front` | Frontend dev server only |
-| `ygg bot run <func>` | Call a @remote function |
-| `ygg bot chat` | Terminal chat client |
-| `ygg bot status` | Show bot status |
-| `ygg bot stop` | Stop background bot |
-| `ygg genie` | Databricks Genie CLI |
-| `ygg databricks` | Databricks management CLI |
+## Environment
 
-## Frontend (next/ygg/)
-
-- **Bot API proxy**: `/api/bot/*` → FastAPI at `BOT_API_URL` (default `http://127.0.0.1:8100`)
-- **Client API**: `import { bot } from "@/lib/api"` for bot calls, `import { api }` for Next.js routes
-- **GlobalSidebar** in root layout — present on every page, handles dark/light mode
-- **Design tokens** in `globals.css` via CSS custom properties (dark default, `.light` override)
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `YGG_BOT_PORT` | `8100` | Bot server port |
-| `YGG_BOT_HOST` | `0.0.0.0` | Bot bind host |
-| `YGG_BOT_FRONT_PORT` | `3000` | Frontend dev server port |
-| `YGG_BOT_FRONT_HOME` | `<repo>/next/ygg` | Frontend directory |
-| `BOT_API_URL` | `http://127.0.0.1:8100` | Frontend → bot proxy target |
-| `YGG_FASTAPI_PORT` | `8000` | Standalone FastAPI port |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `YGG_BOT_PORT` | 8100 | Bot port |
+| `YGG_BOT_FRONT_PORT` | 3000 | Frontend port |
+| `BOT_API_URL` | `http://127.0.0.1:8100` | Frontend → bot proxy |
