@@ -83,6 +83,7 @@ import pyarrow as pa
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.data.enums import Mode
+from yggdrasil.environ import PyEnv
 from yggdrasil.lazy_imports import field_class, schema_class
 
 if TYPE_CHECKING:
@@ -1555,6 +1556,13 @@ class CastOptions:
         if self.target is None:
             return obj
         return self.target.spark_alias(obj)
+
+    def get_spark_session(self, create: bool = True, **kwargs):
+        return PyEnv.spark_session(
+            self.spark_session,
+            create=create,
+            **kwargs
+        )
 
     # ==================================================================
     # Dunders
