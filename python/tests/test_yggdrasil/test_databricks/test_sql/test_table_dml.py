@@ -35,8 +35,10 @@ import pyarrow as pa
 
 from yggdrasil.data.enums import Mode
 from yggdrasil.data.schema import Schema
+from yggdrasil.data import Field
 from yggdrasil.databricks.table.table import (
     _build_anti_join_insert,
+    _build_cast_column_projection,
     _build_column_projection,
     _build_delete_insert_statements,
     _build_dml_statements,
@@ -588,7 +590,7 @@ class TestBuildColumnProjection:
             _schema(("id", pa.int64()), ("v", pa.float64())).fields,
             source_alias="raw_src",
         )
-        assert sql == "raw_src.`id`, raw_src.`v`"
+        assert sql == "`raw_src`.`id`, `raw_src`.`v`"
 
     def test_empty_fields_returns_empty_string(self) -> None:
         assert _build_column_projection(_schema().fields) == ""
@@ -622,6 +624,84 @@ class TestBuildColumnProjection:
         assert "COMMENT" not in sql
 
 
+class TestBuildCastColumnProjection:
+
+    def test_matching_types_bypass_cast(self) -> None:
+        target = _schema(("id", pa.int64()), ("name", pa.string())).fields
+        source = {
+            "id": Field("id", pa.int64()),
+            "name": Field("name", pa.string()),
+        }
+        sql = _build_cast_column_projection(
+            target, source_fields=source, source_alias="S",
+        )
+        assert sql == "`S`.`id`, `S`.`name`"
+        assert "CAST" not in sql
+
+    def test_mismatched_types_emit_cast(self) -> None:
+        target = _schema(("v", pa.float64())).fields
+        source = {"v": Field("v", pa.int32())}
+        sql = _build_cast_column_projection(
+            target, source_fields=source, source_alias="S",
+        )
+        assert sql == "CAST(`S`.`v` AS DOUBLE) AS `v`"
+
+    def test_missing_columns_filled_with_null(self) -> None:
+        target = _schema(("id", pa.int64()), ("extra", pa.string())).fields
+        source = {"id": Field("id", pa.int64())}
+        sql = _build_cast_column_projection(
+            target, source_fields=source, source_alias="S",
+        )
+        assert "`S`.`id`" in sql
+        assert "CAST(NULL AS STRING) AS `extra`" in sql
+
+    def test_no_source_fields_casts_everything(self) -> None:
+        target = _schema(("id", pa.int64()), ("v", pa.float64())).fields
+        sql = _build_cast_column_projection(
+            target, source_fields=None, source_alias="S",
+        )
+        assert "CAST(`S`.`id` AS BIGINT) AS `id`" in sql
+        assert "CAST(`S`.`v` AS DOUBLE) AS `v`" in sql
+
+    def test_alias_with_spaces_is_quoted(self) -> None:
+        target = _schema(("x", pa.int32())).fields
+        source = {"x": Field("x", pa.int32())}
+        sql = _build_cast_column_projection(
+            target, source_fields=source, source_alias="my src",
+        )
+        assert sql == "`my src`.`x`"
+
+    def test_column_name_with_spaces(self) -> None:
+        target = _schema(("a b", pa.string())).fields
+        source = {"a b": Field("a b", pa.int32())}
+        sql = _build_cast_column_projection(
+            target, source_fields=source, source_alias="S",
+        )
+        assert sql == "CAST(`S`.`a b` AS STRING) AS `a b`"
+
+    def test_mixed_match_mismatch_missing(self) -> None:
+        target = _schema(
+            ("id", pa.int64()),
+            ("name", pa.string()),
+            ("value", pa.float64()),
+            ("ts", pa.timestamp("us", "UTC")),
+        ).fields
+        source = {
+            "id": Field("id", pa.int64()),       # match
+            "name": Field("name", pa.int32()),    # mismatch
+            # value: missing
+            "ts": Field("ts", pa.timestamp("us", "UTC")),  # match
+        }
+        sql = _build_cast_column_projection(
+            target, source_fields=source, source_alias="S",
+        )
+        parts = [p.strip() for p in sql.split(",")]
+        assert parts[0] == "`S`.`id`"
+        assert parts[1] == "CAST(`S`.`name` AS STRING) AS `name`"
+        assert parts[2] == "CAST(NULL AS DOUBLE) AS `value`"
+        assert parts[3] == "`S`.`ts`"
+
+
 class TestSparkInsertSQLProjection:
     """Pin the shape of the source projection used by spark_insert /
     arrow_insert / sql_insert.  Validates the helper through the call
@@ -652,7 +732,7 @@ class TestSparkInsertSQLProjection:
         # reference resolves against the wrapper alias.
         schema = _schema(("id", pa.int64()))
         proj = _build_column_projection(schema.fields, source_alias="raw_src")
-        assert proj == "raw_src.`id`"
+        assert proj == "`raw_src`.`id`"
 
 
 # ---------------------------------------------------------------------------

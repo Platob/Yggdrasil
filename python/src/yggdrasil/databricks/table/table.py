@@ -493,41 +493,63 @@ def _build_column_projection(
     user query).
     """
     parts: list[str] = []
+    alias = quote_ident(source_alias) if source_alias else None
     for f in fields:
         col = quote_ident(f.name)
-        parts.append(f"{source_alias}.{col}" if source_alias else col)
+        parts.append(f"{alias}.{col}" if alias else col)
     return ", ".join(parts)
 
 
 def _build_cast_column_projection(
     target_fields: "Iterable[Field]",
     *,
-    source_columns: "frozenset[str] | set[str]",
+    source_fields: "Mapping[str, Field] | None" = None,
     source_alias: str,
 ) -> str:
-    """Build a SELECT projection that CASTs each column to its target Spark type.
+    """Build a SELECT projection that CASTs source columns to target Spark types.
 
     For each target field:
 
-    * **present in source** — ``CAST(source_alias.`col` AS <spark_type>)
-      AS `col```
-    * **missing from source** — ``CAST(NULL AS <spark_type>) AS `col```
+    * **present in source, same type** — bare ``alias.`col``` (no CAST)
+    * **present in source, different type** —
+      ``CAST(alias.`col` AS <spark_type>) AS `col```
+    * **missing from source** —
+      ``CAST(NULL AS <spark_type>) AS `col```
 
-    This gives the warehouse engine an explicit type contract per
-    column instead of relying on implicit coercion at the column
-    boundary, and fills target-only columns with typed NULLs so the
-    row shape always matches the target schema.
+    *source_fields* maps column names to their :class:`Field`
+    descriptors from the source schema. When a source field's Spark
+    type name matches the target's, the CAST is skipped — the engine
+    already has the right type and a redundant CAST would just add
+    noise (and cost, for nested types where Spark re-validates every
+    child field). When *source_fields* is ``None`` every target column
+    is assumed present with an unknown type (always CAST).
     """
+    alias = quote_ident(source_alias)
     parts: list[str] = []
     for f in target_fields:
         col = quote_ident(f.name)
-        spark_type = f.to_spark_name(
+        target_spark = f.to_spark_name(
             with_name=False, with_nullable=False, with_comment=False,
         )
-        if f.name in source_columns:
-            parts.append(f"CAST({source_alias}.{col} AS {spark_type}) AS {col}")
+        if source_fields is not None:
+            src = source_fields.get(f.name)
         else:
-            parts.append(f"CAST(NULL AS {spark_type}) AS {col}")
+            src = ...  # sentinel: "assume present, unknown type"
+
+        if src is None:
+            # Column not in source — typed NULL fill.
+            parts.append(f"CAST(NULL AS {target_spark}) AS {col}")
+        elif src is ...:
+            # Present but type unknown — always CAST.
+            parts.append(f"CAST({alias}.{col} AS {target_spark}) AS {col}")
+        else:
+            source_spark = src.to_spark_name(
+                with_name=False, with_nullable=False, with_comment=False,
+            )
+            if source_spark == target_spark:
+                parts.append(f"{alias}.{col}")
+            else:
+                parts.append(f"CAST({alias}.{col} AS {target_spark}) AS {col}")
     return ", ".join(parts)
 
 
@@ -3912,27 +3934,20 @@ class Table(DatabricksPath):
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
 
-        # Determine source columns — when cast_options.source carries a
-        # schema we know which columns the source query produces. Use
-        # the cast projection so each column gets an explicit
-        # CAST(col AS spark_type); columns present in the target but
-        # missing from the source are filled with CAST(NULL AS type).
         source_field = cast_options.source
         if source_field is not None and source_field.children:
-            source_columns = frozenset(c.name for c in source_field.children)
-            source_projection = _build_cast_column_projection(
-                fields,
-                source_columns=source_columns,
-                source_alias="raw_src",
-            )
+            source_fields_map: Mapping[str, Field] = {
+                c.name: c for c in source_field.children
+            }
         else:
-            source_projection = _build_cast_column_projection(
-                fields,
-                source_columns=frozenset(columns),
-                source_alias="raw_src",
-            )
+            source_fields_map = None
+        source_projection = _build_cast_column_projection(
+            fields,
+            source_fields=source_fields_map,
+            source_alias="raw_src",
+        )
         source_sql = (
-            f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS raw_src"
+            f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS {quote_ident('raw_src')}"
         )
 
         prune_predicates = _build_prune_predicate(
