@@ -1,302 +1,322 @@
-# CLAUDE.md
+# Yggdrasil Next.js Frontend - AI Agent Instructions
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Design System: Nordic Mythic Theme
 
-## Project layout
+This frontend uses a **mythic Nordic aesthetic** inspired by the Yggdrasil World Tree.
 
-Two sibling packages live at the repo root:
+### Brand Colors (Black, White, Grey, Red, Orange, Coral)
+- **Primary**: `#f26b3a` (Coral/Orange) - from the Yggdrasil logo
+- **Secondary**: `#dc2626` (Deep Red) - for emphasis
+- **Accent**: `#fb923c` (Warm Coral) - highlights
+- **Background**: `#050507` (Pure black void)
+- **Foreground**: `#ffffff` (Pure white)
+- **Muted**: `#525252` / `#737373` (Grey tones)
 
-- `python/` — the main library. PyPI package `ygg`, import package `yggdrasil`. Sources in `python/src/yggdrasil/`, tests in `python/tests/test_yggdrasil/`, docs in `python/docs/` (MkDocs).
-- `powerquery/` — Excel (`.pq`) and Power BI (`.mez`) connectors that talk to the FastAPI service in `yggdrasil.fastapi`. Build/install via `build.ps1` / `install.ps1` (PowerShell).
+### Design Principles
+1. **Dark, atmospheric** - deep blacks and charcoals evoke Norse mythology
+2. **Orange/coral accents** - the World Tree color, used sparingly for emphasis
+3. **Clean and functional** - modern dashboard UI, not decorative fantasy
+4. **Subtle glows** - primary color has soft glow effects for status/emphasis
 
-`AGENTS.md` at the root is the canonical style, tone, and design-rule guide — read it before non-trivial changes. It supersedes generic instincts on error messages, comment voice, and API ergonomics.
+### Component Patterns
+- Use `.nordic-card` for card containers
+- Use `.btn-primary` for primary actions (orange gradient with glow)
+- Use `.btn-ghost` for secondary actions
+- Use `.input-nordic` for form inputs
+- Use `.status-dot` with `.online/.offline/.pending` for status indicators
 
-## Common commands
+### Logo
+- Import from `@/components/logo` 
+- `<YggdrasilLogo />` - Static SVG tree icon
+- `<AnimatedYggdrasilTree />` - Large animated tree with draw-on effects
+- `<YggdrasilBrand />` - logo + wordmark combo
 
-All Python commands run from `python/`.
+### CSS Classes in `globals.css`
+- `.nordic-card` - Card with border, rounded corners, hover state
+- `.constellation-card` - Service card with hover glow and gradient
+- `.btn-primary` - Primary button with gradient and glow
+- `.btn-secondary` - Border button with hover fill
+- `.btn-ghost` - Ghost button for secondary actions  
+- `.input-nordic` - Styled input with focus ring
+- `.code-block` - Code/pre block styling
+- `.glow-intense` - Intense animated glow for hero elements
+- `.pulse-glow` - Subtle pulsing glow for background orbs
+- `.float` - Gentle floating animation
+- `.twinkle` - Star twinkling animation
+- `.constellation-line` - Animated SVG line for connections
+- `.gradient-text` - Multi-color gradient text
+- `.star-field`, `.star` - Star background elements
 
-```bash
-cd python
-uv venv --seed .venv && source .venv/bin/activate   # .venv\Scripts\activate on Windows
-uv pip install -e .[dev]                     # core dev tooling
+## Architecture Overview
 
-# Optional extras are additive — install only what a task needs:
-#   [databricks] databricks-sdk  [bigdata] pyspark
-#   [delta] deltalake            [api] fastapi+uvicorn+pydantic
-#   [pickle] cloudpickle/dill/zstandard/xxhash/blake3
+This is a **hybrid architecture** with two backends:
 
-pytest                                        # full suite
-pytest tests/test_yggdrasil/test_data/        # scope to one area
-pytest tests/test_yggdrasil/test_data/test_registry.py::test_name  # single test
-ruff check
-black .
+1. **FastAPI Bot Backend** (`BOT_API_URL`, default: `http://127.0.0.1:8100`)
+   - Runs on the Yggdrasil bot instance
+   - Handles: Python execution, shell commands, messaging, remote function calls
+   - Real-time bot state, node info, channel management
+   - **Owner maintains this** - do not suggest changes to FastAPI code
+
+2. **Next.js API Routes** (`/api/...` in `src/app/api/`)
+   - Handles: Caching, aggregation, auth, frontend-optimized endpoints
+   - SSR data fetching, session management, preferences
+   - **You (v0) maintain this** - implement features here when optimal
+
+## When to Use Each Backend
+
+### Use FastAPI (Bot) Backend For:
+- Python/shell code execution (`/api/bot/python`, `/api/bot/cmd`)
+- Real-time messaging and long-polling (`/api/bot/messenger/*`)
+- Node info and bot state (`/api/bot/hello`)
+- Remote function registry and calls (`/api/bot/call/*`)
+- Anything requiring direct bot process access
+
+### Use Next.js API Routes For:
+- **Caching/Aggregation**: Combine multiple bot API calls into one
+- **Auth & Sessions**: User authentication, API key management
+- **Preferences**: User settings, theme, layout preferences
+- **Data Transformation**: Reshape bot responses for frontend needs
+- **Rate Limiting**: Protect bot from excessive requests
+- **Webhooks**: External service integrations
+- **Static Data**: Feature flags, config, UI metadata
+
+## API Structure
+
+```
+/api/
+├── bot/           → Proxied to FastAPI (rewrites in next.config.ts)
+│   ├── hello
+│   ├── python
+│   ├── cmd
+│   ├── messenger/
+│   └── call/
+│
+└── [next routes]  → Next.js API handlers
+    ├── health/    → Health check, version info
+    ├── config/    → Frontend config, feature flags
+    ├── cache/     → Cached bot data (node info, registry)
+    └── prefs/     → User preferences (future)
 ```
 
-- Databricks live-integration tests are gated by the `integration` marker and skipped unless `DATABRICKS_HOST` is set (see `[tool.pytest.ini_options]` in `python/pyproject.toml`).
-- `pytest-asyncio` runs in `strict` mode — async tests need the explicit marker.
-- `python/tests/conftest.py` injects `python/src` onto `sys.path` and wires a `yggdrasil` DEBUG logger, so tests run without installing the package.
+## Environment Variables
 
-### Data tests use the engine TestCase base classes
+```env
+# Bot backend URL (default: http://127.0.0.1:8100)
+BOT_API_URL=http://127.0.0.1:8100
 
-Any test that touches a dataframe, Arrow object, or engine-side type **must** subclass the matching base class from `yggdrasil.*.tests` instead of importing the engine module at the top of the file. These bases handle optional-dependency skipping, per-test tmp dirs, Arrow interop, and frame/schema assertions — you get a consistent skip story and less boilerplate for free.
-
-| Engine | Base class | Module |
-| --- | --- | --- |
-| Arrow | `ArrowTestCase` | `yggdrasil.arrow.tests` |
-| Polars | `PolarsTestCase` | `yggdrasil.polars.tests` |
-| pandas | `PandasTestCase` | `yggdrasil.pandas.tests` |
-| Spark | `SparkTestCase` | `yggdrasil.spark.tests` |
-
-Rules:
-
-- Do `from yggdrasil.arrow.tests import ArrowTestCase` (etc.) and subclass it. Use `self.pa` / `self.pl` / `self.pd` / `self.spark` rather than a top-level `import pyarrow as pa` — a bare import breaks base installs and defeats the skip-on-missing behavior.
-- Use the provided helpers (`self.table(...)`, `self.df(...)`, `self.lazy(...)`, `self.record_batch(...)`, `self.arrow_to_polars(...)`, `self.write_parquet(...)`, `self.tmp_path`, etc.) instead of reimplementing fixtures.
-- Prefer the built-in assertions (`assertFrameEqual`, `assertSchemaEqual`, `assertSeriesEqual`, `SparkTestCase.assertDataFrameEqual` / `assertSparkEqual`) — they give readable diffs and handle dtype/order/index knobs consistently.
-- Cross-engine tests can multi-inherit (e.g. `class TestX(PolarsTestCase, ArrowTestCase):`) or split into sibling classes in the same file — both work; pick whichever keeps the test body clean.
-- `SparkTestCase` shares a single process-wide `SparkSession`; don't call `SparkSession.builder` yourself and don't stop the session in `tearDown`.
-- For Databricks integration tests, keep the `integration` marker *and* subclass `ArrowTestCase` (or whichever engine is actually exercised) so the local run still skips cleanly without `DATABRICKS_HOST`.
-
-Docs site (MkDocs Material):
-
-```bash
-cd python
-mkdocs serve    # or `mkdocs build`
+# Optional: API timeout in ms
+BOT_API_TIMEOUT=30000
 ```
 
-FastAPI service (used by the Power Query connector):
+## Code Patterns
 
-```bash
-python -m yggdrasil.fastapi.main   # entry point, also exposed as `ygg-api`
+### Calling Bot API from Next.js Route Handlers
+
+```typescript
+// src/lib/bot-client.ts
+import { botFetch } from "@/lib/bot-client";
+
+// In a route handler:
+export async function GET() {
+  const data = await botFetch("/api/hello");
+  return Response.json(data);
+}
 ```
 
-## Architecture
+### Frontend API Client Usage
 
-### Reach for `yggdrasil.data` before raw engine APIs
+```typescript
+// For bot-proxied endpoints (real-time, execution)
+import { bot } from "@/lib/api";
+await bot.executePython(code);
+await bot.pollMessages(channel, afterId);
 
-`yggdrasil.data` is the canonical surface for describing and moving frames. When a task involves a dataframe, schema, field, type, or a cross-engine conversion, start from `yggdrasil.data` and only drop down to `polars` / `pandas` / `pyspark` / `pyarrow` when you actually need something the abstraction does not cover.
-
-Prefer these primitives in this order:
-
-- `yggdrasil.data.DataField` / `Field` and `yggdrasil.data.Schema` for describing columns — they carry names, nullability, metadata, tags, nested structure, and engine-side dtype intent in one place. Build them with `Field.from_pandas`, `Field.from_polars`, `Field.from_arrow`, `Schema.from_fields`, etc. instead of re-building per-engine schemas by hand.
-- `yggdrasil.data.DataType` / `DataTypeId` (and the `types/` submodules: `primitive`, `nested`, `iso`, `extensions`) for type hints — don't hand-roll `pa.int64()` / `pl.Int64` / `"bigint"` strings when a `DataType` can produce all of them.
-- `yggdrasil.data.DataTable` and `yggdrasil.data.statement_result.StatementResult` for anything that looks like "execute a query, then move rows somewhere" — new integrations should implement these interfaces rather than invent a parallel one.
-- `yggdrasil.data.cast.convert(value, target, options=...)` with `CastOptions` for value conversion. Do not call `df.to_pandas()`, `pl.from_arrow(...)`, or `spark.createDataFrame(...)` directly from feature code if a registered converter already handles it — that's what the registry is for.
-- `yggdrasil.data.enums` (currency, geozone, timezone) when you need normalized domain values; do not re-parse those strings inline.
-
-Only reach past this layer when adding a new converter, writing engine-internal glue in `arrow/` / `polars/` / `pandas/` / `spark/`, or implementing performance-critical code that the abstraction intentionally doesn't cover. When you do, register the new behavior back into `yggdrasil.data` (converter + `DataType` + `DataField`/`Schema` support) so the next caller gets it for free.
-
-### Converter registry is the core
-
-`yggdrasil/data/cast/registry.py` holds a single registry that every engine plugs into. Register converters with `@register_converter(from_hint, to_hint)` and dispatch them via `convert(value, target)`. Dispatch order is: **exact match → identity → `Any` wildcard → MRO fallback → one-hop composition.** New conversions belong in the registry (or an engine-specific converter module or shared normalization helper) — not as ad-hoc one-offs at call sites.
-
-Engine modules register their converters **on import**: `arrow/cast.py`, `polars/cast.py`, `pandas/cast.py`, `spark/cast.py`. If an expected conversion does not fire, check whether the engine module has been imported.
-
-### `CastOptions` is the shared options object
-
-`yggdrasil/data/cast/options.py` defines `CastOptions` — the single normalized carrier for source hints, target fields/schemas, safety/memory/nullability behavior, and strictness flags. Do not invent parallel per-call option objects; extend `CastOptions` or pass it through.
-
-### Optional-dependency pattern (`lib.py`)
-
-Subsystems that depend on optional packages (polars, pandas, spark, databricks, blake3, xxhash, etc.) expose a `lib.py` guard that does the import once and raises a helpful "install extra X" error on failure. Always go through the guard:
-
-```python
-from yggdrasil.polars.lib import polars   # correct
-import polars                             # wrong — breaks base installs
+// For Next.js endpoints (cached, aggregated)
+import { api } from "@/lib/api";
+await api.getConfig();
+await api.getCachedNodeInfo();
 ```
 
-The only hard runtime dependency of `ygg` is `pyarrow` (`>=20`). Base installs must keep working without any other engine.
+## Translation Guidelines: FastAPI → Next.js
 
-### `io/` is a real integration boundary
+When the owner asks to "translate" or "optimize" a FastAPI endpoint:
 
-`yggdrasil/io/` is not "utilities" — it's the transport surface: buffers (`buffer/` → `BytesIO`, `MediaIO`), URLs, requests, responses, codecs, media types, sessions, pagination, caching. For new HTTP work prefer the modern stack in `io/http_/`: `HTTPSession`, `PreparedRequest`, `Response`, `SendConfig` / `SendManyConfig`. Preserve observability fields (normalized URL parts, promoted/remaining headers, body bytes, payload hashes, timestamps, status/timing) — tooling downstream relies on them. Buffer changes must preserve spill-to-disk behavior, codec handling, cursor safety, and Arrow/Parquet/JSON/IPC compatibility.
+1. **Identify if it benefits from Next.js**:
+   - Does it need caching? → Next.js with `unstable_cache` or `revalidateTag`
+   - Does it aggregate data? → Next.js to reduce client requests
+   - Is it read-only + cacheable? → Next.js
+   - Does it need bot process access? → Keep in FastAPI
 
-### Module map (top level of `yggdrasil/`)
+2. **Create Next.js route** in `src/app/api/[feature]/route.ts`
 
-- **Schema & conversion (start here):** `data/` is the canonical surface — cast registry + `CastOptions`, `DataType`/`DataTypeId`, `DataField`/`Schema`/`DataTable`, `StatementResult`, normalized enums (currency, geozone, timezone). `arrow/` holds type inference and Arrow cast helpers; `dataclasses/` has dataclass→Arrow field helpers and waiting/expiring utilities.
-- **Dataframe engines:** `polars/`, `pandas/`, `spark/` — each registers on import and provides a `lib.py` guard *and* a `tests.py` TestCase base. Prefer the `yggdrasil.data` abstractions over calling these engines directly from feature code.
-- **Platform integrations:** `databricks/` (sub-packages `sql/`, `jobs/`, `compute/`, `iam/`, `secrets/`, `workspaces/`, `fs/`, `account/`, `ai/`; entry via `DatabricksClient`), `mongo/`, `mongoengine/`, `fastapi/` (routers power the Power Query connector).
-- **Serialization & hashing:** `pickle/` (custom serialization with optional cloudpickle/dill/zstandard), `blake3/`, `xxhash/` — all guarded.
-- **Utilities:** `pyutils/` (retry, parallelize, helpers), `concurrent/`, `environ/` (runtime import/install logic), `fxrates/`, `requests/`, `exceptions.py`, `version.py`.
+3. **Update frontend API client** in `src/lib/api.ts`
 
-## Conventions that aren't obvious
+4. **Document the change** - note what was moved and why
 
-- **Python 3.10 minimum.** Don't use 3.11+ syntax (e.g. `typing.Self`) without a fallback.
-- **Integrate, don't invent.** Before writing anything new, find where the behavior already lives and extend it. Modify the function/class that already does most of the job, register into `data/cast/registry.py` instead of writing a one-off conversion at a call site, add a flag to `CastOptions` instead of a new options object, add a method to `DataField`/`Schema`/`DataTable`/`StatementResult` instead of a sibling helper module, use `HTTPSession`/`PreparedRequest`/`Response` instead of a parallel HTTP path. Only create a new module/class/abstraction when the existing surface genuinely cannot host the behavior — and wire it back through the canonical path so the next caller finds it.
-- **Centralise exceptions in `yggdrasil.exceptions`.** The library has **one** root: `YGGException`. Every exception yggdrasil deliberately raises must derive from it — directly or transitively — so callers can write `except YGGException:` once and catch every error the library generates. Concrete types live in peer modules under `yggdrasil/exceptions/` (`base.py` → `YGGException`, `cast.py` → `CastError`, `http.py` → the full HTTP hierarchy with `HTTPError`, `NotFoundError`, `ForbiddenError`, `TooManyRequests`, etc.) and are re-exported from `yggdrasil/exceptions/__init__.py`, so `from yggdrasil.exceptions import <Anything>` always works without knowing which sub-module hosts it. **Rules for new failure modes**: (1) before defining a new exception, grep `yggdrasil/exceptions/` for one that already fits — `NotFoundError` for missing remote resources, `CastError` for conversion failures, `HTTPError` subclasses for HTTP-layer signals, `UnauthorizedError` / `ForbiddenError` for auth — and reuse it; (2) when you must add a new type, add it to `yggdrasil/exceptions/<area>.py`, subclass `YGGException` (and the most specific existing yggdrasil type the failure semantically inherits from — e.g. an SDK-shaped 404 should subclass `NotFoundError`, not just `YGGException`), re-export from `exceptions/__init__.py`, and stack-trace-compatible third-party bases (`pa.ArrowInvalid`, `urllib3.exceptions.*`) go *after* `YGGException` in the bases so the C3 MRO keeps the yggdrasil root visible first; (3) do **not** define ad-hoc `class FooError(Exception):` in feature modules — promote it into `yggdrasil.exceptions` instead. **Raising shape**: prefer raising the *specific* subclass (`raise NotFoundError(...)`) over the generic root (`raise YGGException(...)`) so callers with narrower catches still match; include the same "what you passed / what was expected / what to try next" payload the rest of the project's error messages do (see the *Error messages must answer …* rule). **Re-raising from third-party SDK errors**: catch the vendor exception, translate to the matching `yggdrasil.exceptions` type, and `raise ... from exc` so the original cause stays on the traceback — this is what `from_urllib3(exc, request=..., response=...)` already does for urllib3 errors and what new integrations should mirror.
-- **Constructors are named `from_*`, not `parse` / `load` / `of` / `make`.** When implementing a class that needs alternative constructors, follow the project-wide convention used by `DataType`, `Field`, `URL`, `DatabricksPath`, `MimeType`, `ByteUnit`, `TimeUnit`, `Codec`, `Mode`, every `data.enums.*`, and the rest of the codebase: a single `from_(value: Any)` classmethod is the **generic dispatch** entry point (accepts whatever the caller has, routes by type to the specific constructor, returns the instance unchanged when handed one — the identity short-circuit), and the per-type constructors are `from_str(...)`, `from_bytes(...)`, `from_dict(...)`, `from_pandas(...)`, `from_arrow(...)`, `from_pytype(...)`, etc. Don't introduce `parse(...)` / `load(...)` / `of(...)` / `make(...)` / `create(...)` as parallel spellings — they fragment the surface and break the "I have an X, can I get a Y" reflex callers rely on across the library. If the input space is large enough to need dispatch, write `from_` + the per-type `from_X` siblings; if it's a single shape, just write the right `from_X`. Reserve `parse(...)` for *non*-constructor parsing helpers (e.g. parser functions that return a tree / dict / `ParsedDataType` token, not the class instance itself).
-- **Route lifecycle ops through the resource singleton's own method, not the raw SDK.** For Databricks resources, `Volume` / `Schema` / `Catalog` / `Table` / `Warehouse` / `Cluster` / `Job` / `Secret` / `WorkspaceFile` already expose `.create(...)` / `.delete(...)` / `.read_info(...)` / `.exists` / `.ensure_created(...)` wrapping the underlying SDK call with the project defaults (managed-volume-type, owner/comment normalization), the `_store_infos` cache warm-up, and `missing_ok` ergonomics. **From recovery / `_ensure_X` paths — even from inside the resource class itself — call `self.create(...)` / `self.delete(...)`, not `ws.volumes.create(...)` / `ws.schemas.create(...)`.** Grep the resource class for the method first; a private `_create_X = lambda: ws.X.create(...)` is the smell that you skipped this rule. If a knob is missing (`missing_ok=False` so AlreadyExists raises through, a different default), extend the existing method — don't fork it. Same rule for any resource class outside `databricks/` that exposes the create/read/delete trio.
-- **No Python `for` loops over data.** Row-by-row Python iteration over Arrow / Polars / pandas / Spark values is the single biggest performance trap in this codebase. Reach for vectorised primitives in this order before considering a loop:
-  1. **pyarrow.compute** kernels (`pc.cast`, `pc.if_else`, `pc.list_element`, `pc.binary_join_element_wise`, `pc.replace_substring_regex`, `pc.fill_null`, `pc.equal`, etc.) — these stay inside the C++ runtime and don't cross a Python frame per row.
-  2. **pyarrow.json / pyarrow.csv** vectorised readers when the workload is "decode N rows of `<format>` into a typed Arrow array" (see `_cast_json.py:_vectorized_parse_json`).
-  3. **Polars expressions** (`pl.col(...).str.json_decode`, `.str.contains`, `.cast`, `.list.eval`, `pl.when(...).then(...).otherwise(...)`) as the next-best vectorised fallback when pyarrow.compute doesn't cover the operation. Build a polars Series / LazyFrame, run the expression, hand the result back to Arrow via `.to_arrow()`.
-  4. **Numpy ufuncs** for numerical work where the data is already in a numpy-backed buffer.
-  - Only after those exhaust their coverage is a Python loop acceptable, and even then **only as a documented fallback path** (per-row-on-failure permissive decode, per-row-because-pyarrow-can't-emit-maps, etc.) — comment why the vectorised path doesn't cover the case and what the fallback's cost is.
-  - `array.to_pylist()` followed by a Python comprehension is the same trap with one less line — same rule applies. Look for a vectorised expression first; reach for `to_pylist` only when materialising into Python objects is the genuine endpoint (e.g. JSON encoding via `json.dumps`).
-  - The shape of an acceptable per-row fallback already exists at `_cast_json.py:_parse_via_python` (vectorised C++ NDJSON first, per-row only when that raises in permissive mode). Mirror that pattern; don't reinvent it.
-- **Never `to_pylist` / `to_list` / `tolist` heavy data.** `pa.Array.to_pylist`, `pl.Series.to_list`, `pd.Series.tolist`, and `np.ndarray.tolist` all walk every cell into a Python object — same per-row cost as a Python loop, just hidden in C. **Do not use them in cast helpers, frame converters, batch readers, type inference, or any hot transform path.** When you need to leave Arrow/Polars/pandas, use the engine's own zero-copy bridge:
-  - Arrow → pandas: `Array.to_pandas()` (struct cells surface as dicts, list cells as numpy arrays — the standard pyarrow → pandas mapping; no per-row hop).
-  - Arrow → polars: `pl.from_arrow(arr)` (zero-copy).
-  - Arrow → numpy (numeric only): `Array.to_numpy(zero_copy_only=True)`.
-  - Pandas → Arrow: `pa.array(series, from_pandas=True, type=...)` — pass the type so the C bridge skips inference.
-  - Polars → Arrow: `series.to_arrow()` (zero-copy).
-  - Pandas → Polars: `pl.from_pandas(df)`.
-  - Build a per-row Series of dicts from per-child arrays: `pa.StructArray.from_arrays(arrs, names=..., mask=...).to_pandas()` — one C-bridge pass, no row loop.
-  Three exemptions, *only* these, keep a `to_pylist` / `to_list` call: (1) documented per-row fallback for shapes vectorised engines genuinely can't emit (e.g. permissive `_cast_json` paths); (2) genuine row endpoints where the workload IS "yield Python rows to a downstream sink" — ndjson / xlsx writers, kafka producers, mongo inserts, JSON HTTP responses, `Tabular.to_pylist` / `iter_pylist` API methods, pickle one-shot serialization; (3) diagnostics — test assertion formatters, debug logging, `repr`. Anywhere else, the answer is "use the zero-copy bridge above." See `AGENTS.md` → "Never materialise heavy data via `to_pylist` / `to_list` / `tolist`" for the worked rules.
-- **Log shape: `<Verb> <ResourceNoun> %r (key=value, key=value, …)`.** Every log line in `yggdrasil.databricks.*` and the IO surface follows the same scannable shape: present-progressive verb for intent (`"Creating"`, `"Deleting"`, `"Starting"`, `"Listing"`) or past for completion (`"Created"`, `"Deleted"`, `"Started"`), then the resource noun (`"job"`, `"job run"`, `"cluster"`, `"warehouse"`, `"catalog"`, `"schema"`, `"table"`, `"volume"`, `"secret"`, `"context"`, `"workspace directory"`, `"DBFS directory"`), then the object via `%r`, then any metadata in `(key=value, …)` parens. Always name the resource noun even when the `__repr__` already encodes the type — `"Deleted job run %r"` reads cleanly in a wall of mixed lines; `"Deleted %r"` forces the reader to parse the repr to know what was deleted. **Lifecycle pairs**: `LOGGER.debug("Verbing <noun> %r (...)", self, …)` at start, `LOGGER.info("Verbed <noun> %r", self)` after the SDK call returns. Failures don't get a third log call — the re-raised exception / stacktrace carries the diagnostic. **Anti-patterns**: function-name prefixes (`"Catalog.schemas: listing …"`), bracketed call-site shorthand (`"Cache hit [Schemas.find] key=%s"`), ad-hoc pipe separators (`"Spark insert -> %s | mode=%s"`), platform-name redundancy (`"Creating Databricks job …"` — the logger name already says `databricks`), and bare-verb messages (`"Deleted %r"`).
-- **Prefer `%r` self-representation in logs with explicit simple texts.** Format objects through `%r` (their `__repr__`) — not `%s` / `str(...)` — in every `LOGGER.debug` / `LOGGER.info` / `LOGGER.warning` / `LOGGER.error` call. Long-lived objects (`DatabricksClient`, `DatabricksPath`, `Volume`, `Schema`, `Table`, `Session`, `URL`, `HTTPSession`, …) define `__repr__` to carry the full identity (`<VolumePath dbfs+volume://…>`, `DatabricksClient(host='…', auth_type='pat')`); `str(obj)` often collapses to an ambiguous path / hostname. Two exceptions: stdlib `logging` formatter slots (`%(asctime)s`, `%(levelname)s`) stay `%s`, and primitive values (`int`, `bool`, a URL string that's part of the message structure) read more naturally as `%s` than `%r`'s redundant quotes. Always lazy-interpolate (`LOGGER.debug("foo %r", obj)`, not f-strings) — the level guard exists to skip `repr()` on heavy objects when the level is disabled.
-- **Don't log cache hits at debug; do log misses / expiries / invalidations.** Hits are the steady-state success path — they fire on every read in tight loops and drown the rare interesting events. `if cached is not None: return cached` (silent); the `logger.debug("Cache expired for %r (age=%.0fs) — refreshing", …)` / `logger.debug("Fetching %r from remote", …)` branch is the one worth logging. Same rule for entity-tag caches, schema-info caches, warehouse caches, singleton caches.
-- **Drop `if logger.isEnabledFor(...)` around a single lazy-format call.** `logger.debug("…", obj)` already evaluates the format args lazily when the level is disabled — the guard only earns its keep when there's *real* pre-computation outside the call (materialising a generator into a list, building a summary dict). `if logger.isEnabledFor(logging.DEBUG): logger.debug("Deleting %r", self)` collapses to `logger.debug("Deleting %r", self)`; `if logger.isEnabledFor(logging.DEBUG): entries = list(entries); logger.debug("Listing %r -> %d entries", self, len(entries))` stays. See `AGENTS.md` → "Logging guidance" for the worked rules and examples.
-- **Use `yggdrasil.pickle.json` for JSON, not stdlib `json`.** `orjson` is a hard dependency; `yggdrasil.pickle.json` wraps it with the type coverage we use across the codebase (datetime/date/time/UUID/Path/Enum/dataclass/namedtuple/set/Mapping/bytes/Decimal). Same `loads / dumps / load / dump` surface, faster, fewer surprises with rich types. Drop down to `import orjson` directly only inside hot inner loops where you don't need any of the type coercions. Stdlib `import json` is reserved for: parsing third-party config where stdlib semantics are part of the contract, debug `print` formatting, and inside `yggdrasil.pickle.json` itself (which keeps stdlib as a fallback for option combos orjson can't express).
-- **Reach for the enums in `yggdrasil.data.enums` first.** Whenever a value belongs to a fixed token set — currencies, time units, byte sizes (`ByteUnit`), media types, MIME types, modes, codecs, geozones, timezones — use the enum's member or its `Enum.from_(...)` / `Enum.parse_size(...)` / `Enum.parse(...)` coercion at the API boundary instead of hand-rolling a dict, regex, alias table, or expression like `int(x) * 1024 * 1024` at the call site. Centralizing these tokens in an enum is how aliases, validation, formatting, and cross-engine mapping stay consistent across the codebase. If an enum is missing a member or alias the code legitimately needs, **add it to the enum** and have the caller route through it; do not branch around the enum with a one-off lookup. When introducing a new fixed-vocabulary concept, add a new enum to `yggdrasil.data.enums` (matching the `from_` / `parse*` / `is_valid` shape of the existing ones) instead of scattering string constants.
-- **Prefer top-level imports; reach for function-scope imports only when you have to.** The default is one `from yggdrasil.data.enums import Mode` at the top of the module. Function-scope (`def foo(): from yggdrasil.x import Y`) is reserved for: (1) breaking a real circular import that can't be fixed by reshaping the modules, (2) optional-dependency guards that already live in a `lib.py` (`polars`, `pandas`, `spark`, `databricks`, `blake3`, `xxhash`, …), (3) `TYPE_CHECKING`-only types where a runtime import would be pure cost. Everywhere else, hoist the import. Function-scope imports make call sites noisier, hide the module's real dependency graph from readers and tooling, and pay an attribute-lookup cost on every call. If you find yourself reaching for one, first try moving the import to the top of the file and check what actually breaks.
-- **Benchmark-driven optimization — measure, don't guess.** Performance changes go through `python/benchmarks/`, organized to mirror the source tree (`benchmarks/data/`, `benchmarks/io/primitive/`, `benchmarks/io/path/`, …). For *any* "I think this is slow" or "this would be faster" change: (1) find or add the bench first — write the scenario into the matching `benchmarks/<module>/bench_<name>.py` if it doesn't already cover the call shape; (2) capture the baseline with `python benchmarks/<file>.py --repeat 5` against the pre-change tree; (3) apply one conceptual change at a time; (4) re-run the same bench and quote `best` + `median` before / after; (5) run `python benchmarks/run_all.py --repeat 3` to confirm the rest of the suite didn't regress — optimizations frequently trade off, so show the surrounding numbers; (6) put the before / after in the commit body so the next reader knows which numbers are load-bearing. "Felt faster" doesn't ship — quoted numbers do. When the bench is missing for the hot path you're touching, **adding the bench counts as part of the change**. See `AGENTS.md` → "Benchmark-driven optimization" for the worked rules.
-- **Keep diffs small and reuse-heavy.** Prefer a small edit to an existing function over a new module. Don't add parameters, branches, classes, or files "in case we need them later" — add them when a real caller needs them. Three nearly-identical lines is fine; a premature base class is not.
-- **No dead or isolated code.** Every new function, class, option, file, or test must be reachable from a real caller in the same change. No helpers defined but never called, no flags never read, no new files that only re-export existing names, no speculative branches for inputs the public API doesn't accept. If nothing uses it yet, delete it or wait for the caller.
-- **Be forgiving on input, strict on meaning.** Accept the shapes a real caller has (type hints, strings, dict payloads, framework objects, things with `.schema`/`.type`/`.arrow_schema`). But fail loudly on *conflicting* arguments — don't silently pick a side.
-- **Fail fast on remote resources; retry the real call, don't pre-check it.** Every call to a remote system (HTTP, Databricks Files / SQL / Workspace, S3, MongoDB, Spark cluster, …) costs latency and quota. Do the operation and handle the error — don't gate `download` / `upload` / `delete` / `read_bytes` / `iterdir` on a preceding `exists()` / `stat()` / `get_metadata()` / `HEAD` probe. The probe doubles the round trip, races concurrent writers, and lies under eventual consistency; catch `NotFound` / `404` / `FileNotFoundError` from the real call instead. Wrap the operation in the existing retry policy (`retry_sdk_call`, `_call`, `_call_ensuring_parents`, the HTTP send retry config) to absorb transient 5xx / throttling / connect timeouts; let deterministic errors (`NotFound`, `AlreadyExists`, `PermissionDenied`, stable `BadRequest`) propagate immediately. Reuse the existing stat / metadata caches (`RemotePath._STAT_CACHE`) instead of re-issuing the call, and invalidate them after mutations (`_invalidate_stat_cache`). Default round-trip budget for a new op: **one** for the intended action plus at most one parent-recovery retry — count and justify any more. See `AGENTS.md` → "Fail fast on remote resources" for the worked rules.
-- **Preserve schema intent across boundaries.** Field names, order, nullability, metadata, nested structure, precision/scale, timezone intent are part of the user contract. Don't drop them unless the API documents the loss.
-- **Error messages must answer: what you passed, what was expected, valid values, what to try next.** Suggest near matches on typos when practical. See `AGENTS.md` for worked examples and tone (blunt, helpful, lightly conversational — no slang/emoji/meme formatting).
-- **Comments describe weirdness, not syntax.** Version quirks, engine edge cases, schema invariants, compatibility hacks — yes. `# loop through fields` — no.
-- **Type hints must match runtime.** If a method can return `None`, annotate `| None`.
-- **Keyword-only arguments** are preferred for ambiguous options.
-- **Fetch online documentation when third-party behaviour is in question.** When a fix or integration turns on the contract of an external SDK / HTTP API / cloud service (Databricks, Spark, MongoDB, Polars, pandas, FastAPI, Power Query, etc.), reach for `WebSearch` / `WebFetch` (or the relevant MCP doc-fetch tool) and read the vendor docs / SDK reference / GitHub source before guessing. Treat the official docs and the SDK's own source as the source of truth — quote the relevant signature, default, or error string in the commit message or PR body so the next reader can verify. This is explicitly allowed and encouraged; do not hand-wave around an unfamiliar API surface.
-- **Use `...` (Ellipsis) as the unset / missing sentinel.** When you need to distinguish "caller didn't pass this" from "caller passed `None`" — keyword defaults, `dict.get(key, ...)` to tell missing from `None`, lazy-init cache slots — reach for the built-in `...` singleton instead of a private `_UNSET = object()` / `_MISSING = object()` per module. Reads cleanly (`if cached is not ...:`), avoids per-module sentinel proliferation, and is a real singleton across pickle boundaries. Only allocate a private sentinel when `...` is itself a legitimate value in the domain.
-- **Reach for `yggdrasil.dataclasses.ExpiringDict` for any concurrent or expiring key→value cache.** Whenever you find yourself writing a module-level / class-level dict that needs (a) thread-safe `get` / `set` / `get_or_set`, (b) per-key TTL, capacity-bound eviction, or background expiry, or (c) an `on_evict` hook so values that own external resources (file handles, spilled buffers, GPU memory) get released deterministically — use `ExpiringDict` instead of pairing a bare `dict` with a `threading.Lock` and a hand-rolled expiry sweep. It already owns its `RLock`, exposes atomic `get_or_set` / `set_many` / `update` / `pop` / `clear` / `purge_expired`, pickles cleanly (live entries only; lock and callbacks are recreated on load), and is the same primitive every Databricks SDK / SQL / warehouse cache uses (`databricks/sql/{schemas,tables,views,catalogs}.py`, `databricks/warehouse/service.py`, `MSALAuth._INSTANCES`). Pass `default_ttl=None` for "live for the process lifetime" singleton caches (e.g. `_INSTANCES`), seconds/`timedelta` for time-bound entries, `max_size` for bounded caches, and `on_evict` when values need to release something on the way out. Do not introduce a new `dict + Lock + sweep` triple — extend `ExpiringDict` (or the call site's `default_ttl` / `max_size` / callbacks) instead.
-- **Make every long-lived object picklable + hashable + singleton-by-config.** Configs / clients / sessions / services / paths / schemas all cross pickle boundaries (Spark workers, multiprocessing, FastAPI forks, Power Query bridges) and end up as dict keys / set members / `groupBy` keys. The standard pattern, used by `yggdrasil.io.session.Session` and `yggdrasil.aws.AWSClient`:
-  - Pure-data configs are `@dataclass(unsafe_hash=True)` with `compare=False, hash=False, repr=False` on unhashable members (callables, live handles).
-  - Live "client/session/service" classes cache instances per `(cls, config)` in a class-level `_INSTANCES` dict via `__new__`; `__init__` is idempotent (`if getattr(self, "_initialized", False): return`); `__getnewargs__` returns the cache key so in-process unpickle collapses to the live singleton.
-  - Generic `__getstate__`/`__setstate__`: list non-picklable handles in `_TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]]`; `__getstate__` filters them out of `__dict__`; `__setstate__` short-circuits when the singleton is already initialized, otherwise restores `__dict__` and re-inits the transient slots to their fresh defaults. Subclasses extend `_TRANSIENT_STATE_ATTRS` with `Base._TRANSIENT_STATE_ATTRS | frozenset({...})` and chain `__setstate__` to super.
-  - Hash + equality follow `(type(self), config)`, not `id(self)`.
-  - Every new such class ships at least: same-config-same-instance, idempotent `__init__`, in-process pickle preserves singleton, cross-process pickle (`Cls._INSTANCES.clear()` then unpickle) rebuilds transients, `_TRANSIENT_STATE_ATTRS` actually keeps live handles out of the payload. See `AGENTS.md` → "Make objects picklable and hashable by default" for the full pattern and worked example.
-- **Hold live objects internally, dump URL strings on serialisation.** When a record describes "the X to operate on" (a `DatabricksPath`, a `URL`, a `Table`, a `Schema`, an `HTTPSession`), keep the live object on the instance — it's singleton-cached, carries its bound client, and is what tests / IDE inspection want. Don't pre-stringify into the field and force every consumer to coerce back via `from_(...)`. On every serialisation boundary do the inverse: `to_dict` / `to_json_bytes` / `__getstate__` project path-shaped fields through `_path_for_sql(...)` (or `str(obj.url)`), the on-disk JSON format stays a plain string the receiver loads without importing the path class, and downstream readers rehydrate lazily via `DatabricksPath.from_(...)` (which short-circuits when handed a live path). `AsyncInsert` (`databricks/table/async_write.py`) is the worked example — `parquet_paths` / `metadata_paths` carry live `VolumePath` objects post-`stage_async_insert`, but serialisation always emits URL strings. See `AGENTS.md` → "Make objects picklable" rule 7.
+## File Structure
 
-## Data layout: `raw_` + curated, schema-per-source, ISO joins
-
-- **One schema per data source.** `<catalog>.<source>.raw_<entity>` for landed source-shaped rows; `<catalog>.<source>.<entity>` for the curated layer; `<catalog>.<source>._meta.*` for vendor-specific lookups; **shared `<catalog>.iso.*`** dimensions (currency, country, exchange, timezone, EIC) for cross-source joins. Don't combine two sources in one schema even when "they look similar" — schemas are free.
-- **`raw_<entity>` carries provenance.** Add `_ingested_at: timestamp("UTC")`, `_source: string`, `_source_url: string`, `_payload_hash: string` (xxhash64), `_batch_id: string` as standard columns on every raw landing. Idempotency keys are `(<source_natural_id>, _ingested_at)`. `yggdrasil.io.response.RESPONSE_SCHEMA` is the canonical shape when the source is an HTTP response landed verbatim.
-- **`Field` metadata drives DDL.** `tags={"primary_key": True}` → inline `CONSTRAINT pk_<table>_<cols> PRIMARY KEY(...) RELY`; `tags={"foreign_key": True}` + `metadata={"references": "cat.sch.tbl(col)"}` → post-create via `databricks.constraints.TableConstraints`; `tags={"partition_by": True}` / `"cluster_by"` land on the matching DDL clauses. Don't hand-write `CREATE TABLE` SQL when `Schema.from_fields([...])` + `Table.ensure_created(schema=...)` produces the same DDL.
-- **Curated standardisation rules.** Timestamps → `<col>_utc` + `DataType.timestamp("UTC")` (no string timestamps); money → `decimal(18, 2)` (never `float64`); FX → `decimal(18, 8)`; counts → `int32`; ISO codes column-named `<concept>_<standard>` (`currency_iso` = ISO 4217, `country_iso` = ISO 3166-1 alpha-2, `region_iso` = 3166-2, `language_iso` = 639-1, `timezone_iana`, `mic_iso` = ISO 10383, `eic_code` = ENTSO-E). Cross-source joins **must** route through `<catalog>.iso.*` instead of vendor A's column joining vendor B's.
-- **Geographic data is always renderable.** Any curated table with a location reference carries `lat: float64 [-90, 90]` + `lon: float64 [-180, 180]` (WGS84) so frontends and map plugins (kepler.gl, pydeck, folium, Databricks SQL geo visual) can plot rows without a second lookup. Two equivalent shapes are supported and the call site picks: **flat columns** (`lat` / `lon` at the top level) when the row has one location, **`geo_point("name")`** (`yggdrasil.data.geo_point` / `yggdrasil.data.GEO_POINT_TYPE`) when the row has multiple locations (`origin` / `destination`) or a downstream sink speaks the `{"lat": …, "lon": …}` shape natively. `GEO_POINT_TYPE` is the canonical `StructType(lat: float64 not-null, lon: float64 not-null)` singleton — same instance reused across every `geo_point()` call so the cast registry hits its exact-match fast path. `is_geo_point_type(dtype)` matches the shape downstream. Zone / region shapes also carry `boundary_geojson: string` (a GeoJSON `Feature` / `FeatureCollection`); tracks / time-series of positions use `points: list<struct<lat, lon, observation_utc>>`. Resolve at curate time via `yggdrasil.data.enums.geozone.GeoZoneCatalog` (every `GeoZone` already carries `lat` / `lon` / `country_iso` / `eic`); the `<catalog>.iso.*` shared dims (`country`, `region`, `exchange`, `bidding_zone`, …) all ship the geo columns so FK joins inherit them for free. Don't store WGS84 coords as `decimal` — geo libraries expect `float64`.
-- **Prefer hard table splits over MERGE contention.** When a source has a stable shardable dimension (per-symbol, per-tenant, per-day, per-month), land each shard in its own `raw_<entity>_<shard>` table (`raw_ohlcv_cl` / `raw_ohlcv_ng`, `raw_orders_tenant_a` / `raw_orders_tenant_b`, `raw_events_2026_05` / `raw_events_2026_06`). Each split owns its own Delta commit lock — concurrent ingestion jobs never fight, parallel fan-out is the schedule (one Job task per shard) rather than a write coordinator, and a poison batch corrupts one shard not the whole entity. Reach for the split when concurrent writers exist, when `MERGE` shows Delta concurrency-conflict exceptions in the job log, or when one entity dominates volume by > 10×. The curated + `dash_*` layers stay un-sharded — the `UNION ALL` runs once at curate time so consumers see one table.
-- **Pick compute by workload type.** Ingestion that talks to the public internet (HTTP APIs, S3 / GCS / Azure, vendor SFTP, webhooks) goes on a **multi-node custom all-purpose cluster** with `ygg[data,databricks,http]` preinstalled — Databricks serverless compute has no outbound internet egress on most workspaces, and **multi-node is the default for API ingestion** so outbound requests spread across N worker IPs behind the workspace NAT (per-IP rate limits hit N× later; a single noisy worker doesn't poison the whole feed). Default shape is `num_workers >= 2` (or autoscale with a small floor); single-node ingestion is only correct for very-low-volume sources or per-account (not per-IP) quotas. To actually realise the IP spread, drive the fetch in parallel (one `JobTask` per shard, or `foreachPartition` / `mapInPandas` over a request frame, or `yggdrasil.concurrent` helpers) — a multi-node cluster behind a single-threaded loop wastes the worker IPs. Internal pipelines (curated rebuilds, `dash_*` refreshes, ML training on UC data, anything that touches only Unity Catalog + Delta) stay on **serverless** (`environment_key=DEFAULT_ENVIRONMENT_KEY`) — fast cold start, `ygg` is provisioned via `JobTask.from_callable`'s AST-walked dependency resolution. The cluster pin is per-task: one multi-task Job ends up with one classic ingestion task and N serverless downstream tasks. Heavy / GPU ML training uses a sized job cluster (one-shot, deletes itself).
-- **Business-display layer (`dash_*`).** The ingestion pipeline ends with consumer-facing `dash_<view>` tables / views in the same `<catalog>.<source>.*` schema — wide, denormalised, pre-aggregated for BI tools and dashboards. Read-only contract: pipeline-driven refresh, no analyst writes. Time-series get pre-rolled time buckets (`dash_ohlcv_5m`, `dash_ohlcv_1h`) with the bucket size in the table name. Long → wide pivots use portable `MAX(CASE WHEN …)` (not `PIVOT (…)`) with stable kebab-case entity labels (`price_fr`, not `price_10YFR-RTE------C`). Geo-display tables inline `geo_point` + `boundary_geojson` so map plugins render without joining the shared dims. KPI tiles land in a stable `(kpi: string, value, unit, computed_at_utc)` row-per-KPI shape. Refresh runs as a downstream task on the same Job DAG (`depends_on=["curate"]`). Materialise as a table when joins / windows are expensive; keep as a view when standardisation is renames + casts.
-
-## HTTP ingestion: build the session you need, don't fit through one
-
-- **Build your own `HTTPSession` subclass / resource service when an integration needs one.** The library ships the transport primitives (`HTTPSession`, `PreparedRequest`, `Response`, `SendConfig` / `SendManyConfig`, `_TieredRetry`, `CacheConfig`) and the Databricks resource singletons (`Schema`, `Table`, `Volume`, `Warehouse`, `Cluster`, `Job`, …). Application / integration code is **expected** to subclass / compose these into the session, service, or resource class that fits its API contract — per-vendor auth handler, per-API cache layout, per-API time-window snap, per-API pagination quirk, per-API rate-limit policy. Do not try to fit every vendor through one mega-class with N feature flags; one small subclass per source is the correct shape. Follow the established patterns: hashable + picklable singleton (rule 18), `_attach_cache` for cache-config stamping, `prepare_request_before_send` for header / auth / signing, override `_local_send` only for transport swaps. Land the subclass next to the integration that uses it (`yggdrasil.<source>.session`, `yggdrasil.<source>.client`), not in shared infrastructure — moves it up to a shared module only after a **second** real caller appears.
-- **Persistent failures must not break the pipeline.** `_TieredRetry` (`python/src/yggdrasil/http_/session.py`) already gives 429 / 5xx a status-aware backoff and respects `Retry-After`. For failures that outlast the retry budget, send with `raise_error=False` and inspect the returned `Response`; surface alerts (SMTP, Slack, PagerDuty) through the integration's own notification path. Alerting belongs in the integration that owns the data contract, not in the shared transport.
-- **Standardise the way each vendor's data is fetched so the cache is reusable.** Within one application / source, every call to the same API must produce the same URL when the underlying data is the same. Snap time-range query params onto a grid (`?start=10:23&end=10:38` → `?start=10:00&end=11:00`), pick *one* canonical date format (`YYYY-MM-DDTHH:MM:SSZ`, always UTC, no `+00:00` ↔ `Z` flips), sort multi-valued params (`URL.with_query_items(..., sort_keys=True)`), pick *one* spelling per param (`startTime` xor `start_time`, not both at random call sites), and route every fetch through the same session subclass so a small URL drift can't bypass the cache. The Delta / disk cache key is a hash of the URL — undisciplined fetching means every call is a cache miss. The session subclass is the single place this normalisation lives; the call sites stay short.
-- **Don't keep evolutionary scaffolding in the library.** Temporary helpers, half-finished services, "we might need this later" wrappers, and integration-specific glue that grew during a project don't belong in `yggdrasil`. If a class only has one caller and that caller would be simpler with the body inlined, inline it. If a module hosts behavior only one downstream project uses, ship it in that project. The library carries the *primitives every integration needs*, not the bespoke layering each integration built on top. When in doubt, delete and let the next agent rebuild the thin layer they actually need; rebuilding is cheap, carrying dead surface is not.
-
-## ML / MLOps conventions
-
-- **Models train on curated tables, never `raw_`.** Standardisation is the model's input contract; raw drift = silent training drift.
-- **Per-task artifact schema.** Each modelled task `<task>` lands three tables in `<catalog>.<source>.ml_<task>_*`:
-    - `ml_<task>_features` — keyed `(entity_id, observation_utc, feature_set_version)`, holds a nested `features` struct + `label` + `label_horizon_iso`.
-    - `ml_<task>_predictions` — keyed `(entity_id, observation_utc, predicted_at_utc)`, holds `model_uri`, `prediction`, optional `prediction_lower/upper`, `confidence`.
-    - `ml_<task>_runs` — keyed by MLflow `run_id`, mirrors run metadata so analysts can join on `run_id` without the MLflow API.
-- **Use Unity Catalog model registry**, not workspace-scoped. `mlflow.set_tracking_uri("databricks")` + `mlflow.set_registry_uri("databricks-uc")`; model name is a three-part UC identifier (`<catalog>.<source>.<model>`). UC's alias model (`@champion` / `@challenger`) replaces the deprecated `Staging` / `Production` stages.
-- **No `yggdrasil.databricks.mlops` service yet.** Until a dedicated service ships, training callables go through `mlflow.*` directly + `DatabricksClient.sql / .tables` for the artifact tables, scheduled via `dbc.jobs.create_or_update(...)` + `Job.pytask(train_func, ...)`. The conventions above are the contract a future service will implement.
-
-## Databricks scripting with `Dataset` (SparkTabular)
-
-`Dataset` (`yggdrasil.spark.tabular.Dataset`, aliased as `SparkTabular`) is the canonical surface for distributed scripting on Databricks. It wraps a Spark DataFrame with yggdrasil schema awareness, executor-side module shipping, and a rich transform API (`map`, `apply`, `filter`, `parallelize`, `cast`, `explode`). Prefer `Dataset` over raw `pyspark.sql.DataFrame` manipulation — it handles pickle/Arrow bridging, dependency auto-install on executors, and schema casting transparently.
-
-### Quick-start patterns
-
-```python
-from yggdrasil.databricks import DatabricksClient
-
-dbc = DatabricksClient()
-
-# Read from SQL or table name — auto-detected
-ds = dbc.dataset("SELECT * FROM main.sales.orders")
-ds = dbc.dataset("main.sales.orders")
-
-# Distribute a function over inputs via Spark executors
-results = dbc.parallelize(fetch_data, urls, schema=output_schema)
-
-# Transform chain → write back to Delta
-(dbc.dataset("main.raw.events")
- .map(transform)
- .filter(lambda row: row["status"] == "active")
- .to_table("main.curated.events"))
-
-# Direct Dataset construction (no DatabricksClient needed)
-from yggdrasil.spark.tabular import Dataset
-
-ds = Dataset.from_sql("SELECT 1", spark_session=spark)
-ds = Dataset.from_table("main.sales.orders", spark_session=spark)
-ds = Dataset.from_iterable([{"a": 1}, {"a": 2}], schema=my_schema, spark_session=spark)
-ds = Dataset.parallelize(fn, inputs, schema=output, spark_session=spark)
-ds.to_table("main.out.result", mode="overwrite")
+```
+src/
+├── app/
+│   ├── api/           # Next.js API routes
+│   │   ├── health/
+│   │   ├── config/
+│   │   └── cache/
+│   ├── bot/           # Bot control dashboard (with sidebar)
+│   │   ├── layout.tsx # Sidebar wrapper
+│   │   ├── page.tsx   # Dashboard
+│   │   ├── execute/   # Code execution
+│   │   └── chat/      # Messaging
+│   ├── layout.tsx     # Root layout (minimal)
+│   ├── page.tsx       # Welcome/landing page (animated tree, constellations)
+│   └── globals.css
+├── components/
+│   ├── logo.tsx       # AnimatedYggdrasilTree, YggdrasilLogo, YggdrasilBrand
+│   └── sidebar.tsx    # Bot dashboard sidebar
+└── lib/
+    ├── api.ts         # Frontend API client (both backends)
+    ├── bot-client.ts  # Server-side bot API client
+    └── utils.ts       # Shared utilities
 ```
 
-### Key `Dataset` methods
+## Route Structure
 
-| Method | Purpose |
-| --- | --- |
-| `from_sql(text)` | Execute SQL, wrap result |
-| `from_table(name)` | Read table by fully-qualified name |
-| `from_spark_frame(df, schema)` | Wrap an existing Spark DataFrame |
-| `from_iterable(items, schema)` | Build from Python objects |
-| `parallelize(fn, inputs, schema)` | Distribute function over inputs via `mapInArrow` |
-| `map(fn, schema)` | 1:1 row transform |
-| `apply(fn, schema)` | Map with batch-level vectorisation |
-| `filter(predicate)` | Row filter (callable or SQL expression) |
-| `cast(schema)` | Re-cast to a new schema |
-| `explode(schema)` | Flatten iterables into rows |
-| `to_table(name, mode, format)` | Write to Delta table |
-| `toArrow()` / `toPandas()` / `toPolars()` | Collect to driver |
-| `collect()` / `to_local_iterator()` | Collect as Python objects |
-| `persist()` / `unpersist()` | Executor cache management |
-| `infer_schema()` | Infer yggdrasil Schema from row contents |
+| Route | Description |
+|-------|-------------|
+| `/` | Welcome landing page with animated tree and service constellation |
+| `/bot` | Bot dashboard - node overview, stats |
+| `/bot/execute` | Python/shell code execution |
+| `/bot/chat` | Real-time messaging channels |
+| `/trading` | Trading service (coming soon) |
+| `/data` | Data streams service (coming soon) |
+| `/agents` | AI Agents service (coming soon) |
 
-### `DatabricksClient` surface
+## Services Constellation
 
-`DatabricksClient` exposes two direct `Dataset` methods that resolve the Spark session via Databricks Connect automatically:
+The welcome page displays services as a "constellation" - interconnected nodes representing different Yggdrasil capabilities:
 
-- **`dbc.dataset(sql_or_table, schema=None)`** — returns a `Dataset`. Auto-detects SQL vs table name.
-- **`dbc.parallelize(fn, inputs, schema=None)`** — returns a `Dataset`. Distributes `fn` across Spark executors.
+1. **Bot Control** (`/bot`) - Active, the main dashboard
+2. **Trading** - Coming soon, market data & execution
+3. **Data Streams** - Coming soon, real-time feeds & analytics
+4. **AI Agents** - Coming soon, autonomous workflows
 
-Both use `dbc.spark()` for session resolution (reuses active session in notebooks / jobs; creates Databricks Connect session otherwise).
+To add a new service:
+1. Add to `SERVICES` array in `src/app/page.tsx`
+2. Add connections in `CONNECTIONS` array
+3. Create route at `src/app/[service-name]/`
+4. Set `comingSoon: false` when ready
 
-### `SQLEngine` surface
+## WebGL & 3D Rendering Guidelines
 
-`dbc.sql` also exposes `dataset()` and `parallelize()` with the same signatures. Use `dbc.sql` when you need the full engine (warehouse fallback, execute/execute_many, table CRUD).
+This project uses **React Three Fiber (R3F)** for WebGL-powered 3D visualizations.
 
-### Dynamic vs typed mode
+### Dependencies
+- `@react-three/fiber` - React renderer for Three.js
+- `@react-three/drei` - Useful helpers (OrbitControls, Html, etc.)
+- `three` - Core Three.js library
 
-- **Dynamic** (`schema=None`) — rows are arbitrary pickled Python objects. Transforms see unpickled inner objects. Good for heterogeneous data or when the output shape isn't known ahead of time.
-- **Typed** (`schema=<Schema>`) — the underlying Spark frame matches the schema. Transforms receive row-dicts and outputs are cast through `mapInArrow`. Always prefer typed when the schema is known — it avoids the pickle round-trip and enables vectorised batch processing.
+### When to Use WebGL
+- **Globe/Map visualizations** - Network topology, node locations worldwide
+- **Data visualizations** - 3D charts, real-time metrics
+- **Hero animations** - Landing page eye-candy, branded experiences
+- **Interactive dashboards** - When 2D charts aren't sufficient
 
-### Executor dependency shipping
+### Globe Pattern (globe.gl style)
+The welcome page features an interactive 3D globe. Key patterns:
 
-`Dataset` auto-ships `yggdrasil` and any modules referenced by the user function to Spark executors via `addArtifacts`. The `installed_modules` set tracks what's been shipped per frame lineage so a chain like `ds.map(f).map(g).filter(h)` only installs each module once.
+```tsx
+import { Canvas, useFrame } from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import * as THREE from "three";
 
-### Workflow integration
+// Dark globe with wireframe graticule
+<mesh>
+  <sphereGeometry args={[1.98, 64, 64]} />
+  <meshStandardMaterial color="#0a0a10" />
+</mesh>
+<lineSegments>
+  <wireframeGeometry args={[new THREE.SphereGeometry(2, 24, 18)]} />
+  <lineBasicMaterial color="#1e1e2a" transparent opacity={0.6} />
+</lineSegments>
 
-For scheduled pipelines, combine `Dataset` with the `@task` / `@flow` workflow decorators:
+// Atmospheric glow (BackSide rendering)
+<mesh>
+  <sphereGeometry args={[2.08, 64, 64]} />
+  <meshBasicMaterial color="#f26b3a" transparent opacity={0.03} side={THREE.BackSide} />
+</mesh>
 
-```python
-from yggdrasil.databricks.workflow import flow, task
-
-@task
-def ingest(date: str) -> str:
-    dbc = DatabricksClient()
-    (dbc.dataset(f"SELECT * FROM vendor.raw WHERE date = '{date}'")
-     .map(clean)
-     .to_table(f"main.curated.events"))
-    return "main.curated.events"
-
-@flow(name="daily-ingest", schedule="0 2 * * *")
-def daily(date: str = "2025-01-01"):
-    ingest(date)
+// Node markers at lat/lng positions
+function latLngToVector3(lat: number, lng: number, radius: number) {
+  const phi = (90 - lat) * (Math.PI / 180);
+  const theta = (lng + 180) * (Math.PI / 180);
+  return new THREE.Vector3(
+    -radius * Math.sin(phi) * Math.cos(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.sin(theta)
+  );
+}
 ```
 
-## Release & CI
+### Performance Best Practices
+1. **Use `useFrame` sparingly** - Only for animations that need per-frame updates
+2. **Memoize geometries** - Use `useMemo` for complex geometry calculations
+3. **Limit draw calls** - Batch similar objects, use instanced meshes for many items
+4. **Dispose resources** - Clean up geometries/materials in useEffect cleanup
+5. **Use `<Html>` for UI overlays** - Don't render DOM in 3D unless needed
 
-- Version is the single source of truth in `python/pyproject.toml`. `.github/workflows/publish.yml` reads it, checks PyPI, and on `main` pushes that touch `python/src/**`, `pyproject.toml`, README, or LICENSE, it builds the sdist + pure-Python wheel and publishes `ygg`, then tags `vX.Y.Z` and cuts a GitHub Release.
-- `.github/workflows/docs.yml` publishes the MkDocs site to GitHub Pages (`https://platob.github.io/Yggdrasil/`).
-- Do not push to `main` directly from an agent session — develop on the branch you were given and open a PR only when the user asks.
-- **Cleanup-previous-release convention.** `publish.yml` removes the previous release when either (a) any commit on the push carries the literal token `!cleanup-prev-release` (opt-in, cross-minor — for shipping a broken release off the index), or (b) the new version is a patch bump of the previous tag (same `MAJOR.MINOR`, e.g. `1.2.3 → 1.2.4`; `1.2.5 → 1.3.0` does not trigger it). The previous tag is the highest semver `v*` tag below the new version; the job deletes its git tag + GitHub Release after the new release lands. PyPI yanking is *not* automated (no public API): the workflow summary surfaces the `pypi.org/manage/...` link so the maintainer can yank in one click.
+### Canvas Setup
+```tsx
+<Canvas
+  camera={{ position: [0, 0, 5], fov: 45 }}
+  gl={{ antialias: true, alpha: true }}
+  style={{ background: "transparent" }}
+>
+  <ambientLight intensity={0.4} />
+  <pointLight position={[10, 10, 10]} intensity={0.6} />
+  <OrbitControls 
+    enablePan={false}
+    minDistance={3}
+    maxDistance={8}
+    autoRotate
+    autoRotateSpeed={0.3}
+  />
+  {/* Scene content */}
+</Canvas>
+```
+
+### Color Palette for 3D
+- Globe surface: `#0a0a10` (near-black)
+- Wireframe/grid: `#1e1e2a` (dark grey)
+- Nodes online: `#4ade80` (green)
+- Nodes pending: `#fbbf24` (yellow)
+- Nodes offline: `#ef4444` (red)
+- Arcs/connections: `#f26b3a` (primary orange)
+- Atmosphere glow: `#f26b3a` at low opacity
+
+## Feature Implementation Checklist
+
+When adding a new feature:
+
+- [ ] Determine which backend handles it (see "When to Use" above)
+- [ ] If Next.js: create route in `src/app/api/`
+- [ ] If Bot proxy: ensure rewrite exists in `next.config.ts`
+- [ ] Update `src/lib/api.ts` with typed client function
+- [ ] Add TypeScript interfaces for request/response
+- [ ] Handle errors with proper status codes
+- [ ] Add loading states in UI
+
+## Current Bot API Endpoints (FastAPI)
+
+These are proxied via `/api/bot/*`:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/hello` | GET | Node info, uptime, version |
+| `/api/python` | POST | Execute Python code |
+| `/api/cmd` | POST | Execute shell command |
+| `/api/messenger` | POST | Send message |
+| `/api/messenger/channels` | GET/POST | List/create channels |
+| `/api/messenger/channels/{name}/messages` | GET | Get channel messages |
+| `/api/messenger/channels/{name}/poll` | GET | Long-poll for new messages |
+| `/api/call/registry` | GET | List registered @remote functions |
+| `/api/call/{function}` | POST | Call a remote function |
