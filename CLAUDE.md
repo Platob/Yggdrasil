@@ -22,10 +22,12 @@ python/src/yggdrasil/
     schemas/            Pydantic models
     geo.py              IP geolocation
     ids.py              Int64 ID generation (xxhash)
+    fn.py               @function decorator framework
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
   databricks/           Databricks SDK integrations
 next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
+  src/lib/time.ts       Java-style time utilities (Instant, ZonedDateTime, Duration)
 ```
 
 ## Node API
@@ -63,22 +65,31 @@ next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
 | `/node/execute` | Direct code execution |
 | `/msg` | Messaging channels |
 
-## ID System
+## Python Decorator Framework
 
 ```python
-from yggdrasil.node.ids import make_id, make_id_pair
-func_id = make_id("my_function")      # xxh32("my_function") << 32 | timestamp_ms
-run_id = make_id(f"{func_id}:{now}")   # unique per execution
-pair = make_id_pair("node_a", "func_b") # two concepts combined
+from yggdrasil.node.fn import function, dag
+
+@function
+def process(data: list) -> dict:
+    import pandas as pd
+    return {"count": len(data)}
+
+# Call like a normal function — returns FunctionRun (Future-like)
+run = process([1, 2, 3])
+result = run.wait()          # block until done
+result = run.wait(wait=10)   # timeout after 10s (uses WaitingConfig)
+
+# Target a specific environment or remote node
+run = process.with_env("ml-env")([1, 2, 3])
+run = process.on("http://node-2:8100")([1, 2, 3])
+
+# DAG chaining with >> operator
+pipeline = dag("etl", extract >> transform >> load)
+run = pipeline()
 ```
 
-## Execution Model
-
-```
-node:function + node:environment + args → node:run
-```
-
-Functions run in a subprocess using the linked environment's Python. Runs stream logs via SSE. DAGs chain function runs across nodes, passing outputs as inputs.
+The `@function` decorator infers: name, source code, dependencies (AST), python version. `FunctionRun` integrates with `WaitingConfig`, `State` enum, and polls the node API.
 
 ## CLI
 
