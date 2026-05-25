@@ -224,3 +224,4 @@ __marimo__/
 .next/
 out/
 node_modules/
+tsconfig.tsbuildinfo
