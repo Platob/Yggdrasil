@@ -459,16 +459,20 @@ class CacheConfig(_ConfigBase):
         return self.mode in (Mode.APPEND, Mode.AUTO)
 
     @property
-    def cache_enabled(self):
+    def cache_write_enabled(self):
         return self.mode != Mode.IGNORE
 
     @property
+    def cache_enabled(self):
+        return self.cache_write_enabled
+
+    @property
     def local_cache_enabled(self):
-        return self.cache_enabled
+        return self.cache_write_enabled
 
     @property
     def remote_cache_enabled(self):
-        if not self.cache_enabled:
+        if not self.cache_write_enabled:
             return False
         return self.tabular is not None
 
