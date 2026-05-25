@@ -518,12 +518,63 @@ class GenieCLI(DatabricksCLI):
         except KeyboardInterrupt:
             self.warn("  interrupted.")
             return
-        except Exception as exc:  # surface SDK / auth / 4xx errors cleanly
+        except ValueError as exc:
+            if "auto-pick" in str(exc) and self._prompt_space():
+                self.ask(question)
+                return
+            self.error(f"  error: {exc}")
+            LOGGER.debug("ask failed", exc_info=True)
+            return
+        except Exception as exc:
             self.error(f"  error: {type(exc).__name__}: {exc}")
             LOGGER.debug("ask failed", exc_info=True)
             return
         self.conversation_id = answer.conversation_id or self.conversation_id
         self._render_answer(answer)
+
+    def _prompt_space(self) -> bool:
+        """List available Genie spaces and let the user pick one."""
+        try:
+            spaces = list(self.genie.list_spaces())
+        except Exception:
+            spaces = []
+
+        if spaces:
+            self.out("")
+            self.info("  Available Genie spaces:")
+            for i, sp in enumerate(spaces, 1):
+                title = getattr(sp._details, "title", None) if sp._details else None
+                label = f"{sp.space_id}"
+                if title:
+                    label += f"  {title}"
+                self.out(f"  {self.style.dim(f'{i:>3}.')} {label}")
+            self.out("")
+            try:
+                choice = self.input_fn(
+                    self.style.cyan("  pick a space ")
+                    + self.style.dim(f"(1-{len(spaces)}): "),
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                self.out("")
+                return False
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(spaces):
+                    picked = spaces[idx]
+                    self.genie.defaults = _dc_replace(
+                        self.defaults, space_id=picked.space_id,
+                    )
+                    title = getattr(picked._details, "title", None) if picked._details else None
+                    self.success(f"  using space {picked.space_id}" + (f" ({title})" if title else ""))
+                    return True
+            except ValueError:
+                pass
+            self.error(f"  invalid choice: {choice!r}")
+            return False
+        else:
+            self.warn("  no Genie spaces found in this workspace.")
+            self.info("  create one in the Databricks UI, or use --auto-create-space with --warehouse-id.")
+            return False
 
     # ------------------------------------------------------------------ #
     # Slash dispatch
