@@ -21,6 +21,14 @@ from .job import (
     RunEntry,
     JobEntry,
 )
+from .messenger import (
+    MessageSend,
+    Message,
+    ChannelInfo,
+    ChannelListResponse,
+    MessageListResponse,
+    ChannelResponse,
+)
 
 __all__ = [
     "StrictModel",
@@ -44,4 +52,10 @@ __all__ = [
     "RunListResponse",
     "RunEntry",
     "JobEntry",
+    "MessageSend",
+    "Message",
+    "ChannelInfo",
+    "ChannelListResponse",
+    "MessageListResponse",
+    "ChannelResponse",
 ]

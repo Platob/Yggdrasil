@@ -6,8 +6,8 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .exceptions import register_exception_handlers
-from .routers import call_router, cmd_router, env_router, job_router, python_router
-from .services import CallService, CmdService, EnvService, JobService, PythonExecService
+from .routers import call_router, cmd_router, env_router, job_router, messenger_router, python_router
+from .services import CallService, CmdService, EnvService, JobService, MessengerService, PythonExecService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -27,6 +27,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.python_service = PythonExecService(settings)
     app.state.job_service = JobService(settings)
     app.state.call_service = CallService(settings)
+    app.state.messenger_service = MessengerService(settings)
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -56,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(python_router, prefix=f"{prefix}/python")
     app.include_router(job_router, prefix=f"{prefix}/job")
     app.include_router(call_router, prefix=f"{prefix}/call")
+    app.include_router(messenger_router, prefix=f"{prefix}/messenger")
 
     return app
 

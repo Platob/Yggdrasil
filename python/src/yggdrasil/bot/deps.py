@@ -6,6 +6,7 @@ from .services.call import CallService
 from .services.cmd import CmdService
 from .services.env import EnvService
 from .services.job import JobService
+from .services.messenger import MessengerService
 from .services.python import PythonExecService
 
 
@@ -27,3 +28,7 @@ def get_job_service(request: Request) -> JobService:
 
 def get_call_service(request: Request) -> CallService:
     return request.app.state.call_service
+
+
+def get_messenger_service(request: Request) -> MessengerService:
+    return request.app.state.messenger_service

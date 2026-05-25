@@ -42,6 +42,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--stream", action="store_true", default=False, help="Stream Arrow IPC batches.")
     run.set_defaults(handler=_bot_run)
 
+    # -- chat --------------------------------------------------------------
+    chat_parser = bot_sub.add_parser("chat", help="Open the terminal chat client.")
+    chat_parser.add_argument("--url", default="http://127.0.0.1:8100", help="Bot server URL.")
+    chat_parser.add_argument("--user", default=None, help="Display name.")
+    chat_parser.add_argument("--channel", default="general", help="Initial channel.")
+    chat_parser.set_defaults(handler=_bot_chat)
+
     # -- genie -------------------------------------------------------------
     genie_parser = subparsers.add_parser(
         "genie",
@@ -111,6 +118,11 @@ def _bot_run(args: argparse.Namespace) -> int:
     else:
         print(result)
     return 0
+
+
+def _bot_chat(args: argparse.Namespace) -> int:
+    from yggdrasil.bot.chat import run_chat
+    return run_chat(url=args.url, username=args.user, channel=args.channel)
 
 
 def _genie(args: argparse.Namespace) -> int:
