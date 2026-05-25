@@ -4,8 +4,8 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from yggdrasil.bot.app import create_app
-from yggdrasil.bot.config import Settings
+from yggdrasil.node.app import create_app
+from yggdrasil.node.config import Settings
 
 
 class TestBotEndpoints(unittest.TestCase):

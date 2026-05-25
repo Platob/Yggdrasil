@@ -91,14 +91,14 @@ const Icon = {
 // ── Service definitions ────────────────────────────────────
 const SERVICES: ServiceSection[] = [
   {
-    id: "bot",
-    label: "Bot Control",
-    prefix: "/bot",
+    id: "node",
+    label: "Node Control",
+    prefix: "/node",
     icon: Icon.bolt,
     items: [
-      { href: "/bot", label: "Dashboard", icon: Icon.grid, exact: true },
-      { href: "/bot/network", label: "Network", icon: Icon.globe },
-      { href: "/bot/execute", label: "Execute", icon: Icon.terminal },
+      { href: "/node", label: "Dashboard", icon: Icon.grid, exact: true },
+      { href: "/node/network", label: "Network", icon: Icon.globe },
+      { href: "/node/execute", label: "Execute", icon: Icon.terminal },
     ],
   },
   {

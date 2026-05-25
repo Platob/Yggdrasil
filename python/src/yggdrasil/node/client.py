@@ -5,7 +5,7 @@ from typing import Any, Callable, Iterator
 
 import pyarrow as pa
 
-from yggdrasil.bot.transport import (
+from yggdrasil.node.transport import (
     CONTENT_TYPE_ARROW_STREAM,
     CONTENT_TYPE_PICKLE,
     deserialize_result,
@@ -16,12 +16,12 @@ from yggdrasil.bot.transport import (
 LOGGER = logging.getLogger(__name__)
 
 
-class BotClient:
+class NodeClient:
     """Client for calling @remote functions on a bot server.
 
     Usage::
 
-        client = BotClient("http://localhost:8100")
+        client = NodeClient("http://localhost:8100")
 
         # Call a registered remote function
         result = client.call(my_func, 1, 2, key="val")
@@ -192,7 +192,7 @@ class BotClient:
                     break
         else:
             result = deserialize_result(data, content_type)
-            from yggdrasil.bot.transport import to_arrow_table
+            from yggdrasil.node.transport import to_arrow_table
             table = to_arrow_table(result)
             yield from table.to_batches()
 
@@ -215,4 +215,4 @@ class BotClient:
         return loads(data)
 
     def __repr__(self) -> str:
-        return f"BotClient({self.base_url!r})"
+        return f"NodeClient({self.base_url!r})"

@@ -21,16 +21,16 @@ import sys
 import time
 from pathlib import Path
 
-from yggdrasil.bot.config import Settings, _find_open_port, get_settings
+from yggdrasil.node.config import Settings, _find_open_port, get_settings
 
 LOGGER = logging.getLogger(__name__)
 
-_PID_FILE = "bot.pid"
-_PORT_FILE = "bot.port"
+_PID_FILE = "node.pid"
+_PORT_FILE = "node.port"
 
 
 def ensure_directories(settings: Settings) -> None:
-    for d in (settings.bot_home, settings.data_root, settings.cache_root,
+    for d in (settings.node_home, settings.data_root, settings.cache_root,
               settings.spill_root, settings.logs_root):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -60,9 +60,9 @@ def _is_port_open(host: str, port: int) -> bool:
         return False
 
 
-def _is_bot_running(settings: Settings) -> tuple[bool, int | None, int | None]:
-    pid_path = settings.bot_home / _PID_FILE
-    port_path = settings.bot_home / _PORT_FILE
+def _is_node_running(settings: Settings) -> tuple[bool, int | None, int | None]:
+    pid_path = settings.node_home / _PID_FILE
+    port_path = settings.node_home / _PORT_FILE
 
     if not pid_path.exists():
         return False, None, None
@@ -87,14 +87,14 @@ def _is_bot_running(settings: Settings) -> tuple[bool, int | None, int | None]:
 
 
 def _write_pid(settings: Settings, pid: int, port: int) -> None:
-    (settings.bot_home / _PID_FILE).write_text(str(pid))
-    (settings.bot_home / _PORT_FILE).write_text(str(port))
+    (settings.node_home / _PID_FILE).write_text(str(pid))
+    (settings.node_home / _PORT_FILE).write_text(str(port))
 
 
-def get_bot_url(settings: Settings | None = None) -> str:
+def get_node_url(settings: Settings | None = None) -> str:
     settings = settings or get_settings()
     ensure_directories(settings)
-    port_path = settings.bot_home / _PORT_FILE
+    port_path = settings.node_home / _PORT_FILE
     if port_path.exists():
         try:
             port = int(port_path.read_text().strip())
@@ -104,7 +104,7 @@ def get_bot_url(settings: Settings | None = None) -> str:
     return f"http://127.0.0.1:{settings.port}"
 
 
-def spawn_bot(settings: Settings | None = None, *, allow_remote: bool = False) -> tuple[int, int]:
+def spawn_node(settings: Settings | None = None, *, allow_remote: bool = False) -> tuple[int, int]:
     """Ensure a bot is running. Returns (pid, port).
 
     If a bot is already running, returns its pid/port.
@@ -114,23 +114,23 @@ def spawn_bot(settings: Settings | None = None, *, allow_remote: bool = False) -
     ensure_directories(settings)
     cleanup_old_logs(settings)
 
-    running, pid, port = _is_bot_running(settings)
+    running, pid, port = _is_node_running(settings)
     if running:
         return pid, port
 
     port = _find_open_port(settings.port, settings.port + 100)
 
-    log_file = settings.logs_root / f"bot-{dt.date.today().isoformat()}.log"
+    log_file = settings.logs_root / f"node-{dt.date.today().isoformat()}.log"
 
     env = os.environ.copy()
-    env["YGG_BOT_PORT"] = str(port)
-    env["YGG_BOT_HOME"] = str(settings.bot_home)
+    env["YGG_NODE_PORT"] = str(port)
+    env["YGG_NODE_HOME"] = str(settings.node_home)
     if allow_remote:
-        env["YGG_BOT_ALLOW_REMOTE"] = "1"
+        env["YGG_NODE_ALLOW_REMOTE"] = "1"
 
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "yggdrasil.bot.main"],
+            [sys.executable, "-m", "yggdrasil.node.main"],
             env=env,
             stdout=lf,
             stderr=lf,
@@ -143,13 +143,13 @@ def spawn_bot(settings: Settings | None = None, *, allow_remote: bool = False) -
             break
 
     _write_pid(settings, proc.pid, port)
-    LOGGER.info("Spawned bot (pid=%d, port=%d, log=%s)", proc.pid, port, log_file)
+    LOGGER.info("Spawned node (pid=%d, port=%d, log=%s)", proc.pid, port, log_file)
     return proc.pid, port
 
 
-def stop_bot(settings: Settings | None = None) -> bool:
+def stop_node(settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
-    pid_path = settings.bot_home / _PID_FILE
+    pid_path = settings.node_home / _PID_FILE
 
     if not pid_path.exists():
         return False
@@ -165,5 +165,5 @@ def stop_bot(settings: Settings | None = None) -> bool:
         pass
 
     pid_path.unlink(missing_ok=True)
-    (settings.bot_home / _PORT_FILE).unlink(missing_ok=True)
+    (settings.node_home / _PORT_FILE).unlink(missing_ok=True)
     return True

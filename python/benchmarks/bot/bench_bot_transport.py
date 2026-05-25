@@ -1,4 +1,4 @@
-"""Benchmark yggdrasil.bot transport layer.
+"""Benchmark yggdrasil.node transport layer.
 
 Covers the serialization / deserialization round-trip for the two
 transport formats (Arrow IPC stream and pickle) across common payload
@@ -27,7 +27,7 @@ import pyarrow as pa
 
 from yggdrasil.pickle.ser.serde import dumps as ygg_dumps, loads as ygg_loads
 
-from yggdrasil.bot.transport import (
+from yggdrasil.node.transport import (
     CONTENT_TYPE_ARROW_STREAM,
     CONTENT_TYPE_PICKLE,
     deserialize_pickle,
@@ -237,9 +237,9 @@ def _bench_polars(repeat: int) -> None:
 
 
 def _bench_call_endpoint(repeat: int) -> None:
-    from yggdrasil.bot.app import create_app
-    from yggdrasil.bot.config import Settings
-    from yggdrasil.bot.remote import remote
+    from yggdrasil.node.app import create_app
+    from yggdrasil.node.config import Settings
+    from yggdrasil.node.remote import remote
 
     @remote(name="bench:add")
     def _bench_add(x: int, y: int) -> int:
@@ -284,7 +284,7 @@ def _bench_call_endpoint(repeat: int) -> None:
 def run(repeat: int) -> None:
     print()
     print("=" * 90)
-    print(f"  yggdrasil.bot transport benchmark  (repeat={repeat}, inner={INNER})")
+    print(f"  yggdrasil.node transport benchmark  (repeat={repeat}, inner={INNER})")
     print("=" * 90)
 
     _bench_pickle_roundtrip(repeat)

@@ -7,10 +7,10 @@ import unittest
 import pyarrow as pa
 from fastapi.testclient import TestClient
 
-from yggdrasil.bot.app import create_app
-from yggdrasil.bot.config import Settings
-from yggdrasil.bot.remote import _REGISTRY, _infer_modules, remote
-from yggdrasil.bot.transport import (
+from yggdrasil.node.app import create_app
+from yggdrasil.node.config import Settings
+from yggdrasil.node.remote import _REGISTRY, _infer_modules, remote
+from yggdrasil.node.transport import (
     CONTENT_TYPE_ARROW_STREAM,
     CONTENT_TYPE_PICKLE,
     deserialize_pickle,
@@ -194,23 +194,23 @@ class TestCLI(unittest.TestCase):
     def test_help(self):
         result = self._run_ygg("--help")
         self.assertEqual(result.returncode, 0)
-        self.assertIn("bot", result.stdout)
+        self.assertIn("node", result.stdout)
         self.assertIn("genie", result.stdout)
 
-    def test_bot_help(self):
-        result = self._run_ygg("bot", "--help")
+    def test_node_help(self):
+        result = self._run_ygg("node", "--help")
         self.assertEqual(result.returncode, 0)
         self.assertIn("serve", result.stdout)
         self.assertIn("run", result.stdout)
 
     def test_bot_serve_help(self):
-        result = self._run_ygg("bot", "serve", "--help")
+        result = self._run_ygg("node", "serve", "--help")
         self.assertEqual(result.returncode, 0)
         self.assertIn("--host", result.stdout)
         self.assertIn("--port", result.stdout)
 
     def test_bot_run_help(self):
-        result = self._run_ygg("bot", "run", "--help")
+        result = self._run_ygg("node", "run", "--help")
         self.assertEqual(result.returncode, 0)
         self.assertIn("func", result.stdout)
         self.assertIn("--url", result.stdout)
@@ -219,7 +219,7 @@ class TestCLI(unittest.TestCase):
     def test_no_args_shows_help(self):
         result = self._run_ygg()
         self.assertEqual(result.returncode, 0)
-        self.assertIn("bot", result.stdout)
+        self.assertIn("node", result.stdout)
 
 
 if __name__ == "__main__":

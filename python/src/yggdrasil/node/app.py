@@ -43,7 +43,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 content={
                     "detail": (
                         "Remote access is disabled. Bind locally or set "
-                        "YGG_BOT_ALLOW_REMOTE=1 to allow non-local clients."
+                        "YGG_NODE_ALLOW_REMOTE=1 to allow non-local clients."
                     )
                 },
             )

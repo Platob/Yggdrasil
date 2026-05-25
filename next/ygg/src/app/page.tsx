@@ -157,7 +157,7 @@ function StatsStrip({
           Total <span className="font-bold text-white ml-1">{nodes.length}</span>
         </span>
         <div className="ml-auto hidden md:flex items-center gap-1.5">
-          {([["Bot", "/bot"], ["Messages", "/msg"], ["Network", "/bot/network"]] as const).map(([name, href]) => (
+          {([["Nodes", "/node"], ["Messages", "/msg"], ["Network", "/node/network"]] as const).map(([name, href]) => (
             <Link
               key={name}
               href={href}
@@ -232,7 +232,7 @@ export default function WelcomePage() {
             </span>
           </div>
           <Link
-            href="/bot"
+            href="/node"
             className="text-[11px] font-medium px-3 py-1.5 rounded-full text-white/60 hover:text-white transition-all"
             style={{ border: "1px solid rgba(255,255,255,0.1)" }}
           >

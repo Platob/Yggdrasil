@@ -1,4 +1,4 @@
-import { botAPI, BotAPIError } from "@/lib/bot-client";
+import { nodeAPI, NodeAPIError } from "@/lib/node-client";
 import type { NodeInfo, ChannelInfo } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -13,9 +13,9 @@ export async function GET() {
   let channels: ChannelInfo[] = [];
 
   const results = await Promise.allSettled([
-    botAPI.getNodeInfo(),
-    botAPI.getRegistry(),
-    botAPI.getChannels(),
+    nodeAPI.getNodeInfo(),
+    nodeAPI.getRegistry(),
+    nodeAPI.getChannels(),
   ]);
 
   if (results[0].status === "fulfilled") {

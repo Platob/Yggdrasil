@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, use } from "react";
-import { bot, type NodeInfo } from "@/lib/api";
+import { node as api, type NodeInfo } from "@/lib/api";
 import { YggdrasilLogo } from "@/components/logo";
 import Link from "next/link";
 
@@ -219,13 +219,13 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
   useEffect(() => {
     async function loadNode() {
       try {
-        const self = await bot.getNodeInfo();
+        const self = await api.getNodeInfo();
         if (self.node_id === id) {
           setNode(self);
         } else {
           // Check peers for this node
           try {
-            const peersData = await bot.getPeers();
+            const peersData = await api.getPeers();
             const peer = peersData.peers.find((p) => p.node_id === id);
             if (peer) {
               setNode(peer);
@@ -261,7 +261,7 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
           }
         }
       } catch {
-        // Bot unavailable — enter demo mode
+        // Node unavailable — enter demo mode
         setDemoMode(true);
         setNode({
           node_id: id,
@@ -315,7 +315,7 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex items-center gap-4">
           <Link
-            href="/bot"
+            href="/node"
             className="w-8 h-8 rounded-lg bg-card border border-border flex items-center justify-center text-muted hover:text-foreground hover:border-primary transition-colors"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

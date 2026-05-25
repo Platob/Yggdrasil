@@ -5,10 +5,10 @@ import unittest
 import pyarrow as pa
 from fastapi.testclient import TestClient
 
-from yggdrasil.bot.app import create_app
-from yggdrasil.bot.config import Settings
-from yggdrasil.bot.remote import _REGISTRY, _RemoteSpec, ensure_modules, remote
-from yggdrasil.bot.transport import (
+from yggdrasil.node.app import create_app
+from yggdrasil.node.config import Settings
+from yggdrasil.node.remote import _REGISTRY, _RemoteSpec, ensure_modules, remote
+from yggdrasil.node.transport import (
     CONTENT_TYPE_ARROW_STREAM,
     CONTENT_TYPE_PICKLE,
     deserialize_pickle,

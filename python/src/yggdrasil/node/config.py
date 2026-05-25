@@ -18,12 +18,12 @@ def _user_key() -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
-def _bot_home() -> Path:
-    return Path.home() / ".bot" / _user_key()
+def _node_home() -> Path:
+    return Path.home() / ".ygg" / _user_key()
 
 
 def _default_node_id() -> str:
-    return os.getenv("YGG_BOT_NODE_ID", f"{platform.node()}-{uuid.uuid4().hex[:8]}")
+    return os.getenv("YGG_NODE_NODE_ID", f"{platform.node()}-{uuid.uuid4().hex[:8]}")
 
 
 def _find_open_port(start: int = 8100, end: int = 8200) -> int:
@@ -45,7 +45,7 @@ def _default_front_home() -> Path:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    app_name: str = "yggdrasil-bot"
+    app_name: str = "yggdrasil-node"
     app_version: str = "0.1.0"
     host: str = "0.0.0.0"
     port: int = 8100
@@ -56,7 +56,7 @@ class Settings:
     openapi_url: str = "/openapi.json"
     api_prefix: str = "/api"
     node_id: str = field(default_factory=_default_node_id)
-    bot_home: Path = field(default_factory=_bot_home)
+    node_home: Path = field(default_factory=_node_home)
     front_home: Path = field(default_factory=_default_front_home)
     max_cmd_timeout: float = 300.0
     max_python_timeout: float = 600.0
@@ -71,7 +71,7 @@ class Settings:
 
     @property
     def data_root(self) -> Path:
-        return self.bot_home / "data"
+        return self.node_home / "data"
 
     @property
     def jobs_root(self) -> Path:
@@ -79,15 +79,15 @@ class Settings:
 
     @property
     def cache_root(self) -> Path:
-        return self.bot_home / "cache"
+        return self.node_home / "cache"
 
     @property
     def logs_root(self) -> Path:
-        return self.bot_home / "logs"
+        return self.node_home / "logs"
 
     @property
     def spill_root(self) -> Path:
-        return self.bot_home / "spill"
+        return self.node_home / "spill"
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -98,27 +98,27 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
 
 def get_settings() -> Settings:
     return Settings(
-        app_name=os.getenv("YGG_BOT_APP_NAME", "yggdrasil-bot"),
-        app_version=os.getenv("YGG_BOT_APP_VERSION", "0.1.0"),
-        host=os.getenv("YGG_BOT_HOST", "0.0.0.0"),
-        port=int(os.getenv("YGG_BOT_PORT", "8100")),
-        front_port=int(os.getenv("YGG_BOT_FRONT_PORT", "3000")),
-        allow_remote=_as_bool(os.getenv("YGG_BOT_ALLOW_REMOTE"), True),
-        docs_url=os.getenv("YGG_BOT_DOCS_URL", "/docs"),
-        redoc_url=os.getenv("YGG_BOT_REDOC_URL", "/redoc"),
-        openapi_url=os.getenv("YGG_BOT_OPENAPI_URL", "/openapi.json"),
-        api_prefix=os.getenv("YGG_BOT_API_PREFIX", "/api"),
+        app_name=os.getenv("YGG_NODE_APP_NAME", "yggdrasil-node"),
+        app_version=os.getenv("YGG_NODE_APP_VERSION", "0.1.0"),
+        host=os.getenv("YGG_NODE_HOST", "0.0.0.0"),
+        port=int(os.getenv("YGG_NODE_PORT", "8100")),
+        front_port=int(os.getenv("YGG_NODE_FRONT_PORT", "3000")),
+        allow_remote=_as_bool(os.getenv("YGG_NODE_ALLOW_REMOTE"), True),
+        docs_url=os.getenv("YGG_NODE_DOCS_URL", "/docs"),
+        redoc_url=os.getenv("YGG_NODE_REDOC_URL", "/redoc"),
+        openapi_url=os.getenv("YGG_NODE_OPENAPI_URL", "/openapi.json"),
+        api_prefix=os.getenv("YGG_NODE_API_PREFIX", "/api"),
         node_id=_default_node_id(),
-        bot_home=Path(
-            os.getenv("YGG_BOT_HOME", str(_bot_home()))
+        node_home=Path(
+            os.getenv("YGG_NODE_HOME", str(_node_home()))
         ).expanduser().resolve(),
         front_home=Path(
-            os.getenv("YGG_BOT_FRONT_HOME", str(_default_front_home()))
+            os.getenv("YGG_NODE_FRONT_HOME", str(_default_front_home()))
         ).expanduser().resolve(),
-        max_cmd_timeout=float(os.getenv("YGG_BOT_MAX_CMD_TIMEOUT", "300")),
-        max_python_timeout=float(os.getenv("YGG_BOT_MAX_PYTHON_TIMEOUT", "600")),
-        max_concurrent_jobs=int(os.getenv("YGG_BOT_MAX_CONCURRENT_JOBS", "16")),
-        job_ttl=int(os.getenv("YGG_BOT_JOB_TTL", "3600")),
-        job_max_history=int(os.getenv("YGG_BOT_JOB_MAX_HISTORY", "256")),
-        log_retention_days=int(os.getenv("YGG_BOT_LOG_RETENTION_DAYS", "7")),
+        max_cmd_timeout=float(os.getenv("YGG_NODE_MAX_CMD_TIMEOUT", "300")),
+        max_python_timeout=float(os.getenv("YGG_NODE_MAX_PYTHON_TIMEOUT", "600")),
+        max_concurrent_jobs=int(os.getenv("YGG_NODE_MAX_CONCURRENT_JOBS", "16")),
+        job_ttl=int(os.getenv("YGG_NODE_JOB_TTL", "3600")),
+        job_max_history=int(os.getenv("YGG_NODE_JOB_MAX_HISTORY", "256")),
+        log_retention_days=int(os.getenv("YGG_NODE_LOG_RETENTION_DAYS", "7")),
     )

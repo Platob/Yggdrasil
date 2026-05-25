@@ -1,6 +1,6 @@
 # Yggdrasil
 
-Distributed bot framework — Python backend, Next.js frontend, Nordic dark UI.
+Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 
 ## Principles
 
@@ -13,25 +13,24 @@ Distributed bot framework — Python backend, Next.js frontend, Nordic dark UI.
 
 ```
 python/src/yggdrasil/
-  bot/                  Bot server (FastAPI, default :8100)
+  node/                 Node server (FastAPI, default :8100)
     routers/            Thin HTTP handlers
     services/           Business logic
     schemas/            Pydantic models (StrictModel)
     geo.py              IP geolocation (lat/lon)
-  fastapi/              Standalone FastAPI service (:8000)
   cli/                  ygg CLI (argparse)
   exceptions/
     api.py              APIError → NotFoundError, ConflictError, ...
     http.py             HTTP client errors (with Response object)
   databricks/           Databricks SDK integrations
 next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
-  src/app/bot/          Bot dashboard pages
-  src/app/bot/[id]/     Single-node detail view
+  src/app/node/         Node dashboard pages
+  src/app/node/[id]/    Single-node detail view
   src/app/msg/          Messaging
-  src/lib/api.ts        API client (bot.* + api.* namespaces)
+  src/lib/api.ts        API client (node.* + api.* namespaces)
 ```
 
-## Bot API
+## Node API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -51,29 +50,29 @@ next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
 | Route | Description |
 |-------|-------------|
 | `/` | Welcome — interactive 3D globe |
-| `/bot` | Network overview — all nodes, closest neighbors |
-| `/bot/{id}` | Node detail — resource graphs, processes, system info |
-| `/bot/network` | 3D network map |
-| `/bot/execute` | Python/shell execution |
+| `/node` | Network overview — all nodes, closest neighbors |
+| `/node/{id}` | Node detail — resource graphs, processes, system info |
+| `/node/network` | 3D network map |
+| `/node/execute` | Python/shell execution |
 | `/msg` | Real-time messaging |
 
 ## Exceptions
 
 ```python
-from yggdrasil.exceptions.api import NotFoundError, ConflictError, register_api_exception_handlers
+from yggdrasil.exceptions.api import NotFoundError, register_api_exception_handlers
 raise NotFoundError(f"Channel {name!r} not found")
-register_api_exception_handlers(app)  # wire into FastAPI
+register_api_exception_handlers(app)
 ```
 
 ## CLI
 
-`ygg bot serve` — bot + frontend | `ygg bot front` — frontend only
-`ygg bot serve --no-front` — bot only | `ygg bot status/stop` — manage daemon
+`ygg node serve` — node + frontend | `ygg node front` — frontend only
+`ygg node serve --no-front` — node only | `ygg node status/stop` — manage daemon
 
 ## Environment
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `YGG_BOT_PORT` | 8100 | Bot port |
-| `YGG_BOT_FRONT_PORT` | 3000 | Frontend port |
-| `BOT_API_URL` | `http://127.0.0.1:8100` | Frontend → bot proxy |
+| `YGG_NODE_PORT` | 8100 | Node port |
+| `YGG_NODE_FRONT_PORT` | 3000 | Frontend port |
+| `NODE_API_URL` | `http://127.0.0.1:8100` | Frontend → node proxy |

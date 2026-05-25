@@ -6,9 +6,9 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from yggdrasil.bot.app import create_app
-from yggdrasil.bot.config import Settings
-from yggdrasil.bot.services.messenger import MessengerService, _CHANNEL_TTL
+from yggdrasil.node.app import create_app
+from yggdrasil.node.config import Settings
+from yggdrasil.node.services.messenger import MessengerService, _CHANNEL_TTL
 
 
 class TestMessengerEndpoints(unittest.TestCase):
@@ -164,7 +164,7 @@ class TestMessengerServiceDirect(unittest.TestCase):
         return self.loop.run_until_complete(coro)
 
     def test_send_and_retrieve(self):
-        from yggdrasil.bot.schemas.messenger import MessageSend
+        from yggdrasil.node.schemas.messenger import MessageSend
         msg = self._run(self.service.send_message(
             MessageSend(text="direct test", sender="tester")
         ))
@@ -175,7 +175,7 @@ class TestMessengerServiceDirect(unittest.TestCase):
         self.assertIn("direct test", texts)
 
     def test_auto_purge_stale_channels(self):
-        from yggdrasil.bot.schemas.messenger import MessageSend
+        from yggdrasil.node.schemas.messenger import MessageSend
         import datetime as dt
 
         self._run(self.service.create_channel("stale-chan"))
@@ -201,7 +201,7 @@ class TestMessengerServiceDirect(unittest.TestCase):
         self.assertIn("general", names)
 
     def test_poll_returns_new_messages(self):
-        from yggdrasil.bot.schemas.messenger import MessageSend
+        from yggdrasil.node.schemas.messenger import MessageSend
 
         self._run(self.service.send_message(
             MessageSend(text="seed", sender="a")
@@ -220,7 +220,7 @@ class TestMessengerServiceDirect(unittest.TestCase):
         self.assertEqual(poll_resp.messages[0].text, "new msg")
 
     def test_poll_timeout_returns_empty(self):
-        from yggdrasil.bot.schemas.messenger import MessageSend
+        from yggdrasil.node.schemas.messenger import MessageSend
 
         self._run(self.service.send_message(
             MessageSend(text="x", sender="a")
@@ -237,7 +237,7 @@ class TestMessengerServiceDirect(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.4)
 
     def test_message_deque_bounded(self):
-        from yggdrasil.bot.schemas.messenger import MessageSend
+        from yggdrasil.node.schemas.messenger import MessageSend
 
         for i in range(1100):
             self._run(self.service.send_message(
@@ -256,7 +256,7 @@ class TestMessengerPoll(unittest.TestCase):
         service = MessengerService(settings)
         loop = asyncio.new_event_loop()
 
-        from yggdrasil.bot.schemas.messenger import MessageSend
+        from yggdrasil.node.schemas.messenger import MessageSend
 
         loop.run_until_complete(service.send_message(
             MessageSend(text="seed", sender="a")

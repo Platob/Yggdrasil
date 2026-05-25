@@ -2,7 +2,7 @@
  * Frontend API client for Yggdrasil Dashboard
  * 
  * Two namespaces:
- * - `bot.*` - Calls proxied to FastAPI bot backend (real-time, execution)
+ * - `node.*` - Calls proxied to FastAPI bot backend (real-time, execution)
  * - `api.*` - Calls to Next.js API routes (cached, aggregated, config)
  */
 
@@ -112,72 +112,72 @@ async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 // =============================================================================
-// Bot API (proxied to FastAPI via /api/bot/*)
+// Bot API (proxied to FastAPI via /api/node/*)
 // =============================================================================
 
-const BOT_BASE = "/api/bot";
+const NODE_BASE = "/api/node";
 
-export const bot = {
+export const node = {
   // Python execution
   executePython: (code: string): Promise<PythonResponse> =>
-    fetchJSON(`${BOT_BASE}/python`, {
+    fetchJSON(`${NODE_BASE}/python`, {
       method: "POST",
       body: JSON.stringify({ code }),
     }),
 
   // Shell commands
   executeCmd: (command: string[]): Promise<CmdResponse> =>
-    fetchJSON(`${BOT_BASE}/cmd`, {
+    fetchJSON(`${NODE_BASE}/cmd`, {
       method: "POST",
       body: JSON.stringify({ command }),
     }),
 
   // Messaging
   sendMessage: (text: string, sender: string, channel: string): Promise<Message> =>
-    fetchJSON(`${BOT_BASE}/messenger`, {
+    fetchJSON(`${NODE_BASE}/messenger`, {
       method: "POST",
       body: JSON.stringify({ text, sender, channel }),
     }),
 
   getChannels: async (): Promise<ChannelInfo[]> => {
-    const data = await fetchJSON<{ channels: ChannelInfo[] }>(`${BOT_BASE}/messenger/channels`);
+    const data = await fetchJSON<{ channels: ChannelInfo[] }>(`${NODE_BASE}/messenger/channels`);
     return data.channels;
   },
 
   getMessages: async (channel: string, limit = 100): Promise<Message[]> => {
     const data = await fetchJSON<{ messages: Message[] }>(
-      `${BOT_BASE}/messenger/channels/${channel}/messages?limit=${limit}`
+      `${NODE_BASE}/messenger/channels/${channel}/messages?limit=${limit}`
     );
     return data.messages;
   },
 
   pollMessages: async (channel: string, afterId: string, timeout = 25): Promise<Message[]> => {
     const data = await fetchJSON<{ messages: Message[] }>(
-      `${BOT_BASE}/messenger/channels/${channel}/poll?after_id=${afterId}&timeout=${timeout}`
+      `${NODE_BASE}/messenger/channels/${channel}/poll?after_id=${afterId}&timeout=${timeout}`
     );
     return data.messages;
   },
 
   createChannel: async (name: string): Promise<ChannelInfo> => {
     const data = await fetchJSON<{ channel: ChannelInfo }>(
-      `${BOT_BASE}/messenger/channels?name=${encodeURIComponent(name)}`,
+      `${NODE_BASE}/messenger/channels?name=${encodeURIComponent(name)}`,
       { method: "POST" }
     );
     return data.channel;
   },
 
   // Node info (direct)
-  getNodeInfo: (): Promise<NodeInfo> => fetchJSON(`${BOT_BASE}/hello`),
+  getNodeInfo: (): Promise<NodeInfo> => fetchJSON(`${NODE_BASE}/hello`),
 
   // Peers
-  getPeers: (): Promise<PeersResponse> => fetchJSON(`${BOT_BASE}/hello/peers`),
+  getPeers: (): Promise<PeersResponse> => fetchJSON(`${NODE_BASE}/hello/peers`),
 
   // Registry
-  getRegistry: (): Promise<Record<string, string>> => fetchJSON(`${BOT_BASE}/call/registry`),
+  getRegistry: (): Promise<Record<string, string>> => fetchJSON(`${NODE_BASE}/call/registry`),
 
   // Remote function call
   callFunction: <T = unknown>(name: string, args: Record<string, unknown> = {}): Promise<T> =>
-    fetchJSON(`${BOT_BASE}/call/${name}`, {
+    fetchJSON(`${NODE_BASE}/call/${name}`, {
       method: "POST",
       body: JSON.stringify(args),
     }),
@@ -204,29 +204,29 @@ export const api = {
 // Legacy exports (for backward compatibility during migration)
 // =============================================================================
 
-/** @deprecated Use bot.executePython instead */
-export const executePython = bot.executePython;
+/** @deprecated Use node.executePython instead */
+export const executePython = node.executePython;
 
-/** @deprecated Use bot.executeCmd instead */
-export const executeCmd = bot.executeCmd;
+/** @deprecated Use node.executeCmd instead */
+export const executeCmd = node.executeCmd;
 
-/** @deprecated Use bot.sendMessage instead */
-export const sendMessage = bot.sendMessage;
+/** @deprecated Use node.sendMessage instead */
+export const sendMessage = node.sendMessage;
 
-/** @deprecated Use bot.getChannels instead */
-export const getChannels = bot.getChannels;
+/** @deprecated Use node.getChannels instead */
+export const getChannels = node.getChannels;
 
-/** @deprecated Use bot.getMessages instead */
-export const getMessages = bot.getMessages;
+/** @deprecated Use node.getMessages instead */
+export const getMessages = node.getMessages;
 
-/** @deprecated Use bot.pollMessages instead */
-export const pollMessages = bot.pollMessages;
+/** @deprecated Use node.pollMessages instead */
+export const pollMessages = node.pollMessages;
 
-/** @deprecated Use bot.createChannel instead */
-export const createChannel = bot.createChannel;
+/** @deprecated Use node.createChannel instead */
+export const createChannel = node.createChannel;
 
-/** @deprecated Use bot.getNodeInfo instead */
-export const getNodeInfo = bot.getNodeInfo;
+/** @deprecated Use node.getNodeInfo instead */
+export const getNodeInfo = node.getNodeInfo;
 
-/** @deprecated Use bot.getRegistry instead */
-export const getRegistry = bot.getRegistry;
+/** @deprecated Use node.getRegistry instead */
+export const getRegistry = node.getRegistry;

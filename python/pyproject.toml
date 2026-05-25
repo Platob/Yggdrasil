@@ -88,7 +88,7 @@ api = [
   "pydantic>=2.10",
 ]
 
-bot = [
+node = [
   "fastapi",
   "uvicorn",
   "pydantic>=2.10",
@@ -126,8 +126,7 @@ Documentation = "https://platob.github.io/Yggdrasil/"
 
 [project.scripts]
 ygg = "yggdrasil.cli.main:main"
-ygg-api = "yggdrasil.fastapi.main:main"
-ygg-bot = "yggdrasil.bot.main:main"
+ygg-node = "yggdrasil.node.main:main"
 ygg-genie = "yggdrasil.cli.databricks.genie:main"
 ygg-databricks = "yggdrasil.databricks.cli:main"
 

@@ -113,7 +113,7 @@ class CallService:
     def _ensure_deps(spec, extra_modules: list[str] | None) -> None:
         ensure_modules(spec)
         if extra_modules:
-            from yggdrasil.bot.remote import _RemoteSpec
+            from yggdrasil.node.remote import _RemoteSpec
             tmp = _RemoteSpec(func=spec.func, key=spec.key, timeout=spec.timeout, modules=extra_modules)
             ensure_modules(tmp)
 

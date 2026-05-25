@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { bot, type NodeInfo } from "@/lib/api";
+import { node, type NodeInfo } from "@/lib/api";
 import { YggdrasilLogo } from "@/components/logo";
 import Link from "next/link";
 
@@ -91,12 +91,12 @@ export default function NetworkOverview() {
 
       try {
         // Fetch self info
-        const self = await bot.getNodeInfo();
+        const self = await node.getNodeInfo();
         setSelfNode(self);
 
         // Fetch peers
         try {
-          const peersData = await bot.getPeers();
+          const peersData = await node.getPeers();
           setPeers(peersData.peers);
         } catch {
           // Peers endpoint may not be available yet — just show self
@@ -104,7 +104,7 @@ export default function NetworkOverview() {
         }
       } catch {
         // Bot entirely unavailable — show demo data
-        setError("Bot unavailable - showing demo data");
+        setError("Node unavailable - showing demo data");
         const demoSelf: NodeInfo = {
           node_id: "ygg-node-alpha",
           host: "192.168.1.10",

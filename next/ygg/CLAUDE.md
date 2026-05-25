@@ -4,19 +4,19 @@ Next.js 16 + React 19 + Tailwind v4. Read `node_modules/next/dist/docs/` — bre
 
 ## API
 
-- **Bot proxy**: `/api/bot/*` → FastAPI (configured in `next.config.ts`)
-- **Client**: `import { bot } from "@/lib/api"` — `bot.getNodeInfo()`, `bot.getPeers()`, `bot.executePython()`, etc.
-- **Server-side**: `import { botFetch } from "@/lib/bot-client"` for route handlers
+- **Node proxy**: `/api/node/*` → FastAPI (configured in `next.config.ts`)
+- **Client**: `import { node } from "@/lib/api"` — `node.getNodeInfo()`, `node.getPeers()`, `node.executePython()`, etc.
+- **Server-side**: `import { nodeFetch } from "@/lib/node-client"` for route handlers
 
 ## Routes
 
 | Route | Page |
 |-------|------|
 | `/` | 3D globe welcome |
-| `/bot` | Network overview — node grid, closest neighbors |
-| `/bot/[id]` | Node detail — resource graphs, processes |
-| `/bot/network` | 3D network visualization |
-| `/bot/execute` | Code execution |
+| `/node` | Network overview — node grid, closest neighbors |
+| `/node/[id]` | Node detail — resource graphs, processes |
+| `/node/network` | 3D network visualization |
+| `/node/execute` | Code execution |
 | `/msg` | Messaging channels |
 
 ## Design

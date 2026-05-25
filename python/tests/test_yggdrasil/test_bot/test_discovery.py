@@ -6,9 +6,9 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from yggdrasil.bot.app import create_app
-from yggdrasil.bot.config import Settings
-from yggdrasil.bot.services.discovery import DiscoveryService, _PEER_TTL
+from yggdrasil.node.app import create_app
+from yggdrasil.node.config import Settings
+from yggdrasil.node.services.discovery import DiscoveryService, _PEER_TTL
 
 
 class TestDiscoveryEndpoints(unittest.TestCase):
@@ -156,7 +156,7 @@ class TestDiscoveryServiceDirect(unittest.TestCase):
         return self.loop.run_until_complete(coro)
 
     def test_stale_peers_are_purged(self):
-        from yggdrasil.bot.schemas.discovery import HelloRequest
+        from yggdrasil.node.schemas.discovery import HelloRequest
 
         # Register a peer
         self._run(self.service.hello(HelloRequest(
@@ -183,7 +183,7 @@ class TestDiscoveryServiceDirect(unittest.TestCase):
         self.assertNotIn("stale-peer", peer_ids)
 
     def test_hello_logs_new_peer(self):
-        from yggdrasil.bot.schemas.discovery import HelloRequest
+        from yggdrasil.node.schemas.discovery import HelloRequest
 
         resp = self._run(self.service.hello(HelloRequest(
             node_id="fresh-peer",
