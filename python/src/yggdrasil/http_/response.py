@@ -110,9 +110,6 @@ class HTTPResponse(Response, IO):
         buffer: Any,
         received_at: dt.datetime,
         receiver: "Optional[UserInfo]" = None,
-        *,
-        local_cached: bool = False,
-        remote_cached: bool = False,
     ) -> None:
         # :class:`Response`'s ``super().__init__()`` chains through the
         # full IO MRO (:class:`Singleton` → :class:`URLBased` →
@@ -128,8 +125,6 @@ class HTTPResponse(Response, IO):
             buffer=buffer,
             received_at=received_at,
             receiver=receiver,
-            local_cached=local_cached,
-            remote_cached=remote_cached,
         )
         # Wire the IO cursor's parent to the response buffer so every
         # byte primitive (:meth:`IO.read` / :meth:`IO.seek` /
