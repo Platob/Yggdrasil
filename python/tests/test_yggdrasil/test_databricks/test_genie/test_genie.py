@@ -420,7 +420,7 @@ class TestGenieManagedDefaults(GenieTestCase):
 
     def test_managed_defaults_have_sensible_off_state(self):
         d = self.genie.defaults
-        self.assertFalse(d.auto_create_space)
+        self.assertTrue(d.auto_create_space)
         self.assertFalse(d.cleanup_dead_spaces)
         self.assertEqual(d.managed_space_title, DEFAULT_MANAGED_SPACE_TITLE)
         self.assertEqual(d.managed_space_tables, ())

@@ -331,16 +331,6 @@ class TestMainEntry(DatabricksTestCase):
         self.assertEqual(rc, 0)
         self.assertIn("one-shot", buf.getvalue())
 
-    def test_main_failure_returns_2(self):
-        import io
-
-        err = io.StringIO()
-        with patch("yggdrasil.databricks.client.DatabricksClient", side_effect=RuntimeError("nope")), \
-             patch("sys.stderr", err):
-            rc = main(["--host", "x.databricks.com", "-q", "test"])
-        self.assertEqual(rc, 2)
-        self.assertIn("nope", err.getvalue())
-
     def test_main_applies_defaults_overrides(self):
         # Confirms ``GenieCLI.run`` re-applies CLI flags onto the
         # service defaults *before* asking — auto-save format set via

@@ -99,19 +99,69 @@ class _Style:
         return self(self.MAGENTA, t)
 
 
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
 class _StatusLine:
     """Single-line status display that overwrites itself on each update.
 
     Writes ``\\r`` + erase-line + the new text so the terminal shows only
     the latest status.  :meth:`finish` prints a final line with a newline
     so subsequent output starts on a fresh row.
+
+    When the terminal supports ANSI, :meth:`spin` starts a background
+    thread that cycles through braille spinner frames next to the status
+    text.  The spinner stops automatically on :meth:`finish` or
+    :meth:`clear`.
     """
 
     def __init__(self, style: _Style):
         self._style = style
         self._active = False
+        self._spin_thread: "Any" = None
+        self._spin_stop: "Any" = None
+        self._spin_text: str = ""
+
+    def _stop_spinner(self) -> None:
+        if self._spin_stop is not None:
+            self._spin_stop.set()
+        if self._spin_thread is not None:
+            self._spin_thread.join(timeout=1.0)
+            self._spin_thread = None
+            self._spin_stop = None
+
+    def _spinner_loop(self) -> None:
+        idx = 0
+        assert self._spin_stop is not None
+        while not self._spin_stop.is_set():
+            frame = _SPINNER_FRAMES[idx % len(_SPINNER_FRAMES)]
+            sys.stdout.write(
+                f"\r{_Style.ERASE_LINE}  "
+                f"{self._style.cyan(frame)} {self._spin_text}"
+            )
+            sys.stdout.flush()
+            idx += 1
+            self._spin_stop.wait(0.08)
+
+    def spin(self, text: str) -> None:
+        """Start an animated spinner with ``text`` as the status message."""
+        self._stop_spinner()
+        self._spin_text = text
+        self._active = True
+        if not self._style.enabled:
+            sys.stdout.write(f"  {text}\n")
+            sys.stdout.flush()
+            return
+        import threading
+
+        self._spin_stop = threading.Event()
+        self._spin_thread = threading.Thread(
+            target=self._spinner_loop, daemon=True,
+        )
+        self._spin_thread.start()
 
     def update(self, text: str) -> None:
+        self._stop_spinner()
         if self._style.enabled:
             sys.stdout.write(f"\r{_Style.ERASE_LINE}  {text}")
             sys.stdout.flush()
@@ -121,6 +171,7 @@ class _StatusLine:
         self._active = True
 
     def finish(self, text: str) -> None:
+        self._stop_spinner()
         if self._style.enabled and self._active:
             sys.stdout.write(f"\r{_Style.ERASE_LINE}  {text}\n")
             sys.stdout.flush()
@@ -130,6 +181,7 @@ class _StatusLine:
         self._active = False
 
     def clear(self) -> None:
+        self._stop_spinner()
         if self._style.enabled and self._active:
             sys.stdout.write(f"\r{_Style.ERASE_LINE}")
             sys.stdout.flush()
@@ -158,7 +210,7 @@ class _StatusLineHandler(logging.Handler):
                     else self._style.red(msg)
                 )
             elif record.levelno >= logging.INFO:
-                self._status.update(self._style.dim(msg))
+                self._status.spin(self._style.dim(msg))
         except Exception:
             self.handleError(record)
 
@@ -424,8 +476,26 @@ class GenieCLI(DatabricksCLI):
     # ------------------------------------------------------------------ #
     # Banner / entry
     # ------------------------------------------------------------------ #
+    _LOGO = (
+        r"        /\        ",
+        r"       /  \       ",
+        r"      /    \      ",
+        r"     /  /\  \     ",
+        r"    /  /  \  \    ",
+        r"   /  /    \  \   ",
+        r"  /  / /--\ \  \  ",
+        r" /  / /    \ \  \ ",
+        r"/__/ /      \ \__\\",
+        r"   |/        \|   ",
+        r"   ||  ||||  ||   ",
+        r"   ||  ||||  ||   ",
+    )
+
     def print_banner(self) -> None:
         host = getattr(self.client, "host", None) or "?"
+        self.out("")
+        for line in self._LOGO:
+            self.out(self.style.green(f"  {line}"))
         self.out("")
         self.out(self.style.bold("  Yggdrasil Genie") + self.style.dim(f"  ·  {host}"))
         space_id = self.defaults.space_id
@@ -518,6 +588,9 @@ class GenieCLI(DatabricksCLI):
         """Validate the client can reach Databricks, prompting on failure."""
         try:
             self.client.make_config()
+            host = getattr(self.client, "host", None)
+            if host:
+                self._save_creds(host, getattr(self.client, "token", None))
             return True
         except Exception:
             pass
@@ -720,7 +793,7 @@ class GenieCLI(DatabricksCLI):
         return 0
 
     def ask(self, question: str) -> None:
-        self._status.update(self.style.dim("asking Genie…"))
+        self._status.spin(self.style.dim("asking Genie…"))
         try:
             answer = self.agent.run(question, conversation_id=self.conversation_id)
         except KeyboardInterrupt:
@@ -734,6 +807,11 @@ class GenieCLI(DatabricksCLI):
                 return
             if "managed_space_tables" in msg and self._prompt_tables():
                 self.ask(question)
+                return
+            if "not found in any catalog/schema" in msg or "is ambiguous" in msg:
+                self._handle_error(exc)
+                if self._prompt_tables():
+                    self.ask(question)
                 return
             self._handle_error(exc)
             return

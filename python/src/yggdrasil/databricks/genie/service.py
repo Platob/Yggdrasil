@@ -448,6 +448,21 @@ class Genie(DatabricksService):
             pass
         return base
 
+    _RESOLVE_TABLE_SQL = (
+        "SELECT table_catalog, table_schema, table_name"
+        " FROM system.information_schema.tables"
+        " WHERE LOWER(table_name) = LOWER('{table}')"
+        "{schema_clause}"
+        " LIMIT 20"
+    )
+
+    _SAMPLE_TABLES_SQL = (
+        "SELECT table_catalog, table_schema, table_name"
+        " FROM system.information_schema.tables"
+        "{schema_clause}"
+        " LIMIT 10"
+    )
+
     def resolve_table_identifiers(
         self,
         tables: "tuple[str, ...] | list[str]",
@@ -456,9 +471,10 @@ class Genie(DatabricksService):
 
         Identifiers that already contain three dotted parts pass through
         unchanged.  Shorter names (``"orders"``, ``"sales.orders"``) are
-        looked up via :meth:`Tables.list_tables` across all visible
-        catalogs and schemas.  When exactly one match is found it is used;
-        when zero or multiple matches are found, a helpful error is raised.
+        looked up via ``system.information_schema.tables`` — a single SQL
+        query instead of walking every catalog/schema through the API.
+        When exactly one match is found it is used; when zero or multiple
+        matches are found, a helpful error is raised.
         """
         resolved: list[str] = []
         for ident in tables:
@@ -472,28 +488,25 @@ class Genie(DatabricksService):
             else:
                 schema_filter, table_filter = None, parts[0]
 
-            matches: list[str] = []
-            for tbl in self.client.tables.list_tables(
-                name=table_filter,
-                catalog_name=None,
-                schema_name=schema_filter,
-            ):
-                matches.append(
-                    f"{tbl.catalog_name}.{tbl.schema_name}.{tbl.table_name}"
-                )
+            schema_clause = (
+                f" AND LOWER(table_schema) = LOWER('{schema_filter}')"
+                if schema_filter
+                else ""
+            )
+
+            matches = self._sql_resolve_table(table_filter, schema_clause)
+            if matches is None:
+                matches = self._api_resolve_table(table_filter, schema_filter)
 
             if len(matches) == 1:
-                LOGGER.info(
-                    "Resolved table %r to %r",
-                    ident,
-                    matches[0],
-                )
+                LOGGER.info("Resolved table %r to %r", ident, matches[0])
                 resolved.append(matches[0])
             elif len(matches) == 0:
+                hint = self._sample_tables_hint(schema_clause)
                 raise ValueError(
                     f"Table {ident!r} not found in any catalog/schema. "
                     "Pass a fully-qualified 'catalog.schema.table' name, or "
-                    "check that the table exists and you have access."
+                    f"check that the table exists and you have access.{hint}"
                 )
             else:
                 raise ValueError(
@@ -502,6 +515,76 @@ class Genie(DatabricksService):
                     "'catalog.schema.table' name to disambiguate."
                 )
         return tuple(resolved)
+
+    def _sql_resolve_table(
+        self,
+        table_filter: str,
+        schema_clause: str,
+    ) -> "list[str] | None":
+        """Try to resolve via ``system.information_schema``. Returns None on failure."""
+        try:
+            sql = self._RESOLVE_TABLE_SQL.format(
+                table=table_filter.replace("'", "''"),
+                schema_clause=schema_clause,
+            )
+            rows = self.client.sql.execute(sql).to_pylist()
+            return [
+                f"{r['table_catalog']}.{r['table_schema']}.{r['table_name']}"
+                for r in rows
+            ]
+        except Exception:
+            LOGGER.debug(
+                "SQL resolution via information_schema failed, falling back to API",
+                exc_info=True,
+            )
+            return None
+
+    def _api_resolve_table(
+        self,
+        table_filter: str,
+        schema_filter: "str | None",
+    ) -> "list[str]":
+        """Fallback: resolve via the Tables API (walks catalogs/schemas)."""
+        matches: list[str] = []
+        for tbl in self.client.tables.list_tables(
+            name=table_filter,
+            catalog_name=None,
+            schema_name=schema_filter,
+        ):
+            matches.append(
+                f"{tbl.catalog_name}.{tbl.schema_name}.{tbl.table_name}"
+            )
+        return matches
+
+    def _sample_tables_hint(self, schema_clause: str) -> str:
+        """Build a hint showing available tables for the error message."""
+        first_encountered: list[str] = []
+        try:
+            sql = self._SAMPLE_TABLES_SQL.format(schema_clause=schema_clause)
+            rows = self.client.sql.execute(sql).to_pylist()
+            first_encountered = [
+                f"{r['table_catalog']}.{r['table_schema']}.{r['table_name']}"
+                for r in rows
+            ]
+        except Exception:
+            try:
+                for tbl in self.client.tables.list_tables(
+                    name=None, catalog_name=None, schema_name=None,
+                ):
+                    first_encountered.append(
+                        f"{tbl.catalog_name}.{tbl.schema_name}.{tbl.table_name}"
+                    )
+                    if len(first_encountered) >= 10:
+                        break
+            except Exception:
+                pass
+        if first_encountered:
+            listing = ", ".join(first_encountered)
+            return (
+                f" First tables found: [{listing}]."
+                " Use one of these or another fully-qualified name."
+            )
+        return ""
 
     def _create_managed_space(self) -> GenieSpace:
         """Create a Genie space using the ``managed_space_*`` defaults.
