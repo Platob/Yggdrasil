@@ -197,7 +197,7 @@ export default function WelcomePage() {
   }
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden bg-[#030306] font-sans">
+    <div className="relative w-full h-[calc(100vh-0px)] -m-6 overflow-hidden bg-[#030306] font-sans">
 
       {/* Full-bleed globe */}
       <WorldGlobe
