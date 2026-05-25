@@ -92,6 +92,7 @@ node = [
   "fastapi",
   "uvicorn",
   "pydantic>=2.10",
+  "psutil>=5.9",
 ]
 
 mongo = [

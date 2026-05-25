@@ -95,6 +95,51 @@ export interface CachedDashboard {
   cachedAt: string;
 }
 
+// -- Functions --
+export interface FunctionEntry {
+  id: string;
+  name: string;
+  language: string;
+  code: string;
+  description: string;
+  python_version: string | null;
+  dependencies: string[];
+  environment_id: string | null;
+  creator: string;
+  created_at: string;
+  updated_at: string;
+  run_count: number;
+}
+
+// -- Environments --
+export interface EnvironmentEntry {
+  id: string;
+  name: string;
+  python_version: string;
+  dependencies: string[];
+  path: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  error: string | null;
+}
+
+// -- Runs --
+export interface RunEntry {
+  id: string;
+  function_id: string;
+  environment_id: string | null;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  duration: number | null;
+  returncode: number | null;
+  stdout: string | null;
+  stderr: string | null;
+  result: unknown;
+  node_id: string;
+}
+
 // =============================================================================
 // Fetch Helpers
 // =============================================================================
@@ -181,6 +226,32 @@ export const node = {
       method: "POST",
       body: JSON.stringify(args),
     }),
+
+  // Functions
+  listFunctions: () => fetchJSON<{ functions: FunctionEntry[] }>(`${NODE_BASE}/function`),
+  createFunction: (data: { name: string; code: string; language?: string; description?: string; python_version?: string; dependencies?: string[]; environment_id?: string }) =>
+    fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function`, { method: "POST", body: JSON.stringify(data) }),
+  getFunction: (id: string) => fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}`),
+  updateFunction: (id: string, data: Record<string, unknown>) =>
+    fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  deleteFunction: (id: string) => fetchJSON<void>(`${NODE_BASE}/function/${id}`, { method: "DELETE" }),
+  runFunction: (id: string, args?: Record<string, unknown>) =>
+    fetchJSON<{ run: RunEntry }>(`${NODE_BASE}/function/${id}/run`, { method: "POST", body: JSON.stringify(args || {}) }),
+  listFunctionRuns: (id: string) => fetchJSON<{ runs: RunEntry[] }>(`${NODE_BASE}/function/${id}/run`),
+
+  // Environments
+  listEnvironments: () => fetchJSON<{ environments: EnvironmentEntry[] }>(`${NODE_BASE}/environment`),
+  createEnvironment: (data: { name: string; python_version?: string; dependencies?: string[] }) =>
+    fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment`, { method: "POST", body: JSON.stringify(data) }),
+  getEnvironment: (id: string) => fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}`),
+  deleteEnvironment: (id: string) => fetchJSON<void>(`${NODE_BASE}/environment/${id}`, { method: "DELETE" }),
+  installPackages: (id: string, packages: string[]) =>
+    fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}/install`, { method: "POST", body: JSON.stringify({ packages }) }),
+
+  // Runs
+  listRuns: () => fetchJSON<{ runs: RunEntry[] }>(`${NODE_BASE}/run`),
+  getRun: (id: string) => fetchJSON<{ run: RunEntry }>(`${NODE_BASE}/run/${id}`),
+  deleteRun: (id: string) => fetchJSON<void>(`${NODE_BASE}/run/${id}`, { method: "DELETE" }),
 };
 
 // =============================================================================

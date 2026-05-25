@@ -64,6 +64,9 @@ class Settings:
     job_ttl: int = 3600
     job_max_history: int = 256
     log_retention_days: int = 7
+    max_environments: int = 32
+    max_functions: int = 256
+    max_runs_history: int = 512
 
     @property
     def local_clients(self) -> set[str]:
@@ -121,4 +124,7 @@ def get_settings() -> Settings:
         job_ttl=int(os.getenv("YGG_NODE_JOB_TTL", "3600")),
         job_max_history=int(os.getenv("YGG_NODE_JOB_MAX_HISTORY", "256")),
         log_retention_days=int(os.getenv("YGG_NODE_LOG_RETENTION_DAYS", "7")),
+        max_environments=int(os.getenv("YGG_NODE_MAX_ENVIRONMENTS", "32")),
+        max_functions=int(os.getenv("YGG_NODE_MAX_FUNCTIONS", "256")),
+        max_runs_history=int(os.getenv("YGG_NODE_MAX_RUNS_HISTORY", "512")),
     )

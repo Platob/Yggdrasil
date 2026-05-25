@@ -6,9 +6,12 @@ from .services.call import CallService
 from .services.cmd import CmdService
 from .services.discovery import DiscoveryService
 from .services.env import EnvService
+from .services.environment import EnvironmentService
+from .services.function import FunctionService
 from .services.job import JobService
 from .services.messenger import MessengerService
 from .services.python import PythonExecService
+from .services.run import RunService
 
 
 def get_env_service(request: Request) -> EnvService:
@@ -37,3 +40,15 @@ def get_messenger_service(request: Request) -> MessengerService:
 
 def get_discovery_service(request: Request) -> DiscoveryService:
     return request.app.state.discovery_service
+
+
+def get_function_service(request: Request) -> FunctionService:
+    return request.app.state.function_service
+
+
+def get_environment_service(request: Request) -> EnvironmentService:
+    return request.app.state.environment_service
+
+
+def get_run_service(request: Request) -> RunService:
+    return request.app.state.run_service

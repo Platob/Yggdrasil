@@ -29,6 +29,27 @@ from .messenger import (
     MessageListResponse,
     ChannelResponse,
 )
+from .function import (
+    FunctionCreate,
+    FunctionUpdate,
+    FunctionEntry,
+    FunctionResponse,
+    FunctionListResponse,
+)
+from .environment import (
+    EnvironmentCreate,
+    EnvironmentUpdate,
+    EnvironmentEntry,
+    EnvironmentResponse,
+    EnvironmentListResponse,
+    InstallRequest,
+)
+from .run import (
+    RunCreate,
+    RunEntry as FunctionRunEntry,
+    RunResponse as FunctionRunResponse,
+    RunListResponse as FunctionRunListResponse,
+)
 
 __all__ = [
     "StrictModel",
@@ -58,4 +79,19 @@ __all__ = [
     "ChannelListResponse",
     "MessageListResponse",
     "ChannelResponse",
+    "FunctionCreate",
+    "FunctionUpdate",
+    "FunctionEntry",
+    "FunctionResponse",
+    "FunctionListResponse",
+    "EnvironmentCreate",
+    "EnvironmentUpdate",
+    "EnvironmentEntry",
+    "EnvironmentResponse",
+    "EnvironmentListResponse",
+    "InstallRequest",
+    "RunCreate",
+    "FunctionRunEntry",
+    "FunctionRunResponse",
+    "FunctionRunListResponse",
 ]

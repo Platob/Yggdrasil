@@ -86,6 +86,16 @@ const Icon = {
       <polyline points="9 18 15 12 9 6" />
     </svg>
   ),
+  code: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" />
+    </svg>
+  ),
+  box: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+    </svg>
+  ),
 };
 
 // ── Service definitions ────────────────────────────────────
@@ -97,6 +107,8 @@ const SERVICES: ServiceSection[] = [
     icon: Icon.bolt,
     items: [
       { href: "/node", label: "Dashboard", icon: Icon.grid, exact: true },
+      { href: "/node/functions", label: "Functions", icon: Icon.code },
+      { href: "/node/environments", label: "Environments", icon: Icon.box },
       { href: "/node/network", label: "Network", icon: Icon.globe },
       { href: "/node/execute", label: "Execute", icon: Icon.terminal },
     ],

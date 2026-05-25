@@ -7,8 +7,32 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .exceptions import register_exception_handlers
-from .routers import call_router, cmd_router, discovery_router, env_router, job_router, messenger_router, python_router
-from .services import CallService, CmdService, DiscoveryService, EnvService, JobService, MessengerService, PythonExecService
+from .routers import (
+    call_router,
+    cmd_router,
+    discovery_router,
+    env_router,
+    environment_router,
+    function_router,
+    job_router,
+    messenger_router,
+    python_router,
+    run_router,
+)
+from .routers.monitor import router as monitor_router
+from .services import (
+    CallService,
+    CmdService,
+    DiscoveryService,
+    EnvService,
+    EnvironmentService,
+    FunctionService,
+    JobService,
+    MessengerService,
+    PythonExecService,
+    RunService,
+)
+from .services.monitor import MonitorService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -30,6 +54,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.call_service = CallService(settings)
     app.state.messenger_service = MessengerService(settings)
     app.state.discovery_service = DiscoveryService(settings, messenger_service=app.state.messenger_service)
+    app.state.monitor_service = MonitorService(settings)
+    app.state.function_service = FunctionService(settings)
+    app.state.environment_service = EnvironmentService(settings)
+    app.state.run_service = RunService(
+        settings,
+        function_service=app.state.function_service,
+        environment_service=app.state.environment_service,
+    )
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -67,6 +99,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(call_router, prefix=f"{prefix}/call")
     app.include_router(messenger_router, prefix=f"{prefix}/messenger")
     app.include_router(discovery_router, prefix=f"{prefix}/hello")
+    app.include_router(function_router, prefix=f"{prefix}/function")
+    app.include_router(environment_router, prefix=f"{prefix}/environment")
+    app.include_router(run_router, prefix=f"{prefix}/run")
+    app.include_router(monitor_router, prefix=f"{prefix}/monitor")
 
     return app
 
