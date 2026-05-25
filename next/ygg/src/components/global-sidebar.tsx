@@ -86,19 +86,44 @@ const Icon = {
       <polyline points="9 18 15 12 9 6" />
     </svg>
   ),
+  code: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" />
+    </svg>
+  ),
+  box: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+    </svg>
+  ),
+  dag: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="5" cy="6" r="3"/><circle cx="19" cy="6" r="3"/><circle cx="12" cy="18" r="3"/>
+      <line x1="7.5" y1="7.5" x2="10.5" y2="16.5"/><line x1="16.5" y1="7.5" x2="13.5" y2="16.5"/>
+    </svg>
+  ),
+  file: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+    </svg>
+  ),
 };
 
 // ── Service definitions ────────────────────────────────────
 const SERVICES: ServiceSection[] = [
   {
-    id: "bot",
-    label: "Bot Control",
-    prefix: "/bot",
+    id: "node",
+    label: "Node Control",
+    prefix: "/node",
     icon: Icon.bolt,
     items: [
-      { href: "/bot", label: "Dashboard", icon: Icon.grid, exact: true },
-      { href: "/bot/network", label: "Network", icon: Icon.globe },
-      { href: "/bot/execute", label: "Execute", icon: Icon.terminal },
+      { href: "/node", label: "Dashboard", icon: Icon.grid, exact: true },
+      { href: "/node/functions", label: "Functions", icon: Icon.code },
+      { href: "/node/environments", label: "Environments", icon: Icon.box },
+      { href: "/node/dags", label: "DAGs", icon: Icon.dag },
+      { href: "/node/files", label: "Files", icon: Icon.file },
+      { href: "/node/network", label: "Network", icon: Icon.globe },
+      { href: "/node/execute", label: "Execute", icon: Icon.terminal },
     ],
   },
   {

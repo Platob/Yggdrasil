@@ -2,11 +2,12 @@
 
 Subcommands::
 
-    ygg bot serve       Start YGGBOT server (foreground)
-    ygg bot run         Call a @remote function
-    ygg bot chat        Open YGGCHAT terminal
-    ygg bot status      Show running bot status
-    ygg bot stop        Stop the background bot
+    ygg node serve      Start node server + frontend (foreground)
+    ygg node front      Start frontend only (Next.js dev server)
+    ygg node run        Call a @remote function
+    ygg node chat       Open YGGCHAT terminal
+    ygg node status     Show running node status
+    ygg node stop       Stop the background node
     ygg genie           Launch YGGGENIE conversational CLI
     ygg databricks      YGGDBKS Databricks management CLI
 """
@@ -17,11 +18,11 @@ import sys
 from typing import Sequence
 
 
-def _ensure_bot_running() -> str:
+def _ensure_node_running() -> str:
     try:
-        from yggdrasil.bot.daemon import get_bot_url, spawn_bot
-        spawn_bot()
-        return get_bot_url()
+        from yggdrasil.node.daemon import get_node_url, spawn_node
+        spawn_node()
+        return get_node_url()
     except Exception:
         return "http://127.0.0.1:8100"
 
@@ -29,43 +30,49 @@ def _ensure_bot_running() -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ygg",
-        description="Yggdrasil CLI — data tools, bot execution, and Databricks utilities.",
+        description="Yggdrasil CLI — data tools, node execution, and Databricks utilities.",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
-    parser.add_argument("--no-bot", action="store_true", help="Skip auto-spawning the background bot.")
+    parser.add_argument("--no-node", action="store_true", help="Skip auto-spawning the background node.")
 
     sub = parser.add_subparsers(dest="command")
 
-    # -- bot ---------------------------------------------------------------
-    bot = sub.add_parser("bot", help="YGGBOT server and remote execution.")
-    bot_sub = bot.add_subparsers(dest="bot_action")
+    # -- node --------------------------------------------------------------
+    node = sub.add_parser("node", help="Yggdrasil node server and remote execution.")
+    node_sub = node.add_subparsers(dest="node_action")
 
-    serve = bot_sub.add_parser("serve", help="Start YGGBOT server (foreground).")
+    serve = node_sub.add_parser("serve", help="Start node server + frontend (foreground).")
     serve.add_argument("--host", default=None, help="Bind host (default: 0.0.0.0).")
     serve.add_argument("--port", type=int, default=None, help="Bind port (auto-scans if busy).")
     serve.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
-    serve.set_defaults(handler=_bot_serve)
+    serve.add_argument("--no-front", action="store_true", default=False, help="Skip launching the frontend.")
+    serve.set_defaults(handler=_node_serve)
 
-    run = bot_sub.add_parser("run", help="Call a @remote function.")
+    front = node_sub.add_parser("front", help="Start frontend dev server only.")
+    front.add_argument("--port", type=int, default=None, help="Frontend port (default: 3000).")
+    front.add_argument("--node-port", type=int, default=None, help="Node API port to proxy to.")
+    front.set_defaults(handler=_node_front)
+
+    run = node_sub.add_parser("run", help="Call a @remote function.")
     run.add_argument("func", help="Function key (e.g. 'mymodule:my_func').")
     run.add_argument("args", nargs="*", default=[], help="Positional arguments.")
-    run.add_argument("--url", default=None, help="Bot server URL (default: auto).")
+    run.add_argument("--url", default=None, help="Node server URL (default: auto).")
     run.add_argument("--kwarg", action="append", default=[], metavar="KEY=VALUE")
     run.add_argument("--timeout", type=float, default=600.0)
     run.add_argument("--stream", action="store_true", default=False)
-    run.set_defaults(handler=_bot_run)
+    run.set_defaults(handler=_node_run)
 
-    chat = bot_sub.add_parser("chat", help="Open YGGCHAT terminal.")
-    chat.add_argument("--url", default=None, help="Bot server URL (default: auto).")
+    chat = node_sub.add_parser("chat", help="Open YGGCHAT terminal.")
+    chat.add_argument("--url", default=None, help="Node server URL (default: auto).")
     chat.add_argument("--user", default=None, help="Display name.")
     chat.add_argument("--channel", default="general", help="Initial channel.")
-    chat.set_defaults(handler=_bot_chat)
+    chat.set_defaults(handler=_node_chat)
 
-    status = bot_sub.add_parser("status", help="Show YGGBOT status.")
-    status.set_defaults(handler=_bot_status)
+    status = node_sub.add_parser("status", help="Show node status.")
+    status.set_defaults(handler=_node_status)
 
-    stop = bot_sub.add_parser("stop", help="Stop YGGBOT.")
-    stop.set_defaults(handler=_bot_stop)
+    stop = node_sub.add_parser("stop", help="Stop the node.")
+    stop.set_defaults(handler=_node_stop)
 
     # -- genie -------------------------------------------------------------
     genie = sub.add_parser("genie", help="Launch YGGGENIE.", add_help=False)
@@ -78,19 +85,65 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _bot_serve(args: argparse.Namespace) -> int:
+def _start_frontend(settings, *, node_port: int, front_port: int | None = None) -> "subprocess.Popen | None":
     import os
-    from yggdrasil.cli.style import Spinner, print_logo
+    import shutil
+    import subprocess
 
-    print_logo("YGGBOT")
+    front_home = settings.front_home
+    if not (front_home / "package.json").exists():
+        from yggdrasil.cli.style import dim, out, yellow
+        out(f"  {yellow('skip')}  frontend not found at {dim(str(front_home))}\n")
+        return None
+
+    npm = shutil.which("npm")
+    if npm is None:
+        from yggdrasil.cli.style import dim, out, yellow
+        out(f"  {yellow('skip')}  npm not found — install Node.js to serve the frontend\n")
+        return None
+
+    if not (front_home / "node_modules").exists():
+        from yggdrasil.cli.style import Spinner
+        with Spinner("installing frontend dependencies...", color="33") as sp:
+            subprocess.run(
+                [npm, "install"],
+                cwd=str(front_home),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            sp.stop()
+
+    from yggdrasil.node.config import _find_open_port
+    port = front_port or _find_open_port(settings.front_port, settings.front_port + 100)
+
+    env = {**os.environ, "YGG_NODE_PORT": str(node_port), "PORT": str(port)}
+    proc = subprocess.Popen(
+        [npm, "run", "dev", "--", "--port", str(port)],
+        cwd=str(front_home),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    from yggdrasil.cli.style import bold, cyan, out
+    out(f"  {cyan('front')} {bold(f'http://localhost:{port}')}\n")
+    return proc
+
+
+def _node_serve(args: argparse.Namespace) -> int:
+    import os
+    from yggdrasil.cli.style import print_logo
+
+    print_logo("YGGNODE")
 
     if args.host:
-        os.environ["YGG_BOT_HOST"] = args.host
+        os.environ["YGG_NODE_HOST"] = args.host
     if args.port:
-        os.environ["YGG_BOT_PORT"] = str(args.port)
+        os.environ["YGG_NODE_PORT"] = str(args.port)
 
-    from yggdrasil.bot.config import _find_open_port, get_settings
-    from yggdrasil.bot.daemon import cleanup_old_logs, ensure_directories
+    from yggdrasil.node.config import _find_open_port, get_settings
+    from yggdrasil.node.daemon import cleanup_old_logs, ensure_directories
 
     settings = get_settings()
     ensure_directories(settings)
@@ -101,19 +154,54 @@ def _bot_serve(args: argparse.Namespace) -> int:
 
     from yggdrasil.cli.style import bold, cyan, dim, out
     out(f"  {cyan('node')}  {bold(settings.node_id)}\n")
-    out(f"  {cyan('home')}  {dim(str(settings.bot_home))}\n")
-    out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n\n")
+    out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
+    out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n")
+
+    front_proc = None
+    if not args.no_front:
+        front_proc = _start_frontend(settings, node_port=port)
+    out("\n")
 
     import uvicorn
-    uvicorn.run("yggdrasil.bot.app:app", host=host, port=port, reload=args.reload)
+    try:
+        uvicorn.run("yggdrasil.node.app:app", host=host, port=port, reload=args.reload)
+    finally:
+        if front_proc is not None:
+            front_proc.terminate()
+            front_proc.wait(timeout=5)
     return 0
 
 
-def _bot_run(args: argparse.Namespace) -> int:
-    from yggdrasil.bot.client import BotClient
+def _node_front(args: argparse.Namespace) -> int:
+    import signal
+
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.cli.style import print_logo
+
+    print_logo("YGGNODE")
+    settings = get_settings()
+
+    node_port = args.node_port or settings.port
+    proc = _start_frontend(settings, node_port=node_port, front_port=args.port)
+    if proc is None:
+        return 1
+
+    from yggdrasil.cli.style import dim, out
+    out(f"  {dim('Press Ctrl+C to stop.')}\n\n")
+
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+    return 0
+
+
+def _node_run(args: argparse.Namespace) -> int:
+    from yggdrasil.node.client import NodeClient
     from yggdrasil.cli.style import Spinner
 
-    url = args.url or _ensure_bot_running()
+    url = args.url or _ensure_node_running()
     kwargs = {}
     for kv in args.kwarg:
         if "=" not in kv:
@@ -122,7 +210,7 @@ def _bot_run(args: argparse.Namespace) -> int:
         k, v = kv.split("=", 1)
         kwargs[k] = v
 
-    client = BotClient(url, timeout=args.timeout)
+    client = NodeClient(url, timeout=args.timeout)
 
     if args.stream:
         try:
@@ -148,42 +236,42 @@ def _bot_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _bot_chat(args: argparse.Namespace) -> int:
-    from yggdrasil.bot.chat import run_chat
-    url = args.url or _ensure_bot_running()
+def _node_chat(args: argparse.Namespace) -> int:
+    from yggdrasil.node.chat import run_chat
+    url = args.url or _ensure_node_running()
     return run_chat(url=url, username=args.user, channel=args.channel)
 
 
-def _bot_status(args: argparse.Namespace) -> int:
-    from yggdrasil.bot.config import get_settings
-    from yggdrasil.bot.daemon import _is_bot_running, ensure_directories
+def _node_status(args: argparse.Namespace) -> int:
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.node.daemon import _is_node_running, ensure_directories
     from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, red
 
-    print_logo("YGGBOT")
+    print_logo("YGGNODE")
     settings = get_settings()
     ensure_directories(settings)
-    running, pid, port = _is_bot_running(settings)
+    running, pid, port = _is_node_running(settings)
 
-    out(f"  {cyan('home')}    {dim(str(settings.bot_home))}\n")
+    out(f"  {cyan('home')}    {dim(str(settings.node_home))}\n")
     out(f"  {cyan('logs')}    {dim(str(settings.logs_root))}\n")
     out(f"  {cyan('cache')}   {dim(str(settings.cache_root))}\n")
     if running:
-        out(f"  {cyan('status')}  {green(f'running')} {dim(f'(pid={pid}, port={port})')}\n")
+        out(f"  {cyan('status')}  {green('running')} {dim(f'(pid={pid}, port={port})')}\n")
         out(f"  {cyan('url')}     {bold(f'http://127.0.0.1:{port}')}\n")
     else:
         out(f"  {cyan('status')}  {red('stopped')}\n")
     return 0
 
 
-def _bot_stop(args: argparse.Namespace) -> int:
-    from yggdrasil.bot.daemon import stop_bot
+def _node_stop(args: argparse.Namespace) -> int:
+    from yggdrasil.node.daemon import stop_node
     from yggdrasil.cli.style import green, out, print_logo, red
 
-    print_logo("YGGBOT")
-    if stop_bot():
-        out(f"  {green('bot stopped.')}\n")
+    print_logo("YGGNODE")
+    if stop_node():
+        out(f"  {green('node stopped.')}\n")
     else:
-        out(f"  {red('no running bot found.')}\n")
+        out(f"  {red('no running node found.')}\n")
     return 0
 
 
@@ -216,13 +304,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    if not getattr(args, "no_bot", False) and args.command not in ("bot",):
-        _ensure_bot_running()
+    if not getattr(args, "no_node", False) and args.command not in ("node",):
+        _ensure_node_running()
 
     handler = getattr(args, "handler", None)
     if handler is None:
-        if args.command == "bot":
-            parser.parse_args(["bot", "--help"])
+        if args.command == "node":
+            parser.parse_args(["node", "--help"])
         parser.print_help()
         return 0
 

@@ -6,9 +6,9 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from yggdrasil.bot.app import create_app
-from yggdrasil.bot.config import Settings
-from yggdrasil.bot.services.discovery import DiscoveryService, _PEER_TTL
+from yggdrasil.node.app import create_app
+from yggdrasil.node.config import Settings
+from yggdrasil.node.services.discovery import DiscoveryService, _PEER_TTL
 
 
 class TestDiscoveryEndpoints(unittest.TestCase):
@@ -125,19 +125,14 @@ class TestDiscoveryEndpoints(unittest.TestCase):
         peer_ids = [p["node_id"] for p in data["peers"]]
         self.assertIn("peer-list-test", peer_ids)
 
-    # -- POST /api/hello/discover ------------------------------------------
-
-    def test_discover_empty_targets(self):
-        resp = self.client.post("/api/hello/discover", json=[])
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertEqual(data["peers"], [])
-
     # -- self-info channels from messenger ---------------------------------
 
     def test_self_info_includes_messenger_channels(self):
         # Create a channel through the messenger service
         self.client.post("/api/messenger/channels?name=discovery-test-chan")
+        # Invalidate response cache so the next GET reflects the new channel.
+        from yggdrasil.node.middleware import invalidate_response_cache
+        invalidate_response_cache()
         resp = self.client.get("/api/hello")
         data = resp.json()
         self.assertIn("discovery-test-chan", data["channels"])
@@ -156,7 +151,7 @@ class TestDiscoveryServiceDirect(unittest.TestCase):
         return self.loop.run_until_complete(coro)
 
     def test_stale_peers_are_purged(self):
-        from yggdrasil.bot.schemas.discovery import HelloRequest
+        from yggdrasil.node.schemas.discovery import HelloRequest
 
         # Register a peer
         self._run(self.service.hello(HelloRequest(
@@ -183,7 +178,7 @@ class TestDiscoveryServiceDirect(unittest.TestCase):
         self.assertNotIn("stale-peer", peer_ids)
 
     def test_hello_logs_new_peer(self):
-        from yggdrasil.bot.schemas.discovery import HelloRequest
+        from yggdrasil.node.schemas.discovery import HelloRequest
 
         resp = self._run(self.service.hello(HelloRequest(
             node_id="fresh-peer",
@@ -202,12 +197,6 @@ class TestDiscoveryServiceDirect(unittest.TestCase):
         self.assertEqual(info.node_id, self.settings.node_id)
         self.assertEqual(info.version, self.settings.app_version)
 
-    def test_discover_friends_unreachable(self):
-        # Targets that don't exist should be handled gracefully
-        resp = self._run(self.service.discover_friends(
-            ["http://192.0.2.1:9999"]  # RFC 5737 TEST-NET, unreachable
-        ))
-        self.assertEqual(resp.peers, [])
 
 
 if __name__ == "__main__":

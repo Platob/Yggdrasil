@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { OrbitControls } from "@react-three/drei";
+import { OrbitControls, Html } from "@react-three/drei";
 import * as THREE from "three";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -193,9 +193,7 @@ function NodeSpikes({
               <bufferGeometry>
                 <bufferAttribute
                   attach="attributes-position"
-                  count={2}
-                  array={new Float32Array([...pos.toArray(), ...endPos.toArray()])}
-                  itemSize={3}
+                  args={[new Float32Array([...pos.toArray(), ...endPos.toArray()]), 3]}
                 />
               </bufferGeometry>
               <lineBasicMaterial color={col} transparent opacity={selected ? 1 : 0.7} />
@@ -444,6 +442,126 @@ function CameraSetup({ isMobile }: { isMobile: boolean }) {
   return null;
 }
 
+// ─── Camera Zoom-To-Node animation ──────────────────────────────────────────
+
+function CameraZoom({ target, rotation }: { target: THREE.Vector3 | null; rotation: number }) {
+  const { camera } = useThree();
+  const targetPos = useRef<THREE.Vector3 | null>(null);
+
+  useEffect(() => {
+    if (!target) {
+      targetPos.current = null;
+      return;
+    }
+    // Apply the globe rotation to the target so camera tracks the rotated position
+    const rotated = target.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), rotation);
+    // Position camera at distance 4 looking toward the node
+    const dir = rotated.clone().normalize();
+    targetPos.current = dir.multiplyScalar(4);
+  }, [target, rotation]);
+
+  useFrame(() => {
+    if (!targetPos.current) return;
+    camera.position.lerp(targetPos.current, 0.025);
+  });
+
+  return null;
+}
+
+// ─── Node Identity Card (Html overlay near selected node) ───────────────────
+
+function NodeIdentityCard({
+  node,
+  rotation,
+  onNavigate,
+}: {
+  node: BotNode;
+  rotation: number;
+  onNavigate: (id: string) => void;
+}) {
+  const pos = useMemo(() => {
+    const base = latLngToVector3(node.lat, node.lng, GLOBE_RADIUS + 0.3);
+    return base;
+  }, [node.lat, node.lng]);
+
+  const groupRef = useRef<THREE.Group>(null);
+  useFrame(() => {
+    if (groupRef.current) groupRef.current.rotation.y = rotation;
+  });
+
+  const statusColor = node.status === "online" ? "#4ade80" : node.status === "pending" ? "#fbbf24" : "#ef4444";
+
+  const formatUptime = (s?: number) => {
+    if (!s || s === 0) return "Offline";
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  };
+
+  return (
+    <group ref={groupRef}>
+      <Html position={pos} distanceFactor={6} zIndexRange={[100, 0]} center>
+        <div
+          className="pointer-events-auto select-none w-[200px] rounded-lg p-3 backdrop-blur-md text-white"
+          style={{
+            background: "rgba(8,8,14,0.94)",
+            border: "1px solid rgba(255,255,255,0.12)",
+            boxShadow: "0 4px 24px rgba(0,0,0,0.5)",
+            fontSize: "11px",
+          }}
+        >
+          {/* Header */}
+          <div className="flex items-center gap-1.5 mb-2">
+            <span
+              className="w-2 h-2 rounded-full flex-shrink-0"
+              style={{ background: statusColor, boxShadow: `0 0 6px ${statusColor}` }}
+            />
+            <span className="font-semibold truncate">{node.label || node.id}</span>
+            {node.version && (
+              <span className="ml-auto text-[9px] text-white/40 font-mono">v{node.version}</span>
+            )}
+          </div>
+
+          {/* Details */}
+          <div className="space-y-1 text-[10px] text-white/60">
+            <div className="flex justify-between">
+              <span>ID</span>
+              <span className="font-mono text-white/80 truncate max-w-[110px]">{node.id}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Coordinates</span>
+              <span className="font-mono text-white/80">{node.lat.toFixed(2)}, {node.lng.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Uptime</span>
+              <span className="font-mono text-white/80">{formatUptime(node.uptime)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Status</span>
+              <span className="font-mono capitalize" style={{ color: statusColor }}>{node.status}</span>
+            </div>
+          </div>
+
+          {/* Navigate button */}
+          <button
+            onClick={(e) => { e.stopPropagation(); onNavigate(node.id); }}
+            className="mt-2 w-full text-center py-1 rounded text-[10px] font-medium transition-colors"
+            style={{
+              background: "rgba(242,107,58,0.15)",
+              border: "1px solid rgba(242,107,58,0.3)",
+              color: "#f26b3a",
+            }}
+            onMouseEnter={(e) => { (e.target as HTMLElement).style.background = "rgba(242,107,58,0.3)"; }}
+            onMouseLeave={(e) => { (e.target as HTMLElement).style.background = "rgba(242,107,58,0.15)"; }}
+          >
+            View Details &rarr;
+          </button>
+        </div>
+      </Html>
+    </group>
+  );
+}
+
 // ─── Scene ────────────────────────────────────────────────────────────────────
 
 function GlobeScene({
@@ -451,20 +569,28 @@ function GlobeScene({
   arcs,
   selectedId,
   onSelect,
+  onNavigate,
   isMobile,
 }: {
   nodes: BotNode[];
   arcs: ArcDef[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  onNavigate?: (id: string) => void;
   isMobile: boolean;
 }) {
   const [rotation, setRotation] = useState(() => getTimezoneRotation());
   useFrame((_, delta) => setRotation((r) => r + delta * 0.055));
 
+  const selectedNode = nodes.find((n) => n.id === selectedId) ?? null;
+  const selectedTarget = selectedNode
+    ? latLngToVector3(selectedNode.lat, selectedNode.lng, GLOBE_RADIUS)
+    : null;
+
   return (
     <>
       <CameraSetup isMobile={isMobile} />
+      <CameraZoom target={selectedTarget} rotation={rotation} />
       <ambientLight intensity={0.1} />
       <directionalLight position={[5, 3, 5]} intensity={0.35} color="#ffffff" />
       <directionalLight position={[-5, 3, 5]} intensity={0.2} color="#f26b3a" />
@@ -480,9 +606,18 @@ function GlobeScene({
       <ArcConnections nodes={nodes} arcs={arcs} rotation={rotation} />
       <LandingPulses nodes={nodes} rotation={rotation} />
 
+      {/* Node identity card overlay */}
+      {selectedNode && (
+        <NodeIdentityCard
+          node={selectedNode}
+          rotation={rotation}
+          onNavigate={onNavigate ?? (() => {})}
+        />
+      )}
+
       <OrbitControls
         enablePan={false}
-        minDistance={3.5}
+        minDistance={2.5}
         maxDistance={9}
         enableDamping
         dampingFactor={0.06}
@@ -500,12 +635,14 @@ export function WorldGlobe({
   arcs,
   selectedId,
   onSelect,
+  onNavigate,
   className = "",
 }: {
   nodes: BotNode[];
   arcs: ArcDef[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  onNavigate?: (id: string) => void;
   className?: string;
 }) {
   const [mounted, setMounted] = useState(false);
@@ -534,6 +671,7 @@ export function WorldGlobe({
         arcs={arcs}
         selectedId={selectedId}
         onSelect={onSelect}
+        onNavigate={onNavigate}
         isMobile={isMobile}
       />
     </Canvas>

@@ -1,10 +1,13 @@
 /**
  * Frontend API client for Yggdrasil Dashboard
- * 
+ *
  * Two namespaces:
- * - `bot.*` - Calls proxied to FastAPI bot backend (real-time, execution)
+ * - `node.*` - Calls proxied to FastAPI bot backend (real-time, execution)
  * - `api.*` - Calls to Next.js API routes (cached, aggregated, config)
  */
+
+import { nodeCache, listCache } from "./cache";
+
 
 // =============================================================================
 // Types
@@ -61,6 +64,14 @@ export interface NodeInfo {
   uptime: number;
   channels: string[];
   functions: string[];
+  lat: number | null;
+  lon: number | null;
+}
+
+// -- Peers --
+export interface PeersResponse {
+  node_id: string;
+  peers: NodeInfo[];
 }
 
 // -- Next.js API types --
@@ -87,6 +98,112 @@ export interface CachedDashboard {
   cachedAt: string;
 }
 
+// -- Filesystem --
+export interface FileInfo {
+  path: string;
+  name: string;
+  is_dir: boolean;
+  size: number;
+  modified_at: string;
+  created_at: string;
+}
+
+// -- Functions --
+export interface FunctionEntry {
+  id: number;
+  name: string;
+  language: string;
+  code: string;
+  description: string;
+  python_version: string | null;
+  dependencies: string[];
+  environment_id: number | null;
+  creator: string;
+  created_at: string;
+  updated_at: string;
+  run_count: number;
+  deleted_at: string | null;
+  last_used_at: string | null;
+  state: string;
+}
+
+// -- Environments --
+export interface EnvironmentEntry {
+  id: number;
+  name: string;
+  python_version: string;
+  dependencies: string[];
+  path: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  error: string | null;
+  deleted_at: string | null;
+  last_used_at: string | null;
+  state: string;
+}
+
+// -- Runs --
+export interface RunEntry {
+  id: number;
+  function_id: number;
+  environment_id: number | null;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  duration: number | null;
+  returncode: number | null;
+  stdout: string | null;
+  stderr: string | null;
+  result: unknown;
+  node_id: string;
+  max_memory_mb: number | null;
+  max_cpu_percent: number | null;
+  timeout: number | null;
+}
+
+// -- DAGs --
+export interface DagNodeRef {
+  node_url: string | null;
+  function_id: number;
+  environment_id: number | null;
+  args: Record<string, unknown>;
+}
+
+export interface DagEdge {
+  from_step: string;
+  to_step: string;
+  output_key: string;
+  input_key: string;
+}
+
+export interface DagStep {
+  id: string;
+  ref: DagNodeRef;
+  depends_on: string[];
+}
+
+export interface DagEntry {
+  id: number;
+  name: string;
+  description: string;
+  steps: DagStep[];
+  edges: DagEdge[];
+  created_at: string;
+  updated_at: string;
+  run_count: number;
+}
+
+export interface DagRunEntry {
+  id: number;
+  dag_id: number;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  duration: number | null;
+  step_results: Record<string, unknown>;
+}
+
 // =============================================================================
 // Fetch Helpers
 // =============================================================================
@@ -104,72 +221,126 @@ async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 // =============================================================================
-// Bot API (proxied to FastAPI via /api/bot/*)
+// Bot API (proxied to FastAPI via /api/node/*)
 // =============================================================================
 
-const BOT_BASE = "/api/bot";
+const NODE_BASE = "/api/node";
 
-export const bot = {
+export const node = {
   // Python execution
   executePython: (code: string): Promise<PythonResponse> =>
-    fetchJSON(`${BOT_BASE}/python`, {
+    fetchJSON(`${NODE_BASE}/python`, {
       method: "POST",
       body: JSON.stringify({ code }),
     }),
 
   // Shell commands
   executeCmd: (command: string[]): Promise<CmdResponse> =>
-    fetchJSON(`${BOT_BASE}/cmd`, {
+    fetchJSON(`${NODE_BASE}/cmd`, {
       method: "POST",
       body: JSON.stringify({ command }),
     }),
 
   // Messaging
   sendMessage: (text: string, sender: string, channel: string): Promise<Message> =>
-    fetchJSON(`${BOT_BASE}/messenger`, {
+    fetchJSON(`${NODE_BASE}/messenger`, {
       method: "POST",
       body: JSON.stringify({ text, sender, channel }),
     }),
 
   getChannels: async (): Promise<ChannelInfo[]> => {
-    const data = await fetchJSON<{ channels: ChannelInfo[] }>(`${BOT_BASE}/messenger/channels`);
+    const data = await fetchJSON<{ channels: ChannelInfo[] }>(`${NODE_BASE}/messenger/channels`);
     return data.channels;
   },
 
   getMessages: async (channel: string, limit = 100): Promise<Message[]> => {
     const data = await fetchJSON<{ messages: Message[] }>(
-      `${BOT_BASE}/messenger/channels/${channel}/messages?limit=${limit}`
+      `${NODE_BASE}/messenger/channels/${channel}/messages?limit=${limit}`
     );
     return data.messages;
   },
 
   pollMessages: async (channel: string, afterId: string, timeout = 25): Promise<Message[]> => {
     const data = await fetchJSON<{ messages: Message[] }>(
-      `${BOT_BASE}/messenger/channels/${channel}/poll?after_id=${afterId}&timeout=${timeout}`
+      `${NODE_BASE}/messenger/channels/${channel}/poll?after_id=${afterId}&timeout=${timeout}`
     );
     return data.messages;
   },
 
   createChannel: async (name: string): Promise<ChannelInfo> => {
     const data = await fetchJSON<{ channel: ChannelInfo }>(
-      `${BOT_BASE}/messenger/channels?name=${encodeURIComponent(name)}`,
+      `${NODE_BASE}/messenger/channels?name=${encodeURIComponent(name)}`,
       { method: "POST" }
     );
     return data.channel;
   },
 
-  // Node info (direct)
-  getNodeInfo: (): Promise<NodeInfo> => fetchJSON(`${BOT_BASE}/hello`),
+  // Node info (cached 30s)
+  getNodeInfo: (): Promise<NodeInfo> =>
+    nodeCache.getOrFetch("self", () => fetchJSON(`${NODE_BASE}/hello`)) as Promise<NodeInfo>,
+
+  // Peers (cached 30s)
+  getPeers: (): Promise<PeersResponse> =>
+    nodeCache.getOrFetch("peers", () => fetchJSON(`${NODE_BASE}/hello/peers`)) as Promise<PeersResponse>,
 
   // Registry
-  getRegistry: (): Promise<Record<string, string>> => fetchJSON(`${BOT_BASE}/call/registry`),
+  getRegistry: (): Promise<Record<string, string>> => fetchJSON(`${NODE_BASE}/call/registry`),
 
   // Remote function call
   callFunction: <T = unknown>(name: string, args: Record<string, unknown> = {}): Promise<T> =>
-    fetchJSON(`${BOT_BASE}/call/${name}`, {
+    fetchJSON(`${NODE_BASE}/call/${name}`, {
       method: "POST",
       body: JSON.stringify(args),
     }),
+
+  // Functions (cached 10s)
+  listFunctions: () =>
+    listCache.getOrFetch("functions", () => fetchJSON(`${NODE_BASE}/function`)) as Promise<{ functions: FunctionEntry[] }>,
+  createFunction: (data: { name: string; code: string; language?: string; description?: string; python_version?: string; dependencies?: string[]; environment_id?: number }) =>
+    fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function`, { method: "POST", body: JSON.stringify(data) }),
+  getFunction: (id: number) => fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}`),
+  updateFunction: (id: number, data: Record<string, unknown>) =>
+    fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  deleteFunction: (id: number) => fetchJSON<void>(`${NODE_BASE}/function/${id}`, { method: "DELETE" }),
+  runFunction: (id: number, args?: Record<string, unknown>) =>
+    fetchJSON<{ run: RunEntry }>(`${NODE_BASE}/function/${id}/run`, { method: "POST", body: JSON.stringify(args || {}) }),
+  listFunctionRuns: (id: number) => fetchJSON<{ runs: RunEntry[] }>(`${NODE_BASE}/function/${id}/run`),
+
+  // Environments (cached 10s)
+  listEnvironments: () =>
+    listCache.getOrFetch("environments", () => fetchJSON(`${NODE_BASE}/environment`)) as Promise<{ environments: EnvironmentEntry[] }>,
+  createEnvironment: (data: { name: string; python_version?: string; dependencies?: string[] }) =>
+    fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment`, { method: "POST", body: JSON.stringify(data) }),
+  getEnvironment: (id: number) => fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}`),
+  deleteEnvironment: (id: number) => fetchJSON<void>(`${NODE_BASE}/environment/${id}`, { method: "DELETE" }),
+  installPackages: (id: number, packages: string[]) =>
+    fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}/install`, { method: "POST", body: JSON.stringify({ packages }) }),
+
+  // Runs
+  listRuns: () => fetchJSON<{ runs: RunEntry[] }>(`${NODE_BASE}/run`),
+  getRun: (id: number) => fetchJSON<{ run: RunEntry }>(`${NODE_BASE}/run/${id}`),
+  deleteRun: (id: number) => fetchJSON<void>(`${NODE_BASE}/run/${id}`, { method: "DELETE" }),
+
+  // DAGs
+  listDags: () => fetchJSON<{ dags: DagEntry[] }>(`${NODE_BASE}/dag`),
+  createDag: (data: { name: string; description?: string; steps: DagStep[]; edges?: DagEdge[] }) =>
+    fetchJSON<{ dag: DagEntry }>(`${NODE_BASE}/dag`, { method: "POST", body: JSON.stringify(data) }),
+  getDag: (id: number) => fetchJSON<{ dag: DagEntry }>(`${NODE_BASE}/dag/${id}`),
+  deleteDag: (id: number) => fetchJSON<void>(`${NODE_BASE}/dag/${id}`, { method: "DELETE" }),
+  runDag: (id: number) => fetchJSON<{ run: DagRunEntry }>(`${NODE_BASE}/dag/${id}/run`, { method: "POST" }),
+  listDagRuns: (id: number) => fetchJSON<{ runs: DagRunEntry[] }>(`${NODE_BASE}/dag/${id}/run`),
+  getDagRun: (dagId: number, runId: number) => fetchJSON<{ run: DagRunEntry }>(`${NODE_BASE}/dag/${dagId}/run/${runId}`),
+
+  // Filesystem
+  listDir: (path?: string) => fetchJSON<{ path: string; entries: FileInfo[] }>(`${NODE_BASE}/fs/ls?path=${encodeURIComponent(path || "")}`),
+  readFile: (path: string) => fetchJSON<{ path: string; content: string; encoding: string }>(`${NODE_BASE}/fs/read?path=${encodeURIComponent(path)}`),
+  writeFile: (path: string, content: string) => fetchJSON<{ path: string }>(`${NODE_BASE}/fs/write`, { method: "POST", body: JSON.stringify({ path, content }) }),
+  deleteFile: (path: string) => fetchJSON<void>(`${NODE_BASE}/fs/delete?path=${encodeURIComponent(path)}`, { method: "DELETE" }),
+  mkdir: (path: string) => fetchJSON<void>(`${NODE_BASE}/fs/mkdir?path=${encodeURIComponent(path)}`, { method: "POST" }),
+
+  // Clone
+  cloneFunction: (id: number, name?: string) => fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}/clone`, { method: "POST", body: JSON.stringify({ name }) }),
+  cloneEnvironment: (id: number, name?: string) => fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}/clone`, { method: "POST", body: JSON.stringify({ name }) }),
 };
 
 // =============================================================================
@@ -193,29 +364,29 @@ export const api = {
 // Legacy exports (for backward compatibility during migration)
 // =============================================================================
 
-/** @deprecated Use bot.executePython instead */
-export const executePython = bot.executePython;
+/** @deprecated Use node.executePython instead */
+export const executePython = node.executePython;
 
-/** @deprecated Use bot.executeCmd instead */
-export const executeCmd = bot.executeCmd;
+/** @deprecated Use node.executeCmd instead */
+export const executeCmd = node.executeCmd;
 
-/** @deprecated Use bot.sendMessage instead */
-export const sendMessage = bot.sendMessage;
+/** @deprecated Use node.sendMessage instead */
+export const sendMessage = node.sendMessage;
 
-/** @deprecated Use bot.getChannels instead */
-export const getChannels = bot.getChannels;
+/** @deprecated Use node.getChannels instead */
+export const getChannels = node.getChannels;
 
-/** @deprecated Use bot.getMessages instead */
-export const getMessages = bot.getMessages;
+/** @deprecated Use node.getMessages instead */
+export const getMessages = node.getMessages;
 
-/** @deprecated Use bot.pollMessages instead */
-export const pollMessages = bot.pollMessages;
+/** @deprecated Use node.pollMessages instead */
+export const pollMessages = node.pollMessages;
 
-/** @deprecated Use bot.createChannel instead */
-export const createChannel = bot.createChannel;
+/** @deprecated Use node.createChannel instead */
+export const createChannel = node.createChannel;
 
-/** @deprecated Use bot.getNodeInfo instead */
-export const getNodeInfo = bot.getNodeInfo;
+/** @deprecated Use node.getNodeInfo instead */
+export const getNodeInfo = node.getNodeInfo;
 
-/** @deprecated Use bot.getRegistry instead */
-export const getRegistry = bot.getRegistry;
+/** @deprecated Use node.getRegistry instead */
+export const getRegistry = node.getRegistry;

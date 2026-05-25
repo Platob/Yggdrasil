@@ -1,0 +1,488 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { node as api, type EnvironmentEntry, type NodeInfo } from "@/lib/api";
+import { formatRelative } from "@/lib/time";
+import Link from "next/link";
+
+// ── Demo data ────────────────────────────────────────────────
+const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
+  {
+    id: 1,
+    name: "metrics-env",
+    python_version: "3.12",
+    dependencies: ["psutil", "requests"],
+    path: "/var/ygg/envs/metrics-env",
+    status: "ready",
+    created_at: "2025-05-15T10:00:00Z",
+    updated_at: "2025-05-22T14:00:00Z",
+    error: null,
+    deleted_at: null,
+    last_used_at: null,
+    state: "ready",
+  },
+  {
+    id: 2,
+    name: "data-science",
+    python_version: "3.11",
+    dependencies: ["pandas", "numpy", "scikit-learn", "matplotlib"],
+    path: "/var/ygg/envs/data-science",
+    status: "ready",
+    created_at: "2025-05-12T08:00:00Z",
+    updated_at: "2025-05-20T16:30:00Z",
+    error: null,
+    deleted_at: null,
+    last_used_at: null,
+    state: "ready",
+  },
+  {
+    id: 3,
+    name: "ml-pipeline",
+    python_version: "3.12",
+    dependencies: ["torch", "transformers", "datasets"],
+    path: "/var/ygg/envs/ml-pipeline",
+    status: "creating",
+    created_at: "2025-05-24T12:00:00Z",
+    updated_at: "2025-05-24T12:00:00Z",
+    error: null,
+    deleted_at: null,
+    last_used_at: null,
+    state: "ready",
+  },
+  {
+    id: 4,
+    name: "broken-env",
+    python_version: "3.10",
+    dependencies: ["nonexistent-package-xyz"],
+    path: "/var/ygg/envs/broken-env",
+    status: "failed",
+    created_at: "2025-05-23T09:00:00Z",
+    updated_at: "2025-05-23T09:01:00Z",
+    error: "pip install failed: No matching distribution found for nonexistent-package-xyz",
+    deleted_at: null,
+    last_used_at: null,
+    state: "failed",
+  },
+];
+
+function statusDotClass(status: string): string {
+  switch (status) {
+    case "ready": return "status-dot online";
+    case "creating": return "status-dot pending";
+    case "failed": return "status-dot offline";
+    default: return "status-dot";
+  }
+}
+
+function statusLabel(status: string): string {
+  switch (status) {
+    case "ready": return "Ready";
+    case "creating": return "Creating...";
+    case "failed": return "Failed";
+    default: return status;
+  }
+}
+
+export default function EnvironmentsPage() {
+  const [environments, setEnvironments] = useState<EnvironmentEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [showForm, setShowForm] = useState(false);
+  const [installFormId, setInstallFormId] = useState<number | null>(null);
+  const [installPackages, setInstallPackages] = useState("");
+  const [installing, setInstalling] = useState(false);
+
+  // Form state
+  const [formName, setFormName] = useState("");
+  const [formPythonVersion, setFormPythonVersion] = useState("3.12");
+  const [formDeps, setFormDeps] = useState("");
+  const [formSubmitting, setFormSubmitting] = useState(false);
+
+  // Clone modal state
+  const [cloneTarget, setCloneTarget] = useState<EnvironmentEntry | null>(null);
+  const [cloneName, setCloneName] = useState("");
+  const [cloneNodeId, setCloneNodeId] = useState("");
+  const [cloning, setCloning] = useState(false);
+  const [nodes, setNodes] = useState<NodeInfo[]>([]);
+
+  useEffect(() => {
+    loadEnvironments();
+    loadNodes();
+  }, []);
+
+  async function loadEnvironments() {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await api.listEnvironments();
+      setEnvironments(data.environments);
+    } catch {
+      setError("Node unavailable - showing demo data");
+      setEnvironments(DEMO_ENVIRONMENTS);
+    }
+    setLoading(false);
+  }
+
+  async function loadNodes() {
+    try {
+      const [selfData, peersData] = await Promise.all([
+        api.getNodeInfo(),
+        api.getPeers(),
+      ]);
+      setNodes([selfData, ...peersData.peers]);
+    } catch {
+      // non-critical
+    }
+  }
+
+  function openCloneModal(env: EnvironmentEntry) {
+    setCloneTarget(env);
+    setCloneName(`${env.name}-copy`);
+    setCloneNodeId("");
+  }
+
+  async function handleClone() {
+    if (!cloneTarget) return;
+    setCloning(true);
+    try {
+      await api.cloneEnvironment(cloneTarget.id, cloneName || undefined);
+      setCloneTarget(null);
+      await loadEnvironments();
+    } catch (e) {
+      setError(`Clone failed: ${e}`);
+    }
+    setCloning(false);
+  }
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    setFormSubmitting(true);
+    try {
+      const deps = formDeps.split("\n").map((d) => d.trim()).filter(Boolean);
+      await api.createEnvironment({
+        name: formName,
+        python_version: formPythonVersion,
+        dependencies: deps,
+      });
+      setShowForm(false);
+      setFormName("");
+      setFormDeps("");
+      await loadEnvironments();
+    } catch (e) {
+      setError(`Create failed: ${e}`);
+    }
+    setFormSubmitting(false);
+  }
+
+  async function handleDelete(id: number) {
+    if (!confirm("Delete this environment? This cannot be undone.")) return;
+    try {
+      await api.deleteEnvironment(id);
+      await loadEnvironments();
+    } catch (e) {
+      setError(`Delete failed: ${e}`);
+    }
+  }
+
+  async function handleInstall(id: number) {
+    setInstalling(true);
+    try {
+      const packages = installPackages.split(",").map((p) => p.trim()).filter(Boolean);
+      if (packages.length === 0) return;
+      await api.installPackages(id, packages);
+      setInstallFormId(null);
+      setInstallPackages("");
+      await loadEnvironments();
+    } catch (e) {
+      setError(`Install failed: ${e}`);
+    }
+    setInstalling(false);
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-[80vh]">
+        <div className="text-center animate-in">
+          <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full spin-slow mx-auto mb-4" />
+          <p className="text-primary font-mono text-sm pulse-primary">Loading environments...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 space-y-6 animate-in">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-bold text-foreground">Environments</h1>
+          <p className="text-sm text-muted mt-0.5">
+            {environments.length} environment{environments.length !== 1 ? "s" : ""} configured
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          {error && (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-warning/10 border border-warning/20">
+              <div className="status-dot pending" />
+              <span className="text-xs font-medium text-warning">{error}</span>
+            </div>
+          )}
+          <button onClick={() => setShowForm(!showForm)} className="btn-primary text-sm">
+            {showForm ? "Cancel" : "New Environment"}
+          </button>
+        </div>
+      </div>
+
+      {/* Creation Form */}
+      {showForm && (
+        <form onSubmit={handleCreate} className="nordic-card p-5 space-y-4">
+          <h2 className="text-sm font-semibold text-foreground">Create Environment</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Name</label>
+              <input
+                type="text"
+                value={formName}
+                onChange={(e) => setFormName(e.target.value)}
+                className="input-nordic w-full text-sm"
+                placeholder="my-environment"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Python Version</label>
+              <select
+                value={formPythonVersion}
+                onChange={(e) => setFormPythonVersion(e.target.value)}
+                className="input-nordic w-full text-sm"
+              >
+                <option value="3.10">3.10</option>
+                <option value="3.11">3.11</option>
+                <option value="3.12">3.12</option>
+                <option value="3.13">3.13</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs text-muted mb-1.5">Dependencies (one per line)</label>
+            <textarea
+              value={formDeps}
+              onChange={(e) => setFormDeps(e.target.value)}
+              className="input-nordic w-full text-sm font-mono"
+              rows={5}
+              placeholder={"requests\npandas\nnumpy"}
+            />
+          </div>
+          <div className="flex justify-end">
+            <button type="submit" className="btn-primary text-sm" disabled={formSubmitting}>
+              {formSubmitting ? "Creating..." : "Create Environment"}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* Environments List */}
+      <div className="space-y-3">
+        {environments.map((env) => (
+          <div key={env.id} className="nordic-card p-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-3 mb-2">
+                  <div className={statusDotClass(env.status)} />
+                  <Link href={`/node/environments/${env.id}`} className="font-mono text-sm font-medium text-foreground hover:text-primary transition-colors">{env.name}</Link>
+                  <span
+                    className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
+                    style={{
+                      color: env.status === "ready" ? "var(--success)" : env.status === "creating" ? "var(--warning)" : "var(--destructive)",
+                      background: env.status === "ready" ? "rgba(74,222,128,0.1)" : env.status === "creating" ? "rgba(251,191,36,0.1)" : "rgba(239,68,68,0.1)",
+                    }}
+                  >
+                    {statusLabel(env.status)}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-xs mb-3">
+                  <div>
+                    <span className="text-muted">Python</span>
+                    <p className="font-mono text-foreground-dim">{env.python_version}</p>
+                  </div>
+                  <div>
+                    <span className="text-muted">Packages</span>
+                    <p className="text-foreground-dim">{env.dependencies.length}</p>
+                  </div>
+                  <div className="col-span-2">
+                    <span className="text-muted">Path</span>
+                    <p className="font-mono text-foreground-dim truncate text-[11px]">{env.path}</p>
+                  </div>
+                </div>
+
+                {/* Dependencies pills */}
+                {env.dependencies.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mb-3">
+                    {env.dependencies.map((dep) => (
+                      <span key={dep} className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-border/50 text-muted border border-border">
+                        {dep}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Error message */}
+                {env.error && (
+                  <div className="mt-2 p-3 rounded-lg bg-destructive/5 border border-destructive/20">
+                    <pre className="text-xs text-destructive/80 font-mono whitespace-pre-wrap">{env.error}</pre>
+                  </div>
+                )}
+
+                {/* Install form inline */}
+                {installFormId === env.id && (
+                  <div className="mt-3 flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={installPackages}
+                      onChange={(e) => setInstallPackages(e.target.value)}
+                      className="input-nordic text-sm flex-1"
+                      placeholder="package1, package2"
+                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleInstall(env.id); } }}
+                    />
+                    <button
+                      onClick={() => handleInstall(env.id)}
+                      disabled={installing}
+                      className="btn-primary text-xs"
+                    >
+                      {installing ? "..." : "Install"}
+                    </button>
+                    <button
+                      onClick={() => { setInstallFormId(null); setInstallPackages(""); }}
+                      className="btn-ghost text-xs"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+
+                {/* Sync state */}
+                <div className="mt-2">
+                  {env.last_used_at ? (
+                    <span className="text-[10px] text-success flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-success" />
+                      Synced {formatRelative(env.last_used_at)}
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-warning flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-warning" />
+                      Not synced
+                    </span>
+                  )}
+                </div>
+
+                {/* Timestamps */}
+                <div className="flex gap-4 text-[10px] text-muted mt-2">
+                  <span>Created: {new Date(env.created_at).toLocaleDateString()}</span>
+                  <span>Updated: {new Date(env.updated_at).toLocaleDateString()}</span>
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className="flex flex-col gap-2 shrink-0">
+                {env.status === "ready" && installFormId !== env.id && (
+                  <button
+                    onClick={() => { setInstallFormId(env.id); setInstallPackages(""); }}
+                    className="btn-ghost text-xs"
+                  >
+                    Install Pkg
+                  </button>
+                )}
+                <button
+                  onClick={() => openCloneModal(env)}
+                  className="btn-ghost text-xs"
+                >
+                  Clone
+                </button>
+                <button
+                  onClick={() => handleDelete(env.id)}
+                  className="btn-ghost text-xs text-destructive hover:bg-destructive/10"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {environments.length === 0 && (
+        <div className="nordic-card p-6 space-y-4">
+          <h2 className="text-sm font-semibold text-foreground">Python Environments</h2>
+          <p className="text-sm text-muted">Manage isolated Python environments with uv.</p>
+
+          <div className="code-block p-3 text-xs">
+            <p className="text-muted mb-1"># Create an environment via decorator</p>
+            <p>@function(environment=&quot;ml-env&quot;)</p>
+            <p>def train(data):</p>
+            <p>    import torch  # available in ml-env</p>
+            <p>    return model.train(data)</p>
+          </div>
+
+          <div className="code-block p-3 text-xs">
+            <p className="text-muted mb-1"># Each environment auto-installs yggdrasil + uv</p>
+            <p>run = train.with_env(&quot;ml-env&quot;)(data)</p>
+          </div>
+
+          <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-2">
+            Create your first environment
+          </button>
+        </div>
+      )}
+
+      {/* Clone Modal */}
+      {cloneTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setCloneTarget(null)} />
+          <div className="relative nordic-card p-6 w-full max-w-md space-y-4 mx-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-foreground">Clone environment to node</h3>
+              <button onClick={() => setCloneTarget(null)} className="text-muted hover:text-foreground transition-colors">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Target Node</label>
+              <select
+                value={cloneNodeId}
+                onChange={(e) => setCloneNodeId(e.target.value)}
+                className="input-nordic w-full text-sm"
+              >
+                <option value="">Local (this node)</option>
+                {nodes.map((n) => (
+                  <option key={n.node_id} value={n.node_id}>{n.node_id}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs text-muted mb-1.5">New Name</label>
+              <input
+                type="text"
+                value={cloneName}
+                onChange={(e) => setCloneName(e.target.value)}
+                className="input-nordic w-full text-sm font-mono"
+                placeholder="environment-name-copy"
+              />
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button onClick={() => setCloneTarget(null)} className="btn-ghost text-sm">Cancel</button>
+              <button onClick={handleClone} disabled={cloning} className="btn-primary text-sm">
+                {cloning ? "Cloning..." : "Clone"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

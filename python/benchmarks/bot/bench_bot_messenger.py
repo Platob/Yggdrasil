@@ -1,4 +1,4 @@
-"""Benchmark yggdrasil.bot messenger service.
+"""Benchmark yggdrasil.node messenger service.
 
 Covers in-memory message throughput, channel operations, and the
 HTTP endpoint overhead for the chat system.
@@ -42,9 +42,9 @@ def _fmt(label: str, samples: list[float]) -> str:
 def _bench_service_direct(repeat: int) -> None:
     """Benchmark the MessengerService directly (no HTTP overhead)."""
     import asyncio
-    from yggdrasil.bot.config import Settings
-    from yggdrasil.bot.services.messenger import MessengerService
-    from yggdrasil.bot.schemas.messenger import MessageSend
+    from yggdrasil.node.config import Settings
+    from yggdrasil.node.services.messenger import MessengerService
+    from yggdrasil.node.schemas.messenger import MessageSend
 
     settings = Settings(allow_remote=True)
     service = MessengerService(settings)
@@ -100,8 +100,8 @@ def _bench_service_direct(repeat: int) -> None:
 def _bench_endpoint(repeat: int) -> None:
     """Benchmark messenger via TestClient (full HTTP stack)."""
     from fastapi.testclient import TestClient
-    from yggdrasil.bot.app import create_app
-    from yggdrasil.bot.config import Settings
+    from yggdrasil.node.app import create_app
+    from yggdrasil.node.config import Settings
 
     settings = Settings(allow_remote=True)
     app = create_app(settings)
@@ -142,9 +142,9 @@ def _bench_endpoint(repeat: int) -> None:
 def _bench_throughput(repeat: int) -> None:
     """Measure raw message throughput."""
     import asyncio
-    from yggdrasil.bot.config import Settings
-    from yggdrasil.bot.services.messenger import MessengerService
-    from yggdrasil.bot.schemas.messenger import MessageSend
+    from yggdrasil.node.config import Settings
+    from yggdrasil.node.services.messenger import MessengerService
+    from yggdrasil.node.schemas.messenger import MessageSend
 
     settings = Settings(allow_remote=True)
     service = MessengerService(settings)
@@ -174,7 +174,7 @@ def _bench_throughput(repeat: int) -> None:
 def run(repeat: int) -> None:
     print()
     print("=" * 82)
-    print(f"  yggdrasil.bot messenger benchmark  (repeat={repeat})")
+    print(f"  yggdrasil.node messenger benchmark  (repeat={repeat})")
     print("=" * 82)
 
     _bench_service_direct(repeat)
