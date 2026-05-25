@@ -836,25 +836,20 @@ class HTTPSession(Session):
     def _load_cached_response(
         self,
         request: PreparedRequest,
-        cache_cfg: CacheConfig,
         *,
         source: str,
     ) -> Optional[Response]:
         """Resolve one request against a cache backend (local or remote).
 
-        Same call shape for both sides: build
-        :meth:`CacheConfig.make_lookup_predicate`, push it through
-        :meth:`Tabular.read_arrow_batches`, client-side dedup by
-        ``received_at`` (APPEND-mode caches can hold multiple rows
-        per identity), and filter on
-        :meth:`CacheConfig.filter_response`.
-
-        Skips the per-request :meth:`PreparedRequest.anonymize` pass
-        when ``cache_cfg.request_by_is_public`` holds — the
-        predicate and the row's match keys collapse to the same
-        ``public_*`` columns either way.
+        Reads the :class:`CacheConfig` from the request's
+        :attr:`~PreparedRequest.send_config_or_default` — ``local_cache``
+        for ``source="local"``, ``remote_cache`` for ``source="remote"``.
+        Returns ``None`` when the cache is unconfigured, the mode
+        disables reads, or no matching response exists.
         """
-        if source == "remote" and not cache_cfg.remote_cache_enabled:
+        config = request.send_config_or_default
+        cache_cfg = config.local_cache if source == "local" else config.remote_cache
+        if cache_cfg is None or not cache_cfg.cache_enabled or cache_cfg.mode == Mode.UPSERT:
             return None
         tabular = self._cache_tabular_for_source(cache_cfg, source)
         if tabular is None:
@@ -862,22 +857,13 @@ class HTTPSession(Session):
 
         from yggdrasil.data.options import CastOptions
 
-        # Local cache stores responses as-is (the writer never
-        # anonymises before persist), so the lookup tuple matches
-        # the row's original ``request_*`` columns straight from
-        # the request — no per-call URL parse + header normalise.
-        # Remote stores remove user-info too, but only paths keyed
-        # on private ``request_by`` columns need to anonymise the
-        # lookup; ``request_by_is_public`` collapses to the same
-        # ``public_*`` hash on both projections, so anonymisation
-        # is a no-op there either way.
         lookup_request = (
             request
             if source == "local" or cache_cfg.request_by_is_public
             else request.anonymize(mode=cache_cfg.anonymize)
         )
         predicate = cache_cfg.make_lookup_predicate(request=lookup_request)
-        opts = CastOptions(predicate=predicate, spark_session=request.send_config_or_default.spark_session)
+        opts = CastOptions(predicate=predicate, spark_session=config.spark_session)
         batches = tabular.read_arrow_batches(options=opts.check_target(RESPONSE_SCHEMA))
 
         best: Optional[Response] = None
@@ -898,56 +884,44 @@ class HTTPSession(Session):
     def _store_cached_response(
         self,
         response: Response,
-        cache_cfg: CacheConfig,
         *,
         source: str,
-        tabular: Any = None,
+        request: PreparedRequest | None = None,
         mode: Optional[Mode] = None,
         async_write: "bool | None" = None,
     ) -> None:
         """Persist one response to a cache backend (local or remote).
 
-        Both backends go through :func:`_insert_cache` — the
-        canonical :meth:`Tabular.write_arrow_batches` adapter that
-        also carries ``prune_values`` for the MERGE narrow-target
-        path. The Session never branches on backend type for the
-        write itself.
+        Reads the :class:`CacheConfig` from *request*'s
+        :attr:`~PreparedRequest.send_config_or_default` (falls back
+        to ``response.request`` when *request* is not supplied).
 
         ``async_write`` controls the dispatch policy: ``True`` queues
         the write through the :class:`Job` fire-and-forget pool so
         the caller doesn't block on disk / network IO; ``False`` runs
-        inline. Default ``None`` picks per-source — local cache
-        writes are fire-and-forget (the response buffer is still
-        live, so we drain it inline but ship the actual write off
-        the request hot path), remote writes run synchronously (the
-        bulk persist path :meth:`_persist_remote` already
-        parallelises across write groups).
+        inline. Default ``None`` picks per-source — local writes are
+        fire-and-forget, remote writes run synchronously.
         """
         if not response.ok:
             return
-        if source == "local" and response.request is None:
+        req = request or response.request
+        if req is None:
+            return
+        config = req.send_config_or_default
+        cache_cfg = config.local_cache if source == "local" else config.remote_cache
+        if cache_cfg is None or not cache_cfg.cache_enabled:
             return
 
-        tabular = (
-            tabular if tabular is not None
-            else self._cache_tabular_for_source(cache_cfg, source)
-        )
+        tabular = self._cache_tabular_for_source(cache_cfg, source)
         if tabular is None:
             return
         batch = response.to_arrow_batch(parse=False)
-        # Prune values matter for the remote MERGE narrow-target
-        # path; the local FolderPath ignores them on writes (it
-        # splits by partition automatically from the batch's
-        # ``t:partition_by`` schema metadata). Skip the build for
-        # local so the cache hot path doesn't pay the dict-build
-        # the local backend wouldn't use.
         prune_values = (
             _cache_prune_values_for(batch) if source == "remote" else None
         )
         if async_write is None:
             async_write = (source == "local")
-        req = response.request
-        spark = req.send_config_or_default.spark_session if req is not None else None
+        spark = config.spark_session
         if async_write:
             Job.make(
                 _insert_cache,
@@ -1220,40 +1194,21 @@ class HTTPSession(Session):
         *before* this method is reached.
         """
         config = request.send_config_or_default
-        local_cfg = config.local_cache
-        remote_cfg = config.remote_cache
 
-        local_cache_tabular: Any = None
-        if local_cfg is not None and local_cfg.local_cache_enabled:
-            local_cache_tabular = local_cfg.cache_tabular(session=self)
-            if local_cfg.mode != Mode.UPSERT:
-                local_response = self._load_cached_response(
-                    request, local_cfg, source="local",
-                )
-                if local_response is not None:
-                    if config.raise_error:
-                        local_response.raise_for_status()
-                    return local_response
+        local_response = self._load_cached_response(request, source="local")
+        if local_response is not None:
+            if config.raise_error:
+                local_response.raise_for_status()
+            return local_response
 
-        if (
-            remote_cfg is not None
-            and remote_cfg.remote_cache_enabled
-            and remote_cfg.mode != Mode.UPSERT
-        ):
-            remote_response = self._load_cached_response(
-                request, remote_cfg, source="remote",
+        remote_response = self._load_cached_response(request, source="remote")
+        if remote_response is not None:
+            self._store_cached_response(
+                remote_response, source="local", request=request,
             )
-            if remote_response is not None:
-                if local_cache_tabular is not None:
-                    self._store_cached_response(
-                        remote_response,
-                        local_cfg,
-                        source="local",
-                        tabular=local_cache_tabular,
-                    )
-                if config.raise_error:
-                    remote_response.raise_for_status()
-                return remote_response
+            if config.raise_error:
+                remote_response.raise_for_status()
+            return remote_response
 
         if config.cache_only:
             response = _synthetic_not_found(request)
@@ -1267,18 +1222,8 @@ class HTTPSession(Session):
         response = self.prepare_response_after_received(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
-        if local_cache_tabular is not None:
-            self._store_cached_response(
-                response,
-                local_cfg,
-                source="local",
-                tabular=local_cache_tabular,
-            )
-
-        if remote_cfg is not None and remote_cfg.remote_cache_enabled:
-            self._store_cached_response(
-                response, remote_cfg, source="remote",
-            )
+        self._store_cached_response(response, source="local", request=request)
+        self._store_cached_response(response, source="remote", request=request)
 
         if config.raise_error:
             response.raise_for_status()

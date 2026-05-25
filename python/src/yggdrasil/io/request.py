@@ -435,10 +435,7 @@ class PreparedRequest:
         if config.mode not in (Mode.APPEND, Mode.AUTO, Mode.UPSERT):
             return None
 
-        if (
-            (config.received_from is not None or config.received_to is not None)
-            and config.tabular is None
-        ):
+        if config.tabular is None:
             object.__setattr__(config, "tabular", self.session.local_cache())
 
         return config

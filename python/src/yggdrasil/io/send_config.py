@@ -492,11 +492,7 @@ class CacheConfig(_ConfigBase):
 
     @property
     def local_cache_enabled(self):
-        if not self.cache_enabled:
-            return False
-        if self.tabular is not None:
-            return True
-        return self.received_from is not None or self.received_to is not None
+        return self.cache_enabled
 
     @property
     def remote_cache_enabled(self):
