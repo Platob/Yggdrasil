@@ -218,8 +218,9 @@ def _insert_cache(
     except Exception as exc:
         if raise_error:
             raise
-        LOGGER.debug(
+        LOGGER.warning(
             "Cache write failed for %r: %s", tabular, exc,
+            exc_info=True,
         )
 
 
@@ -828,6 +829,8 @@ class HTTPSession(Session):
             return None
         tabular = cache_cfg.tabular
         if tabular is None:
+            tabular = cache_cfg.cache_tabular(session=self)
+        if tabular is None:
             return None
 
         from yggdrasil.data.options import CastOptions
@@ -873,6 +876,8 @@ class HTTPSession(Session):
         if not response.ok or cache_cfg is None or not cache_cfg.cache_enabled:
             return
         tabular = cache_cfg.tabular
+        if tabular is None:
+            tabular = cache_cfg.cache_tabular(session=self)
         if tabular is None:
             return
         req = response.request
