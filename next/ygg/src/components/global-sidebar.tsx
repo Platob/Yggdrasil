@@ -195,11 +195,58 @@ export function GlobalSidebar({ onCollapse }: { onCollapse?: (collapsed: boolean
         borderRight: "1px solid var(--sidebar-border)",
         transition: "width 200ms ease, min-width 200ms ease, max-width 200ms ease",
       }}
-      className="fixed left-0 top-0 h-full flex flex-col z-50 overflow-hidden"
+      className="fixed left-0 top-0 h-full flex flex-col z-50 overflow-visible"
     >
-      {/* ── Logo + collapse button ── */}
+      {/* ── Collapse tab — center-right edge of sidebar ── */}
+      <button
+        onClick={toggleCollapse}
+        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        style={{
+          position: "absolute",
+          right: "-14px",
+          top: "50%",
+          transform: "translateY(-50%)",
+          width: "14px",
+          height: "48px",
+          background: "var(--sidebar-bg)",
+          border: "1px solid var(--sidebar-border)",
+          borderLeft: "none",
+          borderRadius: "0 6px 6px 0",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          cursor: "pointer",
+          color: "var(--muted-foreground)",
+          transition: "background 150ms, color 150ms",
+          zIndex: 51,
+        }}
+        onMouseEnter={e => {
+          (e.currentTarget as HTMLButtonElement).style.background = "var(--card-hover)";
+          (e.currentTarget as HTMLButtonElement).style.color = "var(--foreground)";
+        }}
+        onMouseLeave={e => {
+          (e.currentTarget as HTMLButtonElement).style.background = "var(--sidebar-bg)";
+          (e.currentTarget as HTMLButtonElement).style.color = "var(--muted-foreground)";
+        }}
+      >
+        <svg
+          width="8"
+          height="12"
+          viewBox="0 0 8 12"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          style={{ transition: "transform 200ms", transform: collapsed ? "scaleX(-1)" : "scaleX(1)" }}
+        >
+          <polyline points="5 1 1 6 5 11" />
+        </svg>
+      </button>
+
+      {/* ── Logo ── */}
       <div
-        className="flex items-center justify-between h-14 shrink-0 px-3 relative"
+        className="flex items-center h-14 shrink-0 px-3"
         style={{ borderBottom: "1px solid var(--sidebar-border)" }}
       >
         {!collapsed && (
@@ -217,17 +264,6 @@ export function GlobalSidebar({ onCollapse }: { onCollapse?: (collapsed: boolean
             </Link>
           </div>
         )}
-        
-        {/* Collapse button - positioned on the right edge */}
-        <button
-          onClick={toggleCollapse}
-          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-md p-1.5 transition-all hover:bg-border/20"
-          style={{ color: "var(--muted-foreground)" }}
-          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          title={collapsed ? "Expand" : "Collapse"}
-        >
-          {collapsed ? Icon.chevronRight : Icon.chevronLeft}
-        </button>
       </div>
 
       {/* ── Nav: services + items ── */}
