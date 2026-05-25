@@ -27,7 +27,7 @@ __all__ = ["CacheConfig", "SendConfig"]
 
 # Module-level cached paths — avoids repeated syscalls in hot paths
 # (``local_cache_folder`` is called per-request in the batch pipeline).
-_DEFAULT_CACHE_ROOT: pathlib.Path = pathlib.Path.home() / ".yggdrasil" / "cache" / "response"
+_DEFAULT_CACHE_ROOT: pathlib.Path = pathlib.Path.home() / ".cache" / "http" / "response"
 
 
 # Identity-by-default — ``public_url_hash`` is the URL-based identity
@@ -570,7 +570,7 @@ class CacheConfig(_ConfigBase):
         :attr:`tabular` is local (any :class:`yggdrasil.io.path.Path`
         subclass — LocalPath on disk, VolumePath on a Databricks
         Volume, S3Path on a bucket, …); otherwise builds the default
-        LocalPath under ``~/.yggdrasil/cache/response``, suffixed
+        LocalPath under ``~/.cache/http/response``, suffixed
         with the session's ``base_url`` host + path when one is
         available so different APIs sharing the same machine don't
         collide on disk:
