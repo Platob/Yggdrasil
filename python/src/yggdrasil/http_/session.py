@@ -1497,8 +1497,10 @@ class HTTPSession(Session):
         local_hits: "Tabular | None" = None
         remote_hits: "Tabular | None" = None
         misses = reqs
+        lc = reqs[0].local_cache_config if reqs else None
+        rc = reqs[0].remote_cache_config if reqs else None
 
-        if local_holder is not None:
+        if local_holder is not None and lc is not None and lc.cache_read_enabled:
             local_hits, misses = self._read_holder(
                 local_holder, reqs, "local_cache_config",
                 spark_session=spark,
@@ -1510,7 +1512,7 @@ class HTTPSession(Session):
                     local_count, n, local_holder,
                 )
 
-        if remote_holder is not None and misses:
+        if remote_holder is not None and rc is not None and rc.cache_read_enabled and misses:
             before = len(misses)
             remote_hits, misses = self._read_holder(
                 remote_holder, misses, "remote_cache_config",
@@ -1599,25 +1601,12 @@ class HTTPSession(Session):
         if new_list:
             _hits = new_list
             wb: list[Callable] = []
-            has_remote = remote_holder is not None or any(
-                r.remote_cache_config is not None for r in misses
-            )
-            if has_remote:
+            if remote_holder is not None:
                 wb.append(lambda: self._persist_remote(_hits))
             if local_holder is not None:
                 wb.append(lambda: self._backfill_local_cache(
                     responses_to_tabular(_hits), {local_holder: reqs},
                 ))
-            else:
-                local_map: dict["IO | None", list[PreparedRequest]] = {}
-                for r in reqs:
-                    lc = r.local_cache_config
-                    if lc is not None and lc.tabular is not None:
-                        local_map.setdefault(lc.tabular, []).append(r)
-                if local_map:
-                    wb.append(lambda: self._backfill_local_cache(
-                        responses_to_tabular(_hits), local_map,
-                    ))
             if wb:
                 LOGGER.debug(
                     "Writing back %d response(s) to %d cache(s)",
@@ -1647,11 +1636,8 @@ class HTTPSession(Session):
         )
         new_hits = self._spark_fetch_misses(misses, spark)
         rc = reqs[0].remote_cache_config
-        has_remote = remote_holder is not None or any(
-            r.remote_cache_config is not None for r in misses
-        )
-        if has_remote and rc is not None:
-            LOGGER.debug("Persisting Spark results to remote cache %r", rc.tabular)
+        if remote_holder is not None and rc is not None:
+            LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
             self._spark_persist_remote(new_hits, rc, spark=spark)
         return HTTPResponseBatch(
             local=local_hits, remote=remote_hits,
@@ -1678,29 +1664,21 @@ class HTTPSession(Session):
         """Group requests by cache identity so each group can be processed
         as a single batch with consistent settings.
 
-        Key: ``(local_holder, remote_holder, local_mode, remote_mode,
-        has_spark)``.
-
-        * **UPSERT** holders are set to ``None`` so they skip the cache
-          read (straight to network), but the mode stays in the key so the
-          writeback path can still tell them apart.
-        * **Modes** (APPEND vs OVERWRITE vs UPSERT) are separated so
-          ``_send_batch`` never mixes incompatible write semantics.
-        * **spark_session** presence is separated so the Spark and
-          thread-pool fetch paths never mix in one group.
+        Key: ``(local_tabular, remote_tabular, local_mode, remote_mode,
+        has_spark)``.  The mode decides read vs write behaviour
+        downstream; the tabular is always present when a cache config
+        exists so the write path can find it directly.
         """
         groups: dict[tuple, list[PreparedRequest]] = {}
         for r in batch:
             lc = r.local_cache_config
             rc = r.remote_cache_config
-            local_mode = lc.mode if lc is not None else None
-            remote_mode = rc.mode if rc is not None else None
             has_spark = r.send_config_or_default.spark_session is not None
             key = (
-                lc.tabular if lc is not None and lc.cache_read_enabled else None,
-                rc.tabular if rc is not None and rc.cache_read_enabled else None,
-                local_mode,
-                remote_mode,
+                lc.tabular if lc is not None else None,
+                rc.tabular if rc is not None else None,
+                lc.mode if lc is not None else None,
+                rc.mode if rc is not None else None,
                 has_spark,
             )
             groups.setdefault(key, []).append(r)
