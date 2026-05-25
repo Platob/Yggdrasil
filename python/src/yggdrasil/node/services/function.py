@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import uuid
+import time
 from collections import OrderedDict
 from threading import Lock
 
 from ..config import Settings
 from ..exceptions import NotFoundError
+from ..ids import make_id
 from ..schemas.function import (
     FunctionCreate,
     FunctionEntry,
@@ -22,36 +23,62 @@ LOGGER = logging.getLogger(__name__)
 class FunctionService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._functions: OrderedDict[str, FunctionEntry] = OrderedDict()
+        self._functions: OrderedDict[int, FunctionEntry] = OrderedDict()
         self._lock = Lock()
 
     # -- CRUD ---------------------------------------------------------------
 
     async def create(self, req: FunctionCreate) -> FunctionResponse:
-        func_id = uuid.uuid4().hex[:12]
+        """Create-or-update: if a function with the same name exists, update it."""
+        return await self.create_or_update(req)
+
+    async def create_or_update(self, req: FunctionCreate) -> FunctionResponse:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
 
-        entry = FunctionEntry(
-            id=func_id,
-            name=req.name,
-            language=req.language,
-            code=req.code,
-            description=req.description,
-            python_version=req.python_version,
-            dependencies=list(req.dependencies),
-            environment_id=req.environment_id,
-            created_at=now,
-            updated_at=now,
-        )
-
         with self._lock:
-            self._functions[func_id] = entry
-            self._evict()
+            # Check if name already exists
+            existing = next(
+                (f for f in self._functions.values() if f.name == req.name), None
+            )
+            if existing:
+                # Update in place
+                updates: dict = {"updated_at": now}
+                updates["code"] = req.code
+                updates["language"] = req.language
+                if req.description:
+                    updates["description"] = req.description
+                if req.python_version is not None:
+                    updates["python_version"] = req.python_version
+                if req.dependencies:
+                    updates["dependencies"] = list(req.dependencies)
+                if req.environment_id is not None:
+                    updates["environment_id"] = req.environment_id
 
-        LOGGER.info("Created function %r (name=%r)", func_id, req.name)
-        return FunctionResponse(function=entry)
+                updated = existing.model_copy(update=updates)
+                self._functions[existing.id] = updated
+                LOGGER.info("Upserted function %r (name=%r, mode=update)", existing.id, req.name)
+                return FunctionResponse(function=updated)
+            else:
+                # Create new
+                func_id = make_id(req.name)
+                entry = FunctionEntry(
+                    id=func_id,
+                    name=req.name,
+                    language=req.language,
+                    code=req.code,
+                    description=req.description,
+                    python_version=req.python_version,
+                    dependencies=list(req.dependencies),
+                    environment_id=req.environment_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                self._functions[func_id] = entry
+                self._evict()
+                LOGGER.info("Upserted function %r (name=%r, mode=create)", func_id, req.name)
+                return FunctionResponse(function=entry)
 
-    async def get(self, func_id: str) -> FunctionEntry:
+    async def get(self, func_id: int) -> FunctionEntry:
         with self._lock:
             entry = self._functions.get(func_id)
         if entry is None:
@@ -66,7 +93,7 @@ class FunctionService:
             functions=items,
         )
 
-    async def update(self, func_id: str, req: FunctionUpdate) -> FunctionResponse:
+    async def update(self, func_id: int, req: FunctionUpdate) -> FunctionResponse:
         with self._lock:
             entry = self._functions.get(func_id)
         if entry is None:
@@ -94,7 +121,7 @@ class FunctionService:
         LOGGER.info("Updated function %r", func_id)
         return FunctionResponse(function=updated)
 
-    async def delete(self, func_id: str) -> FunctionResponse:
+    async def delete(self, func_id: int) -> FunctionResponse:
         with self._lock:
             entry = self._functions.pop(func_id, None)
         if entry is None:
@@ -102,7 +129,7 @@ class FunctionService:
         LOGGER.info("Deleted function %r", func_id)
         return FunctionResponse(function=entry)
 
-    def increment_run_count(self, func_id: str) -> None:
+    def increment_run_count(self, func_id: int) -> None:
         """Bump the run counter for a function (called by RunService)."""
         with self._lock:
             entry = self._functions.get(func_id)

@@ -4,7 +4,7 @@ const NODE_API_URL = process.env.NODE_API_URL || `http://127.0.0.1:${process.env
 
 const nextConfig: NextConfig = {
   turbopack: {
-    root: ".",
+    root: process.cwd(),
   },
   async rewrites() {
     return [

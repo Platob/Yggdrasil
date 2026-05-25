@@ -12,7 +12,7 @@ class FunctionCreate(StrictModel):
     description: str = ""
     python_version: str | None = None
     dependencies: list[str] = Field(default_factory=list)
-    environment_id: str | None = None
+    environment_id: int | None = None
 
 
 class FunctionUpdate(StrictModel):
@@ -21,18 +21,18 @@ class FunctionUpdate(StrictModel):
     description: str | None = None
     python_version: str | None = None
     dependencies: list[str] | None = None
-    environment_id: str | None = None
+    environment_id: int | None = None
 
 
 class FunctionEntry(StrictModel):
-    id: str
+    id: int
     name: str
     language: str
     code: str
     description: str
     python_version: str | None = None
     dependencies: list[str] = Field(default_factory=list)
-    environment_id: str | None = None
+    environment_id: int | None = None
     creator: str = "system"
     created_at: str
     updated_at: str

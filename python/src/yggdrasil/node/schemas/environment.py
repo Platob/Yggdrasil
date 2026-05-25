@@ -17,7 +17,7 @@ class EnvironmentUpdate(StrictModel):
 
 
 class EnvironmentEntry(StrictModel):
-    id: str
+    id: int
     name: str
     python_version: str
     dependencies: list[str] = Field(default_factory=list)

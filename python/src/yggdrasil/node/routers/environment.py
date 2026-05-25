@@ -32,7 +32,7 @@ async def create_environment(
 
 @router.get("/{env_id}", response_model=EnvironmentResponse)
 async def get_environment(
-    env_id: str,
+    env_id: int,
     service: EnvironmentService = Depends(get_environment_service),
 ) -> EnvironmentResponse:
     entry = await service.get(env_id)
@@ -41,7 +41,7 @@ async def get_environment(
 
 @router.put("/{env_id}", response_model=EnvironmentResponse)
 async def update_environment(
-    env_id: str,
+    env_id: int,
     req: EnvironmentUpdate,
     service: EnvironmentService = Depends(get_environment_service),
 ) -> EnvironmentResponse:
@@ -50,7 +50,7 @@ async def update_environment(
 
 @router.delete("/{env_id}", response_model=EnvironmentResponse)
 async def delete_environment(
-    env_id: str,
+    env_id: int,
     service: EnvironmentService = Depends(get_environment_service),
 ) -> EnvironmentResponse:
     return await service.delete(env_id)
@@ -58,7 +58,7 @@ async def delete_environment(
 
 @router.post("/{env_id}/install", response_model=EnvironmentResponse)
 async def install_packages(
-    env_id: str,
+    env_id: int,
     req: InstallRequest,
     service: EnvironmentService = Depends(get_environment_service),
 ) -> EnvironmentResponse:

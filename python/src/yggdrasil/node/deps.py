@@ -4,6 +4,7 @@ from fastapi import Request
 
 from .services.call import CallService
 from .services.cmd import CmdService
+from .services.dag import DagService
 from .services.discovery import DiscoveryService
 from .services.env import EnvService
 from .services.environment import EnvironmentService
@@ -52,3 +53,7 @@ def get_environment_service(request: Request) -> EnvironmentService:
 
 def get_run_service(request: Request) -> RunService:
     return request.app.state.run_service
+
+
+def get_dag_service(request: Request) -> DagService:
+    return request.app.state.dag_service

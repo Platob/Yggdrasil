@@ -21,7 +21,7 @@ async def list_runs(
 
 @router.get("/{run_id}", response_model=RunResponse)
 async def get_run(
-    run_id: str,
+    run_id: int,
     service: RunService = Depends(get_run_service),
 ) -> RunResponse:
     entry = await service.get(run_id)
@@ -30,7 +30,7 @@ async def get_run(
 
 @router.delete("/{run_id}", response_model=RunResponse)
 async def delete_run(
-    run_id: str,
+    run_id: int,
     service: RunService = Depends(get_run_service),
 ) -> RunResponse:
     return await service.delete(run_id)
@@ -38,7 +38,7 @@ async def delete_run(
 
 @router.get("/{run_id}/logs")
 async def stream_logs(
-    run_id: str,
+    run_id: int,
     service: RunService = Depends(get_run_service),
 ) -> StreamingResponse:
     # Validate run exists before starting the stream response,

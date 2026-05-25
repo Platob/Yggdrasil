@@ -1,5 +1,6 @@
 from .call import router as call_router
 from .cmd import router as cmd_router
+from .dag import router as dag_router
 from .discovery import router as discovery_router
 from .env import router as env_router
 from .environment import router as environment_router
@@ -12,6 +13,7 @@ from .run import router as run_router
 __all__ = [
     "call_router",
     "cmd_router",
+    "dag_router",
     "discovery_router",
     "env_router",
     "environment_router",

@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { node as api, type EnvironmentEntry } from "@/lib/api";
+import Link from "next/link";
 
 // ── Demo data ────────────────────────────────────────────────
 const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
   {
-    id: "env-001",
+    id: 1,
     name: "metrics-env",
     python_version: "3.12",
     dependencies: ["psutil", "requests"],
@@ -17,7 +18,7 @@ const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
     error: null,
   },
   {
-    id: "env-002",
+    id: 2,
     name: "data-science",
     python_version: "3.11",
     dependencies: ["pandas", "numpy", "scikit-learn", "matplotlib"],
@@ -28,7 +29,7 @@ const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
     error: null,
   },
   {
-    id: "env-003",
+    id: 3,
     name: "ml-pipeline",
     python_version: "3.12",
     dependencies: ["torch", "transformers", "datasets"],
@@ -39,7 +40,7 @@ const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
     error: null,
   },
   {
-    id: "env-004",
+    id: 4,
     name: "broken-env",
     python_version: "3.10",
     dependencies: ["nonexistent-package-xyz"],
@@ -74,7 +75,7 @@ export default function EnvironmentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
-  const [installFormId, setInstallFormId] = useState<string | null>(null);
+  const [installFormId, setInstallFormId] = useState<number | null>(null);
   const [installPackages, setInstallPackages] = useState("");
   const [installing, setInstalling] = useState(false);
 
@@ -121,7 +122,7 @@ export default function EnvironmentsPage() {
     setFormSubmitting(false);
   }
 
-  async function handleDelete(id: string) {
+  async function handleDelete(id: number) {
     if (!confirm("Delete this environment? This cannot be undone.")) return;
     try {
       await api.deleteEnvironment(id);
@@ -131,7 +132,7 @@ export default function EnvironmentsPage() {
     }
   }
 
-  async function handleInstall(id: string) {
+  async function handleInstall(id: number) {
     setInstalling(true);
     try {
       const packages = installPackages.split(",").map((p) => p.trim()).filter(Boolean);
@@ -236,7 +237,7 @@ export default function EnvironmentsPage() {
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-3 mb-2">
                   <div className={statusDotClass(env.status)} />
-                  <span className="font-mono text-sm font-medium text-foreground">{env.name}</span>
+                  <Link href={`/node/environments/${env.id}`} className="font-mono text-sm font-medium text-foreground hover:text-primary transition-colors">{env.name}</Link>
                   <span
                     className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
                     style={{

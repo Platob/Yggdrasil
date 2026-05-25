@@ -9,6 +9,8 @@ Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 3. **Schemas are contracts** — `StrictModel` (extra="forbid") for all request/response types.
 4. **Streaming first** — use SSE for logs, metrics, long-running operations.
 5. **POC mode** — ship fast, iterate. No legacy compat.
+6. **Int64 IDs** — prefer `int` over string UUIDs. Use xxhash-based composites: `xxh32(semantic_key) << 32 | timestamp_ms`. Two xxhash int64s are acceptable when coupling different concepts. Never use cryptographic hashes for IDs.
+7. **Upsert by default** — POST endpoints create if name not found, update if it exists. ID is immutable once assigned.
 
 ## Layout
 
@@ -19,6 +21,7 @@ python/src/yggdrasil/
     services/           Business logic + state
     schemas/            Pydantic models
     geo.py              IP geolocation
+    ids.py              Int64 ID generation (xxhash)
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
   databricks/           Databricks SDK integrations
@@ -35,6 +38,8 @@ next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
 | `/api/environment` | Python venv management (uv-based) |
 | `/api/run` | Run history, logs (SSE streaming) |
 | `/api/monitor` | Resource + network IO metrics (SSE streaming) |
+| `/api/dag` | DAG definitions — chain functions across nodes |
+| `/api/dag/{id}/run` | Execute DAG with cross-node orchestration |
 | `/api/python` | Direct Python code execution |
 | `/api/cmd` | Shell command execution |
 | `/api/job` | Job definitions + scheduled runs |
@@ -51,9 +56,29 @@ next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
 | `/node/functions` | Functions CRUD — create, edit, run |
 | `/node/functions/{id}` | Function detail — code, runs, SSE logs |
 | `/node/environments` | Python venv management |
+| `/node/environments/{id}` | Environment detail — packages, status |
+| `/node/dags` | DAG definitions — function pipelines |
+| `/node/dags/{id}` | DAG detail — step flow, runs |
 | `/node/network` | 3D network visualization |
 | `/node/execute` | Direct code execution |
 | `/msg` | Messaging channels |
+
+## ID System
+
+```python
+from yggdrasil.node.ids import make_id, make_id_pair
+func_id = make_id("my_function")      # xxh32("my_function") << 32 | timestamp_ms
+run_id = make_id(f"{func_id}:{now}")   # unique per execution
+pair = make_id_pair("node_a", "func_b") # two concepts combined
+```
+
+## Execution Model
+
+```
+node:function + node:environment + args → node:run
+```
+
+Functions run in a subprocess using the linked environment's Python. Runs stream logs via SSE. DAGs chain function runs across nodes, passing outputs as inputs.
 
 ## CLI
 

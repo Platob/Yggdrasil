@@ -97,14 +97,14 @@ export interface CachedDashboard {
 
 // -- Functions --
 export interface FunctionEntry {
-  id: string;
+  id: number;
   name: string;
   language: string;
   code: string;
   description: string;
   python_version: string | null;
   dependencies: string[];
-  environment_id: string | null;
+  environment_id: number | null;
   creator: string;
   created_at: string;
   updated_at: string;
@@ -113,7 +113,7 @@ export interface FunctionEntry {
 
 // -- Environments --
 export interface EnvironmentEntry {
-  id: string;
+  id: number;
   name: string;
   python_version: string;
   dependencies: string[];
@@ -126,9 +126,9 @@ export interface EnvironmentEntry {
 
 // -- Runs --
 export interface RunEntry {
-  id: string;
-  function_id: string;
-  environment_id: string | null;
+  id: number;
+  function_id: number;
+  environment_id: number | null;
   status: string;
   started_at: string | null;
   completed_at: string | null;
@@ -138,6 +138,48 @@ export interface RunEntry {
   stderr: string | null;
   result: unknown;
   node_id: string;
+}
+
+// -- DAGs --
+export interface DagNodeRef {
+  node_url: string | null;
+  function_id: number;
+  environment_id: number | null;
+  args: Record<string, unknown>;
+}
+
+export interface DagEdge {
+  from_step: string;
+  to_step: string;
+  output_key: string;
+  input_key: string;
+}
+
+export interface DagStep {
+  id: string;
+  ref: DagNodeRef;
+  depends_on: string[];
+}
+
+export interface DagEntry {
+  id: number;
+  name: string;
+  description: string;
+  steps: DagStep[];
+  edges: DagEdge[];
+  created_at: string;
+  updated_at: string;
+  run_count: number;
+}
+
+export interface DagRunEntry {
+  id: number;
+  dag_id: number;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  duration: number | null;
+  step_results: Record<string, unknown>;
 }
 
 // =============================================================================
@@ -229,29 +271,39 @@ export const node = {
 
   // Functions
   listFunctions: () => fetchJSON<{ functions: FunctionEntry[] }>(`${NODE_BASE}/function`),
-  createFunction: (data: { name: string; code: string; language?: string; description?: string; python_version?: string; dependencies?: string[]; environment_id?: string }) =>
+  createFunction: (data: { name: string; code: string; language?: string; description?: string; python_version?: string; dependencies?: string[]; environment_id?: number }) =>
     fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function`, { method: "POST", body: JSON.stringify(data) }),
-  getFunction: (id: string) => fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}`),
-  updateFunction: (id: string, data: Record<string, unknown>) =>
+  getFunction: (id: number) => fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}`),
+  updateFunction: (id: number, data: Record<string, unknown>) =>
     fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}`, { method: "PUT", body: JSON.stringify(data) }),
-  deleteFunction: (id: string) => fetchJSON<void>(`${NODE_BASE}/function/${id}`, { method: "DELETE" }),
-  runFunction: (id: string, args?: Record<string, unknown>) =>
+  deleteFunction: (id: number) => fetchJSON<void>(`${NODE_BASE}/function/${id}`, { method: "DELETE" }),
+  runFunction: (id: number, args?: Record<string, unknown>) =>
     fetchJSON<{ run: RunEntry }>(`${NODE_BASE}/function/${id}/run`, { method: "POST", body: JSON.stringify(args || {}) }),
-  listFunctionRuns: (id: string) => fetchJSON<{ runs: RunEntry[] }>(`${NODE_BASE}/function/${id}/run`),
+  listFunctionRuns: (id: number) => fetchJSON<{ runs: RunEntry[] }>(`${NODE_BASE}/function/${id}/run`),
 
   // Environments
   listEnvironments: () => fetchJSON<{ environments: EnvironmentEntry[] }>(`${NODE_BASE}/environment`),
   createEnvironment: (data: { name: string; python_version?: string; dependencies?: string[] }) =>
     fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment`, { method: "POST", body: JSON.stringify(data) }),
-  getEnvironment: (id: string) => fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}`),
-  deleteEnvironment: (id: string) => fetchJSON<void>(`${NODE_BASE}/environment/${id}`, { method: "DELETE" }),
-  installPackages: (id: string, packages: string[]) =>
+  getEnvironment: (id: number) => fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}`),
+  deleteEnvironment: (id: number) => fetchJSON<void>(`${NODE_BASE}/environment/${id}`, { method: "DELETE" }),
+  installPackages: (id: number, packages: string[]) =>
     fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}/install`, { method: "POST", body: JSON.stringify({ packages }) }),
 
   // Runs
   listRuns: () => fetchJSON<{ runs: RunEntry[] }>(`${NODE_BASE}/run`),
-  getRun: (id: string) => fetchJSON<{ run: RunEntry }>(`${NODE_BASE}/run/${id}`),
-  deleteRun: (id: string) => fetchJSON<void>(`${NODE_BASE}/run/${id}`, { method: "DELETE" }),
+  getRun: (id: number) => fetchJSON<{ run: RunEntry }>(`${NODE_BASE}/run/${id}`),
+  deleteRun: (id: number) => fetchJSON<void>(`${NODE_BASE}/run/${id}`, { method: "DELETE" }),
+
+  // DAGs
+  listDags: () => fetchJSON<{ dags: DagEntry[] }>(`${NODE_BASE}/dag`),
+  createDag: (data: { name: string; description?: string; steps: DagStep[]; edges?: DagEdge[] }) =>
+    fetchJSON<{ dag: DagEntry }>(`${NODE_BASE}/dag`, { method: "POST", body: JSON.stringify(data) }),
+  getDag: (id: number) => fetchJSON<{ dag: DagEntry }>(`${NODE_BASE}/dag/${id}`),
+  deleteDag: (id: number) => fetchJSON<void>(`${NODE_BASE}/dag/${id}`, { method: "DELETE" }),
+  runDag: (id: number) => fetchJSON<{ run: DagRunEntry }>(`${NODE_BASE}/dag/${id}/run`, { method: "POST" }),
+  listDagRuns: (id: number) => fetchJSON<{ runs: DagRunEntry[] }>(`${NODE_BASE}/dag/${id}/run`),
+  getDagRun: (dagId: number, runId: number) => fetchJSON<{ run: DagRunEntry }>(`${NODE_BASE}/dag/${dagId}/run/${runId}`),
 };
 
 // =============================================================================

@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { node as api, type FunctionEntry } from "@/lib/api";
+import { node as api, type FunctionEntry, type EnvironmentEntry } from "@/lib/api";
 import Link from "next/link";
 
 // ── Demo data ────────────────────────────────────────────────
 const DEMO_FUNCTIONS: FunctionEntry[] = [
   {
-    id: "fn-001",
+    id: 1,
     name: "hello_world",
     language: "python",
     code: 'def main():\n    return "Hello, Yggdrasil!"',
@@ -21,35 +21,35 @@ const DEMO_FUNCTIONS: FunctionEntry[] = [
     run_count: 42,
   },
   {
-    id: "fn-002",
+    id: 2,
     name: "fetch_metrics",
     language: "python",
     code: 'import psutil\n\ndef main():\n    return {"cpu": psutil.cpu_percent(), "ram": psutil.virtual_memory().percent}',
     description: "Collect system metrics from the node",
     python_version: "3.12",
     dependencies: ["psutil"],
-    environment_id: "env-001",
+    environment_id: 1,
     creator: "admin",
     created_at: "2025-05-18T08:30:00Z",
     updated_at: "2025-05-22T14:00:00Z",
     run_count: 156,
   },
   {
-    id: "fn-003",
+    id: 3,
     name: "data_pipeline",
     language: "python",
     code: 'import pandas as pd\n\ndef main(source: str):\n    df = pd.read_csv(source)\n    return df.describe().to_dict()',
     description: "Run data pipeline on a CSV source",
     python_version: "3.11",
     dependencies: ["pandas", "numpy"],
-    environment_id: "env-002",
+    environment_id: 2,
     creator: "admin",
     created_at: "2025-05-15T12:00:00Z",
     updated_at: "2025-05-23T09:15:00Z",
     run_count: 28,
   },
   {
-    id: "fn-004",
+    id: 4,
     name: "health_check",
     language: "python",
     code: 'import requests\n\ndef main(url: str):\n    r = requests.get(url, timeout=5)\n    return {"status": r.status_code, "ok": r.ok}',
@@ -66,11 +66,12 @@ const DEMO_FUNCTIONS: FunctionEntry[] = [
 
 export default function FunctionsPage() {
   const [functions, setFunctions] = useState<FunctionEntry[]>([]);
+  const [environments, setEnvironments] = useState<EnvironmentEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
-  const [runningId, setRunningId] = useState<string | null>(null);
-  const [runResult, setRunResult] = useState<{ id: string; status: string; stdout?: string | null } | null>(null);
+  const [runningId, setRunningId] = useState<number | null>(null);
+  const [runResult, setRunResult] = useState<{ id: number; status: string; stdout?: string | null } | null>(null);
 
   // Form state
   const [formName, setFormName] = useState("");
@@ -78,10 +79,12 @@ export default function FunctionsPage() {
   const [formDescription, setFormDescription] = useState("");
   const [formPythonVersion, setFormPythonVersion] = useState("3.12");
   const [formDeps, setFormDeps] = useState("");
+  const [formEnvId, setFormEnvId] = useState<number | null>(null);
   const [formSubmitting, setFormSubmitting] = useState(false);
 
   useEffect(() => {
     loadFunctions();
+    loadEnvironments();
   }, []);
 
   async function loadFunctions() {
@@ -97,7 +100,16 @@ export default function FunctionsPage() {
     setLoading(false);
   }
 
-  async function handleRun(id: string) {
+  async function loadEnvironments() {
+    try {
+      const data = await api.listEnvironments();
+      setEnvironments(data.environments.filter((e) => e.status === "ready"));
+    } catch {
+      // Environments are optional, no error shown
+    }
+  }
+
+  async function handleRun(id: number) {
     setRunningId(id);
     setRunResult(null);
     try {
@@ -121,12 +133,14 @@ export default function FunctionsPage() {
         description: formDescription,
         python_version: formPythonVersion,
         dependencies: deps,
+        environment_id: formEnvId ?? undefined,
       });
       setShowForm(false);
       setFormName("");
       setFormCode("");
       setFormDescription("");
       setFormDeps("");
+      setFormEnvId(null);
       await loadFunctions();
     } catch (e) {
       setError(`Create failed: ${e}`);
@@ -219,15 +233,30 @@ export default function FunctionsPage() {
               required
             />
           </div>
-          <div>
-            <label className="block text-xs text-muted mb-1.5">Dependencies (comma-separated)</label>
-            <input
-              type="text"
-              value={formDeps}
-              onChange={(e) => setFormDeps(e.target.value)}
-              className="input-nordic w-full text-sm"
-              placeholder="requests, pandas, numpy"
-            />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Dependencies (comma-separated)</label>
+              <input
+                type="text"
+                value={formDeps}
+                onChange={(e) => setFormDeps(e.target.value)}
+                className="input-nordic w-full text-sm"
+                placeholder="requests, pandas, numpy"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Environment</label>
+              <select
+                value={formEnvId ?? ""}
+                onChange={(e) => setFormEnvId(e.target.value ? parseInt(e.target.value, 10) : null)}
+                className="input-nordic w-full text-sm"
+              >
+                <option value="">None (default)</option>
+                {environments.map((env) => (
+                  <option key={env.id} value={env.id}>{env.name}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <div className="flex justify-end">
             <button type="submit" className="btn-primary text-sm" disabled={formSubmitting}>
@@ -287,6 +316,14 @@ export default function FunctionsPage() {
                   {new Date(fn.created_at).toLocaleDateString()}
                 </span>
               </div>
+              {fn.environment_id != null && (
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted">Env</span>
+                  <span className="text-primary font-mono text-[11px]">
+                    {environments.find((e) => e.id === fn.environment_id)?.name ?? `#${fn.environment_id}`}
+                  </span>
+                </div>
+              )}
               {fn.dependencies.length > 0 && (
                 <div className="flex flex-wrap gap-1 pt-1">
                   {fn.dependencies.slice(0, 3).map((dep) => (

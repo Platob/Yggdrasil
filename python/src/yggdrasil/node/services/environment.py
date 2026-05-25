@@ -4,7 +4,6 @@ import datetime as dt
 import logging
 import shutil
 import subprocess
-import uuid
 from collections import OrderedDict
 from functools import partial
 from threading import Lock
@@ -13,6 +12,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from ..config import Settings
 from ..exceptions import NotFoundError
+from ..ids import make_id
 from ..schemas.environment import (
     EnvironmentCreate,
     EnvironmentEntry,
@@ -28,7 +28,7 @@ LOGGER = logging.getLogger(__name__)
 class EnvironmentService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._envs: OrderedDict[str, EnvironmentEntry] = OrderedDict()
+        self._envs: OrderedDict[int, EnvironmentEntry] = OrderedDict()
         self._lock = Lock()
         self._envs_root = settings.node_home / "envs"
         self._envs_root.mkdir(parents=True, exist_ok=True)
@@ -39,35 +39,65 @@ class EnvironmentService:
     # -- CRUD ---------------------------------------------------------------
 
     async def create(self, req: EnvironmentCreate) -> EnvironmentResponse:
-        env_id = uuid.uuid4().hex[:12]
+        """Create-or-update: if an environment with the same name exists, update deps."""
+        return await self.create_or_update(req)
+
+    async def create_or_update(self, req: EnvironmentCreate) -> EnvironmentResponse:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
-        env_path = self._envs_root / env_id
-
-        entry = EnvironmentEntry(
-            id=env_id,
-            name=req.name,
-            python_version=req.python_version,
-            dependencies=list(req.dependencies),
-            path=str(env_path),
-            status="creating",
-            created_at=now,
-            updated_at=now,
-        )
 
         with self._lock:
-            self._envs[env_id] = entry
-            self._evict()
+            existing = next(
+                (e for e in self._envs.values() if e.name == req.name), None
+            )
 
-        LOGGER.info("Creating environment %r (name=%r, python=%s)", env_id, req.name, req.python_version)
+        if existing:
+            # Update existing: keep ID and venv path, install new deps
+            new_deps = [d for d in req.dependencies if d not in existing.dependencies]
+            updates: dict = {"updated_at": now}
+            if new_deps:
+                updates["dependencies"] = list(existing.dependencies) + new_deps
 
-        # Build the venv in a threadpool so we don't block the event loop
-        await self._run(self._build_env, env_id, req.python_version, list(req.dependencies), env_path)
+            updated = existing.model_copy(update=updates)
+            with self._lock:
+                self._envs[existing.id] = updated
 
-        with self._lock:
-            entry = self._envs.get(env_id, entry)
-        return EnvironmentResponse(environment=entry)
+            if new_deps:
+                await self._run(self._install_packages, existing.id, new_deps)
+                with self._lock:
+                    updated = self._envs.get(existing.id, updated)
 
-    async def get(self, env_id: str) -> EnvironmentEntry:
+            LOGGER.info("Upserted environment %r (name=%r, mode=update)", existing.id, req.name)
+            return EnvironmentResponse(environment=updated)
+        else:
+            # Create new
+            env_id = make_id(req.name)
+            env_path = self._envs_root / str(env_id)
+
+            entry = EnvironmentEntry(
+                id=env_id,
+                name=req.name,
+                python_version=req.python_version,
+                dependencies=list(req.dependencies),
+                path=str(env_path),
+                status="creating",
+                created_at=now,
+                updated_at=now,
+            )
+
+            with self._lock:
+                self._envs[env_id] = entry
+                self._evict()
+
+            LOGGER.info("Upserted environment %r (name=%r, mode=create, python=%s)", env_id, req.name, req.python_version)
+
+            # Build the venv in a threadpool so we don't block the event loop
+            await self._run(self._build_env, env_id, req.python_version, list(req.dependencies), env_path)
+
+            with self._lock:
+                entry = self._envs.get(env_id, entry)
+            return EnvironmentResponse(environment=entry)
+
+    async def get(self, env_id: int) -> EnvironmentEntry:
         with self._lock:
             entry = self._envs.get(env_id)
         if entry is None:
@@ -82,7 +112,7 @@ class EnvironmentService:
             environments=items,
         )
 
-    async def update(self, env_id: str, req: EnvironmentUpdate) -> EnvironmentResponse:
+    async def update(self, env_id: int, req: EnvironmentUpdate) -> EnvironmentResponse:
         with self._lock:
             entry = self._envs.get(env_id)
         if entry is None:
@@ -106,21 +136,21 @@ class EnvironmentService:
         LOGGER.info("Updated environment %r", env_id)
         return EnvironmentResponse(environment=updated)
 
-    async def delete(self, env_id: str) -> EnvironmentResponse:
+    async def delete(self, env_id: int) -> EnvironmentResponse:
         with self._lock:
             entry = self._envs.pop(env_id, None)
         if entry is None:
             raise NotFoundError(f"Environment {env_id!r} not found")
 
         # Remove the filesystem venv
-        env_path = self._envs_root / env_id
+        env_path = self._envs_root / str(env_id)
         if env_path.exists():
             shutil.rmtree(env_path, ignore_errors=True)
 
         LOGGER.info("Deleted environment %r", env_id)
         return EnvironmentResponse(environment=entry)
 
-    async def install(self, env_id: str, req: InstallRequest) -> EnvironmentResponse:
+    async def install(self, env_id: int, req: InstallRequest) -> EnvironmentResponse:
         with self._lock:
             entry = self._envs.get(env_id)
         if entry is None:
@@ -132,7 +162,7 @@ class EnvironmentService:
             entry = self._envs.get(env_id, entry)
         return EnvironmentResponse(environment=entry)
 
-    def get_python_path(self, env_id: str) -> str | None:
+    def get_python_path(self, env_id: int) -> str | None:
         """Return the python binary path for a given environment, or None."""
         with self._lock:
             entry = self._envs.get(env_id)
@@ -148,7 +178,7 @@ class EnvironmentService:
 
     # -- internals ----------------------------------------------------------
 
-    def _build_env(self, env_id: str, python_version: str, dependencies: list[str], env_path) -> None:
+    def _build_env(self, env_id: int, python_version: str, dependencies: list[str], env_path) -> None:
         try:
             uv = shutil.which("uv")
             if uv:
@@ -184,7 +214,7 @@ class EnvironmentService:
             self._update_entry(env_id, status="failed", error=str(exc))
             LOGGER.error("Environment %r creation failed: %s", env_id, exc)
 
-    def _install_packages(self, env_id: str, packages: list[str]) -> None:
+    def _install_packages(self, env_id: int, packages: list[str]) -> None:
         with self._lock:
             entry = self._envs.get(env_id)
         if entry is None:
@@ -210,7 +240,7 @@ class EnvironmentService:
             self._update_entry(env_id, error=error_msg)
             LOGGER.error("Package install failed for env %r: %s", env_id, error_msg)
 
-    def _pip_install(self, env_id: str, env_path, packages: list[str], *, uv: str | None) -> None:
+    def _pip_install(self, env_id: int, env_path, packages: list[str], *, uv: str | None) -> None:
         python_bin = str(env_path / "bin" / "python")
         if uv:
             cmd = [uv, "pip", "install", "--python", python_bin] + packages
@@ -225,7 +255,7 @@ class EnvironmentService:
             text=True,
         )
 
-    def _update_entry(self, env_id: str, **updates) -> None:
+    def _update_entry(self, env_id: int, **updates) -> None:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         updates["updated_at"] = now
         with self._lock:
@@ -237,6 +267,6 @@ class EnvironmentService:
         while len(self._envs) > self.settings.max_environments:
             evicted_id, evicted = self._envs.popitem(last=False)
             # Clean up filesystem for evicted envs
-            evicted_path = self._envs_root / evicted_id
+            evicted_path = self._envs_root / str(evicted_id)
             if evicted_path.exists():
                 shutil.rmtree(evicted_path, ignore_errors=True)

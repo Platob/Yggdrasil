@@ -218,3 +218,4 @@ __marimo__/
 # and ``python/*/`` is the result of an unquoted-glob accident).
 /python/data.qqq
 /python/\*/
+.next/

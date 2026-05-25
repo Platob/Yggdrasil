@@ -8,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
@@ -19,6 +18,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from ..config import Settings
 from ..exceptions import NotFoundError
+from ..ids import make_id
 from ..schemas.function import FunctionEntry
 from ..schemas.run import (
     RunCreate,
@@ -42,7 +42,7 @@ class RunService:
         self.settings = settings
         self._function_service = function_service
         self._environment_service = environment_service
-        self._runs: OrderedDict[str, RunEntry] = OrderedDict()
+        self._runs: OrderedDict[int, RunEntry] = OrderedDict()
         self._lock = Lock()
 
     async def _run(self, fn, /, *args, **kwargs):
@@ -60,7 +60,7 @@ class RunService:
         if env_id is not None:
             env_python = self._environment_service.get_python_path(env_id)
 
-        run_id = uuid.uuid4().hex[:12]
+        run_id = make_id(f"{req.function_id}:{time.monotonic()}")
         now = dt.datetime.now(dt.timezone.utc).isoformat()
 
         entry = RunEntry(
@@ -88,14 +88,14 @@ class RunService:
 
         return RunResponse(run=result)
 
-    async def get(self, run_id: str) -> RunEntry:
+    async def get(self, run_id: int) -> RunEntry:
         with self._lock:
             entry = self._runs.get(run_id)
         if entry is None:
             raise NotFoundError(f"Run {run_id!r} not found")
         return entry
 
-    async def list(self, *, function_id: str | None = None) -> RunListResponse:
+    async def list(self, *, function_id: int | None = None) -> RunListResponse:
         with self._lock:
             items = list(self._runs.values())
         if function_id is not None:
@@ -105,7 +105,7 @@ class RunService:
             runs=items,
         )
 
-    async def delete(self, run_id: str) -> RunResponse:
+    async def delete(self, run_id: int) -> RunResponse:
         with self._lock:
             entry = self._runs.pop(run_id, None)
         if entry is None:
@@ -113,7 +113,7 @@ class RunService:
         LOGGER.info("Deleted run %r", run_id)
         return RunResponse(run=entry)
 
-    async def stream_logs(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
+    async def stream_logs(self, run_id: int) -> AsyncIterator[dict[str, Any]]:
         """Async generator yielding log events for an SSE stream.
 
         If the run is already completed, yields the stored stdout/stderr
@@ -151,7 +151,7 @@ class RunService:
 
     def _execute(
         self,
-        run_id: str,
+        run_id: int,
         function: FunctionEntry,
         env_python: str | None,
         args: dict[str, Any],
@@ -225,7 +225,7 @@ class RunService:
             if tmp is not None:
                 Path(tmp.name).unlink(missing_ok=True)
 
-    def _update_entry(self, run_id: str, **updates) -> RunEntry:
+    def _update_entry(self, run_id: int, **updates) -> RunEntry:
         with self._lock:
             entry = self._runs.get(run_id)
             if entry is not None:

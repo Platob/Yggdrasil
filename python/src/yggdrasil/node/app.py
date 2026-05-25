@@ -10,6 +10,7 @@ from .exceptions import register_exception_handlers
 from .routers import (
     call_router,
     cmd_router,
+    dag_router,
     discovery_router,
     env_router,
     environment_router,
@@ -23,6 +24,7 @@ from .routers.monitor import router as monitor_router
 from .services import (
     CallService,
     CmdService,
+    DagService,
     DiscoveryService,
     EnvService,
     EnvironmentService,
@@ -61,6 +63,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings,
         function_service=app.state.function_service,
         environment_service=app.state.environment_service,
+    )
+    app.state.dag_service = DagService(
+        settings,
+        function_service=app.state.function_service,
+        environment_service=app.state.environment_service,
+        run_service=app.state.run_service,
     )
 
     @app.middleware("http")
@@ -103,6 +111,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(environment_router, prefix=f"{prefix}/environment")
     app.include_router(run_router, prefix=f"{prefix}/run")
     app.include_router(monitor_router, prefix=f"{prefix}/monitor")
+    app.include_router(dag_router, prefix=f"{prefix}/dag")
 
     return app
 

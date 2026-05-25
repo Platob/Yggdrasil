@@ -6,14 +6,14 @@ import Link from "next/link";
 
 // ── Demo data ────────────────────────────────────────────────
 const DEMO_FUNCTION: FunctionEntry = {
-  id: "fn-002",
+  id: 2,
   name: "fetch_metrics",
   language: "python",
   code: 'import psutil\nimport json\n\ndef main():\n    """Collect system metrics from the node."""\n    cpu = psutil.cpu_percent(interval=1)\n    mem = psutil.virtual_memory()\n    disk = psutil.disk_usage("/")\n    return {\n        "cpu_percent": cpu,\n        "ram_percent": mem.percent,\n        "ram_used_gb": round(mem.used / 1e9, 2),\n        "disk_percent": disk.percent,\n    }',
   description: "Collect system metrics from the node including CPU, RAM, and disk usage",
   python_version: "3.12",
   dependencies: ["psutil"],
-  environment_id: "env-001",
+  environment_id: 1,
   creator: "admin",
   created_at: "2025-05-18T08:30:00Z",
   updated_at: "2025-05-22T14:00:00Z",
@@ -22,9 +22,9 @@ const DEMO_FUNCTION: FunctionEntry = {
 
 const DEMO_RUNS: RunEntry[] = [
   {
-    id: "run-001",
-    function_id: "fn-002",
-    environment_id: "env-001",
+    id: 1,
+    function_id: 2,
+    environment_id: 1,
     status: "completed",
     started_at: "2025-05-24T10:00:00Z",
     completed_at: "2025-05-24T10:00:02Z",
@@ -36,9 +36,9 @@ const DEMO_RUNS: RunEntry[] = [
     node_id: "ygg-node-alpha",
   },
   {
-    id: "run-002",
-    function_id: "fn-002",
-    environment_id: "env-001",
+    id: 2,
+    function_id: 2,
+    environment_id: 1,
     status: "completed",
     started_at: "2025-05-24T09:00:00Z",
     completed_at: "2025-05-24T09:00:01Z",
@@ -50,9 +50,9 @@ const DEMO_RUNS: RunEntry[] = [
     node_id: "ygg-node-alpha",
   },
   {
-    id: "run-003",
-    function_id: "fn-002",
-    environment_id: "env-001",
+    id: 3,
+    function_id: 2,
+    environment_id: 1,
     status: "failed",
     started_at: "2025-05-23T22:00:00Z",
     completed_at: "2025-05-23T22:00:00Z",
@@ -85,19 +85,20 @@ function statusDotClass(status: string): string {
 
 export default function FunctionDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
+  const numericId = parseInt(id, 10);
   const [fn, setFn] = useState<FunctionEntry | null>(null);
   const [runs, setRuns] = useState<RunEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
-  const [expandedRun, setExpandedRun] = useState<string | null>(null);
+  const [expandedRun, setExpandedRun] = useState<number | null>(null);
   const [streamingLogs, setStreamingLogs] = useState<string>("");
-  const [streamingRunId, setStreamingRunId] = useState<string | null>(null);
+  const [streamingRunId, setStreamingRunId] = useState<number | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     loadData();
-  }, [id]);
+  }, [numericId]);
 
   useEffect(() => {
     if (logsEndRef.current) {
@@ -110,8 +111,8 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
     setError(null);
     try {
       const [fnData, runsData] = await Promise.all([
-        api.getFunction(id),
-        api.listFunctionRuns(id),
+        api.getFunction(numericId),
+        api.listFunctionRuns(numericId),
       ]);
       setFn(fnData.function);
       setRuns(runsData.runs);
@@ -128,7 +129,7 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
     setStreamingLogs("");
     setStreamingRunId(null);
     try {
-      const data = await api.runFunction(id);
+      const data = await api.runFunction(numericId);
       const runId = data.run.id;
       setStreamingRunId(runId);
 

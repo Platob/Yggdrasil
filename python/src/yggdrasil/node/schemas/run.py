@@ -8,15 +8,15 @@ from .common import StrictModel
 
 
 class RunCreate(StrictModel):
-    function_id: str
-    environment_id: str | None = None
+    function_id: int
+    environment_id: int | None = None
     args: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunEntry(StrictModel):
-    id: str
-    function_id: str
-    environment_id: str | None = None
+    id: int
+    function_id: int
+    environment_id: int | None = None
     status: str = "pending"
     started_at: str | None = None
     completed_at: str | None = None
