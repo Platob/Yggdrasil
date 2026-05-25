@@ -24,6 +24,19 @@ and the worked example.
 """
 from __future__ import annotations
 
+from .api import (
+    APIError,
+    BadRequestError,
+    ConflictError as APIConflictError,
+    ForbiddenError as APIForbiddenError,
+    MethodNotAllowedError,
+    NotFoundError as APINotFoundError,
+    TimeoutError as APITimeoutError,
+    TooManyRequestsError,
+    UnauthorizedError as APIUnauthorizedError,
+    UnprocessableError,
+    register_api_exception_handlers,
+)
 from .base import YGGException
 from .cast import CastError
 from .http import (
@@ -74,6 +87,18 @@ from .http import (
 __all__ = [
     # Root
     "YGGException",
+    # API server errors
+    "APIError",
+    "BadRequestError",
+    "APIConflictError",
+    "APIForbiddenError",
+    "APINotFoundError",
+    "APITimeoutError",
+    "APIUnauthorizedError",
+    "MethodNotAllowedError",
+    "TooManyRequestsError",
+    "UnprocessableError",
+    "register_api_exception_handlers",
     # Cast
     "CastError",
     # HTTP — base
