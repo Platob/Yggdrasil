@@ -1244,9 +1244,9 @@ class Tabular(ABC, Generic[O]):
         return self._read_table(self.check_options(options, overrides=locals()))
 
     def _read_table(self, options: O) -> "Tabular | None":
-        spark = options.spark_session
+        spark = options.get_spark_session()
 
-        if spark is not None or PyEnv.in_databricks():
+        if spark is not None:
             from yggdrasil.spark.tabular import Dataset as _Dataset
             df = self._read_spark_frame(options)
             return _Dataset(frame=df) if df is not None else None

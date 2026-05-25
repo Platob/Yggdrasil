@@ -1557,7 +1557,7 @@ class CastOptions:
             return obj
         return self.target.spark_alias(obj)
 
-    def get_spark_session(self, create: bool = True, **kwargs):
+    def get_spark_session(self, create: bool = False, **kwargs):
         return PyEnv.spark_session(
             self.spark_session,
             create=create,

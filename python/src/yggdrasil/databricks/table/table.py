@@ -1459,7 +1459,9 @@ class Table(DatabricksPath):
             if not self.exists and options.target:
                 self.create(options.target)
                 s: pa.Schema = options.target.to_spark_schema()
-                return options.get_spark_session().createDataFrame([], schema=s)
+                return options.get_spark_session(
+                    create=True
+                ).createDataFrame([], schema=s)
             else:
                 raise
 
