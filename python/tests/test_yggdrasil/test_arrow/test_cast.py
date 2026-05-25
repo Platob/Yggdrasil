@@ -301,6 +301,93 @@ class TestRechunker(ArrowTestCase):
         out = list(rechunk_arrow_batches(small, byte_size=10_000))
         self.assertEqual(sum(x.num_rows for x in out), 5)
 
+    # ---- data-integrity tests ----
+
+    def _wide_batch(self, n: int) -> "pa.RecordBatch":
+        return self.record_batch({
+            "id": list(range(n)),
+            "val": [float(i) * 1.1 for i in range(n)],
+            "label": [f"row-{i}" for i in range(n)],
+        })
+
+    def test_row_size_preserves_data(self) -> None:
+        b = self._wide_batch(9)
+        out = list(rechunk_arrow_batches([b], row_size=4))
+        combined = self.pa.concat_batches(out)
+        self.assertEqual(combined.to_pydict(), b.to_pydict())
+
+    def test_byte_size_preserves_data(self) -> None:
+        b = self._wide_batch(100)
+        nbytes = get_arrow_nbytes(b)
+        out = list(rechunk_arrow_batches([b], byte_size=nbytes // 4))
+        combined = self.pa.concat_batches(out)
+        self.assertEqual(combined.to_pydict(), b.to_pydict())
+
+    def test_byte_size_chunks_near_target(self) -> None:
+        b = self._wide_batch(200)
+        target = get_arrow_nbytes(b) // 5
+        out = list(rechunk_arrow_batches([b], byte_size=target))
+        self.assertGreaterEqual(len(out), 3)
+        for chunk in out[:-1]:
+            chunk_bytes = get_arrow_nbytes(chunk)
+            self.assertLessEqual(chunk_bytes, target * 2)
+
+    def test_many_small_batches_coalesced_then_split(self) -> None:
+        small = [self._wide_batch(5) for _ in range(20)]
+        total_bytes = sum(get_arrow_nbytes(b) for b in small)
+        target = total_bytes // 3
+        out = list(rechunk_arrow_batches(small, byte_size=target))
+        combined = self.pa.concat_batches(out)
+        expected = self.pa.concat_batches(small)
+        self.assertEqual(combined.to_pydict(), expected.to_pydict())
+        self.assertLess(len(out), 20)
+
+    def test_mixed_size_batches_preserves_data(self) -> None:
+        batches = [self._wide_batch(n) for n in (1, 50, 2, 30, 1, 100, 3)]
+        out = list(rechunk_arrow_batches(batches, byte_size=200))
+        combined = self.pa.concat_batches(out)
+        expected = self.pa.concat_batches(batches)
+        self.assertEqual(combined.to_pydict(), expected.to_pydict())
+
+    def test_single_large_batch_sliced_preserves_data(self) -> None:
+        b = self._wide_batch(500)
+        target = get_arrow_nbytes(b) // 10
+        out = list(rechunk_arrow_batches([b], byte_size=target))
+        self.assertGreater(len(out), 5)
+        combined = self.pa.concat_batches(out)
+        self.assertEqual(combined.to_pydict(), b.to_pydict())
+
+    def test_byte_and_row_preserves_data(self) -> None:
+        b = self._wide_batch(50)
+        out = list(rechunk_arrow_batches([b], byte_size=100, row_size=7))
+        combined = self.pa.concat_batches(out)
+        self.assertEqual(combined.to_pydict(), b.to_pydict())
+        for chunk in out:
+            self.assertLessEqual(chunk.num_rows, 7)
+
+    def test_schema_preserved_after_rechunk(self) -> None:
+        b = self._wide_batch(20)
+        out = list(rechunk_arrow_batches([b], row_size=5))
+        for chunk in out:
+            self.assertEqual(chunk.schema, b.schema)
+
+    def test_empty_input_yields_nothing(self) -> None:
+        out = list(rechunk_arrow_batches([], byte_size=100))
+        self.assertEqual(out, [])
+
+    def test_all_empty_batches_yield_nothing(self) -> None:
+        empties = [self.record_batch({"a": []}) for _ in range(3)]
+        out = list(rechunk_arrow_batches(empties, byte_size=100))
+        self.assertEqual(out, [])
+
+    def test_generator_input_works(self) -> None:
+        def gen():
+            for i in range(5):
+                yield self._wide_batch(10)
+
+        out = list(rechunk_arrow_batches(gen(), byte_size=200))
+        self.assertEqual(sum(c.num_rows for c in out), 50)
+
 
 class TestArrowNbytes(ArrowTestCase):
     """``get_arrow_nbytes`` covers arrays, chunked arrays, tables, and ``None``."""
