@@ -18,37 +18,40 @@ from datetime import datetime, timezone
 # -- ANSI helpers (no external deps) ----------------------------------------
 
 _CSI = "\033["
+_RESET = f"{_CSI}0m"
 
-def _color(text: str, code: str) -> str:  return f"{_CSI}{code}m{text}{_CSI}0m"
-def _bold(text: str) -> str:   return _color(text, "1")
-def _dim(text: str) -> str:    return _color(text, "2")
-def _cyan(text: str) -> str:   return _color(text, "36")
-def _green(text: str) -> str:  return _color(text, "32")
-def _yellow(text: str) -> str: return _color(text, "33")
-def _magenta(text: str) -> str: return _color(text, "35")
-def _red(text: str) -> str:    return _color(text, "31")
-def _blue(text: str) -> str:   return _color(text, "34")
 
-def _clear_line() -> None:
-    sys.stdout.write(f"{_CSI}2K\r"); sys.stdout.flush()
+def _color(text: str, code: str) -> str:
+    return f"{_CSI}{code}m{text}{_RESET}"
 
-def _move_up(n: int = 1) -> None:
-    sys.stdout.write(f"{_CSI}{n}A"); sys.stdout.flush()
+def _bold(text: str) -> str:    return _color(text, "1")
+def _dim(text: str) -> str:     return _color(text, "2")
+def _yellow(text: str) -> str:  return _color(text, "33")
+def _cyan(text: str) -> str:    return _color(text, "36")
+def _green(text: str) -> str:   return _color(text, "32")
 
 _USERNAME_CODES = (31, 32, 33, 34, 35, 36)
 
-def _username_color(name: str) -> int:
-    return _USERNAME_CODES[hash(name) % len(_USERNAME_CODES)]
-
 def _colored_name(name: str) -> str:
-    return _color(name, str(_username_color(name)))
+    return _color(name, str(_USERNAME_CODES[hash(name) % len(_USERNAME_CODES)]))
+
+def _clear_line() -> None:
+    sys.stdout.write(f"{_CSI}2K\r")
+    sys.stdout.flush()
+
+def _out(text: str) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
 
 # -- HTTP helpers (stdlib only) ---------------------------------------------
+
 
 def _http_get(url: str, timeout: float = 30.0) -> dict:
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
+
 
 def _http_post(url: str, body: dict | None = None, timeout: float = 10.0) -> dict:
     data = json.dumps(body).encode() if body is not None else b""
@@ -56,6 +59,7 @@ def _http_post(url: str, body: dict | None = None, timeout: float = 10.0) -> dic
     req = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
+
 
 # -- Banner & typing animation ---------------------------------------------
 
@@ -68,19 +72,17 @@ _BANNER = r"""
   {g}      |___/          {r}
 """
 
-def _print_banner() -> None:
-    sys.stdout.write(_BANNER.format(g=_CSI + "32m", c=_CSI + "36m", r=_CSI + "0m"))
-    sys.stdout.flush()
 
-def _typing_dots(duration: float = 0.6, frames: int = 3) -> None:
-    """Show a brief typing indicator before rendering a message."""
+def _typing_dots(duration: float = 0.35, frames: int = 3) -> None:
     delay = duration / (frames + 1)
     for i in range(1, frames + 1):
-        sys.stdout.write(f"\r  {_dim('.' * i)}"); sys.stdout.flush()
+        _out(f"\r  {_dim('.' * i)}")
         time.sleep(delay)
     _clear_line()
 
+
 # -- ChatClient -------------------------------------------------------------
+
 
 class ChatClient:
     """Interactive terminal chat client for the bot messenger API."""
@@ -99,7 +101,7 @@ class ChatClient:
         return f"[{_cyan(self.channel)}] {_colored_name(self.username)}> "
 
     def _write_prompt(self) -> None:
-        sys.stdout.write(self._prompt); sys.stdout.flush()
+        _out(self._prompt)
 
     def _api(self, path: str) -> str:
         return f"{self.base_url}/api/messenger{path}"
@@ -112,18 +114,18 @@ class ChatClient:
                 self._api(""),
                 {"text": text, "sender": self.username, "channel": self.channel},
             )
-            if "id" in resp:  # track own id so poller skips it
+            if "id" in resp:
                 self.last_id = resp["id"]
             return resp
         except urllib.error.URLError as exc:
-            self._print_system(f"send failed: {exc.reason}")
+            self._sys(f"send failed: {exc.reason}")
             return None
 
     def list_channels(self) -> list[dict]:
         try:
             return _http_get(self._api("/channels")).get("channels", [])
         except urllib.error.URLError as exc:
-            self._print_system(f"cannot list channels: {exc.reason}")
+            self._sys(f"cannot list channels: {exc.reason}")
             return []
 
     def fetch_messages(self, channel: str | None = None) -> list[dict]:
@@ -152,7 +154,7 @@ class ChatClient:
             encoded = urllib.request.quote(name, safe="")
             return _http_post(self._api(f"/channels?name={encoded}"))
         except urllib.error.URLError as exc:
-            self._print_system(f"create channel failed: {exc.reason}")
+            self._sys(f"create channel failed: {exc.reason}")
             return None
 
     # -- display ---------------------------------------------------------
@@ -167,16 +169,15 @@ class ChatClient:
         except (ValueError, TypeError):
             return ts[:5] if len(ts) >= 5 else ts
 
-    def _print_message(self, msg: dict, *, animate: bool = False) -> None:
+    def _print_msg(self, msg: dict, *, animate: bool = False) -> None:
         sender, text = msg.get("sender", "???"), msg.get("text", "")
         ts = self._format_ts(msg.get("timestamp", ""))
         if animate and sender != self.username:
-            _typing_dots(duration=0.35)
-        sys.stdout.write(f"  {_dim(ts)} {_colored_name(sender)}: {text}\n")
-        sys.stdout.flush()
+            _typing_dots()
+        _out(f"  {_dim(ts)} {_colored_name(sender)}: {text}\n")
 
-    def _print_system(self, text: str) -> None:
-        sys.stdout.write(f"  {_dim('*')} {_yellow(text)}\n"); sys.stdout.flush()
+    def _sys(self, text: str) -> None:
+        _out(f"  {_dim('*')} {_yellow(text)}\n")
 
     # -- background poller -----------------------------------------------
 
@@ -189,7 +190,7 @@ class ChatClient:
                 _clear_line()
                 for msg in messages:
                     if msg.get("sender") != self.username:
-                        self._print_message(msg, animate=True)
+                        self._print_msg(msg, animate=True)
                     self.last_id = msg.get("id", self.last_id)
                 self._write_prompt()
 
@@ -210,43 +211,45 @@ class ChatClient:
     def _cmd_join(self, arg: str) -> None:
         name = arg.strip()
         if not name:
-            self._print_system("usage: /join <channel>"); return
+            self._sys("usage: /join <channel>")
+            return
         self._stop_poller()
         self.channel = name
         self._seed_last_id()
-        self._print_system(f"joined #{name}")
+        self._sys(f"joined #{name}")
         self._start_poller()
 
     def _cmd_channels(self) -> None:
         channels = self.list_channels()
         if not channels:
-            self._print_system("no channels (or server unreachable)"); return
-        self._print_system("channels:")
+            self._sys("no channels (or server unreachable)")
+            return
+        self._sys("channels:")
         for ch in channels:
             n, c = ch.get("name", "?"), ch.get("message_count", 0)
             m = len(ch.get("members", []))
             mark = _green(" <--") if n == self.channel else ""
-            sys.stdout.write(f"    {_bold('#' + n)}  {_dim(f'{c} msgs, {m} members')}{mark}\n")
-        sys.stdout.flush()
+            _out(f"    {_bold('#' + n)}  {_dim(f'{c} msgs, {m} members')}{mark}\n")
 
     def _cmd_create(self, arg: str) -> None:
         name = arg.strip()
         if not name:
-            self._print_system("usage: /create <channel>"); return
+            self._sys("usage: /create <channel>")
+            return
         if self.create_channel(name):
-            self._print_system(f"channel #{name} created")
+            self._sys(f"channel #{name} created")
 
     def _cmd_users(self) -> None:
         for ch in self.list_channels():
             if ch.get("name") == self.channel:
-                self._print_system(f"members of #{self.channel}:")
+                self._sys(f"members of #{self.channel}:")
                 for m in ch.get("members", []):
-                    sys.stdout.write(f"    {_colored_name(m)}\n")
-                sys.stdout.flush(); return
-        self._print_system(f"channel #{self.channel} not found")
+                    _out(f"    {_colored_name(m)}\n")
+                return
+        self._sys(f"channel #{self.channel} not found")
 
     def _cmd_help(self) -> None:
-        self._print_system("commands:")
+        self._sys("commands:")
         for cmd, desc in [
             ("/join <channel>", "switch to a channel"),
             ("/channels", "list all channels"),
@@ -255,8 +258,7 @@ class ChatClient:
             ("/help", "show this help"),
             ("/quit", "exit the chat"),
         ]:
-            sys.stdout.write(f"    {_bold(cmd):30s} {_dim(desc)}\n")
-        sys.stdout.flush()
+            _out(f"    {_bold(cmd):30s} {_dim(desc)}\n")
 
     def _handle_command(self, line: str) -> bool:
         """Handle a ``/command``.  Returns *True* to quit."""
@@ -274,7 +276,7 @@ class ChatClient:
         if handler:
             handler()
         else:
-            self._print_system(f"unknown command {cmd} -- try /help")
+            self._sys(f"unknown command {cmd} -- try /help")
         return False
 
     def _seed_last_id(self) -> None:
@@ -285,16 +287,14 @@ class ChatClient:
     # -- main REPL -------------------------------------------------------
 
     def run(self) -> int:
-        _print_banner()
-        self._print_system(
-            f"connecting to {_bold(self.base_url)} as {_colored_name(self.username)}",
-        )
+        _out(_BANNER.format(g=_CSI + "32m", c=_CSI + "36m", r=_RESET))
+        self._sys(f"connecting to {_bold(self.base_url)} as {_colored_name(self.username)}")
         self._cmd_channels()
-        self._print_system(f"joined #{self.channel} -- type /help for commands\n")
+        self._sys(f"joined #{self.channel} -- type /help for commands\n")
         self._seed_last_id()
         for msg in self.fetch_messages()[-20:]:
-            self._print_message(msg)
-        sys.stdout.write("\n")
+            self._print_msg(msg)
+        _out("\n")
         self._start_poller()
         try:
             while True:
@@ -315,12 +315,13 @@ class ChatClient:
             pass
         finally:
             self._stop_poller()
-            sys.stdout.write("\n")
-            self._print_system("disconnected")
+            _out("\n")
+            self._sys("disconnected")
         return 0
 
 
 # -- Entry point ------------------------------------------------------------
+
 
 def run_chat(
     url: str = "http://127.0.0.1:8100",
