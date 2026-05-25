@@ -30,7 +30,7 @@ inherits them::
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Iterable, Iterator, Optional
 
 from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
@@ -264,19 +264,58 @@ class Genie(DatabricksService):
     def create_space(
         self,
         *,
+        tables: "Iterable[str] | None" = None,
+        instructions: "Iterable[str] | None" = None,
         warehouse_id: str | None = None,
-        serialized_space: str,
+        serialized_space: str | None = None,
         title: str | None = None,
         description: str | None = None,
         parent_path: str | None = None,
     ) -> GenieSpace:
-        """Create a new Genie space."""
+        """Create a new Genie space.
+
+        Parameters
+        ----------
+        tables
+            Table names to expose.  Short names (``"orders"``,
+            ``"sales.orders"``) are resolved to fully-qualified
+            ``catalog.schema.table`` via :meth:`resolve_table_identifiers`.
+            Mutually exclusive with *serialized_space*.
+        instructions
+            Free-text instructions for the Genie LLM.  Only used when
+            *tables* builds the ``serialized_space``.
+        warehouse_id
+            Warehouse id.  Falls back to :attr:`GenieDefaults.warehouse_id`,
+            then to the workspace default warehouse.
+        serialized_space
+            Pre-built JSON payload.  When provided, *tables* and
+            *instructions* must be ``None``.
+        title
+            Space title.
+        description
+            Space description.
+        parent_path
+            Workspace folder the space is filed under.
+        """
+        if tables is not None and serialized_space is not None:
+            raise ValueError(
+                "Pass either tables=... or serialized_space=..., not both."
+            )
+        if tables is not None:
+            resolved = self.resolve_table_identifiers(tuple(tables))
+            serialized_space = build_serialized_space(
+                tables=resolved,
+                text_instructions=tuple(instructions or ()),
+            )
+        if serialized_space is None:
+            raise ValueError(
+                "Either tables=... or serialized_space=... is required to "
+                "create a Genie space."
+            )
         warehouse_id = warehouse_id or self.defaults.warehouse_id
         if not warehouse_id:
-            raise ValueError(
-                "warehouse_id is required to create a Genie space; "
-                "pass warehouse_id=... or set Genie.defaults.warehouse_id."
-            )
+            wh = self.resolve_warehouse()
+            warehouse_id = wh.warehouse_id
         space = self.api.create_space(
             warehouse_id=warehouse_id,
             serialized_space=serialized_space,
@@ -409,6 +448,61 @@ class Genie(DatabricksService):
             pass
         return base
 
+    def resolve_table_identifiers(
+        self,
+        tables: "tuple[str, ...] | list[str]",
+    ) -> "tuple[str, ...]":
+        """Resolve short table names to fully-qualified ``catalog.schema.table``.
+
+        Identifiers that already contain three dotted parts pass through
+        unchanged.  Shorter names (``"orders"``, ``"sales.orders"``) are
+        looked up via :meth:`Tables.list_tables` across all visible
+        catalogs and schemas.  When exactly one match is found it is used;
+        when zero or multiple matches are found, a helpful error is raised.
+        """
+        resolved: list[str] = []
+        for ident in tables:
+            parts = [p.strip().strip("`") for p in ident.split(".")]
+            if len(parts) >= 3:
+                resolved.append(ident)
+                continue
+
+            if len(parts) == 2:
+                schema_filter, table_filter = parts
+            else:
+                schema_filter, table_filter = None, parts[0]
+
+            matches: list[str] = []
+            for tbl in self.client.tables.list_tables(
+                name=table_filter,
+                catalog_name=None,
+                schema_name=schema_filter,
+            ):
+                matches.append(
+                    f"{tbl.catalog_name}.{tbl.schema_name}.{tbl.table_name}"
+                )
+
+            if len(matches) == 1:
+                LOGGER.info(
+                    "Resolved table %r to %r",
+                    ident,
+                    matches[0],
+                )
+                resolved.append(matches[0])
+            elif len(matches) == 0:
+                raise ValueError(
+                    f"Table {ident!r} not found in any catalog/schema. "
+                    "Pass a fully-qualified 'catalog.schema.table' name, or "
+                    "check that the table exists and you have access."
+                )
+            else:
+                raise ValueError(
+                    f"Table {ident!r} is ambiguous — found {len(matches)} "
+                    f"matches: {matches!r}. Pass a fully-qualified "
+                    "'catalog.schema.table' name to disambiguate."
+                )
+        return tuple(resolved)
+
     def _create_managed_space(self) -> GenieSpace:
         """Create a Genie space using the ``managed_space_*`` defaults.
 
@@ -421,23 +515,10 @@ class Genie(DatabricksService):
                 "Genie.defaults.managed_space_tables — Genie requires at "
                 "least one fully-qualified `catalog.schema.table` to expose."
             )
-        wh_id = self.defaults.warehouse_id
-        if not wh_id:
-            wh_id = self.resolve_warehouse().warehouse_id
-        serialized = build_serialized_space(
-            tables=self.defaults.managed_space_tables,
-            text_instructions=self.defaults.managed_space_instructions,
-        )
         title = self._resolve_managed_title()
-        LOGGER.info(
-            "Creating Genie space %r (tables=%r, warehouse_id=%r)",
-            title,
-            tuple(self.defaults.managed_space_tables),
-            wh_id,
-        )
         return self.create_space(
-            warehouse_id=wh_id,
-            serialized_space=serialized,
+            tables=self.defaults.managed_space_tables,
+            instructions=self.defaults.managed_space_instructions,
             title=title,
             description=self.defaults.managed_space_description,
             parent_path=self.defaults.managed_space_parent_path,
