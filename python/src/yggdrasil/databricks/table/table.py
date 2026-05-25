@@ -2096,24 +2096,6 @@ class Table(DatabricksPath):
         # external / explicit-storage paths fall through to the legacy
         # drop + recreate (UC's tables.create API has no replace verb).
         if or_replace:
-            is_managed_delta = (
-                (table_type is None or table_type == TableType.MANAGED)
-                and storage_location is None
-                and data_source_format == DataSourceFormat.DELTA
-            )
-            if is_managed_delta:
-                result = self.sql_create(
-                    definition,
-                    comment=comment,
-                    missing_ok=False,
-                    or_replace=True,
-                    wait=wait,
-                    properties=properties,
-                    data_source_format=data_source_format,
-                    record_ygg_properties=record_ygg_properties,
-                )
-                self.invalidate_singleton(remove_global=True)
-                return result
             self.delete(wait=True, missing_ok=True, delete_staging=False, delete_job=False)
 
         if self.exists:
