@@ -1,5 +1,42 @@
 # Yggdrasil Next.js Frontend - AI Agent Instructions
 
+## Design System: Nordic Mythic Theme
+
+This frontend uses a **mythic Nordic aesthetic** inspired by the Yggdrasil World Tree.
+
+### Brand Colors
+- **Primary**: `#f26b3a` (Coral/Orange) - from the Yggdrasil logo
+- **Background**: `#0c0c0f` (Deep charcoal/void)
+- **Accent**: `#5b9bd5` (Nordic ice blue) - for contrast only
+
+### Design Principles
+1. **Dark, atmospheric** - deep blacks and charcoals evoke Norse mythology
+2. **Orange/coral accents** - the World Tree color, used sparingly for emphasis
+3. **Clean and functional** - modern dashboard UI, not decorative fantasy
+4. **Subtle glows** - primary color has soft glow effects for status/emphasis
+
+### Component Patterns
+- Use `.nordic-card` for card containers
+- Use `.btn-primary` for primary actions (orange gradient with glow)
+- Use `.btn-ghost` for secondary actions
+- Use `.input-nordic` for form inputs
+- Use `.status-dot` with `.online/.offline/.pending` for status indicators
+
+### Logo
+- Import from `@/components/logo` 
+- `<YggdrasilLogo />` - SVG tree icon
+- `<YggdrasilBrand />` - logo + wordmark combo
+
+### CSS Classes in `globals.css`
+- `.nordic-card` - Card with border, rounded corners, hover state
+- `.btn-primary` - Primary button with gradient and glow
+- `.btn-ghost` - Ghost button for secondary actions  
+- `.input-nordic` - Styled input with focus ring
+- `.code-block` - Code/pre block styling
+- `.glow-primary` - Animated glow effect
+- `.pulse-primary` - Pulse animation for loading states
+- `.rune-border` - Decorative gradient border (use sparingly)
+
 ## Architecture Overview
 
 This is a **hybrid architecture** with two backends:
