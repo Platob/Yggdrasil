@@ -206,6 +206,93 @@ To add a new service:
 3. Create route at `src/app/[service-name]/`
 4. Set `comingSoon: false` when ready
 
+## WebGL & 3D Rendering Guidelines
+
+This project uses **React Three Fiber (R3F)** for WebGL-powered 3D visualizations.
+
+### Dependencies
+- `@react-three/fiber` - React renderer for Three.js
+- `@react-three/drei` - Useful helpers (OrbitControls, Html, etc.)
+- `three` - Core Three.js library
+
+### When to Use WebGL
+- **Globe/Map visualizations** - Network topology, node locations worldwide
+- **Data visualizations** - 3D charts, real-time metrics
+- **Hero animations** - Landing page eye-candy, branded experiences
+- **Interactive dashboards** - When 2D charts aren't sufficient
+
+### Globe Pattern (globe.gl style)
+The welcome page features an interactive 3D globe. Key patterns:
+
+```tsx
+import { Canvas, useFrame } from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import * as THREE from "three";
+
+// Dark globe with wireframe graticule
+<mesh>
+  <sphereGeometry args={[1.98, 64, 64]} />
+  <meshStandardMaterial color="#0a0a10" />
+</mesh>
+<lineSegments>
+  <wireframeGeometry args={[new THREE.SphereGeometry(2, 24, 18)]} />
+  <lineBasicMaterial color="#1e1e2a" transparent opacity={0.6} />
+</lineSegments>
+
+// Atmospheric glow (BackSide rendering)
+<mesh>
+  <sphereGeometry args={[2.08, 64, 64]} />
+  <meshBasicMaterial color="#f26b3a" transparent opacity={0.03} side={THREE.BackSide} />
+</mesh>
+
+// Node markers at lat/lng positions
+function latLngToVector3(lat: number, lng: number, radius: number) {
+  const phi = (90 - lat) * (Math.PI / 180);
+  const theta = (lng + 180) * (Math.PI / 180);
+  return new THREE.Vector3(
+    -radius * Math.sin(phi) * Math.cos(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.sin(theta)
+  );
+}
+```
+
+### Performance Best Practices
+1. **Use `useFrame` sparingly** - Only for animations that need per-frame updates
+2. **Memoize geometries** - Use `useMemo` for complex geometry calculations
+3. **Limit draw calls** - Batch similar objects, use instanced meshes for many items
+4. **Dispose resources** - Clean up geometries/materials in useEffect cleanup
+5. **Use `<Html>` for UI overlays** - Don't render DOM in 3D unless needed
+
+### Canvas Setup
+```tsx
+<Canvas
+  camera={{ position: [0, 0, 5], fov: 45 }}
+  gl={{ antialias: true, alpha: true }}
+  style={{ background: "transparent" }}
+>
+  <ambientLight intensity={0.4} />
+  <pointLight position={[10, 10, 10]} intensity={0.6} />
+  <OrbitControls 
+    enablePan={false}
+    minDistance={3}
+    maxDistance={8}
+    autoRotate
+    autoRotateSpeed={0.3}
+  />
+  {/* Scene content */}
+</Canvas>
+```
+
+### Color Palette for 3D
+- Globe surface: `#0a0a10` (near-black)
+- Wireframe/grid: `#1e1e2a` (dark grey)
+- Nodes online: `#4ade80` (green)
+- Nodes pending: `#fbbf24` (yellow)
+- Nodes offline: `#ef4444` (red)
+- Arcs/connections: `#f26b3a` (primary orange)
+- Atmosphere glow: `#f26b3a` at low opacity
+
 ## Feature Implementation Checklist
 
 When adding a new feature:
