@@ -1697,8 +1697,8 @@ class HTTPSession(Session):
             remote_mode = rc.mode if rc is not None else None
             has_spark = r.send_config_or_default.spark_session is not None
             key = (
-                lc.tabular if lc is not None and local_mode != Mode.UPSERT else None,
-                rc.tabular if rc is not None and remote_mode != Mode.UPSERT else None,
+                lc.tabular if lc is not None and lc.cache_read_enabled else None,
+                rc.tabular if rc is not None and rc.cache_read_enabled else None,
                 local_mode,
                 remote_mode,
                 has_spark,
