@@ -125,6 +125,7 @@ Repository = "https://github.com/Platob/Yggdrasil"
 Documentation = "https://platob.github.io/Yggdrasil/"
 
 [project.scripts]
+ygg = "yggdrasil.cli.main:main"
 ygg-api = "yggdrasil.fastapi.main:main"
 ygg-bot = "yggdrasil.bot.main:main"
 ygg-genie = "yggdrasil.cli.databricks.genie:main"

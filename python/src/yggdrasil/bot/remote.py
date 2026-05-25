@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import functools
 import inspect
 import logging
+import textwrap
 from typing import Any, Callable, TypeVar, overload
 
 LOGGER = logging.getLogger(__name__)
@@ -10,6 +12,22 @@ LOGGER = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
 _REGISTRY: dict[str, _RemoteSpec] = {}
+
+_STDLIB_MODULES = frozenset({
+    "abc", "argparse", "ast", "asyncio", "base64", "binascii", "builtins",
+    "collections", "concurrent", "contextlib", "copy", "csv", "ctypes",
+    "dataclasses", "datetime", "decimal", "difflib", "email", "enum",
+    "errno", "fnmatch", "fractions", "functools", "gc", "getpass", "glob",
+    "gzip", "hashlib", "heapq", "hmac", "html", "http", "importlib",
+    "inspect", "io", "itertools", "json", "locale", "logging", "lzma",
+    "math", "mmap", "multiprocessing", "numbers", "operator", "os",
+    "pathlib", "pickle", "platform", "pprint", "queue", "random", "re",
+    "secrets", "shlex", "shutil", "signal", "socket", "sqlite3",
+    "statistics", "string", "struct", "subprocess", "sys", "tempfile",
+    "textwrap", "threading", "time", "timeit", "traceback", "types",
+    "typing", "unittest", "urllib", "uuid", "warnings", "weakref",
+    "xml", "zipfile", "zlib",
+})
 
 
 class _RemoteSpec:
@@ -32,6 +50,36 @@ def _func_key(func: Callable) -> str:
     module = getattr(func, "__module__", None) or ""
     qualname = getattr(func, "__qualname__", None) or func.__name__
     return f"{module}:{qualname}"
+
+
+def _infer_modules(func: Callable) -> list[str]:
+    """Infer third-party module imports from function source code."""
+    try:
+        source = inspect.getsource(func)
+    except (OSError, TypeError):
+        return []
+
+    source = textwrap.dedent(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top not in _STDLIB_MODULES:
+                    modules.add(top)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top = node.module.split(".")[0]
+                if top not in _STDLIB_MODULES:
+                    modules.add(top)
+
+    modules.discard("yggdrasil")
+    return sorted(modules)
 
 
 @overload
@@ -67,8 +115,9 @@ def remote(
             import numpy as np
             ...
 
-    ``modules`` lists pip packages the function needs. When called on a
-    bot node that lacks them, the server auto-installs before execution.
+    When ``modules`` is not specified, the decorator auto-infers
+    third-party imports from the function source code via AST analysis.
+    Explicitly passing ``modules=[]`` disables inference.
 
     The decorated function works normally when called locally.
     Use ``BotClient.call(func, *args, **kwargs)`` to invoke it on a
@@ -76,7 +125,8 @@ def remote(
     """
     def _wrap(f: F) -> F:
         key = name or _func_key(f)
-        spec = _RemoteSpec(func=f, key=key, timeout=timeout, modules=modules)
+        resolved_modules = modules if modules is not None else _infer_modules(f)
+        spec = _RemoteSpec(func=f, key=key, timeout=timeout, modules=resolved_modules)
         _REGISTRY[key] = spec
 
         @functools.wraps(f)
@@ -86,7 +136,7 @@ def remote(
         wrapper._remote_key = key  # type: ignore[attr-defined]
         wrapper._remote_timeout = timeout  # type: ignore[attr-defined]
         wrapper._remote_func = f  # type: ignore[attr-defined]
-        wrapper._remote_modules = modules  # type: ignore[attr-defined]
+        wrapper._remote_modules = resolved_modules  # type: ignore[attr-defined]
         return wrapper  # type: ignore[return-value]
 
     if func is not None:

@@ -34,6 +34,32 @@ async def execute_call(
     )
 
 
+@router.post("/stream")
+async def execute_call_stream(
+    request: Request,
+    service: CallService = Depends(get_call_service),
+):
+    """Always-streaming variant. Returns Arrow IPC stream for tabular,
+    pickle bytes for scalars. Preferred for keep-alive connections."""
+    body = await request.body()
+    result_data, content_type, headers = await service.execute_call(
+        body, "application/vnd.apache.arrow.stream"
+    )
+
+    if isinstance(result_data, collections.abc.Iterator):
+        return StreamingResponse(
+            result_data,
+            media_type=content_type,
+            headers=headers,
+        )
+
+    return FastAPIResponse(
+        content=result_data,
+        media_type=content_type,
+        headers=headers,
+    )
+
+
 @router.get("/registry")
 async def list_registry(
     service: CallService = Depends(get_call_service),

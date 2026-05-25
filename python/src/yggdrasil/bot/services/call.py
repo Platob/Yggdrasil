@@ -55,6 +55,8 @@ class CallService:
         if spec.modules or extra_modules:
             await self._run(self._ensure_deps, spec, extra_modules)
 
+        args, kwargs = self._coerce_args(spec.func, args, kwargs)
+
         call_id = uuid.uuid4().hex[:12]
         LOGGER.info("Executing call %r (id=%s)", func_key, call_id)
 
@@ -98,6 +100,14 @@ class CallService:
             )
 
         return serialize_pickle(result), CONTENT_TYPE_PICKLE, headers
+
+    @staticmethod
+    def _coerce_args(func, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        try:
+            from yggdrasil.dataclasses.safe_function import check_function_args
+            return check_function_args(func, args, kwargs)
+        except Exception:
+            return args, kwargs
 
     @staticmethod
     def _ensure_deps(spec, extra_modules: list[str] | None) -> None:
