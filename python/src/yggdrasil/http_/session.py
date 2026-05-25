@@ -808,21 +808,6 @@ class HTTPSession(Session):
         base = parts.path.rsplit("/", 1)[0] + "/"
         return urlunsplit((parts.scheme, parts.netloc, base + location, "", ""))
 
-    @property
-    def x_api_key(self) -> Optional[str]:
-        if self.headers:
-            return self.headers.get("X-API-Key")
-        return None
-
-    @x_api_key.setter
-    def x_api_key(self, value: Optional[str]) -> None:
-        if self.headers is None:
-            self.headers = Headers()
-        if value is None:
-            self.headers.pop("X-API-Key", None)
-        else:
-            self.headers["X-API-Key"] = value
-
     def _request_log_id(self, request: PreparedRequest) -> str:
         try:
             return request.xxh3_b64(url_safe=True)
@@ -1309,11 +1294,7 @@ class HTTPSession(Session):
         request: PreparedRequest,
     ) -> HTTPResponse:
         config = request.send_config_or_default
-        wait_cfg = (
-            config.wait
-            if config.wait is not None and config.wait is not DEFAULT_WAITING_CONFIG
-            else self.waiting
-        )
+        wait_cfg = config.wait if config.wait is not None else self.waiting
 
         result = self._wire_send(request, wait_cfg)
 
