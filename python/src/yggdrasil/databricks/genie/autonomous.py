@@ -56,9 +56,28 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .service import Genie
 
 
-__all__ = ["AutonomousAgent", "AgentResult", "AgentStep"]
+__all__ = ["AutonomousAgent", "AgentResponse", "AgentResult", "AgentStep"]
 
 LOGGER = logging.getLogger(__name__)
+
+_MAX_INTROSPECT_CATALOGS: int = 10
+_MAX_INTROSPECT_SCHEMAS: int = 10
+_MAX_INTROSPECT_TABLES: int = 20
+_MAX_RECOVERY_ATTEMPTS: int = 2
+_MAX_REPLAN_CYCLES: int = 3
+_MAX_HISTORY_FOR_CONTEXT: int = 5
+
+_RESOURCE_CREATION_TOOLS: frozenset[str] = frozenset(
+    {
+        "create_catalog",
+        "create_schema",
+        "create_table",
+        "create_volume",
+        "create_warehouse",
+        "create_cluster",
+        "setup_storage",
+    }
+)
 
 
 # ----------------------------------------------------------------------- #
@@ -118,31 +137,177 @@ class AgentResult:
         )
 
 
+@dataclass
+class AgentResponse:
+    """Result of :meth:`AutonomousAgent.respond` — the smart dispatch entry point."""
+
+    intent: str
+    text: Optional[str] = None
+    result: Any = None
+    succeeded: bool = True
+    query: Optional[str] = None
+    conversation_id: Optional[str] = None
+
+
+# ----------------------------------------------------------------------- #
+# Intent classification keywords
+# ----------------------------------------------------------------------- #
+
+_GOAL_PREFIXES: tuple[str, ...] = (
+    "set up",
+    "setup",
+    "create",
+    "build",
+    "deploy",
+    "configure",
+    "install",
+    "make",
+    "add",
+    "remove",
+    "delete",
+    "drop",
+    "migrate",
+    "move",
+    "rename",
+    "update",
+    "upgrade",
+    "schedule",
+    "automate",
+    "run the pipeline",
+    "run a pipeline",
+    "start the",
+    "stop the",
+    "restart",
+    "provision",
+    "initialize",
+    "init ",
+    "bootstrap",
+    "wire up",
+    "hook up",
+    "connect",
+    "integrate",
+    "ingest",
+    "land",
+    "curate",
+    "transform",
+    "load",
+    "refresh",
+    "backfill",
+    "replicate",
+    "sync",
+)
+
+_GOAL_PHRASES: tuple[str, ...] = (
+    "i want to",
+    "i need to",
+    "i'd like to",
+    "please create",
+    "please set up",
+    "please deploy",
+    "please configure",
+    "can you create",
+    "can you set up",
+    "can you deploy",
+    "could you create",
+    "we need to",
+    "let's create",
+    "let's set up",
+    "let's build",
+    "go ahead and",
+)
+
+_QUESTION_PREFIXES: tuple[str, ...] = (
+    "how many",
+    "how much",
+    "what is",
+    "what are",
+    "what's",
+    "where is",
+    "where are",
+    "when did",
+    "when was",
+    "when is",
+    "who ",
+    "which ",
+    "why ",
+    "show me",
+    "show the",
+    "tell me",
+    "get me",
+    "find ",
+    "count ",
+    "average ",
+    "total ",
+    "sum of",
+    "list the",
+    "list all",
+    "display",
+    "describe the data",
+    "what happened",
+    "is there",
+    "are there",
+    "do we have",
+    "does ",
+)
+
+_RESOURCE_NOUNS: tuple[str, ...] = (
+    "catalog",
+    "schema",
+    "table",
+    "volume",
+    "warehouse",
+    "cluster",
+    "pipeline",
+    "workflow",
+    "job",
+    "notebook",
+    "dashboard",
+    "secret",
+)
+
+
 # ----------------------------------------------------------------------- #
 # Planning prompt templates
 # ----------------------------------------------------------------------- #
 
 _PLAN_PROMPT = """\
-You are an autonomous Databricks agent. Given a goal and the current workspace \
-state, produce a step-by-step plan using ONLY these available tools:
+You are an autonomous Databricks workspace agent. Given a goal and the current \
+workspace state, produce a step-by-step plan using ONLY these available tools:
 
 {tools}
 
 Current workspace state:
 {context}
 
+{history_context}
+
 Goal: {goal}
+
+Rules:
+- Use fully-qualified three-part names: catalog.schema.table, catalog.schema.volume.
+- Follow the naming convention: raw tables are raw_<entity>, curated are <entity>.
+- One schema per data source: <catalog>.<source>.
+- Create the catalog first, then schemas, then tables/volumes (parent-first order).
+- When creating tables, always specify a schema definition with proper types.
+- For storage setup, prefer setup_storage(profile) over individual create_* calls.
+- If the goal has independent parts, say PARALLEL: before listing the independent \
+branches so the agent can fork them.
+- Verify critical resources exist after creation with describe_catalog / \
+describe_schema / describe_table.
 
 Respond with a numbered list of steps. Each step must be ONE of:
 - TOOL: <tool_name>(<arg1>, <arg2>, key=value) — call a registered tool
-- ASK: <question> — ask Genie a clarifying question
+- ASK: <question> — ask Genie a data question to inform the plan
+- VERIFY: <tool_name>(<args>) — verify a prior step's result exists
 - DONE: <summary> — the goal is achieved
+- PARALLEL: — next indented steps are independent and can run concurrently
 
-Be specific with resource names. Use fully-qualified names (catalog.schema.table).
+Be specific and concrete. Prefer fewer, higher-level tool calls (setup_storage \
+over manual create_catalog + create_schema + create_table chains).
 """
 
 _EVALUATE_PROMPT = """\
-You are evaluating progress on a goal.
+You are evaluating progress toward a goal.
 
 Goal: {goal}
 
@@ -152,9 +317,33 @@ Steps completed so far:
 Remaining plan:
 {remaining}
 
-Should the agent: (a) continue with the next step, (b) adjust the plan, \
-or (c) declare the goal achieved?
-Respond with CONTINUE, ADJUST: <new_steps>, or DONE: <conclusion>.
+Resources confirmed to exist:
+{verified_resources}
+
+Decide the next action. Respond with EXACTLY ONE of:
+- DONE: <conclusion> — the goal is fully achieved, summarize what was done
+- ADJUST: <numbered_steps> — the plan needs changes, provide corrected remaining \
+steps in the same TOOL:/ASK:/VERIFY:/DONE: format
+- RETRY: <step_description> — retry a failed step with a different approach
+- CONTINUE — proceed with the next planned step as-is
+"""
+
+_RECOVERY_PROMPT = """\
+A step failed while working toward: {goal}
+
+Failed step: {failed_action}
+Tool: {failed_tool}
+Error: {error}
+
+Steps completed before the failure:
+{prior_steps}
+
+Available tools: {tools}
+
+Suggest a recovery. Respond with ONE of:
+- TOOL: <recovery_tool_call> — a single tool call that fixes or works around the error
+- SKIP — this step is non-critical, continue with the remaining plan
+- ABORT: <reason> — the error is unrecoverable for this goal
 """
 
 
@@ -198,6 +387,159 @@ class AutonomousAgent(GenieAgent):
         )
 
     # ------------------------------------------------------------------ #
+    # Smart routing — classify intent and dispatch
+    # ------------------------------------------------------------------ #
+    def respond(
+        self,
+        text: str,
+        *,
+        conversation_id: Optional[str] = None,
+        space_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "AgentResponse":
+        """Interpret user text and route to the right capability.
+
+        This is the "just type what's on your mind" entry point. The agent
+        classifies the user's intent and dispatches accordingly:
+
+        - **question** → :meth:`run` (ask Genie a data question)
+        - **goal** → :meth:`accomplish` (plan and execute autonomously)
+        - **tool** → :meth:`run_tool` (invoke a registered tool directly)
+
+        Returns an :class:`AgentResponse` with the result and which path
+        was taken, so callers (CLI, notebooks) can render appropriately.
+        """
+        intent = self.classify_intent(text)
+        LOGGER.debug("Classified %r as %r", text[:80], intent)
+
+        if intent == "goal":
+            result = self.accomplish(text, **kwargs)
+            return AgentResponse(
+                intent="goal",
+                text=result.conclusion,
+                result=result,
+                succeeded=result.succeeded,
+            )
+        elif intent == "tool":
+            tool_name, args, kw = self._extract_tool_call(text)
+            if tool_name and tool_name in self.tools:
+                try:
+                    result = self.run_tool(tool_name, *args, **kw)
+                    return AgentResponse(
+                        intent="tool",
+                        text=f"Tool {tool_name!r} returned: {result!r}",
+                        result=result,
+                        succeeded=True,
+                    )
+                except Exception as exc:
+                    return AgentResponse(
+                        intent="tool",
+                        text=f"Tool {tool_name!r} failed: {exc}",
+                        result=exc,
+                        succeeded=False,
+                    )
+            # Fall through to question if tool extraction failed
+            intent = "question"
+
+        # Default: treat as a data question
+        answer = self.run(
+            text,
+            conversation_id=conversation_id,
+            space_id=space_id,
+        )
+        return AgentResponse(
+            intent="question",
+            text=answer.text,
+            result=answer,
+            succeeded=not answer.is_failed,
+            query=answer.query,
+            conversation_id=answer.conversation_id,
+        )
+
+    def classify_intent(self, text: str) -> str:
+        """Classify user text into an intent category.
+
+        Returns one of:
+
+        - ``"goal"`` — the user wants to create, set up, deploy, configure,
+          or otherwise *do* something that requires multi-step execution.
+        - ``"tool"`` — the user is referencing a specific tool by name
+          (e.g. "run introspect", "fetch https://...").
+        - ``"question"`` — the user is asking a data question or wants
+          information from Genie.
+
+        The classification is heuristic (keyword + pattern based), not
+        LLM-driven, so it's fast and deterministic.
+        """
+        lower = text.lower().strip()
+
+        # Direct tool reference: "run <tool_name>" or "<tool_name>(...)"
+        first_word = lower.split()[0] if lower.split() else ""
+        if first_word in ("run", "execute", "call", "invoke"):
+            rest = lower[len(first_word) :].strip()
+            candidate = rest.split("(")[0].split()[0] if rest else ""
+            if candidate in self.tools:
+                return "tool"
+
+        # Parenthesized tool call: "introspect()" or "fetch_json(url)"
+        if "(" in lower:
+            candidate = lower.split("(")[0].strip()
+            if candidate in self.tools:
+                return "tool"
+
+        # Goal patterns: imperative verbs that imply multi-step work
+        if any(lower.startswith(prefix) for prefix in _GOAL_PREFIXES):
+            return "goal"
+
+        # Goal patterns: contains action-implying phrases
+        if any(phrase in lower for phrase in _GOAL_PHRASES):
+            return "goal"
+
+        # Question patterns: starts with question words or "show me"
+        if any(lower.startswith(prefix) for prefix in _QUESTION_PREFIXES):
+            return "question"
+
+        # Ends with "?" — likely a question
+        if text.strip().endswith("?"):
+            return "question"
+
+        # Short imperative without question structure — lean toward goal
+        # if it contains resource nouns
+        if any(noun in lower for noun in _RESOURCE_NOUNS) and not text.strip().endswith(
+            "?"
+        ):
+            return "goal"
+
+        return "question"
+
+    def _extract_tool_call(
+        self, text: str
+    ) -> tuple[Optional[str], tuple[Any, ...], dict[str, Any]]:
+        """Try to extract a tool name and arguments from user text."""
+        lower = text.lower().strip()
+
+        # "run <tool>(args)" or "call <tool>(args)"
+        for prefix in ("run ", "execute ", "call ", "invoke "):
+            if lower.startswith(prefix):
+                remainder = text[len(prefix) :].strip()
+                step = self._parse_tool_step(remainder)
+                if step and step.tool in self.tools:
+                    return step.tool, step.args, step.kwargs
+                # Tool name without parens
+                candidate = remainder.split()[0] if remainder.split() else ""
+                if candidate in self.tools:
+                    return candidate, (), {}
+                break
+
+        # Direct "tool_name(args)" syntax
+        if "(" in text:
+            step = self._parse_tool_step(text.strip())
+            if step and step.tool in self.tools:
+                return step.tool, step.args, step.kwargs
+
+        return None, (), {}
+
+    # ------------------------------------------------------------------ #
     # The autonomous loop
     # ------------------------------------------------------------------ #
     def accomplish(
@@ -215,13 +557,16 @@ class AutonomousAgent(GenieAgent):
            warehouses, jobs already exist.
         2. **Plan** — ask Genie to break the goal into tool-call steps,
            given the workspace context and available tools.
-        3. **Execute** each step, recording results.
+        3. **Execute** each step, recording results.  VERIFY steps trigger
+           a post-check that the resource exists.
         4. **Evaluate** — ask Genie whether the goal is met, the plan needs
            adjustment, or execution should continue.
-        5. **Repeat** until done or the step budget is exhausted.
+        5. **Re-plan** — when evaluation says ADJUST, parse the new steps
+           and loop (up to ``_MAX_REPLAN_CYCLES``).
+        6. **Repeat** until done or the step budget is exhausted.
 
-        When ``auto_fork`` is ``True`` and the plan contains independent
-        branches, the agent may spawn children to work in parallel.
+        When ``auto_fork`` is ``True`` and the plan contains a PARALLEL
+        block, the agent spawns children to work concurrently.
         """
         budget = max_steps or self.max_steps
         result = AgentResult(goal=goal)
@@ -232,41 +577,106 @@ class AutonomousAgent(GenieAgent):
 
         context = self.introspect()
         plan = self._plan(goal, context)
+        replan_cycles = 0
+        verified_resources: list[str] = []
+        aborted = False
 
-        for step in plan:
-            if len(result.steps) >= budget:
-                LOGGER.info(
-                    "Step budget exhausted for %r (budget=%d)",
-                    self.name,
-                    budget,
-                )
-                result.conclusion = (
-                    f"Step budget ({budget}) exhausted before completion."
-                )
-                break
+        while True:
+            while plan:
+                step = plan.pop(0)
 
-            executed = self._execute_step(step)
-            result.steps.append(executed)
+                if len(result.steps) >= budget:
+                    LOGGER.info(
+                        "Step budget exhausted for %r (budget=%d)",
+                        self.name,
+                        budget,
+                    )
+                    result.conclusion = (
+                        f"Step budget ({budget}) exhausted before completion."
+                    )
+                    aborted = True
+                    break
 
-            if executed.failed:
-                LOGGER.warning(
-                    "Step failed for agent %r: %s (tool=%r)",
-                    self.name,
-                    executed.error,
-                    executed.tool,
-                )
-                adjusted = self._handle_failure(goal, result, executed, context)
-                if adjusted is not None:
-                    plan.extend(adjusted)
+                if auto_fork and step.tool == "_parallel":
+                    parallel_results = self._execute_parallel_block(
+                        step,
+                        plan,
+                        goal,
+                        budget - len(result.steps),
+                    )
+                    result.steps.extend(parallel_results)
                     continue
-                result.conclusion = (
-                    f"Failed at step: {executed.action} — {executed.error}"
-                )
+
+                executed = self._execute_step(step)
+                result.steps.append(executed)
+
+                if executed.succeeded and executed.tool in _RESOURCE_CREATION_TOOLS:
+                    verified_resources.append(
+                        f"{executed.tool}("
+                        f"{', '.join(str(a) for a in executed.args)})"
+                    )
+
+                if executed.failed:
+                    LOGGER.warning(
+                        "Step failed for agent %r: %s (tool=%r)",
+                        self.name,
+                        executed.error,
+                        executed.tool,
+                    )
+                    recovery = self._handle_failure(
+                        goal,
+                        result,
+                        executed,
+                        context,
+                    )
+                    if recovery is not None:
+                        plan[0:0] = recovery
+                        continue
+                    result.conclusion = (
+                        f"Failed at step: {executed.action} — {executed.error}"
+                    )
+                    aborted = True
+                    break
+
+            if aborted:
                 break
-        else:
-            evaluation = self._evaluate(goal, result, context)
-            result.conclusion = evaluation
+
+            evaluation = self._evaluate(
+                goal,
+                result,
+                context,
+                verified_resources=verified_resources,
+            )
+
+            if evaluation.startswith("ADJUST:") and replan_cycles < _MAX_REPLAN_CYCLES:
+                replan_cycles += 1
+                new_steps = self._parse_plan(
+                    evaluation[len("ADJUST:") :],
+                    goal,
+                )
+                if new_steps:
+                    LOGGER.info(
+                        "Re-planning for %r (cycle %d): %d new steps",
+                        self.name,
+                        replan_cycles,
+                        len(new_steps),
+                    )
+                    plan = new_steps
+                    continue
+            elif evaluation.startswith("RETRY:") and replan_cycles < _MAX_REPLAN_CYCLES:
+                retry_text = evaluation[len("RETRY:") :].strip()
+                retry_step = self._parse_tool_step(retry_text)
+                if retry_step:
+                    replan_cycles += 1
+                    plan = [retry_step]
+                    continue
+
+            if evaluation.startswith("DONE:"):
+                result.conclusion = evaluation[len("DONE:") :].strip()
+            else:
+                result.conclusion = evaluation
             result.state = State.SUCCEEDED
+            break
 
         if not result.succeeded:
             result.state = State.FAILED
@@ -283,22 +693,62 @@ class AutonomousAgent(GenieAgent):
     # ------------------------------------------------------------------ #
     # Introspection — what exists in the workspace
     # ------------------------------------------------------------------ #
-    def introspect(self) -> dict[str, Any]:
+    def introspect(self, *, deep: bool = True) -> dict[str, Any]:
         """Discover what already exists in the workspace.
 
         Returns a dict describing the current state: catalogs, schemas,
-        warehouses, jobs.  Used by :meth:`accomplish` to inform planning.
+        tables, warehouses, jobs, clusters, and volumes.  Used by
+        :meth:`accomplish` to inform planning.
+
+        When *deep* is ``True`` (default), also enumerates schemas inside
+        each catalog and tables inside each schema (capped to avoid
+        runaway listing on large workspaces). Set ``deep=False`` to skip
+        the schema/table walk when only top-level awareness is needed.
         """
+        ws = self.client.workspace_client()
         context: dict[str, Any] = {"agent": self.name}
 
         try:
-            catalogs = list(self.client.catalogs.list())
-            context["catalogs"] = [getattr(c, "name", None) or str(c) for c in catalogs]
+            catalogs_raw = list(ws.catalogs.list())
+            context["catalogs"] = [
+                getattr(c, "name", None) or str(c) for c in catalogs_raw
+            ]
         except Exception:
             context["catalogs"] = []
 
+        if deep and context["catalogs"]:
+            schemas_by_catalog: dict[str, list[str]] = {}
+            tables_by_schema: dict[str, list[str]] = {}
+            for cat_name in context["catalogs"][:_MAX_INTROSPECT_CATALOGS]:
+                try:
+                    schemas_raw = list(ws.schemas.list(catalog_name=cat_name))
+                    schema_names = [
+                        getattr(s, "name", None) or str(s) for s in schemas_raw
+                    ]
+                    schemas_by_catalog[cat_name] = schema_names[
+                        :_MAX_INTROSPECT_SCHEMAS
+                    ]
+                    for schema_name in schema_names[:_MAX_INTROSPECT_SCHEMAS]:
+                        fqn = f"{cat_name}.{schema_name}"
+                        try:
+                            tables_raw = list(
+                                ws.tables.list(
+                                    catalog_name=cat_name,
+                                    schema_name=schema_name,
+                                )
+                            )
+                            tables_by_schema[fqn] = [
+                                getattr(t, "name", None) or str(t) for t in tables_raw
+                            ][:_MAX_INTROSPECT_TABLES]
+                        except Exception:
+                            tables_by_schema[fqn] = []
+                except Exception:
+                    schemas_by_catalog[cat_name] = []
+            context["schemas"] = schemas_by_catalog
+            context["tables"] = tables_by_schema
+
         try:
-            warehouses = list(self.client.warehouses.list())
+            warehouses = list(ws.warehouses.list())
             context["warehouses"] = [
                 getattr(w, "name", None) or str(w) for w in warehouses
             ]
@@ -310,6 +760,11 @@ class AutonomousAgent(GenieAgent):
             context["jobs"] = [getattr(j, "name", None) or str(j) for j in jobs]
         except Exception:
             context["jobs"] = []
+
+        try:
+            context["current_user"] = self.client.user_scoped_name("")
+        except Exception:
+            context["current_user"] = None
 
         LOGGER.debug(
             "Introspected workspace for agent %r: %d catalogs, %d warehouses, %d jobs",
@@ -327,11 +782,13 @@ class AutonomousAgent(GenieAgent):
         """Ask Genie to produce a plan, then parse it into steps."""
         tools_desc = self._describe_tools()
         context_str = self._format_context(context)
+        history_ctx = self._format_history_context()
 
         prompt = _PLAN_PROMPT.format(
             tools=tools_desc,
             context=context_str,
             goal=goal,
+            history_context=history_ctx,
         )
 
         try:
@@ -366,12 +823,24 @@ class AutonomousAgent(GenieAgent):
                 step = self._parse_tool_step(line[5:].strip())
                 if step:
                     steps.append(step)
+            elif upper.startswith("VERIFY:"):
+                step = self._parse_tool_step(line[7:].strip())
+                if step:
+                    step.kwargs["_verify"] = True
+                    steps.append(step)
             elif upper.startswith("ASK:"):
                 steps.append(
                     AgentStep(
                         action=line[4:].strip(),
                         tool="ask",
                         args=(line[4:].strip(),),
+                    )
+                )
+            elif upper.startswith("PARALLEL:"):
+                steps.append(
+                    AgentStep(
+                        action=line[9:].strip() or "parallel block",
+                        tool="_parallel",
                     )
                 )
             elif upper.startswith("DONE:"):
@@ -473,6 +942,13 @@ class AutonomousAgent(GenieAgent):
         lower = goal.lower()
         steps: list[AgentStep] = []
 
+        steps.append(
+            AgentStep(
+                action="Introspect workspace to understand current state",
+                tool="introspect",
+            )
+        )
+
         if any(
             kw in lower
             for kw in (
@@ -483,6 +959,12 @@ class AutonomousAgent(GenieAgent):
                 "storage",
                 "pipeline",
                 "ingest",
+                "set up",
+                "setup",
+                "create",
+                "land",
+                "raw",
+                "curate",
             )
         ):
             steps.append(
@@ -490,12 +972,14 @@ class AutonomousAgent(GenieAgent):
                     action="Ask Genie to analyze the data requirements",
                     tool="ask",
                     args=(
-                        f"What catalogs, schemas, and tables are needed for: {goal}",
+                        f"What catalogs, schemas, and tables are needed for: {goal}? "
+                        "List specific table names with fully-qualified paths "
+                        "(catalog.schema.table) and column types.",
                     ),
                 )
             )
 
-        if any(kw in lower for kw in ("warehouse", "sql", "query")):
+        if any(kw in lower for kw in ("warehouse", "sql", "query", "analytics")):
             steps.append(
                 AgentStep(
                     action="Ask Genie about warehouse configuration",
@@ -504,7 +988,7 @@ class AutonomousAgent(GenieAgent):
                 )
             )
 
-        if any(kw in lower for kw in ("cluster", "compute", "spark")):
+        if any(kw in lower for kw in ("cluster", "compute", "spark", "job")):
             steps.append(
                 AgentStep(
                     action="Ask Genie about compute configuration",
@@ -513,13 +997,26 @@ class AutonomousAgent(GenieAgent):
                 )
             )
 
-        if not steps:
+        if any(kw in lower for kw in ("fetch", "http", "api", "download", "scrape")):
+            steps.append(
+                AgentStep(
+                    action="Ask Genie about data source endpoints",
+                    tool="ask",
+                    args=(
+                        f"What API endpoints or data sources are needed for: {goal}? "
+                        "List the URLs, authentication method, and expected response format.",
+                    ),
+                )
+            )
+
+        if len(steps) <= 1:
             steps.append(
                 AgentStep(
                     action="Ask Genie to understand the goal",
                     tool="ask",
                     args=(
-                        f"Help me plan how to accomplish this in Databricks: {goal}",
+                        f"Help me plan how to accomplish this in Databricks: {goal}. "
+                        "Break it into concrete steps with specific resource names.",
                     ),
                 )
             )
@@ -536,18 +1033,32 @@ class AutonomousAgent(GenieAgent):
             step.result = step.action
             return step
 
+        if step.tool == "_parallel":
+            step.state = State.SUCCEEDED
+            step.result = "parallel marker"
+            return step
+
         if step.tool is None or step.tool not in self.tools:
+            near = self._suggest_tool(step.tool or "")
+            hint = f" — did you mean {near!r}?" if near else ""
             step.state = State.FAILED
             step.error = (
-                f"Unknown tool {step.tool!r}; registered: {sorted(self.tools)!r}"
+                f"Unknown tool {step.tool!r}{hint}; "
+                f"registered: {sorted(self.tools)!r}"
             )
             return step
 
+        is_verify = step.kwargs.pop("_verify", False)
         step.state = State.RUNNING
         LOGGER.debug("Executing step: %s (tool=%r)", step.action, step.tool)
         try:
             step.result = self.run_tool(step.tool, *step.args, **step.kwargs)
             step.state = State.SUCCEEDED
+            if is_verify and step.result is None:
+                step.state = State.FAILED
+                step.error = (
+                    f"Verification failed: {step.tool}({step.args}) returned None"
+                )
         except Exception as exc:
             step.state = State.FAILED
             step.error = f"{type(exc).__name__}: {exc}"
@@ -562,29 +1073,45 @@ class AutonomousAgent(GenieAgent):
         goal: str,
         result: AgentResult,
         context: dict[str, Any],
+        *,
+        verified_resources: Optional[list[str]] = None,
     ) -> str:
-        """Ask Genie to evaluate whether the goal is met."""
+        """Ask Genie to evaluate whether the goal is met.
+
+        Returns the raw evaluation text. The caller inspects the prefix
+        (DONE: / ADJUST: / RETRY: / CONTINUE) to decide next action.
+        """
         steps_summary = "\n".join(
             f"  {i+1}. [{s.state.name}] {s.action}"
-            + (f" → {s.result!r}" if s.result and s.succeeded else "")
-            + (f" ✗ {s.error}" if s.error else "")
+            + (f" -> {s.result!r}" if s.result and s.succeeded else "")
+            + (f" X {s.error}" if s.error else "")
             for i, s in enumerate(result.steps)
+        )
+
+        verified_str = (
+            "\n".join(f"  - {r}" for r in verified_resources)
+            if verified_resources
+            else "  (none verified)"
         )
 
         prompt = _EVALUATE_PROMPT.format(
             goal=goal,
             steps_summary=steps_summary or "(no steps executed yet)",
             remaining="(none — plan completed)",
+            verified_resources=verified_str,
         )
 
         try:
             answer = self.service.ask(prompt)
             self.history.append(answer)
-            return answer.text or "Plan completed."
+            text = (answer.text or "").strip()
+            return text or "DONE: Plan completed."
         except Exception:
             n_done = len(result.completed_steps)
             n_total = len(result.steps)
-            return f"Completed {n_done}/{n_total} steps."
+            if n_done == n_total and n_total > 0:
+                return f"DONE: Completed all {n_total} steps."
+            return f"DONE: Completed {n_done}/{n_total} steps."
 
     def _handle_failure(
         self,
@@ -593,25 +1120,44 @@ class AutonomousAgent(GenieAgent):
         failed_step: AgentStep,
         context: dict[str, Any],
     ) -> Optional[list[AgentStep]]:
-        """Decide how to recover from a failed step.
+        """Try to recover from a failed step.
+
+        Asks Genie for recovery guidance using the enriched
+        ``_RECOVERY_PROMPT`` that includes prior step context. Supports
+        TOOL (retry with different call), SKIP (continue past the
+        failure), and ABORT (give up).
 
         Returns a list of recovery steps, or ``None`` to abort.
         """
-        prompt = (
-            f"A step failed while working on: {goal}\n\n"
-            f"Failed step: {failed_step.action}\n"
-            f"Error: {failed_step.error}\n\n"
-            f"Available tools: {', '.join(sorted(self.tools))}\n\n"
-            "Can this be recovered? If yes, respond with TOOL: <recovery_step>. "
-            "If no, respond with ABORT: <reason>."
+        prior_summary = (
+            "\n".join(
+                f"  {i+1}. [{s.state.name}] {s.action}"
+                for i, s in enumerate(result.steps)
+                if s is not failed_step
+            )
+            or "  (none)"
+        )
+
+        prompt = _RECOVERY_PROMPT.format(
+            goal=goal,
+            failed_action=failed_step.action,
+            failed_tool=failed_step.tool or "unknown",
+            error=failed_step.error or "unknown error",
+            prior_steps=prior_summary,
+            tools=", ".join(sorted(self.tools)),
         )
         try:
             answer = self.service.ask(prompt)
             self.history.append(answer)
-            text = (answer.text or "").strip().upper()
-            if text.startswith("ABORT"):
+            text = (answer.text or "").strip()
+            upper = text.upper()
+
+            if upper.startswith("ABORT"):
                 return None
-            recovery = self._parse_plan(answer.text or "", goal)
+            if upper.startswith("SKIP"):
+                return []
+
+            recovery = self._parse_plan(text, goal)
             return recovery if recovery else None
         except Exception:
             return None
@@ -945,6 +1491,54 @@ class AutonomousAgent(GenieAgent):
         return space
 
     # ------------------------------------------------------------------ #
+    # Parallel block execution
+    # ------------------------------------------------------------------ #
+    def _execute_parallel_block(
+        self,
+        parallel_step: AgentStep,
+        remaining_plan: list[AgentStep],
+        goal: str,
+        budget_left: int,
+    ) -> list[AgentStep]:
+        """Execute a PARALLEL block concurrently.
+
+        Collects consecutive non-DONE, non-PARALLEL steps after the
+        PARALLEL marker as parallel branches. Each branch runs on
+        ``self`` via a thread pool. Returns the executed steps.
+        """
+        branches: list[AgentStep] = []
+        while remaining_plan and remaining_plan[0].tool not in (
+            "_done",
+            "_parallel",
+        ):
+            branches.append(remaining_plan.pop(0))
+            if len(branches) >= budget_left:
+                break
+
+        if len(branches) <= 1:
+            return [self._execute_step(b) for b in branches]
+
+        results: list[AgentStep] = [None] * len(branches)  # type: ignore[list-item]
+
+        def _run_branch(idx: int) -> AgentStep:
+            return self._execute_step(branches[idx])
+
+        with cf.ThreadPoolExecutor(max_workers=len(branches)) as pool:
+            futures = {pool.submit(_run_branch, i): i for i in range(len(branches))}
+            for future in cf.as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:
+                    results[idx] = AgentStep(
+                        action=branches[idx].action,
+                        tool=branches[idx].tool,
+                        state=State.FAILED,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+        return results
+
+    # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
     def _describe_tools(self) -> str:
@@ -956,6 +1550,31 @@ class AutonomousAgent(GenieAgent):
             lines.append(f"  - {name}: {first_line}" if first_line else f"  - {name}")
         return "\n".join(lines)
 
+    def _format_history_context(self) -> str:
+        """Summarize recent conversation history for the planning prompt."""
+        if not self.history:
+            return ""
+        recent = self.history[-_MAX_HISTORY_FOR_CONTEXT:]
+        lines = ["Recent conversation context:"]
+        for ans in recent:
+            text = ans.text or ""
+            preview = text[:200] + ("..." if len(text) > 200 else "")
+            query = ans.query
+            entry = f"  - Answer: {preview}"
+            if query:
+                entry += f"\n    SQL: {query[:150]}{'...' if len(query) > 150 else ''}"
+            lines.append(entry)
+        return "\n".join(lines)
+
+    def _suggest_tool(self, name: str) -> Optional[str]:
+        """Return the closest registered tool name, or ``None``."""
+        if not name:
+            return None
+        from difflib import get_close_matches
+
+        matches = get_close_matches(name, self.tools.keys(), n=1, cutoff=0.6)
+        return matches[0] if matches else None
+
     @staticmethod
     def _format_context(context: dict[str, Any]) -> str:
         """Format introspection context for the planning prompt."""
@@ -963,12 +1582,24 @@ class AutonomousAgent(GenieAgent):
         for key, value in context.items():
             if key == "agent":
                 continue
-            if isinstance(value, list):
+            if isinstance(value, dict):
+                if value:
+                    for dk, dv in value.items():
+                        if isinstance(dv, list) and dv:
+                            parts.append(
+                                f"  {key}.{dk}: "
+                                f"{', '.join(str(v) for v in dv[:20])}"
+                            )
+                        elif isinstance(dv, list):
+                            parts.append(f"  {key}.{dk}: (empty)")
+                else:
+                    parts.append(f"  {key}: (none)")
+            elif isinstance(value, list):
                 if value:
                     parts.append(f"  {key}: {', '.join(str(v) for v in value[:20])}")
                 else:
                     parts.append(f"  {key}: (none)")
-            else:
+            elif value is not None:
                 parts.append(f"  {key}: {value}")
         return "\n".join(parts) or "  (empty workspace)"
 

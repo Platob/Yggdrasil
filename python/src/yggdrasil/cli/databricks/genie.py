@@ -156,7 +156,8 @@ class _StatusLine:
 
         self._spin_stop = threading.Event()
         self._spin_thread = threading.Thread(
-            target=self._spinner_loop, daemon=True,
+            target=self._spinner_loop,
+            daemon=True,
         )
         self._spin_thread.start()
 
@@ -450,6 +451,10 @@ class GenieCLI(DatabricksCLI):
     @property
     def agent(self):
         return self.genie.agent
+
+    @property
+    def smart_agent(self):
+        return self.genie.autonomous_agent
 
     @property
     def defaults(self):
@@ -785,12 +790,86 @@ class GenieCLI(DatabricksCLI):
                 if stop:
                     return 0
                 continue
-            self.ask(line)
+            self.smart_ask(line)
 
     def ask_once(self, question: str) -> int:
         """One-shot ask used by ``-q / --question``."""
-        self.ask(question)
+        self.smart_ask(question)
         return 0
+
+    def smart_ask(self, text: str) -> None:
+        """Route user text through the autonomous agent's intent classifier.
+
+        Classifies the text as a question, goal, or tool call and
+        dispatches accordingly. Falls back to the plain Genie ask
+        when classification selects ``"question"``.
+        """
+        intent = self.smart_agent.classify_intent(text)
+
+        if intent == "goal":
+            self._status.spin(self.style.dim("planning…"))
+            try:
+                response = self.smart_agent.respond(
+                    text,
+                    conversation_id=self.conversation_id,
+                )
+            except KeyboardInterrupt:
+                self._status.finish(self.style.yellow("interrupted."))
+                return
+            except Exception as exc:
+                self._status.clear()
+                self._handle_error(exc)
+                return
+            self._status.clear()
+            self._render_agent_response(response)
+            return
+
+        if intent == "tool":
+            self._status.spin(self.style.dim("running tool…"))
+            try:
+                response = self.smart_agent.respond(text)
+            except KeyboardInterrupt:
+                self._status.finish(self.style.yellow("interrupted."))
+                return
+            except Exception as exc:
+                self._status.clear()
+                self._handle_error(exc)
+                return
+            self._status.clear()
+            self._render_agent_response(response)
+            return
+
+        self.ask(text)
+
+    def _render_agent_response(self, response: Any) -> None:
+        """Render an :class:`AgentResponse` from :meth:`smart_ask`."""
+        self.out("")
+        intent_label = {
+            "goal": "goal",
+            "tool": "tool",
+            "question": "question",
+        }.get(response.intent, response.intent)
+        self.info(f"  [{intent_label}]")
+
+        if response.text:
+            for line in response.text.splitlines():
+                self.out(f"  {line}")
+
+        if response.query:
+            self.out(self.style.dim("  SQL:"))
+            for line in response.query.splitlines():
+                self.out("    " + self.style.yellow(line))
+
+        if response.succeeded:
+            self.out("")
+            if hasattr(response.result, "summary"):
+                self.info(f"  {response.result.summary()}")
+        else:
+            self.error("  failed")
+
+        if response.conversation_id:
+            self.conversation_id = response.conversation_id
+        self.out("")
 
     def ask(self, question: str) -> None:
         self._status.spin(self.style.dim("asking Genie…"))
