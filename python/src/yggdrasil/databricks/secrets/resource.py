@@ -10,6 +10,8 @@ from databricks.sdk.errors import NotFound
 from databricks.sdk.service.workspace import AclItem, AclPermission, GetSecretResponse
 from yggdrasil.data.cast import any_to_datetime
 
+from yggdrasil.io.url import URL
+
 from .service import Secrets
 from ..client import DatabricksResource
 
@@ -75,6 +77,12 @@ class Scope(DatabricksResource):
         super().__init__(*args, **kwargs)
         self.service = Secrets.current() if service is None else service
         self.key = key
+
+    @property
+    def explore_url(self) -> URL:
+        return self.client.base_url.with_fragment(
+            f"secrets/createScope/{self.key or 'unknown'}"
+        )
 
     def __bool__(self):
         return bool(self.key)
@@ -326,6 +334,13 @@ class Secret(DatabricksResource):
         self.key = key
         self.b64 = b64
         self.update_timestamp = update_timestamp
+
+    @property
+    def explore_url(self) -> URL:
+        return self.client.base_url.with_fragment(
+            f"secrets/createScope/{(self.scope.key if self.scope else None) or 'unknown'}"
+            f"/{self.key or 'unknown'}"
+        )
 
     def __post_init__(self):
         self.scope = Scope.from_(self.scope, service=self.service)
