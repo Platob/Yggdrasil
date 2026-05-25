@@ -18,10 +18,10 @@ from .routers import (
     function_router,
     job_router,
     messenger_router,
+    monitor_router,
     python_router,
     run_router,
 )
-from .routers.monitor import router as monitor_router
 from .services import (
     CallService,
     CmdService,
@@ -33,10 +33,10 @@ from .services import (
     FunctionService,
     JobService,
     MessengerService,
+    MonitorService,
     PythonExecService,
     RunService,
 )
-from .services.monitor import MonitorService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

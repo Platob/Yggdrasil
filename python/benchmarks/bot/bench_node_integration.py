@@ -87,12 +87,14 @@ def bench_function_lifecycle():
 def bench_function_upsert():
     print("\n=== Upsert Performance ===")
     name = f"bench-upsert-{int(time.time())}"
-    _timed("POST /api/function (create)", lambda: _post("/api/function", {
+    resp = _timed("POST /api/function (create)", lambda: _post("/api/function", {
         "name": name, "code": "x = 1",
     }))
+    func_id = resp["function"]["id"]
     _timed("POST /api/function (update same name)", lambda: _post("/api/function", {
         "name": name, "code": "x = 2",
     }), n=50)
+    _delete(f"/api/function/{func_id}")
 
 
 def bench_monitor():

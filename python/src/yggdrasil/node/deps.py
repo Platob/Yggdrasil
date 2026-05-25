@@ -11,6 +11,7 @@ from .services.environment import EnvironmentService
 from .services.function import FunctionService
 from .services.job import JobService
 from .services.messenger import MessengerService
+from .services.monitor import MonitorService
 from .services.python import PythonExecService
 from .services.filesystem import FilesystemService
 from .services.run import RunService
@@ -62,3 +63,7 @@ def get_dag_service(request: Request) -> DagService:
 
 def get_filesystem_service(request: Request) -> FilesystemService:
     return request.app.state.filesystem_service
+
+
+def get_monitor_service(request: Request) -> MonitorService:
+    return request.app.state.monitor_service

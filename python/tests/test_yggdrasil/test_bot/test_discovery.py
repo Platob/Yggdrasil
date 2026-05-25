@@ -125,14 +125,6 @@ class TestDiscoveryEndpoints(unittest.TestCase):
         peer_ids = [p["node_id"] for p in data["peers"]]
         self.assertIn("peer-list-test", peer_ids)
 
-    # -- POST /api/hello/discover ------------------------------------------
-
-    def test_discover_empty_targets(self):
-        resp = self.client.post("/api/hello/discover", json=[])
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertEqual(data["peers"], [])
-
     # -- self-info channels from messenger ---------------------------------
 
     def test_self_info_includes_messenger_channels(self):
@@ -202,12 +194,6 @@ class TestDiscoveryServiceDirect(unittest.TestCase):
         self.assertEqual(info.node_id, self.settings.node_id)
         self.assertEqual(info.version, self.settings.app_version)
 
-    def test_discover_friends_unreachable(self):
-        # Targets that don't exist should be handled gracefully
-        resp = self._run(self.service.discover_friends(
-            ["http://192.0.2.1:9999"]  # RFC 5737 TEST-NET, unreachable
-        ))
-        self.assertEqual(resp.peers, [])
 
 
 if __name__ == "__main__":

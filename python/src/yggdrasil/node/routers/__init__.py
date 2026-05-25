@@ -8,6 +8,7 @@ from .filesystem import router as filesystem_router
 from .function import router as function_router
 from .job import router as job_router
 from .messenger import router as messenger_router
+from .monitor import router as monitor_router
 from .python import router as python_router
 from .run import router as run_router
 
@@ -22,6 +23,7 @@ __all__ = [
     "function_router",
     "job_router",
     "messenger_router",
+    "monitor_router",
     "python_router",
     "run_router",
 ]

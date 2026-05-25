@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
@@ -59,8 +56,8 @@ class DiscoveryService:
         self._peers: dict[str, _Peer] = {}
         self._lock = Lock()
         self._messenger_service = messenger_service
-        # Cache for self-info and geolocation (5s TTL in nanoseconds)
-        self._info_cache: ExpiringDict[str, NodeInfo] = ExpiringDict(default_ttl=5_000_000_000)
+        # Cache for geolocation (5s TTL in nanoseconds)
+        self._geo_cache: ExpiringDict[str, tuple[float | None, float | None]] = ExpiringDict(default_ttl=5_000_000_000)
 
     async def hello(self, req: HelloRequest) -> HelloResponse:
         with self._lock:
@@ -124,74 +121,6 @@ class DiscoveryService:
             lon=lon,
         )
 
-    async def discover_friends(self, targets: list[str]) -> PeerListResponse:
-        if not targets:
-            return PeerListResponse(node_id=self.settings.node_id, peers=[])
-
-        discovered: list[NodeInfo] = []
-        lat, lon = self._get_cached_location()
-        payload = json.dumps({
-            "node_id": self.settings.node_id,
-            "host": self.settings.host,
-            "port": self.settings.port,
-            "version": self.settings.app_version,
-            "lat": lat,
-            "lon": lon,
-        }).encode()
-
-        def _contact(url: str) -> NodeInfo | None:
-            hello_url = url.rstrip("/") + "/api/hello"
-            req = urllib.request.Request(
-                hello_url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read())
-                return NodeInfo(
-                    node_id=data["node_id"],
-                    host=data["host"],
-                    port=data["port"],
-                    version=data["version"],
-                    lat=data.get("lat"),
-                    lon=data.get("lon"),
-                )
-            except Exception as exc:
-                LOGGER.debug("Failed to contact %r: %s", url, exc)
-                return None
-
-        with ThreadPoolExecutor(max_workers=min(len(targets), 8)) as pool:
-            futures = {pool.submit(_contact, t): t for t in targets}
-            for future in as_completed(futures):
-                result = future.result()
-                if result is not None:
-                    discovered.append(result)
-                    # Register the discovered node as a peer.
-                    with self._lock:
-                        peer = self._peers.get(result.node_id)
-                        if peer is None:
-                            peer = _Peer(
-                                node_id=result.node_id,
-                                host=result.host,
-                                port=result.port,
-                                version=result.version,
-                                lat=result.lat,
-                                lon=result.lon,
-                            )
-                            self._peers[result.node_id] = peer
-                            LOGGER.info(
-                                "Discovered peer %r (%s:%d)",
-                                result.node_id, result.host, result.port,
-                            )
-                        else:
-                            peer.lat = result.lat
-                            peer.lon = result.lon
-                            peer.touch()
-
-        return PeerListResponse(node_id=self.settings.node_id, peers=discovered)
-
     def _purge_stale_peers(self) -> None:
         """Remove peers not seen in the last ``_PEER_TTL`` seconds.
 
@@ -208,12 +137,12 @@ class DiscoveryService:
 
     def _get_cached_location(self) -> tuple[float | None, float | None]:
         """Return cached geolocation (lat, lon) with 5s TTL."""
-        cached = self._info_cache.get("_geo")
+        cached = self._geo_cache.get("_geo")
         if cached is not None:
             return cached
         from ..geo import get_location
         loc = get_location()
-        self._info_cache.set("_geo", loc, ttl=5_000_000_000)
+        self._geo_cache.set("_geo", loc, ttl=5_000_000_000)
         return loc
 
     def _get_channels(self) -> list[str]:

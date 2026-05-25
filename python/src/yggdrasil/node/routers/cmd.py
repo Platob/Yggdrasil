@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
-from fastapi.responses import Response as FastAPIResponse
 
 from ..deps import get_cmd_service
 from ..schemas.cmd import CmdListResponse, CmdRequest, CmdResponse

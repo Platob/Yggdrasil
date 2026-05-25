@@ -8,6 +8,7 @@ from .filesystem import FilesystemService
 from .function import FunctionService
 from .job import JobService
 from .messenger import MessengerService
+from .monitor import MonitorService
 from .python import PythonExecService
 from .run import RunService
 
@@ -22,6 +23,7 @@ __all__ = [
     "FunctionService",
     "JobService",
     "MessengerService",
+    "MonitorService",
     "PythonExecService",
     "RunService",
 ]

@@ -5,7 +5,6 @@ import logging
 import time
 import uuid
 from functools import partial
-from typing import Any
 
 from fastapi.concurrency import run_in_threadpool
 

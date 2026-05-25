@@ -17,12 +17,12 @@ async def bench_function_crud(n: int = 100) -> None:
 
     ids = []
     for i in range(n):
-        entry = await service.create(FunctionCreate(
+        response = await service.create(FunctionCreate(
             name=f"bench-func-{i}",
             code=f"print({i})",
             language="python",
         ))
-        ids.append(entry.id)
+        ids.append(response.function.id)
 
     create_time = time.perf_counter() - start
 

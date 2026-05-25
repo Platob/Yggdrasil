@@ -14,7 +14,7 @@ from typing import Any
 from fastapi.concurrency import run_in_threadpool
 
 from ..config import Settings
-from ..exceptions import BotError, NotFoundError
+from ..exceptions import NotFoundError
 from ..schemas.job import (
     JobCreateRequest,
     JobEntry,
