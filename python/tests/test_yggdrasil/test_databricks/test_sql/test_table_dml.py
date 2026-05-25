@@ -626,58 +626,62 @@ class TestBuildColumnProjection:
 
 class TestBuildCastColumnProjection:
 
+    def _source(self, *pairs: tuple[str, "pa.DataType"]) -> Field:
+        return _schema(*pairs).to_field()
+
     def test_matching_types_bypass_cast(self) -> None:
         target = _schema(("id", pa.int64()), ("name", pa.string())).fields
-        source = {
-            "id": Field("id", pa.int64()),
-            "name": Field("name", pa.string()),
-        }
         sql = _build_cast_column_projection(
-            target, source_fields=source, source_alias="S",
+            target, source=self._source(("id", pa.int64()), ("name", pa.string())),
+            source_alias="S",
         )
         assert sql == "`S`.`id`, `S`.`name`"
         assert "CAST" not in sql
 
     def test_mismatched_types_emit_cast(self) -> None:
         target = _schema(("v", pa.float64())).fields
-        source = {"v": Field("v", pa.int32())}
         sql = _build_cast_column_projection(
-            target, source_fields=source, source_alias="S",
+            target, source=self._source(("v", pa.int32())),
+            source_alias="S",
         )
-        assert sql == "CAST(`S`.`v` AS DOUBLE) AS `v`"
+        assert sql == "CAST(`S`.`v` AS DOUBLE)"
 
     def test_missing_columns_filled_with_null(self) -> None:
         target = _schema(("id", pa.int64()), ("extra", pa.string())).fields
-        source = {"id": Field("id", pa.int64())}
         sql = _build_cast_column_projection(
-            target, source_fields=source, source_alias="S",
+            target, source=self._source(("id", pa.int64())),
+            source_alias="S",
         )
         assert "`S`.`id`" in sql
         assert "CAST(NULL AS STRING) AS `extra`" in sql
 
-    def test_no_source_fields_casts_everything(self) -> None:
+    def test_no_source_casts_everything(self) -> None:
         target = _schema(("id", pa.int64()), ("v", pa.float64())).fields
         sql = _build_cast_column_projection(
-            target, source_fields=None, source_alias="S",
+            target, source=None, source_alias="S",
         )
-        assert "CAST(`S`.`id` AS BIGINT) AS `id`" in sql
-        assert "CAST(`S`.`v` AS DOUBLE) AS `v`" in sql
+        assert "CAST(`S`.`id` AS BIGINT)" in sql
+        assert "CAST(`S`.`v` AS DOUBLE)" in sql
+        # No redundant AS alias on CAST of existing columns.
+        assert "AS `id`" not in sql
+        assert "AS `v`" not in sql
 
     def test_alias_with_spaces_is_quoted(self) -> None:
         target = _schema(("x", pa.int32())).fields
-        source = {"x": Field("x", pa.int32())}
         sql = _build_cast_column_projection(
-            target, source_fields=source, source_alias="my src",
+            target, source=self._source(("x", pa.int32())),
+            source_alias="my src",
         )
         assert sql == "`my src`.`x`"
 
     def test_column_name_with_spaces(self) -> None:
         target = _schema(("a b", pa.string())).fields
-        source = {"a b": Field("a b", pa.int32())}
         sql = _build_cast_column_projection(
-            target, source_fields=source, source_alias="S",
+            target, source=self._source(("a b", pa.int32())),
+            source_alias="S",
         )
-        assert sql == "CAST(`S`.`a b` AS STRING) AS `a b`"
+        # Mismatched type — CAST without redundant AS (name preserved).
+        assert sql == "CAST(`S`.`a b` AS STRING)"
 
     def test_mixed_match_mismatch_missing(self) -> None:
         target = _schema(
@@ -686,18 +690,18 @@ class TestBuildCastColumnProjection:
             ("value", pa.float64()),
             ("ts", pa.timestamp("us", "UTC")),
         ).fields
-        source = {
-            "id": Field("id", pa.int64()),       # match
-            "name": Field("name", pa.int32()),    # mismatch
+        source = self._source(
+            ("id", pa.int64()),                       # match
+            ("name", pa.int32()),                      # mismatch
             # value: missing
-            "ts": Field("ts", pa.timestamp("us", "UTC")),  # match
-        }
+            ("ts", pa.timestamp("us", "UTC")),         # match
+        )
         sql = _build_cast_column_projection(
-            target, source_fields=source, source_alias="S",
+            target, source=source, source_alias="S",
         )
         parts = [p.strip() for p in sql.split(",")]
         assert parts[0] == "`S`.`id`"
-        assert parts[1] == "CAST(`S`.`name` AS STRING) AS `name`"
+        assert parts[1] == "CAST(`S`.`name` AS STRING)"
         assert parts[2] == "CAST(NULL AS DOUBLE) AS `value`"
         assert parts[3] == "`S`.`ts`"
 

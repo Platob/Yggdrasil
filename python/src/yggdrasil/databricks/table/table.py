@@ -503,7 +503,7 @@ def _build_column_projection(
 def _build_cast_column_projection(
     target_fields: "Iterable[Field]",
     *,
-    source_fields: "Mapping[str, Field] | None" = None,
+    source: "Field | None" = None,
     source_alias: str,
 ) -> str:
     """Build a SELECT projection that CASTs source columns to target Spark types.
@@ -512,17 +512,15 @@ def _build_cast_column_projection(
 
     * **present in source, same type** — bare ``alias.`col``` (no CAST)
     * **present in source, different type** —
-      ``CAST(alias.`col` AS <spark_type>) AS `col```
+      ``CAST(alias.`col` AS <spark_type>)``
     * **missing from source** —
       ``CAST(NULL AS <spark_type>) AS `col```
 
-    *source_fields* maps column names to their :class:`Field`
-    descriptors from the source schema. When a source field's Spark
-    type name matches the target's, the CAST is skipped — the engine
-    already has the right type and a redundant CAST would just add
-    noise (and cost, for nested types where Spark re-validates every
-    child field). When *source_fields* is ``None`` every target column
-    is assumed present with an unknown type (always CAST).
+    *source* is the :class:`Field` describing the source schema.
+    Child lookup uses :meth:`Field.get` — no intermediate dict.
+    When a source child's Spark type matches the target's, the CAST
+    is skipped. When *source* is ``None`` every target column is
+    assumed present with an unknown type (always CAST).
     """
     alias = quote_ident(source_alias)
     parts: list[str] = []
@@ -531,17 +529,12 @@ def _build_cast_column_projection(
         target_spark = f.to_spark_name(
             with_name=False, with_nullable=False, with_comment=False,
         )
-        if source_fields is not None:
-            src = source_fields.get(f.name)
-        else:
-            src = ...  # sentinel: "assume present, unknown type"
+        src = source.get(f.name) if source is not None else ...
 
         if src is None:
-            # Column not in source — typed NULL fill.
             parts.append(f"CAST(NULL AS {target_spark}) AS {col}")
         elif src is ...:
-            # Present but type unknown — always CAST.
-            parts.append(f"CAST({alias}.{col} AS {target_spark}) AS {col}")
+            parts.append(f"CAST({alias}.{col} AS {target_spark})")
         else:
             source_spark = src.to_spark_name(
                 with_name=False, with_nullable=False, with_comment=False,
@@ -549,7 +542,7 @@ def _build_cast_column_projection(
             if source_spark == target_spark:
                 parts.append(f"{alias}.{col}")
             else:
-                parts.append(f"CAST({alias}.{col} AS {target_spark}) AS {col}")
+                parts.append(f"CAST({alias}.{col} AS {target_spark})")
     return ", ".join(parts)
 
 
@@ -3934,16 +3927,9 @@ class Table(DatabricksPath):
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
 
-        source_field = cast_options.source
-        if source_field is not None and source_field.children:
-            source_fields_map: Mapping[str, Field] = {
-                c.name: c for c in source_field.children
-            }
-        else:
-            source_fields_map = None
         source_projection = _build_cast_column_projection(
             fields,
-            source_fields=source_fields_map,
+            source=cast_options.source if cast_options.source and cast_options.source.children else None,
             source_alias="raw_src",
         )
         source_sql = (
