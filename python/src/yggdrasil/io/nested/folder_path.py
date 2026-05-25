@@ -1777,15 +1777,25 @@ class FolderPath(IO[bytes, FolderOptions]):
         (the ``.ygg/`` sidecar, transient ``.tmp`` fragments) stay
         — :meth:`_persist_schema` immediately re-stamps the
         sidecar after the parent finishes the write.
+
+        Singleton-cached child FolderPaths have their schema cache
+        reset so :meth:`_persist_schema` re-stamps their sidecar
+        after the recursive write recreates them.
         """
         for entry in self.path.iterdir():
             if entry.name.startswith("."):
                 continue
             try:
-                # ``Path.remove(recursive=True)`` handles both files
-                # and directories (rmtree-style for dirs); the call
-                # is best-effort so a transient race with a sibling
-                # writer doesn't poison the overwrite.
+                is_dir = entry.is_dir()
+            except Exception:
+                is_dir = False
+            if is_dir:
+                child = self._INSTANCES.get(
+                    type(self)._singleton_key(path=entry),
+                )
+                if child is not None:
+                    child._schema_cache = ...
+            try:
                 entry.remove(recursive=True, missing_ok=True)
             except Exception:
                 pass
