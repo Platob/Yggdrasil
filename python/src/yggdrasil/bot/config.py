@@ -42,9 +42,9 @@ def _find_open_port(start: int = 8100, end: int = 8200) -> int:
 class Settings:
     app_name: str = "yggdrasil-bot"
     app_version: str = "0.1.0"
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 8100
-    allow_remote: bool = False
+    allow_remote: bool = True
     docs_url: str = "/docs"
     redoc_url: str = "/redoc"
     openapi_url: str = "/openapi.json"
@@ -93,9 +93,9 @@ def get_settings() -> Settings:
     return Settings(
         app_name=os.getenv("YGG_BOT_APP_NAME", "yggdrasil-bot"),
         app_version=os.getenv("YGG_BOT_APP_VERSION", "0.1.0"),
-        host=os.getenv("YGG_BOT_HOST", "127.0.0.1"),
+        host=os.getenv("YGG_BOT_HOST", "0.0.0.0"),
         port=int(os.getenv("YGG_BOT_PORT", "8100")),
-        allow_remote=_as_bool(os.getenv("YGG_BOT_ALLOW_REMOTE"), False),
+        allow_remote=_as_bool(os.getenv("YGG_BOT_ALLOW_REMOTE"), True),
         docs_url=os.getenv("YGG_BOT_DOCS_URL", "/docs"),
         redoc_url=os.getenv("YGG_BOT_REDOC_URL", "/redoc"),
         openapi_url=os.getenv("YGG_BOT_OPENAPI_URL", "/openapi.json"),

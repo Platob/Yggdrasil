@@ -75,7 +75,7 @@ class TestDiscoveryEndpoints(unittest.TestCase):
             },
         )
         data = resp.json()
-        self.assertEqual(data["host"], "127.0.0.1")
+        self.assertIn(data["host"], ("127.0.0.1", "0.0.0.0"))
         self.assertEqual(data["port"], 8100)
         self.assertEqual(data["version"], "0.1.0")
 

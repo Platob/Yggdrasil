@@ -1,97 +1,39 @@
-"""Terminal chat client for the yggdrasil bot messenger endpoints.
-
-Pure-stdlib implementation -- no external dependencies beyond Python 3.10+.
-Uses ANSI escape codes for color, a background thread for long-poll message
-reception, and ``urllib.request`` for HTTP.
-"""
+"""Terminal chat client for the yggdrasil bot messenger."""
 from __future__ import annotations
 
 import getpass
 import json
 import sys
 import threading
-import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-# -- ANSI helpers (no external deps) ----------------------------------------
-
-_CSI = "\033["
-_RESET = f"{_CSI}0m"
-
-
-def _color(text: str, code: str) -> str:
-    return f"{_CSI}{code}m{text}{_RESET}"
-
-def _bold(text: str) -> str:    return _color(text, "1")
-def _dim(text: str) -> str:     return _color(text, "2")
-def _yellow(text: str) -> str:  return _color(text, "33")
-def _cyan(text: str) -> str:    return _color(text, "36")
-def _green(text: str) -> str:   return _color(text, "32")
-
-_USERNAME_CODES = (31, 32, 33, 34, 35, 36)
-
-def _colored_name(name: str) -> str:
-    return _color(name, str(_USERNAME_CODES[hash(name) % len(_USERNAME_CODES)]))
-
-def _clear_line() -> None:
-    sys.stdout.write(f"{_CSI}2K\r")
-    sys.stdout.flush()
-
-def _out(text: str) -> None:
-    sys.stdout.write(text)
-    sys.stdout.flush()
+from yggdrasil.cli.style import (
+    Spinner, bold, clear_line, colored_name, cyan, dim, green,
+    out, print_logo, typing_dots, yellow,
+)
 
 
 # -- HTTP helpers (stdlib only) ---------------------------------------------
 
-
 def _http_get(url: str, timeout: float = 30.0) -> dict:
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=timeout) as r:
+        return json.loads(r.read())
 
 
 def _http_post(url: str, body: dict | None = None, timeout: float = 10.0) -> dict:
     data = json.dumps(body).encode() if body is not None else b""
-    headers = {"Content-Type": "application/json"} if body is not None else {}
-    req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
-
-
-# -- Banner & typing animation ---------------------------------------------
-
-def _build_banner() -> str:
-    o = _CSI + "38;5;208m"
-    b = _CSI + "1m"
-    d = _CSI + "2m"
-    r = _RESET
-    return (
-        f"\n"
-        f"  {o} __   __ ___ ___ {r}\n"
-        f"  {o} \\ \\ / // __/ __| {r}\n"
-        f"  {o}  \\ V /| (_ | (_ | {r}\n"
-        f"  {o}   |_|  \\___|\\___| {r}\n"
-        f"  {d}            chat{r}\n"
-        f"\n"
-    )
-
-
-def _typing_dots(duration: float = 0.35, frames: int = 3) -> None:
-    delay = duration / (frames + 1)
-    for i in range(1, frames + 1):
-        _out(f"\r  {_dim('.' * i)}")
-        time.sleep(delay)
-    _clear_line()
+    hdrs = {"Content-Type": "application/json"} if body is not None else {}
+    with urllib.request.urlopen(
+        urllib.request.Request(url, data=data, headers=hdrs), timeout=timeout,
+    ) as r:
+        return json.loads(r.read())
 
 
 # -- ChatClient -------------------------------------------------------------
 
-
 class ChatClient:
-    """Interactive terminal chat client for the bot messenger API."""
 
     def __init__(self, base_url: str, username: str, channel: str = "general"):
         self.base_url = base_url.rstrip("/")
@@ -104,15 +46,15 @@ class ChatClient:
 
     @property
     def _prompt(self) -> str:
-        return f"[{_cyan(self.channel)}] {_colored_name(self.username)}> "
+        return f"[{cyan(self.channel)}] {colored_name(self.username)}> "
 
     def _write_prompt(self) -> None:
-        _out(self._prompt)
+        out(self._prompt)
 
     def _api(self, path: str) -> str:
         return f"{self.base_url}/api/messenger{path}"
 
-    # -- API calls -------------------------------------------------------
+    # -- API calls ---------------------------------------------------------
 
     def send_message(self, text: str) -> dict | None:
         try:
@@ -155,7 +97,6 @@ class ChatClient:
             return []
 
     def create_channel(self, name: str) -> dict | None:
-        # Server expects name as a query parameter, not a JSON body
         try:
             encoded = urllib.request.quote(name, safe="")
             return _http_post(self._api(f"/channels?name={encoded}"))
@@ -163,7 +104,7 @@ class ChatClient:
             self._sys(f"create channel failed: {exc.reason}")
             return None
 
-    # -- display ---------------------------------------------------------
+    # -- display -----------------------------------------------------------
 
     @staticmethod
     def _format_ts(ts: str) -> str:
@@ -179,13 +120,13 @@ class ChatClient:
         sender, text = msg.get("sender", "???"), msg.get("text", "")
         ts = self._format_ts(msg.get("timestamp", ""))
         if animate and sender != self.username:
-            _typing_dots()
-        _out(f"  {_dim(ts)} {_colored_name(sender)}: {text}\n")
+            typing_dots()
+        out(f"  {dim(ts)} {colored_name(sender)}: {text}\n")
 
     def _sys(self, text: str) -> None:
-        _out(f"  {_dim('*')} {_yellow(text)}\n")
+        out(f"  {dim('*')} {yellow(text)}\n")
 
-    # -- background poller -----------------------------------------------
+    # -- background poller -------------------------------------------------
 
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
@@ -193,7 +134,7 @@ class ChatClient:
             if not messages:
                 continue
             with self._lock:
-                _clear_line()
+                clear_line()
                 for msg in messages:
                     if msg.get("sender") != self.username:
                         self._print_msg(msg, animate=True)
@@ -208,17 +149,35 @@ class ChatClient:
 
     def _stop_poller(self) -> None:
         self._stop.set()
-        if self._poll_thread is not None:
+        if self._poll_thread:
             self._poll_thread.join(timeout=3.0)
             self._poll_thread = None
 
-    # -- slash commands ---------------------------------------------------
+    # -- slash commands ----------------------------------------------------
+
+    def _handle_command(self, line: str) -> bool:
+        parts = line.split(maxsplit=1)
+        cmd, arg = parts[0].lower(), (parts[1] if len(parts) > 1 else "")
+        if cmd == "/quit":
+            return True
+        handlers = {
+            "/join": lambda: self._cmd_join(arg),
+            "/channels": self._cmd_channels,
+            "/create": lambda: self._cmd_create(arg),
+            "/users": self._cmd_users,
+            "/help": self._cmd_help,
+        }
+        h = handlers.get(cmd)
+        if h:
+            h()
+        else:
+            self._sys(f"unknown command {cmd} -- try /help")
+        return False
 
     def _cmd_join(self, arg: str) -> None:
         name = arg.strip()
         if not name:
-            self._sys("usage: /join <channel>")
-            return
+            self._sys("usage: /join <channel>"); return
         self._stop_poller()
         self.channel = name
         self._seed_last_id()
@@ -228,20 +187,18 @@ class ChatClient:
     def _cmd_channels(self) -> None:
         channels = self.list_channels()
         if not channels:
-            self._sys("no channels (or server unreachable)")
-            return
+            self._sys("no channels (or server unreachable)"); return
         self._sys("channels:")
         for ch in channels:
-            n, c = ch.get("name", "?"), ch.get("message_count", 0)
-            m = len(ch.get("members", []))
-            mark = _green(" <--") if n == self.channel else ""
-            _out(f"    {_bold('#' + n)}  {_dim(f'{c} msgs, {m} members')}{mark}\n")
+            n = ch.get("name", "?")
+            c, m = ch.get("message_count", 0), len(ch.get("members", []))
+            mark = green(" <--") if n == self.channel else ""
+            out(f"    {bold('#' + n)}  {dim(f'{c} msgs, {m} members')}{mark}\n")
 
     def _cmd_create(self, arg: str) -> None:
         name = arg.strip()
         if not name:
-            self._sys("usage: /create <channel>")
-            return
+            self._sys("usage: /create <channel>"); return
         if self.create_channel(name):
             self._sys(f"channel #{name} created")
 
@@ -250,57 +207,40 @@ class ChatClient:
             if ch.get("name") == self.channel:
                 self._sys(f"members of #{self.channel}:")
                 for m in ch.get("members", []):
-                    _out(f"    {_colored_name(m)}\n")
+                    out(f"    {colored_name(m)}\n")
                 return
         self._sys(f"channel #{self.channel} not found")
 
     def _cmd_help(self) -> None:
         self._sys("commands:")
-        for cmd, desc in [
+        for c, d in [
             ("/join <channel>", "switch to a channel"),
             ("/channels", "list all channels"),
             ("/create <channel>", "create a new channel"),
-            ("/users", "show members in current channel"),
+            ("/users", "show members"),
             ("/help", "show this help"),
-            ("/quit", "exit the chat"),
+            ("/quit", "exit"),
         ]:
-            _out(f"    {_bold(cmd):30s} {_dim(desc)}\n")
-
-    def _handle_command(self, line: str) -> bool:
-        """Handle a ``/command``.  Returns *True* to quit."""
-        parts = line.split(maxsplit=1)
-        cmd, arg = parts[0].lower(), (parts[1] if len(parts) > 1 else "")
-        if cmd == "/quit":
-            return True
-        handler = {
-            "/join": lambda: self._cmd_join(arg),
-            "/channels": self._cmd_channels,
-            "/create": lambda: self._cmd_create(arg),
-            "/users": self._cmd_users,
-            "/help": self._cmd_help,
-        }.get(cmd)
-        if handler:
-            handler()
-        else:
-            self._sys(f"unknown command {cmd} -- try /help")
-        return False
+            out(f"    {bold(c):30s} {dim(d)}\n")
 
     def _seed_last_id(self) -> None:
         messages = self.fetch_messages()
         if messages:
             self.last_id = messages[-1].get("id", "0")
 
-    # -- main REPL -------------------------------------------------------
+    # -- REPL --------------------------------------------------------------
 
     def run(self) -> int:
-        _out(_build_banner())
-        self._sys(f"connecting to {_bold(self.base_url)} as {_colored_name(self.username)}")
+        print_logo("YGGCHAT")
+        with Spinner("connecting...", color="33") as sp:
+            channels = self.list_channels()
+            sp.stop(f"{yellow('connected')} to {bold(self.base_url)} as {colored_name(self.username)}")
         self._cmd_channels()
         self._sys(f"joined #{self.channel} -- type /help for commands\n")
         self._seed_last_id()
         for msg in self.fetch_messages()[-20:]:
             self._print_msg(msg)
-        _out("\n")
+        out("\n")
         self._start_poller()
         try:
             while True:
@@ -321,12 +261,9 @@ class ChatClient:
             pass
         finally:
             self._stop_poller()
-            _out("\n")
+            out("\n")
             self._sys("disconnected")
         return 0
-
-
-# -- Entry point ------------------------------------------------------------
 
 
 def run_chat(
@@ -334,7 +271,6 @@ def run_chat(
     username: str | None = None,
     channel: str = "general",
 ) -> int:
-    """Launch the interactive terminal chat client."""
     if username is None:
         try:
             username = getpass.getuser()
@@ -345,10 +281,9 @@ def run_chat(
 
 if __name__ == "__main__":
     import argparse
-
-    p = argparse.ArgumentParser(description="yggdrasil bot chat client")
-    p.add_argument("--url", default="http://127.0.0.1:8100", help="bot server URL")
-    p.add_argument("--user", default=None, help="display name")
-    p.add_argument("--channel", default="general", help="initial channel")
+    p = argparse.ArgumentParser(description="YGGCHAT")
+    p.add_argument("--url", default="http://127.0.0.1:8100")
+    p.add_argument("--user", default=None)
+    p.add_argument("--channel", default="general")
     a = p.parse_args()
     raise SystemExit(run_chat(url=a.url, username=a.user, channel=a.channel))
