@@ -1160,6 +1160,11 @@ class FolderPath(IO[bytes, FolderOptions]):
                 kept = predicate.filter_arrow_batch(batch)
                 if kept.num_rows > 0:
                     yield kept
+                elif batch.num_rows > 0:
+                    LOGGER.debug(
+                        "Predicate filtered %d row(s) to 0 in %r",
+                        batch.num_rows, self,
+                    )
 
         if accumulated is not None and cache_key is not None:
             if accumulated:
@@ -1230,6 +1235,11 @@ class FolderPath(IO[bytes, FolderOptions]):
             kept = predicate.filter_arrow_batch(batch)
             if kept.num_rows > 0:
                 yield kept
+            elif batch.num_rows > 0:
+                LOGGER.debug(
+                    "Predicate filtered %d cached row(s) to 0",
+                    batch.num_rows,
+                )
 
     def _free_cols_for(self, predicate: "Predicate") -> "tuple[str, ...] | None":
         """Memoised :func:`free_columns` lookup keyed by ``id(predicate)``.

@@ -848,6 +848,12 @@ class HTTPSession(Session):
         best: Optional[Response] = None
         for response in Response.from_arrow_tabular(iter(batches)):
             if not cache_cfg.filter_response(response, request=request):
+                LOGGER.debug(
+                    "Cache filter rejected response in %r "
+                    "(received_at=%s, window=[%s, %s))",
+                    tabular, response.received_at,
+                    cache_cfg.received_from, cache_cfg.received_to,
+                )
                 continue
             if best is None or response.received_at >= best.received_at:
                 best = response
