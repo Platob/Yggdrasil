@@ -20,7 +20,12 @@ from databricks.sdk.service.dashboards import (
 )
 
 from yggdrasil.data.enums.state import State
-from yggdrasil.databricks.genie import AgentResult, AgentStep, AutonomousAgent
+from yggdrasil.databricks.genie import (
+    AgentResponse,
+    AgentResult,
+    AgentStep,
+    AutonomousAgent,
+)
 from yggdrasil.databricks.genie.profiles import (
     INGESTION_CLUSTER,
     SERVERLESS_WAREHOUSE,
@@ -1122,3 +1127,152 @@ class TestFallbackPlanExpanded(AutonomousAgentTestCase):
                 "introspect",
                 msg=f"Fallback for {goal!r} should start with introspect",
             )
+
+
+# ----------------------------------------------------------------------- #
+# Intent classification
+# ----------------------------------------------------------------------- #
+class TestClassifyIntent(AutonomousAgentTestCase):
+    def test_question_with_question_mark(self):
+        self.assertEqual(self.agent.classify_intent("How many orders?"), "question")
+
+    def test_question_with_prefix(self):
+        for text in [
+            "How many orders last month",
+            "What is the average revenue",
+            "Show me the top 10 customers",
+            "Tell me about sales trends",
+            "Count the number of orders",
+            "List all tables in main.sales",
+        ]:
+            self.assertEqual(
+                self.agent.classify_intent(text),
+                "question",
+                msg=f"{text!r} should be classified as 'question'",
+            )
+
+    def test_goal_with_imperative(self):
+        for text in [
+            "Create a catalog for energy data",
+            "Set up the ingestion pipeline",
+            "Deploy the workflow to production",
+            "Build a curated layer for prices",
+            "Configure a new warehouse",
+            "Delete the test schema",
+            "Schedule a daily refresh job",
+            "Ingest data from the ENTSO-E API",
+        ]:
+            self.assertEqual(
+                self.agent.classify_intent(text),
+                "goal",
+                msg=f"{text!r} should be classified as 'goal'",
+            )
+
+    def test_goal_with_polite_phrase(self):
+        for text in [
+            "I want to create a new table",
+            "I need to set up storage",
+            "Can you create a catalog?",
+            "Please deploy the pipeline",
+            "Let's build the raw layer",
+            "Go ahead and create the schema",
+        ]:
+            self.assertEqual(
+                self.agent.classify_intent(text),
+                "goal",
+                msg=f"{text!r} should be classified as 'goal'",
+            )
+
+    def test_tool_with_run_prefix(self):
+        self.assertEqual(self.agent.classify_intent("run introspect"), "tool")
+
+    def test_tool_with_parens(self):
+        self.assertEqual(
+            self.agent.classify_intent("introspect()"),
+            "tool",
+        )
+
+    def test_tool_with_call_prefix(self):
+        self.assertEqual(
+            self.agent.classify_intent("call introspect"),
+            "tool",
+        )
+
+    def test_ambiguous_defaults_to_question(self):
+        self.assertEqual(
+            self.agent.classify_intent("orders by region"),
+            "question",
+        )
+
+    def test_resource_noun_without_question_mark_is_goal(self):
+        self.assertEqual(
+            self.agent.classify_intent("need a new warehouse for analytics"),
+            "goal",
+        )
+
+
+# ----------------------------------------------------------------------- #
+# Smart respond()
+# ----------------------------------------------------------------------- #
+class TestRespond(AutonomousAgentTestCase):
+    def test_respond_routes_question_to_genie(self):
+        self._ask_returns("42 orders last month")
+        resp = self.agent.respond("How many orders last month?")
+        self.assertIsInstance(resp, AgentResponse)
+        self.assertEqual(resp.intent, "question")
+        self.assertTrue(resp.succeeded)
+
+    def test_respond_routes_goal_to_accomplish(self):
+        self._ask_returns("1. DONE: Already exists\n")
+        resp = self.agent.respond("Create a catalog for energy data")
+        self.assertIsInstance(resp, AgentResponse)
+        self.assertEqual(resp.intent, "goal")
+        self.assertIsInstance(resp.result, AgentResult)
+
+    def test_respond_routes_tool_call(self):
+        resp = self.agent.respond("run introspect")
+        self.assertIsInstance(resp, AgentResponse)
+        self.assertEqual(resp.intent, "tool")
+        self.assertTrue(resp.succeeded)
+        self.assertIsInstance(resp.result, dict)
+
+    def test_respond_tool_with_parens(self):
+        self.agent.register_tool("ping", lambda: "pong")
+        resp = self.agent.respond("ping()")
+        self.assertEqual(resp.intent, "tool")
+        self.assertEqual(resp.result, "pong")
+
+    def test_respond_failed_tool(self):
+        self.agent.register_tool(
+            "boom", lambda: (_ for _ in ()).throw(RuntimeError("kaboom"))
+        )
+        resp = self.agent.respond("run boom")
+        self.assertEqual(resp.intent, "tool")
+        self.assertFalse(resp.succeeded)
+        self.assertIn("kaboom", resp.text)
+
+
+# ----------------------------------------------------------------------- #
+# Extract tool call
+# ----------------------------------------------------------------------- #
+class TestExtractToolCall(AutonomousAgentTestCase):
+    def test_extract_run_tool(self):
+        name, args, kwargs = self.agent._extract_tool_call("run introspect")
+        self.assertEqual(name, "introspect")
+        self.assertEqual(args, ())
+
+    def test_extract_tool_with_args(self):
+        name, args, kwargs = self.agent._extract_tool_call(
+            "create_catalog(energy, comment='test')"
+        )
+        self.assertEqual(name, "create_catalog")
+        self.assertEqual(args, ("energy",))
+        self.assertEqual(kwargs, {"comment": "test"})
+
+    def test_extract_unknown_tool_returns_none(self):
+        name, _, _ = self.agent._extract_tool_call("run nonexistent_tool")
+        self.assertIsNone(name)
+
+    def test_extract_plain_text_returns_none(self):
+        name, _, _ = self.agent._extract_tool_call("just a question")
+        self.assertIsNone(name)

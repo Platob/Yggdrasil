@@ -1,7 +1,7 @@
 """Genie API service wrappers."""
 
 from .agent import AGENT_SAVE_FORMATS, GenieAgent
-from .autonomous import AgentResult, AgentStep, AutonomousAgent
+from .autonomous import AgentResponse, AgentResult, AgentStep, AutonomousAgent
 from .profiles import (
     INGESTION_CLUSTER,
     PRO_WAREHOUSE,
@@ -28,6 +28,7 @@ from .resources import (
 from .service import Genie
 
 __all__ = [
+    "AgentResponse",
     "AgentResult",
     "AgentStep",
     "AutonomousAgent",

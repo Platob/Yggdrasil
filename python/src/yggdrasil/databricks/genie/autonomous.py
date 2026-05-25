@@ -56,7 +56,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .service import Genie
 
 
-__all__ = ["AutonomousAgent", "AgentResult", "AgentStep"]
+__all__ = ["AutonomousAgent", "AgentResponse", "AgentResult", "AgentStep"]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -135,6 +135,135 @@ class AgentResult:
             f"State: {self.state.name} ({done}/{total} steps completed)\n"
             f"Conclusion: {self.conclusion}"
         )
+
+
+@dataclass
+class AgentResponse:
+    """Result of :meth:`AutonomousAgent.respond` — the smart dispatch entry point."""
+
+    intent: str
+    text: Optional[str] = None
+    result: Any = None
+    succeeded: bool = True
+    query: Optional[str] = None
+    conversation_id: Optional[str] = None
+
+
+# ----------------------------------------------------------------------- #
+# Intent classification keywords
+# ----------------------------------------------------------------------- #
+
+_GOAL_PREFIXES: tuple[str, ...] = (
+    "set up",
+    "setup",
+    "create",
+    "build",
+    "deploy",
+    "configure",
+    "install",
+    "make",
+    "add",
+    "remove",
+    "delete",
+    "drop",
+    "migrate",
+    "move",
+    "rename",
+    "update",
+    "upgrade",
+    "schedule",
+    "automate",
+    "run the pipeline",
+    "run a pipeline",
+    "start the",
+    "stop the",
+    "restart",
+    "provision",
+    "initialize",
+    "init ",
+    "bootstrap",
+    "wire up",
+    "hook up",
+    "connect",
+    "integrate",
+    "ingest",
+    "land",
+    "curate",
+    "transform",
+    "load",
+    "refresh",
+    "backfill",
+    "replicate",
+    "sync",
+)
+
+_GOAL_PHRASES: tuple[str, ...] = (
+    "i want to",
+    "i need to",
+    "i'd like to",
+    "please create",
+    "please set up",
+    "please deploy",
+    "please configure",
+    "can you create",
+    "can you set up",
+    "can you deploy",
+    "could you create",
+    "we need to",
+    "let's create",
+    "let's set up",
+    "let's build",
+    "go ahead and",
+)
+
+_QUESTION_PREFIXES: tuple[str, ...] = (
+    "how many",
+    "how much",
+    "what is",
+    "what are",
+    "what's",
+    "where is",
+    "where are",
+    "when did",
+    "when was",
+    "when is",
+    "who ",
+    "which ",
+    "why ",
+    "show me",
+    "show the",
+    "tell me",
+    "get me",
+    "find ",
+    "count ",
+    "average ",
+    "total ",
+    "sum of",
+    "list the",
+    "list all",
+    "display",
+    "describe the data",
+    "what happened",
+    "is there",
+    "are there",
+    "do we have",
+    "does ",
+)
+
+_RESOURCE_NOUNS: tuple[str, ...] = (
+    "catalog",
+    "schema",
+    "table",
+    "volume",
+    "warehouse",
+    "cluster",
+    "pipeline",
+    "workflow",
+    "job",
+    "notebook",
+    "dashboard",
+    "secret",
+)
 
 
 # ----------------------------------------------------------------------- #
@@ -256,6 +385,159 @@ class AutonomousAgent(GenieAgent):
             f"children={len(self.children)}, "
             f"tools={len(self.tools)})"
         )
+
+    # ------------------------------------------------------------------ #
+    # Smart routing — classify intent and dispatch
+    # ------------------------------------------------------------------ #
+    def respond(
+        self,
+        text: str,
+        *,
+        conversation_id: Optional[str] = None,
+        space_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "AgentResponse":
+        """Interpret user text and route to the right capability.
+
+        This is the "just type what's on your mind" entry point. The agent
+        classifies the user's intent and dispatches accordingly:
+
+        - **question** → :meth:`run` (ask Genie a data question)
+        - **goal** → :meth:`accomplish` (plan and execute autonomously)
+        - **tool** → :meth:`run_tool` (invoke a registered tool directly)
+
+        Returns an :class:`AgentResponse` with the result and which path
+        was taken, so callers (CLI, notebooks) can render appropriately.
+        """
+        intent = self.classify_intent(text)
+        LOGGER.debug("Classified %r as %r", text[:80], intent)
+
+        if intent == "goal":
+            result = self.accomplish(text, **kwargs)
+            return AgentResponse(
+                intent="goal",
+                text=result.conclusion,
+                result=result,
+                succeeded=result.succeeded,
+            )
+        elif intent == "tool":
+            tool_name, args, kw = self._extract_tool_call(text)
+            if tool_name and tool_name in self.tools:
+                try:
+                    result = self.run_tool(tool_name, *args, **kw)
+                    return AgentResponse(
+                        intent="tool",
+                        text=f"Tool {tool_name!r} returned: {result!r}",
+                        result=result,
+                        succeeded=True,
+                    )
+                except Exception as exc:
+                    return AgentResponse(
+                        intent="tool",
+                        text=f"Tool {tool_name!r} failed: {exc}",
+                        result=exc,
+                        succeeded=False,
+                    )
+            # Fall through to question if tool extraction failed
+            intent = "question"
+
+        # Default: treat as a data question
+        answer = self.run(
+            text,
+            conversation_id=conversation_id,
+            space_id=space_id,
+        )
+        return AgentResponse(
+            intent="question",
+            text=answer.text,
+            result=answer,
+            succeeded=not answer.is_failed,
+            query=answer.query,
+            conversation_id=answer.conversation_id,
+        )
+
+    def classify_intent(self, text: str) -> str:
+        """Classify user text into an intent category.
+
+        Returns one of:
+
+        - ``"goal"`` — the user wants to create, set up, deploy, configure,
+          or otherwise *do* something that requires multi-step execution.
+        - ``"tool"`` — the user is referencing a specific tool by name
+          (e.g. "run introspect", "fetch https://...").
+        - ``"question"`` — the user is asking a data question or wants
+          information from Genie.
+
+        The classification is heuristic (keyword + pattern based), not
+        LLM-driven, so it's fast and deterministic.
+        """
+        lower = text.lower().strip()
+
+        # Direct tool reference: "run <tool_name>" or "<tool_name>(...)"
+        first_word = lower.split()[0] if lower.split() else ""
+        if first_word in ("run", "execute", "call", "invoke"):
+            rest = lower[len(first_word) :].strip()
+            candidate = rest.split("(")[0].split()[0] if rest else ""
+            if candidate in self.tools:
+                return "tool"
+
+        # Parenthesized tool call: "introspect()" or "fetch_json(url)"
+        if "(" in lower:
+            candidate = lower.split("(")[0].strip()
+            if candidate in self.tools:
+                return "tool"
+
+        # Goal patterns: imperative verbs that imply multi-step work
+        if any(lower.startswith(prefix) for prefix in _GOAL_PREFIXES):
+            return "goal"
+
+        # Goal patterns: contains action-implying phrases
+        if any(phrase in lower for phrase in _GOAL_PHRASES):
+            return "goal"
+
+        # Question patterns: starts with question words or "show me"
+        if any(lower.startswith(prefix) for prefix in _QUESTION_PREFIXES):
+            return "question"
+
+        # Ends with "?" — likely a question
+        if text.strip().endswith("?"):
+            return "question"
+
+        # Short imperative without question structure — lean toward goal
+        # if it contains resource nouns
+        if any(noun in lower for noun in _RESOURCE_NOUNS) and not text.strip().endswith(
+            "?"
+        ):
+            return "goal"
+
+        return "question"
+
+    def _extract_tool_call(
+        self, text: str
+    ) -> tuple[Optional[str], tuple[Any, ...], dict[str, Any]]:
+        """Try to extract a tool name and arguments from user text."""
+        lower = text.lower().strip()
+
+        # "run <tool>(args)" or "call <tool>(args)"
+        for prefix in ("run ", "execute ", "call ", "invoke "):
+            if lower.startswith(prefix):
+                remainder = text[len(prefix) :].strip()
+                step = self._parse_tool_step(remainder)
+                if step and step.tool in self.tools:
+                    return step.tool, step.args, step.kwargs
+                # Tool name without parens
+                candidate = remainder.split()[0] if remainder.split() else ""
+                if candidate in self.tools:
+                    return candidate, (), {}
+                break
+
+        # Direct "tool_name(args)" syntax
+        if "(" in text:
+            step = self._parse_tool_step(text.strip())
+            if step and step.tool in self.tools:
+                return step.tool, step.args, step.kwargs
+
+        return None, (), {}
 
     # ------------------------------------------------------------------ #
     # The autonomous loop
