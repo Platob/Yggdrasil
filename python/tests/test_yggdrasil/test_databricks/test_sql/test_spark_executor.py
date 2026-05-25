@@ -25,9 +25,12 @@ class TestDatabricksSparkStatementExecutor:
         client = MagicMock(name="client")
         client.spark.return_value = sentinel
 
+        fake_module = MagicMock()
+        fake_module.SparkSession.getActiveSession.return_value = None
+
         executor = DatabricksSparkStatementExecutor(client=client)
-        with patch(
-            "pyspark.sql.SparkSession.getActiveSession", return_value=None,
+        with patch.dict(
+            "sys.modules", {"pyspark.sql": fake_module, "pyspark": MagicMock()},
         ):
             session = executor.resolve_session(create=True)
 
@@ -42,8 +45,11 @@ class TestDatabricksSparkStatementExecutor:
         client = MagicMock(name="client")
         executor = DatabricksSparkStatementExecutor(client=client)
 
-        with patch(
-            "pyspark.sql.SparkSession.getActiveSession", return_value=None,
+        fake_module = MagicMock()
+        fake_module.SparkSession.getActiveSession.return_value = None
+
+        with patch.dict(
+            "sys.modules", {"pyspark.sql": fake_module, "pyspark": MagicMock()},
         ):
             assert executor.resolve_session(create=False) is None
         client.spark.assert_not_called()

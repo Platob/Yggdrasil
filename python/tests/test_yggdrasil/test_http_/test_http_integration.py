@@ -459,8 +459,8 @@ class TestLocalCacheIntegration:
         assert len(s.calls) == 1, "stale row outside the window must miss"
         assert out.json() == {"fresh": True}
 
-    def test_upsert_mode_skips_lookup_and_refetches(self, tmp_path) -> None:
-        """UPSERT bypasses the read, always going to the network."""
+    def test_upsert_mode_reads_cache_and_persists(self, tmp_path) -> None:
+        """UPSERT reads from cache like any other mode."""
         s = StubSession()
         cache = CacheConfig(tabular=str(tmp_path), mode=Mode.UPSERT)
         req = make_request("https://example.com/x")
@@ -468,10 +468,9 @@ class TestLocalCacheIntegration:
             cache, make_response(request=req, body=b'{"cached":true}'),
         )
 
-        s.queue(make_response(body=b'{"fresh":true}'))
         out = s.send(req, local_cache=cache)
-        assert len(s.calls) == 1, "UPSERT must always hit the network"
-        assert out.json() == {"fresh": True}
+        assert len(s.calls) == 0, "cache hit must skip network"
+        assert out.json() == {"cached": True}
 
     def test_per_request_cache_override_wins(self, tmp_path) -> None:
         """A request-level cache config overrides the session-level one."""

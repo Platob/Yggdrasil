@@ -1566,6 +1566,10 @@ class DatabricksClient(Singleton, URLBased):
         return cached
 
     @property
+    def clusters(self):
+        return self.compute.clusters
+
+    @property
     def secrets(self) -> "Secrets":
         """Default secrets helper for this client."""
         cached = self.__dict__.get("_secrets")
@@ -1738,6 +1742,7 @@ class DatabricksClient(Singleton, URLBased):
         registry: "Optional[Any]" = None,
         check_public: bool = False,
         cache_dir: "Optional[Union[str, os.PathLike]]" = None,
+        cluster: "str | Cluster | None" = None
     ):
         """Open a Databricks Connect session with auto-resolved deps.
 
@@ -1852,6 +1857,12 @@ class DatabricksClient(Singleton, URLBased):
         )
         registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
         specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)
+
+        cluster = self.cluster_id if cluster is None else cluster
+
+        if cluster is not None and cluster != "serverless":
+            cluster = self.clusters.get_or_create(cluster)
+            self.cluster_id = cluster.cluster_id
 
         LOGGER.debug(
             "Creating Spark Connect session %r (mode=%s, cluster_id=%r, "

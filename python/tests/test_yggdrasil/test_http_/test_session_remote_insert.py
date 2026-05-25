@@ -233,8 +233,8 @@ class TestSendManyRemoteInsert:
         assert inserted_a == 1, f"tab_a should have 1 insert, got {inserted_a}"
         assert inserted_b == 1, f"tab_b should have 1 insert, got {inserted_b}"
 
-    def test_upsert_mode_skips_insert_in_send_many(self):
-        """UPSERT mode in send_many must skip both lookup and writeback."""
+    def test_upsert_mode_skips_read_and_persists_in_send_many(self):
+        """UPSERT mode in send_many skips the cache read but persists."""
         tab = FakeTable()
         cfg = _cache(tab, mode=Mode.UPSERT)
 
@@ -245,8 +245,9 @@ class TestSendManyRemoteInsert:
         list(s.send_many(iter([req]), remote_cache=cfg))
 
         assert len(s.calls) == 1, "UPSERT must fetch from network"
-        assert len(tab.lookups) == 0, "UPSERT must not lookup"
-        assert len(tab.inserts) == 0, "UPSERT must not insert"
+        assert len(tab.lookups) == 0, "UPSERT must not look up"
+        assert len(tab.inserts) == 1, "UPSERT must persist the response"
+        assert tab.inserts[0]["mode"] == Mode.UPSERT
 
     def test_error_responses_not_inserted_in_send_many(self):
         """Error responses in send_many must not be inserted into
@@ -288,3 +289,251 @@ class TestSendManyRemoteInsert:
         assert len(s.calls) == 1, "second round must not touch network"
         assert len(results) == 1
         assert results[0].ok
+
+
+# =========================================================================
+# UPSERT / OVERWRITE persist behavior
+# =========================================================================
+
+
+class TestSendManyUpsertOverwritePersist:
+    """All modes read from cache then write back with their own
+    semantics.  The mode is passed through to the insert call."""
+
+    def test_upsert_single_send_persists(self):
+        """Single send() with UPSERT reads and persists."""
+        tab = FakeTable()
+        cfg = _cache(tab, mode=Mode.UPSERT)
+        req = make_request("https://api.example.com/u")
+
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"u":1}'))
+        s.send(req, remote_cache=cfg)
+
+        assert len(s.calls) == 1
+        assert len(tab.lookups) == 1, "UPSERT reads from cache"
+        assert len(tab.inserts) == 1
+        assert tab.inserts[0]["mode"] == Mode.UPSERT
+        assert tab.inserts[0]["rows"] == 1
+
+    def test_overwrite_single_send_persists(self):
+        """Single send() with OVERWRITE reads then persists."""
+        tab = FakeTable()
+        cfg = _cache(tab, mode=Mode.OVERWRITE)
+        req = make_request("https://api.example.com/o")
+
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"o":1}'))
+        s.send(req, remote_cache=cfg)
+
+        assert len(s.calls) == 1
+        assert len(tab.inserts) == 1
+        assert tab.inserts[0]["mode"] == Mode.OVERWRITE
+
+    def test_upsert_send_many_persists(self):
+        """send_many with UPSERT skips read but persists."""
+        tab = FakeTable()
+        cfg = _cache(tab, mode=Mode.UPSERT)
+
+        reqs = [
+            make_request("https://api.example.com/u1"),
+            make_request("https://api.example.com/u2"),
+        ]
+        s = StubSession()
+        for r in reqs:
+            s.queue(make_response(request=r, body=b'{"ok":true}'))
+
+        list(s.send_many(iter(reqs), remote_cache=cfg))
+
+        assert len(s.calls) == 2
+        assert len(tab.lookups) == 0, "UPSERT must not look up"
+        total = sum(i["rows"] for i in tab.inserts)
+        assert total == 2, "both responses must be persisted"
+        assert all(i["mode"] == Mode.UPSERT for i in tab.inserts)
+
+    def test_overwrite_send_many_persists(self):
+        """send_many with OVERWRITE persists responses."""
+        tab = FakeTable()
+        cfg = _cache(tab, mode=Mode.OVERWRITE)
+
+        req = make_request("https://api.example.com/o1")
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"o":1}'))
+
+        list(s.send_many(iter([req]), remote_cache=cfg))
+
+        assert len(s.calls) == 1
+        total = sum(i["rows"] for i in tab.inserts)
+        assert total == 1
+        assert any(i["mode"] == Mode.OVERWRITE for i in tab.inserts)
+
+    def test_mixed_upsert_append_both_persist(self):
+        """A batch with APPEND and UPSERT requests persists both."""
+        tab = FakeTable()
+        append_cfg = _cache(tab, mode=Mode.APPEND)
+        upsert_cfg = _cache(tab, mode=Mode.UPSERT)
+
+        a = make_request("https://api.example.com/a").copy(
+            send_config=SendConfig(remote_cache=append_cfg),
+        )
+        b = make_request("https://api.example.com/b").copy(
+            send_config=SendConfig(remote_cache=upsert_cfg),
+        )
+        s = StubSession()
+        s.queue(
+            make_response(request=a, body=b'{"a":1}'),
+            make_response(request=b, body=b'{"b":1}'),
+        )
+
+        list(s.send_many(iter([a, b])))
+
+        assert len(s.calls) == 2
+        modes = {i["mode"] for i in tab.inserts}
+        assert modes == {Mode.APPEND, Mode.UPSERT}
+
+    def test_mixed_overwrite_upsert_both_persist(self):
+        """OVERWRITE + UPSERT in the same batch — both persist."""
+        tab = FakeTable()
+        ow_cfg = _cache(tab, mode=Mode.OVERWRITE)
+        up_cfg = _cache(tab, mode=Mode.UPSERT)
+
+        a = make_request("https://api.example.com/ow").copy(
+            send_config=SendConfig(remote_cache=ow_cfg),
+        )
+        b = make_request("https://api.example.com/up").copy(
+            send_config=SendConfig(remote_cache=up_cfg),
+        )
+        s = StubSession()
+        s.queue(
+            make_response(request=a, body=b'{"a":1}'),
+            make_response(request=b, body=b'{"b":1}'),
+        )
+
+        list(s.send_many(iter([a, b])))
+
+        assert len(s.calls) == 2
+        modes = {i["mode"] for i in tab.inserts}
+        assert modes == {Mode.OVERWRITE, Mode.UPSERT}
+
+    def test_upsert_per_request_with_session_append(self):
+        """Per-request UPSERT overrides session-level APPEND config.
+        Both the APPEND and the UPSERT request should persist."""
+        tab = FakeTable()
+        session_cfg = _cache(tab, mode=Mode.APPEND)
+        per_req_cfg = _cache(tab, mode=Mode.UPSERT)
+
+        normal = make_request("https://api.example.com/normal")
+        upsert = make_request("https://api.example.com/upsert").copy(
+            send_config=SendConfig(remote_cache=per_req_cfg),
+        )
+
+        s = StubSession()
+        s.queue(
+            make_response(request=normal, body=b'{"n":1}'),
+            make_response(request=upsert, body=b'{"u":1}'),
+        )
+
+        list(s.send_many(iter([normal, upsert]), remote_cache=session_cfg))
+
+        assert len(s.calls) == 2
+        total = sum(i["rows"] for i in tab.inserts)
+        assert total == 2
+        modes = {i["mode"] for i in tab.inserts}
+        assert modes == {Mode.APPEND, Mode.UPSERT}
+
+    def test_upsert_local_cache_persists(self, tmp_path):
+        """UPSERT local cache: skips read but persists to disk."""
+        from pathlib import Path
+
+        cache_dir = tmp_path / "upsert_local"
+        cache_dir.mkdir()
+        cfg = CacheConfig(
+            tabular=str(cache_dir),
+            mode=Mode.UPSERT,
+            request_by=["public_url_hash"],
+            wait=False,
+        )
+
+        req = make_request("https://api.example.com/local-upsert")
+        s = StubSession()
+        s.queue(make_response(request=req, body=b'{"local":1}'))
+        s.send(req, local_cache=cfg)
+
+        # Wait for the fire-and-forget writeback
+        deadline = __import__("time").monotonic() + 5.0
+        while __import__("time").monotonic() < deadline:
+            parts = list(Path(cache_dir).rglob("partition_key=*/part-*"))
+            if parts:
+                break
+            __import__("time").sleep(0.05)
+        assert len(parts) >= 1, "UPSERT must persist to local cache"
+
+
+# =========================================================================
+# Holder grouping — mode and spark_session separation
+# =========================================================================
+
+
+class TestHolderGrouping:
+    """Verify _group_by_holders separates by mode and spark_session."""
+
+    def test_groups_separate_by_mode(self):
+        from yggdrasil.http_.session import HTTPSession
+
+        tab = FakeTable()
+        append_cfg = _cache(tab, mode=Mode.APPEND)
+        upsert_cfg = _cache(tab, mode=Mode.UPSERT)
+
+        a = make_request("https://api.example.com/a").copy(
+            send_config=SendConfig(remote_cache=append_cfg),
+        )
+        b = make_request("https://api.example.com/b").copy(
+            send_config=SendConfig(remote_cache=upsert_cfg),
+        )
+
+        groups = HTTPSession._group_by_holders([a, b])
+        assert len(groups) == 2, (
+            "APPEND and UPSERT must be in separate groups"
+        )
+
+    def test_groups_separate_by_local_mode(self):
+        from yggdrasil.http_.session import HTTPSession
+
+        cfg_append = CacheConfig(
+            tabular="/tmp/test", mode=Mode.APPEND,
+            request_by=["public_url_hash"], wait=False,
+        )
+        cfg_overwrite = CacheConfig(
+            tabular="/tmp/test", mode=Mode.OVERWRITE,
+            request_by=["public_url_hash"], wait=False,
+        )
+
+        a = make_request("https://example.com/a").copy(
+            send_config=SendConfig(local_cache=cfg_append),
+        )
+        b = make_request("https://example.com/b").copy(
+            send_config=SendConfig(local_cache=cfg_overwrite),
+        )
+
+        groups = HTTPSession._group_by_holders([a, b])
+        assert len(groups) == 2, (
+            "APPEND and OVERWRITE local modes must be in separate groups"
+        )
+
+    def test_same_mode_same_holder_groups_together(self):
+        from yggdrasil.http_.session import HTTPSession
+
+        tab = FakeTable()
+        cfg = _cache(tab, mode=Mode.APPEND)
+
+        a = make_request("https://example.com/a").copy(
+            send_config=SendConfig(remote_cache=cfg),
+        )
+        b = make_request("https://example.com/b").copy(
+            send_config=SendConfig(remote_cache=cfg),
+        )
+
+        groups = HTTPSession._group_by_holders([a, b])
+        assert len(groups) == 1, (
+            "same holder + same mode → single group"
+        )

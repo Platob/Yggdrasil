@@ -825,7 +825,7 @@ class HTTPSession(Session):
         Returns ``None`` when *cache_cfg* is disabled, the mode
         disables reads, or no matching response exists.
         """
-        if cache_cfg is None or not cache_cfg.cache_enabled or cache_cfg.mode == Mode.UPSERT:
+        if cache_cfg is None or not cache_cfg.cache_enabled:
             return None
         tabular = cache_cfg.tabular
         if tabular is None:
@@ -1390,12 +1390,12 @@ class HTTPSession(Session):
         requests: Iterator[PreparedRequest],
         config: SendConfig | Mapping[str, Any] | None = None,
         *,
-        wait: WaitingConfigArg = None,
-        raise_error: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
-        cache_only: bool = False,
-        spark_session: Optional["SparkSession"] = None,
+        wait: WaitingConfigArg = ...,
+        raise_error: bool = ...,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        cache_only: bool = ...,
+        spark_session: Optional["SparkSession"] = ...,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
@@ -1408,17 +1408,28 @@ class HTTPSession(Session):
         ``max_in_flight``, ``max_batch_ttl``) control chunking and
         concurrency; everything else is folded into a :class:`SendConfig`
         that gets stamped on each request.
+
+        Send-config kwargs default to ``...`` (Ellipsis).  When left
+        unset the per-request :attr:`PreparedRequest.send_config` is
+        preserved; an explicit value overrides that field on every
+        request in the batch.
         """
-        cfg = SendConfig.from_(
-            config,
-            wait=wait,
-            raise_error=raise_error,
-            remote_cache=remote_cache,
-            local_cache=local_cache,
-            cache_only=cache_only,
-            spark_session=spark_session,
-            **options,
-        )
+        overrides: dict[str, Any] = {**options}
+        if wait is not ...:
+            overrides["wait"] = wait
+        if raise_error is not ...:
+            overrides["raise_error"] = raise_error
+        if remote_cache is not ...:
+            overrides["remote_cache"] = remote_cache
+        if local_cache is not ...:
+            overrides["local_cache"] = local_cache
+        if cache_only is not ...:
+            overrides["cache_only"] = cache_only
+        if spark_session is not ...:
+            overrides["spark_session"] = spark_session
+
+        cfg = SendConfig.from_(config, **overrides)
+
         batch_kw: dict[str, Any] = {}
         if batch_size is not None:
             batch_kw["batch_size"] = batch_size
@@ -1437,6 +1448,19 @@ class HTTPSession(Session):
             for r in reqs:
                 if r.send_config is None:
                     r.send_config = cfg
+                elif overrides:
+                    req_sc = r.send_config
+                    merged = SendConfig.from_(req_sc, **overrides)
+                    # Per-request cache configs always win over
+                    # call-level overrides.
+                    merge_back: dict[str, Any] = {}
+                    if req_sc.local_cache is not None:
+                        merge_back["local_cache"] = req_sc.local_cache
+                    if req_sc.remote_cache is not None:
+                        merge_back["remote_cache"] = req_sc.remote_cache
+                    if merge_back:
+                        merged = dataclasses.replace(merged, **merge_back)
+                    r.send_config = merged
                 yield r
 
         return self._send_many(_stamp(requests), **batch_kw)
@@ -1459,6 +1483,8 @@ class HTTPSession(Session):
         local_holder: "IO | None",
         remote_holder: "IO | None",
         reqs: list[PreparedRequest],
+        local_mode: Mode,
+        remote_mode: Mode,
         *,
         ordered: bool = False,
         max_in_flight: int | None = None,
@@ -1467,14 +1493,14 @@ class HTTPSession(Session):
         spark = reqs[0].send_config_or_default.spark_session if reqs else None
         n = len(reqs)
         LOGGER.debug(
-            "Processing batch (requests=%d, local=%r, remote=%r)",
-            n, local_holder, remote_holder,
+            "Processing batch (requests=%d, local=%r [%r], remote=%r [%r])",
+            n, local_holder, local_mode, remote_holder, remote_mode,
         )
         local_hits: "Tabular | None" = None
         remote_hits: "Tabular | None" = None
         misses = reqs
 
-        if local_holder is not None:
+        if local_holder is not None and local_mode in (Mode.AUTO, Mode.APPEND):
             local_hits, misses = self._read_holder(
                 local_holder, reqs, "local_cache_config",
                 spark_session=spark,
@@ -1486,7 +1512,7 @@ class HTTPSession(Session):
                     local_count, n, local_holder,
                 )
 
-        if remote_holder is not None and misses:
+        if remote_holder is not None and misses and remote_mode in (Mode.AUTO, Mode.APPEND):
             before = len(misses)
             remote_hits, misses = self._read_holder(
                 remote_holder, misses, "remote_cache_config",
@@ -1508,11 +1534,6 @@ class HTTPSession(Session):
                     received_at=dt.datetime.now(dt.timezone.utc),
                     mode=Mode.OVERWRITE,
                 )
-
-        if local_hits is not None and remote_holder is not None:
-            rc = reqs[0].remote_cache_config
-            if rc is not None:
-                self._mirror_local_hits_to_remote(local_hits, rc)
 
         cfg = reqs[0].send_config_or_default
         if not misses or cfg.cache_only:
@@ -1536,10 +1557,12 @@ class HTTPSession(Session):
                 local_hits, remote_hits, reqs, misses,
                 spark=spark,
                 local_holder=local_holder, remote_holder=remote_holder,
+                local_mode=local_mode,
             )
         return self._send_local_batch(
             local_hits, remote_hits, reqs, misses,
             local_holder=local_holder, remote_holder=remote_holder,
+            local_mode=local_mode,
             ordered=ordered, max_in_flight=max_in_flight,
         )
 
@@ -1552,6 +1575,7 @@ class HTTPSession(Session):
         *,
         local_holder: "IO | None",
         remote_holder: "IO | None",
+        local_mode: "Mode | None" = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
@@ -1580,6 +1604,7 @@ class HTTPSession(Session):
             if local_holder is not None:
                 wb.append(lambda: self._backfill_local_cache(
                     responses_to_tabular(_hits), {local_holder: reqs},
+                    mode=local_mode,
                 ))
             if wb:
                 LOGGER.debug(
@@ -1603,6 +1628,7 @@ class HTTPSession(Session):
         spark: "SparkSession",
         local_holder: "IO | None",
         remote_holder: "IO | None",
+        local_mode: "Mode | None" = None,
     ) -> HTTPResponseBatch:
         """Fetch misses via Spark mapInArrow and persist to remote cache."""
         LOGGER.info(
@@ -1634,19 +1660,26 @@ class HTTPSession(Session):
     @staticmethod
     def _group_by_holders(
         batch: list[PreparedRequest],
-    ) -> dict[tuple["IO | None", "IO | None"], list[PreparedRequest]]:
-        """Group requests by ``(local_holder, remote_holder)`` pair.
+    ) -> dict[tuple, list[PreparedRequest]]:
+        """Group requests by cache identity so each group can be processed
+        as a single batch with consistent settings.
 
-        UPSERT-mode configs are treated as ``None`` so they skip
-        the cache read and go straight to network.
+        Key: ``(local_tabular, remote_tabular, local_mode, remote_mode,
+        has_spark)``.  The mode decides read vs write behaviour
+        downstream; the tabular is always present when a cache config
+        exists so the write path can find it directly.
         """
-        groups: dict[tuple["IO | None", "IO | None"], list[PreparedRequest]] = {}
+        groups: dict[tuple, list[PreparedRequest]] = {}
         for r in batch:
             lc = r.local_cache_config
             rc = r.remote_cache_config
+            has_spark = r.send_config_or_default.spark_session is not None
             key = (
-                lc.tabular if lc is not None and lc.mode != Mode.UPSERT else None,
-                rc.tabular if rc is not None and rc.mode != Mode.UPSERT else None,
+                lc.tabular if lc is not None else None,
+                rc.tabular if rc is not None else None,
+                lc.mode if lc is not None else None,
+                rc.mode if rc is not None else None,
+                has_spark,
             )
             groups.setdefault(key, []).append(r)
         return groups
@@ -1915,23 +1948,6 @@ class HTTPSession(Session):
             thread_name_prefix="ygg-remote-cache-insert",
         )
 
-    def _mirror_local_hits_to_remote(
-        self,
-        local_hits: "Tabular",
-        remote_cfg: CacheConfig,
-    ) -> None:
-        """Bulk-upsert local-cache hits into the remote cache."""
-        if not remote_cfg.mirror_local_to_remote:
-            return
-        if not remote_cfg.remote_cache_enabled:
-            return
-        batches = list(local_hits.read_arrow_batches())
-        if not batches or all(b.num_rows == 0 for b in batches):
-            return
-        table = pa.Table.from_batches(batches)
-        LOGGER.info("Mirroring %d local-cache hit(s) to remote cache", table.num_rows)
-        _insert_cache(remote_cfg.tabular, remote_cfg, table)
-
     def _send_many(
         self,
         requests: Iterator[PreparedRequest],
@@ -1949,17 +1965,59 @@ class HTTPSession(Session):
         self,
         requests: Iterator[PreparedRequest],
         *,
+        wait: WaitingConfigArg = ...,
+        raise_error: bool = ...,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        cache_only: bool = ...,
+        spark_session: Optional["SparkSession"] = ...,
         batch_size: int | None = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
         max_batch_ttl: float | None = None,
-        **options,
     ) -> Iterator[HTTPResponseBatch]:
-        """Yield one :class:`HTTPResponseBatch` per processed chunk."""
-        if options:
-            def it():
-                for r in requests:
-                    r.send_config = r.send_config_or_default()
+        """Yield one :class:`HTTPResponseBatch` per processed chunk.
+
+        Send-config kwargs default to ``...`` (Ellipsis).  When left
+        unset the per-request :attr:`PreparedRequest.send_config` is
+        preserved; an explicit value overrides that field on every
+        request in the batch.
+        """
+        overrides: dict[str, Any] = {}
+        if wait is not ...:
+            overrides["wait"] = wait
+        if raise_error is not ...:
+            overrides["raise_error"] = raise_error
+        if remote_cache is not ...:
+            overrides["remote_cache"] = remote_cache
+        if local_cache is not ...:
+            overrides["local_cache"] = local_cache
+        if cache_only is not ...:
+            overrides["cache_only"] = cache_only
+        if spark_session is not ...:
+            overrides["spark_session"] = spark_session
+
+        if overrides:
+            cfg = SendConfig.from_(None, **overrides)
+
+            def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
+                for r in reqs:
+                    if r.send_config is None:
+                        r.send_config = cfg
+                    else:
+                        req_sc = r.send_config
+                        merged = SendConfig.from_(req_sc, **overrides)
+                        merge_back: dict[str, Any] = {}
+                        if req_sc.local_cache is not None:
+                            merge_back["local_cache"] = req_sc.local_cache
+                        if req_sc.remote_cache is not None:
+                            merge_back["remote_cache"] = req_sc.remote_cache
+                        if merge_back:
+                            merged = dataclasses.replace(merged, **merge_back)
+                        r.send_config = merged
+                    yield r
+
+            requests = _stamp(requests)
 
         yield from self._send_many_batches(
             requests,
@@ -2040,17 +2098,16 @@ class HTTPSession(Session):
                 chunk_index, len(chunk), len(groups),
             )
 
-            for (local_holder, remote_holder), reqs in groups.items():
+            for (local_holder, remote_holder, local_mode, remote_mode, _), reqs in groups.items():
                 batch = self._send_batch(
                     local_holder, remote_holder, reqs,
+                    local_mode=local_mode, remote_mode=remote_mode,
                     ordered=ordered, max_in_flight=max_in_flight,
                 )
                 total_cache_hits += len(reqs) - len(batch.misses)
                 total_network += batch.counts.get("new", 0)
                 total_failed += len(batch.failed)
                 yield batch
-                if batch.failed:
-                    batch.failed[-1].raise_for_status()
 
         LOGGER.info(
             "Finished send_many pipeline (chunks=%d, cache_hits=%d, "
@@ -2682,6 +2739,13 @@ class HTTPSession(Session):
 
         if send_kwargs:
             send_config = SendConfig.from_(send_config, **send_kwargs)
+
+        if send_config is not None and send_config.local_cache is not None:
+            lc = send_config.local_cache
+            if lc.tabular is None and (
+                lc.received_from is not None or lc.received_to is not None
+            ):
+                object.__setattr__(lc, "tabular", self.local_cache())
 
         request = PreparedRequest.prepare(
             method=method,

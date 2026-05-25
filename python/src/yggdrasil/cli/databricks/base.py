@@ -183,9 +183,11 @@ class DatabricksCLI(ABC):
 
         try:
             client = cls.build_client(args)
-        except Exception:
-            from yggdrasil.databricks.client import DatabricksClient
-            client = DatabricksClient()
+        except Exception as exc:
+            import sys
+
+            print(f"{cls.prog}: {exc}", file=sys.stderr)
+            return 2
 
         instance = cls(client=client, args=args)
         return instance.run()

@@ -456,7 +456,7 @@ class CacheConfig(_ConfigBase):
 
     @property
     def cache_enabled(self):
-        return self.mode in (Mode.APPEND, Mode.AUTO)
+        return self.mode != Mode.IGNORE
 
     @property
     def local_cache_enabled(self):

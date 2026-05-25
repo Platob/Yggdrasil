@@ -264,18 +264,16 @@ class TestLocalCacheSend:
         time.sleep(0.2)
         assert _wait_for_local(cache, timeout=0.1) == 0
 
-    def test_upsert_skips_lookup_and_refetches(self, tmp_path) -> None:
+    def test_upsert_reads_cache_and_persists(self, tmp_path) -> None:
         cache = _local_cfg(tmp_path, mode=Mode.UPSERT)
         req = make_request("https://example.com/x")
         _seed_local(cache, make_response(request=req, body=b'{"v":"cached"}'))
 
         s = StubSession()
-        s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
-
         out = s.send(req, local_cache=cache)
-        # UPSERT bypasses the read — the network must fire.
-        assert len(s.calls) == 1
-        assert out.json() == {"v": "fresh"}
+        # UPSERT reads from cache like any other mode.
+        assert len(s.calls) == 0
+        assert out.json() == {"v": "cached"}
 
     def test_received_window_filters_stale_row(self, tmp_path) -> None:
         cache = _local_cfg(
@@ -513,23 +511,22 @@ class TestRemoteCacheSend:
         s.send(req, remote_cache=cfg, raise_error=False)
         assert tab.inserts == [], "5xx response must not write back to remote"
 
-    def test_upsert_skips_both_lookup_and_writeback(self) -> None:
-        # ``CacheConfig.cache_enabled`` gates the remote flow on
-        # ``mode in (APPEND, AUTO)``, so UPSERT short-circuits the
-        # whole remote cache: no lookup query, no writeback insert.
+    def test_upsert_reads_then_persists(self) -> None:
+        # UPSERT reads from cache like any other mode and persists
+        # the response back with UPSERT semantics.
         tab = _FakeRemoteTabular()
         cfg = _remote_cfg(tab, mode=Mode.UPSERT)
-        req = make_request("https://example.com/x")
-        _seed_remote(tab, make_response(request=req, body=b'{"v":"old"}'))
 
+        # Miss case: no seeded row → network fetch → persist.
+        req = make_request("https://example.com/x")
         s = StubSession()
         s.queue(make_response(request=req, body=b'{"v":"fresh"}'))
         out = s.send(req, remote_cache=cfg)
 
-        assert len(s.calls) == 1, "UPSERT must always go to the network"
+        assert len(s.calls) == 1, "miss must hit the network"
         assert out.json() == {"v": "fresh"}
-        assert tab.predicates == [], "UPSERT must not issue a lookup query"
-        assert tab.inserts == [], "UPSERT short-circuits the writeback too"
+        assert len(tab.inserts) == 1
+        assert tab.inserts[0]["mode"] == Mode.UPSERT
 
     def test_per_request_override_routes_to_alt_table(self) -> None:
         # Session-level config holds the cached row in tab_a;
@@ -615,9 +612,8 @@ class TestRemoteCacheSendMany:
         assert len(tab_b.predicates) == 1
 
     def test_writeback_groups_split_by_mode(self) -> None:
-        # APPEND + UPSERT in the same batch — APPEND should write back,
-        # UPSERT should short-circuit (see ``cache_enabled`` gate),
-        # leaving exactly one insert call on the table.
+        # APPEND + UPSERT in the same batch — both persist but as
+        # separate writeback groups (different modes).
         tab = _FakeRemoteTabular()
         append_cfg = _remote_cfg(tab, mode=Mode.APPEND)
         upsert_cfg = _remote_cfg(tab, mode=Mode.UPSERT)
@@ -635,12 +631,13 @@ class TestRemoteCacheSendMany:
         )
         list(s.send_many(iter([a, b])))
 
-        # Two network calls (UPSERT always misses), one writeback
-        # group (only APPEND persists).
+        # Both requests go to the network (UPSERT skips read, APPEND
+        # misses because the remote is empty). Two writeback groups —
+        # one per mode — each with one row.
         assert len(s.calls) == 2
-        assert len(tab.inserts) == 1
-        assert tab.inserts[0]["mode"] == Mode.APPEND
-        assert tab.inserts[0]["rows"] == 1
+        modes = {i["mode"] for i in tab.inserts}
+        assert modes == {Mode.APPEND, Mode.UPSERT}
+        assert all(i["rows"] == 1 for i in tab.inserts)
 
 
 # ===========================================================================
@@ -698,13 +695,11 @@ class TestCombinedCacheIntegration:
         assert _wait_for_local(local) >= 1
         assert tab.inserts and tab.inserts[0]["rows"] == 1
 
-    def test_mirror_local_to_remote_pushes_local_hit_upstream(self, tmp_path) -> None:
-        # ``mirror_local_to_remote=True`` — during ``send_many``, a
-        # local hit must produce a remote insert without going to the
-        # network.
+    def test_local_hit_does_not_push_to_remote(self, tmp_path) -> None:
+        # A local-only hit must not trigger a remote insert.
         local = _local_cfg(tmp_path)
         tab = _FakeRemoteTabular()
-        remote = _remote_cfg(tab, mirror_local_to_remote=True)
+        remote = _remote_cfg(tab)
         req = make_request("https://example.com/x")
         _seed_local(local, make_response(request=req, body=b'{"v":"local"}'))
 
@@ -715,27 +710,8 @@ class TestCombinedCacheIntegration:
             remote_cache=remote,
         ))
         assert len(s.calls) == 0, "local hit must not touch the network"
-        assert any(call["rows"] >= 1 for call in tab.inserts), (
-            "mirror_local_to_remote must push the local hit upstream"
-        )
-
-    def test_mirror_disabled_keeps_remote_silent_on_local_hit(self, tmp_path) -> None:
-        # Default config — no mirror flag — leaves the remote untouched
-        # on a batch satisfied entirely by the local cache.
-        local = _local_cfg(tmp_path)
-        tab = _FakeRemoteTabular()
-        remote = _remote_cfg(tab)  # mirror_local_to_remote defaults to False
-        req = make_request("https://example.com/x")
-        _seed_local(local, make_response(request=req, body=b'{"v":"local"}'))
-
-        s = StubSession()
-        list(s.send_many(
-            iter([req]),
-            local_cache=local,
-            remote_cache=remote,
-        ))
         assert tab.inserts == [], (
-            "default config must not push local-only hits to remote"
+            "local-only hit must not push to remote"
         )
 
     def test_send_many_mixes_local_hit_remote_hit_and_full_miss(
