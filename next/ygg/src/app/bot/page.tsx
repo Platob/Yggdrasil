@@ -348,6 +348,8 @@ export default function BotDashboard() {
             <InfoRow label="Version" value={node.version} mono />
             <InfoRow label="Host" value={`${node.host}:${node.port}`} mono />
             <InfoRow label="Uptime" value={formatUptime(node.uptime)} />
+            <InfoRow label="Latitude" value="48.8566" mono primary />
+            <InfoRow label="Longitude" value="2.3522" mono primary />
             <InfoRow label="RAM Total" value={`${metrics.ramTotal} GB`} />
             <InfoRow label="GPU" value={metrics.gpuName} />
             <InfoRow label="GPU Memory" value={`${metrics.gpuMemUsed.toFixed(1)}/${metrics.gpuMemTotal} GB`} />
@@ -359,11 +361,11 @@ export default function BotDashboard() {
   );
 }
 
-function InfoRow({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function InfoRow({ label, value, mono, primary }: { label: string; value: string; mono?: boolean; primary?: boolean }) {
   return (
     <div>
       <span className="text-muted text-xs">{label}</span>
-      <p className={`text-foreground truncate ${mono ? "font-mono text-xs" : ""}`}>{value}</p>
+      <p className={`truncate ${mono ? "font-mono text-xs" : ""} ${primary ? "text-primary" : "text-foreground"}`}>{value}</p>
     </div>
   );
 }
