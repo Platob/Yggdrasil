@@ -48,30 +48,38 @@ def colored_name(name: str) -> str:
 
 # -- logo ------------------------------------------------------------------
 
-_YGG_LINES = (
-    r" __   __ ___ ___ ",
-    r" \ \ / // __/ __|",
-    r"  \ V /| (_ | (_ |",
-    r"   |_|  \___|\___| ",
-)
+_LOGOS: dict[str, tuple[str, ...]] = {
+    "YGG": (
+        r" __   __ ___ ___ ",
+        r" \ \ / // __/ __|",
+        r"  \ V /| (_ | (_ |",
+        r"   |_|  \___|\___| ",
+    ),
+    "YGGBOT": (
+        r" __   __ ___ ___  ___   ___  _____",
+        r" \ \ / // __/ __|| _ ) / _ \|_   _|",
+        r"  \ V /| (_ | (_ | _ \| (_) | | |  ",
+        r"   |_|  \___|\___||___/ \___/  |_|  ",
+    ),
+}
 
 
 def logo(suffix: str = "") -> str:
     """Render the YGG logo with an optional suffix like BOT, CHAT, GENIE."""
+    key = suffix or "YGG"
+    lines = _LOGOS.get(key, _LOGOS["YGG"])
     if not _IS_TTY:
-        parts = ["  " + ln for ln in _YGG_LINES]
-        if suffix:
+        parts = ["  " + ln for ln in lines]
+        if key not in _LOGOS and suffix:
             parts.append(f"  {suffix}")
         return "\n".join(parts)
 
     o = f"{_CSI}38;5;208m"
-    b = f"{_CSI}1m"
-    d = f"{_CSI}2m"
     r = _RESET
-    lines = [f"  {o}{ln}{r}" for ln in _YGG_LINES]
-    if suffix:
-        lines.append(f"  {b}{suffix}{r}")
-    return "\n".join(lines)
+    rendered = [f"  {o}{ln}{r}" for ln in lines]
+    if key not in _LOGOS and suffix:
+        rendered.append(f"  {_CSI}1m{suffix}{r}")
+    return "\n".join(rendered)
 
 
 def print_logo(suffix: str = "") -> None:
