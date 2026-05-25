@@ -48,6 +48,7 @@ def _systemd_unit_content(settings: Settings) -> str:
         f"Environment=YGG_NODE_HOST={settings.host}",
         f"Environment=YGG_NODE_HOME={node_home}",
         f"Environment=YGG_NODE_FRONT_HOME={front_home}",
+        "Environment=YGG_NODE_ALLOW_REMOTE=1",
         f"Environment=PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
         "Restart=on-failure",
         "RestartSec=5",
@@ -88,6 +89,8 @@ def _launchd_plist_content(settings: Settings) -> str:
         <string>{node_home}</string>
         <key>YGG_NODE_FRONT_HOME</key>
         <string>{front_home}</string>
+        <key>YGG_NODE_ALLOW_REMOTE</key>
+        <string>1</string>
         <key>PATH</key>
         <string>{os.environ.get('PATH', '/usr/bin:/bin')}</string>
     </dict>
@@ -117,7 +120,7 @@ def _front_systemd_unit_content(settings: Settings) -> str:
         "[Service]",
         "Type=simple",
         f"WorkingDirectory={front_home}",
-        f"ExecStart={npm} run dev -- --port {settings.front_port}",
+        f"ExecStart={npm} run dev -- --hostname 0.0.0.0 --port {settings.front_port}",
         f"Environment=YGG_NODE_PORT={settings.port}",
         f"Environment=PORT={settings.front_port}",
         f"Environment=PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
@@ -154,6 +157,8 @@ def _front_launchd_plist_content(settings: Settings) -> str:
         <string>run</string>
         <string>dev</string>
         <string>--</string>
+        <string>--hostname</string>
+        <string>0.0.0.0</string>
         <string>--port</string>
         <string>{settings.front_port}</string>
     </array>

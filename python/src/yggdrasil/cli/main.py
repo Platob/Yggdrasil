@@ -131,7 +131,7 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None) 
 
     env = {**os.environ, "YGG_NODE_PORT": str(node_port), "PORT": str(port)}
     proc = subprocess.Popen(
-        [npm, "run", "dev", "--", "--port", str(port)],
+        [npm, "run", "dev", "--", "--hostname", "0.0.0.0", "--port", str(port)],
         cwd=str(front_home),
         env=env,
         stdout=subprocess.DEVNULL,
