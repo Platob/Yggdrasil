@@ -130,6 +130,9 @@ class TestDiscoveryEndpoints(unittest.TestCase):
     def test_self_info_includes_messenger_channels(self):
         # Create a channel through the messenger service
         self.client.post("/api/messenger/channels?name=discovery-test-chan")
+        # Invalidate response cache so the next GET reflects the new channel.
+        from yggdrasil.node.middleware import invalidate_response_cache
+        invalidate_response_cache()
         resp = self.client.get("/api/hello")
         data = resp.json()
         self.assertIn("discovery-test-chan", data["channels"])
