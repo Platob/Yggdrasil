@@ -157,6 +157,7 @@ nav:
       - Data Model: guides/data-model.md
       - Casting: guides/casting.md
       - IO & HTTP: guides/io-http.md
+      - Bot & Mesh: guides/bot.md
       - Databricks: guides/databricks.md
       - Development: guides/development.md
   - Module Walkthrough:

@@ -63,14 +63,27 @@ def _http_post(url: str, body: dict | None = None, timeout: float = 10.0) -> dic
 
 # -- Banner & typing animation ---------------------------------------------
 
-_BANNER = r"""
-  {g}  __  __              {c}    _            _ _ {r}
-  {g}  \ \/ /__ _ __ _     {c}   | |__ ___  __| | |{r}
-  {g}   \  / _` / _` |    {c}   | '_ \/ _ \/ _` |_|{r}
-  {g}   / / (_| \__, |    {c}   |_.__/\___/\__,_(_){r}
-  {g}  /_/ \__, |___/     {c}          chat{r}
-  {g}      |___/          {r}
-"""
+def _build_banner() -> str:
+    o = _CSI + "38;5;208m"  # orange like the logo
+    d = _CSI + "2m"
+    c = _CSI + "1m"
+    r = _RESET
+    return (
+        f"\n"
+        f"  {o}        \\  |  /{r}\n"
+        f"  {o}     \\   \\ | /   /{r}\n"
+        f"  {o}      `. ,\\|/, .`{r}\n"
+        f"  {o}       '.,\\|/,.'{r}\n"
+        f"  {o}     -- --{c}|{o}-- --{r}\n"
+        f"  {o}       ,'/|\\`,.{r}\n"
+        f"  {o}      .' /|\\ `.{r}\n"
+        f"  {d}         /|\\{r}\n"
+        f"  {d}        / | \\{r}\n"
+        f"  {d}    ___/  |  \\___{r}\n"
+        f"  {d}   ~   ~  ~  ~   ~{r}\n"
+        f"  {c}    Y G G D R A S I L{r} {d}chat{r}\n"
+        f"\n"
+    )
 
 
 def _typing_dots(duration: float = 0.35, frames: int = 3) -> None:
@@ -287,7 +300,7 @@ class ChatClient:
     # -- main REPL -------------------------------------------------------
 
     def run(self) -> int:
-        _out(_BANNER.format(g=_CSI + "32m", c=_CSI + "36m", r=_RESET))
+        _out(_build_banner())
         self._sys(f"connecting to {_bold(self.base_url)} as {_colored_name(self.username)}")
         self._cmd_channels()
         self._sys(f"joined #{self.channel} -- type /help for commands\n")

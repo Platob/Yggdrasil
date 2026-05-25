@@ -4,6 +4,7 @@ from fastapi import Request
 
 from .services.call import CallService
 from .services.cmd import CmdService
+from .services.discovery import DiscoveryService
 from .services.env import EnvService
 from .services.job import JobService
 from .services.messenger import MessengerService
@@ -32,3 +33,7 @@ def get_call_service(request: Request) -> CallService:
 
 def get_messenger_service(request: Request) -> MessengerService:
     return request.app.state.messenger_service
+
+
+def get_discovery_service(request: Request) -> DiscoveryService:
+    return request.app.state.discovery_service

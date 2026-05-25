@@ -2,9 +2,15 @@
 
 Subcommands:
 
-    ygg bot serve       Start the bot HTTP server
+    ygg bot serve       Start the bot HTTP server (foreground)
     ygg bot run         Call a @remote function on a bot server
+    ygg bot chat        Open the terminal chat client
+    ygg bot status      Show the running bot's status
+    ygg bot stop        Stop the background bot
     ygg genie           Launch the Genie conversational CLI
+
+A background bot is auto-spawned on first use and kept running for
+the session.  Data lives in ``~/.bot/{user_key}/``.
 """
 from __future__ import annotations
 
@@ -13,12 +19,23 @@ import sys
 from typing import Sequence
 
 
+def _ensure_bot_running() -> str:
+    """Spawn background bot if not already running. Returns the bot URL."""
+    try:
+        from yggdrasil.bot.daemon import spawn_bot, get_bot_url
+        spawn_bot()
+        return get_bot_url()
+    except Exception:
+        return "http://127.0.0.1:8100"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ygg",
         description="Yggdrasil CLI — data tools, bot execution, and Databricks utilities.",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("--no-bot", action="store_true", help="Skip auto-spawning the background bot.")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -26,9 +43,9 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_parser = subparsers.add_parser("bot", help="Bot HTTP server and remote execution.")
     bot_sub = bot_parser.add_subparsers(dest="bot_action")
 
-    serve = bot_sub.add_parser("serve", help="Start the bot HTTP server.")
+    serve = bot_sub.add_parser("serve", help="Start the bot HTTP server (foreground).")
     serve.add_argument("--host", default=None, help="Bind host (default: 127.0.0.1).")
-    serve.add_argument("--port", type=int, default=None, help="Bind port (default: 8100).")
+    serve.add_argument("--port", type=int, default=None, help="Bind port (auto-detected if busy).")
     serve.add_argument("--allow-remote", action="store_true", default=False, help="Allow non-local clients.")
     serve.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
     serve.set_defaults(handler=_bot_serve)
@@ -36,18 +53,23 @@ def _build_parser() -> argparse.ArgumentParser:
     run = bot_sub.add_parser("run", help="Call a @remote function on a bot server.")
     run.add_argument("func", help="Function key (e.g. 'mymodule:my_func').")
     run.add_argument("args", nargs="*", default=[], help="Positional arguments.")
-    run.add_argument("--url", default="http://127.0.0.1:8100", help="Bot server URL.")
+    run.add_argument("--url", default=None, help="Bot server URL (default: auto-detect).")
     run.add_argument("--kwarg", action="append", default=[], metavar="KEY=VALUE", help="Keyword argument (repeatable).")
     run.add_argument("--timeout", type=float, default=600.0, help="Request timeout in seconds.")
     run.add_argument("--stream", action="store_true", default=False, help="Stream Arrow IPC batches.")
     run.set_defaults(handler=_bot_run)
 
-    # -- chat --------------------------------------------------------------
-    chat_parser = bot_sub.add_parser("chat", help="Open the terminal chat client.")
-    chat_parser.add_argument("--url", default="http://127.0.0.1:8100", help="Bot server URL.")
-    chat_parser.add_argument("--user", default=None, help="Display name.")
-    chat_parser.add_argument("--channel", default="general", help="Initial channel.")
-    chat_parser.set_defaults(handler=_bot_chat)
+    chat = bot_sub.add_parser("chat", help="Open the terminal chat client.")
+    chat.add_argument("--url", default=None, help="Bot server URL (default: auto-detect).")
+    chat.add_argument("--user", default=None, help="Display name.")
+    chat.add_argument("--channel", default="general", help="Initial channel.")
+    chat.set_defaults(handler=_bot_chat)
+
+    status = bot_sub.add_parser("status", help="Show running bot status.")
+    status.set_defaults(handler=_bot_status)
+
+    stop = bot_sub.add_parser("stop", help="Stop the background bot.")
+    stop.set_defaults(handler=_bot_stop)
 
     # -- genie -------------------------------------------------------------
     genie_parser = subparsers.add_parser(
@@ -62,6 +84,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _bot_serve(args: argparse.Namespace) -> int:
     import os
+    from yggdrasil.bot.config import _find_open_port, get_settings
+    from yggdrasil.bot.daemon import ensure_directories, cleanup_old_logs
 
     if args.host:
         os.environ["YGG_BOT_HOST"] = args.host
@@ -70,14 +94,18 @@ def _bot_serve(args: argparse.Namespace) -> int:
     if args.allow_remote:
         os.environ["YGG_BOT_ALLOW_REMOTE"] = "1"
 
-    from yggdrasil.bot.config import get_settings
-    import uvicorn
-
     settings = get_settings()
+    ensure_directories(settings)
+    cleanup_old_logs(settings)
+
+    port = args.port or _find_open_port(settings.port, settings.port + 100)
+    host = args.host or settings.host
+
+    import uvicorn
     uvicorn.run(
         "yggdrasil.bot.app:app",
-        host=settings.host,
-        port=settings.port,
+        host=host,
+        port=port,
         reload=args.reload,
     )
     return 0
@@ -85,8 +113,8 @@ def _bot_serve(args: argparse.Namespace) -> int:
 
 def _bot_run(args: argparse.Namespace) -> int:
     from yggdrasil.bot.client import BotClient
-    from yggdrasil.dataclasses.safe_function import check_function_args
 
+    url = args.url or _ensure_bot_running()
     kwargs = {}
     for kv in args.kwarg:
         if "=" not in kv:
@@ -95,7 +123,7 @@ def _bot_run(args: argparse.Namespace) -> int:
         k, v = kv.split("=", 1)
         kwargs[k] = v
 
-    client = BotClient(args.url, timeout=args.timeout)
+    client = BotClient(url, timeout=args.timeout)
 
     if args.stream:
         try:
@@ -122,12 +150,40 @@ def _bot_run(args: argparse.Namespace) -> int:
 
 def _bot_chat(args: argparse.Namespace) -> int:
     from yggdrasil.bot.chat import run_chat
-    return run_chat(url=args.url, username=args.user, channel=args.channel)
+    url = args.url or _ensure_bot_running()
+    return run_chat(url=url, username=args.user, channel=args.channel)
+
+
+def _bot_status(args: argparse.Namespace) -> int:
+    from yggdrasil.bot.config import get_settings
+    from yggdrasil.bot.daemon import _is_bot_running, ensure_directories
+
+    settings = get_settings()
+    ensure_directories(settings)
+    running, pid, port = _is_bot_running(settings)
+
+    print(f"Bot home:  {settings.bot_home}")
+    print(f"Logs:      {settings.logs_root}")
+    print(f"Cache:     {settings.cache_root}")
+    if running:
+        print(f"Status:    running (pid={pid}, port={port})")
+        print(f"URL:       http://127.0.0.1:{port}")
+    else:
+        print("Status:    stopped")
+    return 0
+
+
+def _bot_stop(args: argparse.Namespace) -> int:
+    from yggdrasil.bot.daemon import stop_bot
+    if stop_bot():
+        print("Bot stopped.")
+    else:
+        print("No running bot found.")
+    return 0
 
 
 def _genie(args: argparse.Namespace) -> int:
     from yggdrasil.cli.databricks.genie import main as genie_main
-
     remaining = sys.argv[2:] if len(sys.argv) > 2 else []
     return genie_main(remaining)
 
@@ -147,6 +203,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+
+    if not getattr(args, "no_bot", False) and args.command != "bot":
+        _ensure_bot_running()
 
     handler = getattr(args, "handler", None)
     if handler is None:
