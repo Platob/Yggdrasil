@@ -1569,7 +1569,7 @@ class HTTPSession(Session):
         return self._send_local_batch(
             local_hits, remote_hits, reqs, misses,
             local_holder=local_holder, remote_holder=remote_holder,
-            local_mode=local_mode,
+            local_mode=local_mode, remote_mode=remote_mode,
             ordered=ordered, max_in_flight=max_in_flight,
         )
 
@@ -1583,6 +1583,7 @@ class HTTPSession(Session):
         local_holder: "IO | None",
         remote_holder: "IO | None",
         local_mode: "Mode | None" = None,
+        remote_mode: "Mode | None" = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
@@ -1607,8 +1608,7 @@ class HTTPSession(Session):
             _hits = new_list
             wb: list[Callable] = []
             if remote_holder is not None:
-                rc = misses[0].remote_cache_config
-                wb.append(lambda: self._persist_remote(remote_holder, _hits, rc))
+                wb.append(lambda: self._persist_remote(remote_holder, _hits, remote_mode))
             if local_holder is not None:
                 wb.append(lambda: self._backfill_local_cache(
                     responses_to_tabular(_hits), {local_holder: reqs},
@@ -1881,21 +1881,20 @@ class HTTPSession(Session):
     def _persist_remote(
         holder: "Tabular",
         responses: list[Response],
-        config: "CacheConfig",
+        mode: "Mode | None" = None,
     ) -> None:
         """Stage 4: bulk-insert successful responses into the remote cache."""
         LOGGER.info(
             "Persisting %d response(s) to remote cache %r",
             len(responses), holder,
         )
-        batches = pa.Table.from_batches(
+        table = pa.Table.from_batches(
             [Response.values_to_arrow_batch(responses)]
         )
-        _insert_cache(
-            holder, config, batches,
-            mode=config.mode,
-            prune_values=_cache_prune_values_for(batches),
-            raise_error=True,
+        from yggdrasil.data.options import CastOptions
+        holder.write_arrow_batches(
+            table.to_batches(),
+            options=CastOptions(mode=mode or Mode.APPEND),
         )
 
     def _send_many(
