@@ -1646,10 +1646,9 @@ class HTTPSession(Session):
             "Scattering %d miss(es) to Spark executors", len(misses),
         )
         new_hits = self._spark_fetch_misses(misses, spark)
-        rc = reqs[0].remote_cache_config
-        if remote_holder is not None and rc is not None:
+        if remote_holder is not None:
             LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
-            self._spark_persist_remote(new_hits, rc, spark=spark)
+            self._spark_persist_remote(remote_holder, new_hits, spark=spark)
         return HTTPResponseBatch(
             local=local_hits, remote=remote_hits,
             new=new_hits, misses=misses,
@@ -2054,8 +2053,8 @@ class HTTPSession(Session):
 
     def _spark_persist_remote(
         self,
+        holder: "Tabular",
         new_responses_df: "SparkDataFrame",
-        cfg: CacheConfig,
         *,
         spark: "SparkSession",
     ) -> None:
@@ -2064,48 +2063,43 @@ class HTTPSession(Session):
         APPEND-mode writes are de-duplicated against existing rows via
         a ``left_anti`` join on ``(partition_key, public_hash)``.
         """
-        if not cfg.remote_cache_enabled:
-            return
         from pyspark.sql import functions as F
 
-        table_name = cfg.tabular.full_name(safe=True)
+        table_name = holder.full_name(safe=True)
         ok_df = new_responses_df.where(
             (F.col("status_code") >= 200)
             & (F.col("status_code") < 300)
         )
 
-        if cfg.mode != Mode.UPSERT:
-            try:
-                wanted = [
-                    row["partition_key"]
-                    for row in ok_df.select("partition_key").distinct().collect()
-                ]
-            except Exception:
-                wanted = []
+        try:
+            wanted = [
+                row["partition_key"]
+                for row in ok_df.select("partition_key").distinct().collect()
+            ]
+        except Exception:
+            wanted = []
 
-            try:
-                if wanted:
-                    literals = ", ".join(str(int(v)) for v in wanted)
-                    existing = spark.sql(
-                        "SELECT DISTINCT partition_key, public_hash "
-                        f"FROM {table_name} WHERE partition_key IN ({literals})"
-                    )
-                else:
-                    existing = spark.sql(
-                        "SELECT DISTINCT partition_key, public_hash "
-                        f"FROM {table_name}"
-                    )
-                ok_df = ok_df.join(existing, on=["partition_key", "public_hash"], how="left_anti")
-            except Exception as exc:
-                if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
-                    raise
+        try:
+            if wanted:
+                literals = ", ".join(str(int(v)) for v in wanted)
+                existing = spark.sql(
+                    "SELECT DISTINCT partition_key, public_hash "
+                    f"FROM {table_name} WHERE partition_key IN ({literals})"
+                )
+            else:
+                existing = spark.sql(
+                    "SELECT DISTINCT partition_key, public_hash "
+                    f"FROM {table_name}"
+                )
+            ok_df = ok_df.join(existing, on=["partition_key", "public_hash"], how="left_anti")
+        except Exception as exc:
+            if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
+                raise
 
         LOGGER.info(
-            "%s ok response(s) into remote cache %s (spark, mode=%s)",
-            "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
-            table_name, cfg.mode.name,
+            "Persisting ok response(s) into remote cache %s (spark)", table_name,
         )
-        _insert_cache(cfg.tabular, cfg, ok_df, spark_session=spark, raise_error=True)
+        holder.write_spark_frame(ok_df, mode=Mode.APPEND)
 
     def _spark_fetch_misses(
         self,
