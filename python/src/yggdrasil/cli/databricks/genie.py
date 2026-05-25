@@ -656,28 +656,70 @@ class GenieCLI(DatabricksCLI):
         return True
 
     def _prompt_tables(self) -> bool:
-        """Ask the user which tables to expose in the Genie space."""
+        """List tables from the catalog and let the user pick."""
         self.info("  Genie needs at least one table to create a space.")
         try:
-            raw = self.input_fn(
-                self.style.cyan("  tables ")
-                + self.style.dim("(catalog.schema.table, comma-separated): "),
-            ).strip()
-        except (EOFError, KeyboardInterrupt):
+            available = list(self.client.tables.list())
+        except Exception:
+            available = []
+
+        if available:
             self.out("")
-            return False
-        if not raw:
-            self.error("  at least one table is required.")
-            return False
-        tables = tuple(t.strip() for t in raw.split(",") if t.strip())
-        if not tables:
-            self.error("  at least one table is required.")
-            return False
+            for i, t in enumerate(available, 1):
+                self.out(f"  {self.style.dim(f'{i:>3}.')} {t}")
+            self.out("")
+            try:
+                raw = self.input_fn(
+                    self.style.cyan("  tables ")
+                    + self.style.dim(f"(numbers or names, comma-sep, empty=all): "),
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                self.out("")
+                return False
+            if not raw:
+                tables = tuple(str(t) for t in available)
+            else:
+                tables = self._resolve_table_choices(raw, available)
+                if not tables:
+                    return False
+        else:
+            try:
+                raw = self.input_fn(
+                    self.style.cyan("  tables ")
+                    + self.style.dim("(catalog.schema.table, comma-separated): "),
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                self.out("")
+                return False
+            if not raw:
+                self.error("  at least one table is required.")
+                return False
+            tables = tuple(t.strip() for t in raw.split(",") if t.strip())
+
         self.genie.defaults = _dc_replace(
             self.defaults, managed_space_tables=tables,
         )
         self.info(f"  tables: {', '.join(tables)}")
         return True
+
+    def _resolve_table_choices(
+        self, raw: str, available: list,
+    ) -> "tuple[str, ...] | None":
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        tables: list[str] = []
+        for part in parts:
+            try:
+                idx = int(part) - 1
+                if 0 <= idx < len(available):
+                    tables.append(str(available[idx]))
+                    continue
+            except ValueError:
+                pass
+            tables.append(part)
+        if not tables:
+            self.error("  at least one table is required.")
+            return None
+        return tuple(tables)
 
     # ------------------------------------------------------------------ #
     # Slash dispatch
