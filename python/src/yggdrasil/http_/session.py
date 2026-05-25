@@ -1608,7 +1608,10 @@ class HTTPSession(Session):
             _hits = new_list
             wb: list[Callable] = []
             if remote_holder is not None:
-                wb.append(lambda: self._persist_remote(remote_holder, _hits, remote_mode))
+                wb.append(lambda: remote_holder.write_arrow_batches(
+                    Response.values_to_arrow_batch(_hits),
+                    mode=remote_mode or Mode.APPEND,
+                ))
             if local_holder is not None:
                 wb.append(lambda: self._backfill_local_cache(
                     responses_to_tabular(_hits), {local_holder: reqs},
@@ -1810,7 +1813,7 @@ class HTTPSession(Session):
         """Run *tasks* in parallel, re-raising the first failure.
 
         Used by the cache-write path (``_backfill_local_cache``,
-        ``_persist_remote``, stage 4) to fan out independent inserts
+        stage 4 remote persist) to fan out independent inserts
         across threads so a batch that targets several remote tables
         or local cache roots doesn't pay for a head-to-tail
         serialization. ``ThreadPoolExecutor`` is used unconditionally
@@ -1876,26 +1879,6 @@ class HTTPSession(Session):
                 _insert_cache, holder, cfg, table,
                 mode=mode,
             ).fire_and_forget()
-
-    @staticmethod
-    def _persist_remote(
-        holder: "Tabular",
-        responses: list[Response],
-        mode: "Mode | None" = None,
-    ) -> None:
-        """Stage 4: bulk-insert successful responses into the remote cache."""
-        LOGGER.info(
-            "Persisting %d response(s) to remote cache %r",
-            len(responses), holder,
-        )
-        table = pa.Table.from_batches(
-            [Response.values_to_arrow_batch(responses)]
-        )
-        from yggdrasil.data.options import CastOptions
-        holder.write_arrow_batches(
-            table.to_batches(),
-            options=CastOptions(mode=mode or Mode.APPEND),
-        )
 
     def _send_many(
         self,
