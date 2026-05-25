@@ -162,6 +162,63 @@ class EnvironmentService:
             entry = self._envs.get(env_id, entry)
         return EnvironmentResponse(environment=entry)
 
+    async def clone(self, env_id: int, new_name: str | None = None) -> EnvironmentResponse:
+        """Clone an environment (copies venv directory)."""
+        with self._lock:
+            entry = self._envs.get(env_id)
+        if entry is None:
+            raise NotFoundError(f"Environment {env_id!r} not found")
+
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        clone_name = new_name or f"{entry.name}_clone"
+        clone_id = make_id(clone_name)
+        clone_path = self._envs_root / str(clone_id)
+
+        clone_entry = EnvironmentEntry(
+            id=clone_id,
+            name=clone_name,
+            python_version=entry.python_version,
+            dependencies=list(entry.dependencies),
+            path=str(clone_path),
+            status="creating",
+            created_at=now,
+            updated_at=now,
+        )
+
+        with self._lock:
+            self._envs[clone_id] = clone_entry
+            self._evict()
+
+        LOGGER.info("Cloning environment %r -> %r (name=%r)", env_id, clone_id, clone_name)
+
+        # Copy the venv directory in a threadpool
+        await self._run(self._clone_venv, env_id, clone_id, clone_path)
+
+        with self._lock:
+            clone_entry = self._envs.get(clone_id, clone_entry)
+        return EnvironmentResponse(environment=clone_entry)
+
+    def _clone_venv(self, source_id: int, dest_id: int, dest_path) -> None:
+        """Copy source venv to dest path."""
+        from pathlib import Path
+        try:
+            source_path = self._envs_root / str(source_id)
+            if source_path.exists():
+                shutil.copytree(str(source_path), str(dest_path))
+            else:
+                # Source venv missing, create a fresh one from deps
+                with self._lock:
+                    entry = self._envs.get(dest_id)
+                if entry is not None:
+                    self._build_env(dest_id, entry.python_version, list(entry.dependencies), Path(entry.path))
+                return
+
+            self._update_entry(dest_id, status="ready")
+            LOGGER.info("Cloned environment venv %r ready", dest_id)
+        except Exception as exc:
+            self._update_entry(dest_id, status="failed", error=str(exc))
+            LOGGER.error("Environment clone %r failed: %s", dest_id, exc)
+
     def get_python_path(self, env_id: int) -> str | None:
         """Return the python binary path for a given environment, or None."""
         with self._lock:
@@ -199,6 +256,18 @@ class EnvironmentService:
                     stderr=subprocess.PIPE,
                     text=True,
                 )
+
+            # Always install base packages (uv + yggdrasil from source if available)
+            from pathlib import Path as _Path
+            base_packages: list[str] = ["uv"]
+            ygg_root = _Path(__file__).resolve().parents[4]
+            if (ygg_root / "pyproject.toml").exists():
+                base_packages.append(str(ygg_root))
+            try:
+                self._pip_install(env_id, env_path, base_packages, uv=uv)
+            except subprocess.CalledProcessError:
+                # Non-fatal: base package install failure should not block env creation
+                LOGGER.warning("Base package install failed for env %r, continuing", env_id)
 
             if dependencies:
                 self._pip_install(env_id, env_path, dependencies, uv=uv)

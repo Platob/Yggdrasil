@@ -1,0 +1,312 @@
+"""NodePath — pathlib-like interface for node filesystem access.
+
+Provides a ``pathlib.Path``-like API that transparently works with
+local files or remote node filesystems via the ``/api/fs`` endpoints.
+
+Local access uses direct filesystem calls.  Remote access uses
+HTTP with streaming for large files.
+
+Usage::
+
+    from yggdrasil.node.path import NodePath
+
+    # Local node files (direct filesystem)
+    p = NodePath("data/input.csv")
+    content = p.read_text()
+    p.write_text("hello")
+    for child in p.iterdir():
+        print(child.name, child.is_dir())
+
+    # Remote node files (via HTTP)
+    remote = NodePath("data/input.csv", node_url="http://node-2:8100")
+    content = remote.read_bytes()
+    remote.write_bytes(b"data")
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import shutil
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Iterator
+
+
+class NodePath:
+    """Path-like object for node filesystem access.
+
+    When ``node_url`` is None, operates directly on the local filesystem
+    within the node's data directory.  When ``node_url`` is set, uses
+    HTTP calls to the remote node's ``/api/fs`` endpoints.
+    """
+
+    __slots__ = ("_path", "_node_url", "_root")
+
+    def __init__(
+        self,
+        path: str = "",
+        *,
+        node_url: str | None = None,
+        _root: Path | None = None,
+    ) -> None:
+        self._path = PurePosixPath(path.lstrip("/"))
+        self._node_url = node_url
+        if _root is None and node_url is None:
+            from .config import get_settings
+            self._root = get_settings().data_root / "files"
+        else:
+            self._root = _root
+
+    @property
+    def is_local(self) -> bool:
+        return self._node_url is None
+
+    @property
+    def name(self) -> str:
+        return self._path.name or ""
+
+    @property
+    def parent(self) -> NodePath:
+        return NodePath(
+            str(self._path.parent) if str(self._path) != "." else "",
+            node_url=self._node_url,
+            _root=self._root,
+        )
+
+    @property
+    def suffix(self) -> str:
+        return self._path.suffix
+
+    @property
+    def stem(self) -> str:
+        return self._path.stem
+
+    def __truediv__(self, other: str) -> NodePath:
+        return NodePath(
+            str(self._path / other),
+            node_url=self._node_url,
+            _root=self._root,
+        )
+
+    def __str__(self) -> str:
+        return str(self._path)
+
+    def __repr__(self) -> str:
+        target = self._node_url or "local"
+        return f"NodePath({str(self._path)!r}, node={target!r})"
+
+    # ── Local helpers ────────────────────────────────────────
+
+    def _local_path(self) -> Path:
+        resolved = (self._root / str(self._path)).resolve()
+        root_str = str(self._root.resolve())
+        if not str(resolved).startswith(root_str):
+            raise PermissionError("Path traversal not allowed")
+        return resolved
+
+    # ── Read operations ──────────────────────────────────────
+
+    def exists(self) -> bool:
+        if self.is_local:
+            return self._local_path().exists()
+        try:
+            self.stat()
+            return True
+        except Exception:
+            return False
+
+    def is_dir(self) -> bool:
+        if self.is_local:
+            return self._local_path().is_dir()
+        try:
+            info = self.stat()
+            return info.get("is_dir", False)
+        except Exception:
+            return False
+
+    def is_file(self) -> bool:
+        if self.is_local:
+            return self._local_path().is_file()
+        return not self.is_dir()
+
+    def stat(self) -> dict:
+        if self.is_local:
+            p = self._local_path()
+            s = p.stat()
+            return {
+                "path": str(self._path),
+                "name": p.name,
+                "is_dir": p.is_dir(),
+                "size": s.st_size,
+                "modified_at": datetime.fromtimestamp(s.st_mtime, tz=timezone.utc).isoformat(),
+                "created_at": datetime.fromtimestamp(s.st_ctime, tz=timezone.utc).isoformat(),
+            }
+        return _get(f"{self._node_url}/api/fs/stat?path={_quote(str(self._path))}")
+
+    def read_text(self, encoding: str = "utf-8") -> str:
+        if self.is_local:
+            return self._local_path().read_text(encoding=encoding)
+        resp = _get(f"{self._node_url}/api/fs/read?path={_quote(str(self._path))}")
+        content = resp.get("content", "")
+        if resp.get("encoding") == "base64":
+            return base64.b64decode(content).decode(encoding)
+        return content
+
+    def read_bytes(self) -> bytes:
+        if self.is_local:
+            return self._local_path().read_bytes()
+        resp = _get(f"{self._node_url}/api/fs/read?path={_quote(str(self._path))}")
+        content = resp.get("content", "")
+        if resp.get("encoding") == "base64":
+            return base64.b64decode(content)
+        return content.encode()
+
+    def iterdir(self) -> Iterator[NodePath]:
+        if self.is_local:
+            for child in sorted(self._local_path().iterdir()):
+                yield NodePath(
+                    str(self._path / child.name),
+                    node_url=self._node_url,
+                    _root=self._root,
+                )
+            return
+        resp = _get(f"{self._node_url}/api/fs/ls?path={_quote(str(self._path))}")
+        for entry in resp.get("entries", []):
+            yield NodePath(
+                entry["path"],
+                node_url=self._node_url,
+                _root=self._root,
+            )
+
+    # ── Write operations ─────────────────────────────────────
+
+    def write_text(self, content: str, encoding: str = "utf-8") -> None:
+        if self.is_local:
+            p = self._local_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding=encoding)
+            return
+        _post(f"{self._node_url}/api/fs/write", {
+            "path": str(self._path),
+            "content": content,
+            "encoding": "utf-8",
+            "mkdir": True,
+        })
+
+    def write_bytes(self, data: bytes) -> None:
+        if self.is_local:
+            p = self._local_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            return
+        _post(f"{self._node_url}/api/fs/write", {
+            "path": str(self._path),
+            "content": base64.b64encode(data).decode(),
+            "encoding": "base64",
+            "mkdir": True,
+        })
+
+    def mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+        if self.is_local:
+            self._local_path().mkdir(parents=parents, exist_ok=exist_ok)
+            return
+        _post(f"{self._node_url}/api/fs/mkdir?path={_quote(str(self._path))}", {})
+
+    def unlink(self, missing_ok: bool = False) -> None:
+        if self.is_local:
+            p = self._local_path()
+            if p.is_dir():
+                shutil.rmtree(p)
+            elif p.exists():
+                p.unlink()
+            elif not missing_ok:
+                raise FileNotFoundError(str(self._path))
+            return
+        try:
+            _delete(f"{self._node_url}/api/fs/delete?path={_quote(str(self._path))}")
+        except Exception:
+            if not missing_ok:
+                raise
+
+    def rename(self, target: str) -> NodePath:
+        if self.is_local:
+            src = self._local_path()
+            dst = (self._root / target.lstrip("/")).resolve()
+            src.rename(dst)
+            return NodePath(target, node_url=self._node_url, _root=self._root)
+        _post(f"{self._node_url}/api/fs/move", {
+            "source": str(self._path),
+            "destination": target,
+        })
+        return NodePath(target, node_url=self._node_url, _root=self._root)
+
+    # ── Streaming ────────────────────────────────────────────
+
+    def stream_read(self, chunk_size: int = 65536) -> Iterator[bytes]:
+        if self.is_local:
+            with open(self._local_path(), "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+            return
+        req = urllib.request.Request(
+            f"{self._node_url}/api/fs/stream?path={_quote(str(self._path))}",
+            headers={"Accept": "application/octet-stream"},
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+
+    # ── Copy between nodes ───────────────────────────────────
+
+    def copy_to(self, target: NodePath) -> NodePath:
+        """Copy this file/directory to another NodePath (possibly on a different node)."""
+        if self.is_dir():
+            target.mkdir()
+            for child in self.iterdir():
+                child.copy_to(target / child.name)
+            return target
+
+        if self.is_local and target.is_local:
+            shutil.copy2(str(self._local_path()), str(target._local_path()))
+        else:
+            data = self.read_bytes()
+            target.write_bytes(data)
+        return target
+
+
+# ── HTTP helpers ─────────────────────────────────────────────
+
+def _quote(s: str) -> str:
+    from urllib.parse import quote
+    return quote(s, safe="")
+
+
+def _get(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def _post(url: str, data: dict) -> dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(data).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read())
+
+
+def _delete(url: str) -> None:
+    req = urllib.request.Request(url, method="DELETE")
+    with urllib.request.urlopen(req, timeout=30):
+        pass

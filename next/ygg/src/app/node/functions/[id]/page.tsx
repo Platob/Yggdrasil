@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState, useRef, use } from "react";
+import { useEffect, useState, useRef, use, useCallback } from "react";
 import { node as api, type FunctionEntry, type RunEntry } from "@/lib/api";
+import { formatRelative, formatDuration } from "@/lib/time";
 import Link from "next/link";
 
-// ── Demo data ────────────────────────────────────────────────
+// -- Demo data --
 const DEMO_FUNCTION: FunctionEntry = {
   id: 2,
   name: "fetch_metrics",
@@ -18,6 +19,9 @@ const DEMO_FUNCTION: FunctionEntry = {
   created_at: "2025-05-18T08:30:00Z",
   updated_at: "2025-05-22T14:00:00Z",
   run_count: 156,
+  deleted_at: null,
+  last_used_at: "2025-05-24T10:00:00Z",
+  state: "ready",
 };
 
 const DEMO_RUNS: RunEntry[] = [
@@ -34,6 +38,9 @@ const DEMO_RUNS: RunEntry[] = [
     stderr: null,
     result: { cpu_percent: 23.5, ram_percent: 45.2 },
     node_id: "ygg-node-alpha",
+    max_memory_mb: 512,
+    max_cpu_percent: 80,
+    timeout: 30,
   },
   {
     id: 2,
@@ -48,6 +55,9 @@ const DEMO_RUNS: RunEntry[] = [
     stderr: null,
     result: { cpu_percent: 18.2, ram_percent: 42.8 },
     node_id: "ygg-node-alpha",
+    max_memory_mb: null,
+    max_cpu_percent: null,
+    timeout: null,
   },
   {
     id: 3,
@@ -62,6 +72,9 @@ const DEMO_RUNS: RunEntry[] = [
     stderr: "ModuleNotFoundError: No module named 'psutil'",
     result: null,
     node_id: "ygg-node-alpha",
+    max_memory_mb: null,
+    max_cpu_percent: null,
+    timeout: null,
   },
 ];
 
@@ -83,6 +96,50 @@ function statusDotClass(status: string): string {
   }
 }
 
+// -- SSE Log Streaming for running functions --
+function RunningLogs({ runId, onComplete }: { runId: number; onComplete: () => void }) {
+  const [logs, setLogs] = useState<string[]>([]);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const es = new EventSource(`/api/node/run/${runId}/logs`);
+    es.onmessage = (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.type === "stdout" || event.type === "stderr") {
+          setLogs((prev) => [...prev, event.line]);
+        } else if (event.type === "complete") {
+          es.close();
+          onComplete();
+        }
+      } catch {
+        setLogs((prev) => [...prev, e.data]);
+      }
+    };
+    es.onerror = () => {
+      es.close();
+    };
+    return () => es.close();
+  }, [runId, onComplete]);
+
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
+
+  return (
+    <div className="code-block p-4 max-h-64 overflow-y-auto">
+      <div className="flex items-center gap-2 mb-2">
+        <div className="w-2 h-2 rounded-full bg-warning animate-pulse" />
+        <span className="text-[10px] uppercase tracking-wider text-warning">Live Streaming</span>
+      </div>
+      <pre className="text-xs whitespace-pre-wrap font-mono">
+        {logs.length > 0 ? logs.join("\n") : "Waiting for output..."}
+      </pre>
+      <div ref={logsEndRef} />
+    </div>
+  );
+}
+
 export default function FunctionDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const numericId = parseInt(id, 10);
@@ -92,19 +149,11 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [expandedRun, setExpandedRun] = useState<number | null>(null);
-  const [streamingLogs, setStreamingLogs] = useState<string>("");
   const [streamingRunId, setStreamingRunId] = useState<number | null>(null);
-  const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     loadData();
   }, [numericId]);
-
-  useEffect(() => {
-    if (logsEndRef.current) {
-      logsEndRef.current.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [streamingLogs]);
 
   async function loadData() {
     setLoading(true);
@@ -124,49 +173,28 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
     setLoading(false);
   }
 
+  const refreshRuns = useCallback(async () => {
+    try {
+      const runsData = await api.listFunctionRuns(numericId);
+      setRuns(runsData.runs);
+    } catch {
+      // ignore
+    }
+    setStreamingRunId(null);
+  }, [numericId]);
+
   async function handleRun() {
     setRunning(true);
-    setStreamingLogs("");
-    setStreamingRunId(null);
     try {
       const data = await api.runFunction(numericId);
       const runId = data.run.id;
-      setStreamingRunId(runId);
-
-      // Try SSE streaming for logs
-      try {
-        const eventSource = new EventSource(`/api/node/run/${runId}/logs`);
-        eventSource.onmessage = (event) => {
-          try {
-            const logData = JSON.parse(event.data);
-            if (logData.line) {
-              setStreamingLogs((prev) => prev + logData.line + "\n");
-            }
-            if (logData.done) {
-              eventSource.close();
-              loadData();
-            }
-          } catch {
-            setStreamingLogs((prev) => prev + event.data + "\n");
-          }
-        };
-        eventSource.onerror = () => {
-          eventSource.close();
-          // If SSE fails, just show the result from the run response
-          if (data.run.stdout) {
-            setStreamingLogs(data.run.stdout);
-          }
-          loadData();
-        };
-      } catch {
-        // SSE not available, show result directly
-        if (data.run.stdout) {
-          setStreamingLogs(data.run.stdout);
-        }
-        loadData();
+      if (data.run.status === "running") {
+        setStreamingRunId(runId);
+      } else {
+        await loadData();
       }
     } catch (e) {
-      setStreamingLogs(`Error: ${e}`);
+      setError(`Run failed: ${e}`);
     }
     setRunning(false);
   }
@@ -260,16 +288,11 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
         <pre className="code-block p-4 overflow-x-auto whitespace-pre-wrap">{fn.code}</pre>
       </div>
 
-      {/* Streaming Logs */}
-      {(streamingLogs || streamingRunId) && (
+      {/* Streaming Logs for active run */}
+      {streamingRunId && (
         <div>
-          <h2 className="text-xs font-medium text-muted uppercase tracking-wider mb-2">
-            {running ? "Live Output" : "Last Run Output"}
-          </h2>
-          <div className="code-block p-4 max-h-64 overflow-y-auto">
-            <pre className="text-xs whitespace-pre-wrap">{streamingLogs || "Waiting for output..."}</pre>
-            <div ref={logsEndRef} />
-          </div>
+          <h2 className="text-xs font-medium text-muted uppercase tracking-wider mb-2">Live Output</h2>
+          <RunningLogs runId={streamingRunId} onComplete={refreshRuns} />
         </div>
       )}
 
@@ -291,20 +314,18 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
                   <div className={statusDotClass(run.status)} />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-3">
-                      <span className="font-mono text-xs text-foreground-dim truncate">{run.id}</span>
                       <span
                         className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
                         style={{ color: statusColor(run.status), background: `color-mix(in srgb, ${statusColor(run.status)} 15%, transparent)` }}
                       >
                         {run.status}
                       </span>
+                      <span className="font-mono text-xs text-foreground-dim">#{run.id}</span>
                     </div>
                   </div>
-                  <div className="text-right text-xs text-muted shrink-0">
-                    {run.duration != null && <span className="font-mono">{run.duration.toFixed(1)}s</span>}
-                    {run.started_at && (
-                      <div className="text-[10px] mt-0.5">{new Date(run.started_at).toLocaleString()}</div>
-                    )}
+                  <div className="text-right text-xs text-muted shrink-0 space-y-0.5">
+                    <div className="font-mono">{formatDuration(run.duration)}</div>
+                    <div className="text-[10px]">{formatRelative(run.started_at)}</div>
                   </div>
                   <svg
                     width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -316,23 +337,71 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
                   </svg>
                 </button>
 
-                {expandedRun === run.id && (
+                {/* SSE for running runs */}
+                {run.status === "running" && expandedRun === run.id && (
+                  <div className="border-t border-border px-4 pb-4 pt-3">
+                    <RunningLogs runId={run.id} onComplete={refreshRuns} />
+                  </div>
+                )}
+
+                {/* Expanded details for non-running runs */}
+                {expandedRun === run.id && run.status !== "running" && (
                   <div className="border-t border-border px-4 pb-4 pt-3 space-y-3">
+                    {/* stdout */}
                     {run.stdout && (
                       <div>
                         <span className="text-[10px] uppercase tracking-wider text-muted">stdout</span>
-                        <pre className="code-block p-3 mt-1 text-xs overflow-x-auto whitespace-pre-wrap">{run.stdout}</pre>
+                        <pre className="bg-[#0d1117] border border-border rounded-lg p-3 mt-1 text-xs overflow-x-auto whitespace-pre-wrap font-mono text-foreground-dim">{run.stdout}</pre>
                       </div>
                     )}
+
+                    {/* stderr */}
                     {run.stderr && (
                       <div>
                         <span className="text-[10px] uppercase tracking-wider text-destructive">stderr</span>
-                        <pre className="code-block p-3 mt-1 text-xs overflow-x-auto whitespace-pre-wrap text-destructive/80">{run.stderr}</pre>
+                        <pre className="bg-[#1a0a0a] border border-destructive/20 rounded-lg p-3 mt-1 text-xs overflow-x-auto whitespace-pre-wrap font-mono text-destructive/80">{run.stderr}</pre>
                       </div>
                     )}
-                    {!run.stdout && !run.stderr && (
+
+                    {/* result */}
+                    {run.result != null && (
+                      <div>
+                        <span className="text-[10px] uppercase tracking-wider text-muted">result</span>
+                        <pre className="code-block p-3 mt-1 text-xs overflow-x-auto whitespace-pre-wrap font-mono">{JSON.stringify(run.result, null, 2)}</pre>
+                      </div>
+                    )}
+
+                    {/* error for failed */}
+                    {(run.status === "failed" || run.status === "error") && !run.stderr && (
+                      <div>
+                        <span className="text-[10px] uppercase tracking-wider text-destructive">error</span>
+                        <p className="text-xs text-destructive mt-1">Run failed with exit code {run.returncode ?? "unknown"}</p>
+                      </div>
+                    )}
+
+                    {/* Resource limits */}
+                    {(run.max_memory_mb != null || run.max_cpu_percent != null || run.timeout != null) && (
+                      <div>
+                        <span className="text-[10px] uppercase tracking-wider text-muted">resource limits</span>
+                        <div className="flex gap-4 mt-1 text-xs">
+                          {run.max_memory_mb != null && (
+                            <span className="font-mono text-foreground-dim">Memory: {run.max_memory_mb}MB</span>
+                          )}
+                          {run.max_cpu_percent != null && (
+                            <span className="font-mono text-foreground-dim">CPU: {run.max_cpu_percent}%</span>
+                          )}
+                          {run.timeout != null && (
+                            <span className="font-mono text-foreground-dim">Timeout: {run.timeout}s</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* No output */}
+                    {!run.stdout && !run.stderr && run.result == null && (
                       <p className="text-xs text-muted">No output captured.</p>
                     )}
+
                     <div className="flex gap-4 text-[10px] text-muted pt-1">
                       <span>Node: <span className="font-mono">{run.node_id}</span></span>
                       {run.returncode != null && <span>Exit code: <span className="font-mono">{run.returncode}</span></span>}

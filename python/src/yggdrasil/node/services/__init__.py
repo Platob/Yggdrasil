@@ -4,6 +4,7 @@ from .dag import DagService
 from .discovery import DiscoveryService
 from .env import EnvService
 from .environment import EnvironmentService
+from .filesystem import FilesystemService
 from .function import FunctionService
 from .job import JobService
 from .messenger import MessengerService
@@ -17,6 +18,7 @@ __all__ = [
     "DiscoveryService",
     "EnvService",
     "EnvironmentService",
+    "FilesystemService",
     "FunctionService",
     "JobService",
     "MessengerService",

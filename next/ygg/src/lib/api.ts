@@ -95,6 +95,16 @@ export interface CachedDashboard {
   cachedAt: string;
 }
 
+// -- Filesystem --
+export interface FileInfo {
+  path: string;
+  name: string;
+  is_dir: boolean;
+  size: number;
+  modified_at: string;
+  created_at: string;
+}
+
 // -- Functions --
 export interface FunctionEntry {
   id: number;
@@ -109,6 +119,9 @@ export interface FunctionEntry {
   created_at: string;
   updated_at: string;
   run_count: number;
+  deleted_at: string | null;
+  last_used_at: string | null;
+  state: string;
 }
 
 // -- Environments --
@@ -122,6 +135,9 @@ export interface EnvironmentEntry {
   created_at: string;
   updated_at: string;
   error: string | null;
+  deleted_at: string | null;
+  last_used_at: string | null;
+  state: string;
 }
 
 // -- Runs --
@@ -138,6 +154,9 @@ export interface RunEntry {
   stderr: string | null;
   result: unknown;
   node_id: string;
+  max_memory_mb: number | null;
+  max_cpu_percent: number | null;
+  timeout: number | null;
 }
 
 // -- DAGs --
@@ -304,6 +323,17 @@ export const node = {
   runDag: (id: number) => fetchJSON<{ run: DagRunEntry }>(`${NODE_BASE}/dag/${id}/run`, { method: "POST" }),
   listDagRuns: (id: number) => fetchJSON<{ runs: DagRunEntry[] }>(`${NODE_BASE}/dag/${id}/run`),
   getDagRun: (dagId: number, runId: number) => fetchJSON<{ run: DagRunEntry }>(`${NODE_BASE}/dag/${dagId}/run/${runId}`),
+
+  // Filesystem
+  listDir: (path?: string) => fetchJSON<{ path: string; entries: FileInfo[] }>(`${NODE_BASE}/fs/ls?path=${encodeURIComponent(path || "")}`),
+  readFile: (path: string) => fetchJSON<{ path: string; content: string; encoding: string }>(`${NODE_BASE}/fs/read?path=${encodeURIComponent(path)}`),
+  writeFile: (path: string, content: string) => fetchJSON<{ path: string }>(`${NODE_BASE}/fs/write`, { method: "POST", body: JSON.stringify({ path, content }) }),
+  deleteFile: (path: string) => fetchJSON<void>(`${NODE_BASE}/fs/delete?path=${encodeURIComponent(path)}`, { method: "DELETE" }),
+  mkdir: (path: string) => fetchJSON<void>(`${NODE_BASE}/fs/mkdir?path=${encodeURIComponent(path)}`, { method: "POST" }),
+
+  // Clone
+  cloneFunction: (id: number, name?: string) => fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}/clone`, { method: "POST", body: JSON.stringify({ name }) }),
+  cloneEnvironment: (id: number, name?: string) => fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}/clone`, { method: "POST", body: JSON.stringify({ name }) }),
 };
 
 // =============================================================================

@@ -26,6 +26,8 @@ class EnvironmentEntry(StrictModel):
     created_at: str
     updated_at: str
     error: str | None = None
+    deleted_at: str | None = None
+    last_used_at: str | None = None
 
 
 class EnvironmentResponse(StrictModel):
@@ -35,6 +37,10 @@ class EnvironmentResponse(StrictModel):
 class EnvironmentListResponse(StrictModel):
     node_id: str
     environments: list[EnvironmentEntry]
+
+
+class EnvironmentCloneRequest(StrictModel):
+    name: str | None = None
 
 
 class InstallRequest(StrictModel):

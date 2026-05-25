@@ -46,6 +46,8 @@ class DagEntry(StrictModel):
     created_at: str
     updated_at: str
     run_count: int = 0
+    deleted_at: str | None = None
+    last_used_at: str | None = None
 
 
 class DagResponse(StrictModel):

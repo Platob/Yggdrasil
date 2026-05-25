@@ -12,6 +12,7 @@ from .services.function import FunctionService
 from .services.job import JobService
 from .services.messenger import MessengerService
 from .services.python import PythonExecService
+from .services.filesystem import FilesystemService
 from .services.run import RunService
 
 
@@ -57,3 +58,7 @@ def get_run_service(request: Request) -> RunService:
 
 def get_dag_service(request: Request) -> DagService:
     return request.app.state.dag_service
+
+
+def get_filesystem_service(request: Request) -> FilesystemService:
+    return request.app.state.filesystem_service

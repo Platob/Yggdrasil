@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 
 from ..deps import get_function_service, get_run_service
 from ..schemas.function import (
+    FunctionCloneRequest,
     FunctionCreate,
     FunctionListResponse,
     FunctionResponse,
@@ -57,6 +58,18 @@ async def delete_function(
     service: FunctionService = Depends(get_function_service),
 ) -> FunctionResponse:
     return await service.delete(func_id)
+
+
+# -- clone ------------------------------------------------------------------
+
+@router.post("/{func_id}/clone", response_model=FunctionResponse)
+async def clone_function(
+    func_id: int,
+    req: FunctionCloneRequest | None = None,
+    service: FunctionService = Depends(get_function_service),
+) -> FunctionResponse:
+    new_name = req.name if req else None
+    return await service.clone(func_id, new_name=new_name)
 
 
 # -- run sub-resource (per function) ----------------------------------------

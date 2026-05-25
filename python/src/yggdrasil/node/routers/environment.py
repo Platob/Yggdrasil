@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 
 from ..deps import get_environment_service
 from ..schemas.environment import (
+    EnvironmentCloneRequest,
     EnvironmentCreate,
     EnvironmentListResponse,
     EnvironmentResponse,
@@ -54,6 +55,16 @@ async def delete_environment(
     service: EnvironmentService = Depends(get_environment_service),
 ) -> EnvironmentResponse:
     return await service.delete(env_id)
+
+
+@router.post("/{env_id}/clone", response_model=EnvironmentResponse)
+async def clone_environment(
+    env_id: int,
+    req: EnvironmentCloneRequest | None = None,
+    service: EnvironmentService = Depends(get_environment_service),
+) -> EnvironmentResponse:
+    new_name = req.name if req else None
+    return await service.clone(env_id, new_name=new_name)
 
 
 @router.post("/{env_id}/install", response_model=EnvironmentResponse)

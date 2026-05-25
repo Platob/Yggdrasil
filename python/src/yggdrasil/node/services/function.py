@@ -129,13 +129,45 @@ class FunctionService:
         LOGGER.info("Deleted function %r", func_id)
         return FunctionResponse(function=entry)
 
+    async def clone(self, func_id: int, new_name: str | None = None) -> FunctionResponse:
+        """Clone a function with a new ID and name."""
+        with self._lock:
+            entry = self._functions.get(func_id)
+        if entry is None:
+            raise NotFoundError(f"Function {func_id!r} not found")
+
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        clone_name = new_name or f"{entry.name}_clone"
+        clone_id = make_id(clone_name)
+
+        cloned = FunctionEntry(
+            id=clone_id,
+            name=clone_name,
+            language=entry.language,
+            code=entry.code,
+            description=entry.description,
+            python_version=entry.python_version,
+            dependencies=list(entry.dependencies),
+            environment_id=entry.environment_id,
+            created_at=now,
+            updated_at=now,
+        )
+
+        with self._lock:
+            self._functions[clone_id] = cloned
+            self._evict()
+
+        LOGGER.info("Cloned function %r -> %r (name=%r)", func_id, clone_id, clone_name)
+        return FunctionResponse(function=cloned)
+
     def increment_run_count(self, func_id: int) -> None:
-        """Bump the run counter for a function (called by RunService)."""
+        """Bump the run counter and touch last_used_at (called by RunService)."""
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         with self._lock:
             entry = self._functions.get(func_id)
             if entry is not None:
                 self._functions[func_id] = entry.model_copy(
-                    update={"run_count": entry.run_count + 1}
+                    update={"run_count": entry.run_count + 1, "last_used_at": now}
                 )
 
     # -- internals ----------------------------------------------------------

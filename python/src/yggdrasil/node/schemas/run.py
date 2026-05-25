@@ -11,6 +11,9 @@ class RunCreate(StrictModel):
     function_id: int
     environment_id: int | None = None
     args: dict[str, Any] = Field(default_factory=dict)
+    max_memory_mb: int | None = None
+    max_cpu_percent: float | None = None
+    timeout: float | None = None
 
 
 class RunEntry(StrictModel):
@@ -26,6 +29,9 @@ class RunEntry(StrictModel):
     stderr: str | None = None
     result: Any = None
     node_id: str = ""
+    max_memory_mb: int | None = None
+    max_cpu_percent: float | None = None
+    timeout: float | None = None
 
 
 class RunResponse(StrictModel):

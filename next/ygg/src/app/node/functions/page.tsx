@@ -18,6 +18,7 @@ const DEMO_FUNCTIONS: FunctionEntry[] = [
     creator: "system",
     created_at: "2025-05-20T10:00:00Z",
     updated_at: "2025-05-20T10:00:00Z",
+    deleted_at: null, last_used_at: null, state: "ready",
     run_count: 42,
   },
   {
@@ -32,6 +33,7 @@ const DEMO_FUNCTIONS: FunctionEntry[] = [
     creator: "admin",
     created_at: "2025-05-18T08:30:00Z",
     updated_at: "2025-05-22T14:00:00Z",
+    deleted_at: null, last_used_at: null, state: "ready",
     run_count: 156,
   },
   {
@@ -46,6 +48,7 @@ const DEMO_FUNCTIONS: FunctionEntry[] = [
     creator: "admin",
     created_at: "2025-05-15T12:00:00Z",
     updated_at: "2025-05-23T09:15:00Z",
+    deleted_at: null, last_used_at: null, state: "ready",
     run_count: 28,
   },
   {
@@ -60,6 +63,7 @@ const DEMO_FUNCTIONS: FunctionEntry[] = [
     creator: "system",
     created_at: "2025-05-10T16:45:00Z",
     updated_at: "2025-05-10T16:45:00Z",
+    deleted_at: null, last_used_at: null, state: "ready",
     run_count: 312,
   },
 ];

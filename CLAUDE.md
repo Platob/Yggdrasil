@@ -23,6 +23,7 @@ python/src/yggdrasil/
     geo.py              IP geolocation
     ids.py              Int64 ID generation (xxhash)
     fn.py               @function decorator framework
+    path.py             NodePath — pathlib-like local/remote filesystem
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
   databricks/           Databricks SDK integrations

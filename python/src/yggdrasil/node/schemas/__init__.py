@@ -30,6 +30,7 @@ from .messenger import (
     ChannelResponse,
 )
 from .function import (
+    FunctionCloneRequest,
     FunctionCreate,
     FunctionUpdate,
     FunctionEntry,
@@ -37,6 +38,7 @@ from .function import (
     FunctionListResponse,
 )
 from .environment import (
+    EnvironmentCloneRequest,
     EnvironmentCreate,
     EnvironmentUpdate,
     EnvironmentEntry,
@@ -49,6 +51,13 @@ from .run import (
     RunEntry as FunctionRunEntry,
     RunResponse as FunctionRunResponse,
     RunListResponse as FunctionRunListResponse,
+)
+from .filesystem import (
+    DirectoryListing,
+    FileContent,
+    FileInfo,
+    FileMoveRequest,
+    FileWriteRequest,
 )
 
 __all__ = [
@@ -94,4 +103,11 @@ __all__ = [
     "FunctionRunEntry",
     "FunctionRunResponse",
     "FunctionRunListResponse",
+    "FunctionCloneRequest",
+    "EnvironmentCloneRequest",
+    "DirectoryListing",
+    "FileContent",
+    "FileInfo",
+    "FileMoveRequest",
+    "FileWriteRequest",
 ]

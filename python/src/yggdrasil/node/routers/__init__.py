@@ -4,6 +4,7 @@ from .dag import router as dag_router
 from .discovery import router as discovery_router
 from .env import router as env_router
 from .environment import router as environment_router
+from .filesystem import router as filesystem_router
 from .function import router as function_router
 from .job import router as job_router
 from .messenger import router as messenger_router
@@ -17,6 +18,7 @@ __all__ = [
     "discovery_router",
     "env_router",
     "environment_router",
+    "filesystem_router",
     "function_router",
     "job_router",
     "messenger_router",

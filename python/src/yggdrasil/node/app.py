@@ -14,6 +14,7 @@ from .routers import (
     discovery_router,
     env_router,
     environment_router,
+    filesystem_router,
     function_router,
     job_router,
     messenger_router,
@@ -28,6 +29,7 @@ from .services import (
     DiscoveryService,
     EnvService,
     EnvironmentService,
+    FilesystemService,
     FunctionService,
     JobService,
     MessengerService,
@@ -70,6 +72,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         environment_service=app.state.environment_service,
         run_service=app.state.run_service,
     )
+    app.state.filesystem_service = FilesystemService(settings)
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -112,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(run_router, prefix=f"{prefix}/run")
     app.include_router(monitor_router, prefix=f"{prefix}/monitor")
     app.include_router(dag_router, prefix=f"{prefix}/dag")
+    app.include_router(filesystem_router, prefix=f"{prefix}/fs")
 
     return app
 

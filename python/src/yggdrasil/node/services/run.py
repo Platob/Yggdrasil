@@ -4,6 +4,8 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import platform
+import resource as resource_mod
 import subprocess
 import sys
 import tempfile
@@ -70,6 +72,9 @@ class RunService:
             status="pending",
             started_at=now,
             node_id=self.settings.node_id,
+            max_memory_mb=req.max_memory_mb,
+            max_cpu_percent=req.max_cpu_percent,
+            timeout=req.timeout,
         )
 
         with self._lock:
@@ -78,9 +83,13 @@ class RunService:
 
         LOGGER.info("Triggering run %r for function %r", run_id, req.function_id)
 
+        # Determine effective timeout: explicit > settings default
+        effective_timeout = req.timeout if req.timeout is not None else self.settings.max_python_timeout
+
         # Execute in threadpool
         result = await self._run(
             self._execute, run_id, function, env_python, req.args,
+            effective_timeout, req.max_memory_mb,
         )
 
         # Bump function run counter
@@ -149,12 +158,27 @@ class RunService:
 
     # -- internals ----------------------------------------------------------
 
+    def _make_preexec_fn(self, max_memory_mb: int | None):
+        """Build a preexec_fn that sets resource limits in the child process (Linux only)."""
+        if max_memory_mb is None or platform.system() != "Linux":
+            return None
+
+        memory_bytes = max_memory_mb * 1024 * 1024
+
+        def _set_limits():
+            # RLIMIT_AS = virtual memory limit
+            resource_mod.setrlimit(resource_mod.RLIMIT_AS, (memory_bytes, memory_bytes))
+
+        return _set_limits
+
     def _execute(
         self,
         run_id: int,
         function: FunctionEntry,
         env_python: str | None,
         args: dict[str, Any],
+        timeout: float,
+        max_memory_mb: int | None,
     ) -> RunEntry:
         self._update_entry(run_id, status="running")
 
@@ -173,12 +197,15 @@ class RunService:
             tmp.flush()
             tmp.close()
 
+            preexec_fn = self._make_preexec_fn(max_memory_mb)
+
             proc = subprocess.run(
                 [python_bin, tmp.name],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=self.settings.max_python_timeout,
+                timeout=timeout,
+                preexec_fn=preexec_fn,
             )
 
             duration = round(time.monotonic() - t0, 3)
@@ -204,9 +231,9 @@ class RunService:
                 status="failed",
                 completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
                 duration=duration,
-                stderr=f"Timed out after {self.settings.max_python_timeout:.0f}s",
+                stderr=f"Timed out after {timeout:.0f}s",
             )
-            LOGGER.error("Run %r timed out after %.0fs", run_id, self.settings.max_python_timeout)
+            LOGGER.error("Run %r timed out after %.0fs", run_id, timeout)
             return entry
 
         except Exception as exc:

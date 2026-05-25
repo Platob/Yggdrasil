@@ -16,6 +16,9 @@ const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
     created_at: "2025-05-15T10:00:00Z",
     updated_at: "2025-05-22T14:00:00Z",
     error: null,
+    deleted_at: null,
+    last_used_at: null,
+    state: "ready",
   },
   {
     id: 2,
@@ -27,6 +30,9 @@ const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
     created_at: "2025-05-12T08:00:00Z",
     updated_at: "2025-05-20T16:30:00Z",
     error: null,
+    deleted_at: null,
+    last_used_at: null,
+    state: "ready",
   },
   {
     id: 3,
@@ -38,6 +44,9 @@ const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
     created_at: "2025-05-24T12:00:00Z",
     updated_at: "2025-05-24T12:00:00Z",
     error: null,
+    deleted_at: null,
+    last_used_at: null,
+    state: "ready",
   },
   {
     id: 4,
@@ -49,6 +58,9 @@ const DEMO_ENVIRONMENTS: EnvironmentEntry[] = [
     created_at: "2025-05-23T09:00:00Z",
     updated_at: "2025-05-23T09:01:00Z",
     error: "pip install failed: No matching distribution found for nonexistent-package-xyz",
+    deleted_at: null,
+    last_used_at: null,
+    state: "failed",
   },
 ];
 

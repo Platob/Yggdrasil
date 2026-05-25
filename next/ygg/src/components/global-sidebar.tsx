@@ -102,6 +102,11 @@ const Icon = {
       <line x1="7.5" y1="7.5" x2="10.5" y2="16.5"/><line x1="16.5" y1="7.5" x2="13.5" y2="16.5"/>
     </svg>
   ),
+  file: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+    </svg>
+  ),
 };
 
 // ── Service definitions ────────────────────────────────────
@@ -116,6 +121,7 @@ const SERVICES: ServiceSection[] = [
       { href: "/node/functions", label: "Functions", icon: Icon.code },
       { href: "/node/environments", label: "Environments", icon: Icon.box },
       { href: "/node/dags", label: "DAGs", icon: Icon.dag },
+      { href: "/node/files", label: "Files", icon: Icon.file },
       { href: "/node/network", label: "Network", icon: Icon.globe },
       { href: "/node/execute", label: "Execute", icon: Icon.terminal },
     ],

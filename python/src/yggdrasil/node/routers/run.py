@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from ..deps import get_run_service
-from ..schemas.run import RunListResponse, RunResponse
+from ..schemas.run import RunCreate, RunListResponse, RunResponse
 from ..services.run import RunService
 
 router = APIRouter(tags=["run"])
@@ -17,6 +17,14 @@ async def list_runs(
     service: RunService = Depends(get_run_service),
 ) -> RunListResponse:
     return await service.list()
+
+
+@router.post("", response_model=RunResponse)
+async def create_run(
+    req: RunCreate,
+    service: RunService = Depends(get_run_service),
+) -> RunResponse:
+    return await service.create(req)
 
 
 @router.get("/{run_id}", response_model=RunResponse)
