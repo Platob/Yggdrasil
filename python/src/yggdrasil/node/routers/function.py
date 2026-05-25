@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from ..deps import get_function_service, get_run_service
+from ..middleware import cached_response, invalidate_response_cache
 from ..schemas.function import (
     FunctionCloneRequest,
     FunctionCreate,
@@ -20,6 +21,7 @@ router = APIRouter(tags=["function"])
 # -- function CRUD ---------------------------------------------------------
 
 @router.get("", response_model=FunctionListResponse)
+@cached_response(ttl_seconds=3.0)
 async def list_functions(
     service: FunctionService = Depends(get_function_service),
 ) -> FunctionListResponse:
@@ -31,7 +33,9 @@ async def create_function(
     req: FunctionCreate,
     service: FunctionService = Depends(get_function_service),
 ) -> FunctionResponse:
-    return await service.create(req)
+    result = await service.create(req)
+    invalidate_response_cache()
+    return result
 
 
 @router.get("/{func_id}", response_model=FunctionResponse)
@@ -49,7 +53,9 @@ async def update_function(
     req: FunctionUpdate,
     service: FunctionService = Depends(get_function_service),
 ) -> FunctionResponse:
-    return await service.update(func_id, req)
+    result = await service.update(func_id, req)
+    invalidate_response_cache()
+    return result
 
 
 @router.delete("/{func_id}", response_model=FunctionResponse)
@@ -57,7 +63,9 @@ async def delete_function(
     func_id: int,
     service: FunctionService = Depends(get_function_service),
 ) -> FunctionResponse:
-    return await service.delete(func_id)
+    result = await service.delete(func_id)
+    invalidate_response_cache()
+    return result
 
 
 # -- clone ------------------------------------------------------------------

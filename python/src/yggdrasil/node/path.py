@@ -1,4 +1,4 @@
-"""NodePath — pathlib-like interface for node filesystem access.
+"""NodePath ��� pathlib-like interface for node filesystem access.
 
 Provides a ``pathlib.Path``-like API that transparently works with
 local files or remote node filesystems via the ``/api/fs`` endpoints.
@@ -32,6 +32,29 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Iterator
+from urllib.parse import urlparse
+
+
+def _is_local_url(url: str) -> bool:
+    """Check if a URL points to the local node.
+
+    Compares the host and port against known localhost addresses and the
+    configured YGG_NODE_PORT. When a "remote" URL actually points back to
+    this node, we can skip HTTP and use direct filesystem access instead.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port
+        # If no explicit port in URL, it's not targeting our node port
+        if port is None:
+            return False
+        local_port = int(os.environ.get("YGG_NODE_PORT", "8100"))
+        if port != local_port:
+            return False
+        return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+    except (ValueError, TypeError):
+        return False
 
 
 class NodePath:
@@ -52,6 +75,10 @@ class NodePath:
         _root: Path | None = None,
     ) -> None:
         self._path = PurePosixPath(path.lstrip("/"))
+        # Optimize: if node_url points to localhost, treat as local access
+        # to skip unnecessary HTTP round-trips.
+        if node_url and _is_local_url(node_url):
+            node_url = None
         self._node_url = node_url
         if _root is None and node_url is None:
             from .config import get_settings

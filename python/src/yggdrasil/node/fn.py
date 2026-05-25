@@ -260,7 +260,14 @@ class FunctionRun:
             iteration += 1
 
     def _poll(self) -> None:
-        """Fetch current run state from the node API."""
+        """Fetch current run state from the node API.
+
+        Optimization: if the run has already reached a terminal state,
+        skip the network call entirely -- the result cannot change.
+        """
+        if self._state.is_done:
+            return  # already settled, skip network call
+
         from yggdrasil.data.enums.state import State
 
         try:

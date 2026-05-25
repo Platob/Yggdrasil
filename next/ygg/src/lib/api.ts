@@ -1,10 +1,13 @@
 /**
  * Frontend API client for Yggdrasil Dashboard
- * 
+ *
  * Two namespaces:
  * - `node.*` - Calls proxied to FastAPI bot backend (real-time, execution)
  * - `api.*` - Calls to Next.js API routes (cached, aggregated, config)
  */
+
+import { nodeCache, listCache } from "./cache";
+
 
 // =============================================================================
 // Types
@@ -272,11 +275,13 @@ export const node = {
     return data.channel;
   },
 
-  // Node info (direct)
-  getNodeInfo: (): Promise<NodeInfo> => fetchJSON(`${NODE_BASE}/hello`),
+  // Node info (cached 30s)
+  getNodeInfo: (): Promise<NodeInfo> =>
+    nodeCache.getOrFetch("self", () => fetchJSON(`${NODE_BASE}/hello`)) as Promise<NodeInfo>,
 
-  // Peers
-  getPeers: (): Promise<PeersResponse> => fetchJSON(`${NODE_BASE}/hello/peers`),
+  // Peers (cached 30s)
+  getPeers: (): Promise<PeersResponse> =>
+    nodeCache.getOrFetch("peers", () => fetchJSON(`${NODE_BASE}/hello/peers`)) as Promise<PeersResponse>,
 
   // Registry
   getRegistry: (): Promise<Record<string, string>> => fetchJSON(`${NODE_BASE}/call/registry`),
@@ -288,8 +293,9 @@ export const node = {
       body: JSON.stringify(args),
     }),
 
-  // Functions
-  listFunctions: () => fetchJSON<{ functions: FunctionEntry[] }>(`${NODE_BASE}/function`),
+  // Functions (cached 10s)
+  listFunctions: () =>
+    listCache.getOrFetch("functions", () => fetchJSON(`${NODE_BASE}/function`)) as Promise<{ functions: FunctionEntry[] }>,
   createFunction: (data: { name: string; code: string; language?: string; description?: string; python_version?: string; dependencies?: string[]; environment_id?: number }) =>
     fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function`, { method: "POST", body: JSON.stringify(data) }),
   getFunction: (id: number) => fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}`),
@@ -300,8 +306,9 @@ export const node = {
     fetchJSON<{ run: RunEntry }>(`${NODE_BASE}/function/${id}/run`, { method: "POST", body: JSON.stringify(args || {}) }),
   listFunctionRuns: (id: number) => fetchJSON<{ runs: RunEntry[] }>(`${NODE_BASE}/function/${id}/run`),
 
-  // Environments
-  listEnvironments: () => fetchJSON<{ environments: EnvironmentEntry[] }>(`${NODE_BASE}/environment`),
+  // Environments (cached 10s)
+  listEnvironments: () =>
+    listCache.getOrFetch("environments", () => fetchJSON(`${NODE_BASE}/environment`)) as Promise<{ environments: EnvironmentEntry[] }>,
   createEnvironment: (data: { name: string; python_version?: string; dependencies?: string[] }) =>
     fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment`, { method: "POST", body: JSON.stringify(data) }),
   getEnvironment: (id: number) => fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}`),

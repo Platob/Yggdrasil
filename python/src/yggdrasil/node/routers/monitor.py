@@ -6,6 +6,7 @@ import json
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
+from ..middleware import cached_response
 from ..schemas.monitor import MonitorResponse, ResourceSnapshot
 from ..services.monitor import MonitorService
 
@@ -17,6 +18,7 @@ def _get_service(request: Request) -> MonitorService:
 
 
 @router.get("", response_model=MonitorResponse)
+@cached_response(ttl_seconds=1.0)
 async def get_monitor(
     limit: int = Query(60, ge=1, le=300),
     service: MonitorService = Depends(_get_service),

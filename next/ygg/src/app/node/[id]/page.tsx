@@ -206,6 +206,7 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
   const { id } = use(params);
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [demoMode, setDemoMode] = useState(false);
+  const [isLocal, setIsLocal] = useState(false);
   const [refreshRate, setRefreshRate] = useState(1000);
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
@@ -221,9 +222,12 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
       try {
         const self = await api.getNodeInfo();
         if (self.node_id === id) {
+          // LOCAL node — use direct API calls (no peer network overhead)
           setNode(self);
+          setIsLocal(true);
         } else {
-          // Check peers for this node
+          // REMOTE node — display info from the peers list
+          setIsLocal(false);
           try {
             const peersData = await api.getPeers();
             const peer = peersData.peers.find((p) => p.node_id === id);
@@ -279,7 +283,7 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
     loadNode();
   }, [id]);
 
-  // Periodic metrics fetch
+  // Periodic metrics fetch — only for local nodes (live resource monitoring)
   const fetchMetrics = useCallback(() => {
     // TODO: Replace with real API call when bot is connected: bot.getSystemMetrics()
     const m = generateMockMetrics();
@@ -293,10 +297,20 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
   }, []);
 
   useEffect(() => {
-    fetchMetrics();
-    const interval = setInterval(fetchMetrics, refreshRate);
-    return () => clearInterval(interval);
-  }, [refreshRate, fetchMetrics]);
+    if (isLocal || demoMode) {
+      // Local node: show live metrics
+      fetchMetrics();
+      const interval = setInterval(fetchMetrics, refreshRate);
+      return () => clearInterval(interval);
+    } else {
+      // Remote node: show static placeholder metrics (last-known info from discovery)
+      setMetrics({
+        cpu: 0, ram: 0, ramUsed: 0, ramTotal: 0,
+        gpu: 0, gpuMemUsed: 0, gpuMemTotal: 0, gpuName: "N/A (remote)",
+      });
+      setProcesses([]);
+    }
+  }, [refreshRate, fetchMetrics, isLocal, demoMode]);
 
   if (!node || !metrics) {
     return (
@@ -337,19 +351,33 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
 
         {/* Status + Refresh Rate */}
         <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-muted">Refresh:</span>
-            <select
-              value={refreshRate}
-              onChange={(e) => setRefreshRate(Number(e.target.value))}
-              className="bg-card border border-border rounded px-2 py-1 text-xs font-mono text-foreground focus:outline-none focus:border-primary"
-            >
-              <option value={500}>500ms</option>
-              <option value={1000}>1s</option>
-              <option value={2000}>2s</option>
-              <option value={5000}>5s</option>
-            </select>
+          {/* Local/Remote badge */}
+          <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-wide ${
+            isLocal
+              ? "bg-success/10 border border-success/20 text-success"
+              : "bg-orange-500/10 border border-orange-500/20 text-orange-400"
+          }`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${isLocal ? "bg-success" : "bg-orange-400"}`} />
+            {isLocal ? "Local" : "Remote"}
           </div>
+
+          {/* Refresh rate — only for local nodes with live metrics */}
+          {isLocal && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted">Refresh:</span>
+              <select
+                value={refreshRate}
+                onChange={(e) => setRefreshRate(Number(e.target.value))}
+                className="bg-card border border-border rounded px-2 py-1 text-xs font-mono text-foreground focus:outline-none focus:border-primary"
+              >
+                <option value={500}>500ms</option>
+                <option value={1000}>1s</option>
+                <option value={2000}>2s</option>
+                <option value={5000}>5s</option>
+              </select>
+            </div>
+          )}
+
           <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full ${demoMode ? "bg-warning/10 border border-warning/20" : "bg-success/10 border border-success/20"}`}>
             <div className={`status-dot ${demoMode ? "pending" : "online"}`} />
             <span className={`text-xs font-medium ${demoMode ? "text-warning" : "text-success"}`}>
@@ -359,57 +387,88 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
         </div>
       </div>
 
-      {/* Resource Usage Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <TimePlot
-          data={cpuHistory}
-          color="#f26b3a"
-          label="CPU Usage"
-          value={metrics.cpu}
-          unit="%"
-        />
-        <TimePlot
-          data={ramHistory}
-          color="#5b9bd5"
-          label="Memory"
-          value={metrics.ram}
-          unit="%"
-          secondaryValue={`${metrics.ramUsed.toFixed(1)}/${metrics.ramTotal}GB`}
-          secondaryLabel="Used"
-        />
-        <TimePlot
-          data={gpuHistory}
-          color="#4ade80"
-          label="GPU"
-          value={metrics.gpu}
-          unit="%"
-          secondaryValue={metrics.gpuName}
-          secondaryLabel=""
-        />
-      </div>
+      {/* Resource Usage Charts — only for local nodes */}
+      {isLocal || demoMode ? (
+        <>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <TimePlot
+              data={cpuHistory}
+              color="#f26b3a"
+              label="CPU Usage"
+              value={metrics.cpu}
+              unit="%"
+            />
+            <TimePlot
+              data={ramHistory}
+              color="#5b9bd5"
+              label="Memory"
+              value={metrics.ram}
+              unit="%"
+              secondaryValue={`${metrics.ramUsed.toFixed(1)}/${metrics.ramTotal}GB`}
+              secondaryLabel="Used"
+            />
+            <TimePlot
+              data={gpuHistory}
+              color="#4ade80"
+              label="GPU"
+              value={metrics.gpu}
+              unit="%"
+              secondaryValue={metrics.gpuName}
+              secondaryLabel=""
+            />
+          </div>
 
-      {/* Bottom Section */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Process List */}
-        <ProcessList processes={processes} />
+          {/* Bottom Section */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {/* Process List */}
+            <ProcessList processes={processes} />
 
-        {/* System Info */}
-        <div className="nordic-card p-4">
-          <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">System Info</h3>
-          <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
-            <InfoRow label="Node ID" value={node.node_id} mono />
-            <InfoRow label="Version" value={node.version} mono />
-            <InfoRow label="Host" value={`${node.host}:${node.port}`} mono />
-            <InfoRow label="Uptime" value={formatUptime(node.uptime)} />
-            <InfoRow label="Latitude" value={node.lat != null ? String(node.lat) : "N/A"} mono primary />
-            <InfoRow label="Longitude" value={node.lon != null ? String(node.lon) : "N/A"} mono primary />
-            <InfoRow label="RAM Total" value={`${metrics.ramTotal} GB`} />
-            <InfoRow label="GPU" value={metrics.gpuName} />
-            <InfoRow label="GPU Memory" value={`${metrics.gpuMemUsed.toFixed(1)}/${metrics.gpuMemTotal} GB`} />
-            <InfoRow label="Functions" value={`${node.functions.length} registered`} />
+            {/* System Info */}
+            <div className="nordic-card p-4">
+              <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">System Info</h3>
+              <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
+                <InfoRow label="Node ID" value={node.node_id} mono />
+                <InfoRow label="Version" value={node.version} mono />
+                <InfoRow label="Host" value={`${node.host}:${node.port}`} mono />
+                <InfoRow label="Uptime" value={formatUptime(node.uptime)} />
+                <InfoRow label="Latitude" value={node.lat != null ? String(node.lat) : "N/A"} mono primary />
+                <InfoRow label="Longitude" value={node.lon != null ? String(node.lon) : "N/A"} mono primary />
+                <InfoRow label="RAM Total" value={`${metrics.ramTotal} GB`} />
+                <InfoRow label="GPU" value={metrics.gpuName} />
+                <InfoRow label="GPU Memory" value={`${metrics.gpuMemUsed.toFixed(1)}/${metrics.gpuMemTotal} GB`} />
+                <InfoRow label="Functions" value={`${node.functions.length} registered`} />
+              </div>
+            </div>
+          </div>
+        </>
+      ) : (
+        /* Remote node: show last-known discovery info */
+        <div className="space-y-4">
+          <div className="nordic-card p-5 border-orange-500/20">
+            <div className="flex items-center gap-2 mb-3">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-orange-400">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="8" x2="12" y2="12" />
+                <line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+              <span className="text-xs font-medium text-orange-400 uppercase tracking-wider">Remote Node - Last Known Info</span>
+            </div>
+            <p className="text-xs text-muted mb-4">
+              Live resource metrics are not available for remote nodes. Showing discovery information only.
+            </p>
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-3 text-sm">
+              <InfoRow label="Node ID" value={node.node_id} mono />
+              <InfoRow label="Version" value={node.version} mono />
+              <InfoRow label="Host" value={`${node.host}:${node.port}`} mono />
+              <InfoRow label="Uptime" value={formatUptime(node.uptime)} />
+              <InfoRow label="Latitude" value={node.lat != null ? String(node.lat) : "N/A"} mono primary />
+              <InfoRow label="Longitude" value={node.lon != null ? String(node.lon) : "N/A"} mono primary />
+              <InfoRow label="Channels" value={`${node.channels.length}`} />
+              <InfoRow label="Functions" value={`${node.functions.length} registered`} />
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

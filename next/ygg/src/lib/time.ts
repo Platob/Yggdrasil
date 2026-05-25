@@ -10,6 +10,12 @@ export class ZoneId {
   static of(zoneId: string): ZoneId {
     return new ZoneId(zoneId);
   }
+
+  static from_(value: string | ZoneId | null | undefined): ZoneId | null {
+    if (!value) return null;
+    if (value instanceof ZoneId) return value;
+    return ZoneId.of(value);
+  }
   static UTC = new ZoneId("UTC");
   static SYSTEM = new ZoneId(
     Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -39,6 +45,14 @@ export class Instant {
   }
   static parse(iso: string): Instant {
     return new Instant(new Date(iso).getTime());
+  }
+
+  static from_(value: string | number | Date | Instant | null | undefined): Instant | null {
+    if (!value) return null;
+    if (value instanceof Instant) return value;
+    if (value instanceof Date) return Instant.ofEpochMillis(value.getTime());
+    if (typeof value === "number") return Instant.ofEpochMillis(value);
+    try { return Instant.parse(String(value)); } catch { return null; }
   }
 
   get epochSeconds(): number {
@@ -120,6 +134,12 @@ export class Duration {
     return new Duration(s * 1000);
   }
 
+  static from_(value: number | Duration | null | undefined): Duration | null {
+    if (!value && value !== 0) return null;
+    if (value instanceof Duration) return value;
+    return Duration.fromSeconds(value as number);
+  }
+
   /** Between two instants */
   static between(start: Instant, end: Instant): Duration {
     return new Duration(end.epochMillis - start.epochMillis);
@@ -198,6 +218,12 @@ export class LocalDate {
   static parse(iso: string): LocalDate {
     const [y, m, d] = iso.split("-").map(Number);
     return new LocalDate(y, m, d);
+  }
+
+  static from_(value: string | LocalDate | null | undefined): LocalDate | null {
+    if (!value) return null;
+    if (value instanceof LocalDate) return value;
+    try { return LocalDate.parse(String(value)); } catch { return null; }
   }
 
   atTime(time: LocalTime): LocalDateTime {
@@ -365,6 +391,12 @@ export class ZonedDateTime {
     const zone =
       match && match[1] !== "Z" ? ZoneId.of(`UTC${match[1]}`) : ZoneId.UTC;
     return new ZonedDateTime(instant, zone);
+  }
+
+  static from_(value: string | ZonedDateTime | null | undefined): ZonedDateTime | null {
+    if (!value) return null;
+    if (value instanceof ZonedDateTime) return value;
+    try { return ZonedDateTime.parse(String(value)); } catch { return null; }
   }
 
   /** Format in the target timezone */

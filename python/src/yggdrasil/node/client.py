@@ -5,6 +5,7 @@ from typing import Any, Callable, Iterator
 
 import pyarrow as pa
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.node.transport import (
     CONTENT_TYPE_ARROW_STREAM,
     CONTENT_TYPE_PICKLE,
@@ -43,11 +44,16 @@ class NodeClient:
         *,
         api_prefix: str = "/api",
         timeout: float = 600.0,
+        cache_ttl: float = 10.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_prefix = api_prefix
         self.timeout = timeout
         self._session = None
+        # Cache for GET/read operations (TTL in nanoseconds)
+        self._cache: ExpiringDict[str, Any] = ExpiringDict(
+            default_ttl=int(cache_ttl * 1_000_000_000)
+        )
 
     @property
     def session(self):
@@ -73,6 +79,7 @@ class NodeClient:
         *,
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
+        _invalidate_cache: bool = True,
     ) -> tuple[bytes, str, dict[str, str]]:
         url = self._url(path)
         hdrs = {"Content-Type": content_type}
@@ -96,6 +103,9 @@ class NodeClient:
 
         resp_ct = resp.headers.get("Content-Type", "application/octet-stream")
         resp_headers = dict(resp.headers)
+        # Invalidate cache on mutations (POST that actually writes state)
+        if _invalidate_cache:
+            self._cache.clear()
         return resp.data, resp_ct, resp_headers
 
     def _post_json(
@@ -205,14 +215,24 @@ class NodeClient:
         return self._post_json("/cmd", {"command": command, **kwargs})
 
     def list_functions(self) -> dict[str, str]:
-        """List registered @remote functions on the bot server."""
+        """List registered @remote functions on the bot server (cached)."""
+        cached = self._cache.get("functions")
+        if cached is not None:
+            return cached
         from yggdrasil.pickle.json import loads
         data, _, _ = self._post(
             "/call/registry",
             b"",
             "application/json",
+            _invalidate_cache=False,
         )
-        return loads(data)
+        result = loads(data)
+        self._cache["functions"] = result
+        return result
+
+    def invalidate_cache(self) -> None:
+        """Manually invalidate the client's response cache."""
+        self._cache.clear()
 
     def __repr__(self) -> str:
         return f"NodeClient({self.base_url!r})"

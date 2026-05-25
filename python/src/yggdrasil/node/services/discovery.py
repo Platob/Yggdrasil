@@ -7,6 +7,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
+
 from ..config import Settings
 from ..remote import list_registered
 from ..schemas.discovery import HelloRequest, HelloResponse, NodeInfo, PeerListResponse
@@ -57,6 +59,8 @@ class DiscoveryService:
         self._peers: dict[str, _Peer] = {}
         self._lock = Lock()
         self._messenger_service = messenger_service
+        # Cache for self-info and geolocation (5s TTL in nanoseconds)
+        self._info_cache: ExpiringDict[str, NodeInfo] = ExpiringDict(default_ttl=5_000_000_000)
 
     async def hello(self, req: HelloRequest) -> HelloResponse:
         with self._lock:
@@ -85,8 +89,7 @@ class DiscoveryService:
         if not existing:
             LOGGER.info("Registered new peer %r (%s:%d)", req.node_id, req.host, req.port)
 
-        from ..geo import get_location
-        lat, lon = get_location()
+        lat, lon = self._get_cached_location()
 
         return HelloResponse(
             node_id=self.settings.node_id,
@@ -105,12 +108,10 @@ class DiscoveryService:
         return PeerListResponse(node_id=self.settings.node_id, peers=peers)
 
     async def get_self_info(self) -> NodeInfo:
-        from ..geo import get_location
-
         uptime = time.monotonic() - self._start_time
         channels = self._get_channels()
         functions = sorted(list_registered().keys())
-        lat, lon = get_location()
+        lat, lon = self._get_cached_location()
         return NodeInfo(
             node_id=self.settings.node_id,
             host=self.settings.host,
@@ -127,10 +128,8 @@ class DiscoveryService:
         if not targets:
             return PeerListResponse(node_id=self.settings.node_id, peers=[])
 
-        from ..geo import get_location
-
         discovered: list[NodeInfo] = []
-        lat, lon = get_location()
+        lat, lon = self._get_cached_location()
         payload = json.dumps({
             "node_id": self.settings.node_id,
             "host": self.settings.host,
@@ -206,6 +205,16 @@ class DiscoveryService:
         for node_id in stale:
             del self._peers[node_id]
             LOGGER.debug("Purged stale peer %r", node_id)
+
+    def _get_cached_location(self) -> tuple[float | None, float | None]:
+        """Return cached geolocation (lat, lon) with 5s TTL."""
+        cached = self._info_cache.get("_geo")
+        if cached is not None:
+            return cached
+        from ..geo import get_location
+        loc = get_location()
+        self._info_cache.set("_geo", loc, ttl=5_000_000_000)
+        return loc
 
     def _get_channels(self) -> list[str]:
         """Return channel names from the messenger service if accessible."""

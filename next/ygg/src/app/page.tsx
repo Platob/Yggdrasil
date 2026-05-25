@@ -1,8 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { WorldGlobe, type BotNode, type ArcDef } from "@/components/world-globe";
+import { node } from "@/lib/api";
 
 // ─── Data ────────────────────────────────────────────────────────────────────
 
@@ -185,10 +187,38 @@ function LogoMark() {
 // ─── Welcome Page ────────────────────────────────────────────────────────────
 
 export default function WelcomePage() {
+  const router = useRouter();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [statsCollapsed, setStatsCollapsed] = useState(true);
+  const [botNodes, setBotNodes] = useState<BotNode[]>(BOT_NODES);
 
-  const selectedNode = BOT_NODES.find((n) => n.id === selectedId) ?? null;
+  // Fetch real node data on mount
+  useEffect(() => {
+    async function loadNodes() {
+      try {
+        const [self, peersData] = await Promise.all([
+          node.getNodeInfo(),
+          node.getPeers(),
+        ]);
+        // Convert NodeInfo to BotNode format
+        const allNodes = [self, ...peersData.peers]
+          .filter(n => n.lat != null && n.lon != null)
+          .map(n => ({
+            id: n.node_id,
+            label: n.node_id,
+            lat: n.lat!,
+            lng: n.lon!,
+            status: "online" as const,
+            version: n.version,
+            uptime: n.uptime,
+          }));
+        if (allNodes.length > 0) setBotNodes(allNodes);
+      } catch { /* keep demo data */ }
+    }
+    loadNodes();
+  }, []);
+
+  const selectedNode = botNodes.find((n) => n.id === selectedId) ?? null;
 
   function handleSelect(id: string) {
     setSelectedId((prev) => (prev === id ? null : id));
@@ -196,15 +226,20 @@ export default function WelcomePage() {
     setStatsCollapsed(true);
   }
 
+  function handleNavigate(id: string) {
+    router.push(`/node/${encodeURIComponent(id)}`);
+  }
+
   return (
     <div className="relative w-full h-[calc(100vh-0px)] -m-6 overflow-hidden bg-[#030306] font-sans">
 
       {/* Full-bleed globe */}
       <WorldGlobe
-        nodes={BOT_NODES}
+        nodes={botNodes}
         arcs={ARCS}
         selectedId={selectedId}
         onSelect={handleSelect}
+        onNavigate={handleNavigate}
         className="absolute inset-0 w-full h-full"
       />
 
@@ -228,7 +263,7 @@ export default function WelcomePage() {
           <div className="hidden md:flex items-center gap-1.5 mr-1">
             <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
             <span className="text-[11px] text-white/40 font-mono">
-              {BOT_NODES.filter((n) => n.status === "online").length} online
+              {botNodes.filter((n) => n.status === "online").length} online
             </span>
           </div>
           <Link
@@ -249,13 +284,24 @@ export default function WelcomePage() {
           {selectedNode && (
             <div className="pointer-events-auto w-full max-w-[17rem]">
               <NodePanel node={selectedNode} onClose={() => setSelectedId(null)} />
+              <Link
+                href={`/node/${encodeURIComponent(selectedNode.id)}`}
+                className="mt-2 flex items-center justify-center gap-1.5 w-full py-2 rounded-lg text-xs font-medium transition-all"
+                style={{
+                  background: "rgba(242,107,58,0.12)",
+                  border: "1px solid rgba(242,107,58,0.25)",
+                  color: "#f26b3a",
+                }}
+              >
+                View Node &rarr;
+              </Link>
             </div>
           )}
         </div>
 
         {/* Stats strip — bottom */}
         <StatsStrip
-          nodes={BOT_NODES}
+          nodes={botNodes}
           collapsed={statsCollapsed}
           onToggle={() => setStatsCollapsed((c) => !c)}
         />
