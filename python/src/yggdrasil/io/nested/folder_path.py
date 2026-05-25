@@ -1101,15 +1101,25 @@ class FolderPath(IO[bytes, FolderOptions]):
         drops to the remaining partitions (or to a flat write when
         the schema's partition set is exhausted).
         """
+        yielded = False
+        for batch in self._read_arrow_batches_inner(options):
+            yielded = True
+            yield batch
+        if not yielded:
+            schema = self._schema_cache
+            if schema is ... or not schema:
+                schema = options.target
+            if schema and hasattr(schema, "to_arrow_schema"):
+                arrow_schema = schema.to_arrow_schema()
+                yield pa.RecordBatch.from_pydict(
+                    {f.name: pa.array([], type=f.type) for f in arrow_schema},
+                    schema=arrow_schema,
+                )
+
+    def _read_arrow_batches_inner(
+        self, options: FolderOptions,
+    ) -> Iterator[pa.RecordBatch]:
         predicate = options.predicate
-        # Mutualise the predicate AST walk across the whole read
-        # subtree. :meth:`_free_cols_for` checks this folder and
-        # every ``tabular_parent`` for a cached entry keyed by
-        # ``id(predicate)`` — the candidate-probe loop yields fresh
-        # child FolderPaths, but they all share the same root and the
-        # same predicate instance, so the walk happens exactly once
-        # per ``read_arrow_batches`` call instead of N times per
-        # iter_children iteration.
         free_cols = self._free_cols_for(predicate)
         if self._should_prune_by_predicate(options, free_cols=free_cols):
             LOGGER.debug("Pruned read from %r — predicate eliminates partition", self)
