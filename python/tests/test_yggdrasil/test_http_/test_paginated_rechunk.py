@@ -83,7 +83,6 @@ class _PaginatedStubSession(HTTPSession):
         page_num,
         body_seed,
         wait_cfg,
-        stream,
         raise_error,
     ):
         rows = self._pages[page_num]
