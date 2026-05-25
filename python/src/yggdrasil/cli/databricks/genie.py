@@ -349,6 +349,7 @@ class GenieCLI(DatabricksCLI):
             )
         if not getattr(self.args, "debug", False):
             self._YGG_LOGGER.setLevel(logging.INFO)
+            logging.getLogger("databricks.sdk").setLevel(logging.ERROR)
 
     # ------------------------------------------------------------------ #
     # Credential setup
