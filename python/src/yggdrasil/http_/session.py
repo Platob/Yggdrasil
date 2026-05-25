@@ -1493,7 +1493,7 @@ class HTTPSession(Session):
         spark = reqs[0].send_config_or_default.spark_session if reqs else None
         n = len(reqs)
         LOGGER.debug(
-            "Processing batch (requests=%d, local=%r [%s], remote=%r [%s])",
+            "Processing batch (requests=%d, local=%r [%r], remote=%r [%r])",
             n, local_holder, local_mode, remote_holder, remote_mode,
         )
         local_hits: "Tabular | None" = None
