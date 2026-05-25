@@ -572,9 +572,58 @@ class GenieCLI(DatabricksCLI):
             self.error(f"  invalid choice: {choice!r}")
             return False
         else:
-            self.warn("  no Genie spaces found in this workspace.")
-            self.info("  create one in the Databricks UI, or use --auto-create-space with --warehouse-id.")
-            return False
+            self.warn("  no Genie spaces found — creating one.")
+            return self._prompt_create_space()
+
+    def _prompt_create_space(self) -> bool:
+        """Prompt for a warehouse, auto-create a Genie space."""
+        try:
+            warehouses = list(self.client.warehouses.list())
+        except Exception:
+            warehouses = []
+
+        wh_id = self.defaults.warehouse_id
+        if not wh_id:
+            if warehouses:
+                self.out("")
+                self.info("  Available warehouses:")
+                for i, wh in enumerate(warehouses, 1):
+                    name = getattr(wh, "name", None) or getattr(wh, "warehouse_id", "?")
+                    self.out(f"  {self.style.dim(f'{i:>3}.')} {name}")
+                self.out("")
+                try:
+                    choice = self.input_fn(
+                        self.style.cyan("  pick a warehouse ")
+                        + self.style.dim(f"(1-{len(warehouses)}): "),
+                    ).strip()
+                except (EOFError, KeyboardInterrupt):
+                    self.out("")
+                    return False
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(warehouses):
+                        wh_id = warehouses[idx].warehouse_id
+                except (ValueError, AttributeError):
+                    pass
+            if not wh_id:
+                try:
+                    wh_id = self.input_fn(
+                        self.style.cyan("  warehouse id: "),
+                    ).strip() or None
+                except (EOFError, KeyboardInterrupt):
+                    self.out("")
+                    return False
+            if not wh_id:
+                self.error("  warehouse id is required to create a space.")
+                return False
+
+        self.genie.defaults = _dc_replace(
+            self.defaults,
+            warehouse_id=wh_id,
+            auto_create_space=True,
+        )
+        self.info("  creating space…")
+        return True
 
     # ------------------------------------------------------------------ #
     # Slash dispatch
