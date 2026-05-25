@@ -154,8 +154,8 @@ class TestRechunkThroughIPC:
         assert got.to_pydict() == table.to_pydict()
 
 
-class TestCalibratedRechunkThroughIPC:
-    """Verify _calibrate_ipc_chunksize produces precise serialized page sizes."""
+class TestContentSizeRechunkThroughIPC:
+    """Verify page-content-size rechunking in _combine_paginated_pages shape."""
 
     def _wide_table(self, n: int) -> pa.Table:
         return pa.table({
@@ -165,35 +165,26 @@ class TestCalibratedRechunkThroughIPC:
             "flag": [i % 2 == 0 for i in range(n)],
         })
 
-    def test_calibrated_chunksize_targets_serialized_size(self) -> None:
-        import pyarrow.ipc as ipc
-        from yggdrasil.http_.session import HTTPSession
+    @staticmethod
+    def _rechunk(table: pa.Table, target: int) -> list[pa.RecordBatch]:
+        total_rows = table.num_rows
+        content_bytes = sum(b.serialize().size for b in table.to_batches())
+        if total_rows > 0 and content_bytes > target:
+            max_chunksize = max(1, total_rows * target // content_bytes)
+            return table.to_batches(max_chunksize=max_chunksize)
+        return table.to_batches()
 
+    def test_splits_by_content_size(self) -> None:
         table = self._wide_table(10_000)
-        target = 32 * 1024  # 32 KiB per serialized page
-
-        chunksize = HTTPSession._calibrate_ipc_chunksize(table, target)
-        batches = table.to_batches(max_chunksize=chunksize)
+        target = 32 * 1024
+        batches = self._rechunk(table, target)
         assert len(batches) > 1
-
         for batch in batches[:-1]:
-            sink = pa.BufferOutputStream()
-            with ipc.new_stream(
-                sink, batch.schema,
-                options=ipc.IpcWriteOptions(compression="zstd"),
-            ) as w:
-                w.write_batch(batch)
-            serialized = sink.getvalue().size
-            assert serialized <= target * 2
+            assert batch.serialize().size <= target * 2
 
-    def test_calibrated_round_trip_preserves_data(self) -> None:
-        from yggdrasil.http_.session import HTTPSession
-
+    def test_round_trip_preserves_data(self) -> None:
         table = self._wide_table(5_000)
-        target = 64 * 1024
-
-        chunksize = HTTPSession._calibrate_ipc_chunksize(table, target)
-        batches = table.to_batches(max_chunksize=chunksize)
+        batches = self._rechunk(table, 64 * 1024)
 
         mem = Memory()
         ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_batches(
@@ -202,60 +193,17 @@ class TestCalibratedRechunkThroughIPC:
         got = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
         assert got.to_pydict() == table.to_pydict()
 
-    def test_calibrated_vs_nbytes_precision(self) -> None:
-        """Calibrated chunking should be closer to the target than nbytes-based."""
-        import pyarrow.ipc as ipc
-        from yggdrasil.arrow.cast import rechunk_arrow_batches, get_arrow_nbytes
-        from yggdrasil.http_.session import HTTPSession
-
-        table = self._wide_table(10_000)
-        target = 64 * 1024
-
-        # Calibrated approach
-        chunksize = HTTPSession._calibrate_ipc_chunksize(table, target)
-        calibrated_batches = table.to_batches(max_chunksize=chunksize)
-
-        # nbytes-based approach
-        nbytes_batches = list(rechunk_arrow_batches(
-            table.to_batches(), byte_size=target,
-        ))
-
-        def _measure_serialized(batches):
-            sizes = []
-            for b in batches:
-                sink = pa.BufferOutputStream()
-                with ipc.new_stream(
-                    sink, b.schema,
-                    options=ipc.IpcWriteOptions(compression="zstd"),
-                ) as w:
-                    w.write_batch(b)
-                sizes.append(sink.getvalue().size)
-            return sizes
-
-        cal_sizes = _measure_serialized(calibrated_batches)
-        nb_sizes = _measure_serialized(nbytes_batches)
-
-        cal_error = sum(abs(s - target) for s in cal_sizes[:-1]) / max(1, len(cal_sizes) - 1)
-        nb_error = sum(abs(s - target) for s in nb_sizes[:-1]) / max(1, len(nb_sizes) - 1)
-
-        assert cal_error <= nb_error
-
-    def test_empty_table(self) -> None:
-        from yggdrasil.http_.session import HTTPSession
-
-        table = pa.table({"a": pa.array([], type=pa.int64())})
-        chunksize = HTTPSession._calibrate_ipc_chunksize(table, 1024)
-        assert chunksize == 1
-
-    def test_tiny_table_single_batch(self) -> None:
-        from yggdrasil.http_.session import HTTPSession
-
+    def test_small_table_stays_single_batch(self) -> None:
         table = self._wide_table(10)
-        chunksize = HTTPSession._calibrate_ipc_chunksize(table, 128 * 1024 * 1024)
-        assert chunksize >= 10
-        batches = table.to_batches(max_chunksize=chunksize)
+        batches = self._rechunk(table, 128 * 1024 * 1024)
         assert len(batches) == 1
         assert batches[0].num_rows == 10
+
+    def test_empty_table(self) -> None:
+        table = pa.table({"a": pa.array([], type=pa.int64())})
+        batches = self._rechunk(table, 1024)
+        total = sum(b.num_rows for b in batches)
+        assert total == 0
 
 
 class TestLocalPathRoundTrip:

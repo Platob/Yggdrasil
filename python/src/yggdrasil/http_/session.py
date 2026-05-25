@@ -104,13 +104,9 @@ LOGGER = logging.getLogger(__name__)
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 # Rechunk byte target for paginated responses assembled by
-# ``_combine_paginated_pages``.  Targets the **serialized IPC page
-# size** (post-compression), not the in-memory Arrow buffer size.
+# ``_combine_paginated_pages``.  Targets the IPC page content size
+# (``RecordBatch.serialize().size``), not the in-memory buffer size.
 _PAGINATED_RECHUNK_BYTE_SIZE: int = 128 * 1024 * 1024
-
-# Number of probe rows sampled from the combined table to calibrate
-# the compressed-bytes-per-row ratio in ``_combine_paginated_pages``.
-_PAGINATED_PROBE_ROWS: int = 1024
 
 
 # Local cache is a partitioned tabular tree backed by
@@ -1366,15 +1362,23 @@ class HTTPSession(Session):
         final_df = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
         combined_table = final_df.to_arrow(compat_level=pl.CompatLevel.newest())
 
-        max_chunksize = self._calibrate_ipc_chunksize(
-            combined_table, _PAGINATED_RECHUNK_BYTE_SIZE,
+        total_rows = combined_table.num_rows
+        content_bytes = sum(
+            b.serialize().size for b in combined_table.to_batches()
         )
+        if total_rows > 0 and content_bytes > _PAGINATED_RECHUNK_BYTE_SIZE:
+            max_chunksize = max(
+                1, total_rows * _PAGINATED_RECHUNK_BYTE_SIZE // content_bytes,
+            )
+            batches = combined_table.to_batches(max_chunksize=max_chunksize)
+        else:
+            batches = combined_table.to_batches()
 
         new_holder = Memory()
         new_holder.media_type = MediaTypes.ARROW_IPC
         with ArrowIPCFile(holder=new_holder, owns_holder=False, mode="wb") as new_buffer:
             new_buffer.write_arrow_batches(
-                combined_table.to_batches(max_chunksize=max_chunksize),
+                iter(batches),
                 compression="zstd",
             )
 
@@ -1388,42 +1392,6 @@ class HTTPSession(Session):
         })
 
         return result
-
-    @staticmethod
-    def _calibrate_ipc_chunksize(
-        table: pa.Table,
-        target_byte_size: int,
-    ) -> int:
-        """Derive a ``max_chunksize`` (rows) that targets *serialized* IPC page size.
-
-        Serializes a small probe slice with zstd to measure the actual
-        compressed bytes-per-row, then divides ``target_byte_size`` by
-        that ratio.  Falls back to the full table row count (single
-        batch) when the table is tiny or the probe fails.
-        """
-        import pyarrow.ipc as ipc
-
-        total_rows = table.num_rows
-        if total_rows == 0:
-            return 1
-
-        probe_rows = min(_PAGINATED_PROBE_ROWS, total_rows)
-        probe = table.slice(0, probe_rows)
-
-        try:
-            sink = pa.BufferOutputStream()
-            with ipc.new_stream(
-                sink, probe.schema,
-                options=ipc.IpcWriteOptions(compression="zstd"),
-            ) as writer:
-                for batch in probe.to_batches():
-                    writer.write_batch(batch)
-            serialized_bytes = sink.getvalue().size
-        except Exception:
-            return total_rows
-
-        bytes_per_row = max(1, serialized_bytes // max(1, probe_rows))
-        return max(1, target_byte_size // bytes_per_row)
 
     def send_many(
         self,
