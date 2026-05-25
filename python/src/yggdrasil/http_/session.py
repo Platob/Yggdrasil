@@ -1634,14 +1634,37 @@ class HTTPSession(Session):
         LOGGER.info(
             "Scattering %d miss(es) to Spark executors", len(misses),
         )
-        new_hits = self._spark_fetch_misses(misses, spark)
+        result_df = self._spark_fetch_misses(misses, spark)
         rc = reqs[0].remote_cache_config
         if remote_holder is not None and rc is not None:
             LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
-            self._spark_persist_remote(new_hits, rc, spark=spark)
+            self._spark_persist_remote(result_df, rc, spark=spark)
+
+        raise_error = misses[0].send_config_or_default.raise_error
+        failed: list[Response] = []
+        if raise_error:
+            from pyspark.sql import functions as F
+            from yggdrasil.spark.cast import spark_dataframe_to_arrow
+
+            ok_df = result_df.where(
+                (F.col("status_code") >= 200) & (F.col("status_code") < 400)
+            )
+            err_df = result_df.where(
+                (F.col("status_code") < 200) | (F.col("status_code") >= 400)
+            )
+            err_table = spark_dataframe_to_arrow(err_df)
+            if len(err_table) > 0:
+                failed = list(Response.from_arrow_tabular(err_table))
+                LOGGER.info(
+                    "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
+                    len(misses), len(misses),
+                    len(misses) - len(failed), len(failed),
+                )
+            result_df = ok_df
+
         return HTTPResponseBatch(
             local=local_hits, remote=remote_hits,
-            new=new_hits, misses=misses,
+            new=result_df, misses=misses, failed=failed,
         )
 
     @staticmethod
