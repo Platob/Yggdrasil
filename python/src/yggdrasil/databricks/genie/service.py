@@ -51,6 +51,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
     from .agent import GenieAgent
+    from .autonomous import AutonomousAgent
 
 
 __all__ = ["Genie"]
@@ -87,6 +88,7 @@ class Genie(DatabricksService):
         super().__init__(client=client)
         self.defaults: GenieDefaults = defaults if defaults is not None else GenieDefaults()
         self._agent: "Optional[GenieAgent]" = None
+        self._autonomous_agent: "Optional[AutonomousAgent]" = None
 
     # ------------------------------------------------------------------ #
     # SDK boundary
@@ -113,6 +115,22 @@ class Genie(DatabricksService):
 
             cached = GenieAgent(service=self)
             self._agent = cached
+        return cached
+
+    @property
+    def autonomous_agent(self) -> "AutonomousAgent":
+        """Lazily-built :class:`AutonomousAgent` for autonomous orchestration.
+
+        One instance per :class:`Genie` service — history, children, and
+        registered tools persist across calls.  Construct directly with
+        ``AutonomousAgent(genie_service)`` if you need a separate session.
+        """
+        cached = self._autonomous_agent
+        if cached is None:
+            from .autonomous import AutonomousAgent
+
+            cached = AutonomousAgent(service=self)
+            self._autonomous_agent = cached
         return cached
 
     # ------------------------------------------------------------------ #
