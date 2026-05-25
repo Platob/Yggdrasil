@@ -1423,7 +1423,6 @@ class HTTPSession(Session):
                     page_num=pn,
                     body_seed=body_seed,
                     wait_cfg=wait_cfg,
-                    stream=True,
                     raise_error=raise_error,
                 )
 

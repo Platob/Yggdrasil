@@ -1359,16 +1359,11 @@ class Table(DatabricksPath):
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         options = options.with_source(source=self.collect_schema())
         query = self._options_to_sql(options)
-        execution = self.sql.execute(
-            query,
-            wait=True,
-            raise_error=False
-        )
 
         try:
-            execution.raise_for_status()
+            execution = self.sql.execute(query)
         except Exception:
-            if options.target:
+            if not self.exists and options.target:
                 self.create(options.target)
                 s: pa.Schema = options.target.to_arrow_schema()
                 yield pa.RecordBatch.from_pylist([], schema=s)
@@ -1410,20 +1405,14 @@ class Table(DatabricksPath):
     def _read_spark_frame(self, options: O) -> "SparkDataFrame":
         options = options.with_source(source=self.collect_schema(options))
         query = self._options_to_sql(options)
-        execution = self.sql.execute(
-            query,
-            wait=True,
-            raise_error=False
-        )
 
         try:
-            execution.raise_for_status()
+            execution = self.sql.execute(query)
         except Exception:
-            if options.target:
+            if not self.exists and options.target:
                 self.create(options.target)
-                s: pa.Schema = options.target.to_arrow_schema()
-                yield pa.RecordBatch.from_pylist([], schema=s)
-                return
+                s: pa.Schema = options.target.to_spark_schema()
+                return options.get_spark_session().createDataFrame([], schema=s)
             else:
                 raise
 
