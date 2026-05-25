@@ -628,10 +628,6 @@ class HTTPSession(Session):
         :meth:`_release_connection`. No intermediate transport class.
         """
         retries: Retry = self._retry.new()  # fresh history per call
-        current_url = request.url.to_string()
-        current_method = request.method
-        current_body = request.buffer.to_bytes() if request.buffer is not None else None
-        current_headers = dict(request.headers or {})
         current_request = request
         visited_redirects = 0
 
@@ -639,28 +635,28 @@ class HTTPSession(Session):
             try:
                 response = self._send_once(
                     request=current_request,
-                    method=current_method,
-                    url=current_url,
-                    body=current_body,
-                    headers=current_headers,
                     timeout=timeout,
                     preload_content=preload_content,
                     decode_content=decode_content,
                     tags=tags,
                 )
             except (socket.timeout, TimeoutError) as exc:
-                wrapped: Exception = ReadTimeoutError(self, current_url, str(exc))
+                url_str = current_request.url.to_string()
+                wrapped: Exception = ReadTimeoutError(self, url_str, str(exc))
                 retries = retries.increment(
-                    method=current_method, url=current_url, error=wrapped, _pool=self,
+                    method=current_request.method, url=url_str,
+                    error=wrapped, _pool=self,
                 )
                 retries.sleep()
                 continue
             except ssl.SSLError as exc:
                 raise SSLError(str(exc)) from exc
             except (OSError, http.client.HTTPException) as exc:
+                url_str = current_request.url.to_string()
                 wrapped = NewConnectionError(self, str(exc))
                 retries = retries.increment(
-                    method=current_method, url=current_url, error=wrapped, _pool=self,
+                    method=current_request.method, url=url_str,
+                    error=wrapped, _pool=self,
                 )
                 retries.sleep()
                 continue
@@ -673,25 +669,32 @@ class HTTPSession(Session):
                     response.drain_conn()
                     response.release_conn()
                     visited_redirects += 1
-                    current_url = self._resolve_redirect(current_url, location)
-                    if response.status in (301, 302, 303) and current_method.upper() != "HEAD":
-                        current_method = "GET"
-                        current_body = None
-                        current_headers.pop("Content-Length", None)
-                        current_headers.pop("Content-Type", None)
-                    # Rebuild a synthetic request for the redirected hop.
-                    current_request = current_request.copy(url=current_url)
+                    current_url = self._resolve_redirect(
+                        current_request.url.to_string(), location,
+                    )
+                    if response.status in (301, 302, 303) and current_request.method.upper() != "HEAD":
+                        redirect_headers = Headers(current_request.headers)
+                        redirect_headers.pop("Content-Length", None)
+                        redirect_headers.pop("Content-Type", None)
+                        current_request = current_request.copy(
+                            url=current_url, method="GET", buffer=None,
+                            headers=redirect_headers,
+                        )
+                    else:
+                        current_request = current_request.copy(url=current_url)
                     continue
 
             # Retry on status_forcelist (5xx / 429 by default).
             if retries.is_retry(
-                current_method,
+                current_request.method,
                 response.status,
                 response.headers.get("Retry-After") is not None,
             ):
                 try:
                     next_retries = retries.increment(
-                        method=current_method, url=current_url, response=response, _pool=self,
+                        method=current_request.method,
+                        url=current_request.url.to_string(),
+                        response=response, _pool=self,
                     )
                 except MaxRetryError:
                     if retries.raise_on_status:
@@ -709,61 +712,72 @@ class HTTPSession(Session):
         self,
         *,
         request: PreparedRequest,
-        method: str,
-        url: str,
-        body: Any,
-        headers: Mapping[str, str],
         timeout: Any,
         preload_content: bool,
         decode_content: bool,
         tags: Optional[Mapping[str, str]] = None,
     ) -> HTTPResponse:
         """Single wire send — one connection, one ``conn.getresponse``."""
-        parts = urlsplit(url)
-        if not parts.scheme or not parts.netloc:
-            raise LocationParseError(url)
-        scheme = parts.scheme.lower()
+        url = request.url
+        scheme = url.scheme
         if scheme not in ("http", "https"):
             raise LocationValueError(f"Unsupported scheme: {scheme!r}")
-        host = parts.hostname or ""
-        port = parts.port or (443 if scheme == "https" else 80)
-        path = parts.path or "/"
-        if parts.query:
-            path = f"{path}?{parts.query}"
+        host = url.host
+        if not host:
+            raise LocationParseError(url.to_string())
+        port = url.port or (443 if scheme == "https" else 80)
+        path = url.path or "/"
+        if url.query:
+            path = f"{path}?{url.query}"
 
         connect_timeout, read_timeout = _resolve_timeout(timeout)
         key = (scheme, host, port)
         conn = self._get_connection(scheme, host, port, connect_timeout)
+        from_pool = conn.sock is not None
         try:
             # Establish the TCP+TLS connection with the connect timeout.
             # stdlib http.client only applies conn.timeout at connect() time,
             # so setting it after the socket exists is a no-op for reused
             # connections — and for fresh ones, request() would auto-connect
             # with conn.timeout which we must NOT overwrite with read_timeout.
-            if conn.sock is None:
+            if not from_pool:
                 conn.connect()
             # Switch the live socket to the read timeout for request IO +
             # response wait — the connect phase is done.
             if read_timeout is not None and conn.sock is not None:
                 conn.sock.settimeout(read_timeout)
-            send_headers = {k: str(v) for k, v in headers.items()}
+            send_headers = dict(request.headers) if request.headers else {}
             send_headers.setdefault(
                 "Host", f"{host}:{port}" if port not in (80, 443) else host,
             )
-            if (
-                body is not None
-                and "Content-Length" not in send_headers
-                and isinstance(body, (bytes, bytearray))
-            ):
+            body = request.buffer.to_bytes() if request.buffer is not None else None
+            if body is not None and "Content-Length" not in send_headers:
                 send_headers["Content-Length"] = str(len(body))
-            conn.request(method, path, body=body, headers=send_headers)
+            conn.request(request.method, path, body=body, headers=send_headers)
             raw = conn.getresponse()
         except socket.timeout as exc:
             try:
                 conn.close()
             except Exception:
                 pass
-            raise ReadTimeoutError(self, url, str(exc)) from exc
+            raise ReadTimeoutError(self, url.to_string(), str(exc)) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            # Stale pooled connection — the server closed the keep-alive
+            # socket between requests. Retry once on a fresh connection
+            # without charging the caller's retry budget.
+            if from_pool:
+                return self._send_once(
+                    request=request,
+                    timeout=timeout,
+                    preload_content=preload_content,
+                    decode_content=decode_content,
+                    tags=tags,
+                )
+            raise
         except Exception:
             try:
                 conn.close()
@@ -771,11 +785,6 @@ class HTTPSession(Session):
                 pass
             raise
 
-        # Build the high-level :class:`HTTPResponse` directly off the
-        # raw socket. ``release_conn`` on the returned response calls
-        # back into ``self._release_connection`` so the keep-alive
-        # socket goes back to the per-host cache without HTTPSession
-        # having to thread the connection through every caller.
         return HTTPResponse.from_wire(
             request=request,
             raw=raw,
@@ -1300,7 +1309,11 @@ class HTTPSession(Session):
         request: PreparedRequest,
     ) -> HTTPResponse:
         config = request.send_config_or_default
-        wait_cfg = self.waiting if config.wait is None else config.wait
+        wait_cfg = (
+            config.wait
+            if config.wait is not None and config.wait is not DEFAULT_WAITING_CONFIG
+            else self.waiting
+        )
 
         result = self._wire_send(request, wait_cfg)
 
