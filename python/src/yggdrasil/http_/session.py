@@ -1617,16 +1617,18 @@ class HTTPSession(Session):
                 ]
 
         if new_list:
-            _hits = new_list
+            _hits = pa.Table.from_batches(
+                [Response.values_to_arrow_batch(new_list)]
+            )
             wb: list[Callable] = []
             if remote_holder is not None:
-                wb.append(lambda: remote_holder.write_arrow_batches(
-                    Response.values_to_arrow_batch(_hits),
-                    mode=remote_mode or Mode.APPEND,
+                wb.append(lambda: _insert_cache(
+                    remote_holder, misses[0].remote_cache_config, _hits,
+                    mode=remote_mode,
                 ))
             if local_holder is not None:
-                wb.append(lambda: self._backfill_local_cache(
-                    responses_to_tabular(_hits), {local_holder: reqs},
+                wb.append(lambda: _insert_cache(
+                    local_holder, misses[0].local_cache_config, _hits,
                     mode=local_mode,
                 ))
             if wb:
