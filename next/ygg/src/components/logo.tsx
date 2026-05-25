@@ -1,5 +1,6 @@
 // Yggdrasil Tree Logo - SVG component matching the brand
 // Coral/orange tree icon representing the Norse World Tree
+"use client";
 
 export function YggdrasilLogo({ 
   className = "", 
@@ -49,6 +50,94 @@ export function YggdrasilLogo({
         strokeLinecap="round"
         strokeLinejoin="round"
       />
+    </svg>
+  );
+}
+
+// Animated Yggdrasil Tree - Large with SVG animations
+export function AnimatedYggdrasilTree({ className = "" }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 400 500"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      className={`w-full h-full ${className}`}
+    >
+      <defs>
+        <style>{`
+          @keyframes branch-grow {
+            from { stroke-dashoffset: 1000; opacity: 0; }
+            to { stroke-dashoffset: 0; opacity: 1; }
+          }
+          @keyframes glow-pulse {
+            0%, 100% { filter: drop-shadow(0 0 4px rgba(242, 107, 58, 0.4)); }
+            50% { filter: drop-shadow(0 0 12px rgba(242, 107, 58, 0.8)); }
+          }
+          @keyframes float-subtle {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-4px); }
+          }
+          .tree-root { animation: branch-grow 2.5s ease-in-out forwards; stroke-dasharray: 1000; }
+          .tree-trunk { animation: branch-grow 2s ease-in-out forwards; stroke-dasharray: 400; }
+          .tree-branch-left { animation: branch-grow 2.8s ease-in-out 0.3s forwards; stroke-dasharray: 600; }
+          .tree-branch-right { animation: branch-grow 2.8s ease-in-out 0.4s forwards; stroke-dasharray: 600; }
+          .tree-top { animation: branch-grow 3s ease-in-out 0.5s forwards; stroke-dasharray: 500; }
+          .tree-glow { animation: glow-pulse 2s ease-in-out infinite; }
+          .tree-float { animation: float-subtle 3s ease-in-out infinite; }
+        `}</style>
+      </defs>
+      
+      {/* Group with floating animation */}
+      <g className="tree-float tree-glow" transform="translate(200, 50)">
+        {/* Roots */}
+        <path
+          className="tree-root"
+          d="M0 200L-30 250M0 200L30 250"
+          stroke="#f26b3a"
+          strokeWidth="6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        
+        {/* Main trunk */}
+        <path
+          className="tree-trunk"
+          d="M0 200V80"
+          stroke="#f26b3a"
+          strokeWidth="8"
+          strokeLinecap="round"
+        />
+        
+        {/* Left major branch */}
+        <path
+          className="tree-branch-left"
+          d="M0 140L-60 80M-60 80L-90 50M-60 80L-80 60M0 140L-50 90M-50 90L-75 60M-50 90L-70 75"
+          stroke="#f26b3a"
+          strokeWidth="6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        
+        {/* Right major branch */}
+        <path
+          className="tree-branch-right"
+          d="M0 140L60 80M60 80L90 50M60 80L80 60M0 140L50 90M50 90L75 60M50 90L70 75"
+          stroke="#f26b3a"
+          strokeWidth="6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        
+        {/* Top crown */}
+        <path
+          className="tree-top"
+          d="M0 80V20M0 20L-25 10M0 20L25 10M-25 10L-35 0M25 10L35 0"
+          stroke="#f26b3a"
+          strokeWidth="5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </g>
     </svg>
   );
 }
