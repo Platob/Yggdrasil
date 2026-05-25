@@ -2,13 +2,15 @@ import base64
 import datetime as dt
 import io
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Optional, Any, Mapping
+from typing import Optional, Any, ClassVar, Mapping
 
 import yggdrasil.pickle.json as json_module
 from databricks.sdk.errors import NotFound
 from databricks.sdk.service.workspace import AclItem, AclPermission, GetSecretResponse
 from yggdrasil.data.cast import any_to_datetime
+from yggdrasil.dataclasses.singleton import Singleton
 
 from yggdrasil.io.url import URL
 
@@ -307,17 +309,28 @@ class Scope(DatabricksResource):
         return self.service.secret(key, scope=self).refresh(raise_error=False).b64 is not None
 
 
-class Secret(DatabricksResource):
-    service: Secrets = field(
-        default_factory=Secrets,
-        hash=False,
-        compare=False,
-        repr=False
-    )
-    scope: Scope = field(default=None)
-    key: Optional[str] = field(default=None)
-    b64: Optional[str] = field(default=None, repr=False, compare=False)
-    update_timestamp: Optional[dt.datetime] = None
+class Secret(Singleton, DatabricksResource):
+    _SINGLETON_TTL: ClassVar[Any] = 3600.0
+    _VALUE_TTL: ClassVar[float] = 30.0
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_value_fetched_at",
+    })
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        service: Secrets | None = None,
+        scope: "Scope | str | None" = None,
+        key: str | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        if isinstance(scope, Scope):
+            scope_key = scope.key
+        elif isinstance(scope, str):
+            scope_key = scope
+        else:
+            scope_key = None
+        return (cls, scope_key, key)
 
     def __init__(
         self,
@@ -326,14 +339,28 @@ class Secret(DatabricksResource):
         key: Optional[str] = None,
         b64: Optional[str] = None,
         update_timestamp: Optional[dt.datetime] = None,
-        *args, **kwargs
+        *,
+        singleton_ttl: Any = ...,
     ):
-        super().__init__(*args, **kwargs)
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            if update_timestamp is not None:
+                self.update_timestamp = any_to_datetime(update_timestamp)
+            return
+
+        super().__init__(service=service)
         self.service = Secrets.current() if service is None else service
         self.scope = scope
         self.key = key
         self.b64 = b64
-        self.update_timestamp = update_timestamp
+        self.update_timestamp = (
+            any_to_datetime(update_timestamp) if update_timestamp else None
+        )
+        self._value_fetched_at: float | None = None
+        self._initialized = True
+
+    def __getnewargs_ex__(self):
+        return (), {"scope": self.scope, "key": self.key}
 
     @property
     def explore_url(self) -> URL:
@@ -342,11 +369,10 @@ class Secret(DatabricksResource):
             f"/{self.key or 'unknown'}"
         )
 
-    def __post_init__(self):
-        self.scope = Scope.from_(self.scope, service=self.service)
-
-        if self.update_timestamp:
-            self.update_timestamp = any_to_datetime(self.update_timestamp)
+    def _is_value_stale(self) -> bool:
+        if self._value_fetched_at is None:
+            return True
+        return (time.monotonic() - self._value_fetched_at) > self._VALUE_TTL
 
     def set_value(self, value: Any):
         if not isinstance(value, str):
@@ -357,7 +383,6 @@ class Secret(DatabricksResource):
                 self.b64 = base64.b64encode(json_module.dumps(value)).decode("utf-8")
                 return self
 
-        # Check if the value is already base64-encoded to avoid double encoding
         try:
             base64.b64decode(value, validate=True)
             self.b64 = value
@@ -453,7 +478,7 @@ class Secret(DatabricksResource):
         return built
 
     def bvalue(self) -> bytes:
-        if not self.b64:
+        if not self.b64 or self._is_value_stale():
             self.refresh()
 
         return base64.b64decode(self.b64) if self.b64 else b""
@@ -509,6 +534,7 @@ class Secret(DatabricksResource):
                     raise
                 else:
                     return self
+            self._value_fetched_at = time.monotonic()
             LOGGER.info("Fetched secret %r", self)
             return self.set_details(infos)
         return self
@@ -564,3 +590,4 @@ class Secret(DatabricksResource):
             return
 
         LOGGER.info("Deleted secret %r", self)
+        self.invalidate_singleton()
