@@ -1,44 +1,64 @@
 @import "tailwindcss";
 
+/* ── Dark theme (default) ─────────────────────────────────── */
 :root {
-  /* Nordic Dark Theme - inspired by ancient runes and the World Tree */
   --background: #0c0c0f;
   --background-elevated: #12121a;
   --foreground: #e8e6e3;
   --foreground-dim: #a8a5a0;
-  
-  /* Muted tones - ash and stone */
   --muted: #6b6966;
   --muted-foreground: #8a8682;
-  
-  /* Borders - carved edges */
   --border: #252329;
   --border-accent: #3d3a42;
-  
-  /* Card surfaces - ancient wood */
   --card: #15151c;
   --card-hover: #1c1c25;
   --card-elevated: #1a1a24;
-  
-  /* Primary - Yggdrasil Coral/Orange from logo */
+  --sidebar-bg: #0a0a0d;
+  --sidebar-border: #1e1e26;
   --primary: #f26b3a;
   --primary-dim: #c95a30;
   --primary-glow: #f26b3a33;
-  
-  /* Accent - Nordic ice blue for contrast */
   --accent: #5b9bd5;
   --accent-dim: #4a7fb3;
-  
-  /* Status colors */
   --success: #4ade80;
   --warning: #fbbf24;
   --destructive: #ef4444;
   --destructive-dim: #b91c1c;
-  
-  /* Radius */
   --radius: 0.75rem;
   --radius-sm: 0.5rem;
   --radius-lg: 1rem;
+}
+
+/* ── Light theme ──────────────────────────────────────────── */
+.light {
+  --background: #f8f7f5;
+  --background-elevated: #ffffff;
+  --foreground: #1a1a1a;
+  --foreground-dim: #4a4a4a;
+  --muted: #9a9a9a;
+  --muted-foreground: #6a6a6a;
+  --border: #e0ddd8;
+  --border-accent: #ccc9c2;
+  --card: #ffffff;
+  --card-hover: #f2f0ed;
+  --card-elevated: #fafaf8;
+  --sidebar-bg: #f0eee9;
+  --sidebar-border: #dddbd5;
+  --primary: #e85a28;
+  --primary-dim: #c94d21;
+  --primary-glow: #e85a2833;
+  --accent: #4a88c4;
+  --accent-dim: #3a72a8;
+  --success: #16a34a;
+  --warning: #d97706;
+  --destructive: #dc2626;
+  --destructive-dim: #991b1b;
+}
+
+/* ── Sidebar width tokens ─────────────────────────────────── */
+:root {
+  --sidebar-w: 224px;
+  --sidebar-w-collapsed: 56px;
 }
 
 @theme inline {
@@ -53,6 +73,8 @@
   --color-card: var(--card);
   --color-card-hover: var(--card-hover);
   --color-card-elevated: var(--card-elevated);
+  --color-sidebar-bg: var(--sidebar-bg);
+  --color-sidebar-border: var(--sidebar-border);
   --color-primary: var(--primary);
   --color-primary-dim: var(--primary-dim);
   --color-primary-glow: var(--primary-glow);
