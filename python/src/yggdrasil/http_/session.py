@@ -1505,6 +1505,8 @@ class HTTPSession(Session):
                 )
                 self._backfill_local_cache(
                     remote_hits, {local_holder: reqs},
+                    received_at=dt.datetime.now(dt.timezone.utc),
+                    mode=Mode.OVERWRITE,
                 )
 
         if local_hits is not None and remote_holder is not None:
@@ -1821,18 +1823,30 @@ class HTTPSession(Session):
         self,
         data: "Tabular",
         local_cache_map: dict["IO | None", list[PreparedRequest]],
+        *,
+        received_at: "dt.datetime | None" = None,
+        mode: "Mode | None" = None,
     ) -> None:
         """Write cache hits back to the local cache holders in *local_cache_map*."""
         batches = list(data.read_arrow_batches())
         if not batches:
             return
         table = pa.Table.from_batches(batches)
+        if received_at is not None:
+            idx = table.schema.get_field_index("received_at")
+            if idx >= 0:
+                col = pa.array(
+                    [int(received_at.timestamp() * 1_000_000)] * len(table),
+                    type=pa.timestamp("us", "UTC"),
+                )
+                table = table.set_column(idx, table.schema.field(idx), col)
         for holder, requests in local_cache_map.items():
             if holder is None:
                 continue
             cfg = requests[0].local_cache_config
             Job.make(
                 _insert_cache, holder, cfg, table,
+                mode=mode,
             ).fire_and_forget()
 
     def _persist_remote(
