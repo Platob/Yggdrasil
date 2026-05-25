@@ -1347,6 +1347,7 @@ class HTTPSession(Session):
                     raise_error=raise_error,
                 )
 
+        content_bytes = result.body_size
         frames = [init_df]
         for job_result in pool.as_completed(
             jobs(),
@@ -1357,15 +1358,13 @@ class HTTPSession(Session):
             raise_error=True,
         ):
             _, page_resp = job_result.result
+            content_bytes += page_resp.body_size
             frames.append(page_resp.to_polars(parse=True, lazy=False))
 
         final_df = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
         combined_table = final_df.to_arrow(compat_level=pl.CompatLevel.newest())
 
         total_rows = combined_table.num_rows
-        content_bytes = sum(
-            b.serialize().size for b in combined_table.to_batches()
-        )
         if total_rows > 0 and content_bytes > _PAGINATED_RECHUNK_BYTE_SIZE:
             max_chunksize = max(
                 1, total_rows * _PAGINATED_RECHUNK_BYTE_SIZE // content_bytes,
