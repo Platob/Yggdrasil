@@ -104,9 +104,8 @@ LOGGER = logging.getLogger(__name__)
 _SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 # Rechunk byte target for paginated responses assembled by
-# ``_combine_paginated_pages``.  Keeps the IPC file's record batches
-# at a predictable size instead of flushing the whole concatenation as
-# a single oversized batch.
+# ``_combine_paginated_pages``.  Targets the IPC page content size
+# (``RecordBatch.serialize().size``), not the in-memory buffer size.
 _PAGINATED_RECHUNK_BYTE_SIZE: int = 128 * 1024 * 1024
 
 
@@ -1348,6 +1347,7 @@ class HTTPSession(Session):
                     raise_error=raise_error,
                 )
 
+        content_bytes = result.body_size
         frames = [init_df]
         for job_result in pool.as_completed(
             jobs(),
@@ -1358,19 +1358,26 @@ class HTTPSession(Session):
             raise_error=True,
         ):
             _, page_resp = job_result.result
+            content_bytes += page_resp.body_size
             frames.append(page_resp.to_polars(parse=True, lazy=False))
 
         final_df = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
         combined_table = final_df.to_arrow(compat_level=pl.CompatLevel.newest())
 
+        total_rows = combined_table.num_rows
+        if total_rows > 0 and content_bytes > _PAGINATED_RECHUNK_BYTE_SIZE:
+            max_chunksize = max(
+                1, total_rows * _PAGINATED_RECHUNK_BYTE_SIZE // content_bytes,
+            )
+            batches = combined_table.to_batches(max_chunksize=max_chunksize)
+        else:
+            batches = combined_table.to_batches()
+
         new_holder = Memory()
         new_holder.media_type = MediaTypes.ARROW_IPC
         with ArrowIPCFile(holder=new_holder, owns_holder=False, mode="wb") as new_buffer:
             new_buffer.write_arrow_batches(
-                rechunk_arrow_batches(
-                    combined_table.to_batches(),
-                    byte_size=_PAGINATED_RECHUNK_BYTE_SIZE,
-                ),
+                iter(batches),
                 compression="zstd",
             )
 
@@ -1562,7 +1569,7 @@ class HTTPSession(Session):
         return self._send_local_batch(
             local_hits, remote_hits, reqs, misses,
             local_holder=local_holder, remote_holder=remote_holder,
-            local_mode=local_mode,
+            local_mode=local_mode, remote_mode=remote_mode,
             ordered=ordered, max_in_flight=max_in_flight,
         )
 
@@ -1576,6 +1583,7 @@ class HTTPSession(Session):
         local_holder: "IO | None",
         remote_holder: "IO | None",
         local_mode: "Mode | None" = None,
+        remote_mode: "Mode | None" = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
@@ -1596,14 +1604,31 @@ class HTTPSession(Session):
             len(new_list), len(failed),
         )
 
+        if new_list and remote_hits is not None:
+            existing = remote_hits.read_arrow_table()
+            if existing.num_rows > 0:
+                existing_keys = set(zip(
+                    existing.column("public_hash").to_pylist(),
+                    existing.column("body_hash").to_pylist(),
+                ))
+                new_list = [
+                    r for r in new_list
+                    if (r.public_hash, r.body_hash) not in existing_keys
+                ]
+
         if new_list:
-            _hits = new_list
+            _hits = pa.Table.from_batches(
+                [Response.values_to_arrow_batch(new_list)]
+            )
             wb: list[Callable] = []
             if remote_holder is not None:
-                wb.append(lambda: self._persist_remote(_hits))
+                wb.append(lambda: _insert_cache(
+                    remote_holder, misses[0].remote_cache_config, _hits,
+                    mode=remote_mode,
+                ))
             if local_holder is not None:
-                wb.append(lambda: self._backfill_local_cache(
-                    responses_to_tabular(_hits), {local_holder: reqs},
+                wb.append(lambda: _insert_cache(
+                    local_holder, misses[0].local_cache_config, _hits,
                     mode=local_mode,
                 ))
             if wb:
@@ -1665,19 +1690,6 @@ class HTTPSession(Session):
         return HTTPResponseBatch(
             local=local_hits, remote=remote_hits,
             new=result_df, misses=misses, failed=failed,
-        )
-
-    @staticmethod
-    def _remote_write_group_key(cfg: CacheConfig) -> tuple:
-        """Identity used to group responses for a single bulk remote insert."""
-        tab = cfg.tabular
-        tab_key = tab.url if hasattr(tab, "url") else id(tab)
-        return (
-            tab_key,
-            cfg.mode,
-            tuple(cfg.match_by) if cfg.match_by else (),
-            bool(cfg.wait),
-            cfg.anonymize,
         )
 
     @staticmethod
@@ -1838,7 +1850,7 @@ class HTTPSession(Session):
         """Run *tasks* in parallel, re-raising the first failure.
 
         Used by the cache-write path (``_backfill_local_cache``,
-        ``_persist_remote``, stage 4) to fan out independent inserts
+        stage 4 remote persist) to fan out independent inserts
         across threads so a batch that targets several remote tables
         or local cache roots doesn't pay for a head-to-tail
         serialization. ``ThreadPoolExecutor`` is used unconditionally
@@ -1904,72 +1916,6 @@ class HTTPSession(Session):
                 _insert_cache, holder, cfg, table,
                 mode=mode,
             ).fire_and_forget()
-
-    def _persist_remote(
-        self,
-        responses: list[Response],
-    ) -> None:
-        """Stage 4: bulk-insert successful responses into the remote cache.
-
-        Each response's remote cache config is read from
-        ``response.request.remote_cache_config``. Responses are bucketed
-        by the full write-group key (table, mode, match_by, wait,
-        anonymize) so distinct per-request configs don't get collapsed.
-        """
-        groups: dict[tuple, tuple[CacheConfig, list[Response]]] = {}
-        for response in responses:
-            req = response.request
-            if req is None:
-                continue
-            eff = req.remote_cache_config
-            if eff is None or not eff.remote_cache_enabled:
-                continue
-            gkey = self._remote_write_group_key(eff)
-            if gkey not in groups:
-                groups[gkey] = (eff, [])
-            groups[gkey][1].append(response)
-
-        if not groups:
-            LOGGER.info(
-                "Stage 4: no remote-cache groups to persist "
-                "(all configs disabled or missing)",
-            )
-            return
-
-        def _insert_one(
-            mode: "Mode",
-            cfg: "CacheConfig",
-            group_responses: "list[Response]",
-        ) -> None:
-            LOGGER.info(
-                "%s %d response(s) in remote cache %r",
-                "Upserting" if mode == Mode.UPSERT else "Persisting",
-                len(group_responses),
-                cfg.tabular,
-            )
-            # One C++ struct walk over the whole group beats N
-            # per-row builds + an outer ``combine_chunks`` concat —
-            # see :meth:`Response.values_to_arrow_batch`. The result
-            # is a single chunked-on-construction batch wrapped in a
-            # one-element table so the downstream
-            # ``batches["partition_key"]`` slot lookup keeps working.
-            batches = pa.Table.from_batches(
-                [Response.values_to_arrow_batch(group_responses)]
-            )
-            _insert_cache(
-                cfg.tabular, cfg, batches,
-                mode=mode,
-                prune_values=_cache_prune_values_for(batches),
-                raise_error=True,
-            )
-
-        self._run_concurrently(
-            [
-                lambda m=gkey[1], c=cfg, r=group_responses: _insert_one(m, c, r)
-                for gkey, (cfg, group_responses) in groups.items()
-            ],
-            thread_name_prefix="ygg-remote-cache-insert",
-        )
 
     def _send_many(
         self,
@@ -2145,8 +2091,8 @@ class HTTPSession(Session):
 
     def _spark_persist_remote(
         self,
+        holder: "Tabular",
         new_responses_df: "SparkDataFrame",
-        cfg: CacheConfig,
         *,
         spark: "SparkSession",
     ) -> None:
@@ -2155,48 +2101,43 @@ class HTTPSession(Session):
         APPEND-mode writes are de-duplicated against existing rows via
         a ``left_anti`` join on ``(partition_key, public_hash)``.
         """
-        if not cfg.remote_cache_enabled:
-            return
         from pyspark.sql import functions as F
 
-        table_name = cfg.tabular.full_name(safe=True)
+        table_name = holder.full_name(safe=True)
         ok_df = new_responses_df.where(
             (F.col("status_code") >= 200)
             & (F.col("status_code") < 300)
         )
 
-        if cfg.mode != Mode.UPSERT:
-            try:
-                wanted = [
-                    row["partition_key"]
-                    for row in ok_df.select("partition_key").distinct().collect()
-                ]
-            except Exception:
-                wanted = []
+        try:
+            wanted = [
+                row["partition_key"]
+                for row in ok_df.select("partition_key").distinct().collect()
+            ]
+        except Exception:
+            wanted = []
 
-            try:
-                if wanted:
-                    literals = ", ".join(str(int(v)) for v in wanted)
-                    existing = spark.sql(
-                        "SELECT DISTINCT partition_key, public_hash "
-                        f"FROM {table_name} WHERE partition_key IN ({literals})"
-                    )
-                else:
-                    existing = spark.sql(
-                        "SELECT DISTINCT partition_key, public_hash "
-                        f"FROM {table_name}"
-                    )
-                ok_df = ok_df.join(existing, on=["partition_key", "public_hash"], how="left_anti")
-            except Exception as exc:
-                if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
-                    raise
+        try:
+            if wanted:
+                literals = ", ".join(str(int(v)) for v in wanted)
+                existing = spark.sql(
+                    "SELECT DISTINCT partition_key, public_hash "
+                    f"FROM {table_name} WHERE partition_key IN ({literals})"
+                )
+            else:
+                existing = spark.sql(
+                    "SELECT DISTINCT partition_key, public_hash "
+                    f"FROM {table_name}"
+                )
+            ok_df = ok_df.join(existing, on=["partition_key", "public_hash"], how="left_anti")
+        except Exception as exc:
+            if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
+                raise
 
         LOGGER.info(
-            "%s ok response(s) into remote cache %s (spark, mode=%s)",
-            "Upserting" if cfg.mode == Mode.UPSERT else "Persisting",
-            table_name, cfg.mode.name,
+            "Persisting ok response(s) into remote cache %s (spark)", table_name,
         )
-        _insert_cache(cfg.tabular, cfg, ok_df, spark_session=spark, raise_error=True)
+        holder.write_spark_frame(ok_df, mode=Mode.APPEND)
 
     def _spark_fetch_misses(
         self,
