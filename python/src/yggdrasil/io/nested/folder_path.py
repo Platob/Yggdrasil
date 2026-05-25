@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import logging
 import time
 from collections.abc import Mapping
 from threading import RLock
@@ -158,6 +159,9 @@ class FolderOptions(CastOptions):
             )
         if coerced is not self.child_media_type:
             object.__setattr__(self, "child_media_type", coerced)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class FolderPath(IO[bytes, FolderOptions]):
@@ -666,15 +670,12 @@ class FolderPath(IO[bytes, FolderOptions]):
         sink = pa.BufferOutputStream()
         with pa.ipc.new_file(sink, arrow_schema):
             pass  # zero-row file, schema-only
+        sidecar = self.path / self.YGGMETA_DIRNAME / self.YGGMETA_SCHEMA_FILENAME
         try:
-            (
-                self.path
-                / self.YGGMETA_DIRNAME
-                / self.YGGMETA_SCHEMA_FILENAME
-            ).write_bytes(sink.getvalue().to_pybytes(), overwrite=True)
+            sidecar.write_bytes(sink.getvalue().to_pybytes(), overwrite=True)
+            LOGGER.debug("Persisted schema sidecar to %r", sidecar)
         except Exception:
-            # Sidecar is opportunistic — never fail the data write.
-            pass
+            LOGGER.debug("Schema sidecar write failed for %r", sidecar, exc_info=True)
 
     # ==================================================================
     # Children — read
@@ -1111,15 +1112,9 @@ class FolderPath(IO[bytes, FolderOptions]):
         # iter_children iteration.
         free_cols = self._free_cols_for(predicate)
         if self._should_prune_by_predicate(options, free_cols=free_cols):
+            LOGGER.debug("Pruned read from %r — predicate eliminates partition", self)
             return
 
-        # Leaf-partition data cache: a folder bound to a ``<col>=<val>/``
-        # path (non-empty :attr:`static_values`) holds the actual file
-        # leaves for that partition. We cache the union of their
-        # unfiltered batches keyed by the partition's full URL — every
-        # subsequent read of the same partition skips the file
-        # opens / IPC parse and pays only the row-level filter cost
-        # on already-in-memory batches.
         cache_key = self._partition_cache_key()
         if cache_key is not None:
             cached = self._PARTITION_DATA_CACHE.get(cache_key)
@@ -1167,15 +1162,12 @@ class FolderPath(IO[bytes, FolderOptions]):
                     yield kept
 
         if accumulated is not None and cache_key is not None:
-            # Detach the cached batches from any mmap-backed buffer
-            # the leaf reader may have handed up — without this, a
-            # subsequent file close / re-write (e.g. an OVERWRITE on
-            # the same partition) could yank the bytes out from under
-            # the cached batch and a later cache hit would see zero
-            # rows. ``concat_batches`` materialises into in-memory
-            # buffers when given a single chunk, owned independently
-            # of the source file.
             if accumulated:
+                total = sum(b.num_rows for b in accumulated)
+                LOGGER.debug(
+                    "Caching %d batch(es) / %d row(s) for partition %r",
+                    len(accumulated), total, cache_key,
+                )
                 self._PARTITION_DATA_CACHE.set(
                     cache_key, (pa.Table.from_batches(accumulated)
                                  .combine_chunks()
@@ -1375,19 +1367,19 @@ class FolderPath(IO[bytes, FolderOptions]):
         # so the call collapses to a no-op there.
         self._invalidate_partition_cache()
 
-        # Materialise the input once. The partition split needs to
-        # see every batch at once (per-batch splitting scatters one
-        # part file per (batch, value) pair into the same partition
-        # directory), and even the flat-write branch needs the first
-        # batch's schema for the ``.ygg/`` sidecar — buffering up
-        # front is the simplest path that serves both.
         materialised = [b for b in batches if b.num_rows > 0]
         if not materialised:
+            LOGGER.debug("Writing to %r — no non-empty batches, skipping", self)
             return
         first = materialised[0]
+        total_rows = sum(b.num_rows for b in materialised)
         first_schema = self._schema_for_arrow(first.schema)
 
         action = self._resolve_action(options.mode)
+        LOGGER.debug(
+            "Writing %d batch(es) / %d row(s) to %r (mode=%s)",
+            len(materialised), total_rows, self, action,
+        )
         if action is Mode.OVERWRITE:
             from yggdrasil.data.schema import Schema
             self._schema_cache = Schema.empty()
@@ -1461,7 +1453,12 @@ class FolderPath(IO[bytes, FolderOptions]):
             # parquet writer already releases the GIL during the
             # encode that's actually parallelisable. Keep the inline
             # loop until a workload appears where parallelism wins.
-            for scalar in pc.unique(column.combine_chunks()):
+            unique_values = pc.unique(column.combine_chunks())
+            LOGGER.debug(
+                "Partitioning %d row(s) by %r into %d partition(s) in %r",
+                table.num_rows, head, len(unique_values), self,
+            )
+            for scalar in unique_values:
                 value = scalar.as_py()
                 mask = (
                     pc.equal(column, scalar) if value is not None
@@ -1584,6 +1581,7 @@ class FolderPath(IO[bytes, FolderOptions]):
             return
 
         child = self.make_child(options=options)
+        LOGGER.debug("Writing part %r in %r", child, self)
         child.write_arrow_batches(
             _chain_first(first, batch_iter),
             options=_leaf_options(child),
