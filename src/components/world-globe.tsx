@@ -220,7 +220,7 @@ function NodeSpikes({
   );
 }
 
-// ─── Arc Connections ──────────────────────────────────────────────────────────
+// ─── Arc Connections with traveling data packets ─────────────────────────────
 
 function ArcConnections({ nodes, arcs, rotation }: { nodes: BotNode[]; arcs: ArcDef[]; rotation: number }) {
   const groupRef = useRef<THREE.Group>(null);
@@ -231,7 +231,7 @@ function ArcConnections({ nodes, arcs, rotation }: { nodes: BotNode[]; arcs: Arc
     if (groupRef.current) groupRef.current.rotation.y = rotation;
   });
 
-  const arcGeometries = useMemo(() => {
+  const arcData = useMemo(() => {
     return arcs.map(({ fromId, toId }, idx) => {
       const from = nodes.find((n) => n.id === fromId);
       const to = nodes.find((n) => n.id === toId);
@@ -241,20 +241,56 @@ function ArcConnections({ nodes, arcs, rotation }: { nodes: BotNode[]; arcs: Arc
       const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
       mid.normalize().multiplyScalar(GLOBE_RADIUS + start.distanceTo(end) * 0.22);
       const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
-      return { geometry: new THREE.TubeGeometry(curve, 44, 0.007, 6, false), idx };
+      return { 
+        geometry: new THREE.TubeGeometry(curve, 44, 0.006, 6, false), 
+        curve,
+        idx,
+        speed: 0.3 + Math.random() * 0.2,
+        offset: Math.random(),
+      };
     });
   }, [nodes, arcs]);
 
   return (
     <group ref={groupRef}>
-      {arcGeometries.map((arc) => {
+      {arcData.map((arc) => {
         if (!arc) return null;
+        
+        // Arc tube with pulsing opacity
         const phase = (t * 0.45 + arc.idx * 0.28) % 3;
-        const opacity = (phase < 1 ? phase : phase < 2 ? 1 : 3 - phase) * 0.55;
+        const opacity = (phase < 1 ? phase : phase < 2 ? 1 : 3 - phase) * 0.4;
+        
+        // Data packet positions - 2-3 packets per arc at different phases
+        const packets = [0, 0.33, 0.66].map((offset, i) => {
+          const progress = ((t * arc.speed + arc.offset + offset) % 1);
+          const pos = arc.curve.getPoint(progress);
+          const size = 0.025 + 0.01 * Math.sin(t * 4 + i);
+          return { pos, size, key: `${arc.idx}-${i}` };
+        });
+
         return (
-          <mesh key={arc.idx} geometry={arc.geometry}>
-            <meshBasicMaterial color="#f26b3a" transparent opacity={opacity} />
-          </mesh>
+          <group key={arc.idx}>
+            {/* Arc tube */}
+            <mesh geometry={arc.geometry}>
+              <meshBasicMaterial color="#f26b3a" transparent opacity={opacity} />
+            </mesh>
+            
+            {/* Traveling data packets */}
+            {packets.map(({ pos, size, key }) => (
+              <group key={key}>
+                {/* Glowing core */}
+                <mesh position={pos}>
+                  <sphereGeometry args={[size * 0.6, 8, 8]} />
+                  <meshBasicMaterial color="#ffffff" />
+                </mesh>
+                {/* Outer glow */}
+                <mesh position={pos}>
+                  <sphereGeometry args={[size, 8, 8]} />
+                  <meshBasicMaterial color="#f26b3a" transparent opacity={0.5} />
+                </mesh>
+              </group>
+            ))}
+          </group>
         );
       })}
     </group>
@@ -323,6 +359,81 @@ function Stars() {
   );
 }
 
+// ─── Distant Planets (galaxy feel) ────────────────────────────────────────────
+
+const PLANETS = [
+  { distance: 9, size: 0.35, color: "#4a88c4", orbitSpeed: 0.015, tilt: 0.3, hasRing: true },
+  { distance: 12, size: 0.22, color: "#9b59b6", orbitSpeed: 0.008, tilt: -0.2, hasRing: false },
+  { distance: 15, size: 0.18, color: "#e74c3c", orbitSpeed: 0.012, tilt: 0.5, hasRing: false },
+  { distance: 7.5, size: 0.15, color: "#f39c12", orbitSpeed: 0.02, tilt: -0.4, hasRing: false },
+];
+
+function DistantPlanets() {
+  const groupRef = useRef<THREE.Group>(null);
+  const [t, setT] = useState(0);
+
+  useFrame((_, delta) => {
+    setT((v) => v + delta);
+  });
+
+  return (
+    <group ref={groupRef}>
+      {PLANETS.map((planet, i) => {
+        const angle = t * planet.orbitSpeed + (i * Math.PI * 0.5);
+        const x = Math.cos(angle) * planet.distance;
+        const z = Math.sin(angle) * planet.distance;
+        const y = Math.sin(angle * 0.5 + i) * planet.tilt * 2;
+
+        return (
+          <group key={i} position={[x, y, z]}>
+            {/* Planet body */}
+            <mesh rotation={[0, t * 0.1, planet.tilt]}>
+              <sphereGeometry args={[planet.size, 24, 24]} />
+              <meshStandardMaterial 
+                color={planet.color} 
+                metalness={0.3} 
+                roughness={0.7}
+                emissive={planet.color}
+                emissiveIntensity={0.1}
+              />
+            </mesh>
+            
+            {/* Atmosphere glow */}
+            <mesh>
+              <sphereGeometry args={[planet.size * 1.15, 16, 16]} />
+              <meshBasicMaterial 
+                color={planet.color} 
+                transparent 
+                opacity={0.08} 
+                side={THREE.BackSide} 
+              />
+            </mesh>
+            
+            {/* Ring (for Saturn-like planet) */}
+            {planet.hasRing && (
+              <mesh rotation={[Math.PI * 0.5, 0, planet.tilt]}>
+                <ringGeometry args={[planet.size * 1.4, planet.size * 2, 32]} />
+                <meshBasicMaterial 
+                  color={planet.color} 
+                  transparent 
+                  opacity={0.25} 
+                  side={THREE.DoubleSide} 
+                />
+              </mesh>
+            )}
+            
+            {/* Orbit trail (faint) */}
+            <mesh rotation={[Math.PI * 0.5, 0, 0]} position={[-x, -y, -z]}>
+              <ringGeometry args={[planet.distance - 0.01, planet.distance + 0.01, 64]} />
+              <meshBasicMaterial color="#ffffff" transparent opacity={0.03} side={THREE.DoubleSide} />
+            </mesh>
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
 // ─── Camera fit helper ────────────────────────────────────────────────────────
 
 function CameraSetup({ isMobile }: { isMobile: boolean }) {
@@ -361,6 +472,7 @@ function GlobeScene({
       <pointLight position={[0, 0, 5]} intensity={0.18} />
 
       <Stars />
+      <DistantPlanets />
       <Halo />
       <GlobeCore rotation={rotation} />
       <EarthDots rotation={rotation} />
