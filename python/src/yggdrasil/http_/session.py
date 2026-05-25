@@ -735,8 +735,17 @@ class HTTPSession(Session):
         key = (scheme, host, port)
         conn = self._get_connection(scheme, host, port, connect_timeout)
         try:
-            if read_timeout is not None:
-                conn.timeout = read_timeout
+            # Establish the TCP+TLS connection with the connect timeout.
+            # stdlib http.client only applies conn.timeout at connect() time,
+            # so setting it after the socket exists is a no-op for reused
+            # connections — and for fresh ones, request() would auto-connect
+            # with conn.timeout which we must NOT overwrite with read_timeout.
+            if conn.sock is None:
+                conn.connect()
+            # Switch the live socket to the read timeout for request IO +
+            # response wait — the connect phase is done.
+            if read_timeout is not None and conn.sock is not None:
+                conn.sock.settimeout(read_timeout)
             send_headers = {k: str(v) for k, v in headers.items()}
             send_headers.setdefault(
                 "Host", f"{host}:{port}" if port not in (80, 443) else host,
