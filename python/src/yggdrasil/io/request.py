@@ -24,7 +24,6 @@ from .headers import Headers
 from .holder import Holder
 from .memory import Memory
 from .url import URL, URL_STRUCT
-from ..data import Mode
 
 if TYPE_CHECKING:
     from .response import Response
@@ -423,21 +422,11 @@ class PreparedRequest:
     def local_cache_config(self) -> "CacheConfig | None":
         """Per-request local :class:`CacheConfig`, delegated to :attr:`send_config`."""
         sc = self.send_config
-
         if sc is None:
-            return sc
-
+            return None
         config = sc.local_cache
-
-        if config is None:
+        if config is None or not config.cache_enabled:
             return None
-
-        if config.mode not in (Mode.APPEND, Mode.AUTO, Mode.UPSERT):
-            return None
-
-        if config.tabular is None:
-            object.__setattr__(config, "tabular", self.session.local_cache())
-
         return config
 
     @property

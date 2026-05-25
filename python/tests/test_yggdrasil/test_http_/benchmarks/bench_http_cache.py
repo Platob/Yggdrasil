@@ -51,7 +51,7 @@ from yggdrasil.io.memory import Memory
 from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import CacheConfig, SendConfig
+from yggdrasil.io.send_config import CacheConfig
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -362,11 +362,9 @@ def _local_folder_cache_scenarios(repeat: int) -> list[dict]:
 def _session_cache_scenarios(repeat: int) -> list[dict]:
     out: list[dict] = []
 
-    local_send_cfg = SendConfig(local_cache=CFG_LOCAL)
-    hit_req = REQ.copy(send_config=local_send_cfg)
     out.append(_time_one(
         "Session._load_cached_response (local hit)",
-        lambda: SESSION._load_cached_response(hit_req, source="local"),
+        lambda: SESSION._load_cached_response(REQ, CFG_LOCAL),
         repeat=repeat, inner=500,
     ))
 
@@ -374,21 +372,19 @@ def _session_cache_scenarios(repeat: int) -> list[dict]:
         "GET",
         "https://api.example.com/v1/missing?cold=1",
         headers={"Content-Type": "application/json"},
-        send_config=local_send_cfg,
     )
     _ = miss_req.public_hash
     out.append(_time_one(
         "Session._load_cached_response (local miss)",
-        lambda: SESSION._load_cached_response(miss_req, source="local"),
+        lambda: SESSION._load_cached_response(miss_req, CFG_LOCAL),
         repeat=repeat, inner=2_000,
     ))
 
     store_cfg = CacheConfig(tabular=tempfile.mkdtemp(prefix="ygg-bench-store-"))
-    store_req = REQ.copy(send_config=SendConfig(local_cache=store_cfg))
     out.append(_time_one(
         "Session._store_cached_response (local, fire-and-forget)",
         lambda: SESSION._store_cached_response(
-            RESP, source="local", request=store_req,
+            RESP, store_cfg, async_write=True,
         ),
         repeat=repeat, inner=500,
     ))

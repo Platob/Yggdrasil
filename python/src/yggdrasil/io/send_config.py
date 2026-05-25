@@ -668,29 +668,6 @@ class CacheConfig(_ConfigBase):
         object.__setattr__(self, "tabular", tabular)
         return tabular
 
-    def prebuild(self, session: "Session | None" = None) -> "CacheConfig":
-        """Materialise :attr:`tabular` for local-cache configs.
-
-        After this call the session-level cache flow can reach for
-        ``cfg.tabular`` directly without a ``cache_tabular(session)``
-        dance. Symmetric to remote configs which always ship with a
-        prebuilt :attr:`tabular`.
-
-        No-op when :attr:`tabular` is already set or
-        :attr:`local_cache_enabled` is False (mode disables the
-        cache, no ``received_*`` window, etc).
-
-        Returns ``self`` so callers can chain
-        ``cfg.prebuild(session)`` at the entry of
-        :meth:`Session._send_many_batches`.
-        """
-        if self.tabular is not None:
-            return self
-        if not self.local_cache_enabled:
-            return self
-        self.cache_tabular(session=session)
-        return self
-
     def request_values(
         self,
         request: PreparedRequest,
