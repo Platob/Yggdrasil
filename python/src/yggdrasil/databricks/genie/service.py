@@ -362,13 +362,20 @@ class Genie(DatabricksService):
         return trashed
 
     def _create_managed_space(self) -> GenieSpace:
-        """Create a Genie space using the ``managed_space_*`` defaults."""
+        """Create a Genie space using the ``managed_space_*`` defaults.
+
+        When ``warehouse_id`` is unset, falls back to the workspace
+        default warehouse via :meth:`resolve_warehouse`.
+        """
         if not self.defaults.managed_space_tables:
             raise ValueError(
                 "Cannot auto-create a Genie space without "
                 "Genie.defaults.managed_space_tables — Genie requires at "
                 "least one fully-qualified `catalog.schema.table` to expose."
             )
+        wh_id = self.defaults.warehouse_id
+        if not wh_id:
+            wh_id = self.resolve_warehouse().warehouse_id
         serialized = build_serialized_space(
             tables=self.defaults.managed_space_tables,
             text_instructions=self.defaults.managed_space_instructions,
@@ -377,10 +384,10 @@ class Genie(DatabricksService):
             "Creating Genie space %r (tables=%r, warehouse_id=%r)",
             self.defaults.managed_space_title,
             tuple(self.defaults.managed_space_tables),
-            self.defaults.warehouse_id,
+            wh_id,
         )
         return self.create_space(
-            warehouse_id=self.defaults.warehouse_id,
+            warehouse_id=wh_id,
             serialized_space=serialized,
             title=self.defaults.managed_space_title or DEFAULT_MANAGED_SPACE_TITLE,
             description=self.defaults.managed_space_description,

@@ -254,7 +254,7 @@ class GenieDefaults:
     wait: WaitingConfig = DEFAULT_WAIT
     auto_execute_query: bool = True
     auto_pick_space: bool = True
-    auto_create_space: bool = False
+    auto_create_space: bool = True
     cleanup_dead_spaces: bool = False
     managed_space_title: str = DEFAULT_MANAGED_SPACE_TITLE
     managed_space_description: Optional[str] = None
