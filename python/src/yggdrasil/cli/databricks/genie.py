@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shlex
 import sys
 from dataclasses import replace as _dc_replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 from yggdrasil.cli.databricks.base import DatabricksCLI
@@ -354,6 +356,27 @@ class GenieCLI(DatabricksCLI):
     # ------------------------------------------------------------------ #
     # Credential setup
     # ------------------------------------------------------------------ #
+    _CREDS_FILE = Path(
+        os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache",
+    ) / "yggdrasil" / "genie" / ".credentials.json"
+
+    def _load_saved_creds(self) -> "dict[str, str | None]":
+        try:
+            import json
+            return json.loads(self._CREDS_FILE.read_text("utf-8"))
+        except Exception:
+            return {}
+
+    def _save_creds(self, host: str, token: "str | None") -> None:
+        try:
+            import json
+            self._CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._CREDS_FILE.write_text(
+                json.dumps({"host": host, "token": token}), "utf-8",
+            )
+        except Exception:
+            pass
+
     def _ensure_connected(self) -> bool:
         """Validate the client can reach Databricks, prompting on failure."""
         try:
@@ -361,6 +384,18 @@ class GenieCLI(DatabricksCLI):
             return True
         except Exception:
             pass
+        saved = self._load_saved_creds()
+        if saved.get("host"):
+            try:
+                from yggdrasil.databricks.client import DatabricksClient
+                self.client = DatabricksClient(
+                    host=saved["host"], token=saved.get("token"),
+                )
+                self.client.make_config()
+                self.success(f"  connected to {saved['host']} (saved credentials)")
+                return True
+            except Exception:
+                pass
         self.warn("  Databricks credentials not configured.")
         return self._prompt_credentials()
 
@@ -368,11 +403,15 @@ class GenieCLI(DatabricksCLI):
         """Interactively ask for host (+ optional token) and rebuild the client."""
         from yggdrasil.databricks.client import DatabricksClient
 
+        saved = self._load_saved_creds()
+        saved_host = saved.get("host") or ""
+        prefill_hint = f", default={saved_host}" if saved_host else ""
+
         try:
             host = self.input_fn(
                 self.style.cyan("  host ")
-                + self.style.dim("(e.g. https://adb-123.7.azuredatabricks.net): "),
-            ).strip()
+                + self.style.dim(f"(e.g. https://adb-123.7.azuredatabricks.net{prefill_hint}): "),
+            ).strip() or saved_host
             if not host:
                 self.error("  host is required.")
                 return False
@@ -387,6 +426,7 @@ class GenieCLI(DatabricksCLI):
         try:
             self.client = DatabricksClient(host=host, token=token)
             self.client.make_config()
+            self._save_creds(host, token)
             self.success(f"  connected to {host}")
             return True
         except Exception as exc:
