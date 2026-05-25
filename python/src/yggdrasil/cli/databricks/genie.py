@@ -33,6 +33,7 @@ LOGGER = logging.getLogger(__name__)
 _SLASH_HELP: dict[str, str] = {
     "/help": "Show this list of commands.",
     "/quit, /exit": "Leave the REPL.",
+    "/login": "Configure Databricks credentials (host + token).",
     "/clear": "Clear the screen.",
     "/reset": "Start a fresh Genie conversation (does NOT clear local history).",
     "/history": "Print every Q & A from this session.",
@@ -123,6 +124,7 @@ class GenieCLI(DatabricksCLI):
             "help": self._cmd_help,
             "quit": self._cmd_quit,
             "exit": self._cmd_quit,
+            "login": self._cmd_login,
             "clear": self._cmd_clear,
             "reset": self._cmd_reset,
             "history": self._cmd_history,
@@ -317,7 +319,9 @@ class GenieCLI(DatabricksCLI):
         was supplied, fall back to a single-shot ask + exit (no REPL
         prompt). Otherwise drop into the REPL.
         """
-        # Merge CLI flags into the Genie service's defaults once on entry.
+        if not self._ensure_connected():
+            return 2
+
         self.genie.defaults = self.defaults_from_args(self.args, self.genie.defaults)
 
         if getattr(self.args, "deploy_skills", False):
@@ -327,6 +331,49 @@ class GenieCLI(DatabricksCLI):
         if question is not None:
             return self.ask_once(question)
         return self.run_repl()
+
+    # ------------------------------------------------------------------ #
+    # Credential setup
+    # ------------------------------------------------------------------ #
+    def _ensure_connected(self) -> bool:
+        """Validate the client can reach Databricks, prompting on failure."""
+        try:
+            self.client.make_config()
+            return True
+        except Exception:
+            pass
+        self.warn("  Databricks credentials not configured.")
+        return self._prompt_credentials()
+
+    def _prompt_credentials(self) -> bool:
+        """Interactively ask for host + token and rebuild the client."""
+        from yggdrasil.databricks.client import DatabricksClient
+
+        try:
+            host = self.input_fn(
+                self.style.cyan("  host ") + self.style.dim("(e.g. https://adb-123.7.azuredatabricks.net): "),
+            ).strip()
+            if not host:
+                self.error("  host is required.")
+                return False
+            token = self.input_fn(
+                self.style.cyan("  token ") + self.style.dim("(PAT): "),
+            ).strip()
+            if not token:
+                self.error("  token is required.")
+                return False
+        except (EOFError, KeyboardInterrupt):
+            self.out("")
+            return False
+
+        try:
+            self.client = DatabricksClient(host=host, token=token)
+            self.client.make_config()
+            self.success("  connected.")
+            return True
+        except Exception as exc:
+            self.error(f"  failed: {exc}")
+            return False
 
     # ------------------------------------------------------------------ #
     # Workspace skill deployment
@@ -517,6 +564,9 @@ class GenieCLI(DatabricksCLI):
     def _cmd_quit(self, _args: list[str]) -> bool:
         self.info("bye.")
         return True
+
+    def _cmd_login(self, _args: list[str]) -> None:
+        self._prompt_credentials()
 
     def _cmd_clear(self, _args: list[str]) -> None:
         if self.style.enabled:
