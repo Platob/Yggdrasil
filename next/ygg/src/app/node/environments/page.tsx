@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { node as api, type EnvironmentEntry } from "@/lib/api";
+import { node as api, type EnvironmentEntry, type NodeInfo } from "@/lib/api";
+import { formatRelative } from "@/lib/time";
 import Link from "next/link";
 
 // ── Demo data ────────────────────────────────────────────────
@@ -97,8 +98,16 @@ export default function EnvironmentsPage() {
   const [formDeps, setFormDeps] = useState("");
   const [formSubmitting, setFormSubmitting] = useState(false);
 
+  // Clone modal state
+  const [cloneTarget, setCloneTarget] = useState<EnvironmentEntry | null>(null);
+  const [cloneName, setCloneName] = useState("");
+  const [cloneNodeId, setCloneNodeId] = useState("");
+  const [cloning, setCloning] = useState(false);
+  const [nodes, setNodes] = useState<NodeInfo[]>([]);
+
   useEffect(() => {
     loadEnvironments();
+    loadNodes();
   }, []);
 
   async function loadEnvironments() {
@@ -112,6 +121,37 @@ export default function EnvironmentsPage() {
       setEnvironments(DEMO_ENVIRONMENTS);
     }
     setLoading(false);
+  }
+
+  async function loadNodes() {
+    try {
+      const [selfData, peersData] = await Promise.all([
+        api.getNodeInfo(),
+        api.getPeers(),
+      ]);
+      setNodes([selfData, ...peersData.peers]);
+    } catch {
+      // non-critical
+    }
+  }
+
+  function openCloneModal(env: EnvironmentEntry) {
+    setCloneTarget(env);
+    setCloneName(`${env.name}-copy`);
+    setCloneNodeId("");
+  }
+
+  async function handleClone() {
+    if (!cloneTarget) return;
+    setCloning(true);
+    try {
+      await api.cloneEnvironment(cloneTarget.id, cloneName || undefined);
+      setCloneTarget(null);
+      await loadEnvironments();
+    } catch (e) {
+      setError(`Clone failed: ${e}`);
+    }
+    setCloning(false);
   }
 
   async function handleCreate(e: React.FormEvent) {
@@ -321,6 +361,21 @@ export default function EnvironmentsPage() {
                   </div>
                 )}
 
+                {/* Sync state */}
+                <div className="mt-2">
+                  {env.last_used_at ? (
+                    <span className="text-[10px] text-success flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-success" />
+                      Synced {formatRelative(env.last_used_at)}
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-warning flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-warning" />
+                      Not synced
+                    </span>
+                  )}
+                </div>
+
                 {/* Timestamps */}
                 <div className="flex gap-4 text-[10px] text-muted mt-2">
                   <span>Created: {new Date(env.created_at).toLocaleDateString()}</span>
@@ -339,6 +394,12 @@ export default function EnvironmentsPage() {
                   </button>
                 )}
                 <button
+                  onClick={() => openCloneModal(env)}
+                  className="btn-ghost text-xs"
+                >
+                  Clone
+                </button>
+                <button
                   onClick={() => handleDelete(env.id)}
                   className="btn-ghost text-xs text-destructive hover:bg-destructive/10"
                 >
@@ -356,6 +417,55 @@ export default function EnvironmentsPage() {
           <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-4">
             Create your first environment
           </button>
+        </div>
+      )}
+
+      {/* Clone Modal */}
+      {cloneTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setCloneTarget(null)} />
+          <div className="relative nordic-card p-6 w-full max-w-md space-y-4 mx-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-foreground">Clone environment to node</h3>
+              <button onClick={() => setCloneTarget(null)} className="text-muted hover:text-foreground transition-colors">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Target Node</label>
+              <select
+                value={cloneNodeId}
+                onChange={(e) => setCloneNodeId(e.target.value)}
+                className="input-nordic w-full text-sm"
+              >
+                <option value="">Local (this node)</option>
+                {nodes.map((n) => (
+                  <option key={n.node_id} value={n.node_id}>{n.node_id}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs text-muted mb-1.5">New Name</label>
+              <input
+                type="text"
+                value={cloneName}
+                onChange={(e) => setCloneName(e.target.value)}
+                className="input-nordic w-full text-sm font-mono"
+                placeholder="environment-name-copy"
+              />
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button onClick={() => setCloneTarget(null)} className="btn-ghost text-sm">Cancel</button>
+              <button onClick={handleClone} disabled={cloning} className="btn-primary text-sm">
+                {cloning ? "Cloning..." : "Clone"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

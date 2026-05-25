@@ -122,6 +122,37 @@ export default function FunctionsPage() {
     }
   }
 
+  async function loadNodes() {
+    try {
+      const [selfData, peersData] = await Promise.all([
+        api.getNodeInfo(),
+        api.getPeers(),
+      ]);
+      setNodes([selfData, ...peersData.peers]);
+    } catch {
+      // non-critical
+    }
+  }
+
+  function openCloneModal(fn: FunctionEntry) {
+    setCloneTarget(fn);
+    setCloneName(`${fn.name}-copy`);
+    setCloneNodeId("");
+  }
+
+  async function handleClone() {
+    if (!cloneTarget) return;
+    setCloning(true);
+    try {
+      await api.cloneFunction(cloneTarget.id, cloneName || undefined);
+      setCloneTarget(null);
+      await loadFunctions();
+    } catch (e) {
+      setError(`Clone failed: ${e}`);
+    }
+    setCloning(false);
+  }
+
   async function handleRun(id: number) {
     setRunningId(id);
     setRunResult(null);
@@ -350,6 +381,21 @@ export default function FunctionsPage() {
                 </div>
               )}
 
+              {/* Sync state */}
+              <div className="pt-1">
+                {fn.last_used_at ? (
+                  <span className="text-[10px] text-success flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-success" />
+                    Synced {formatRelative(fn.last_used_at)}
+                  </span>
+                ) : (
+                  <span className="text-[10px] text-warning flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-warning" />
+                    Not synced
+                  </span>
+                )}
+              </div>
+
               <div className="flex gap-2 pt-2">
                 <Link
                   href={`/node/functions/${fn.id}`}
@@ -364,6 +410,12 @@ export default function FunctionsPage() {
                 >
                   {runningId === fn.id ? "Running..." : "Run"}
                 </button>
+                <button
+                  onClick={() => openCloneModal(fn)}
+                  className="btn-ghost text-xs"
+                >
+                  Clone
+                </button>
               </div>
             </div>
           </div>
@@ -376,6 +428,55 @@ export default function FunctionsPage() {
           <button onClick={() => setShowForm(true)} className="btn-primary text-sm mt-4">
             Create your first function
           </button>
+        </div>
+      )}
+
+      {/* Clone Modal */}
+      {cloneTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setCloneTarget(null)} />
+          <div className="relative nordic-card p-6 w-full max-w-md space-y-4 mx-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-foreground">Clone function to node</h3>
+              <button onClick={() => setCloneTarget(null)} className="text-muted hover:text-foreground transition-colors">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs text-muted mb-1.5">Target Node</label>
+              <select
+                value={cloneNodeId}
+                onChange={(e) => setCloneNodeId(e.target.value)}
+                className="input-nordic w-full text-sm"
+              >
+                <option value="">Local (this node)</option>
+                {nodes.map((n) => (
+                  <option key={n.node_id} value={n.node_id}>{n.node_id}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs text-muted mb-1.5">New Name</label>
+              <input
+                type="text"
+                value={cloneName}
+                onChange={(e) => setCloneName(e.target.value)}
+                className="input-nordic w-full text-sm font-mono"
+                placeholder="function-name-copy"
+              />
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button onClick={() => setCloneTarget(null)} className="btn-ghost text-sm">Cancel</button>
+              <button onClick={handleClone} disabled={cloning} className="btn-primary text-sm">
+                {cloning ? "Cloning..." : "Clone"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
