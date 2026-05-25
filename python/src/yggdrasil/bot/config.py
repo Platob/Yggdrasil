@@ -27,15 +27,16 @@ def _default_node_id() -> str:
 
 
 def _find_open_port(start: int = 8100, end: int = 8200) -> int:
-    for port in range(start, end):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("0.0.0.0", port))
-                return port
-        except OSError:
-            continue
-    return start
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", start))
+            return start
+    except OSError:
+        pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("0.0.0.0", 0))
+        return s.getsockname()[1]
 
 
 @dataclass(frozen=True, slots=True)
