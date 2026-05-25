@@ -513,10 +513,9 @@ class TestRemoteCacheSend:
         s.send(req, remote_cache=cfg, raise_error=False)
         assert tab.inserts == [], "5xx response must not write back to remote"
 
-    def test_upsert_skips_both_lookup_and_writeback(self) -> None:
-        # ``CacheConfig.cache_enabled`` gates the remote flow on
-        # ``mode in (APPEND, AUTO)``, so UPSERT short-circuits the
-        # whole remote cache: no lookup query, no writeback insert.
+    def test_upsert_skips_lookup_but_persists(self) -> None:
+        # UPSERT bypasses the cache read (always goes to the network)
+        # but still persists the response for downstream consumers.
         tab = _FakeRemoteTabular()
         cfg = _remote_cfg(tab, mode=Mode.UPSERT)
         req = make_request("https://example.com/x")
@@ -529,7 +528,8 @@ class TestRemoteCacheSend:
         assert len(s.calls) == 1, "UPSERT must always go to the network"
         assert out.json() == {"v": "fresh"}
         assert tab.predicates == [], "UPSERT must not issue a lookup query"
-        assert tab.inserts == [], "UPSERT short-circuits the writeback too"
+        assert len(tab.inserts) == 1, "UPSERT must persist the fresh response"
+        assert tab.inserts[0]["mode"] == Mode.UPSERT
 
     def test_per_request_override_routes_to_alt_table(self) -> None:
         # Session-level config holds the cached row in tab_a;
@@ -615,9 +615,8 @@ class TestRemoteCacheSendMany:
         assert len(tab_b.predicates) == 1
 
     def test_writeback_groups_split_by_mode(self) -> None:
-        # APPEND + UPSERT in the same batch — APPEND should write back,
-        # UPSERT should short-circuit (see ``cache_enabled`` gate),
-        # leaving exactly one insert call on the table.
+        # APPEND + UPSERT in the same batch — both persist but as
+        # separate writeback groups (different modes).
         tab = _FakeRemoteTabular()
         append_cfg = _remote_cfg(tab, mode=Mode.APPEND)
         upsert_cfg = _remote_cfg(tab, mode=Mode.UPSERT)
@@ -635,12 +634,13 @@ class TestRemoteCacheSendMany:
         )
         list(s.send_many(iter([a, b])))
 
-        # Two network calls (UPSERT always misses), one writeback
-        # group (only APPEND persists).
+        # Both requests go to the network (UPSERT skips read, APPEND
+        # misses because the remote is empty). Two writeback groups —
+        # one per mode — each with one row.
         assert len(s.calls) == 2
-        assert len(tab.inserts) == 1
-        assert tab.inserts[0]["mode"] == Mode.APPEND
-        assert tab.inserts[0]["rows"] == 1
+        modes = {i["mode"] for i in tab.inserts}
+        assert modes == {Mode.APPEND, Mode.UPSERT}
+        assert all(i["rows"] == 1 for i in tab.inserts)
 
 
 # ===========================================================================

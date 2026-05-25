@@ -418,9 +418,9 @@ class TestGenieFeedback(GenieTestCase):
 class TestGenieManagedDefaults(GenieTestCase):
     """New ``GenieDefaults`` fields covering auto-create + cleanup."""
 
-    def test_managed_defaults_have_sensible_off_state(self):
+    def test_managed_defaults_have_sensible_defaults(self):
         d = self.genie.defaults
-        self.assertFalse(d.auto_create_space)
+        self.assertTrue(d.auto_create_space)
         self.assertFalse(d.cleanup_dead_spaces)
         self.assertEqual(d.managed_space_title, DEFAULT_MANAGED_SPACE_TITLE)
         self.assertEqual(d.managed_space_tables, ())
@@ -500,7 +500,8 @@ class TestGenieEnsureSpace(GenieTestCase):
             managed_space_description="auto",
         )
         self.genie_api.list_spaces.return_value = MagicMock(spaces=[])
-        created = MagicMock(space_id="new-id", title=DEFAULT_MANAGED_SPACE_TITLE)
+        expected_title = self.genie._resolve_managed_title()
+        created = MagicMock(space_id="new-id", title=expected_title)
         self.genie_api.create_space.return_value = created
 
         space = self.genie.ensure_space()
@@ -509,7 +510,7 @@ class TestGenieEnsureSpace(GenieTestCase):
 
         call = self.genie_api.create_space.call_args
         self.assertEqual(call.kwargs["warehouse_id"], "wh-1")
-        self.assertEqual(call.kwargs["title"], DEFAULT_MANAGED_SPACE_TITLE)
+        self.assertEqual(call.kwargs["title"], expected_title)
         self.assertEqual(call.kwargs["description"], "auto")
         # serialized_space carries our minimal payload.
         self.assertIn("main.sales.orders", call.kwargs["serialized_space"])

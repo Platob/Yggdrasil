@@ -455,8 +455,12 @@ class CacheConfig(_ConfigBase):
         return cache
 
     @property
-    def cache_enabled(self):
+    def cache_read_enabled(self):
         return self.mode in (Mode.APPEND, Mode.AUTO)
+
+    @property
+    def cache_enabled(self):
+        return self.mode in (Mode.APPEND, Mode.AUTO, Mode.UPSERT, Mode.OVERWRITE)
 
     @property
     def local_cache_enabled(self):
