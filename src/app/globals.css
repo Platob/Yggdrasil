@@ -1,0 +1,260 @@
+@import "tailwindcss";
+
+:root {
+  /* Nordic Dark Theme - inspired by ancient runes and the World Tree */
+  --background: #0c0c0f;
+  --background-elevated: #12121a;
+  --foreground: #e8e6e3;
+  --foreground-dim: #a8a5a0;
+  
+  /* Muted tones - ash and stone */
+  --muted: #6b6966;
+  --muted-foreground: #8a8682;
+  
+  /* Borders - carved edges */
+  --border: #252329;
+  --border-accent: #3d3a42;
+  
+  /* Card surfaces - ancient wood */
+  --card: #15151c;
+  --card-hover: #1c1c25;
+  --card-elevated: #1a1a24;
+  
+  /* Primary - Yggdrasil Coral/Orange from logo */
+  --primary: #f26b3a;
+  --primary-dim: #c95a30;
+  --primary-glow: #f26b3a33;
+  
+  /* Accent - Nordic ice blue for contrast */
+  --accent: #5b9bd5;
+  --accent-dim: #4a7fb3;
+  
+  /* Status colors */
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --destructive: #ef4444;
+  --destructive-dim: #b91c1c;
+  
+  /* Radius */
+  --radius: 0.75rem;
+  --radius-sm: 0.5rem;
+  --radius-lg: 1rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-background-elevated: var(--background-elevated);
+  --color-foreground: var(--foreground);
+  --color-foreground-dim: var(--foreground-dim);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-border-accent: var(--border-accent);
+  --color-card: var(--card);
+  --color-card-hover: var(--card-hover);
+  --color-card-elevated: var(--card-elevated);
+  --color-primary: var(--primary);
+  --color-primary-dim: var(--primary-dim);
+  --color-primary-glow: var(--primary-glow);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-destructive: var(--destructive);
+  --color-destructive-dim: var(--destructive-dim);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --radius: var(--radius);
+  --radius-sm: var(--radius-sm);
+  --radius-lg: var(--radius-lg);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* Selection - primary glow */
+::selection {
+  background: var(--primary);
+  color: #000;
+}
+
+/* Custom scrollbar - carved style */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--background);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-accent);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-in {
+  animation: fadeIn 0.4s ease-out;
+}
+
+@keyframes pulse-primary {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+.pulse-primary {
+  animation: pulse-primary 2s ease-in-out infinite;
+}
+
+@keyframes glow {
+  0%, 100% { box-shadow: 0 0 8px var(--primary-glow); }
+  50% { box-shadow: 0 0 20px var(--primary-glow), 0 0 30px var(--primary-glow); }
+}
+.glow-primary {
+  animation: glow 3s ease-in-out infinite;
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+.spin-slow {
+  animation: spin-slow 1.5s linear infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, transparent, var(--primary-glow), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+}
+
+/* Runic decorative border pattern */
+.rune-border {
+  position: relative;
+}
+.rune-border::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, var(--primary) 0%, transparent 50%, var(--primary) 100%);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0.3;
+}
+
+/* Focus ring */
+.focus-ring:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--primary);
+}
+
+/* Nordic card styling */
+.nordic-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  transition: all 0.2s ease;
+}
+.nordic-card:hover {
+  background: var(--card-hover);
+  border-color: var(--border-accent);
+}
+
+/* Button base */
+.btn-primary {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dim) 100%);
+  color: #fff;
+  font-weight: 600;
+  padding: 0.625rem 1.25rem;
+  border-radius: var(--radius);
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px var(--primary-glow);
+}
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px var(--primary-glow);
+}
+.btn-primary:active {
+  transform: translateY(0);
+}
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--muted);
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  transition: all 0.2s ease;
+}
+.btn-ghost:hover {
+  color: var(--foreground);
+  background: var(--card-hover);
+  border-color: var(--border);
+}
+
+/* Input styling */
+.input-nordic {
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.625rem 0.875rem;
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  transition: all 0.2s ease;
+}
+.input-nordic:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+.input-nordic::placeholder {
+  color: var(--muted);
+}
+
+/* Code block styling */
+.code-block {
+  background: var(--background-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+
+/* Status indicators */
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.status-dot.online {
+  background: var(--success);
+  box-shadow: 0 0 8px var(--success);
+}
+.status-dot.offline {
+  background: var(--destructive);
+}
+.status-dot.pending {
+  background: var(--warning);
+  animation: pulse-primary 1.5s ease-in-out infinite;
+}
