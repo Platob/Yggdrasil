@@ -1072,58 +1072,32 @@ class FolderPath(IO[bytes, FolderOptions]):
     # ==================================================================
 
     def _read_spark_frame(self, options: FolderOptions) -> "Any":
-        """Read via Spark: scatter leaf Holders to executors via mapInArrow.
-
-        1. Driver walks iter_children with predicate pruning (cheap).
-        2. Collects leaf Tabular children.
-        3. Pickles + broadcasts the children.
-        4. mapInArrow: each executor unpickles its Holders and reads Arrow batches.
-        """
+        """Read via Spark: scatter leaf Holders to executors via mapInArrow."""
         import pickle
         from yggdrasil.environ import PyEnv
 
         spark = PyEnv.spark_session(create=True, import_error=True)
+        schema = self._collect_schema(options)
+        spark_schema = schema.to_spark_schema()
 
         leaves: list = []
         self._collect_leaves(leaves, options)
 
         if not leaves:
-            schema = self._collect_schema(options)
-            spark_schema = schema.to_spark_schema() if hasattr(schema, "to_spark_schema") else None
-            if spark_schema:
-                return spark.createDataFrame([], schema=spark_schema)
-            return options.cast_spark(
-                spark.createDataFrame(self._read_arrow_table(options).to_pandas())
-            )
+            return spark.createDataFrame([], schema=spark_schema)
 
-        arrow_schema = self._collect_schema(options)
-        if hasattr(arrow_schema, "to_arrow_schema"):
-            arrow_schema = arrow_schema.to_arrow_schema()
-        from yggdrasil.data.schema import Schema
-        spark_schema = Schema.from_arrow(arrow_schema).to_spark_schema()
+        leaf_table = pa.table({"_pkl": [pickle.dumps(leaf) for leaf in leaves]})
+        leaf_df = spark.createDataFrame(leaf_table.to_pandas())
 
-        try:
-            default_par = max(spark.sparkContext.defaultParallelism, 1)
-        except Exception:
-            default_par = 4
-        n_parts = max(1, min(len(leaves), default_par * 2))
-
-        leaf_bytes = [pickle.dumps(leaf) for leaf in leaves]
-        index_df = spark.createDataFrame(
-            [(i,) for i in range(len(leaf_bytes))], schema=["_idx"]
-        ).repartition(n_parts)
-
-        bc_leaves = spark.sparkContext.broadcast(leaf_bytes)
         bc_options = spark.sparkContext.broadcast(options)
 
         def _read_holders(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
             opts = bc_options.value
             for batch in batches:
-                for idx in batch.column("_idx").to_pylist():
-                    leaf = pickle.loads(bc_leaves.value[idx])
-                    yield from leaf.read_arrow_batches(options=opts)
+                for pkl in batch.column("_pkl").to_pylist():
+                    yield from pickle.loads(pkl).read_arrow_batches(options=opts)
 
-        return index_df.mapInArrow(_read_holders, schema=spark_schema)
+        return leaf_df.mapInArrow(_read_holders, schema=spark_schema)
 
     def _collect_leaves(
         self, out: list, options: "FolderOptions",
