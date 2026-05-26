@@ -737,15 +737,10 @@ class ArrowTabular(Tabular[CastOptions]):
     def _ingest(self, source: ArrowSource) -> None:
         if source is None:
             return
-
-        # Arrow-native shapes first — these are the hot paths and skip
-        # the module-name sniff entirely.
         if isinstance(source, pa.RecordBatch):
-            self._append_batch(source)
-            self._maybe_spill()
+            batches = [source]
+        elif isinstance(source, pa.Table):
+            batches = source.to_batches()
+        else:
             return
-        if isinstance(source, pa.Table):
-            for batch in source.to_batches():
-                self._append_batch(batch)
-            self._maybe_spill()
-            return
+        self._write_arrow_batches(batches, CastOptions(mode=Mode.APPEND))
