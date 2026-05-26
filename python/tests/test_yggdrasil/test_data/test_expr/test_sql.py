@@ -130,10 +130,10 @@ class TestFromSqlRoundtrip:
         assert to_sql(back) == "`d` BETWEEN 1 AND 10"
 
     def test_between_timestamp_call_lifts_typed_literals(self):
-        # ``TIMESTAMP('...')`` parses as ``Cast(string-lit, TIMESTAMP)``
-        # in sqlglot. The lifter folds the cast into a typed
-        # :class:`Literal` carrying a Python ``datetime`` so the
-        # rendered SQL regenerates the ``TIMESTAMP 'iso'`` form.
+        # ``TIMESTAMP('...')`` parses as ``Cast(string-lit, TIMESTAMP)``.
+        # The lifter folds the cast into a typed :class:`Literal`
+        # carrying a Python ``datetime`` so the rendered SQL
+        # regenerates the ``TIMESTAMP 'iso'`` form.
         back = from_sql(
             "issue_date BETWEEN TIMESTAMP('2024-01-01 00:00:00') "
             "AND TIMESTAMP('2024-02-01 00:00:00')"

@@ -8,18 +8,6 @@ form, not a copy of its bytes) plus a cached :class:`Schema` so the
 planner-style "what columns does X have" lookup collapses to one
 ``collect_schema`` call per registration.
 
-Why a three-level engine in addition to :class:`SqlContext`
------------------------------------------------------------
-
-:class:`yggdrasil.execution.sql.SqlContext` is the flat
-``name → Tabular`` mapping the SQL executor uses. It deliberately
-ignores catalog / schema namespacing because the executor's call sites
-only need a single identifier. :class:`TabularEngine` covers the
-opposite need: code (catalog browsers, integration glue, multi-tenant
-session state) that *does* care about the full ``catalog.schema.name``
-shape and wants to ask "list every table in this schema" without
-reparsing strings. The two registries are deliberately independent;
-register into whichever fits the call site.
 """
 
 from __future__ import annotations
@@ -33,7 +21,6 @@ from yggdrasil.execution.plan import ExecutionPlan, PlanOp
 
 if TYPE_CHECKING:
     from yggdrasil.data.schema import Schema
-    from yggdrasil.execution.sql.statement import SqlStatementResult
 
 
 __all__ = [
@@ -45,7 +32,6 @@ __all__ = [
     "get",
     "resolve",
     "execute_plan",
-    "execute_sql",
 ]
 
 
@@ -134,9 +120,10 @@ class TabularEngine:
         here.
         """
         key = self._check_key(catalog, schema, name)
-        from yggdrasil.execution.sql.catalog import coerce_source
-        io = coerce_source(tabular)
-        entry = TabularEntry(catalog=key[0], schema=key[1], name=key[2], tabular=io)
+        if not isinstance(tabular, Tabular):
+            from yggdrasil.io import Holder
+            tabular = Holder.from_(tabular)
+        entry = TabularEntry(catalog=key[0], schema=key[1], name=key[2], tabular=tabular)
         with self._lock:
             self._entries[key] = entry
         return entry
@@ -377,38 +364,6 @@ class TabularEngine:
         return tabular.execute_plan(coerced)
 
     # ------------------------------------------------------------------
-    # SQL execution — delegate to the existing SQL Engine, feeding it
-    # this engine's entries as named sources.
-    # ------------------------------------------------------------------
-
-    def execute_sql(
-        self,
-        query: str,
-        *,
-        sources: "Mapping[str, Any] | None" = None,
-        **kwargs: Any,
-    ) -> "SqlStatementResult":
-        """Run *query* through :class:`yggdrasil.execution.sql.Engine`,
-        with this engine's entries available as named sources.
-
-        Each entry is registered under three aliases — its dotted
-        ``catalog.schema.name``, ``schema.name``, and bare ``name`` —
-        so SQL referencing any spelling resolves. Per-call *sources*
-        override individual aliases without polluting the engine.
-        """
-        from yggdrasil.execution.sql.engine import Engine as _SqlEngine
-
-        merged: dict[str, Any] = {}
-        with self._lock:
-            for k, e in self._entries.items():
-                merged.setdefault(k[2], e.tabular)
-                merged.setdefault(f"{k[1]}.{k[2]}", e.tabular)
-                merged[f"{k[0]}.{k[1]}.{k[2]}"] = e.tabular
-        if sources:
-            merged.update(sources)
-        return _SqlEngine(sources=merged).execute(query, **kwargs)
-
-    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -478,8 +433,3 @@ def execute_plan(
 ) -> Tabular:
     """Apply *plan* to *source* on :data:`SYSTEM_ENGINE`."""
     return SYSTEM_ENGINE.execute_plan(source, plan)
-
-
-def execute_sql(query: str, **kwargs: Any) -> "SqlStatementResult":
-    """Run *query* through :data:`SYSTEM_ENGINE`."""
-    return SYSTEM_ENGINE.execute_sql(query, **kwargs)

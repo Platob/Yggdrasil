@@ -349,37 +349,6 @@ def databricks_error_class():
     return DatabricksError
 
 
-# ---------------------------------------------------------------------------
-# SQL — sqlglot is the parser; polars is the preferred execution backend
-# ---------------------------------------------------------------------------
-
-
-_SQLGLOT_HINT = (
-    "sqlglot is required for yggdrasil.sql parsing; "
-    "install it with `pip install sqlglot` or "
-    "`pip install ygg[sql]`."
-)
-
-
-def sqlglot_module(*, install: bool = False):
-    return _lazy_import("sqlglot", install=install, hint=_SQLGLOT_HINT)
-
-
-def sqlglot_expressions(*, install: bool = False):
-    return _lazy_import(
-        "sqlglot.expressions", "sqlglot", install=install, hint=_SQLGLOT_HINT,
-    )
-
-
-def has_sqlglot() -> bool:
-    """Probe-only — never raises."""
-    try:
-        sqlglot_module()
-    except ImportError:
-        return False
-    return True
-
-
 def has_polars() -> bool:
     """Probe-only — never raises."""
     try:
@@ -408,7 +377,6 @@ _LAZY_ATTRS: "dict[str, Any]" = {
     "WorkspaceClient": databricks_workspace_client_class,
     "Config": databricks_config_class,
     "DatabricksError": databricks_error_class,
-    "sqlglot": sqlglot_module,
 }
 
 

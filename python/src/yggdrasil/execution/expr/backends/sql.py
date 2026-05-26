@@ -23,7 +23,7 @@ from __future__ import annotations
 import datetime as dt
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 from ..nodes import (
     Arithmetic,
@@ -1010,9 +1010,3 @@ def _resolve_cast_dtype_str(name: str) -> Any:
         return DataType.from_str(name)
     except Exception:
         return None
-
-
-# Iterable was used by the previous sqlglot wrapper; kept here so the
-# per-dialect override tables downstreams add later still resolve the
-# import.
-_ = Iterable
