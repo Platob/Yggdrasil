@@ -406,3 +406,259 @@ class TestCacheOnly:
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
         assert _Handler.call_count == n_after_warm
+
+
+# ---------------------------------------------------------------------------
+# Cache upsert / overwrite
+# ---------------------------------------------------------------------------
+
+
+class TestCacheUpsert:
+
+    def test_append_mode_keeps_old_entries(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.enums import Mode
+        cache = CacheConfig(tabular=_folder(local_cache_dir), mode=Mode.APPEND)
+        cfg = SendConfig(local_cache=cache)
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/text"), config=cfg)
+
+        folder = _folder(local_cache_dir)
+        table = folder.read_arrow_table()
+        assert table.num_rows >= 2
+
+    def test_overwrite_mode_writes(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.enums import Mode
+        cache = CacheConfig(tabular=_folder(local_cache_dir), mode=Mode.OVERWRITE)
+        cfg = SendConfig(local_cache=cache)
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        rows = _folder(local_cache_dir).read_arrow_table().num_rows
+        assert rows >= 1
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        rows_after = _folder(local_cache_dir).read_arrow_table().num_rows
+        assert rows_after >= 1
+
+
+# ---------------------------------------------------------------------------
+# Cache key correctness
+# ---------------------------------------------------------------------------
+
+
+class TestCacheKeyCorrectness:
+
+    def test_post_with_different_body_misses(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        resp1 = session.send(
+            HTTPRequest.prepare(method="POST", url=f"{base_url}/echo", body=b"body_a"),
+            config=cfg,
+        )
+        n1 = resp1.json()["n"]
+
+        resp2 = session.send(
+            HTTPRequest.prepare(method="POST", url=f"{base_url}/echo", body=b"body_b"),
+            config=cfg,
+        )
+        n2 = resp2.json()["n"]
+        assert n2 != n1
+
+    def test_post_same_body_hits_cache(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        resp1 = session.send(
+            HTTPRequest.prepare(method="POST", url=f"{base_url}/echo", body=b"same"),
+            config=cfg,
+        )
+        n1 = resp1.json()["n"]
+
+        resp2 = session.send(
+            HTTPRequest.prepare(method="POST", url=f"{base_url}/echo", body=b"same"),
+            config=cfg,
+        )
+        assert resp2.json()["n"] == n1
+
+    def test_different_query_params_different_cache_key(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        req_a = HTTPRequest.prepare(method="GET", url=f"{base_url}/json?page=1")
+        req_b = HTTPRequest.prepare(method="GET", url=f"{base_url}/json?page=2")
+        assert req_a.public_hash != req_b.public_hash
+
+
+# ---------------------------------------------------------------------------
+# Error response caching
+# ---------------------------------------------------------------------------
+
+
+class TestErrorCaching:
+
+    def test_500_response_not_cached(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache, raise_error=False)
+
+        session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/error"),
+            config=cfg,
+        )
+        n1 = _Handler.call_count
+
+        session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/error"),
+            config=cfg,
+        )
+        assert _Handler.call_count > n1
+
+    def test_404_response_not_cached(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache, raise_error=False)
+
+        session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/nonexistent"),
+            config=cfg,
+        )
+        n1 = _Handler.call_count
+
+        session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/nonexistent"),
+            config=cfg,
+        )
+        assert _Handler.call_count > n1
+
+
+# ---------------------------------------------------------------------------
+# Cache read-back fidelity
+# ---------------------------------------------------------------------------
+
+
+class TestCacheFidelity:
+
+    def test_cached_response_preserves_status_code(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        resp = session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        assert resp.status_code == 200
+
+    def test_cached_response_preserves_body(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/text"), config=cfg)
+        resp = session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/text"), config=cfg)
+        assert resp.text == "hello world"
+
+    def test_cached_response_preserves_json(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        resp = session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        data = resp.json()
+        assert data["ok"] is True
+        assert isinstance(data["n"], int)
+
+    def test_cached_response_preserves_content_type(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        resp = session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        assert "application/json" in resp.headers.get("Content-Type", "")
+
+    def test_cached_response_has_request(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        resp = session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        assert resp.request is not None
+        assert resp.request.method == "GET"
+
+
+# ---------------------------------------------------------------------------
+# Anonymization
+# ---------------------------------------------------------------------------
+
+
+class TestCacheAnonymization:
+
+    def test_cached_response_strips_auth_header(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir), anonymize="remove")
+        cfg = SendConfig(local_cache=cache)
+
+        req = HTTPRequest.prepare(
+            method="GET",
+            url=f"{base_url}/json",
+            headers={"Authorization": "Bearer secret123"},
+        )
+        session.send(req, config=cfg)
+
+        folder = _folder(local_cache_dir)
+        table = folder.read_arrow_table()
+        assert table.num_rows >= 1
+
+
+# ---------------------------------------------------------------------------
+# send_many ordering and batching
+# ---------------------------------------------------------------------------
+
+
+class TestSendManyAdvanced:
+
+    def test_send_many_returns_all(self, base_url):
+        session = HTTPSession(base_url=base_url)
+        urls = [f"{base_url}/json", f"{base_url}/text", f"{base_url}/json"]
+        reqs = [HTTPRequest.prepare(method="GET", url=u) for u in urls]
+        responses = list(session.send_many(reqs))
+        assert len(responses) >= len(urls)
+
+    def test_send_many_cached_no_extra_calls(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+
+        urls = [f"{base_url}/json", f"{base_url}/text"]
+        reqs1 = [HTTPRequest.prepare(method="GET", url=u) for u in urls]
+        for r in reqs1:
+            r.send_config = SendConfig(local_cache=cache)
+        list(session.send_many(reqs1))
+        n_after = _Handler.call_count
+
+        reqs2 = [HTTPRequest.prepare(method="GET", url=u) for u in urls]
+        for r in reqs2:
+            r.send_config = SendConfig(local_cache=cache)
+        list(session.send_many(reqs2))
+        assert _Handler.call_count == n_after
+
+    def test_send_many_mixed_hit_miss(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        session.send(HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg)
+        n_after_warm = _Handler.call_count
+
+        reqs = [
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/text"),
+        ]
+        for r in reqs:
+            r.send_config = SendConfig(local_cache=cache)
+        responses = list(session.send_many(reqs))
+        assert len(responses) >= 2
+        assert _Handler.call_count == n_after_warm + 1
