@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     from .catalog.catalogs import Catalogs
     from .compute.service import Compute
     from .genie import Genie
-    from .jobs.service import Jobs
     from .schema.schemas import Schemas
     from .secrets.service import Secrets
     from .sql.engine import SQLEngine
@@ -179,7 +178,3 @@ class DatabricksService(ABC):
         """Databricks AI umbrella service (shorthand for ``client.ai``)."""
         return self.client.ai
 
-    @property
-    def jobs(self) -> "Jobs":
-        """Databricks Jobs service (shorthand for ``client.jobs``)."""
-        return self.client.jobs

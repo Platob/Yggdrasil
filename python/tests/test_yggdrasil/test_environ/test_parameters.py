@@ -822,29 +822,6 @@ class TestFromEnvironment:
 
 
 # ============================================================================
-# NotebookConfig backward-compat alias
-# ============================================================================
-
-
-class TestNotebookConfigAlias:
-    def test_alias_identity(self) -> None:
-        from yggdrasil.databricks.jobs.config import NotebookConfig
-        assert NotebookConfig is SystemParameters
-
-    def test_subclass_works(self) -> None:
-        from yggdrasil.databricks.jobs.config import NotebookConfig
-
-        class Config(NotebookConfig):
-            count: int = 1
-
-        cfg = Config(argv=["--count=42"], dbutils=None)
-        assert cfg.count == 42
-
-    def test_reexport_from_jobs_package(self) -> None:
-        from yggdrasil.databricks.jobs import NotebookConfig
-        assert NotebookConfig is SystemParameters
-
-
 # ============================================================================
 # Converters: any_to_holder, any_to_path
 # ============================================================================

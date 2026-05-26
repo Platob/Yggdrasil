@@ -87,9 +87,6 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
-    from yggdrasil.databricks.jobs.job import Job as DatabricksJob
-    from yggdrasil.databricks.table.async_job import AsyncApplierTaskType
-    from yggdrasil.databricks.table.async_write import AsyncInsert
     from yggdrasil.data.statement import StatementBatch
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
@@ -1230,7 +1227,6 @@ class Table(DatabricksPath):
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
         self._staging_volume: Volume | None = None
-        self._async_job: "DatabricksJob | None" = None
         self._initialized = True
 
     # ------------------------------------
@@ -2096,7 +2092,7 @@ class Table(DatabricksPath):
         # external / explicit-storage paths fall through to the legacy
         # drop + recreate (UC's tables.create API has no replace verb).
         if or_replace:
-            self.delete(wait=True, missing_ok=True, delete_staging=False, delete_job=False)
+            self.delete(wait=True, missing_ok=True, delete_staging=False)
 
         if self.exists:
             if mode == Mode.ERROR_IF_EXISTS:
@@ -2834,7 +2830,6 @@ class Table(DatabricksPath):
         wait: WaitingConfigArg = True,
         missing_ok: bool = False,
         delete_staging: bool = True,
-        delete_job: bool = True
     ) -> "Table":
         # ``delete_staging=False`` keeps the staging volume around for
         # internal drop-and-recreate flows (OVERWRITE) where the very
@@ -2843,8 +2838,8 @@ class Table(DatabricksPath):
         # upload and surface as PATH_NOT_FOUND on the warehouse INSERT.
         uc = self.client.workspace_client().tables
         logger.debug(
-            "Deleting table %r (wait=%s, delete_staging=%s, delete_job=%s)",
-            self, bool(wait), delete_staging, delete_job
+            "Deleting table %r (wait=%s, delete_staging=%s)",
+            self, bool(wait), delete_staging,
         )
 
         if wait:
@@ -2853,14 +2848,11 @@ class Table(DatabricksPath):
 
                 if delete_staging and self._staging_volume:
                     self._staging_volume.delete(wait=False)
-
-                if delete_job and self._async_job:
-                    self._async_job.delete(wait=False)
             except DatabricksError:
                 if not missing_ok:
                     raise
         else:
-            Job.make(self.delete, delete_staging=delete_staging, delete_job=delete_job).fire_and_forget()
+            Job.make(self.delete, delete_staging=delete_staging).fire_and_forget()
 
         self.invalidate_singleton(remove_global=True)
         logger.info("Deleted table %r", self)
@@ -3117,11 +3109,7 @@ class Table(DatabricksPath):
         return_data: bool = False,
         **kwargs
     ) -> "Tabular | None":
-        """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
-
-        For the deferred / drop-and-apply-later flow, see
-        :meth:`async_insert`.
-        """
+        """Insert *data* into this table — thin wrapper over :meth:`insert_into`."""
         return self.insert_into(
             data,
             mode=mode,
@@ -3130,128 +3118,6 @@ class Table(DatabricksPath):
             raise_error=raise_error,
             spark_session=spark_session,
             return_data=return_data,
-            **kwargs,
-        )
-
-    def async_job(
-        self,
-        *,
-        applier: Any = ...,
-        task_type: "AsyncApplierTaskType" = "notebook",
-        force: bool = False,
-        **overrides: Any,
-    ) -> "DatabricksJob":
-        """Get-or-create the per-table applier :class:`Job` for async inserts.
-
-        One Databricks Job per ``(catalog, schema, table)`` triple,
-        watching this table's own
-        ``<table>/.sql/async/insert/data/`` folder via a
-        file-arrival trigger. ``**overrides`` flow into
-        :meth:`AsyncInsertJob.settings` for per-deploy knobs
-        (``schedule=``, ``file_arrival_trigger=``, ``parameters=``,
-        …).
-
-        :meth:`AsyncInsertJob.settings` auto-stages
-        :func:`AsyncInsertJob.apply_records` as the default task —
-        the source is uploaded under
-        ``/Workspace/Shared/.ygg/jobs/<key>/main-<digest>.py`` and a
-        matching :class:`JobEnvironment` lands on ``environments``.
-        ``task_type`` picks the flavour:
-
-        * ``"notebook"`` (default) — Databricks notebook with cells
-          (imports + metadata, captured locals, the ``@checkargs``
-          body, widget-driven invocation that pulls
-          ``catalog_name`` / ``schema_name`` / ``table_name`` from
-          the Job's parameters via ``dbutils.widgets.get``). The UI
-          shows stdout / ``LOGGER`` lines under the cell that
-          produced them.
-        * ``"spark"`` — flat ``SparkPythonTask`` script wired with
-          ``parameters=["{{job.parameters.<name>}}", …]`` so the
-          rendered ``sys.argv`` reads still pick up the Job's
-          parameters at run time. Single-stream logs.
-
-        Pass ``applier=my_func`` to stage a custom callable instead,
-        or ``applier=None`` to leave the job tasks-less.
-
-        By default a pre-existing Job with the matching name
-        short-circuits the deploy — useful when the same table is
-        wired up from multiple processes. Pass ``force=True`` to
-        always re-stage the applier and push the rebuilt settings
-        through :meth:`Jobs.create_or_update` instead — the call to
-        make after upgrading ``yggdrasil`` so the staged task picks
-        up the latest renderer (e.g. the notebook conversion replaces
-        a previously-staged ``SparkPythonTask`` whose ``apply_records()``
-        invocation can't see the job's ``{{job.parameters.*}}``
-        bindings).
-        """
-        if self._async_job is not None:
-            return self._async_job
-
-        from .async_job import AsyncInsertJob
-
-        jobs = self.client.jobs
-
-        if not force:
-            # Pre-check before staging the applier — an existing job
-            # short-circuits the workspace write entirely.
-            prelim_name = AsyncInsertJob.job_name(self)
-            found = jobs.find(name=prelim_name)
-            if found is not None:
-                return found
-
-        settings = AsyncInsertJob.settings(
-            self, applier=applier, task_type=task_type, **overrides,
-        )
-        name = settings.pop("name")
-        self._async_job = jobs.create_or_update(name=name, **settings)
-        return self._async_job
-
-    def async_insert(
-        self,
-        data: Any,
-        *,
-        mode: ModeLike = None,
-        match_by: Optional[list[str]] = None,
-        require_job: bool = True,
-        **kwargs,
-    ) -> "AsyncInsert":
-        """Stage *data* as an async insert and return the metadata record.
-
-        Rows are cast to the target schema and dropped (alongside a
-        JSON metadata file describing the operation) under the
-        table's ``<table>/.sql/async/insert`` staging folder for a
-        downstream applier to pick up; the SQL insert is *not*
-        executed. The constructed :class:`AsyncInsert` is itself a
-        :class:`WarehouseStatementBatch`, so binding an executor and
-        submitting is a single ``.execute(engine)`` call. The caller
-        can also ``merge_with`` peers, or schedule the apply via the
-        per-table :class:`AsyncInsertJob` in :mod:`.async_job`. See
-        :mod:`.async_write` for the wire format.
-
-        ``require_job`` (default ``True``) ensures the per-table
-        applier Job exists before any staging round trip — without one,
-        staged payloads sit in the table's
-        ``<table>/.sql/async/insert/`` folder forever with no
-        consumer. The check rides through :meth:`Table.async_job`,
-        whose :meth:`Jobs.find` lookup caches the ``name → job_id``
-        mapping for 60 s; the steady-state cost is sub-millisecond.
-        A missing job is auto-deployed via :meth:`Table.async_job`
-        with default settings — pass ``require_job=False`` to skip the
-        check entirely (e.g. seeding payloads before
-        :meth:`Table.async_job` deploys a tuned applier from a
-        different process).
-        """
-        from .async_write import stage_async_insert
-
-        if require_job:
-            self.async_job()
-
-        return stage_async_insert(
-            self,
-            data,
-            mode=mode,
-            match_by=match_by,
-            lazy=True,
             **kwargs,
         )
 
@@ -3374,13 +3240,9 @@ class Table(DatabricksPath):
     def staging_folder(
         self,
         temporary: bool = False,
-        async_write: bool = False,
     ) -> VolumePath:
         """Return the staging folder for this table."""
-        if async_write:
-            return self.staging_volume.path(".sql/async/insert", temporary=temporary)
-        else:
-            return self.staging_volume.path(".sql/tmp", temporary=temporary)
+        return self.staging_volume.path(".sql/tmp", temporary=temporary)
 
     def insert_volume_path(
         self,
@@ -3885,7 +3747,7 @@ class Table(DatabricksPath):
         cast_options = CastOptions.check(options=cast_options)
 
         if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, missing_ok=True, delete_staging=False, delete_job=False)
+            self.delete(wait=True, missing_ok=True, delete_staging=False)
 
         if not self.exists:
             target_field = cast_options.target

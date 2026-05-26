@@ -64,39 +64,6 @@ class TestMainHelp(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
 
 
-class TestJobsHelp(unittest.TestCase):
-
-    def test_jobs_help_exits_zero(self):
-        with self.assertRaises(SystemExit) as ctx:
-            main(["jobs", "--help"])
-        self.assertEqual(ctx.exception.code, 0)
-
-    def test_jobs_list_help(self):
-        with self.assertRaises(SystemExit) as ctx:
-            main(["jobs", "list", "--help"])
-        self.assertEqual(ctx.exception.code, 0)
-
-    def test_jobs_get_help(self):
-        with self.assertRaises(SystemExit) as ctx:
-            main(["jobs", "get", "--help"])
-        self.assertEqual(ctx.exception.code, 0)
-
-    def test_jobs_create_help(self):
-        with self.assertRaises(SystemExit) as ctx:
-            main(["jobs", "create", "--help"])
-        self.assertEqual(ctx.exception.code, 0)
-
-    def test_jobs_delete_help(self):
-        with self.assertRaises(SystemExit) as ctx:
-            main(["jobs", "delete", "--help"])
-        self.assertEqual(ctx.exception.code, 0)
-
-    def test_jobs_run_help(self):
-        with self.assertRaises(SystemExit) as ctx:
-            main(["jobs", "run", "--help"])
-        self.assertEqual(ctx.exception.code, 0)
-
-
 class TestClustersHelp(unittest.TestCase):
 
     def test_clusters_help_exits_zero(self):

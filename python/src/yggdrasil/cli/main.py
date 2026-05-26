@@ -10,7 +10,6 @@ Subcommands::
     ygg node chat       Open YGGCHAT terminal
     ygg node status     Show running node status
     ygg node stop       Stop the background node
-    ygg genie           Launch YGGGENIE conversational CLI
     ygg databricks      YGGDBKS Databricks management CLI
 """
 from __future__ import annotations
@@ -85,10 +84,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     stop = node_sub.add_parser("stop", help="Stop the node.")
     stop.set_defaults(handler=_node_stop)
-
-    # -- genie -------------------------------------------------------------
-    genie = sub.add_parser("genie", help="Launch YGGGENIE.", add_help=False)
-    genie.set_defaults(handler=_genie)
 
     # -- databricks --------------------------------------------------------
     dbks = sub.add_parser("databricks", help="YGGDBKS Databricks management.", add_help=False)
@@ -356,12 +351,6 @@ def _node_stop(args: argparse.Namespace) -> int:
     else:
         out(f"  {red('no running node found.')}\n")
     return 0
-
-
-def _genie(args: argparse.Namespace) -> int:
-    from yggdrasil.cli.databricks.genie import main as genie_main
-    remaining = sys.argv[2:] if len(sys.argv) > 2 else []
-    return genie_main(remaining)
 
 
 def _databricks(args: argparse.Namespace) -> int:

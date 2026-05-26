@@ -33,7 +33,6 @@ from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:
     from .iam import IAM
-    from .jobs.service import Jobs
     from .sql.engine import SQLEngine
     from .table.tables import Tables
     from .column.columns import Columns
@@ -45,7 +44,6 @@ if TYPE_CHECKING:
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
     from .path import DatabricksPath
-    from .genie import Genie
     from .ai import DatabricksAI
     from .tags.service import EntityTags
 
@@ -323,9 +321,7 @@ class DatabricksClient(Singleton, URLBased):
             "_catalogs",
             "_schemas",
             "_volumes",
-            "_genie",
             "_filesystem",
-            "_jobs",
         }
     )
 
@@ -1682,30 +1678,6 @@ class DatabricksClient(Singleton, URLBased):
 
         cached = Volumes(client=self)
         self.__dict__["_volumes"] = cached
-        return cached
-
-    @property
-    def jobs(self) -> "Jobs":
-        """Collection-level Databricks Jobs service for this client."""
-        cached = self.__dict__.get("_jobs")
-        if cached is not None:
-            return cached
-        from .jobs.service import Jobs
-
-        cached = Jobs(client=self)
-        self.__dict__["_jobs"] = cached
-        return cached
-
-    @property
-    def genie(self) -> "Genie":
-        """Genie conversation and space management helper for this client."""
-        cached = self.__dict__.get("_genie")
-        if cached is not None:
-            return cached
-        from .genie import Genie
-
-        cached = Genie(client=self)
-        self.__dict__["_genie"] = cached
         return cached
 
     @property
