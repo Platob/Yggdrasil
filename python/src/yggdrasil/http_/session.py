@@ -170,11 +170,7 @@ def _insert_cache(
     :attr:`CastOptions.prune_values` and is **caller-supplied** —
     the remote MERGE turns it into a narrow-target predicate
     (partition pruning + IN-set narrowing); the local
-    :class:`FolderPath` ignores it on writes. Default ``None``
-    keeps the local hot path free of the dict-build the local
-    backend wouldn't use anyway. Spark inserts also skip the
-    ``prune_values`` knob — :meth:`_spark_persist_remote`
-    pre-dedups via a ``left_anti`` join before reaching here.
+    :class:`FolderPath` ignores it on writes.
 
     Errors are caught and logged by default — a failed cache write
     must not poison the request flow that just produced the
@@ -1496,7 +1492,7 @@ class HTTPSession(Session):
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
-        """Process one holder group: local cache → remote cache → network."""
+        """Process one holder group: local cache → remote cache → network → writeback."""
         spark = reqs[0].send_config_or_default.spark_session if reqs else None
         n = len(reqs)
         LOGGER.debug(
@@ -1555,141 +1551,71 @@ class HTTPSession(Session):
                 new=new_hits, misses=misses,
             )
 
+        # Stage 3: fetch misses
         LOGGER.debug(
             "Fetching %d miss(es) via %s",
             len(misses), "spark" if spark else "thread pool",
         )
-        if spark is not None:
-            return self._send_spark_batch(
-                local_hits, remote_hits, reqs, misses,
-                spark=spark,
-                local_holder=local_holder, remote_holder=remote_holder,
-                local_mode=local_mode,
-            )
-        return self._send_local_batch(
-            local_hits, remote_hits, reqs, misses,
-            local_holder=local_holder, remote_holder=remote_holder,
-            local_mode=local_mode, remote_mode=remote_mode,
-            ordered=ordered, max_in_flight=max_in_flight,
-        )
-
-    def _send_local_batch(
-        self,
-        local_hits: "Tabular | None",
-        remote_hits: "Tabular | None",
-        reqs: list[PreparedRequest],
-        misses: list[PreparedRequest],
-        *,
-        local_holder: "IO | None",
-        remote_holder: "IO | None",
-        local_mode: "Mode | None" = None,
-        remote_mode: "Mode | None" = None,
-        ordered: bool = False,
-        max_in_flight: int | None = None,
-    ) -> HTTPResponseBatch:
-        """Fetch misses via the thread pool and write back to caches."""
-        new_list: list[Response] = []
         failed: list[Response] = []
-        for response in self._fetch_misses(
-            misses, ordered=ordered, max_in_flight=max_in_flight,
-        ):
-            if response.ok:
-                new_list.append(response)
-            elif misses[0].send_config_or_default.raise_error:
-                failed.append(response)
+        if spark is not None:
+            new_data = self._spark_fetch_misses(misses, spark)
+            if cfg.raise_error:
+                from pyspark.sql import functions as F
+                from yggdrasil.spark.cast import spark_dataframe_to_arrow
 
-        LOGGER.info(
-            "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-            len(new_list) + len(failed), len(misses),
-            len(new_list), len(failed),
-        )
-
-        if new_list and remote_hits is not None:
-            existing = remote_hits.read_arrow_table()
-            if existing.num_rows > 0:
-                existing_keys = set(zip(
-                    existing.column("public_hash").to_pylist(),
-                    existing.column("body_hash").to_pylist(),
-                ))
-                new_list = [
-                    r for r in new_list
-                    if (r.public_hash, r.body_hash) not in existing_keys
-                ]
-
-        if new_list:
-            _hits = pa.Table.from_batches(
-                [Response.values_to_arrow_batch(new_list)]
+                ok_df = new_data.where(
+                    (F.col("status_code") >= 200) & (F.col("status_code") < 400)
+                )
+                err_df = new_data.where(
+                    (F.col("status_code") < 200) | (F.col("status_code") >= 400)
+                )
+                err_table = spark_dataframe_to_arrow(err_df)
+                if len(err_table) > 0:
+                    failed = list(Response.from_arrow_tabular(err_table))
+                new_data = ok_df
+        else:
+            new_list: list[Response] = []
+            for response in self._fetch_misses(
+                misses, ordered=ordered, max_in_flight=max_in_flight,
+            ):
+                if response.ok:
+                    new_list.append(response)
+                elif cfg.raise_error:
+                    failed.append(response)
+            LOGGER.info(
+                "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
+                len(new_list) + len(failed), len(misses),
+                len(new_list), len(failed),
             )
+            new_data = (
+                pa.Table.from_batches([Response.values_to_arrow_batch(new_list)])
+                if new_list else None
+            )
+
+        # Stage 4: persist to caches via _insert_cache
+        if new_data is not None:
             wb: list[Callable] = []
-            if remote_holder is not None:
+            rc = reqs[0].remote_cache_config
+            if remote_holder is not None and rc is not None:
                 wb.append(lambda: _insert_cache(
-                    remote_holder, misses[0].remote_cache_config, _hits,
-                    mode=remote_mode,
+                    remote_holder, rc, new_data,
+                    mode=remote_mode, spark_session=spark,
                 ))
-            if local_holder is not None:
+            lc = reqs[0].local_cache_config
+            if local_holder is not None and lc is not None:
                 wb.append(lambda: _insert_cache(
-                    local_holder, misses[0].local_cache_config, _hits,
-                    mode=local_mode,
+                    local_holder, lc, new_data,
+                    mode=local_mode, spark_session=spark,
                 ))
             if wb:
                 LOGGER.debug(
-                    "Writing back %d response(s) to %d cache(s)",
-                    len(new_list), len(wb),
+                    "Writing back to %d cache(s)", len(wb),
                 )
                 self._run_concurrently(wb, thread_name_prefix="ygg-wb")
 
         return HTTPResponseBatch(
             local=local_hits, remote=remote_hits,
-            new=new_list or None, misses=misses, failed=failed,
-        )
-
-    def _send_spark_batch(
-        self,
-        local_hits: "Tabular | None",
-        remote_hits: "Tabular | None",
-        reqs: list[PreparedRequest],
-        misses: list[PreparedRequest],
-        *,
-        spark: "SparkSession",
-        local_holder: "IO | None",
-        remote_holder: "IO | None",
-        local_mode: "Mode | None" = None,
-    ) -> HTTPResponseBatch:
-        """Fetch misses via Spark mapInArrow and persist to remote cache."""
-        LOGGER.info(
-            "Scattering %d miss(es) to Spark executors", len(misses),
-        )
-        result_df = self._spark_fetch_misses(misses, spark)
-        rc = reqs[0].remote_cache_config
-        if remote_holder is not None and rc is not None:
-            LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
-            self._spark_persist_remote(remote_holder, result_df, rc, spark=spark)
-
-        raise_error = misses[0].send_config_or_default.raise_error
-        failed: list[Response] = []
-        if raise_error:
-            from pyspark.sql import functions as F
-            from yggdrasil.spark.cast import spark_dataframe_to_arrow
-
-            ok_df = result_df.where(
-                (F.col("status_code") >= 200) & (F.col("status_code") < 400)
-            )
-            err_df = result_df.where(
-                (F.col("status_code") < 200) | (F.col("status_code") >= 400)
-            )
-            err_table = spark_dataframe_to_arrow(err_df)
-            if len(err_table) > 0:
-                failed = list(Response.from_arrow_tabular(err_table))
-                LOGGER.info(
-                    "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-                    len(misses), len(misses),
-                    len(misses) - len(failed), len(failed),
-                )
-            result_df = ok_df
-
-        return HTTPResponseBatch(
-            local=local_hits, remote=remote_hits,
-            new=result_df, misses=misses, failed=failed,
+            new=new_data, misses=misses, failed=failed,
         )
 
     @staticmethod
@@ -2086,81 +2012,8 @@ class HTTPSession(Session):
         )
 
     # ------------------------------------------------------------------ #
-    # Spark stage 3 / 4 helpers                                           #
+    # Spark stage 3 helper                                                #
     # ------------------------------------------------------------------ #
-
-    def _spark_persist_remote(
-        self,
-        holder: "Tabular",
-        new_responses_df: "SparkDataFrame",
-        cache_config: CacheConfig,
-        *,
-        spark: "SparkSession",
-    ) -> None:
-        """Stage 4 on Spark: bulk-insert ok responses into the remote cache.
-
-        APPEND-mode writes are de-duplicated against existing rows.
-        The dedup key is ``partition_key`` plus the config's
-        ``match_by_columns`` (derived from ``request_by`` /
-        ``response_by``).  Existing key tuples are eagerly collected
-        and used as a broadcast anti-join so the write plan is
-        independent of the remote table scan.
-        """
-        from pyspark.sql import functions as F
-
-        table_name = holder.full_name(safe=True)
-        ok_df = new_responses_df.where(
-            (F.col("status_code") >= 200)
-            & (F.col("status_code") < 300)
-        )
-
-        dedup_columns: list[str] = ["partition_key"]
-        seen = {"partition_key"}
-        for c in cache_config.match_by_columns:
-            if c not in seen:
-                dedup_columns.append(c)
-                seen.add(c)
-
-        try:
-            wanted = [
-                row["partition_key"]
-                for row in ok_df.select("partition_key").distinct().collect()
-            ]
-        except Exception:
-            wanted = []
-
-        safe = "`"
-        select_clause = ", ".join(f"{safe}{c}{safe}" for c in dedup_columns)
-        try:
-            if wanted:
-                literals = ", ".join(str(int(v)) for v in wanted)
-                existing_rows = spark.sql(
-                    f"SELECT DISTINCT {select_clause} "
-                    f"FROM {table_name} WHERE partition_key IN ({literals})"
-                ).collect()
-            else:
-                existing_rows = spark.sql(
-                    f"SELECT DISTINCT {select_clause} "
-                    f"FROM {table_name}"
-                ).collect()
-            if existing_rows:
-                existing_df = spark.createDataFrame(
-                    [tuple(r[c] for c in dedup_columns) for r in existing_rows],
-                    dedup_columns,
-                )
-                ok_df = ok_df.join(
-                    F.broadcast(existing_df),
-                    on=dedup_columns,
-                    how="left_anti",
-                )
-        except Exception as exc:
-            if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
-                raise
-
-        LOGGER.info(
-            "Persisting ok response(s) into remote cache %s (spark)", table_name,
-        )
-        holder.write_spark_frame(ok_df, mode=Mode.APPEND)
 
     def _spark_fetch_misses(
         self,

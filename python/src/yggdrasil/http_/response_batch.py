@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterator, Optional
 
+import pyarrow as pa
+
 from yggdrasil.io.tabular import ArrowTabular, Dataset
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
@@ -56,7 +58,7 @@ class HTTPResponseBatch(Tabular):
         self,
         local: "Tabular | None" = None,
         remote: "Tabular | None" = None,
-        new: "Tabular | list[Response] | SparkDataFrame | None" = None,
+        new: "Tabular | list[Response] | SparkDataFrame | pa.Table | None" = None,
         *,
         misses: "list | None" = None,
         failed: "list | None" = None,
@@ -66,6 +68,10 @@ class HTTPResponseBatch(Tabular):
         self.remote: Optional[Tabular] = remote
         if isinstance(new, list):
             self.new: Optional[Tabular] = responses_to_tabular(new) if new else None
+        elif isinstance(new, pa.Table):
+            self.new = ArrowTabular(new.to_batches(), schema=new.schema)
+        elif isinstance(new, pa.RecordBatch):
+            self.new = ArrowTabular([new], schema=new.schema)
         elif new is not None and not isinstance(new, Tabular):
             self.new = Dataset(new)
         else:
