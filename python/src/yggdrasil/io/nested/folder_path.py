@@ -1086,8 +1086,8 @@ class FolderPath(IO[bytes, FolderOptions]):
         if not leaves:
             return spark.createDataFrame([], schema=spark_schema)
 
-        leaf_table = pa.table({"_pkl": [pickle.dumps(leaf) for leaf in leaves]})
-        leaf_df = spark.createDataFrame(leaf_table.to_pandas())
+        leaf_table = pa.table({"_pkl": pa.array([pickle.dumps(leaf) for leaf in leaves], type=pa.large_binary())})
+        leaf_df = spark.createDataFrame(leaf_table)
 
         bc_options = spark.sparkContext.broadcast(options)
 
