@@ -395,3 +395,199 @@ class TestSparkCacheFidelity:
         responses = list(session.send_many(reqs2, spark_session=spark))
         assert len(responses) >= 5
         assert _Handler.call_count == n_after
+
+
+# ---------------------------------------------------------------------------
+# Spark response batch metadata consistency
+# ---------------------------------------------------------------------------
+
+
+class TestSparkBatchMetadata:
+
+    def test_spark_arrow_batch_has_expected_columns(self, base_url, spark):
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.http_.response import HTTPResponse
+        resp = session.get("/json")
+        batch = HTTPResponse.values_to_arrow_batch([resp])
+        names = batch.schema.names
+        assert "status_code" in names
+        assert "hash" in names
+        assert "public_hash" in names
+        assert "body" in names
+        assert "body_size" in names
+        assert "body_hash" in names
+        assert "request_method" in names
+        assert "request_hash" in names
+        assert "partition_key" in names
+
+    def test_spark_hashes_stable_across_runs(self, base_url, spark, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+
+        reqs1 = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_meta_hash")]
+        for r in reqs1:
+            r.send_config = SendConfig(local_cache=cache)
+        resps1 = list(session.send_many(reqs1, spark_session=spark))
+        h1 = resps1[0].arrow_values["hash"]
+        ph1 = resps1[0].arrow_values["public_hash"]
+        rh1 = resps1[0].arrow_values["request_hash"]
+
+        reqs2 = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_meta_hash")]
+        for r in reqs2:
+            r.send_config = SendConfig(local_cache=cache)
+        resps2 = list(session.send_many(reqs2, spark_session=spark))
+        h2 = resps2[0].arrow_values["hash"]
+        ph2 = resps2[0].arrow_values["public_hash"]
+        rh2 = resps2[0].arrow_values["request_hash"]
+
+        assert h1 == h2
+        assert ph1 == ph2
+        assert rh1 == rh2
+
+    def test_spark_body_hash_consistent(self, base_url, spark, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+
+        reqs1 = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_meta_body")]
+        for r in reqs1:
+            r.send_config = SendConfig(local_cache=cache)
+        resps1 = list(session.send_many(reqs1, spark_session=spark))
+        bh1 = resps1[0].arrow_values["body_hash"]
+        bs1 = resps1[0].arrow_values["body_size"]
+
+        reqs2 = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_meta_body")]
+        for r in reqs2:
+            r.send_config = SendConfig(local_cache=cache)
+        resps2 = list(session.send_many(reqs2, spark_session=spark))
+
+        assert resps2[0].arrow_values["body_hash"] == bh1
+        assert resps2[0].arrow_values["body_size"] == bs1
+        assert bs1 > 0
+
+    def test_spark_partition_key_stable(self, base_url, spark):
+        session = HTTPSession(base_url=base_url)
+        reqs = [
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_meta_pk"),
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_meta_pk"),
+        ]
+        resps = list(session.send_many(reqs, spark_session=spark))
+        pks = [r.arrow_values["partition_key"] for r in resps]
+        assert pks[0] == pks[1]
+
+    def test_spark_partition_key_differs_by_url(self, base_url, spark):
+        session = HTTPSession(base_url=base_url)
+        reqs = [
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_pk_a"),
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_pk_b"),
+        ]
+        resps = list(session.send_many(reqs, spark_session=spark))
+        assert resps[0].arrow_values["partition_key"] != resps[1].arrow_values["partition_key"]
+
+    def test_spark_cached_metadata_matches_fresh(self, base_url, spark, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+
+        reqs1 = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_meta_full")]
+        for r in reqs1:
+            r.send_config = SendConfig(local_cache=cache)
+        fresh = list(session.send_many(reqs1, spark_session=spark))[0]
+        fresh_vals = {
+            "hash": fresh.arrow_values["hash"],
+            "public_hash": fresh.arrow_values["public_hash"],
+            "status_code": fresh.arrow_values["status_code"],
+            "body_size": fresh.arrow_values["body_size"],
+            "body_hash": fresh.arrow_values["body_hash"],
+            "request_hash": fresh.arrow_values["request_hash"],
+            "request_method": fresh.arrow_values["request_method"],
+            "partition_key": fresh.arrow_values["partition_key"],
+        }
+
+        reqs2 = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_meta_full")]
+        for r in reqs2:
+            r.send_config = SendConfig(local_cache=cache)
+        cached = list(session.send_many(reqs2, spark_session=spark))[0]
+
+        for key in fresh_vals:
+            assert fresh_vals[key] == cached.arrow_values[key], (
+                f"{key}: {fresh_vals[key]} != {cached.arrow_values[key]}"
+            )
+
+
+class TestSparkBatchHolders:
+
+    def test_spark_batch_new_tabular_is_set(self, base_url, spark):
+        session = HTTPSession(base_url=base_url)
+        reqs = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_holder_new")]
+        for r in reqs:
+            r.send_config = SendConfig()
+        batches = list(session.send_many_batches(reqs, spark_session=spark))
+        assert len(batches) >= 1
+        batch = batches[0]
+        assert batch.new_tabular is not None
+
+    def test_spark_batch_read_arrow_batches(self, base_url, spark):
+        session = HTTPSession(base_url=base_url)
+        reqs = [
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_holder_arrow_a"),
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_holder_arrow_b"),
+        ]
+        for r in reqs:
+            r.send_config = SendConfig()
+        batches = list(session.send_many_batches(reqs, spark_session=spark))
+        arrow_batches = list(batches[0].read_arrow_batches())
+        total_rows = sum(b.num_rows for b in arrow_batches)
+        assert total_rows >= 2
+
+    def test_spark_batch_responses_iterator(self, base_url, spark):
+        session = HTTPSession(base_url=base_url)
+        reqs = [
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_holder_iter_a"),
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_holder_iter_b"),
+        ]
+        for r in reqs:
+            r.send_config = SendConfig()
+        batches = list(session.send_many_batches(reqs, spark_session=spark))
+        responses = list(batches[0].responses())
+        assert len(responses) >= 2
+        assert all(r.status_code == 200 for r in responses)
+
+    def test_spark_batch_with_cache_has_local_tabular(self, base_url, spark, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+
+        reqs_warm = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_holder_cached")]
+        for r in reqs_warm:
+            r.send_config = SendConfig(local_cache=cache)
+        list(session.send_many(reqs_warm, spark_session=spark))
+
+        reqs = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_holder_cached")]
+        for r in reqs:
+            r.send_config = SendConfig(local_cache=cache)
+        batches = list(session.send_many_batches(reqs, spark_session=spark))
+        batch = batches[0]
+        assert batch.local_tabular is not None
+
+    def test_spark_batch_extend_merges(self, base_url, spark):
+        session = HTTPSession(base_url=base_url)
+        reqs_a = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_ext_a")]
+        reqs_b = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_ext_b")]
+        for r in reqs_a + reqs_b:
+            r.send_config = SendConfig()
+        batches_a = list(session.send_many_batches(reqs_a, spark_session=spark))
+        batches_b = list(session.send_many_batches(reqs_b, spark_session=spark))
+        merged = batches_a[0].extend(batches_b[0])
+        responses = list(merged.responses())
+        assert len(responses) >= 2
+
+    def test_spark_batch_schema_matches_response_schema(self, base_url, spark):
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.http_.schemas import RESPONSE_SCHEMA
+        reqs = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_schema")]
+        for r in reqs:
+            r.send_config = SendConfig()
+        batches = list(session.send_many_batches(reqs, spark_session=spark))
+        arrow_batches = list(batches[0].read_arrow_batches())
+        assert len(arrow_batches) >= 1
+        batch_schema = arrow_batches[0].schema
+        expected = RESPONSE_SCHEMA.to_arrow_schema()
+        assert set(batch_schema.names) == set(expected.names)
