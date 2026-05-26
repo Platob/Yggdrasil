@@ -39,6 +39,46 @@ class _FailingTask(Awaitable):
         self._state = State.RUNNING
 
 
+class _RetryableTask(Awaitable):
+    def __init__(self, fail_count: int = 1):
+        self._fail_count = fail_count
+        self._attempts = 0
+        self._polls = 0
+
+    @property
+    def retryable(self) -> bool:
+        return self._attempts <= self._fail_count
+
+    def _poll(self):
+        self._polls += 1
+        if self._polls >= 2:
+            if self._attempts <= self._fail_count:
+                self._state = State.FAILED
+            else:
+                self._state = State.SUCCEEDED
+
+    def _start(self):
+        self._attempts += 1
+        self._polls = 0
+        self._state = State.RUNNING
+
+
+class _AlwaysRetryableTask(Awaitable):
+    def __init__(self):
+        self._attempts = 0
+
+    @property
+    def retryable(self) -> bool:
+        return True
+
+    def _poll(self):
+        self._state = State.FAILED
+
+    def _start(self):
+        self._attempts += 1
+        self._state = State.RUNNING
+
+
 class _CancellableTask(Awaitable):
     cancelled: bool = False
 
@@ -147,6 +187,17 @@ class TestStateAccessors:
         assert not t.started
 
 
+class TestRetryableDefault:
+
+    def test_default_retryable_is_false(self):
+        assert not _InstantTask().retryable
+
+    def test_default_retryable_is_false_on_failure(self):
+        t = _FailingTask()
+        t._state = State.FAILED
+        assert not t.retryable
+
+
 class TestStart:
 
     def test_start_sets_pending_then_delegates(self):
@@ -234,6 +285,66 @@ class TestWait:
         t._state = State.RUNNING
         t.wait(wait=False, raise_error=False)
         assert t.is_failed
+
+    def test_wait_accepts_waiting_config(self):
+        t = _SlowTask(polls_until_done=2)
+        t._state = State.RUNNING
+        wc = WaitingConfig(timeout=60, interval=0.001, backoff=1.0, max_interval=1.0)
+        t.wait(wait=wc)
+        assert t.is_succeeded
+
+    def test_wait_accepts_numeric_seconds(self):
+        t = _InstantTask()
+        t._state = State.RUNNING
+        t.wait(wait=5.0)
+        assert t.is_succeeded
+
+
+class TestRetry:
+
+    def test_retryable_task_retries_on_failure(self):
+        t = _RetryableTask(fail_count=1)
+        t.start(wait=False)
+        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01)
+        t.wait(wait=wc)
+        assert t.is_succeeded
+        assert t._attempts == 2
+
+    def test_retryable_task_multiple_retries(self):
+        t = _RetryableTask(fail_count=3)
+        t.start(wait=False)
+        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01)
+        t.wait(wait=wc)
+        assert t.is_succeeded
+        assert t._attempts == 4
+
+    def test_non_retryable_failure_raises_immediately(self):
+        t = _FailingTask()
+        t._state = State.RUNNING
+        with pytest.raises(RuntimeError):
+            t.wait(wait=False)
+
+    def test_always_retryable_times_out(self):
+        t = _AlwaysRetryableTask()
+        t.start(wait=False)
+        wc = WaitingConfig(timeout=0.05, interval=0.001, backoff=1.0, max_interval=0.01)
+        with pytest.raises(TimeoutError):
+            t.wait(wait=wc)
+        assert t._attempts > 1
+
+    def test_always_retryable_no_raise_returns(self):
+        t = _AlwaysRetryableTask()
+        t.start(wait=False)
+        wc = WaitingConfig(timeout=0.05, interval=0.001, backoff=1.0, max_interval=0.01)
+        result = t.wait(wait=wc, raise_error=False)
+        assert result is t
+
+    def test_retryable_resets_iteration_counter(self):
+        t = _RetryableTask(fail_count=1)
+        t.start(wait=False)
+        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01)
+        t.wait(wait=wc)
+        assert t._polls >= 2
 
 
 class TestCancel:

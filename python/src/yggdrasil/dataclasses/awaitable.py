@@ -53,9 +53,20 @@ class Awaitable(ABC):
     def started(self) -> bool:
         return self._state.is_started
 
+    @property
+    def retryable(self) -> bool:
+        return False
+
     @abstractmethod
     def _poll(self) -> None:
         ...
+
+    @abstractmethod
+    def _start(self) -> None:
+        ...
+
+    def _cancel(self) -> None:
+        self._state = State.CANCELED
 
     def start(
         self,
@@ -71,12 +82,9 @@ class Awaitable(ABC):
         self._state = State.PENDING
         self._start()
         if wait is not False:
-            self.wait(wait=wait, raise_error=raise_error)
+            wc = WaitingConfig.from_(wait)
+            self._wait(wc, raise_error=raise_error)
         return self
-
-    @abstractmethod
-    def _start(self) -> None:
-        ...
 
     def wait(
         self,
@@ -88,24 +96,39 @@ class Awaitable(ABC):
             if self.is_done and self.is_failed and raise_error:
                 self.raise_for_status()
             return self
-
         wc = WaitingConfig.from_(wait)
+        return self._wait(wc, raise_error=raise_error)
+
+    def _wait(
+        self,
+        wait: WaitingConfig,
+        raise_error: bool = True,
+    ) -> "Awaitable":
         start = time.time()
         iteration = 0
         while True:
             self._poll()
             if self.is_done:
+                if self.is_failed and self.retryable and not wait.is_expired(start):
+                    self.start(reset=True, wait=False)
+                    iteration = 0
+                    continue
                 if self.is_failed and raise_error:
+                    if wait.is_expired(start):
+                        raise TimeoutError(
+                            f"{type(self).__name__} timed out after {wait.timeout:.1f}s "
+                            f"(state={self._state})"
+                        )
                     self.raise_for_status()
                 return self
-            if wc.is_expired(start):
+            if wait.is_expired(start):
                 if raise_error:
                     raise TimeoutError(
-                        f"{type(self).__name__} timed out after {wc.timeout:.1f}s "
+                        f"{type(self).__name__} timed out after {wait.timeout:.1f}s "
                         f"(state={self._state})"
                     )
                 return self
-            wc.sleep(iteration, start)
+            wait.sleep(iteration, start)
             iteration += 1
 
     def cancel(
@@ -117,11 +140,9 @@ class Awaitable(ABC):
             return self
         self._cancel()
         if wait is not False:
-            self.wait(wait=wait, raise_error=raise_error)
+            wc = WaitingConfig.from_(wait)
+            self._wait(wc, raise_error=raise_error)
         return self
-
-    def _cancel(self) -> None:
-        self._state = State.CANCELED
 
     def raise_for_status(self) -> None:
         if self.is_failed:
