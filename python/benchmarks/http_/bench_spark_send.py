@@ -12,7 +12,6 @@ import statistics
 import threading
 import time
 
-import pytest
 
 try:
     from pyspark.sql import SparkSession
@@ -88,7 +87,7 @@ def main():
     # --- Spark fan-out (no cache) ---
     _time(
         f"send_many({n} reqs, spark, no cache) → list",
-        lambda: list(session.send_many(iter(reqs), spark_session=spark)),
+        lambda: list(session.send_many((HTTPRequest.prepare(method="GET", url=f"{base}/bench_{i}") for i in range(n)), spark_session=spark)),
         repeat=repeat,
     )
 
@@ -96,14 +95,14 @@ def main():
     one = [HTTPRequest.prepare(method="GET", url=f"{base}/bench_one")]
     _time(
         "send_many(1 req, spark, no cache) → list",
-        lambda: list(session.send_many(iter(one), spark_session=spark)),
+        lambda: list(session.send_many(iter([HTTPRequest.prepare(method="GET", url=f"{base}/bench_one")]), spark_session=spark)),
         repeat=repeat,
     )
 
     # --- Local send (no spark, no cache) baseline ---
     _time(
         f"send_many({n} reqs, local, no cache) → list",
-        lambda: list(session.send_many(iter(reqs))),
+        lambda: list(session.send_many((HTTPRequest.prepare(method="GET", url=f"{base}/bench_{i}") for i in range(n)))),
         repeat=repeat,
     )
 
@@ -122,28 +121,26 @@ def main():
         repeat=1,
     )
 
-    warm_reqs = [HTTPRequest.prepare(method="GET", url=f"{base}/cache_{i}") for i in range(n)]
-    for r in warm_reqs:
-        r.send_config = SendConfig(local_cache=cache)
+    def _warm():
+        rs = [HTTPRequest.prepare(method="GET", url=f"{base}/cache_{i}") for i in range(n)]
+        for r in rs:
+            r.send_config = SendConfig(local_cache=cache)
+        return list(session.send_many(iter(rs), spark_session=spark))
 
-    _time(
-        f"send_many({n}, spark, local cache WARM) → list",
-        lambda: list(session.send_many(iter(warm_reqs), spark_session=spark)),
-        repeat=repeat,
-    )
+    _time(f"send_many({n}, spark, local cache WARM) → list", _warm, repeat=repeat)
 
     shutil.rmtree(cache_dir, ignore_errors=True)
 
     # --- send_many_batches (batch object) ---
     _time(
         f"send_many_batches({n}, spark) → list[batch]",
-        lambda: list(session.send_many_batches(iter(reqs), spark_session=spark)),
+        lambda: list(session.send_many_batches((HTTPRequest.prepare(method="GET", url=f"{base}/bench_{i}") for i in range(n)), spark_session=spark)),
         repeat=repeat,
     )
 
     # --- Batch read_arrow_batches ---
     def _batch_to_arrow():
-        batches = list(session.send_many_batches(iter(reqs), spark_session=spark))
+        batches = list(session.send_many_batches((HTTPRequest.prepare(method="GET", url=f"{base}/bench_{i}") for i in range(n)), spark_session=spark))
         for b in batches:
             list(b.read_arrow_batches())
 
