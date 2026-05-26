@@ -228,7 +228,7 @@ def cast_spark_dataframe(
     dataframe: pyspark_sql.DataFrame,
     options: Optional[CastOptions] = None,
 ) -> pyspark_sql.DataFrame:
-    return CastOptions.check(options).cast_spark_tabular(dataframe)
+    return CastOptions.check(options).cast_spark_frame(dataframe)
 
 
 # Spark Connect's DataFrame class is a parallel implementation of
@@ -251,7 +251,7 @@ def any_to_spark_dataframe(
     opts = CastOptions.check(options)
 
     if isinstance(obj, spark_dataframe_classes()):
-        return opts.cast_spark_tabular(obj)
+        return opts.cast_spark_frame(obj)
 
     # ``Tabular`` (Response, StatementResult, ParquetFile, …) owns its
     # own Spark fan-out — :meth:`Tabular.read_spark_frame` short-circuits

@@ -1243,22 +1243,21 @@ class CastOptions:
         """Cast any Tabular-like object.
 
         Dispatches ArrowTabular and Spark Dataset to their specific
-        cast methods. For generic Tabular, reads to arrow and returns
-        a cast ArrowTabular.
+        cast methods. For generic Tabular, delegates to
+        :meth:`Tabular.cast` which reads and returns the cast result.
         """
         from yggdrasil.arrow.tabular import ArrowTabular
+        from yggdrasil.spark.tabular import Dataset
         from yggdrasil.io.tabular.base import Tabular
 
         if isinstance(data, ArrowTabular):
             return self.cast_arrow_tabular(data)
-        if hasattr(data, "toArrow") or hasattr(data, "toPandas"):
+        if isinstance(data, Dataset):
             return self.cast_spark_tabular(data)
         if isinstance(data, Tabular):
-            batches = list(data.read_arrow_batches())
-            if not batches:
-                return ArrowTabular([])
-            return self.cast_arrow_tabular(
-                ArrowTabular(batches, schema=batches[0].schema)
+            table = data.read_arrow_table()
+            return ArrowTabular(
+                self.cast_arrow_table(table).to_batches()
             )
         raise TypeError(f"cast_tabular: unsupported type {type(data).__name__}")
 
@@ -1578,13 +1577,7 @@ class CastOptions:
 
     # ---- spark -------------------------------------------------------
 
-    def cast_spark(self, obj: Any) -> Any:
-        """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
-        if self.target is None:
-            return obj
-        return self.target.cast_spark(obj, options=self)
-
-    def cast_spark_tabular(self, df: Any) -> Any:
+    def cast_spark_frame(self, df: Any) -> Any:
         """Filter + cast a Spark DataFrame.
 
         Applies :attr:`predicate` (when set) then delegates to
@@ -1596,11 +1589,34 @@ class CastOptions:
             return df
         return self.target.cast_spark_tabular(df, options=self)
 
+    def cast_spark_tabular(self, data: Any) -> Any:
+        """Filter + cast a :class:`Dataset` (Spark Tabular wrapper)."""
+        from yggdrasil.spark.tabular import Dataset
+        if isinstance(data, Dataset):
+            if data.frame is None:
+                return data
+            casted = self.cast_spark_frame(data.frame)
+            if casted is data.frame:
+                return data
+            return Dataset(frame=casted)
+        return self.cast_spark_frame(data)
+
     def cast_spark_column(self, obj: Any) -> Any:
-        """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
+        """Cast a Spark Column."""
         if self.target is None:
             return obj
         return self.target.cast_spark_column(obj, options=self)
+
+    def cast_spark(self, obj: Any) -> Any:
+        """Dispatch spark types to the specific cast method."""
+        from yggdrasil.spark.tabular import Dataset
+        if isinstance(obj, Dataset):
+            return self.cast_spark_tabular(obj)
+        if hasattr(obj, "toArrow") or hasattr(obj, "toPandas"):
+            return self.cast_spark_frame(obj)
+        if self.target is None:
+            return obj
+        return self.target.cast_spark(obj, options=self)
 
     def fill_spark_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level spark null fill — delegates to :meth:`Field.fill_spark`."""

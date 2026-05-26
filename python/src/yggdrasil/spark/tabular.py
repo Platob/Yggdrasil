@@ -237,7 +237,7 @@ class Dataset(Tabular[CastOptions]):
     def _count(self, options=None) -> int:
         if self._frame is None:
             return 0
-        df = options.cast_spark_tabular(self._frame) if options is not None else self._frame
+        df = options.cast_spark_frame(self._frame) if options is not None else self._frame
         return df.count()
 
     # ------------------------------------------------------------------
@@ -392,7 +392,7 @@ class Dataset(Tabular[CastOptions]):
         # ``unique_by`` / ``time_sample_by``. The fast path runs
         # entirely inside Spark — ``groupBy + applyInArrow`` for the
         # partitioned resample, ``row_number() OVER (...)`` for dedup.
-        frame = options.cast_spark_tabular(self._frame)
+        frame = options.cast_spark_frame(self._frame)
         return options.apply_post_read_spark_frame(frame)
 
     def _read_spark_dataset(self, options: CastOptions) -> "Dataset":
@@ -407,7 +407,7 @@ class Dataset(Tabular[CastOptions]):
         if self._frame is None:
             frame = None
         else:
-            frame = options.cast_spark_tabular(self._frame)
+            frame = options.cast_spark_frame(self._frame)
             frame = options.apply_post_read_spark_frame(frame)
         return type(self)(frame=frame, schema=target)
 
