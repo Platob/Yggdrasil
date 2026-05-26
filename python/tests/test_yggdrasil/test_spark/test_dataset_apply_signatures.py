@@ -38,7 +38,7 @@ from yggdrasil.data.types.primitive import (
     Int64Type,
     StringType,
 )
-from yggdrasil.spark.tabular import Dataset
+from yggdrasil.spark.tabular import SparkDataset
 
 
 def _local_spark():
@@ -207,7 +207,7 @@ class _AppliedSignaturesBase(unittest.TestCase):
 class TestDatasetApplySignatures(_AppliedSignaturesBase):
 
     def test_single_arg_dynamic_to_typed(self) -> None:
-        dyn = Dataset.from_iterable(range(5), spark_session=self.spark)
+        dyn = SparkDataset.from_iterable(range(5), spark_session=self.spark)
         out = dyn.apply(_single_arg, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["id"] for r in rows], list(range(5)))
@@ -215,14 +215,14 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
 
     def test_multi_arg_spreads_dict_as_kwargs(self) -> None:
         rows_in = [{"id": i, "name": f"r{i}"} for i in range(4)]
-        dyn = Dataset.from_iterable(rows_in, spark_session=self.spark)
+        dyn = SparkDataset.from_iterable(rows_in, spark_session=self.spark)
         out = dyn.apply(_multi_arg, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["label"] for r in rows], [f"r{i}" for i in range(4)])
 
     def test_var_kw_function_receives_full_dict(self) -> None:
         rows_in = [{"id": i, "name": f"v{i}", "score": float(i)} for i in range(3)]
-        dyn = Dataset.from_iterable(rows_in, spark_session=self.spark)
+        dyn = SparkDataset.from_iterable(rows_in, spark_session=self.spark)
         out = dyn.apply(_var_kw, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["label"] for r in rows], [f"v{i}" for i in range(3)])
@@ -231,14 +231,14 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
     def test_var_positional_spreads_tuple_rows(self) -> None:
         # Each row is a 2-tuple — *xs catches both.
         rows_in = [(i, f"t{i}") for i in range(4)]
-        dyn = Dataset.from_iterable(rows_in, spark_session=self.spark)
+        dyn = SparkDataset.from_iterable(rows_in, spark_session=self.spark)
         out = dyn.apply(_var_pos, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["label"] for r in rows], [f"t{i}" for i in range(4)])
 
     def test_keyword_only_function(self) -> None:
         rows_in = [{"id": i, "name": f"k{i}"} for i in range(3)]
-        dyn = Dataset.from_iterable(rows_in, spark_session=self.spark)
+        dyn = SparkDataset.from_iterable(rows_in, spark_session=self.spark)
         out = dyn.apply(_kw_only, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["score"] for r in rows], [0.0, 2.0, 4.0])
@@ -246,7 +246,7 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
     def test_annotation_coerces_string_inputs(self) -> None:
         # String-shaped ``id`` survives the int annotation via the cast registry.
         rows_in = [{"id": str(i), "name": f"c{i}"} for i in range(3)]
-        dyn = Dataset.from_iterable(rows_in, spark_session=self.spark)
+        dyn = SparkDataset.from_iterable(rows_in, spark_session=self.spark)
         out = dyn.apply(_coerce_strings, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["id"] for r in rows], [0, 1, 2])
@@ -255,7 +255,7 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
         # ``.map(func)`` (no schema) routes through the same dispatcher —
         # the dynamic output should still carry the right shapes.
         rows_in = [{"id": i, "name": f"m{i}"} for i in range(4)]
-        dyn = Dataset.from_iterable(rows_in, spark_session=self.spark)
+        dyn = SparkDataset.from_iterable(rows_in, spark_session=self.spark)
         out = dyn.map(_multi_arg)
         collected = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["label"] for r in collected], [f"m{i}" for i in range(4)])
@@ -270,7 +270,7 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
             field("name", StringType),
         ])
         rows_in = [{"id": i, "name": f"n{i}"} for i in range(5)]
-        typed = Dataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
+        typed = SparkDataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
         out = typed.apply(_single_by_name, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["label"] for r in rows], [f"id-{i}" for i in range(5)])
@@ -285,7 +285,7 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
             field("name", StringType),
         ])
         rows_in = [{"id": i, "name": f"r{i}"} for i in range(6)]
-        typed = Dataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
+        typed = SparkDataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
         out = typed.apply(_whole_batch_record_batch, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["id"] for r in rows], [i * 100 for i in range(6)])
@@ -303,7 +303,7 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
             field("name", StringType),
         ])
         rows_in = [{"id": i, "name": f"p{i}"} for i in range(4)]
-        typed = Dataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
+        typed = SparkDataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
         out = typed.apply(_whole_batch_polars, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["id"] for r in rows], [i * 1000 for i in range(4)])
@@ -320,14 +320,14 @@ class TestDatasetApplySignatures(_AppliedSignaturesBase):
             field("name", StringType),
         ])
         rows_in = [{"id": str(i), "name": f"v{i}"} for i in range(4)]
-        typed = Dataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
+        typed = SparkDataset.from_iterable(rows_in, spark_session=self.spark).cast(in_schema)
         out = typed.apply(_vectorized_cast, _OUT_SCHEMA)
         rows = sorted(out.collect(), key=lambda r: r["id"])
         self.assertEqual([r["id"] for r in rows], list(range(4)))
 
     def test_parallelize_with_multi_arg_function(self) -> None:
         rows_in = [{"id": i, "name": f"p{i}"} for i in range(5)]
-        out = Dataset.parallelize(
+        out = SparkDataset.parallelize(
             rows_in, _multi_arg, schema=_OUT_SCHEMA, spark_session=self.spark,
         )
         rows = sorted(out.collect(), key=lambda r: r["id"])

@@ -32,9 +32,9 @@ from typing import TYPE_CHECKING, Any, Union
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from yggdrasil.data.enums.timeunit import TimeUnit
-from yggdrasil.data.enums.timezone import Timezone
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums.timeunit import TimeUnit
+from yggdrasil.enums.timezone import Timezone
+from yggdrasil.enums import Mode
 
 from .base import PrimitiveType
 from ..id import DataTypeId

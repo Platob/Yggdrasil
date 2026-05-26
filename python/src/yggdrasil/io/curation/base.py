@@ -416,7 +416,7 @@ class Curator(ABC):
         gets killed for OOM."
         """
         from yggdrasil.data.schema import StructField
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.lazy_imports import spark_sql_module
 
         # ``pyspark.cloudpickle`` is the canonical serializer for

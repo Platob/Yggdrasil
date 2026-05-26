@@ -15,7 +15,7 @@ import math
 
 import pytest
 
-from yggdrasil.data.enums.units import (
+from yggdrasil.enums.units import (
     EnergyUnit,
     LengthUnit,
     MassUnit,

@@ -25,7 +25,7 @@ from yggdrasil.data.types.primitive import (
     NullType,
     StringType,
 )
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 
 
 class TestIntegerMerge(unittest.TestCase):

@@ -61,13 +61,14 @@ from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
-
 from yggdrasil.data.data_field import Field as _Field
+from yggdrasil.enums import MediaType, MimeType, Mode, ModeLike
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MediaType, MimeType, Mode, ModeLike
-from yggdrasil.environ import PyEnv
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
+
+if TYPE_CHECKING:
+    from yggdrasil.arrow.tabular import ArrowTabular
 
 
 logger = logging.getLogger(__name__)
@@ -109,7 +110,7 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame
     from yggdrasil.execution.expr import Predicate, PredicateLike
     from yggdrasil.io.holder import Holder
-    from yggdrasil.spark.tabular import Dataset
+    from yggdrasil.spark.tabular import SparkDataset
 
 
 __all__ = ["Tabular", "is_tabular_source"]
@@ -279,10 +280,10 @@ def _default_unique(self_: "Tabular", *, keys: list[str]) -> "Tabular":
     spark_frame = self_._native_spark_frame()
     if spark_frame is not None:
         from yggdrasil.spark.ops import dedup_spark_dataframe
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         new_frame = dedup_spark_dataframe(spark_frame, keys)
-        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+        return SparkDataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
 
     from yggdrasil.arrow.ops import dedup_arrow_table
     from yggdrasil.arrow.tabular import ArrowTabular
@@ -304,7 +305,7 @@ def _default_resample(
     spark_frame = self_._native_spark_frame()
     if spark_frame is not None:
         from yggdrasil.spark.ops import resample_spark_dataframe
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         new_frame = resample_spark_dataframe(
             spark_frame,
@@ -313,7 +314,7 @@ def _default_resample(
             partition_by=partition_by or None,
             fill_strategy=fill_strategy,
         )
-        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+        return SparkDataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
 
     from yggdrasil.arrow.ops import resample_arrow_table
     from yggdrasil.arrow.tabular import ArrowTabular
@@ -372,10 +373,10 @@ def _default_select(self_: "Tabular", *, columns: list[str]) -> "Tabular":
         # public method's "preserve order" contract is the caller's
         # problem to keep right. We don't filter missing names here —
         # the Spark error is more informative than a silent drop.
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         new_frame = spark_frame.select(*columns)
-        return Dataset(frame=new_frame, schema=None)
+        return SparkDataset(frame=new_frame, schema=None)
 
     from yggdrasil.arrow.tabular import ArrowTabular
 
@@ -399,11 +400,11 @@ def _default_drop(self_: "Tabular", *, columns: list[str]) -> "Tabular":
     """
     spark_frame = self_._native_spark_frame()
     if spark_frame is not None:
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         present = [c for c in columns if c in spark_frame.columns]
         new_frame = spark_frame.drop(*present) if present else spark_frame
-        return Dataset(frame=new_frame, schema=None)
+        return SparkDataset(frame=new_frame, schema=None)
 
     from yggdrasil.arrow.tabular import ArrowTabular
 
@@ -419,10 +420,10 @@ def _default_filter(self_: "Tabular", *, predicate: "Predicate") -> "Tabular":
     """Engine-routing row filter — Spark-native when available, else Arrow."""
     spark_frame = self_._native_spark_frame()
     if spark_frame is not None:
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         new_frame = predicate.filter_spark_frame(spark_frame)
-        return Dataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
+        return SparkDataset(frame=new_frame, schema=_schema_for_new_tabular(self_))
 
     from yggdrasil.arrow.tabular import ArrowTabular
 
@@ -1075,15 +1076,6 @@ class Tabular(ABC, Generic[O]):
         if callable(sup_close):
             sup_close(force=force)
 
-    def _commit_metadata(self) -> None:
-        """Sync written metadata (size, mtime, media_type) to the backing.
-
-        Hook for backends with persistent IO metadata. Default no-op —
-        subclasses with a holder (``IO``) override to refresh
-        :class:`IOStats` once at the end of a bulk write rather than
-        per batch. Driven by :attr:`CastOptions.sync_metadata`.
-        """
-
     # ==================================================================
     # Static helpers
     # ==================================================================
@@ -1126,44 +1118,41 @@ class Tabular(ABC, Generic[O]):
         ]
 
     # ==================================================================
+    # Count
+    # ==================================================================
+
+    def count(self, options: "O | None" = None, **kwargs: Any) -> int:
+        """Return the number of rows in this tabular."""
+        return self._count(self.check_options(options, overrides=locals()))
+
+    def _count(self, options: O) -> int:
+        return sum(b.num_rows for b in self._read_arrow_batches(options))
+
+    # ==================================================================
     # Arrow surface
     # ==================================================================
 
-    def _read_arrow_batches_resolved(
-        self, options: O,
-    ) -> Iterator[pa.RecordBatch]:
-        """Inner read entry — applies the post-read tagged-schema passes.
+    def read_arrow_tabular(
+        self, options: "O | None" = None, **kwargs: Any,
+    ) -> "ArrowTabular":
+        return self._read_arrow_tabular(self.check_options(options, overrides=locals()))
 
-        Every public read path (:meth:`read_arrow_batches`,
-        :meth:`_read_arrow_table`, :meth:`_read_arrow_batch_reader`)
-        funnels through this method so the schema-driven post-passes
-        fire exactly once regardless of which entry point the caller
-        picks:
-
-        * :meth:`CastOptions.resample_arrow_batches` — snap rows to
-          the target's ``time_sampling`` grid (Field tag), aggregating
-          finer-grained sources via
-          :func:`yggdrasil.arrow.ops.resample_arrow_table`.
-        * :meth:`CastOptions.dedup_arrow_batches` — collapse duplicate
-          rows on columns flagged ``unique`` via
-          :func:`yggdrasil.arrow.ops.dedup_arrow_table`.
-
-        Resample runs **before** dedup: the resample's bucket collapse
-        already implicitly dedupes on the time column, so a downstream
-        unique-tagged column (typically the same time axis) sees a
-        much smaller input. Both passes identity-short-circuit when
-        no matching tag fires, so the common case stays zero-cost.
-        """
-        stream = self._read_arrow_batches(options)
-        stream = options.resample_arrow_batches(stream)
-        stream = options.dedup_arrow_batches(stream)
-        return stream
+    def _read_arrow_tabular(self, options: O) -> "ArrowTabular":
+        from yggdrasil.arrow.tabular import ArrowTabular
+        return ArrowTabular.from_arrow_batches(
+            self.read_arrow_batches(options)
+        )
 
     def read_arrow_batches(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
         resolved = self.check_options(options, overrides=locals())
-        stream = self._read_arrow_batches_resolved(resolved)
+        stream = self._read_arrow_batches(resolved)
+        if resolved.target is not None:
+            cast = resolved.cast_arrow_batch
+            stream = (cast(batch) for batch in stream)
+        stream = resolved.resample_arrow_batches(stream)
+        stream = resolved.dedup_arrow_batches(stream)
         if not logger.isEnabledFor(logging.DEBUG):
             yield from stream
             return
@@ -1187,13 +1176,8 @@ class Tabular(ABC, Generic[O]):
 
     def _read_arrow_table(self, options: O) -> pa.Table:
         # Pull the raw batches off the underlying reader and assemble
-        # them into one :class:`pa.Table`, then run the
-        # resample / dedup passes directly on that Table via
-        # :meth:`CastOptions.apply_post_read_table`. The iterator
-        # wraps (:meth:`_read_arrow_batches_resolved`) materialise +
-        # re-batch internally too; calling them here would
-        # ``Table.from_batches → group_by → to_batches → Table.from_batches``
-        # for a wasted round trip. Single-Table path bypasses that.
+        # them into one :class:`pa.Table`, then cast + project + resample
+        # + dedup via the options pipeline.
         batches = list(self._read_arrow_batches(options))
         if not batches:
             schema = (
@@ -1203,6 +1187,7 @@ class Tabular(ABC, Generic[O]):
             )
             return schema.to_arrow_schema().empty_table()
         table = pa.Table.from_batches(batches)
+        table = options.cast_arrow_table(table)
         return options.apply_post_read_table(table)
 
     def read_arrow_batch_reader(
@@ -1214,19 +1199,25 @@ class Tabular(ABC, Generic[O]):
 
     def _read_arrow_batch_reader(self, options: O) -> "pa.RecordBatchReader":
         schema = options.check_target(obj=self.collect_schema).merged
+        stream = self._read_arrow_batches(options)
+        if options.target is not None:
+            cast = options.cast_arrow_batch
+            stream = (cast(batch) for batch in stream)
+        stream = options.resample_arrow_batches(stream)
+        stream = options.dedup_arrow_batches(stream)
         return pa.RecordBatchReader.from_batches(
             schema.to_arrow_schema(),
-            self._read_arrow_batches_resolved(options),
+            stream,
         )
 
     def read_arrow_dataset(
         self, options: "O | None" = None, **kwargs: Any,
-    ) -> "pds.Dataset":
+    ) -> "pds.SparkDataset":
         return self._read_arrow_dataset(
             self.check_options(options, overrides=locals())
         )
 
-    def _read_arrow_dataset(self, options: O) -> "pds.Dataset":
+    def _read_arrow_dataset(self, options: O) -> "pds.SparkDataset":
         pds = pyarrow_dataset_module()
         reader = self._read_arrow_batch_reader(options)
         return pds.dataset(reader, schema=reader.schema)
@@ -1247,15 +1238,9 @@ class Tabular(ABC, Generic[O]):
         spark = options.get_spark_session()
 
         if spark is not None:
-            from yggdrasil.spark.tabular import Dataset as _Dataset
-            df = self._read_spark_frame(options)
-            return _Dataset(frame=df) if df is not None else None
+            return self.read_spark_dataset(options)
 
-        batches = list(self.read_arrow_batches(options=options))
-        if not batches or all(b.num_rows == 0 for b in batches):
-            return None
-        from yggdrasil.arrow.tabular import ArrowTabular
-        return ArrowTabular(batches)
+        return self.read_arrow_tabular(options)
 
     def write_table(
         self,
@@ -1399,8 +1384,6 @@ class Tabular(ABC, Generic[O]):
                 n_rows,
                 options.mode.name,
             )
-        if options.sync_metadata:
-            self._commit_metadata()
 
     def write_arrow_table(
         self, table: pa.Table, options: "O | None" = None, **kwargs: Any,
@@ -1410,14 +1393,7 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _write_arrow_table(self, table: pa.Table, options: O) -> None:
-        casted = options.cast_arrow_tabular(table)
-
-        # Keep ``target`` set: downstream writers (delta partition
-        # inference, schema-driven SQL DDL, …) read tags off the
-        # target field. Bind ``source`` to the merged target so the
-        # per-batch ``cast_arrow_tabular`` collapses to its bypass
-        # instead of re-running the cast on data we've already
-        # shaped.
+        casted = options.cast_arrow_table(table)
         merged = options.merged
         inner = options.copy(
             source=merged if merged is not None else ...,
@@ -1426,9 +1402,6 @@ class Tabular(ABC, Generic[O]):
             byte_size=None,
         )
         self._write_arrow_batches(casted.to_batches(), inner)
-
-        if options.sync_metadata:
-            self._commit_metadata()
 
     # ==================================================================
     # Union
@@ -1462,15 +1435,15 @@ class Tabular(ABC, Generic[O]):
             return self._union(ArrowTabular(other), mode=resolved)
         if isinstance(other, list):
             from yggdrasil.arrow.tabular import ArrowTabular
-            from yggdrasil.io.response import Response as _Resp
+            from yggdrasil.http_.response import Response as _Resp
             batches = [r.to_arrow_batch(parse=False) for r in other if isinstance(r, _Resp)]
             if not batches:
                 return self
             return self._union(ArrowTabular(*batches), mode=resolved)
         if hasattr(other, "unionByName"):
             try:
-                from yggdrasil.spark.tabular import Dataset
-                return self._union(Dataset(frame=other), mode=resolved)
+                from yggdrasil.spark.tabular import SparkDataset
+                return self._union(SparkDataset(frame=other), mode=resolved)
             except ImportError:
                 pass
         raise TypeError(
@@ -1542,9 +1515,6 @@ class Tabular(ABC, Generic[O]):
         # ``binary`` shape that every reader/writer handles.
         self._write_arrow_table(casted.to_arrow(compat_level=pl.CompatLevel.oldest()), options)
 
-        if options.sync_metadata:
-            self._commit_metadata()
-
     # ==================================================================
     # Pandas
     # ==================================================================
@@ -1590,41 +1560,8 @@ class Tabular(ABC, Generic[O]):
         self._write_pandas_frame(frame, self.check_options(options, overrides=locals()))
 
     def _write_pandas_frame(self, frame: "pandas.DataFrame", options: O) -> None:
-        # ``frame.index.names`` is always a list (e.g. ``[None]`` for a
-        # default ``RangeIndex``), so ``bool(...)`` is True even on
-        # an anonymous index — we'd round-trip a synthetic column that
-        # the reader then complains about. Only preserve the index
-        # when at least one level has a user-assigned name.
         include_index = any(n is not None for n in frame.index.names)
 
-        # Fast path for object-dtype columns when a target schema is
-        # bound. Object columns are the ones pyarrow's pandas bridge
-        # has to infer from Python objects (list-of-dict for struct,
-        # list-of-list for nested arrays, mixed scalars for strings) —
-        # inference walks every cell and dominates wall time on nested
-        # payloads. Handing the target type to
-        # ``pa.array(col, type=..., from_pandas=True)`` drives the
-        # conversion straight to the wanted shape and also emits
-        # ``string`` instead of ``large_string`` so the downstream
-        # parquet writer can dictionary-encode it (the post-cast path
-        # used to preserve ``large_string``, which silently disabled
-        # dictionary encoding on every staged Parquet file Databricks
-        # ever saw from a pandas caller).
-        #
-        # We can't push ``schema=`` into ``pa.Table.from_pandas``: the
-        # pandas bridge treats ``schema`` as a column projection and
-        # silently drops every frame column not in the schema. Per-
-        # column conversion keeps the column list intact while still
-        # hinting the slow ones; typed columns stay un-hinted so the
-        # downstream cast can still widen / narrow across dtype
-        # mismatches the way it always has (that's the path the old
-        # "string column → numeric target" case relied on, and it
-        # stays intact here).
-        #
-        # Falls back to plain ``from_pandas`` whenever a hinted
-        # conversion raises (incompatible cell contents, non-nullable
-        # target with NaN, …) or whenever the fast path doesn't apply
-        # (no target, index round-trip, duplicate column names).
         fast_casted: "pa.Table | None" = None
         target = getattr(options, "target", None)
         if (
@@ -1665,12 +1602,6 @@ class Tabular(ABC, Generic[O]):
                 casted = _tag_index_columns(casted)
             self._write_arrow_table(casted, options)
         except (pa.ArrowException, TypeError, ValueError):
-            # pyarrow's pandas bridge raises ``pa.ArrowException``
-            # (e.g. for unsupported extension dtypes) and stdlib
-            # ``TypeError`` / ``ValueError`` (e.g. for unhashable
-            # cell contents); fall back to polars, which handles a
-            # broader set of object-typed pandas frames at the cost
-            # of an extra conversion hop.
             pl = polars_module()
             casted = pl.from_pandas(frame, include_index=include_index)
             self._write_polars_frame(casted, options)
@@ -1704,6 +1635,7 @@ class Tabular(ABC, Generic[O]):
         )
 
     write_spark = write_spark_frame
+
     def _write_spark_frame(self, frame: "SparkDataFrame", options: O) -> None:
         to_arrow = getattr(frame, "toArrow", None)
         if to_arrow is not None:
@@ -1713,7 +1645,7 @@ class Tabular(ABC, Generic[O]):
 
     def read_spark_dataset(
         self, options: "O | None" = None, **kwargs: Any,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Read into a :class:`Dataset` holder.
 
         Mirrors :meth:`read_arrow_dataset` for the Spark engine: the
@@ -1728,10 +1660,10 @@ class Tabular(ABC, Generic[O]):
             self.check_options(options, overrides=locals())
         )
 
-    def _read_spark_dataset(self, options: O) -> "Dataset":
-        from yggdrasil.spark.tabular import Dataset
+    def _read_spark_dataset(self, options: O) -> "SparkDataset":
+        from yggdrasil.spark.tabular import SparkDataset
 
-        return Dataset.from_spark_frame(
+        return SparkDataset.from_spark_frame(
             self._read_spark_frame(options),
             schema=options.target,
         )
@@ -1834,8 +1766,6 @@ class Tabular(ABC, Generic[O]):
         chunk_size = max(1, getattr(options, "row_size", None) or 1024)
         chunk_rows: "list[dict]" = []
         chunk_schema: "pa.Schema | None" = None
-        # Per-batch sub-call defers metadata commits; we commit once
-        # below if the caller asked for it.
         inner = options.copy(sync_metadata=False) if options.sync_metadata else options
 
         def _flush() -> None:
@@ -1860,26 +1790,6 @@ class Tabular(ABC, Generic[O]):
             if len(chunk_rows) >= chunk_size:
                 _flush()
         _flush()
-        if options.sync_metadata:
-            self._commit_metadata()
-
-    # ==================================================================
-    # Cross-engine set / time transforms
-    #
-    # ``unique`` (dedup on keys) and ``resample`` (snap to a time grid)
-    # share one shape: a flexible public surface that coerces whatever
-    # the caller passed into the canonical typed shape, plus a typed
-    # private hook (:meth:`_unique` / :meth:`_resample`) that holders
-    # speaking a non-Arrow engine override to stay native.
-    #
-    # The default private implementations route on
-    # :meth:`_native_spark_frame` — a Spark-shaped holder
-    # (:class:`yggdrasil.spark.tabular.Dataset`,
-    # :class:`yggdrasil.spark.statement.SparkStatementResult`) returns
-    # a fresh :class:`Dataset`; everything else collects through Arrow
-    # and returns an :class:`yggdrasil.arrow.tabular.ArrowTabular`. No
-    # per-class overrides needed — the routing is the contract.
-    # ==================================================================
 
     def unique(
         self,
@@ -2121,21 +2031,25 @@ class Tabular(ABC, Generic[O]):
         """
         return _default_filter(self, predicate=predicate)
 
-    def cast(self, schema: "Schema") -> "Tabular":
-        """Cast rows to *schema*, returning a new :class:`Tabular`.
+    def cast(
+        self,
+        options: "O | None" = None,
+        **kwargs
+    ) -> "Tabular":
+        """Cast rows, returning a new :class:`Tabular`.
 
-        Each batch is cast through
-        :meth:`Schema.cast_arrow_batch_iterator`. The result is an
-        :class:`ArrowTabular` with the target schema applied.
+        Accepts a :class:`Schema` or :class:`CastOptions`. When
+        *options* is given, reads to arrow and casts each batch
+        through :meth:`CastOptions.cast_arrow_batch`.
         """
-        from yggdrasil.arrow.tabular import ArrowTabular as _ArrowTabular
+        options = CastOptions.check(options, **kwargs)
+        return self._cast(options)
 
-        batches = list(schema.cast_arrow_batch_iterator(
-            self.read_arrow_batches(),
-        ))
-        if not batches:
-            return _ArrowTabular(schema.to_arrow_schema().empty_table())
-        return _ArrowTabular(batches)
+    def _cast(self, options: O) -> "Tabular":
+        from yggdrasil.arrow.tabular import ArrowTabular
+        return ArrowTabular.from_arrow_batches(
+            self.read_arrow_batches(options)
+        )
 
     # ==================================================================
     # ``to_*`` aliases — pandas-style spelling for the ``read_*`` surface.

@@ -35,7 +35,7 @@ from yggdrasil.arrow.ops import upsert_arrow_batches
 from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
+from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
 from yggdrasil.pickle import json as ygg_json
@@ -247,7 +247,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                     use_threads=options.use_threads,
                     columns=columns,
                 ):
-                    yield options.cast_arrow_tabular(batch)
+                    yield options.cast_arrow_batch(batch)
         finally:
             stream_ctx.__exit__(None, None, None)
 
@@ -276,7 +276,8 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                     )
         except (FileNotFoundError, pa.ArrowInvalid):
             return super()._read_arrow_table(options)
-        return options.cast_arrow_tabular(table)
+        table = options.cast_arrow_table(table)
+        return options.apply_post_read_table(table)
 
     # ==================================================================
     # Write path
@@ -393,7 +394,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         # reshapes the rows to the caller's schema before the
         # encoder sees them.
         write_options = options.check_source(first.schema)
-        first_casted = write_options.cast_arrow_tabular(first)
+        first_casted = write_options.cast_arrow_batch(first)
         schema = write_options.merged.to_arrow_schema()
 
         # If the first batch came back as the same object the cast was a
@@ -419,7 +420,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                             writer.write_batch(batch, row_group_size=options.row_group_size)
                 else:
                     for batch in iterator:
-                        casted = write_options.cast_arrow_tabular(batch)
+                        casted = write_options.cast_arrow_batch(batch)
                         if casted.num_rows > 0:
                             writer.write_batch(casted, row_group_size=options.row_group_size)
 
@@ -555,7 +556,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
     # Native engine overrides — push reads to format-aware scanners
     # ==================================================================
 
-    def _read_arrow_dataset(self, options: ParquetOptions) -> "pds.Dataset":
+    def _read_arrow_dataset(self, options: ParquetOptions) -> "pds.SparkDataset":
         """Native :class:`pyarrow.dataset.Dataset` over the Parquet bytes."""
         pds = pyarrow_dataset_module()
         path = self._local_path_str()

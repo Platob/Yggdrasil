@@ -12,7 +12,7 @@ import datetime as dt
 
 import pytest
 
-from yggdrasil.data.enums.currency import Currency
+from yggdrasil.enums.currency import Currency
 from yggdrasil.fxrate import BackendError, FxRate
 
 from ._helpers import StubFxBackend, make_quote

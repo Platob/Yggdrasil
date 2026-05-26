@@ -1,27 +1,15 @@
 """Databricks SQL warehouse-backed statements.
 
-Three concrete types layered on the abstractions in
-``yggdrasil.data.statement``:
+Three concrete types:
 
-- :class:`WarehousePreparedStatement` — adds typed routing
-  (``warehouse_id`` / ``warehouse_name``), wire format, server-side wait,
-  result caps, parameter bindings, and external-table aliases.
-- :class:`WarehouseStatementResult` — tracks a single submission against
-  the Databricks Statement Execution API: ``statement_id``, response
-  caching, polling, and external-link fetch for Arrow streams.
-- :class:`WarehouseStatementBatch` — re-uses the base batch contract; per-
-  statement external-table aliases are resolved at coerce time, batch-wide
-  scratch is cleaned up at teardown.
-
-A few invariants the cleanup pass enforces:
-
-- Each statement carries its own ``external_volume_paths``.  The batch
-  doesn't maintain a parallel registry — the alias-substitution rewriter
-  reads the per-statement field directly.  Single source of truth.
-- ``_coerce`` returns the prepared statement (the previous version
-  silently dropped it on the floor).
-- Alias substitution doesn't mutate the input statement — it returns a
-  rewritten copy, so re-submitting the same batch is safe.
+- :class:`WarehousePreparedStatement` — typed routing, wire format,
+  server-side wait, result caps, parameter bindings, and external-table
+  aliases.
+- :class:`DatabricksSQL` — tracks a single submission against the
+  Databricks Statement Execution API. Implements :class:`Tabular`
+  (Arrow batch source) and :class:`Awaitable` (start/wait lifecycle).
+- :class:`WarehouseStatementBatch` — manages a batch of statements
+  with alias substitution and parallel execution.
 """
 
 from __future__ import annotations
@@ -29,6 +17,8 @@ from __future__ import annotations
 import copy as copy_mod
 import logging
 import re
+import time
+from collections import OrderedDict
 from typing import (
     Any,
     ClassVar,
@@ -55,18 +45,12 @@ from databricks.sdk.service.sql import (
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema
-from yggdrasil.data.enums import MimeType, MimeTypes, Mode
-from yggdrasil.data.enums.media_type import MediaTypes
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums import MimeType, MimeTypes, Mode
+from yggdrasil.enums.media_type import MediaTypes
+from yggdrasil.enums.state import State
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.statement import (
-    ExternalStatementData,
-    PreparedStatement,
-    StatementResult,
-    StatementBatch,
-)
 from yggdrasil.databricks.sql.exceptions import SQLError
-from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import Awaitable, WaitingConfig, WaitingConfigArg
 from yggdrasil.io.tabular import Tabular
 from ..fs import VolumePath, DatabricksPath
 from ..sql.types import parse_databricks_field
@@ -76,7 +60,9 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
 __all__ = [
+    "ExternalStatementData",
     "WarehousePreparedStatement",
+    "DatabricksSQL",
     "WarehouseStatementResult",
     "WarehouseStatementBatch",
 ]
@@ -138,11 +124,45 @@ _VALID_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
+# ExternalStatementData
+# ---------------------------------------------------------------------------
+
+
+class ExternalStatementData:
+    """Carrier for external-data references bound to a SQL statement.
+
+    Each entry maps a query-text alias to either a live :class:`Tabular`
+    (for Spark temp-view registration) or a baked ``text_value`` (the
+    ``parquet.`path``` SQL fragment for warehouse substitution), or both.
+    """
+
+    __slots__ = ("text_key", "tabular", "text_value")
+
+    def __init__(
+        self,
+        text_key: str,
+        tabular: "Tabular | Any | None" = None,
+        text_value: str | None = None,
+    ) -> None:
+        self.text_key = text_key
+        self.tabular = tabular
+        self.text_value = text_value
+
+    def __repr__(self) -> str:
+        parts = [f"text_key={self.text_key!r}"]
+        if self.tabular is not None:
+            parts.append(f"tabular={type(self.tabular).__name__}")
+        if self.text_value is not None:
+            parts.append(f"text_value={self.text_value!r}")
+        return f"ExternalStatementData({', '.join(parts)})"
+
+
+# ---------------------------------------------------------------------------
 # WarehousePreparedStatement
 # ---------------------------------------------------------------------------
 
 
-class WarehousePreparedStatement(PreparedStatement):
+class WarehousePreparedStatement:
     """Typed Databricks SQL prepared statement.
 
     Carries everything :meth:`SQLWarehouse._submit_statement` reads — no
@@ -172,12 +192,17 @@ class WarehousePreparedStatement(PreparedStatement):
 
     Retry
     -----
-    Inherits ``retry`` (a :class:`WaitingConfig`) from
-    :class:`PreparedStatement`.  Default is ``None`` (not retryable).
-    Pass ``retry=WaitingConfig(...)``, ``retry=True`` for the standard
-    default policy, or ``retry={"timeout": 60, "retries": 3}`` for a
-    dict-shaped config; see :meth:`WaitingConfig.from_`.
+    ``retry`` is a :class:`WaitingConfig`.  Default is ``None``
+    (not retryable). Pass ``retry=WaitingConfig(...)``, ``retry=True``
+    for the standard default policy, or ``retry={"timeout": 60,
+    "retries": 3}`` for a dict-shaped config.
     """
+
+    # ---- Core ----
+    text: str
+    key: Optional[str]
+    retry: Optional[WaitingConfig]
+    external_data: Optional[dict[str, ExternalStatementData]]
 
     # ---- Routing ----
     warehouse_id: Optional[str] = None
@@ -209,6 +234,9 @@ class WarehousePreparedStatement(PreparedStatement):
         *,
         key: Optional[str] = None,
         retry: Optional[WaitingConfigArg] = None,
+        external_data: Optional[
+            Mapping[str, "ExternalStatementData | Tabular | str | tuple"]
+        ] = None,
         warehouse_id: Optional[str] = None,
         warehouse_name: Optional[str] = None,
         catalog_name: Optional[str] = None,
@@ -221,12 +249,12 @@ class WarehousePreparedStatement(PreparedStatement):
         row_limit: Optional[int] = None,
         parameters: Optional[List[StatementParameterListItem]] = None,
         external_volume_paths: Optional[dict[str, VolumePath]] = None,
-        external_data: Optional[
-            Mapping[str, "ExternalStatementData | Tabular | str | tuple"]
-        ] = None,
         **kwargs: Any,
     ):
-        super().__init__(text, key=key, retry=retry, external_data=external_data)
+        self.text = text
+        self.key = key
+        self.retry = WaitingConfig.from_(retry) if retry is not None and not isinstance(retry, WaitingConfig) else retry
+        self.external_data = dict(external_data) if external_data else None
         self.warehouse_id = warehouse_id
         self.warehouse_name = warehouse_name
         self.catalog_name = catalog_name
@@ -239,6 +267,46 @@ class WarehousePreparedStatement(PreparedStatement):
         self.row_limit = row_limit
         self.parameters = parameters
         self.external_volume_paths = external_volume_paths
+
+    # ------------------------------------------------------------------
+    # Coercion
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_(cls, value: "WarehousePreparedStatement | str") -> "WarehousePreparedStatement":
+        """Coerce *value* to a :class:`WarehousePreparedStatement`.
+
+        Identity short-circuit: returns *value* unchanged when it's
+        already the right type.
+        """
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(text=value)
+        raise TypeError(
+            f"{cls.__name__}.from_ expects str or {cls.__name__}; "
+            f"got {type(value).__name__}."
+        )
+
+    @staticmethod
+    def looks_like_query(text: Any) -> bool:
+        """Delegate to :func:`sql_utils.looks_like_query`."""
+        from yggdrasil.databricks.sql.sql_utils import looks_like_query
+        return looks_like_query(text)
+
+    @staticmethod
+    def apply_external_substitution(
+        text: str,
+        external_data: Mapping[str, ExternalStatementData],
+    ) -> str:
+        """Replace ``{alias}`` placeholders in *text* with their ``text_value``.
+
+        Idempotent: already-substituted text passes through unchanged.
+        """
+        for alias, entry in external_data.items():
+            if entry.text_value is not None:
+                text = text.replace("{%s}" % alias, entry.text_value)
+        return text
 
     # ------------------------------------------------------------------
     # External data validation / staging
@@ -269,7 +337,7 @@ class WarehousePreparedStatement(PreparedStatement):
           the underlying value is unwrapped and processed as if passed
           directly.  ``text_value``-only entries (no tabular bound) are
           skipped here; they're substituted via
-          :attr:`PreparedStatement.external_data` by the batch coercer.
+          :attr:`external_data` by the batch coercer.
 
         Returns a fresh ``dict[str, VolumePath]``; never mutates input.
         Empty / ``None`` input returns ``{}``.
@@ -355,16 +423,7 @@ class WarehousePreparedStatement(PreparedStatement):
         temporary: bool,
         client: "DatabricksClient"
     ) -> VolumePath:
-        """Stage tabular ``value`` to a fresh Parquet volume.  Override
-        in subclasses for custom file formats / staging policies.
-
-        Mints the staging path through :meth:`Table.insert_volume_path`
-        on a transient :class:`Table` keyed by ``(catalog, schema,
-        resource_name or alias)`` — same per-table ``<table>``
-        volume layout the warehouse insert path uses — then writes the
-        Parquet payload, unlinking the path on write failure when
-        ``temporary=True``.
-        """
+        """Stage tabular ``value`` to a fresh Parquet volume."""
         from yggdrasil.databricks.table.table import Table
 
         if not catalog_name or not schema_name:
@@ -401,7 +460,7 @@ class WarehousePreparedStatement(PreparedStatement):
     @classmethod
     def prepare(
         cls,
-        statement: "WarehousePreparedStatement | PreparedStatement | str",
+        statement: "WarehousePreparedStatement | str",
         *,
         client: "DatabricksClient | None" = None,
         parameters: Optional[Mapping[str, Any] | List[StatementParameterListItem]] = None,
@@ -443,20 +502,10 @@ class WarehousePreparedStatement(PreparedStatement):
         ext_paths.update(staged)
 
         # ---- Generic external-data registry ----
-        # Mirror every staged / supplied path into the base
-        # ``external_data`` map with a pre-baked ``text_value``, and merge
-        # any caller-supplied :class:`ExternalStatementData` entries (which
-        # may carry their own ``text_value`` for already-baked SQL
-        # fragments — e.g. an existing table reference).  Substitution at
-        # batch coerce time reads ``external_data`` first, then falls back
-        # to ``external_volume_paths`` for entries that didn't get mirrored.
         ext_data: dict[str, ExternalStatementData] = dict(prepared.external_data or {})
         if external_data:
             for alias, value in external_data.items():
                 if isinstance(value, ExternalStatementData):
-                    # Caller-built entry: preserve text_value as-is when
-                    # set; otherwise materialize from the staged path
-                    # below.
                     if value.text_value:
                         ext_data[alias] = ExternalStatementData(
                             alias,
@@ -498,8 +547,6 @@ class WarehousePreparedStatement(PreparedStatement):
             prepared.disposition = Disposition.EXTERNAL_LINKS
 
         # ---- Retry config: only override when caller asked.
-        # ``False`` explicitly disables; any other non-None value passes
-        # through WaitingConfig.from_.
         if retry is not None:
             if retry is False:
                 prepared.retry = None
@@ -519,10 +566,7 @@ class WarehousePreparedStatement(PreparedStatement):
         prepared.external_data = ext_data or None
 
         # Bake placeholder substitution into the text now so the
-        # single-statement submit path (which doesn't go through
-        # WarehouseStatementBatch._coerce) reaches the SDK with valid
-        # SQL.  Idempotent: re-prepare on an already-substituted
-        # statement is a no-op since the placeholders are gone.
+        # single-statement submit path reaches the SDK with valid SQL.
         if ext_data:
             prepared.text = cls.apply_external_substitution(
                 prepared.text, ext_data,
@@ -550,12 +594,7 @@ class WarehousePreparedStatement(PreparedStatement):
         merge: bool = True,
         copy: bool = True,
     ) -> "WarehousePreparedStatement":
-        """Return (or update in place) a copy with ``parameters`` set.
-
-        ``parameters`` may be an SDK-typed list, a ``{name: value}``
-        mapping, or ``None`` to clear.  ``merge=True`` (default) appends
-        to existing parameters; ``copy=False`` mutates ``self`` in place.
-        """
+        """Return (or update in place) a copy with ``parameters`` set."""
         if parameters is None:
             new_params: Optional[List[StatementParameterListItem]] = None
         elif isinstance(parameters, Mapping):
@@ -579,14 +618,7 @@ class WarehousePreparedStatement(PreparedStatement):
     # ------------------------------------------------------------------
 
     def clear_temporary_resources(self) -> None:
-        """Unlink any temporary staged volumes and clear the registry.
-
-        Idempotent: safe to call repeatedly.  Mirrors the per-batch
-        contract — the legacy ``external_volume_paths`` is the single
-        source of truth for paths to unlink; ``external_data`` is only
-        cleared to release tabular references so a re-prepared statement
-        re-stages cleanly.
-        """
+        """Unlink any temporary staged volumes and clear the registry."""
         if self.external_volume_paths:
             for alias, path in self.external_volume_paths.items():
                 if getattr(path, "temporary", False):
@@ -606,12 +638,7 @@ class WarehousePreparedStatement(PreparedStatement):
 def _mapping_to_parameter_list(
     parameters: Mapping[str, Any],
 ) -> List[StatementParameterListItem]:
-    """``{name: value}`` -> SDK ``StatementParameterListItem`` list.
-
-    Already-typed values pass through; everything else goes as a stringified
-    ``value`` and the SDK infers the type — matches Databricks' auto-coercion
-    on untyped parameters.
-    """
+    """``{name: value}`` -> SDK ``StatementParameterListItem`` list."""
     out: List[StatementParameterListItem] = []
     for name, value in parameters.items():
         if isinstance(value, StatementParameterListItem):
@@ -627,40 +654,28 @@ def _mapping_to_parameter_list(
 
 
 # ---------------------------------------------------------------------------
-# WarehouseStatementResult
+# DatabricksSQL (warehouse statement result)
 # ---------------------------------------------------------------------------
 
 
-class WarehouseStatementResult(StatementResult):
-    """Databricks-backed :class:`StatementResult`.
+class DatabricksSQL(Tabular, Awaitable):
+    """Databricks SQL warehouse statement — :class:`Tabular` + :class:`Awaitable`.
 
     Wraps a :class:`WarehousePreparedStatement` plus per-execution state
-    (``statement_id``, cached :class:`StatementResponse`).  Configuration
-    (text, parameters, external tables, routing) lives on
-    ``self.statement``.
+    (``statement_id``, cached :class:`StatementResponse``).
 
-    The ``warehouse_id`` field is the *resolved* warehouse the statement
-    actually ran on (set after submission); ``self.statement.warehouse_id``
-    is the *requested* routing hint (set by the caller before submission).
+    Lifecycle: ``_start()`` submits the SQL via the warehouse HTTP API,
+    ``_wait()`` polls until a terminal state, then ``_read_arrow_batches``
+    streams result chunks via external links.
 
-    Retry semantics are inherited from :class:`StatementResult`: the
-    looping ``retry()`` method drives ``start(reset=True)`` per attempt,
-    sleeping per ``self.statement.retry`` (a :class:`WaitingConfig`)
-    between tries.  ``retryable`` is a derived property — non-retryable
-    when ``self.statement.retry is None`` or the attempt budget is
-    exhausted.
+    States: IDLE → PENDING → RUNNING → SUCCEEDED / FAILED / CANCELED
     """
 
-    _PREPARED_CLASS = WarehousePreparedStatement
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
     @classmethod
     def default_media_type(cls) -> "MimeType | None":
         return MimeTypes.DATABRICKS_STATEMENT_RESULT
-
-    executor: "SQLWarehouse"
-    statement: WarehousePreparedStatement
-    statement_id: Optional[str] = None
 
     def __init__(
         self,
@@ -671,32 +686,130 @@ class WarehouseStatementResult(StatementResult):
         _response: Optional[StatementResponse] = None,
         **kwargs: Any,
     ):
-        self.statement_id = statement_id
-        self._response = _response
-        super().__init__(statement=statement, executor=executor, **kwargs)
+        super().__init__(**kwargs)
+        self.executor: "SQLWarehouse" = executor
+        self.statement: WarehousePreparedStatement = statement or WarehousePreparedStatement()
+        self.statement_id: Optional[str] = statement_id
+        self._response: Optional[StatementResponse] = _response
+        self.iteration: int = 0
+        self.start_timestamp: Optional[float] = None
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def key(self) -> Optional[str]:
+        return self.statement.key
+
+    @property
+    def elapsed_timestamp(self) -> Optional[float]:
+        if self.start_timestamp is None:
+            return None
+        return time.time() - self.start_timestamp
+
+    @property
+    def started(self) -> bool:
+        """True once the statement has been submitted."""
+        return bool(self.statement_id) and self.statement_id != "unknown"
+
+    @property
+    def done(self) -> bool:
+        return self.state.is_done
+
+    @property
+    def failed(self) -> bool:
+        return self.state.is_failed
+
+    @property
+    def cached(self) -> bool:
+        """True when the statement is in a terminal state."""
+        return self.done
+
+    @property
+    def client(self):
+        return self.executor.client
+
+    # ------------------------------------------------------------------
+    # Lifecycle — Awaitable contract
+    # ------------------------------------------------------------------
+
+    def _start(self) -> "DatabricksSQL":
+        """Submit the statement to the warehouse. Idempotent."""
+        if self.started:
+            return self
+        logger.debug("Submitting statement on %r", self.executor)
+        submitted = self.executor.send(self.statement)
+        self.statement = submitted.statement
+        self.set_api_response(submitted._response)
+        self.iteration = self.iteration + 1
+        self.start_timestamp = submitted.start_timestamp
+        logger.debug(
+            "Submitted statement %r (iteration=%d, state=%s)",
+            self, self.iteration,
+            submitted._response.status.state if submitted._response else None,
+        )
+        return self
+
+    def _wait(self, config: WaitingConfig, raise_error: bool = True) -> "DatabricksSQL":
+        """Poll until the statement reaches a terminal state."""
+        if not self.started:
+            self._start()
+
+        start_ts = time.time()
+        iteration = 0
+        while not self.done:
+            config.sleep(iteration=iteration, start=start_ts)
+            self.refresh_status()
+            iteration += 1
+
+        if raise_error:
+            self._raise_for_status()
+        return self
+
+    def start(
+        self,
+        reset: bool = False,
+        *,
+        wait: WaitingConfigArg = False,
+        raise_error: bool = False,
+        **kwargs: Any,
+    ) -> "DatabricksSQL":
+        """Submit the statement.  Idempotent on already-started results.
+
+        ``reset=True`` cancels the existing submission and clears local
+        state before resubmitting — used by retry logic.
+        """
+        if self.started:
+            if not reset:
+                logger.debug(
+                    "Skipping start for statement %r — already started", self,
+                )
+                return self
+
+            logger.debug(
+                "Resetting statement %r before resubmit (iteration=%d)",
+                self, self.iteration,
+            )
+            self.cancel(wait=False)
+            self.statement_id = None
+            self._response = None
+            self._unpersist_schema()
+
+        self._start()
+        return self
+
+    # ------------------------------------------------------------------
+    # Retry
     # ------------------------------------------------------------------
 
     @property
     def retryable(self) -> bool:
         """Result-level retry predicate.
 
-        Drives the base :meth:`StatementResult.retry` loop, which calls
-        :meth:`start` with ``reset=True`` and sleeps per
-        ``self.statement.retry`` between attempts.  Returns ``True`` only
-        when:
-
-        - the statement ran and failed (``_compute_error`` returned an error),
-        - the failure code is one we know is transient
-          (``DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES`` today),
-        - we haven't blown the elapsed budget (5 min) or the attempt
-          budget (2 retries).
-
-        Submission-level failures (cold/busy warehouse, transport) aren't
-        seen here — those propagate from :meth:`send` and the caller
-        owns the retry decision.
+        Returns ``True`` only when the statement ran and hit a known
+        transient error (``DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES``
+        today) and we haven't blown the budget.
         """
         if self.iteration >= _RETRYABLE_ITERATION_LIMIT:
             return False
@@ -712,109 +825,35 @@ class WarehouseStatementResult(StatementResult):
         msg = getattr(error, "message", None) or ""
         return any(code in msg for code in _RETRYABLE_ERROR_CODES)
 
-    @property
-    def started(self) -> bool:
-        """True once the statement has been submitted (``statement_id`` present).
+    def retry(self) -> "DatabricksSQL":
+        """Retry the statement if it's retryable.
 
-        Doesn't read :attr:`state` (which would refresh) — the
-        ``statement_id`` is set synchronously by :meth:`start` and is
-        the cheapest started-flag the warehouse path has.
+        Resets and resubmits, sleeping per ``self.statement.retry``
+        between attempts. Returns self after the retry completes.
         """
-        return bool(self.statement_id) and self.statement_id != "unknown"
-
-    @property
-    def cached(self) -> bool:
-        """True when the statement is in a terminal state (response is final)."""
-        return self.done
-
-    @property
-    def client(self):
-        return self.executor.client
-
-    def persist(
-        self,
-        engine: Literal["arrow", "polars", "spark", "auto"] = "auto",
-        *,
-        data: Any | None = None,
-    ) -> "WarehouseStatementResult":
-        """No-op for warehouse results — backend already caches the response."""
+        if not self.retryable:
+            return self
+        retry_cfg = self.statement.retry
+        if retry_cfg is None:
+            return self
+        retry_cfg.jittered_sleep(self.iteration)
+        self.start(reset=True)
         return self
 
-    def unpersist(self) -> None:
-        """No-op."""
-        pass
+    # ------------------------------------------------------------------
+    # Cancel
+    # ------------------------------------------------------------------
 
-    def set_api_response(self, response: StatementResponse) -> "WarehouseStatementResult":
-        """Test hook: stuff a fully-formed API response into the result."""
-        self._response = response
-
-        if isinstance(self._response, StatementResponse):
-            self.statement_id = response.statement_id
-
-        return self
-
-    def start(
-        self,
-        reset: bool = False,
-        *,
-        wait: WaitingConfigArg = False,
-        raise_error: bool = False,
-        **kwargs: Any,
-    ) -> "WarehouseStatementResult":
-        """Submit the statement.  Idempotent on already-started results.
-
-        ``reset=True`` cancels the existing submission (when not already
-        terminal) and clears local state before resubmitting — this is
-        the path :meth:`StatementResult.retry` drives.
-
-        Caller kwargs override anything carried on ``self.statement`` for
-        this submission only — the underlying statement's hints stay put.
-        """
-        if self.started:
-            if not reset:
-                logger.debug(
-                    "Skipping start for statement %r — already started", self,
-                )
-                return self
-
-            logger.debug(
-                "Resetting statement %r before resubmit (iteration=%d)",
-                self, self.iteration,
-            )
-            self.cancel(wait=False)
-
-            self.statement_id = None
-            self._response = None
-            self._unpersist_schema()
-
-        logger.debug("Submitting statement on %r", self.executor)
-        submitted = self.executor.send(self.statement)
-
-        self.statement = submitted.statement
-        self.set_api_response(submitted._response)
-        self.iteration = self.iteration + 1
-        logger.debug(
-            "Submitted statement %r (iteration=%d, state=%s)",
-            self, self.iteration,
-            submitted._response.status.state if submitted._response else None,
-        )
-
-        return self
-
-    def cancel(self, wait: WaitingConfigArg = False, **kwargs) -> "WarehouseStatementResult":
-        """Cancel the running statement.  No-op when not started or already terminal."""
+    def cancel(self, wait: WaitingConfigArg = False, **kwargs) -> "DatabricksSQL":
+        """Cancel the running statement. No-op when not started or already terminal."""
         if not self.started:
             return self
-        # Use the cached SDK response directly here — we don't want to
-        # trigger ``state``'s refresh just to short-circuit on an already
-        # terminal statement, and the cached response is authoritative
-        # for this check.
         if self._response is not None and self._response.status.state in DONE_STATES:
             return self
 
-        wait = WaitingConfig.from_(wait)
+        wait_cfg = WaitingConfig.from_(wait)
 
-        if wait:
+        if wait_cfg:
             logger.debug("Cancelling statement %r", self)
             try:
                 self.client.workspace_client().statement_execution.cancel_execution(
@@ -829,14 +868,27 @@ class WarehouseStatementResult(StatementResult):
         self._response = None
         return self
 
+    def persist(
+        self,
+        engine: Literal["arrow", "polars", "spark", "auto"] = "auto",
+        *,
+        data: Any | None = None,
+    ) -> "DatabricksSQL":
+        """No-op for warehouse results — backend already caches the response."""
+        return self
+
+    def unpersist(self) -> None:
+        """No-op."""
+        pass
+
     # ------------------------------------------------------------------
     # Display
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
         if self.started:
-            return f"WarehouseStatementResult({self.monitoring_url!r})"
-        return f"WarehouseStatementResult(text={self.statement.text!r})"
+            return f"DatabricksSQL({self.monitoring_url!r})"
+        return f"DatabricksSQL(text={self.statement.text!r})"
 
     def __str__(self) -> str:
         return self.monitoring_url if self.started else self.statement.text
@@ -854,6 +906,13 @@ class WarehouseStatementResult(StatementResult):
     # State / status
     # ------------------------------------------------------------------
 
+    def set_api_response(self, response: StatementResponse) -> "DatabricksSQL":
+        """Set a fully-formed API response on this result."""
+        self._response = response
+        if isinstance(self._response, StatementResponse):
+            self.statement_id = response.statement_id
+        return self
+
     @property
     def response(self) -> StatementResponse:
         """Latest statement response (auto-refreshes until terminal)."""
@@ -867,16 +926,10 @@ class WarehouseStatementResult(StatementResult):
             chunk_index=chunk_index,
         )
 
-    def refresh_status(self) -> "WarehouseStatementResult":
+    def refresh_status(self) -> "DatabricksSQL":
         """Pull the latest :class:`StatementResponse` from the SDK.
 
-        Pure status read — no side effects beyond updating ``self._response``.
-        Terminal responses are sticky (the SDK won't change them), so we
-        short-circuit and return ``self`` without a round-trip.  Auto-retry
-        of retryable failures lives in :meth:`retry` / the base
-        :class:`StatementResult` retry loop, not here — keeping this method
-        pure means ``wait()`` loops and the ``state`` snapshot cache hold
-        their invariants.
+        Terminal responses are sticky — short-circuit without a round-trip.
         """
         if not self.statement_id:
             self._response = StatementResponse(
@@ -915,37 +968,26 @@ class WarehouseStatementResult(StatementResult):
 
     @property
     def sdk_state(self) -> StatementState:
-        """Backend-typed :class:`StatementState` (Databricks SDK).
-
-        Use :attr:`state` for the unified :class:`State` enum that
-        ``done`` / ``failed`` / ``started`` derive from; reach for
-        ``sdk_state`` only when a caller specifically needs the SDK
-        type (e.g. for pattern matching against ``StatementState``
-        members the unified enum collapses, like ``CLOSED``).
-        """
+        """Backend-typed :class:`StatementState` (Databricks SDK)."""
         return self.status.state
 
-    def _compute_state(self) -> State:
-        """Refresh and map the SDK state onto the unified :class:`State`.
-
-        Single source of truth for ``done`` / ``failed`` / ``started``
-        on the warehouse path; the base ``state`` property caches this
-        for the duration of any :meth:`state_snapshot` block so a code
-        path that checks several state-derived predicates only hits the
-        warehouse status endpoint once.
-        """
+    @property
+    def state(self) -> State:
+        """Unified :class:`State` enum — maps from the SDK state."""
+        if not self.started:
+            return State.IDLE
+        # Read cached response without triggering a refresh when the
+        # response is already in a terminal state.
+        if self._response is not None:
+            sdk_state = self._response.status.state
+            if sdk_state in DONE_STATES:
+                return _SDK_TO_STATE.get(sdk_state, State.PENDING)
+        # Non-terminal: refresh and map.
         return _SDK_TO_STATE.get(self.sdk_state, State.PENDING)
 
     def _compute_error(self) -> Optional[SQLError]:
-        """Build a :class:`SQLError` from the SDK response, or ``None`` on success.
-
-        Only meaningful in terminal states — :meth:`SQLError.from_statement`
-        inspects ``status.error``, which the SDK only populates on FAILED
-        / CANCELED.  Called from both :attr:`retryable` (no-refresh, uses
-        cached state) and :meth:`_raise_for_status` (after ``wait()`` has
-        forced termination).
-        """
-        if self.sdk_state not in FAILED_STATES:
+        """Build a :class:`SQLError` from the SDK response, or ``None`` on success."""
+        if not self._response or self._response.status.state not in FAILED_STATES:
             return None
         return SQLError.from_statement(self)
 
@@ -971,7 +1013,7 @@ class WarehouseStatementResult(StatementResult):
         return self.statement.disposition
 
     def _collect_schema(self, options) -> Schema:
-        if options.target:
+        if options and getattr(options, 'target', None):
             return options.target
 
         self.wait()
@@ -1044,11 +1086,6 @@ class WarehouseStatementResult(StatementResult):
         max_workers = 8
         max_in_flight = max_workers * 2
 
-        # Pool is owned by the warehouse executor — its lifetime matches
-        # the warehouse handle, so we don't leak TCP connections in a
-        # long-running process that creates and discards warehouses, and
-        # we still get connection reuse across every chunk fetched
-        # against this warehouse.
         http = self.executor.external_link_pool(max_workers)
         options = options.with_target(self._collect_schema(options))
         byte_size = options.byte_size or _DEFAULT_BYTE_SIZE
@@ -1061,11 +1098,6 @@ class WarehouseStatementResult(StatementResult):
         total_bytes = 0
 
         def fetch_batches(url: str) -> Iterator[pa.RecordBatch]:
-            # ``preload_content=False`` keeps the session's
-            # :class:`MemoryStream` lazy — bytes pull through the
-            # decoder pipeline on demand instead of buffering the full
-            # payload (chunks can run hundreds of MB) up front. We
-            # stream straight into Arrow's IPC reader instead.
             resp = http.fetch(
                 "GET", url,
                 preload_content=False,
@@ -1079,10 +1111,6 @@ class WarehouseStatementResult(StatementResult):
                     for batch in reader:
                         yield batch
             finally:
-                # Drain anything Arrow didn't consume so the connection
-                # can return to the session's idle cache cleanly;
-                # ``release_conn`` alone won't recycle a partially-read
-                # response.
                 try:
                     resp.drain_conn()
                 except Exception:
@@ -1117,14 +1145,8 @@ class WarehouseStatementResult(StatementResult):
             if not pending:
                 return
 
-            # Always go through `concat_batches`, even for a singleton.
-            # The singleton-skip shortcut handed out a batch that could
-            # alias the HTTP response buffer that backed the IPC read;
-            # once `fetch_batches` returns and the response is GC'd,
-            # those buffers vanish.  `concat_batches` materializes a
-            # fresh batch owned by `memory_pool`, breaking the alias.
             combined = pa.concat_batches(pending, memory_pool=memory_pool)
-            casted = options.cast_arrow_tabular(combined)
+            casted = options.cast_arrow_table(combined)
             pending = []
             pending_bytes = 0
             yielded_any = True
@@ -1150,12 +1172,17 @@ class WarehouseStatementResult(StatementResult):
         raise NotImplementedError("Cannot write to Databricks SQL")
 
 
+# Back-compat alias — callers that imported WarehouseStatementResult
+# by name get the new DatabricksSQL class.
+WarehouseStatementResult = DatabricksSQL
+
+
 # ---------------------------------------------------------------------------
 # WarehouseStatementBatch
 # ---------------------------------------------------------------------------
 
 
-class WarehouseStatementBatch(StatementBatch):
+class WarehouseStatementBatch:
     """Warehouse-backed batch of statements.
 
     External-table aliases are resolved at coerce-time by reading the
@@ -1167,11 +1194,6 @@ class WarehouseStatementBatch(StatementBatch):
     set of aliases applied on top of any per-statement registry — useful
     for shared scratch volumes that every statement in the batch reads.
     Per-statement entries take precedence on alias collisions.
-
-    :meth:`retry` is inherited from :class:`StatementBatch` — it walks
-    the result map, picks every entry that is both ``failed`` and
-    ``retryable``, and reissues each via :meth:`StatementResult.retry`
-    on the configured ``parallel`` thread pool.
     """
 
     external_volume_paths: Optional[dict[str, VolumePath]]
@@ -1184,24 +1206,106 @@ class WarehouseStatementBatch(StatementBatch):
         parallel: int = 1,
         external_paths: Optional[dict[str, VolumePath]] = None,
     ):
-        super().__init__(executor=executor, statements=None, parallel=parallel)
+        self.executor: "SQLWarehouse" = executor
+        self.results: OrderedDict[str, DatabricksSQL] = OrderedDict()
+        self.parallel: int = parallel
         self.external_volume_paths = dict(external_paths) if external_paths else {}
+        self.start_timestamp: Optional[float] = None
         if statements:
             self.extend(statements)
+
+    # ------------------------------------------------------------------
+    # Collection interface
+    # ------------------------------------------------------------------
+
+    def extend(self, statements: Iterable["WarehousePreparedStatement | str"]) -> "WarehouseStatementBatch":
+        """Add multiple statements to the batch."""
+        for stmt in statements:
+            self.append(stmt)
+        return self
+
+    def append(self, statement: "WarehousePreparedStatement | str") -> "WarehouseStatementBatch":
+        """Coerce and add a single statement to the batch."""
+        coerced = self._coerce(statement)
+        key = coerced.key or f"stmt_{len(self.results)}"
+        result = DatabricksSQL(executor=self.executor, statement=coerced)
+        self.results[key] = result
+        return self
+
+    def __iter__(self) -> Iterator[DatabricksSQL]:
+        return iter(self.results.values())
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    @property
+    def done(self) -> bool:
+        return all(r.done for r in self.results.values()) if self.results else False
+
+    @property
+    def failed(self) -> bool:
+        return any(r.failed for r in self.results.values())
+
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+
+    def start(self) -> "WarehouseStatementBatch":
+        """Submit all statements in the batch."""
+        self.start_timestamp = time.time()
+        if self.parallel <= 1:
+            for result in self.results.values():
+                result.start()
+        else:
+            def _submit(r: DatabricksSQL) -> DatabricksSQL:
+                r.start()
+                return r
+            with JobPoolExecutor.from_(self.parallel) as ex:
+                jobs_iter = (Job.make(_submit, r) for r in self.results.values())
+                for _ in ex.as_completed(jobs_iter, ordered=True):
+                    pass
+        return self
+
+    def wait(
+        self,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        **kwargs,
+    ) -> "WarehouseStatementBatch":
+        """Start (if needed) and wait for all statements to finish."""
+        if not any(r.started for r in self.results.values()):
+            self.start()
+        for result in self.results.values():
+            result.wait(wait=wait, raise_error=False)
+        if raise_error:
+            self.raise_for_status()
+        self.clear_temporary_resources()
+        return self
+
+    def raise_for_status(self) -> None:
+        """Raise the first error found in the batch."""
+        for result in self.results.values():
+            result._raise_for_status()
+
+    def retry(self) -> "WarehouseStatementBatch":
+        """Retry all retryable failed statements in the batch."""
+        for result in self.results.values():
+            if result.failed and result.retryable:
+                result.retry()
+        return self
+
+    # ------------------------------------------------------------------
+    # Coercion
+    # ------------------------------------------------------------------
 
     def _coerce(self, statement: "WarehousePreparedStatement | str") -> WarehousePreparedStatement:
         stmt = WarehousePreparedStatement.from_(statement)
 
         # Build the effective substitution map.  Three sources, in
         # increasing precedence:
-        #   1. batch-wide ``external_volume_paths`` (legacy)
-        #   2. per-statement ``external_volume_paths`` (legacy)
-        #   3. per-statement ``external_data`` (new generic registry)
-        # Generic entries win because :meth:`WarehousePreparedStatement.prepare`
-        # already mirrors any staged path into ``external_data`` with a
-        # pre-baked ``text_value``, so the two sources stay consistent;
-        # callers who skipped ``prepare`` (built the statement directly
-        # with ``external_volume_paths``) still get substitution.
+        #   1. batch-wide ``external_volume_paths``
+        #   2. per-statement ``external_volume_paths``
+        #   3. per-statement ``external_data``
         effective: dict[str, str] = {}
         for alias, path in (self.external_volume_paths or {}).items():
             effective[alias] = WarehousePreparedStatement.volume_path_text_value(path)
@@ -1232,12 +1336,12 @@ class WarehouseStatementBatch(StatementBatch):
         return copied
 
     def clear_temporary_resources(self) -> "WarehouseStatementBatch":
-        # Per-statement scratch first (each result owns its statement).
-        super().clear_temporary_resources()
+        """Unlink temporary resources for each statement and batch-wide paths."""
+        # Per-statement scratch first.
+        for result in self.results.values():
+            result.statement.clear_temporary_resources()
 
-        # Batch-wide scratch second.  Idempotent: callers (wait() then
-        # retry(), raise_for_status() then retry(), ...) may invoke this
-        # more than once, so bail out once we've already cleared.
+        # Batch-wide scratch second.
         if not self.external_volume_paths:
             return self
 

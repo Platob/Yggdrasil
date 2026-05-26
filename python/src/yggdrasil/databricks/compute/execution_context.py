@@ -19,7 +19,7 @@ from yggdrasil.dataclasses import (
     WaitingConfigArg,
 )
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from yggdrasil.pickle.ser import Serialized, dumps
 
 if TYPE_CHECKING:

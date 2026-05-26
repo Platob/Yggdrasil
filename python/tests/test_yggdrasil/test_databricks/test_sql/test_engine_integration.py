@@ -33,7 +33,7 @@ from typing import ClassVar
 import pyarrow as pa
 from databricks.sdk.errors import DatabricksError, NotFound
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.databricks.sql.engine import SQLEngine
 from yggdrasil.databricks.table.table import Table
 
@@ -406,8 +406,8 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         ``text_value`` (here a ``VALUES`` clause) is substituted
         verbatim — no staging round-trip, no warehouse volume created.
         """
-        from yggdrasil.data.statement import ExternalStatementData
         from yggdrasil.databricks.warehouse.statement import (
+            ExternalStatementData,
             WarehousePreparedStatement,
         )
 
@@ -512,8 +512,8 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         except ImportError:
             self.skipTest("pyspark is not installed in this environment")
 
-        from yggdrasil.data.enums import Mode
-        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.enums import Mode
+        from yggdrasil.enums.media_type import MediaTypes
         from yggdrasil.databricks.table.table import Table
 
         data = pa.table(
@@ -564,8 +564,8 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         the Parquet through ``as_media(PARQUET).write_table`` is the
         two-step pattern the warehouse insert path drives — verify the
         warehouse can read the file back."""
-        from yggdrasil.data.enums import Mode
-        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.enums import Mode
+        from yggdrasil.enums.media_type import MediaTypes
         from yggdrasil.databricks.table.table import Table
 
         data = pa.table(

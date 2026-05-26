@@ -38,7 +38,7 @@ from yggdrasil.databricks.jobs.run import JobRun
 from yggdrasil.databricks.sql.engine import SQLEngine
 from yggdrasil.databricks.table.async_write import AsyncInsert
 from yggdrasil.databricks.table.table import Table
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from .. import DatabricksIntegrationCase
 

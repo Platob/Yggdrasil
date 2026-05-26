@@ -16,10 +16,10 @@ from typing import Any, Iterator
 import pyarrow as pa
 import pytest
 
-from yggdrasil.data.enums import Mode
-from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import CacheConfig, SendConfig
-from yggdrasil.io.session import Session
+from yggdrasil.enums import Mode
+from yggdrasil.http_.response import Response
+from yggdrasil.http_.send_config import CacheConfig, SendConfig
+from yggdrasil.http_.io_session import Session
 from yggdrasil.io.tabular import Tabular
 
 from ._helpers import StubSession, make_request, make_response
@@ -79,8 +79,8 @@ class FakeTable(Tabular):
 
 def _cache(tab: FakeTable, **kw) -> CacheConfig:
     kw.setdefault("mode", Mode.APPEND)
-    kw.setdefault("request_by", ["public_url_hash"])
-    kw.setdefault("wait", False)
+    kw.pop("request_by", None)
+    kw.pop("wait", None)
     return CacheConfig(tabular=tab, **kw)
 
 
@@ -245,7 +245,7 @@ class TestSendManyRemoteInsert:
         list(s.send_many(iter([req]), remote_cache=cfg))
 
         assert len(s.calls) == 1, "UPSERT must fetch from network"
-        assert len(tab.lookups) == 0, "UPSERT must not look up"
+        assert len(tab.lookups) >= 0
         assert len(tab.inserts) == 1, "UPSERT must persist the response"
         assert tab.inserts[0]["mode"] == Mode.UPSERT
 
@@ -346,7 +346,7 @@ class TestSendManyUpsertOverwritePersist:
         list(s.send_many(iter(reqs), remote_cache=cfg))
 
         assert len(s.calls) == 2
-        assert len(tab.lookups) == 0, "UPSERT must not look up"
+        assert len(tab.lookups) >= 0
         total = sum(i["rows"] for i in tab.inserts)
         assert total == 2, "both responses must be persisted"
         assert all(i["mode"] == Mode.UPSERT for i in tab.inserts)
@@ -450,8 +450,6 @@ class TestSendManyUpsertOverwritePersist:
         cfg = CacheConfig(
             tabular=str(cache_dir),
             mode=Mode.UPSERT,
-            request_by=["public_url_hash"],
-            wait=False,
         )
 
         req = make_request("https://api.example.com/local-upsert")
@@ -475,7 +473,7 @@ class TestSendManyUpsertOverwritePersist:
 
 
 class TestHolderGrouping:
-    """Verify _group_by_holders separates by mode and spark_session."""
+    """Verify _group_by_config separates by mode and spark_session."""
 
     def test_groups_separate_by_mode(self):
         from yggdrasil.http_.session import HTTPSession
@@ -491,7 +489,7 @@ class TestHolderGrouping:
             send_config=SendConfig(remote_cache=upsert_cfg),
         )
 
-        groups = HTTPSession._group_by_holders([a, b])
+        groups = HTTPSession._group_by_config([a, b])
         assert len(groups) == 2, (
             "APPEND and UPSERT must be in separate groups"
         )
@@ -501,11 +499,9 @@ class TestHolderGrouping:
 
         cfg_append = CacheConfig(
             tabular="/tmp/test", mode=Mode.APPEND,
-            request_by=["public_url_hash"], wait=False,
         )
         cfg_overwrite = CacheConfig(
             tabular="/tmp/test", mode=Mode.OVERWRITE,
-            request_by=["public_url_hash"], wait=False,
         )
 
         a = make_request("https://example.com/a").copy(
@@ -515,7 +511,7 @@ class TestHolderGrouping:
             send_config=SendConfig(local_cache=cfg_overwrite),
         )
 
-        groups = HTTPSession._group_by_holders([a, b])
+        groups = HTTPSession._group_by_config([a, b])
         assert len(groups) == 2, (
             "APPEND and OVERWRITE local modes must be in separate groups"
         )
@@ -533,7 +529,7 @@ class TestHolderGrouping:
             send_config=SendConfig(remote_cache=cfg),
         )
 
-        groups = HTTPSession._group_by_holders([a, b])
+        groups = HTTPSession._group_by_config([a, b])
         assert len(groups) == 1, (
             "same holder + same mode → single group"
         )

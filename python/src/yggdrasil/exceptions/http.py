@@ -78,8 +78,8 @@ from yggdrasil.http_.exceptions import exceptions as _u3
 from .base import YGGException
 
 if TYPE_CHECKING:
-    from yggdrasil.io.request import PreparedRequest
-    from yggdrasil.io.response import Response
+    from yggdrasil.http_.request import PreparedRequest
+    from yggdrasil.http_.response import Response
     from starlette.responses import JSONResponse as StarletteResponse
     from fastapi.responses import JSONResponse as FastAPIJSONResponse
 
@@ -153,7 +153,7 @@ def _body_snippet(response: "Response", max_bytes: int = 2048) -> str:
         raw = response.buffer.to_bytes() if response.buffer else b""
         if not raw:
             return ""
-        from yggdrasil.io.response import _get_charset
+        from yggdrasil.http_.response import _get_charset
         charset = _get_charset(response.headers)
         text = raw[:max_bytes].decode(charset, errors="replace").strip()
         suffix = "…" if len(raw) > max_bytes else ""

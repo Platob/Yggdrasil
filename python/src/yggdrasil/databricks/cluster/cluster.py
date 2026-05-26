@@ -46,12 +46,12 @@ from databricks.sdk.service.compute import (
     PythonPyPiLibrary,
     State,
 )
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.url import URL, URLBased
 from yggdrasil.pyutils.equality import dicts_equal
 from yggdrasil.version import VersionInfo
 
@@ -199,35 +199,6 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         cluster_name: str | None = None,
         **kwargs: Any,
     ) -> "Cluster":
-        # When the caller asks for a bare ``Cluster`` against a
-        # serverless-configured client (no classic ``cluster_id`` /
-        # ``cluster_name`` pinned), promote the construction to
-        # :class:`ServerlessCluster` so the returned handle carries
-        # the serverless-specific lifecycle overrides (no-op
-        # ``start`` / ``restart``, library-install rejection,
-        # ``dbks+serverless-cluster://`` URL scheme). Only consults a
-        # service that the caller actually handed us — building one
-        # from ``Clusters.current()`` here would force a
-        # ``DatabricksClient.current()`` round-trip on every
-        # construction, which the bare ``Cluster(cluster_id="...")``
-        # shape neither needs nor expects.
-        if (
-            cls is Cluster
-            and not cluster_id
-            and not cluster_name
-            and service is not None
-        ):
-            client = getattr(service, "client", None)
-            serverless_id = getattr(client, "serverless_compute_id", None)
-            if serverless_id:
-                from .serverless import ServerlessCluster
-                return ServerlessCluster.__new__(
-                    ServerlessCluster,
-                    service=service,
-                    cluster_id=serverless_id,
-                    cluster_name=cluster_name,
-                    **kwargs,
-                )
         return super().__new__(
             cls,
             service=service,
@@ -262,7 +233,6 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         self._contexts = contexts or {}
 
         # ``__new__`` may have promoted this instance to
-        # :class:`ServerlessCluster` because the bound client targets
         # serverless compute. ``__init__`` is still called with the
         # original (bare) kwargs, so fill ``cluster_id`` from the
         # client's ``serverless_compute_id`` here — the serverless

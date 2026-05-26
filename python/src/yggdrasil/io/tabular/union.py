@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Tuple
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.tabular.base import Tabular
@@ -204,7 +204,7 @@ class UnionTabular(LazyTabular):
             )
         row_size = getattr(options, "row_size", None) or None
         for batch in table.to_batches(max_chunksize=row_size):
-            yield options.cast_arrow_tabular(batch)
+            yield options.cast_arrow_batch(batch)
 
     def _scan_polars_frame(self, options: CastOptions) -> "pl.LazyFrame":
         return self._build_lazy(options)

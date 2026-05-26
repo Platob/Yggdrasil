@@ -17,9 +17,9 @@ import gzip
 import io
 
 
-from yggdrasil.data.enums.codec import Codecs
-from yggdrasil.data.enums.media_type import MediaType, MediaTypes
-from yggdrasil.data.enums.mime_type import MimeTypes
+from yggdrasil.enums.codec import Codecs
+from yggdrasil.enums.media_type import MediaType, MediaTypes
+from yggdrasil.enums.mime_type import MimeTypes
 
 
 class TestIdentity:

@@ -80,7 +80,7 @@ class TestFormatDispatch:
         assert isinstance(b, CSVFile)
 
     def test_explicit_media_type_wins_over_extension(self, tmp_path) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.bytes_io import BytesIO
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
@@ -91,7 +91,7 @@ class TestFormatDispatch:
         assert isinstance(b, ParquetFile)
 
     def test_storage_holder_media_type_drives_dispatch(self) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.bytes_io import BytesIO
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
@@ -328,7 +328,7 @@ class TestOpenFormatDispatch:
         assert type(cursor) is IO
 
     def test_explicit_media_type_overrides_extension(self, tmp_path) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
         lp = LocalPath(str(tmp_path / "x.csv"))
@@ -370,7 +370,7 @@ class TestFormatRegistry:
             Holder.class_for_media_type("xx-unknown")
 
     def test_for_holder_dispatches_via_stamped_media(self) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
         mem = Memory()
@@ -379,7 +379,7 @@ class TestFormatRegistry:
         assert isinstance(leaf, ParquetFile)
 
     def test_for_holder_explicit_media_type(self) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.primitive.csv_file import CSVFile
 
         mem = Memory()
@@ -402,14 +402,14 @@ class TestFormatRegistry:
 class TestLazyMediaType:
 
     def test_unseeded_holder_infers_from_url(self, tmp_path) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         lp = LocalPath(str(tmp_path / "data.csv"))
         assert lp.media_type is not None
         assert lp.media_type.mime_type == MimeTypes.CSV
 
     def test_explicit_stat_seed_wins(self, tmp_path) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.io_stats import IOStats
 
         seed = MediaType(MimeTypes.PARQUET)
@@ -417,21 +417,21 @@ class TestLazyMediaType:
         assert lp.media_type == seed
 
     def test_setter_overrides(self) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.enums import MediaType, MimeTypes
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
         assert mem.media_type.mime_type == MimeTypes.PARQUET
 
     def test_setter_accepts_string(self) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         mem = Memory()
         mem.media_type = "application/json"
         assert mem.media_type.mime_type == MimeTypes.JSON
 
     def test_setter_none_clears(self) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
+        from yggdrasil.enums import MediaType, MimeTypes
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
@@ -504,7 +504,7 @@ class TestFromUrl:
     """
 
     def test_storage_builds_at_url(self) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         mem = Memory()
         sibling = mem._from_url(URL.from_("/foo/bar/data.parquet"))
@@ -514,7 +514,7 @@ class TestFromUrl:
 
     def test_local_path_no_override_keeps_url(self, tmp_path) -> None:
         # Path._from_url is gone — Holder default handles it.
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         lp = LocalPath(str(tmp_path / "a.bin"))
         target = URL.from_(f"file://{tmp_path / 'b.bin'}")
@@ -524,7 +524,7 @@ class TestFromUrl:
 
     def test_cursor_reuses_parent_storage(self) -> None:
         from yggdrasil.io.bytes_io import BytesIO
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         mem = Memory(b"shared")
         cursor = BytesIO(holder=mem, owns_holder=False, mode="rb")

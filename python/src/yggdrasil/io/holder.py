@@ -63,8 +63,8 @@ from typing import (
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import MediaType, MimeType
-from yggdrasil.data.enums.mode import Mode, ModeLike
+from yggdrasil.enums import MediaType, MimeType
+from yggdrasil.enums.mode import Mode, ModeLike
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
@@ -165,9 +165,9 @@ def _resolve_in_memory_tabular(data: Any) -> "type | None":
         # GroupedData, Window …) aren't tabular sources we know how
         # to wrap; route DataFrames only.
         if "DataFrame" in type(data).__name__:
-            from yggdrasil.spark.tabular import Dataset
+            from yggdrasil.spark.tabular import SparkDataset
 
-            return Dataset
+            return SparkDataset
         return None
 
     if mod in ("polars", "pandas"):
@@ -1837,7 +1837,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             self._media_type = None
             return
         try:
-            from yggdrasil.data.enums.media_type import MediaType
+            from yggdrasil.enums.media_type import MediaType
 
             mt = MediaType.from_(value, default=None)
         except Exception:
@@ -3591,7 +3591,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         :class:`Tabular` leaf and returns ``read_pylist()``.
         """
         import json as _json
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
 
         mt = (
             MediaType.from_(media_type, default=None)
@@ -3673,7 +3673,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             if inner is not None:
                 codec_obj = inner
             else:
-                from yggdrasil.data.enums.codec import Codec
+                from yggdrasil.enums.codec import Codec
 
                 codec_obj = Codec.from_(codec, default=None)
         if codec_obj is None:
@@ -3681,26 +3681,6 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
                 return type(self)(self.to_bytes())
             return self
         return codec_obj.decompress(self)
-
-    def _commit_metadata(self) -> None:
-        """Refresh the holder's :class:`IOStats` after a bulk write.
-
-        Bulk writers route through ``options.sync_metadata=False`` for
-        the inner per-batch call so each ``write_mv`` skips its
-        post-write ``_touch_stat``. This single call at the end stamps
-        a fresh ``mtime`` and flushes any buffered backend state — one
-        ``time.time()`` (and one optional flush) per write op instead
-        of one per batch.
-        """
-        target = self._parent if self._parent is not None else self
-        try:
-            target.touch_mtime()
-        except AttributeError:
-            pass
-        try:
-            target.flush()
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------
     # Dunder

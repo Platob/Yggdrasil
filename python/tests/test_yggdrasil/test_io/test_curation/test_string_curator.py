@@ -11,7 +11,7 @@ import datetime as dt
 import unittest
 
 from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.data.enums.timezone import Timezone
+from yggdrasil.enums.timezone import Timezone
 from yggdrasil.data.types import (
     BooleanType,
     DateType,

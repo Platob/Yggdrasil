@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.mode import Mode, STR_MAPPING
+from yggdrasil.enums.mode import Mode, STR_MAPPING
 
 
 class TestCanonicalMembers:

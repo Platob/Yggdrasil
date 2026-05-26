@@ -5,9 +5,6 @@ from pathlib import Path
 from typing import Any, Callable, ClassVar, IO, Mapping, Union, Iterable, Iterator
 
 __all__ = ["MimeType", "MimeTypes"]
-from yggdrasil.io import URL
-
-from yggdrasil.lazy_imports import io_class
 
 MagicMatcher = Callable[[bytes], bool]
 
@@ -298,7 +295,8 @@ class MimeType:
             # Iterables — but not scalars that happen to be iterable
             # (str, bytes/bytearray/memoryview magic buffers, Path, IO).
             if not isinstance(x, (str, bytes, bytearray, memoryview)):
-                is_path = URL.is_pathish(x)
+                from yggdrasil.url import URL as _URL
+                is_path = _URL.is_pathish(x)
                 is_io = hasattr(x, "read") and hasattr(x, "seek")
                 if not is_path and not is_io and isinstance(x, (list, tuple, set, frozenset, Iterable, Iterator)):
                     try:
@@ -362,6 +360,7 @@ class MimeType:
             return _miss(default, "empty magic buffer")
 
         if not isinstance(magic, (bytes, bytearray)):
+            from yggdrasil.lazy_imports import io_class
             IO = io_class()
 
             if isinstance(magic, IO):
@@ -377,6 +376,8 @@ class MimeType:
                 finally:
                     fh.seek(saved)
             else:
+                from yggdrasil.lazy_imports import bytes_io_class
+                BytesIO = bytes_io_class()
                 bio = BytesIO(magic)
                 bio.acquire()
                 try:

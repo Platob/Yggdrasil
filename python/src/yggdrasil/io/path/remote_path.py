@@ -160,7 +160,7 @@ class RemotePath(Path):
                     f"(int / ByteUnit / size string / None), got {value!r}"
                 )
             return value if value > 0 else None
-        from yggdrasil.data.enums.byteunit import ByteUnit
+        from yggdrasil.enums.byteunit import ByteUnit
 
         try:
             n = ByteUnit.parse_size(value)

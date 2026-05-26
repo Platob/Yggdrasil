@@ -170,111 +170,111 @@ class TestSparkOps(unittest.TestCase):
         """The cross-engine :meth:`Tabular.unique` routes via
         :meth:`_native_spark_frame` and returns a fresh ``Dataset``
         instead of collecting through Arrow."""
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         df = self.spark.createDataFrame(
             [(1, "a"), (2, "b"), (1, "c"), (3, "d")],
             schema="id long, v string",
         )
-        ds = Dataset(frame=df)
+        ds = SparkDataset(frame=df)
         out = ds.unique("id")
-        assert isinstance(out, Dataset)
+        assert isinstance(out, SparkDataset)
         assert out is not ds  # fresh holder
         rows = sorted(out.frame.collect(), key=lambda r: r.id)
         assert [(r.id, r.v) for r in rows] == [(1, "a"), (2, "b"), (3, "d")]
 
     def test_dataset_resample_returns_dataset_with_ffill(self) -> None:
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         rows = [
             ("A", dt.datetime(2024, 1, 1, h), (h + 1) * 10 if h in (0, 3) else None)
             for h in range(6)
         ]
-        ds = Dataset(frame=self._ts_frame(rows))
+        ds = SparkDataset(frame=self._ts_frame(rows))
         out = ds.resample(
             on="ts",
             sampling=dt.timedelta(hours=2),
             partition_by="sym",
         )
-        assert isinstance(out, Dataset)
+        assert isinstance(out, SparkDataset)
         collected = sorted(out.frame.collect(), key=lambda r: r.ts)
         # 2h buckets, first per bucket: [10, None, None] → ffill → [10, 10, 10].
         assert [r.v for r in collected] == [10, 10, 10]
 
     def test_dataset_resample_accepts_iso_duration_string(self) -> None:
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         rows = [("A", dt.datetime(2024, 1, 1, h), h) for h in range(4)]
-        ds = Dataset(frame=self._ts_frame(rows))
+        ds = SparkDataset(frame=self._ts_frame(rows))
         out = ds.resample(on="ts", sampling="PT2H", partition_by=["sym"])
         collected = sorted(out.frame.collect(), key=lambda r: r.ts)
         assert [r.v for r in collected] == [0, 2]
 
     def test_dataset_select_returns_dataset(self) -> None:
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         df = self.spark.createDataFrame(
             [(1, "x", 10), (2, "y", 20), (3, "z", 30)],
             schema="a long, b string, c long",
         )
-        out = Dataset(frame=df).select("a", "c")
-        assert isinstance(out, Dataset)
+        out = SparkDataset(frame=df).select("a", "c")
+        assert isinstance(out, SparkDataset)
         assert out.frame.columns == ["a", "c"]
         rows = sorted(out.frame.collect(), key=lambda r: r.a)
         assert [(r.a, r.c) for r in rows] == [(1, 10), (2, 20), (3, 30)]
 
     def test_dataset_drop_returns_dataset(self) -> None:
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         df = self.spark.createDataFrame(
             [(1, "x", 10), (2, "y", 20)],
             schema="a long, b string, c long",
         )
-        out = Dataset(frame=df).drop("b")
-        assert isinstance(out, Dataset)
+        out = SparkDataset(frame=df).drop("b")
+        assert isinstance(out, SparkDataset)
         assert out.frame.columns == ["a", "c"]
 
     def test_dataset_drop_missing_column_is_no_op(self) -> None:
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
         df = self.spark.createDataFrame([(1,)], schema="a long")
-        out = Dataset(frame=df).drop("nope")
+        out = SparkDataset(frame=df).drop("nope")
         assert out.frame.columns == ["a"]
 
     def test_dataset_filter_sql_string_native_path(self) -> None:
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         df = self.spark.createDataFrame(
             [(1,), (2,), (3,), (4,)], schema="a long",
         )
-        out = Dataset(frame=df).filter("a > 2")
-        assert isinstance(out, Dataset)
+        out = SparkDataset(frame=df).filter("a > 2")
+        assert isinstance(out, SparkDataset)
         rows = sorted(out.frame.collect(), key=lambda r: r.a)
         assert [r.a for r in rows] == [3, 4]
 
     def test_dataset_filter_yggdrasil_expression_native_path(self) -> None:
         from yggdrasil.execution.expr import col
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         df = self.spark.createDataFrame(
             [(1, "x"), (2, "y"), (3, "x")], schema="a long, b string",
         )
-        out = Dataset(frame=df).filter(col("b") == "x")
+        out = SparkDataset(frame=df).filter(col("b") == "x")
         rows = sorted(out.frame.collect(), key=lambda r: r.a)
         assert [(r.a, r.b) for r in rows] == [(1, "x"), (3, "x")]
 
     def test_dataset_filter_callable_still_works(self) -> None:
         """Legacy callable filter path is preserved — ``Dataset.filter``
         dispatches by argument type."""
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
         from yggdrasil.data import field, schema
         from yggdrasil.data.types.primitive import Int64Type
 
         out_schema = schema([field("a", Int64Type, nullable=False)])
         df = self.spark.createDataFrame([(1,), (2,), (3,)], schema=out_schema.to_spark_schema())
-        out = Dataset(frame=df, schema=out_schema).filter(
+        out = SparkDataset(frame=df, schema=out_schema).filter(
             lambda r: r["a"] >= 2, schema=out_schema,
         )
-        assert isinstance(out, Dataset)
+        assert isinstance(out, SparkDataset)
         rows = sorted(out.frame.collect(), key=lambda r: r.a)
         assert [r.a for r in rows] == [2, 3]
 

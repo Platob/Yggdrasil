@@ -6,9 +6,9 @@ import datetime as dt
 from typing import Any
 
 from yggdrasil.http_ import HTTPSession
-from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import SendConfig
+from yggdrasil.http_.request import PreparedRequest
+from yggdrasil.http_.response import Response
+from yggdrasil.http_.send_config import SendConfig
 
 
 EPOCH = dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)

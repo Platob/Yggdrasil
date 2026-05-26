@@ -59,7 +59,7 @@ import threading
 import time
 from typing import Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Mode, Scheme
+from yggdrasil.enums import Mode, Scheme
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.path import Path

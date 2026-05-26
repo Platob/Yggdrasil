@@ -11,7 +11,7 @@ import datetime as dt
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from yggdrasil.data.enums.currency import Currency
+from yggdrasil.enums.currency import Currency
 from yggdrasil.fxrate.backends import Backend
 from yggdrasil.fxrate.session import FxQuote, FxRate
 

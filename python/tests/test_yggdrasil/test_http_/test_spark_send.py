@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.response import RESPONSE_SCHEMA
-from yggdrasil.io.session import Session
+from yggdrasil.http_.response import RESPONSE_SCHEMA
+from yggdrasil.http_.io_session import Session
 
 from ._helpers import StubSession, make_request
 

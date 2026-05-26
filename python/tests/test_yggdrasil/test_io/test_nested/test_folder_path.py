@@ -17,7 +17,7 @@ class TestRegistration:
         assert issubclass(FolderPath, Holder)
 
     def test_folder_in_registry(self) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         assert Holder.class_for_media_type(MimeTypes.FOLDER) is FolderPath
 
@@ -93,12 +93,47 @@ class TestRoundTrip:
         got = folder.read_arrow_table()
         assert got.column("id").to_pylist() == [1, 2, 3]
 
+    def test_read_with_column_projection(self, tmp_path) -> None:
+        folder = FolderPath(path=str(tmp_path))
+        table = pa.table({"id": [1, 2, 3], "v": [10, 20, 30], "name": ["a", "b", "c"]})
+        folder.write_arrow_table(table)
+
+        out = folder.read_arrow_table(columns=["id"])
+        assert out.column_names == ["id"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_read_with_column_projection_multiple(self, tmp_path) -> None:
+        folder = FolderPath(path=str(tmp_path))
+        table = pa.table({"id": [1, 2], "v": [10, 20], "name": ["a", "b"]})
+        folder.write_arrow_table(table)
+
+        out = folder.read_arrow_table(columns=["id", "name"])
+        assert out.column_names == ["id", "name"]
+        assert out.to_pylist() == [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+
+    def test_read_with_column_projection_partitioned(self, tmp_path) -> None:
+        schema = pa.schema([
+            pa.field("pk", pa.int64(), metadata={b"t:partition_by": b"True"}),
+            pa.field("id", pa.int64()),
+            pa.field("v", pa.int64()),
+        ])
+        folder = FolderPath(path=str(tmp_path))
+        batch = pa.record_batch(
+            [pa.array([1, 2], pa.int64()), pa.array([10, 20], pa.int64()), pa.array([100, 200], pa.int64())],
+            schema=schema,
+        )
+        folder.write_arrow_batches((batch,))
+
+        out = folder.read_arrow_table(columns=["id"])
+        assert out.column_names == ["id"]
+        assert sorted(out.column("id").to_pylist()) == [10, 20]
+
 
 class TestMediaTypeMetadata:
     """``FolderPath._persist_schema`` stamps ``Field.media_type``."""
 
     def test_in_memory_schema_carries_media_type(self, tmp_path) -> None:
-        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.enums.media_type import MediaTypes
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -109,7 +144,7 @@ class TestMediaTypeMetadata:
         assert folder.collect_schema().media_type == MediaTypes.ARROW_IPC
 
     def test_sidecar_round_trips_media_type(self, tmp_path) -> None:
-        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.enums.media_type import MediaTypes
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -157,7 +192,7 @@ class TestPartitionWriteModes:
     """
 
     def test_overwrite_clears_stale_partitions(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -180,7 +215,7 @@ class TestPartitionWriteModes:
         assert (tmp_path / "pk=3").is_dir()
 
     def test_ignore_short_circuits_when_any_partition_present(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -197,7 +232,7 @@ class TestPartitionWriteModes:
         assert not (tmp_path / "pk=2").exists()
 
     def test_error_if_exists_raises(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -216,7 +251,7 @@ class TestClearTabularChildren:
     """``_clear_tabular_children`` must remove partition directories too."""
 
     def test_removes_partition_subtrees_not_just_files(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -234,6 +269,120 @@ class TestClearTabularChildren:
         assert (tmp_path / ".ygg").is_dir()
 
 
+
+
+class TestPartitionedUpsert:
+    """OVERWRITE + match_by must upsert per partition, not purge all."""
+
+    @staticmethod
+    def _batch(part_values, ids, values):
+        schema = pa.schema([
+            pa.field("pk", pa.int64(), metadata={b"t:partition_by": b"True"}),
+            pa.field("id", pa.int64()),
+            pa.field("v", pa.int64()),
+        ])
+        return pa.record_batch(
+            [
+                pa.array(part_values, pa.int64()),
+                pa.array(ids, pa.int64()),
+                pa.array(values, pa.int64()),
+            ],
+            schema=schema,
+        )
+
+    def test_overwrite_match_by_preserves_other_partitions(self, tmp_path) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (self._batch([1, 1, 2, 2], [10, 11, 20, 21], [100, 110, 200, 210]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        assert (tmp_path / "pk=1").is_dir()
+        assert (tmp_path / "pk=2").is_dir()
+
+        # OVERWRITE with match_by=["id"] — only touches pk=1, pk=2 untouched
+        folder.write_arrow_batches(
+            (self._batch([1], [10], [999]),),
+            options=FolderOptions(mode=Mode.OVERWRITE, match_by=["id"]),
+        )
+        assert (tmp_path / "pk=1").is_dir()
+        assert (tmp_path / "pk=2").is_dir()
+
+        out = folder.read_arrow_table()
+        rows = sorted(out.to_pylist(), key=lambda r: (r["pk"], r["id"]))
+        # pk=1: id=10 updated to 999, id=11 preserved
+        assert rows[0] == {"pk": 1, "id": 10, "v": 999}
+        assert rows[1] == {"pk": 1, "id": 11, "v": 110}
+        # pk=2: untouched
+        assert rows[2] == {"pk": 2, "id": 20, "v": 200}
+        assert rows[3] == {"pk": 2, "id": 21, "v": 210}
+
+    def test_overwrite_match_by_inserts_new_rows(self, tmp_path) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (self._batch([1], [10], [100]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+
+        # New id=99 in existing partition pk=1
+        folder.write_arrow_batches(
+            (self._batch([1], [99], [999]),),
+            options=FolderOptions(mode=Mode.OVERWRITE, match_by=["id"]),
+        )
+
+        out = folder.read_arrow_table()
+        rows = sorted(out.to_pylist(), key=lambda r: r["id"])
+        assert len(rows) == 2
+        assert rows[0] == {"pk": 1, "id": 10, "v": 100}
+        assert rows[1] == {"pk": 1, "id": 99, "v": 999}
+
+    def test_overwrite_match_by_new_partition_created(self, tmp_path) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (self._batch([1], [10], [100]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+
+        # Write to a new partition pk=3 while pk=1 exists
+        folder.write_arrow_batches(
+            (self._batch([3], [30], [300]),),
+            options=FolderOptions(mode=Mode.OVERWRITE, match_by=["id"]),
+        )
+
+        assert (tmp_path / "pk=1").is_dir()
+        assert (tmp_path / "pk=3").is_dir()
+        out = folder.read_arrow_table()
+        rows = sorted(out.to_pylist(), key=lambda r: r["id"])
+        assert len(rows) == 2
+        assert rows[0] == {"pk": 1, "id": 10, "v": 100}
+        assert rows[1] == {"pk": 3, "id": 30, "v": 300}
+
+    def test_overwrite_without_match_by_still_purges(self, tmp_path) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (self._batch([1, 2], [10, 20], [100, 200]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+
+        # Plain OVERWRITE (no match_by) still purges all partitions
+        folder.write_arrow_batches(
+            (self._batch([3], [30], [300]),),
+            options=FolderOptions(mode=Mode.OVERWRITE),
+        )
+        assert not (tmp_path / "pk=1").exists()
+        assert not (tmp_path / "pk=2").exists()
+        assert (tmp_path / "pk=3").is_dir()
 
 
 class TestCheckedCast:
@@ -273,7 +422,7 @@ class TestCheckedCast:
         # Without ``checked_cast`` the cast pass runs (no-op cast here
         # but the dispatch fires); with it the input passes through
         # by identity.
-        same_id = opts.copy(checked_cast=True).cast_arrow_tabular(batch)
+        same_id = opts.copy(checked_cast=True).cast_arrow_batch(batch)
         assert same_id is batch
 
     def test_write_arrow_batches_with_checked_cast_uses_first_batch_schema(
@@ -374,7 +523,7 @@ class TestUniqueByDedup:
         # collapses them on disk, then a unique_by read returns one
         # row per id even if the on-disk shape still carries dupes.
         from yggdrasil.data import field
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -928,7 +1077,7 @@ class TestComplexNestedTypeDedupResample:
         # payload, then read back with ``unique_by`` set.
         from yggdrasil.data import field
         from yggdrasil.io.nested.folder_path import FolderOptions
-        from yggdrasil.data.enums import MediaTypes
+        from yggdrasil.enums import MediaTypes
 
         t = self._build_table_with_list_of_struct(rows=8)
         folder = FolderPath(path=str(tmp_path))

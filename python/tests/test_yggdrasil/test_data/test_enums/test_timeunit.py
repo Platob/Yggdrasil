@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.timeunit import TimeUnit
+from yggdrasil.enums.timeunit import TimeUnit
 
 
 class TestCanonicalMembers:

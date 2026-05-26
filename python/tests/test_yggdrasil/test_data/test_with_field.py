@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 
 from yggdrasil.data.data_field import Field
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.types.nested.struct import StructType
 from yggdrasil.data.types.primitive import (
     Float64Type,

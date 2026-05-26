@@ -321,7 +321,7 @@ class TestEngineTypeBypassArrow(ArrowTestCase):
         )
         opts = CastOptions(source=source_field, target=target_field)
 
-        out = opts.cast_arrow_tabular(table)
+        out = opts.cast_arrow_table(table)
 
         self.assertIs(out, table)
 
@@ -385,7 +385,7 @@ class TestArrowViewFlatStrictCast(ArrowTestCase):
             obj=table, copy=True,
         )
 
-        out = opts.cast_arrow_tabular(table)
+        out = opts.cast_arrow_table(table)
 
         self.assertEqual(out.schema.field("a").type, pa.string())
         self.assertEqual(out.column("a").to_pylist(), ["x", "y"])

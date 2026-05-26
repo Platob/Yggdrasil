@@ -6,7 +6,7 @@ from pathlib import Path as _Path
 
 import pytest
 
-from yggdrasil.io.url import URL, resolve_memory_address
+from yggdrasil.url import URL, resolve_memory_address
 
 
 # ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ from typing import (
     Tuple,
 )
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.databricks.warehouse.statement import WarehouseStatementBatch
 from yggdrasil.execution.expr import Predicate

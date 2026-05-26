@@ -29,10 +29,10 @@ from typing import Any
 
 import pytest
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.http_ import HTTPSession
-from yggdrasil.io.send_config import CacheConfig
-from yggdrasil.io.session import Session
+from yggdrasil.http_.send_config import CacheConfig
+from yggdrasil.http_.io_session import Session
 from yggdrasil.io.tabular import Tabular
 
 from ._helpers import make_request, make_response
@@ -61,7 +61,7 @@ class _StubTabular(Tabular):
     def __init__(self, name: str) -> None:
         super().__init__()
         self._name = name
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
         self.url = URL.from_(name)
 
     def _read_arrow_batches(self, options=None): return iter(())

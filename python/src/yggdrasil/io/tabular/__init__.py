@@ -34,7 +34,7 @@ __all__ = [
     "O",
     "Tabular",
     "ArrowTabular",
-    "Dataset",
+    "SparkDataset",
     "SparkTabular",
     "LazyTabular",
     "UnionTabular",
@@ -57,7 +57,7 @@ def __getattr__(name: str):
     if name == "ArrowTabular":
         from yggdrasil.arrow.tabular import ArrowTabular
         return ArrowTabular
-    if name in ("Dataset", "SparkTabular"):
-        from yggdrasil.spark.tabular import Dataset
-        return Dataset
+    if name in ("SparkDataset", "SparkTabular"):
+        from yggdrasil.spark.tabular import SparkDataset
+        return SparkDataset
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

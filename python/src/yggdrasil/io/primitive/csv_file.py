@@ -23,7 +23,7 @@ import pyarrow.csv as pa_csv
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
+from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
 from yggdrasil.pickle import json as yg_json
@@ -267,7 +267,7 @@ class CSVFile(IO[bytes, CsvOptions]):
                 return
             try:
                 for batch in reader:
-                    yield options.cast_arrow_tabular(batch)
+                    yield options.cast_arrow_batch(batch)
             finally:
                 reader.close()
         finally:
@@ -381,7 +381,7 @@ class CSVFile(IO[bytes, CsvOptions]):
         # reshapes the rows to the caller's schema before the
         # encoder sees them.
         cast_opts = options.check_source(first.schema)
-        first_casted = cast_opts.cast_arrow_tabular(first)
+        first_casted = cast_opts.cast_arrow_batch(first)
 
         # CSV can't encode nested arrow types — pyarrow's CSVWriter
         # raises ``ArrowInvalid: Unsupported Type`` on the first
@@ -421,7 +421,7 @@ class CSVFile(IO[bytes, CsvOptions]):
                     if first_casted.num_rows > 0:
                         writer.write_batch(first_casted)
                     for batch in iterator:
-                        casted = cast_opts.cast_arrow_tabular(batch)
+                        casted = cast_opts.cast_arrow_batch(batch)
                         if nested_indices:
                             casted = _encode_nested_as_json(
                                 casted,
@@ -442,7 +442,7 @@ class CSVFile(IO[bytes, CsvOptions]):
                 if first_casted.num_rows > 0:
                     writer.write_batch(first_casted)
                 for batch in iterator:
-                    casted = cast_opts.cast_arrow_tabular(batch)
+                    casted = cast_opts.cast_arrow_batch(batch)
                     if nested_indices:
                         casted = _encode_nested_as_json(
                             casted,
@@ -458,7 +458,7 @@ class CSVFile(IO[bytes, CsvOptions]):
     # Native engine overrides
     # ==================================================================
 
-    def _read_arrow_dataset(self, options: CsvOptions) -> "pds.Dataset":
+    def _read_arrow_dataset(self, options: CsvOptions) -> "pds.SparkDataset":
         pds = pyarrow_dataset_module()
         path = self._local_path_str()
         if path is not None:

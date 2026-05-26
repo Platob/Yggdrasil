@@ -27,7 +27,7 @@ from databricks.sdk.service.jobs import (
 
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from ..client import DatabricksResource
 

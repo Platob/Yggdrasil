@@ -39,10 +39,14 @@ from databricks.sdk.service.catalog import (
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
-from yggdrasil.data.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
+from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema, Schema
-from yggdrasil.data.statement import PreparedStatement, StatementResult
+from yggdrasil.databricks.sql.sql_utils import looks_like_query
+from yggdrasil.databricks.warehouse.statement import (
+    DatabricksSQL,
+    WarehousePreparedStatement as _WarehousePreparedStatement,
+)
 from yggdrasil.databricks.client import DatabricksClient
 from yggdrasil.databricks.column.column import Column
 from yggdrasil.databricks.path import DatabricksPath
@@ -55,7 +59,7 @@ from yggdrasil.databricks.sql.sql_utils import (
 )
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.io import URL
+from yggdrasil.url import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import Path
@@ -87,10 +91,10 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.warehouse import WarehousePreparedStatement
+    from yggdrasil.databricks.warehouse.statement import WarehouseStatementBatch as StatementBatch
     from yggdrasil.databricks.jobs.job import Job as DatabricksJob
     from yggdrasil.databricks.table.async_job import AsyncApplierTaskType
     from yggdrasil.databricks.table.async_write import AsyncInsert
-    from yggdrasil.data.statement import StatementBatch
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
 
@@ -235,7 +239,7 @@ def _apply_retry_to_warehouse_statement(
 
 
 def _apply_retry_to_statement(
-    stmt: "PreparedStatement",
+    stmt: Any,
     retry: Optional[WaitingConfigArg],
 ) -> None:
     """Install ``retry`` on any prepared statement (warehouse or Spark)."""
@@ -257,6 +261,34 @@ def _resolve_retry(retry: Optional[WaitingConfigArg]) -> Optional[WaitingConfig]
     if retry is None or retry is False:
         return None
     return WaitingConfig.from_(retry)
+
+
+from contextlib import contextmanager as _contextmanager
+
+@_contextmanager
+def _scoped_spark_conf(session: Any, conf: Optional[Dict[str, str]]):
+    """Temporarily apply Spark config and restore on exit."""
+    if not conf:
+        yield
+        return
+    original: dict[str, str] = {}
+    for key, value in conf.items():
+        try:
+            original[key] = session.conf.get(key)
+        except Exception:
+            original[key] = None
+        session.conf.set(key, value)
+    try:
+        yield
+    finally:
+        for key, prev in original.items():
+            if prev is None:
+                try:
+                    session.conf.unset(key)
+                except Exception:
+                    pass
+            else:
+                session.conf.set(key, prev)
 
 
 def _execute_dml(
@@ -1563,7 +1595,7 @@ class Table(DatabricksPath):
     
     def execute(
         self,
-        statement: str | PreparedStatement,
+        statement: str | _WarehousePreparedStatement,
         *args,
         **kwargs
     ):
@@ -2785,7 +2817,7 @@ class Table(DatabricksPath):
         column order — selecting present columns as-is and substituting
         ``CAST(NULL AS <ddl>)`` for absent ones.
         """
-        from yggdrasil.data.enums.mode import Mode as _Mode
+        from yggdrasil.enums.mode import Mode as _Mode
 
         column_order: list[str] = []
         unified: dict[str, Any] = {}
@@ -3264,7 +3296,7 @@ class Table(DatabricksPath):
         data: Union[
             pa.Table, pa.RecordBatch, pa.RecordBatchReader,
             dict, list, str,
-            PreparedStatement, StatementResult,
+            _WarehousePreparedStatement, DatabricksSQL,
             "pandas.DataFrame", "polars.DataFrame", "pyspark.sql.DataFrame",
         ],
         *,
@@ -3323,7 +3355,7 @@ class Table(DatabricksPath):
             safe_merge=safe_merge,
         )
 
-        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
+        if isinstance(data, (_WarehousePreparedStatement, DatabricksSQL)) or looks_like_query(data):
             return self.sql_insert(
                 data, spark_session=spark_session,
                 schema_mode=schema_mode, cast_options=cast_options,
@@ -3332,7 +3364,7 @@ class Table(DatabricksPath):
 
         if spark_session is None:
             session_attr = getattr(data, "sparkSession", None)
-            spark_session = session_attr if session_attr is not None else self.sql.spark.resolve_session(create=False)
+            spark_session = session_attr if session_attr is not None else self.sql._resolve_spark_session(create=False)
 
         if spark_session is not None:
             return self.spark_insert(
@@ -3450,7 +3482,7 @@ class Table(DatabricksPath):
         """
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
-        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
+        if isinstance(data, (_WarehousePreparedStatement, DatabricksSQL)) or looks_like_query(data):
             return self.sql_insert(
                 data,
                 mode=mode,
@@ -3596,7 +3628,7 @@ class Table(DatabricksPath):
         the materialised source DataFrame — handy for chaining
         downstream transforms without re-querying the target.
         """
-        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
+        if isinstance(data, (_WarehousePreparedStatement, DatabricksSQL)) or looks_like_query(data):
             return self.sql_insert(
                 data,
                 mode=mode,
@@ -3611,7 +3643,7 @@ class Table(DatabricksPath):
             )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
-        from yggdrasil.spark.statement import SparkPreparedStatement
+        from yggdrasil.spark.sql import SparkSQL
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
@@ -3627,7 +3659,7 @@ class Table(DatabricksPath):
         )
 
         sql_engine = self.sql
-        session = spark_session or sql_engine.spark.resolve_session(create=True)
+        session = spark_session or sql_engine._resolve_spark_session(create=True)
         data_df = any_to_spark_dataframe(data, cast_options)
 
         if match_by == "auto":
@@ -3716,12 +3748,10 @@ class Table(DatabricksPath):
 
         retry_cfg = _resolve_retry(retry)
 
-        def _prepare_spark_batch(texts: list[str]) -> list[SparkPreparedStatement]:
-            out: list[SparkPreparedStatement] = []
+        def _prepare_spark_batch(texts: list[str]) -> list[SparkSQL]:
+            out: list[SparkSQL] = []
             for sql in texts:
-                stmt = SparkPreparedStatement(text=sql, spark_session=session)
-                if retry_cfg is not None and _classify_dml(sql):
-                    _apply_retry_to_statement(stmt, retry_cfg)
+                stmt = SparkSQL(query=sql, spark=session)
                 out.append(stmt)
             return out
 
@@ -3738,7 +3768,7 @@ class Table(DatabricksPath):
 
         primary_batch = None
         try:
-            with sql_engine.spark.scoped_spark_conf(session, applied_conf):
+            with _scoped_spark_conf(session, applied_conf):
                 primary_batch = _execute_dml(
                     sql_engine,
                     statements=prepared,
@@ -3768,8 +3798,8 @@ class Table(DatabricksPath):
                     logger.debug("Failed to unpersist cached source; continuing.", exc_info=True)
 
         if return_data:
-            from yggdrasil.spark.tabular import Dataset
-            return Dataset(data_df)
+            from yggdrasil.spark.tabular import SparkDataset
+            return SparkDataset(data_df)
         return primary_batch
 
     # =========================================================================
@@ -3836,7 +3866,7 @@ class Table(DatabricksPath):
             )
 
         if spark_session is None:
-            spark_session = self.sql.spark.resolve_session(create=False)
+            spark_session = self.sql._resolve_spark_session(create=False)
         if spark_session is not None:
             text = (
                 statement.statement.text

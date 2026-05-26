@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 
 from yggdrasil.data.constants import DEFAULT_FIELD_NAME
 from yggdrasil.lazy_imports import field_class

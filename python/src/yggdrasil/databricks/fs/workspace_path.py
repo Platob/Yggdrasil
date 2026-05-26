@@ -15,10 +15,10 @@ import logging
 import time
 from typing import Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Scheme
-from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.enums import Scheme
+from yggdrasil.enums.media_type import MediaType
 from yggdrasil.io.io_stats import IOStats, IOKind
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from ..path import DatabricksPath
 from ..workspaces.service import Workspaces

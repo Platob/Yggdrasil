@@ -27,8 +27,8 @@ from yggdrasil.dataclasses import (
     Singleton,
 )
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.data.enums import MimeTypes, Scheme
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.enums import MimeTypes, Scheme
+from yggdrasil.url import URL, URLBased
 from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:
@@ -1458,13 +1458,13 @@ class DatabricksClient(Singleton, URLBased):
         The result is a full :class:`Dataset` — call ``.map``,
         ``.filter``, ``.to_table``, ``.toArrow``, etc. on it.
         """
-        from yggdrasil.data.statement import PreparedStatement
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.databricks.sql.sql_utils import looks_like_query
+        from yggdrasil.spark.tabular import SparkDataset
 
         session = self.spark()
-        if PreparedStatement.looks_like_query(sql_or_table):
-            return Dataset.from_sql(sql_or_table, spark_session=session, schema=schema)
-        return Dataset.from_table(sql_or_table, spark_session=session, schema=schema)
+        if looks_like_query(sql_or_table):
+            return SparkDataset.from_sql(sql_or_table, spark_session=session, schema=schema)
+        return SparkDataset.from_table(sql_or_table, spark_session=session, schema=schema)
 
     def parallelize(
         self,
@@ -1484,9 +1484,9 @@ class DatabricksClient(Singleton, URLBased):
             # Without function — just wrap inputs as a Dataset
             ds = dbc.parallelize(rows, schema=output_schema)
         """
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
-        return Dataset.parallelize(
+        return SparkDataset.parallelize(
             inputs,
             function,
             schema=schema,

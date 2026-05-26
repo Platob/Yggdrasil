@@ -22,7 +22,7 @@ from yggdrasil.dataclasses import (
     WaitingConfigArg,
 )
 from yggdrasil.environ import PyEnv, shutdown as yg_shutdown
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from yggdrasil.pickle.ser import Serialized, loads, serialize
 from yggdrasil.pyutils.exceptions import raise_parsed_traceback
 from .exceptions import ClientTerminatedSession, CommandExecutionError

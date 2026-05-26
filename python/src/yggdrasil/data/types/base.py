@@ -33,7 +33,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from yggdrasil.data.constants import DEFAULT_FIELD_NAME
-from yggdrasil.data.enums.mode import Mode
+from yggdrasil.enums.mode import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.exceptions import CastError
 from yggdrasil.data.types.parser import (

@@ -1,10 +1,11 @@
 import datetime as dt
 import random
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Union
 
-__all__ = ["WaitingConfig", "WaitingConfigArg", "DEFAULT_WAITING_CONFIG"]
+__all__ = ["WaitingConfig", "WaitingConfigArg", "DEFAULT_WAITING_CONFIG", "Awaitable"]
 
 
 def _safe_seconds_tick(ticks: Union[int, float, dt.timedelta]):
@@ -287,4 +288,32 @@ _FALSE_WAITING_CONFIG = WaitingConfig(
     max_interval=10.0,
     retries=8,
 )
+
+
+class Awaitable(ABC):
+    """Abstract base for operations that can be waited on.
+
+    Subclasses implement :meth:`_wait` (block until ready) and
+    :meth:`_start` (kick off the operation). The public
+    :meth:`wait` / :meth:`start` methods handle
+    :class:`WaitingConfig` coercion so every concrete implementation
+    gets uniform timeout / retry / backoff semantics for free.
+    """
+
+    def wait(self, wait: WaitingConfigArg = None, raise_error: bool = True):
+        """Block until ready, with optional timeout from WaitingConfig."""
+        cfg = WaitingConfig.from_(wait)
+        return self._wait(cfg, raise_error=raise_error)
+
+    @abstractmethod
+    def _wait(self, config: WaitingConfig, raise_error: bool = True):
+        ...
+
+    def start(self):
+        """Start the operation."""
+        return self._start()
+
+    @abstractmethod
+    def _start(self):
+        ...
 

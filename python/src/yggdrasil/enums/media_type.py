@@ -41,11 +41,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Iterable, Union, Any
 
-from yggdrasil.io.url import URL
-from yggdrasil.lazy_imports import path_class
+def _path_class():
+    from yggdrasil.lazy_imports import path_class
+    return path_class()
 
-from yggdrasil.data.enums.codec import Codec
-from yggdrasil.data.enums.mime_type import MimeType, MimeTypes
+
+def _url_class():
+    from yggdrasil.url import URL
+    return URL
+
+from yggdrasil.enums.codec import Codec
+from yggdrasil.enums.mime_type import MimeType, MimeTypes
 
 __all__ = ["MediaType", "MediaTypes"]
 
@@ -108,7 +114,7 @@ class MediaType:
             return cls.from_magic(obj, default=default)
         if hasattr(obj, "read") and hasattr(obj, "seek"):
             return cls.from_io(obj, default=default)
-        if URL.is_pathish(obj):
+        if _url_class().is_pathish(obj):
             parsed = cls.from_path(obj, default=None)
             if parsed is not None:
                 return parsed
@@ -237,7 +243,7 @@ class MediaType:
         *,
         default: "MediaType" = ...,
     ):
-        path = path_class().from_(path, default=None)
+        path = _path_class().from_(path, default=None)
         if path is None:
             if default is ...:
                 raise ValueError(
@@ -298,7 +304,7 @@ class MediaType:
         url: URL,
         default: Any = ...,
     ):
-        url = URL.from_(url, default=None)
+        url = _url_class().from_(url, default=None)
 
         if url is None:
             if default is ...:

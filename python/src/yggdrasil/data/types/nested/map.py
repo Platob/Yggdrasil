@@ -12,7 +12,7 @@ from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
 from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
 from yggdrasil.environ.importlib import cached_from_import
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.lazy_imports import field_class, struct_type_class
 from ._cast_json import (
     cast_arrow_json_string_array,

@@ -47,15 +47,15 @@ from typing import (
 )
 
 from yggdrasil.data.cast import convert
-from yggdrasil.data.enums.currency import Currency
+from yggdrasil.enums.currency import Currency
 from yggdrasil.http_.session import HTTPSession
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from .backends import Backend, BackendError, DEFAULT_BACKENDS
 
 if TYPE_CHECKING:
     import polars as pl
-    from yggdrasil.data.enums.geozone import GeoZone, GeoZoneCatalog
+    from yggdrasil.enums.geozone import GeoZone, GeoZoneCatalog
 
 
 __all__ = [
@@ -259,7 +259,7 @@ def _currency_geo_catalog() -> "GeoZoneCatalog | None":
         if _GEO_CATALOG_FAILED:
             return None
         try:
-            from yggdrasil.data.enums.geozone import load_geozones
+            from yggdrasil.enums.geozone import load_geozones
             _GEO_CATALOG = load_geozones(include_countries=True)
         except Exception as exc:
             LOGGER.warning(
@@ -267,7 +267,7 @@ def _currency_geo_catalog() -> "GeoZoneCatalog | None":
                 "to the default catalog (sparse coverage).", exc,
             )
             try:
-                from yggdrasil.data.enums.geozone import load_geozones
+                from yggdrasil.enums.geozone import load_geozones
                 _GEO_CATALOG = load_geozones()
             except Exception:
                 _GEO_CATALOG_FAILED = True

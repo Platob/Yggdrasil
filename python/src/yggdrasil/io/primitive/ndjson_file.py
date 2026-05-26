@@ -21,7 +21,7 @@ import pyarrow.json as pa_json
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
+from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
 
@@ -201,7 +201,7 @@ class NDJSONFile(IO[bytes, NDJsonOptions]):
                 return
             try:
                 for batch in reader:
-                    yield options.cast_arrow_tabular(batch)
+                    yield options.cast_arrow_batch(batch)
             finally:
                 reader.close()
         finally:
@@ -317,14 +317,14 @@ class NDJSONFile(IO[bytes, NDJsonOptions]):
             if first is None:
                 return
             for batch in _it.chain([first], iterator):
-                casted = cast_opts.cast_arrow_tabular(batch)
+                casted = cast_opts.cast_arrow_batch(batch)
                 sink.write(_encode_batch(casted))
 
     # ==================================================================
     # Native engine overrides
     # ==================================================================
 
-    def _read_arrow_dataset(self, options: NDJsonOptions) -> "pds.Dataset":
+    def _read_arrow_dataset(self, options: NDJsonOptions) -> "pds.SparkDataset":
         pds = pyarrow_dataset_module()
         path = self._local_path_str()
         if path is not None:

@@ -82,7 +82,7 @@ import pyarrow as pa
 
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.lazy_imports import field_class, schema_class
 
@@ -203,19 +203,16 @@ def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
     """Build a :class:`Schema` from *columns* with :class:`ObjectType` fields.
 
     Used by :meth:`CastOptions.check` when the caller passed a bare
-    ``columns=`` list and no source/target peek bound a schema. The
-    children default to :class:`ObjectType` so casts pass through
-    untouched — the caller can later refine the dtype with a real
-    ``source`` / ``target`` once they know more.
+    ``columns=`` list and no target schema bound. The children default
+    to :class:`ObjectType` so casts pass through untouched.
     """
-    # Local imports to avoid the bootstrap cycle described above —
-    # this helper only fires when a caller actually passed columns.
     from yggdrasil.data.data_field import Field as _Field
     from yggdrasil.data.schema import Schema as _Schema
     from yggdrasil.data.types.primitive.object import ObjectType
 
     children = [_Field(name=str(c), dtype=ObjectType()) for c in columns]
     return _Schema(children)
+
 
 
 # ---------------------------------------------------------------------------
@@ -320,86 +317,19 @@ class CastOptions:
     row_size: int | None = None
     byte_size: int | None = None
     row_limit: int | None = None
-    #: Allow format readers / writers to use a thread pool when the
-    #: backend supports it. Universally honored across CSV, Parquet,
-    #: Arrow IPC, and NDJSON; format-specific options can override
-    #: the default by re-declaring the field.
     use_threads: bool = True
     recursive: bool = False
-    #: Field-typed column references to dedup on. Each entry's
-    #: :attr:`Field.name` resolves to the target column; the optional
-    #: :attr:`Field.alias` lets a source frame label the column
-    #: differently (consumers route through
-    #: :meth:`Field.select_in_arrow_tabular` etc. when they need the
-    #: alias-aware lookup). Bare strings passed in ``__init__`` are
-    #: coerced to a default-typed :class:`Field` in
-    #: :meth:`__post_init__` so callers can still pass plain key
-    #: names — the Field-typed shape is the canonical surface.
     match_by: list["Field"] | None = None
-    #: Field-typed column references to dedup on at read time. Same
-    #: shape as :attr:`match_by` — each entry's :attr:`Field.name`
-    #: names the column whose values must be distinct in the read
-    #: output. :meth:`dedup_arrow_batches` collapses duplicates on
-    #: these columns via :func:`yggdrasil.arrow.ops.dedup_arrow_table`
-    #: (first occurrence wins). Unset → no dedup pass; the read
-    #: pipeline yields rows unchanged.
     unique_by: list["Field"] | None = None
-    #: Field-typed timestamp references to resample on at read time.
-    #: Each entry's :attr:`Field.metadata` carries a non-tag
-    #: ``b"time_sampling"`` key whose value is the ISO-8601 duration
-    #: (``"PT1H"``, ``"P1D"``, etc.) that
-    #: :func:`yggdrasil.arrow.ops.resample_arrow_table` snaps the
-    #: column to. Unset → no resample pass; the read pipeline yields
-    #: rows unchanged. Plain ``list[Field]`` keeps the API shape
-    #: parallel to :attr:`match_by` / :attr:`unique_by` — the
-    #: sampling rides on the Field itself rather than a separate
-    #: ``dict`` so the bundle is a single round-trippable Field
-    #: collection.
     time_sample_by: list["Field"] | None = None
-    #: How to fill nulls left by the resample pass. ``"ffill"``
-    #: (default) propagates the last non-null value forward into
-    #: subsequent nulls within the same partition; ``"bfill"``
-    #: propagates the next non-null backward; ``"none"`` / ``None``
-    #: disables the pass so resample emits whatever the ``"first"``
-    #: aggregate picked. Same vocabulary on every engine — the
-    #: arrow / spark ops in :mod:`yggdrasil.arrow.ops` and
-    #: :mod:`yggdrasil.spark.ops` consume this verbatim.
     fill_strategy: str = "ffill"
-    read_seek: int | None = None
-    write_seek: int | None = None
-    #: Row-level predicate. Evaluated by every IO that reads tabular
-    #: rows: applied to each Arrow batch before it leaves the read
-    #: pipeline so callers don't have to wrap the result by hand.
-    #:
-    #: When the predicate references a column the *source* doesn't
-    #: have (different schema, optional column not present in this
-    #: file), the predicate degrades to *accept everything* —
-    #: missing inputs can't yield a coherent boolean, and the
-    #: alternative ("drop everything") is almost always wrong for
-    #: heterogeneous-source folders. Backends that can push the
-    #: predicate down (Delta, warehouse SQL) skip the per-batch
-    #: filter once they've translated it.
     predicate: Predicate | None = None
-    #: Predicate evaluated against a discovered child (``name``,
-    #: ``path``, ``is_dir``, ``is_private``) for IOs that aggregate
-    #: sub-IOs (folders, zips, partitioned tables). Replaces the
-    #: legacy ``include_patterns`` / ``exclude_patterns`` /
-    #: ``exclude_private`` glob knobs with one composable predicate
-    #: backed by :mod:`yggdrasil.data.expr` — for example
-    #: ``~col("name").like(".%") & col("name").like("%.parquet")``.
-    children_predicate: Predicate | None = None
-    read_write_upsert: bool = False
     wait: WaitingConfig = WaitingConfig.default()
     spark_session: "SparkSession | None" = None
     arrow_memory_pool: pa.MemoryPool | None = None
 
     # --- Upsert / merge shape -------------------------------------------
     update_column_names: list[str] | None = None
-
-    # --- Partition pruning ----------------------------------------------
-    # ``prune_by`` accepts the literal string ``"auto"`` to mean
-    # "use the partition columns from the target schema" — Table.*_insert
-    # resolves that into a real column list.
     prune_by: "list[str] | str | None" = None
     prune_values: Mapping[str, tuple[Any, ...]] | None = None
 
@@ -409,74 +339,12 @@ class CastOptions:
     vacuum_hours: int | None = None
 
     # --- Engine knobs ----------------------------------------------------
-    overwrite_schema: bool | None = None
     spark_options: dict[str, Any] | None = None
 
-    # --- Statement-level retry ------------------------------------------
-    # Threaded onto each DML WarehousePreparedStatement on the warehouse
-    # path; ignored on Spark (driver-side retry handles it there).
     retry: WaitingConfigArg | None = None
-
-    # --- Capture inserted rows as a return value -----------------------
-    # When True, mutating tabular operations (table inserts, MERGE-style
-    # writes, …) hand back the rows they actually wrote as a
-    # :class:`Tabular` — typically a :class:`ArrowTabular` or a
-    # :class:`Dataset` depending on the engine that ran the write.
-    # Default ``False`` keeps the historical "fire-and-forget" return
-    # contract; flip it on when downstream code wants to chain on the
-    # newly-appended payload (logging, follow-up tasks, downstream
-    # writes) without re-querying the target.
     return_data: bool = False
-
-    # --- Keyed-write strategy toggle ------------------------------------
-    # When False (the default), keyed inserts use the engine's native
-    # ``MERGE INTO`` statement — Databricks / Delta plans the dedup
-    # once. When True, the table layer sidesteps MERGE entirely:
-    # ``Mode.APPEND`` becomes ``INSERT ... WHERE NOT EXISTS`` (or a
-    # Spark DataFrame anti-join, when a session is reachable);
-    # ``Mode.UPSERT`` / ``Mode.MERGE`` become a keyed ``DELETE``
-    # followed by ``INSERT``. Useful for backends without native
-    # MERGE, for callers that want explicit dedup semantics, or for
-    # the Spark fast path where pre-filtering the DataFrame is much
-    # cheaper than the SQL ``NOT EXISTS`` plan.
     safe_merge: bool = False
-
-    # --- Metadata sync after writes -------------------------------------
-    # When True (the default), a writer commits the holder-side IO
-    # metadata (size, mtime, media_type) once the operation finishes.
-    # Bulk writers (``_write_arrow_table``, ``_write_polars_frame``,
-    # ``_write_records``) flip this to False on the per-batch sub-call
-    # and run a single ``_commit_metadata`` at the end so multi-batch
-    # writes don't pay the stat-refresh cost on every batch. Set to
-    # False at the call site to suppress the final commit too — for
-    # callers that intend to chain another write before any reader sees
-    # the result.
     sync_metadata: bool = True
-
-    # --- Memoization slot ----------------------------------------------
-    # ``merged`` is read repeatedly by every cast / fill / alias
-    # entry point on this class — once per dispatch call, often dozens
-    # of times across a single batch pipeline. The underlying
-    # ``Field.merge_with`` walks the full struct tree on each call.
-    # ``CastOptions`` is frozen, so the inputs to that merge
-    # (``source``, ``target``, ``schema_mode``) cannot change for a
-    # given instance — the result is safe to cache for the lifetime
-    # of the options object.
-    #
-    # ``merged_schema`` returns the same object: now that
-    # :class:`StructField` *is* a :class:`Field`, the merged result
-    # for struct sides already satisfies the Schema interface — one
-    # cache slot covers both views.  The same logic collapses
-    # ``source`` / ``target`` themselves: a single :class:`Field`
-    # slot serves both "I want a column-ish Field" and "I want a
-    # schema-shaped Field" callers — no parallel ``*_schema`` cache
-    # is necessary.
-    #
-    # ``init=False`` keeps the slot out of the constructor signature;
-    # ``compare=False`` keeps two functionally identical CastOptions
-    # equal regardless of which one happened to have its cache warmed;
-    # ``repr=False`` keeps the cache out of the dataclass-generated
-    # repr (the custom repr below also skips non-repr fields).
     _merged_cache: Any = dataclasses.field(
         default=..., init=False, repr=False, compare=False
     )
@@ -754,8 +622,11 @@ class CastOptions:
                 "yggdrasil Field/Schema, or None."
             )
 
-        if columns and instance.source is None:
-            instance = instance.copy(source=_struct_of_objects(columns))
+        if columns:
+            if instance.target is not None:
+                instance = instance.copy(target=instance.target.select(columns))
+            elif instance.source is None:
+                instance = instance.copy(source=_struct_of_objects(columns))
         return instance
 
     @classmethod
@@ -1180,13 +1051,16 @@ class CastOptions:
     def cast(self, obj: Any) -> Any:
         """Cast *obj* to :attr:`target` using its native engine.
 
-        Short-circuits to *obj* unchanged when ``target is None``.
-        Otherwise delegates to :meth:`Field.cast`, which handles engine
-        detection (pyarrow/polars/pandas/spark + iterable fallback) and
-        shape dispatch (tabular vs array/series/column/expr). Source-side
-        metadata still flows through via ``options=self`` for the inner
-        cast paths that need it.
+        Dispatches arrow types through :meth:`cast_arrow`, Tabular
+        through :meth:`cast_tabular`. Everything else delegates to
+        :meth:`Field.cast`.
         """
+        from yggdrasil.arrow.tabular import ArrowTabular
+        from yggdrasil.io.tabular.base import Tabular
+        if isinstance(obj, (pa.Table, pa.RecordBatch, pa.Array, pa.ChunkedArray, ArrowTabular)):
+            return self.cast_arrow(obj)
+        if isinstance(obj, Tabular):
+            return self.cast_tabular(obj)
         if self.target is None:
             return obj
         return self.target.cast(obj, options=self)
@@ -1205,18 +1079,47 @@ class CastOptions:
             return array
         return self.target.cast_arrow_array(array, options=self)
 
-    def cast_arrow_tabular(self, table: Any) -> Any:
-        """Cast a :class:`pa.Table` or :class:`pa.RecordBatch`.
-
-        ``checked_cast=True`` short-circuits to the input unchanged —
-        the caller guarantees every batch already matches the target,
-        so the per-batch cast pass (and the schema rebuild upstream
-        in :meth:`check_source`) is wasted work. Use only when you
-        control the source.
-        """
+    def _apply_predicate_and_cast(self, data: Any) -> Any:
+        if self.predicate is not None:
+            data = self.predicate.filter_arrow_batch(data)
         if self.target is None or self.checked_cast:
-            return table
-        return self.target.cast_arrow_tabular(table, options=self)
+            return data
+        return self.target.cast_arrow_tabular(data, options=self)
+
+    def cast_arrow_batch(self, batch: "pa.RecordBatch") -> "pa.RecordBatch":
+        """Filter + cast a :class:`pa.RecordBatch`."""
+        return self._apply_predicate_and_cast(batch)
+
+    def cast_arrow_table(self, table: "pa.Table") -> "pa.Table":
+        """Filter + cast a :class:`pa.Table`."""
+        return self._apply_predicate_and_cast(table)
+
+    def cast_arrow_tabular(self, data: "ArrowTabular") -> "ArrowTabular":
+        """Filter + cast an :class:`ArrowTabular` (batch by batch)."""
+        from yggdrasil.arrow.tabular import ArrowTabular
+        batches = [self.cast_arrow_batch(b) for b in data.batches]
+        return ArrowTabular(batches)
+
+    def cast_arrow(self, data: Any) -> Any:
+        """Dispatch arrow types to the specific cast method."""
+        from yggdrasil.arrow.tabular import ArrowTabular
+        if isinstance(data, ArrowTabular):
+            return self.cast_arrow_tabular(data)
+        if isinstance(data, pa.Table):
+            return self.cast_arrow_table(data)
+        if isinstance(data, pa.RecordBatch):
+            return self.cast_arrow_batch(data)
+        if isinstance(data, (pa.Array, pa.ChunkedArray)):
+            return self.cast_arrow_array(data)
+        raise TypeError(f"cast_arrow: unsupported type {type(data).__name__}")
+
+    def cast_tabular(self, data: Any) -> Any:
+        """Cast any Tabular-like object."""
+        from yggdrasil.io.tabular.base import Tabular
+
+        if isinstance(data, Tabular):
+            return data.cast(options=self)
+        return Tabular.from_(data).cast(options=self)
 
     def dedup_columns_on_read(self) -> "list[str]":
         """Return the column names that need client-side dedup at read time.
@@ -1356,13 +1259,13 @@ class CastOptions:
     # ------------------------------------------------------------------
 
     def apply_post_read_table(self, table: "pa.Table") -> "pa.Table":
-        """Run resample + dedup directly on a materialised :class:`pa.Table`.
+        """Run column projection + resample + dedup on a materialised :class:`pa.Table`.
 
         Same operations and same order as the streaming wraps —
-        resample first (its bucket collapse trims rows before the
+        column projection first (trim I/O cost before any compute),
+        resample second (its bucket collapse trims rows before the
         unique-tag walk), then dedup. Identity short-circuit when
-        neither pass is configured so the common case stays
-        zero-cost.
+        no pass is configured so the common case stays zero-cost.
 
         Pyarrow / polars / pandas read paths that already produce a
         Table funnel through this method instead of the iterator
@@ -1370,6 +1273,13 @@ class CastOptions:
         ``Table.take`` (per pass) instead of two ``Table.from_batches``
         + a ``Table.to_batches`` rebatch sandwich.
         """
+        columns = self.column_names
+        if columns:
+            available = table.column_names
+            select = [c for c in columns if c in available]
+            if select and len(select) < len(available):
+                table = table.select(select)
+
         resample = self.resample_on_read()
         unique = self.dedup_columns_on_read()
         if resample is None and not unique:
@@ -1527,23 +1437,46 @@ class CastOptions:
 
     # ---- spark -------------------------------------------------------
 
-    def cast_spark(self, obj: Any) -> Any:
-        """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
-        if self.target is None:
-            return obj
-        return self.target.cast_spark(obj, options=self)
+    def cast_spark_frame(self, df: Any) -> Any:
+        """Filter + cast a Spark DataFrame.
 
-    def cast_spark_tabular(self, obj: Any) -> Any:
-        """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
+        Applies :attr:`predicate` (when set) then delegates to
+        :meth:`Field.cast_spark_tabular` for schema coercion.
+        """
+        if self.predicate is not None:
+            df = self.predicate.filter_spark_frame(df)
         if self.target is None:
-            return obj
-        return self.target.cast_spark_tabular(obj, options=self)
+            return df
+        return self.target.cast_spark_tabular(df, options=self)
+
+    def cast_spark_tabular(self, data: Any) -> Any:
+        """Filter + cast a :class:`Dataset` (Spark Tabular wrapper)."""
+        from yggdrasil.spark.tabular import SparkDataset
+        if isinstance(data, SparkDataset):
+            if data.frame is None:
+                return data
+            casted = self.cast_spark_frame(data.frame)
+            if casted is data.frame:
+                return data
+            return SparkDataset(frame=casted)
+        return self.cast_spark_frame(data)
 
     def cast_spark_column(self, obj: Any) -> Any:
-        """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
+        """Cast a Spark Column."""
         if self.target is None:
             return obj
         return self.target.cast_spark_column(obj, options=self)
+
+    def cast_spark(self, obj: Any) -> Any:
+        """Dispatch spark types to the specific cast method."""
+        from yggdrasil.spark.tabular import SparkDataset
+        if isinstance(obj, SparkDataset):
+            return self.cast_spark_tabular(obj)
+        if hasattr(obj, "toArrow") or hasattr(obj, "toPandas"):
+            return self.cast_spark_frame(obj)
+        if self.target is None:
+            return obj
+        return self.target.cast_spark(obj, options=self)
 
     def fill_spark_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level spark null fill — delegates to :meth:`Field.fill_spark`."""

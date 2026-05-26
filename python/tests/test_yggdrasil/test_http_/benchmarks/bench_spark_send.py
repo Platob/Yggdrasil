@@ -72,9 +72,9 @@ os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, [
     os.environ.get("PYTHONPATH", ""),
 ]))
 
-from yggdrasil.io.request import PreparedRequest  # noqa: E402
-from yggdrasil.io.send_config import SendConfig  # noqa: E402
-from yggdrasil.io.session import Session  # noqa: E402
+from yggdrasil.http_.request import PreparedRequest  # noqa: E402
+from yggdrasil.http_.send_config import SendConfig  # noqa: E402
+from yggdrasil.http_.io_session import Session  # noqa: E402
 
 from _bench_stub_session import _StubBenchSession  # noqa: E402
 

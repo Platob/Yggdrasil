@@ -27,7 +27,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
 
-from yggdrasil.data.enums.currency import Currency
+from yggdrasil.enums.currency import Currency
 
 if TYPE_CHECKING:
     from .session import FxQuote, FxRate

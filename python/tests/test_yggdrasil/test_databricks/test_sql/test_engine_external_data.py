@@ -15,12 +15,12 @@ import unittest
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import Scheme
-from yggdrasil.data.statement import ExternalStatementData
+from yggdrasil.enums import Scheme
+from yggdrasil.databricks.warehouse.statement import ExternalStatementData
 from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.sql.engine import _coerce_external_data_for_spark
 from yggdrasil.io.tabular import ArrowTabular
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 
 class TestCoerceExternalDataForSpark(unittest.TestCase):

@@ -35,7 +35,7 @@ from yggdrasil.arrow.cast import get_arrow_nbytes
 from yggdrasil.arrow.ops import upsert_arrow_batches
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import ByteUnit, MimeTypes, Mode
+from yggdrasil.enums import ByteUnit, MimeTypes, Mode
 from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:
@@ -146,7 +146,7 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                 return
             for i in range(reader.num_record_batches):
                 batch = reader.get_batch(i)
-                yield options.cast_arrow_tabular(batch)
+                yield options.cast_arrow_batch(batch)
         finally:
             stream_ctx.__exit__(None, None, None)
 
@@ -173,7 +173,8 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                 table = reader.read_all()
         except FileNotFoundError:
             return super()._read_arrow_table(options)
-        return options.cast_arrow_tabular(table)
+        table = options.cast_arrow_table(table)
+        return options.apply_post_read_table(table)
 
     def _collect_schema(self, options: ArrowIPCOptions) -> Schema:
         """Read the schema straight from the IPC footer.
@@ -302,7 +303,7 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         # :class:`pa.BufferOutputStream` and bulk-commits the encoded
         # bytes (with codec compression when set) on context exit.
         write_options = options.check_source(first.schema)
-        first_casted = write_options.cast_arrow_tabular(first)
+        first_casted = write_options.cast_arrow_batch(first)
 
         # ``compression="auto"`` resolves against the first batch's
         # in-memory size — a representative proxy for the typical
@@ -321,7 +322,7 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                     writer.write_batch(first_casted)
 
                 for batch in iterator:
-                    casted_batch = write_options.cast_arrow_tabular(batch)
+                    casted_batch = write_options.cast_arrow_batch(batch)
                     if casted_batch.num_rows > 0:
                         writer.write_batch(casted_batch)
 

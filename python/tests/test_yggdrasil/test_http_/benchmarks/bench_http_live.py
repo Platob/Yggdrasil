@@ -65,7 +65,7 @@ os.environ["PYTHONPATH"] = (
 )
 
 from yggdrasil.http_ import HTTPSession  # noqa: E402
-from yggdrasil.io.request import PreparedRequest  # noqa: E402
+from yggdrasil.http_.request import PreparedRequest  # noqa: E402
 
 from _bench_http_server import (  # noqa: E402
     start_bench_server as _start_server,
@@ -176,7 +176,7 @@ def _send_many_scenarios(base_url: str, repeat: int) -> list[dict]:
     cache_n = 128
     tmp_cache_many = tempfile.mkdtemp(prefix="ygg-bench-many-cache-")
     try:
-        from yggdrasil.io.send_config import CacheConfig
+        from yggdrasil.http_.send_config import CacheConfig
 
         cfg_many = CacheConfig(tabular=tmp_cache_many)
         cache_reqs = [
@@ -231,7 +231,7 @@ def _local_cache_scenarios(base_url: str, repeat: int) -> list[dict]:
     sess = HTTPSession(base_url=base_url)
     tmp = tempfile.mkdtemp(prefix="ygg-bench-live-cache-")
     try:
-        from yggdrasil.io.send_config import CacheConfig
+        from yggdrasil.http_.send_config import CacheConfig
 
         cfg = CacheConfig(tabular=tmp)
         # First call seeds the cache, subsequent calls hit it.

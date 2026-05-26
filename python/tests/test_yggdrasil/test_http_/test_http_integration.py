@@ -33,8 +33,8 @@ from pathlib import Path
 
 import pytest
 
-from yggdrasil.data.enums import Mode
-from yggdrasil.io.send_config import CacheConfig, SendConfig
+from yggdrasil.enums import Mode
+from yggdrasil.http_.send_config import CacheConfig, SendConfig
 from ._helpers import StubSession, make_request, make_response
 
 
@@ -52,7 +52,7 @@ class TestRequestShape:
         # ``normalize_headers`` previously called it eagerly and raised
         # ``ValueError: Cannot resolve Codec from non-codec MIME type
         # 'gzip, deflate, br, zstd'`` for any such request.
-        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.http_.request import PreparedRequest
         req = PreparedRequest.prepare(
             "POST",
             "https://example.com/refresh",
@@ -276,7 +276,7 @@ class TestRequestsCompat:
         assert "n=10" in seen.url.query
 
     def test_send_false_returns_prepared_request(self) -> None:
-        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.http_.request import PreparedRequest
 
         s = StubSession()
         prepared = s.get("https://example.com/x", params={"q": "1"}, send=False)
@@ -287,7 +287,7 @@ class TestRequestsCompat:
         assert s.calls == []
 
     def test_send_false_post_carries_body_and_headers(self) -> None:
-        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.http_.request import PreparedRequest
 
         s = StubSession()
         prepared = s.post(
@@ -302,7 +302,7 @@ class TestRequestsCompat:
         assert s.calls == []
 
     def test_send_true_default_still_sends(self) -> None:
-        from yggdrasil.io.response import Response
+        from yggdrasil.http_.response import Response
 
         s = StubSession()
         s.queue(make_response())
@@ -565,7 +565,8 @@ class TestCacheConfigCoercion:
         # (received_to defaults to now, received_from = now - delta).
         assert cfg.received_from is not None
         assert cfg.received_to is not None
-        assert cfg.received_to - cfg.received_from == dt.timedelta(hours=6)
+        window = cfg.received_to - cfg.received_from
+        assert dt.timedelta(hours=6) <= window <= dt.timedelta(hours=6, minutes=2)
 
     def test_from__dict_round_trip(self) -> None:
         cfg = CacheConfig.from_({"mode": "APPEND"})
@@ -607,7 +608,7 @@ class TestLocalCacheFolderPerHost:
         assert path.parent.name == "response"
 
     def test_host_only_base_url(self) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         s = StubSession(base_url=URL.from_("https://api.example.com/"))
         path = CacheConfig().local_cache_folder(session=s)
@@ -615,7 +616,7 @@ class TestLocalCacheFolderPerHost:
         assert path.parent.name == "response"
 
     def test_host_plus_path_base_url(self) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         s = StubSession(base_url=URL.from_("https://api.example.com/v1/markets/"))
         path = CacheConfig().local_cache_folder(session=s)
@@ -626,7 +627,7 @@ class TestLocalCacheFolderPerHost:
         )
 
     def test_explicit_path_overrides_default(self, tmp_path) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
         s = StubSession(base_url=URL.from_("https://api.example.com/"))
         cache = CacheConfig(tabular=str(tmp_path), mode=Mode.APPEND)
         # Explicit ``path`` wins — host derivation is for the
@@ -634,7 +635,7 @@ class TestLocalCacheFolderPerHost:
         assert str(cache.local_cache_folder(session=s)) == str(tmp_path)
 
     def test_distinct_hosts_get_distinct_folders(self) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
         a = StubSession(base_url=URL.from_("https://a.example.com/"))
         b = StubSession(base_url=URL.from_("https://b.example.com/"))
         pa = CacheConfig().local_cache_folder(session=a)

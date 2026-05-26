@@ -492,23 +492,27 @@ The benchmark is checked-in; quote before/after numbers when changing the regist
 
 ```python
 import dataclasses
-from yggdrasil.spark.tabular import Dataset
+from yggdrasil.spark.tabular import SparkDataset
 from yggdrasil.data import field, schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
+
 
 @dataclasses.dataclass
 class Row:
     id: int
     label: str
 
+
 # Build a schema from a dataclass — DataType walks the annotations.
 out_schema = schema(Row)
+
 
 # Distribute a user function over the cluster.
 def make_row(id: int, label: str) -> Row:
     return Row(id=id, label=label.upper())
 
-result = Dataset.parallelize(
+
+result = SparkDataset.parallelize(
     make_row,
     inputs=[{"id": 1, "label": "a"}, {"id": 2, "label": "b"}],
     schema=out_schema,

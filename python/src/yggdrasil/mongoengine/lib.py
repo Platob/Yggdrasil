@@ -5,7 +5,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Callable, MutableMapping
 
-from yggdrasil.io import URL
+from yggdrasil.url import URL
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
 
 if TYPE_CHECKING:

@@ -29,14 +29,13 @@ from yggdrasil.data.base_meta import (
     _to_bytes,
 )
 from yggdrasil.data.constants import (
-    ALIAS_KEY,
     DEFAULT_VALUE_KEY,
     DEFAULT_FIELD_NAME,
     MEDIA_TYPE_METADATA_KEY,
     POSITION_KEY,
     TAG_PREFIX,
 )
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
 from yggdrasil.exceptions import CastError
@@ -1097,97 +1096,18 @@ class Field(BaseChildrenFields):
     # ==================================================================
 
     @property
-    def alias(self) -> str:
-        """Alternate name for this field — falls back to :attr:`name`.
-
-        Stored in :attr:`metadata` under :data:`ALIAS_KEY`. Used by
-        :meth:`select_in` (and the engine-specific ``select_in_*``
-        helpers) to resolve a column from a frame whose schema
-        labels it differently than :attr:`name` — common when a
-        source table has been renamed, or when a field carries
-        both a wire name and a friendly name.
-
-        Always returns a string: when no alias is configured the
-        getter returns :attr:`name` so downstream lookups don't
-        have to fork on ``None``. Use :attr:`has_alias` to tell
-        "configured alias" from "name fallback".
-
-        ``Field`` is a frozen dataclass — mutating the alias goes
-        through :meth:`with_alias` (immutable copy) or
-        :meth:`set_alias` (in-place dict mutation, same shape as
-        the rest of the metadata setters).
-        """
-        if self.metadata:
-            value = self.metadata.get(ALIAS_KEY)
-            if value is not None:
-                return value.decode("utf-8") if isinstance(value, bytes) else str(value)
-        return self.name
-
-    @property
-    def has_alias(self) -> bool:
-        """Whether an explicit alias is set in :attr:`metadata`.
-
-        Distinguishes "alias configured" from the
-        :attr:`alias` → :attr:`name` fallback so callers that care
-        (schema diffs, nested-cast lookup precedence) can branch on
-        the real bit.
-        """
-        return bool(self.metadata and self.metadata.get(ALIAS_KEY))
-
-    def set_alias(self, value: str | None) -> "Field":
-        """Set / clear :attr:`alias` on *self* in place.
-
-        Frozen-dataclass property setters trip the auto-generated
-        ``__setattr__`` (cpython #44477), so the alias write path
-        is a method instead. Returns ``self`` so calls chain.
-
-        Normalization rules:
-
-        * ``value == self.name`` → no-op. Storing the canonical name
-          in the alias slot is meaningless — :attr:`alias` already
-          falls back to :attr:`name`.
-        * Field has no name yet (empty or unset) → promote the
-          incoming value to :attr:`name` instead of stashing it in
-          metadata, so the field gets a usable identity in one
-          step.
-        * Otherwise → record under :data:`ALIAS_KEY`.
-        """
-        if value is None or value == self.name:
-            if not self.metadata or ALIAS_KEY not in self.metadata:
-                return self
-            self.metadata.pop(ALIAS_KEY, None)
-            if not self.metadata:
-                object.__setattr__(self, "metadata", None)
-            self._on_metadata_mutated()
-            return self
-        if not self.name:
-            object.__setattr__(self, "name", value)
-            if self.metadata and ALIAS_KEY in self.metadata:
-                self.metadata.pop(ALIAS_KEY, None)
-                if not self.metadata:
-                    object.__setattr__(self, "metadata", None)
-            self._on_metadata_mutated()
-            return self
-        if self.metadata is None:
-            object.__setattr__(self, "metadata", {})
-        self.metadata[ALIAS_KEY] = value.encode("utf-8")
-        self._on_metadata_mutated()
-        return self
-
-    @property
     def position(self) -> int | None:
         """Optional 0-based index this field claims in a parent schema.
 
         Stored in :attr:`metadata` under :data:`POSITION_KEY`. Used
         by :meth:`select_in_field` (and the engine-specific
         ``select_in_*`` helpers) as the last-resort fallback when
-        neither :attr:`name` nor :attr:`alias` matches a child name
-        in the receiving schema — the receiver's
-        ``children[position]`` (or column at ``position``)
-        is then resolved by name and used.
+        :attr:`name` doesn't match a child name in the receiving
+        schema — the receiver's ``children[position]`` (or column
+        at ``position``) is then resolved by name and used.
 
         ``None`` (the default) leaves position-based lookup
-        disabled, matching the historical name/alias-only resolver.
+        disabled, matching the historical name-only resolver.
         """
         if not self.metadata:
             return None
@@ -1243,29 +1163,6 @@ class Field(BaseChildrenFields):
         else:
             metadata[POSITION_KEY] = str(position).encode("utf-8")
         return self.copy(metadata=metadata or None)
-
-    def with_alias(self, alias: str | None) -> "Field":
-        """Return a copy of this field with :attr:`alias` set / cleared.
-
-        Mirrors :meth:`with_default` — immutable shape for callers
-        that don't want to mutate the existing instance. Same
-        normalization rules as :meth:`set_alias`: no-op on
-        ``alias == self.name``; promote to :attr:`name` when the
-        receiver has no name yet.
-        """
-        if alias is None or alias == self.name:
-            if not self.has_alias:
-                return self
-            metadata = dict(self.metadata)
-            metadata.pop(ALIAS_KEY, None)
-            return self.copy(metadata=metadata or None)
-        if not self.name:
-            metadata = dict(self.metadata) if self.metadata else {}
-            metadata.pop(ALIAS_KEY, None)
-            return self.copy(name=alias, metadata=metadata or None)
-        metadata = dict(self.metadata) if self.metadata else {}
-        metadata[ALIAS_KEY] = alias.encode("utf-8")
-        return self.copy(metadata=metadata)
 
     @property
     def has_default(self) -> bool:
@@ -1495,7 +1392,7 @@ class Field(BaseChildrenFields):
         raw = md.get(MEDIA_TYPE_METADATA_KEY)
         if not raw:
             return None
-        from yggdrasil.data.enums.media_type import MediaType
+        from yggdrasil.enums.media_type import MediaType
         # ``raw.decode`` can raise ``UnicodeDecodeError`` on a
         # corrupted metadata byte payload; ``MediaType.from_`` with
         # ``default=None`` already short-circuits unknown mime
@@ -2274,7 +2171,7 @@ class Field(BaseChildrenFields):
         # Routes through ``URL.is_pathish`` (the cross-cutting check) so
         # ``Field.from_any`` doesn't have to know about every Path subtype.
         if isinstance(obj, (pathlib.PurePath, os.PathLike)):
-            from yggdrasil.io.url import URL
+            from yggdrasil.url import URL
 
             if URL.is_pathish(obj):
                 try:
@@ -4406,6 +4303,72 @@ class Field(BaseChildrenFields):
         if right.name and right.name != DEFAULT_FIELD_NAME:
             return right.name
         return left.name
+
+    def select(
+        self,
+        *identifiers: "str | int | Field | Iterable[str | int | Field] | None",
+    ) -> "Field":
+        """Return a new struct-shaped Field with only the selected children.
+
+        Accepts strings (by name), ints (by index), Field instances
+        (by name), iterables thereof, or None (skipped).
+        """
+        flat = [i for i in self._flatten_identifiers(identifiers) if i is not None]
+        if not flat:
+            return type(self)._make_struct(
+                name=self.name, nullable=self.nullable, metadata=self.metadata,
+            )
+        resolved = self.select_fields(flat, raise_error=False)
+        children = [f for f in resolved if f is not None]
+        return type(self)._make_struct(
+            children=children,
+            name=self.name,
+            nullable=self.nullable,
+            metadata=dict(self.metadata) if self.metadata else None,
+        )
+
+    def drop(
+        self,
+        *identifiers: "str | int | Field | Iterable[str | int | Field] | None",
+    ) -> "Field":
+        """Return a new struct-shaped Field without the specified children.
+
+        Accepts strings (by name), ints (by index), Field instances
+        (by name), iterables thereof, or None (skipped).
+        """
+        flat = [i for i in self._flatten_identifiers(identifiers) if i is not None]
+        if not flat:
+            return type(self)._make_struct(
+                children=[f.copy() for f in self.children],
+                name=self.name, nullable=self.nullable,
+                metadata=dict(self.metadata) if self.metadata else None,
+            )
+        resolved = self.select_fields(flat, raise_error=False)
+        drop_names = {f.name for f in resolved if f is not None}
+        return type(self)._make_struct(
+            children=[f.copy() for f in self.children if f.name not in drop_names],
+            name=self.name,
+            nullable=self.nullable,
+            metadata=dict(self.metadata) if self.metadata else None,
+        )
+
+    @staticmethod
+    def _flatten_identifiers(args: tuple) -> list:
+        flat: list = []
+        for item in args:
+            if item is None:
+                continue
+            if isinstance(item, (str, int)):
+                flat.append(item)
+            elif hasattr(item, "name") and hasattr(item, "dtype"):
+                flat.append(item)
+            elif hasattr(item, "__iter__"):
+                for sub in item:
+                    if sub is not None:
+                        flat.append(sub)
+            else:
+                flat.append(item)
+        return flat
 
     def __add__(self, other: Any) -> "Field":
         other = self._coerce_other(other)

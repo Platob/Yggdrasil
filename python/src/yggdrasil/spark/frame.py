@@ -84,7 +84,7 @@ def _emit_pickled(
         yield pa.RecordBatch.from_pylist(out, schema=_ARROW_DYNAMIC_SCHEMA)
 
 
-def _typed_cast(
+def spark_typed_cast(
     objects_per_batch: Iterator[list[Any]],
     schema: Schema,
     *,
@@ -314,7 +314,7 @@ def __getattr__(name: str) -> Any:
     path. ``SparkTabular`` lands on the same class for back-compat.
     """
     if name in ("Dataset", "SparkTabular"):
-        from yggdrasil.spark.tabular import Dataset as _Dataset
+        from yggdrasil.spark.tabular import SparkDataset as _Dataset
 
         # Cache on the module so subsequent lookups skip the resolver.
         globals()[name] = _Dataset

@@ -59,29 +59,23 @@ def _to_polars(value: Any) -> Any:
 
     Yggdrasil :class:`Expression` nodes go through ``to_polars``.
     :class:`yggdrasil.data.data_field.Field` — the canonical
-    selector — is translated to ``pl.col(source).cast(target)
-    .alias(out_name)``, where the source-side label is
-    :attr:`Field.alias` (when distinct from :attr:`Field.name`)
-    and the cast target is :attr:`Field.dtype`. Everything else
-    (column-name strings, polars / pyarrow native expressions)
-    passes through untouched — round-tripping a polars ``Expr``
-    through the AST can lose dtype information, so we only lift
-    the canonical-AST / canonical-Field inputs.
+    selector — is translated to ``pl.col(name).cast(target)``.
+    Everything else (column-name strings, polars / pyarrow native
+    expressions) passes through untouched — round-tripping a polars
+    ``Expr`` through the AST can lose dtype information, so we only
+    lift the canonical-AST / canonical-Field inputs.
     """
     if isinstance(value, Expression):
         return value.to_polars()
     if isinstance(value, Field):
         import polars as pl
 
-        source = value.alias if value.has_alias else value.name
-        expr = pl.col(source)
+        expr = pl.col(value.name)
         if value.dtype is not None and hasattr(value.dtype, "to_polars"):
             try:
                 expr = expr.cast(value.dtype.to_polars())
             except Exception:
                 pass
-        if value.name and value.name != source:
-            expr = expr.alias(value.name)
         return expr
     return value
 
