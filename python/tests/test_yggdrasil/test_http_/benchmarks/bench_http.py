@@ -416,7 +416,7 @@ def _session_scenarios(repeat: int) -> list[dict]:
     # Stand-in auth handler that returns a static token; the real MSAL /
     # OAuth handlers go through the same property surface, so this
     # measures the per-send overhead, not the token refresh.
-    from yggdrasil.io.authorization.base import Authorization
+    from yggdrasil.http_.authorization.base import Authorization
 
     class _StaticAuth(Authorization):
         scheme = "Bearer"

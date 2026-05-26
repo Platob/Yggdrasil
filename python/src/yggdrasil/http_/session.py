@@ -53,7 +53,7 @@ from yggdrasil.dataclasses.waiting import (
     WaitingConfigArg,
 )
 from yggdrasil.http_.response_batch import HTTPResponseBatch
-from yggdrasil.io.authorization.base import Authorization
+from yggdrasil.http_.authorization.base import Authorization
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
 from yggdrasil.io.memory import Memory

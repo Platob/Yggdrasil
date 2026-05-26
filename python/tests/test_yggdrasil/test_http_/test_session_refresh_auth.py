@@ -34,7 +34,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from yggdrasil.exceptions import AuthRequiredError
-from yggdrasil.io.authorization.base import Authorization
+from yggdrasil.http_.authorization.base import Authorization
 from yggdrasil.http_ import HTTPSession
 from yggdrasil.io.session import Session
 

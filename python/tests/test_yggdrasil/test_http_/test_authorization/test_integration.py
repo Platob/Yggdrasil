@@ -18,7 +18,7 @@ import pickle
 
 import pytest
 
-from yggdrasil.io.authorization import Authorization
+from yggdrasil.http_.authorization import Authorization
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.session import Session
 

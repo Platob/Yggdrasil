@@ -1,4 +1,4 @@
-"""Unit tests for :class:`yggdrasil.io.authorization.Authorization`.
+"""Unit tests for :class:`yggdrasil.http_.authorization.Authorization`.
 
 The base class is an ABC — these tests pin the contract every concrete
 provider has to honor: ``authorization`` is required, ``__str__``
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.authorization import Authorization
+from yggdrasil.http_.authorization import Authorization
 
 
 class _StaticAuth(Authorization):
