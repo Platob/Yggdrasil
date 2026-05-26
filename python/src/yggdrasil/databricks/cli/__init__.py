@@ -2,7 +2,6 @@
 
 Subcommands::
 
-    ygg databricks bundle deploy [-t <target>]
     ygg databricks clusters list/get/create/delete
     ygg databricks warehouses list/get/create/delete
 """
@@ -13,7 +12,6 @@ import logging
 import sys
 from typing import Any, Optional, Sequence
 
-from .bundle import BundleCommand
 from .services import (
     ClustersCommand,
     WarehousesCommand,
@@ -53,7 +51,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         client_grp.add_argument(flag, dest=dest, default=None, **kwargs)
 
     subparsers = parser.add_subparsers(dest="command")
-    BundleCommand.register(subparsers)
     ClustersCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
 
