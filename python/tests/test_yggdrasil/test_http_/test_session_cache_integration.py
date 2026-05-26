@@ -91,7 +91,7 @@ def _local_cfg(root: Path | str, **overrides: Any) -> CacheConfig:
 
 def _remote_cfg(tab: "_FakeRemoteTabular", **overrides: Any) -> CacheConfig:
     overrides.setdefault("mode", Mode.APPEND)
-    overrides.setdefault("request_by", ["public_url_hash"])
+    overrides.pop("request_by", None)
     overrides.pop("wait", None)
     return CacheConfig(tabular=tab, **overrides)
 
@@ -334,32 +334,6 @@ class TestLocalCacheSend:
         assert len(s.calls) == 1
         assert out.json() == {"v": "network"}
 
-    def test_distinct_post_bodies_do_not_alias(self, tmp_path) -> None:
-        # ``public_hash`` folds the body bytes into the request
-        # identity, so two POSTs to the same URL with different bytes
-        # match against distinct rows in the partitioned cache. They
-        # share a ``partition_key`` (URL-derived) so they land in the
-        # same partition directory — the row-level match-by predicate
-        # is what distinguishes them. Passing ``request_by=["public_hash"]``
-        # explicitly opts into body-aware identity (the default
-        # ``public_url_hash`` is URL-only by design — see
-        # :data:`_DEFAULT_REQUEST_BY`).
-        cache = _local_cfg(tmp_path, request_by=["public_hash"])
-        url = "https://example.com/echo"
-        req_a = make_request(url, method="POST", body=b"payload-A")
-        req_b = make_request(url, method="POST", body=b"payload-B")
-        _seed_local(cache, make_response(request=req_a, body=b'{"got":"A"}'))
-
-        s = StubSession()
-        s.queue(make_response(request=req_b, body=b'{"got":"B"}'))
-
-        out_a = s.send(req_a, local_cache=cache)
-        out_b = s.send(req_b, local_cache=cache)
-        assert out_a.json() == {"got": "A"}
-        assert out_b.json() == {"got": "B"}
-        # Only req_b touched the wire.
-        assert len(s.calls) == 1
-        assert s.calls[0].buffer.to_bytes() == b"payload-B"
 
 
 # ===========================================================================

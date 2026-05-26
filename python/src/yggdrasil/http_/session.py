@@ -721,7 +721,7 @@ class HTTPSession(Session):
         Returns ``None`` when *cache_cfg* is disabled, the mode
         disables reads, or no matching response exists.
         """
-        if cache_cfg is None or not cache_cfg.cache_enabled:
+        if cache_cfg is None:
             return None
         tabular = cache_cfg.tabular
         if tabular is None:
@@ -737,7 +737,7 @@ class HTTPSession(Session):
             else request.anonymize(mode=cache_cfg.anonymize)
         )
         predicate = cache_cfg.make_lookup_predicate(request=lookup_request)
-        spark = request.send_config_or_default.spark_session
+        spark = request.send_config_or_default.get_spark_session()
         opts = CastOptions(predicate=predicate, spark_session=spark)
         batches = tabular.read_arrow_batches(options=opts.check_target(RESPONSE_SCHEMA))
 
@@ -772,7 +772,7 @@ class HTTPSession(Session):
         received_at: dt.datetime | None = None,
     ) -> None:
         """Persist one response to a cache backend."""
-        if not response.ok or cache_cfg is None or not cache_cfg.cache_enabled:
+        if not response.ok or cache_cfg is None:
             return
         if received_at is not None:
             response.received_at = received_at
@@ -872,14 +872,14 @@ class HTTPSession(Session):
             if req_sc.remote_cache is not None:
                 merge_back["remote_cache"] = req_sc.remote_cache
             if merge_back:
-                cfg = dataclasses.replace(cfg, **merge_back)
+                cfg = cfg.copy( **merge_back)
         request.send_config = cfg
         lc = cfg.local_cache
-        if lc is not None and lc.cache_enabled and lc.tabular is None:
+        if lc is not None and lc.tabular is None:
             lc.cache_tabular(session=self)
         if not start:
             return self._build_idle_response(request, cfg)
-        if cfg.spark_session is not None:
+        if cfg.spark_session:
             for response in self._send_many(iter([request])):
                 return response
         return self._send(request)
@@ -1322,7 +1322,7 @@ class HTTPSession(Session):
             batch_kw["max_batch_ttl"] = max_batch_ttl
 
         lc = cfg.local_cache
-        if lc is not None and lc.cache_enabled and lc.tabular is None:
+        if lc is not None and lc.tabular is None:
             lc.cache_tabular(session=self)
 
         def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
@@ -1340,7 +1340,7 @@ class HTTPSession(Session):
                     if req_sc.remote_cache is not None:
                         merge_back["remote_cache"] = req_sc.remote_cache
                     if merge_back:
-                        merged = dataclasses.replace(merged, **merge_back)
+                        merged = merged.copy( **merge_back)
                     r.send_config = merged
                 yield r
 
@@ -1369,7 +1369,7 @@ class HTTPSession(Session):
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
         """Process one holder group: local cache → remote cache → network → writeback."""
-        spark = reqs[0].send_config_or_default.spark_session if reqs else None
+        spark = reqs[0].send_config_or_default.get_spark_session() if reqs else None
         n = len(reqs)
         LOGGER.debug(
             "Processing batch (requests=%d, local=%r, remote=%r)",
@@ -1533,11 +1533,10 @@ class HTTPSession(Session):
         max_in_flight: int | None = None,
     ) -> Iterator[Response]:
         """Stage 3: send misses through the job pool."""
-        miss_send_config = dataclasses.replace(
-            misses[0].send_config_or_default,
+        miss_send_config = misses[0].send_config_or_default.copy(
             remote_cache=None,
             local_cache=None,
-            spark_session=None,
+            spark_session=False,
             raise_error=False,
         )
 
@@ -1677,7 +1676,7 @@ class HTTPSession(Session):
                         if req_sc.remote_cache is not None:
                             merge_back["remote_cache"] = req_sc.remote_cache
                         if merge_back:
-                            merged = dataclasses.replace(merged, **merge_back)
+                            merged = merged.copy( **merge_back)
                         r.send_config = merged
                     yield r
 
@@ -1875,16 +1874,14 @@ class HTTPSession(Session):
         # the executor's disk cache bounded; no remote cache — the
         # driver handles remote persistence in stage 4.
         config = misses[0].send_config_or_default
-        worker_send_config = dataclasses.replace(
-            config,
+        worker_send_config = config.copy(
             remote_cache=None,
-            spark_session=None,
+            spark_session=False,
             raise_error=False,
         )
         lc = worker_send_config.local_cache
         if lc is not None:
-            worker_send_config = dataclasses.replace(
-                worker_send_config,
+            worker_send_config = worker_send_config.copy(
                 local_cache=lc.copy(
                     received_to=dt.datetime.now(dt.timezone.utc),
                     received_from=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15),

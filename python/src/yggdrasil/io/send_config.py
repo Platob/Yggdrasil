@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import dataclasses
 import datetime as dt
 import logging
 import pathlib
 import time
-from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
@@ -45,7 +43,6 @@ _DEFAULT_REQUEST_BY: tuple[str, ...] = (
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
         "tabular",
-        "request_by",
         "mode",
         "anonymize",
         "received_from",
@@ -73,18 +70,6 @@ _SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
 DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
-def _is_valid_request_key(key: str) -> bool:
-    head, _, _ = key.partition(".")
-    if head in REQUEST_ARROW_SCHEMA.names:
-        return True
-    # Accept the flattened ``request_<col>`` form too — same column,
-    # different spelling — so callers can write the request_by keys
-    # in either shape.
-    if head.startswith("request_") and head[len("request_"):] in REQUEST_ARROW_SCHEMA.names:
-        return True
-    return False
-
-
 def _request_column_sql_name(key: str) -> str:
     """Cache-table column name for a request-side ``request_by`` key.
 
@@ -104,18 +89,6 @@ def _request_column_sql_name(key: str) -> str:
     return prefixed + (sep + tail if sep else "")
 
 
-def _validate_request_by(arg: list[str] | tuple[str, ...] | None = None) -> list[str]:
-    keys = list(_DEFAULT_REQUEST_BY if not arg else arg)
-    invalid = [key for key in keys if not _is_valid_request_key(key)]
-    if invalid:
-        raise ValueError(
-            f"Invalid request_by key(s): {invalid!r}. "
-            f"Must be within: {REQUEST_ARROW_SCHEMA.names!r}"
-        )
-    return keys
-
-
-
 
 def _truncate_to_hour(value: dt.datetime) -> dt.datetime:
     return value.replace(minute=0, second=0, microsecond=0)
@@ -133,9 +106,11 @@ class CacheConfig:
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
     __slots__ = (
-        "tabular", "request_by", "mode", "anonymize",
+        "tabular", "mode", "anonymize",
         "received_from", "received_to", "cleanup_ttl", "_derived",
     )
+
+    request_by: ClassVar[tuple[str, ...]] = _DEFAULT_REQUEST_BY
 
     @classmethod
     def default(cls):
@@ -156,7 +131,6 @@ class CacheConfig:
     def __init__(
         self,
         tabular: Optional[Holder] = None,
-        request_by: Optional[list[str]] = None,
         mode: Mode = Mode.APPEND,
         anonymize: Literal["remove", "redact"] = "remove",
         received_from: Optional[dt.datetime] = None,
@@ -167,8 +141,6 @@ class CacheConfig:
         self.anonymize = anonymize
         self.cleanup_ttl = cleanup_ttl
         self._derived = None
-
-        self.request_by = _validate_request_by(request_by)
 
         self.received_from = _coerce_optional_datetime(received_from)
         self.received_to = _coerce_optional_datetime(received_to)
@@ -185,8 +157,6 @@ class CacheConfig:
             parts.append(f"tabular={self.tabular!r}")
         if self.mode != Mode.APPEND:
             parts.append(f"mode={self.mode!r}")
-        if self.request_by and self.request_by != list(_DEFAULT_REQUEST_BY):
-            parts.append(f"request_by={self.request_by!r}")
         if self.received_from is not None:
             parts.append(f"received_from={self.received_from!r}")
         if self.received_to is not None:
@@ -252,7 +222,6 @@ class CacheConfig:
         return {
             "mode": self.mode,
             "tabular": self.tabular,
-            "request_by": self.request_by,
             "received_from": self.received_from,
             "received_to": self.received_to,
             "anonymize": self.anonymize,
@@ -260,8 +229,7 @@ class CacheConfig:
         }
 
     def __setstate__(self, state):
-        self.mode = state["mode"]
-        self.request_by = state["request_by"]
+        self.mode = state.get("mode", Mode.APPEND)
         self.received_from = state["received_from"]
         self.received_to = state["received_to"]
         tabular = state.get("tabular")
@@ -798,36 +766,74 @@ class CacheConfig:
 DEFAULT_CACHE_CONFIG = CacheConfig()
 
 
-@dataclass(frozen=True, slots=True)
 class SendConfig:
     _FIELD_NAMES: ClassVar[frozenset[str]] = _SEND_CONFIG_FIELDS
 
-    raise_error: bool = True
-    wait: WaitingConfig | None = None
-    remote_cache: CacheConfig | None = None
-    local_cache: CacheConfig | None = None
-    cache_only: bool = False
-    spark_session: Optional["SparkSession"] = field(
-        default=None,
-        hash=False,
-        compare=False,
-        repr=False,
+    __slots__ = (
+        "raise_error", "wait", "remote_cache", "local_cache",
+        "cache_only", "spark_session",
     )
 
-    def __post_init__(self):
-        w = self.wait
-        if w is not None:
-            object.__setattr__(self, "wait", WaitingConfig.from_(w))
-        rc = self.remote_cache
-        if rc is not None:
-            object.__setattr__(self, "remote_cache", CacheConfig.from_(rc))
-        lc = self.local_cache
-        if lc is not None:
-            object.__setattr__(self, "local_cache", CacheConfig.from_(lc))
-        spark = self.spark_session
-        if spark is True or spark is ...:
-            spark = PyEnv.spark_session()
-        object.__setattr__(self, "spark_session", spark)
+    def __init__(
+        self,
+        raise_error: bool = True,
+        wait: "WaitingConfig | None" = None,
+        remote_cache: "CacheConfig | None" = None,
+        local_cache: "CacheConfig | None" = None,
+        cache_only: bool = False,
+        spark_session: "bool | None" = None,
+    ):
+        self.raise_error = raise_error
+        self.wait = WaitingConfig.from_(wait) if wait is not None else None
+        self.remote_cache = CacheConfig.from_(remote_cache) if remote_cache is not None else None
+        self.local_cache = CacheConfig.from_(local_cache) if local_cache is not None else None
+        self.cache_only = cache_only
+        if spark_session is not None and spark_session is not False:
+            self.spark_session = True
+        else:
+            self.spark_session = False
+
+    def get_spark_session(self) -> "SparkSession | None":
+        if not self.spark_session:
+            return None
+        try:
+            return PyEnv.spark_session()
+        except Exception:
+            return None
+
+    def __repr__(self):
+        parts = []
+        if not self.raise_error:
+            parts.append("raise_error=False")
+        if self.wait is not None:
+            parts.append(f"wait={self.wait!r}")
+        if self.remote_cache is not None:
+            parts.append(f"remote_cache={self.remote_cache!r}")
+        if self.local_cache is not None:
+            parts.append(f"local_cache={self.local_cache!r}")
+        if self.cache_only:
+            parts.append("cache_only=True")
+        if self.spark_session:
+            parts.append("spark_session=True")
+        return f"SendConfig({', '.join(parts)})"
+
+    def __eq__(self, other):
+        if not isinstance(other, SendConfig):
+            return NotImplemented
+        return (
+            self.raise_error == other.raise_error
+            and self.wait == other.wait
+            and self.remote_cache == other.remote_cache
+            and self.local_cache == other.local_cache
+            and self.cache_only == other.cache_only
+        )
+
+    def __hash__(self):
+        return hash((
+            self.raise_error, self.wait,
+            self.remote_cache, self.local_cache,
+            self.cache_only,
+        ))
 
     def __getstate__(self):
         return {
@@ -836,16 +842,24 @@ class SendConfig:
             "remote_cache": self.remote_cache,
             "local_cache": self.local_cache,
             "cache_only": self.cache_only,
-            "spark_session": None,
+            "spark_session": self.spark_session,
         }
 
     def __setstate__(self, state):
-        object.__setattr__(self, "raise_error", state.get("raise_error", True))
-        object.__setattr__(self, "wait", state.get("wait"))
-        object.__setattr__(self, "remote_cache", state.get("remote_cache"))
-        object.__setattr__(self, "local_cache", state.get("local_cache"))
-        object.__setattr__(self, "cache_only", state.get("cache_only", False))
-        object.__setattr__(self, "spark_session", None)
+        self.raise_error = state.get("raise_error", True)
+        self.wait = state.get("wait")
+        self.remote_cache = state.get("remote_cache")
+        self.local_cache = state.get("local_cache")
+        self.cache_only = state.get("cache_only", False)
+        self.spark_session = bool(state.get("spark_session", False))
+
+    def copy(self, **overrides):
+        clean = {k: v for k, v in overrides.items() if v is not ...}
+        if not clean:
+            return self
+        state = self.__getstate__()
+        state.update(clean)
+        return type(self)(**state)
 
     @classmethod
     def default(cls):
@@ -861,7 +875,7 @@ class SendConfig:
         values.update(overrides)
         if cls._matches_default(values):
             return cls.default()
-        return cls(**cls._check_mapping(values))
+        return cls(**{k: v for k, v in values.items() if v is not None})
 
     @classmethod
     def _matches_default(cls, values: Mapping[str, Any]) -> bool:
@@ -879,36 +893,13 @@ class SendConfig:
             return False
         return True
 
-    @staticmethod
-    def _check_mapping(values: MutableMapping[str, Any]):
-        spark_session = values.get("spark_session")
-        if spark_session is not None:
-            try:
-                values["spark_session"] = PyEnv.spark_session(obj=spark_session)
-            except Exception:
-                values["spark_session"] = None
-
-        wait = values.get("wait")
-        if wait is not None:
-            values["wait"] = WaitingConfig.from_(wait)
-
-        remote_cache = values.get("remote_cache")
-        if remote_cache is not None:
-            values["remote_cache"] = CacheConfig.from_(remote_cache)
-
-        local_cache = values.get("local_cache")
-        if local_cache is not None:
-            values["local_cache"] = CacheConfig.from_(local_cache)
-
-        return {k: v for k, v in values.items() if v is not None}
-
     def merge(self, **overrides: Any):
         unknown = set(overrides) - self._FIELD_NAMES
         if unknown:
             raise TypeError(
                 f"{type(self).__name__}.merge got unexpected field(s): {sorted(unknown)!r}"
             )
-        return dataclasses.replace(self, **self._check_mapping(overrides))
+        return self.copy(**overrides)
 
     @classmethod
     def from_(

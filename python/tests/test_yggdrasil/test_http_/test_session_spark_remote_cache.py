@@ -81,8 +81,8 @@ class _SparkAwareFakeTabular(Tabular):
 
 def _remote_cfg(tab: _SparkAwareFakeTabular, **overrides: Any) -> CacheConfig:
     overrides.setdefault("mode", Mode.APPEND)
-    overrides.setdefault("request_by", ["public_url_hash"])
-    overrides.setdefault("wait", False)
+    overrides.pop("request_by", None)
+    overrides.pop("wait", None)
     return CacheConfig(tabular=tab, **overrides)
 
 
