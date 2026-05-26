@@ -150,7 +150,6 @@ def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
     return _truncate_to_hour(any_to_datetime(value))
 
 
-@dataclass(frozen=True, slots=True)
 class _ConfigBase:
     _FIELD_NAMES: ClassVar[frozenset[str]]
 
@@ -265,9 +264,6 @@ class CacheConfig(_ConfigBase):
         "tabular", "request_by", "response_by", "mode", "anonymize",
         "received_from", "received_to", "cleanup_ttl", "_derived",
     )
-
-    __setattr__ = object.__setattr__
-    __delattr__ = object.__delattr__
 
     def __init__(
         self,
