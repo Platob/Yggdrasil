@@ -49,8 +49,6 @@ _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
         "anonymize",
         "received_from",
         "received_to",
-        "wait",
-        "mirror_local_to_remote",
         "cleanup_ttl",
     }
 )
@@ -258,8 +256,7 @@ class CacheConfig(_ConfigBase):
 
     __slots__ = (
         "tabular", "request_by", "response_by", "mode", "anonymize",
-        "received_from", "received_to", "wait",
-        "mirror_local_to_remote", "cleanup_ttl", "_derived",
+        "received_from", "received_to", "cleanup_ttl", "_derived",
     )
 
     __setattr__ = object.__setattr__
@@ -274,14 +271,10 @@ class CacheConfig(_ConfigBase):
         anonymize: Literal["remove", "redact"] = "remove",
         received_from: Optional[dt.datetime] = None,
         received_to: Optional[dt.datetime] = None,
-        wait: WaitingConfig = False,
-        mirror_local_to_remote: bool = False,
         cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1),
     ):
         self.mode = Mode.from_(mode, default=Mode.APPEND)
-        self.wait = WaitingConfig.from_(wait)
         self.anonymize = anonymize
-        self.mirror_local_to_remote = mirror_local_to_remote
         self.cleanup_ttl = cleanup_ttl
         self._derived = None
 
@@ -321,8 +314,6 @@ class CacheConfig(_ConfigBase):
             and self.anonymize == other.anonymize
             and self.received_from == other.received_from
             and self.received_to == other.received_to
-            and self.wait == other.wait
-            and self.mirror_local_to_remote == other.mirror_local_to_remote
             and self.cleanup_ttl == other.cleanup_ttl
         )
 
@@ -330,15 +321,11 @@ class CacheConfig(_ConfigBase):
         return hash((
             self.mode, self.anonymize,
             self.received_from, self.received_to,
-            self.wait, self.mirror_local_to_remote, self.cleanup_ttl,
+            self.cleanup_ttl,
         ))
 
     @staticmethod
     def _check_mapping(values: MutableMapping[str, Any]):
-        wait = values.get("wait")
-        if wait is not None:
-            values["wait"] = WaitingConfig.from_(wait)
-
         cleanup_ttl = values.get("cleanup_ttl")
         if cleanup_ttl is not None:
             values["cleanup_ttl"] = any_to_timedelta(cleanup_ttl)
@@ -377,20 +364,17 @@ class CacheConfig(_ConfigBase):
     def __getstate__(self):
         return {
             "mode": self.mode,
-            "wait": self.wait,
             "tabular": self.tabular,
             "request_by": self.request_by,
             "response_by": self.response_by,
             "received_from": self.received_from,
             "received_to": self.received_to,
             "anonymize": self.anonymize,
-            "mirror_local_to_remote": self.mirror_local_to_remote,
             "cleanup_ttl": self.cleanup_ttl,
         }
 
     def __setstate__(self, state):
         self.mode = state["mode"]
-        self.wait = state["wait"]
         self.request_by = state["request_by"]
         self.response_by = state["response_by"]
         self.received_from = state["received_from"]
@@ -403,7 +387,6 @@ class CacheConfig(_ConfigBase):
                 tabular = FolderPath(path=Path.from_(tabular_url))
         self.tabular = tabular
         self.anonymize = state.get("anonymize", "remove")
-        self.mirror_local_to_remote = state.get("mirror_local_to_remote", False)
         self.cleanup_ttl = state.get("cleanup_ttl", dt.timedelta(days=1))
         self._derived = None
 

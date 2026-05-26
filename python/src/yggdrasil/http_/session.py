@@ -183,7 +183,6 @@ def _insert_cache(
     opts = CastOptions(
         mode=mode if mode is not None else cache_cfg.mode,
         match_by=cache_cfg.match_by_columns or None,
-        wait=cache_cfg.wait,
         spark_session=spark_session,
         prune_values=prune_values,
     )

@@ -80,7 +80,7 @@ class FakeTable(Tabular):
 def _cache(tab: FakeTable, **kw) -> CacheConfig:
     kw.setdefault("mode", Mode.APPEND)
     kw.setdefault("request_by", ["public_url_hash"])
-    kw.setdefault("wait", False)
+    kw.pop("wait", None)
     return CacheConfig(tabular=tab, **kw)
 
 
@@ -451,7 +451,6 @@ class TestSendManyUpsertOverwritePersist:
             tabular=str(cache_dir),
             mode=Mode.UPSERT,
             request_by=["public_url_hash"],
-            wait=False,
         )
 
         req = make_request("https://api.example.com/local-upsert")
@@ -501,11 +500,11 @@ class TestHolderGrouping:
 
         cfg_append = CacheConfig(
             tabular="/tmp/test", mode=Mode.APPEND,
-            request_by=["public_url_hash"], wait=False,
+            request_by=["public_url_hash"],
         )
         cfg_overwrite = CacheConfig(
             tabular="/tmp/test", mode=Mode.OVERWRITE,
-            request_by=["public_url_hash"], wait=False,
+            request_by=["public_url_hash"],
         )
 
         a = make_request("https://example.com/a").copy(

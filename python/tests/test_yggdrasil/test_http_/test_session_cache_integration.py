@@ -92,7 +92,7 @@ def _local_cfg(root: Path | str, **overrides: Any) -> CacheConfig:
 def _remote_cfg(tab: "_FakeRemoteTabular", **overrides: Any) -> CacheConfig:
     overrides.setdefault("mode", Mode.APPEND)
     overrides.setdefault("request_by", ["public_url_hash"])
-    overrides.setdefault("wait", False)
+    overrides.pop("wait", None)
     return CacheConfig(tabular=tab, **overrides)
 
 
@@ -200,12 +200,10 @@ class _FakeRemoteTabular(Tabular):
             tuple(f.name for f in match_by_fields)
             if match_by_fields else None
         )
-        wait = getattr(options, "wait", False)
         prune_values = getattr(options, "prune_values", None)
         self.inserts.append({
             "mode": mode,
             "match_by": match_by,
-            "wait": wait,
             "rows": sum(b.num_rows for b in new_batches),
             "prune_keys": (
                 tuple(sorted(prune_values.keys())) if prune_values else ()
@@ -495,9 +493,6 @@ class TestRemoteCacheSend:
         # Insert call carries the configured knobs.
         i = tab.inserts[0]
         assert i["mode"] == Mode.APPEND
-        # ``wait`` is normalized to a :class:`WaitingConfig`; bool
-        # coercion drives the actual "block until visible" behavior.
-        assert not i["wait"]
         # Pruning keys the MERGE on both the partition column and the
         # exact row identity — both keys are int64 so the IN literal
         # stays compact.
@@ -549,16 +544,6 @@ class TestRemoteCacheSend:
         # tab_b got the writeback, tab_a stays untouched.
         assert tab_a.inserts == []
         assert tab_b.inserts and tab_b.inserts[0]["rows"] == 1
-
-    def test_wait_flag_propagates_to_insert(self) -> None:
-        tab = _FakeRemoteTabular()
-        cfg = _remote_cfg(tab, wait=True)
-        s = StubSession()
-        req = make_request("https://example.com/x")
-        s.queue(make_response(request=req, body=b'{"v":1}'))
-
-        s.send(req, remote_cache=cfg)
-        assert tab.inserts and bool(tab.inserts[0]["wait"]) is True
 
 
 # ===========================================================================

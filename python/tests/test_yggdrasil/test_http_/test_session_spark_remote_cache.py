@@ -72,7 +72,6 @@ class _SparkAwareFakeTabular(Tabular):
         self.inserts.append({
             "mode": getattr(options, "mode", None),
             "match_by": match_by,
-            "wait": bool(getattr(options, "wait", False)),
             "url_hashes": [
                 int(h) for h in rows["request_public_url_hash"].tolist()
             ],
