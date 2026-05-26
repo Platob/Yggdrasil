@@ -34,24 +34,15 @@ from yggdrasil.http_.cache_config import (
     DEFAULT_CACHE_CONFIG,
     MATCH_COLUMN,
     MATCH_KEY,
-    _CACHE_CONFIG_FIELDS,
     _DEFAULT_CACHE_ROOT,
 )
 
 
-_SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
-    list(_CACHE_CONFIG_FIELDS) + [
-        "remote_cache", "local_cache", "max_batch_ttl",
-        "batch_predicate", "cache_only",
-        "raise_error", "wait",
-    ]
-)
 
 DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
 class SendConfig:
-    _FIELD_NAMES: ClassVar[frozenset[str]] = _SEND_CONFIG_FIELDS
 
     __slots__ = (
         "raise_error", "wait", "remote_cache", "local_cache",
@@ -281,7 +272,7 @@ class SendConfig:
 
     @classmethod
     def parse_mapping(cls, options: Mapping[str, Any], **overrides: Any):
-        values = {k: v for k, v in options.items() if k in cls._FIELD_NAMES}
+        values = {k: v for k, v in options.items() if k in set(cls.__slots__)}
         values.update(overrides)
         if cls._matches_default(values):
             return cls.default()
@@ -304,7 +295,7 @@ class SendConfig:
         return True
 
     def merge(self, **overrides: Any):
-        unknown = set(overrides) - self._FIELD_NAMES
+        unknown = set(overrides) - set(self.__slots__)
         if unknown:
             raise TypeError(
                 f"{type(self).__name__}.merge got unexpected field(s): {sorted(unknown)!r}"

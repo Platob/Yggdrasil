@@ -237,7 +237,6 @@ class ArrowTabular(Tabular[CastOptions]):
         # explicitly here.
         super().__init__(**kwargs)
         self._batches: list[pa.RecordBatch] = []
-        self._schema: Optional[pa.Schema] = schema.to_arrow_schema() if isinstance(schema, StructField) else schema if isinstance(schema, pa.Schema) else None
         self._schema_cache: Optional[StructField] = None if schema is None else StructField.from_arrow(schema)
 
         # Spill state. ``_spill_bytes_threshold == 0`` (or None) keeps
@@ -537,8 +536,6 @@ class ArrowTabular(Tabular[CastOptions]):
     def _append_batch(self, batch: pa.RecordBatch) -> None:
         """Append *batch* to the in-memory tail and update the byte counter."""
         self._batches.append(batch)
-        if self._schema is None:
-            self._schema = batch.schema
         # ``nbytes`` is the contiguous buffer size — matches what we
         # spend on the IPC file plus a small framing overhead. Close
         # enough for the threshold check.
@@ -748,89 +745,7 @@ class ArrowTabular(Tabular[CastOptions]):
             self._maybe_spill()
             return
         if isinstance(source, pa.Table):
-            if self._schema is None:
-                self._schema = source.schema
             for batch in source.to_batches():
                 self._append_batch(batch)
             self._maybe_spill()
             return
-        if isinstance(source, pa.RecordBatchReader):
-            # ``read_all`` decodes the whole reader inside the C++
-            # runtime — no per-batch Python hop, and the resulting
-            # table shares chunking with the upstream batches.
-            self._ingest(source.read_all())
-            return
-        if isinstance(source, pa.ChunkedArray):
-            raise TypeError(
-                f"ArrowTabular can't ingest a bare pa.ChunkedArray "
-                f"({source.type!r}); wrap it in a pa.Table with a "
-                "column name first: pa.table({'col': chunked})."
-            )
-
-        # Another Tabular — drain it as an Arrow batch stream. Covers
-        # ParquetFile, ArrowIPCFile, LazyTabular, another ArrowTabular,
-        # etc. without each backend re-implementing a dispatch branch.
-        if isinstance(source, Tabular):
-            for batch in source.read_arrow_batches():
-                self._append_batch(batch)
-            self._maybe_spill()
-            return
-
-        # Engine-frame namespaces — sniffed via the canonical
-        # :class:`ObjectSerde` helper so the dispatch table stays
-        # consistent with the rest of the IO layer.
-        namespace, _ = ObjectSerde.module_and_name(source)
-        root = namespace.split(".", 1)[0] if namespace else ""
-        if root == "polars":
-            import polars as pl
-
-            # LazyFrame collects here; the in-memory holder is the
-            # wrong tool for streaming-laziness anyway. Reach for
-            # ``scan_polars_frame`` on a different IO if you want
-            # that.
-            if isinstance(source, pl.LazyFrame):
-                source = source.collect()
-            self._ingest(source.to_arrow())
-            return
-        if root == "pandas":
-            self._ingest(pa.Table.from_pandas(source))
-            return
-        if root == "pyspark":
-            to_arrow = getattr(source, "toArrow", None)
-            if to_arrow is not None:
-                self._ingest(to_arrow())
-                return
-            self._ingest(pa.Table.from_pandas(source.toPandas()))
-            return
-
-        # Pure-Python row-list / column-dict shapes.
-        if isinstance(source, list) and source and all(
-            isinstance(r, dict) for r in source
-        ):
-            self._ingest(pa.Table.from_pylist(source))
-            return
-        if (
-            isinstance(source, dict) and source
-            and all(isinstance(v, (list, tuple)) for v in source.values())
-        ):
-            self._ingest(pa.Table.from_pydict({
-                k: list(v) for k, v in source.items()
-            }))
-            return
-
-        # Iterable fallback — recurse so a caller can pass a
-        # generator of Tables / batches and have it streamed in.
-        try:
-            iterator = iter(source)
-        except TypeError as exc:
-            raise TypeError(
-                f"ArrowTabular can't ingest "
-                f"{type(source).__module__}.{type(source).__name__}: "
-                f"{source!r}. Accepted: pyarrow Table / RecordBatch / "
-                "RecordBatchReader, another Tabular, polars "
-                "DataFrame/LazyFrame, pandas DataFrame, pyspark DataFrame, "
-                "list[dict], dict[str, list], or an iterable of any of "
-                "those."
-            ) from exc
-        for inner in iterator:
-            self._ingest(inner)
