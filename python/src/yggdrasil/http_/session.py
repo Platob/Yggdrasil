@@ -2115,7 +2115,10 @@ class HTTPSession(Session):
         if lc is not None:
             worker_send_config = dataclasses.replace(
                 worker_send_config,
-                local_cache=lc.copy(received_ttl=dt.timedelta(minutes=15)),
+                local_cache=lc.copy(
+                    received_to=dt.datetime.now(dt.timezone.utc),
+                    received_from=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15),
+                ),
             )
 
         self_serialized = pickle.dumps(self)

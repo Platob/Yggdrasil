@@ -258,7 +258,7 @@ class CacheConfig(_ConfigBase):
 
     __slots__ = (
         "tabular", "request_by", "response_by", "mode", "anonymize",
-        "received_from", "received_to", "received_ttl", "wait",
+        "received_from", "received_to", "wait",
         "mirror_local_to_remote", "cleanup_ttl", "_derived",
     )
 
@@ -274,7 +274,6 @@ class CacheConfig(_ConfigBase):
         anonymize: Literal["remove", "redact"] = "remove",
         received_from: Optional[dt.datetime] = None,
         received_to: Optional[dt.datetime] = None,
-        received_ttl: Optional[dt.timedelta] = None,
         wait: WaitingConfig = False,
         mirror_local_to_remote: bool = False,
         cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1),
@@ -291,13 +290,6 @@ class CacheConfig(_ConfigBase):
 
         self.received_from = _coerce_optional_datetime(received_from)
         self.received_to = _coerce_optional_datetime(received_to)
-        self.received_ttl = received_ttl
-
-        if self.received_ttl:
-            if not self.received_to:
-                self.received_to = dt.datetime.now(dt.timezone.utc)
-            if not self.received_from:
-                self.received_from = self.received_to - self.received_ttl
 
         if tabular is not None:
             from yggdrasil.io.tabular import Tabular
@@ -329,7 +321,6 @@ class CacheConfig(_ConfigBase):
             and self.anonymize == other.anonymize
             and self.received_from == other.received_from
             and self.received_to == other.received_to
-            and self.received_ttl == other.received_ttl
             and self.wait == other.wait
             and self.mirror_local_to_remote == other.mirror_local_to_remote
             and self.cleanup_ttl == other.cleanup_ttl
@@ -338,7 +329,7 @@ class CacheConfig(_ConfigBase):
     def __hash__(self):
         return hash((
             self.mode, self.anonymize,
-            self.received_from, self.received_to, self.received_ttl,
+            self.received_from, self.received_to,
             self.wait, self.mirror_local_to_remote, self.cleanup_ttl,
         ))
 
@@ -347,10 +338,6 @@ class CacheConfig(_ConfigBase):
         wait = values.get("wait")
         if wait is not None:
             values["wait"] = WaitingConfig.from_(wait)
-
-        received_ttl = values.get("received_ttl")
-        if received_ttl is not None:
-            values["received_ttl"] = any_to_timedelta(received_ttl)
 
         cleanup_ttl = values.get("cleanup_ttl")
         if cleanup_ttl is not None:
@@ -396,7 +383,6 @@ class CacheConfig(_ConfigBase):
             "response_by": self.response_by,
             "received_from": self.received_from,
             "received_to": self.received_to,
-            "received_ttl": self.received_ttl,
             "anonymize": self.anonymize,
             "mirror_local_to_remote": self.mirror_local_to_remote,
             "cleanup_ttl": self.cleanup_ttl,
@@ -409,7 +395,6 @@ class CacheConfig(_ConfigBase):
         self.response_by = state["response_by"]
         self.received_from = state["received_from"]
         self.received_to = state["received_to"]
-        self.received_ttl = state["received_ttl"]
         tabular = state.get("tabular")
         if tabular is None:
             tabular_url = state.get("tabular_url", state.get("path"))
@@ -450,22 +435,13 @@ class CacheConfig(_ConfigBase):
                 overrides["received_from"] = dt.datetime.combine(arg, dt.time.min, tzinfo=dt.timezone.utc)
 
             elif isinstance(arg, dt.timedelta) or (
-                # Bare number → TTL in seconds. Same shape as the timedelta
-                # branch; the ``bool`` exclusion mirrors
-                # :func:`any_to_timedelta`, which refuses to treat a bool as
-                # a seconds value.
                 isinstance(arg, (int, float)) and not isinstance(arg, bool)
             ):
                 ttl = arg if isinstance(arg, dt.timedelta) else any_to_timedelta(arg)
-                overrides["received_ttl"] = ttl
-
-                # fill received_from and received_to if not exists
                 received_to = overrides.get("received_to")
                 received_to = dt.datetime.now(dt.timezone.utc) if received_to is None else any_to_datetime(received_to)
                 overrides["received_to"] = received_to
-
-                received_from = overrides.get("received_from")
-                if not received_from:
+                if not overrides.get("received_from"):
                     overrides["received_from"] = received_to - ttl
 
             else:

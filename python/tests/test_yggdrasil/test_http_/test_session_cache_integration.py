@@ -295,11 +295,13 @@ class TestLocalCacheSend:
         assert len(s.calls) == 1
         assert out.json() == {"v": "fresh"}
 
-    def test_received_ttl_derived_window_filters_stale_row(self, tmp_path) -> None:
-        # ``received_ttl`` with no explicit ``received_to`` resolves to
-        # ``now() - ttl`` → ``now()``. An mtime an hour in the past is
-        # stale even with a short ttl.
-        cache = _local_cfg(tmp_path, received_ttl=dt.timedelta(minutes=10))
+    def test_received_window_filters_stale_row(self, tmp_path) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        cache = _local_cfg(
+            tmp_path,
+            received_from=now - dt.timedelta(minutes=10),
+            received_to=now,
+        )
         req = make_request("https://example.com/x")
         old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
         _seed_local(cache, make_response(
