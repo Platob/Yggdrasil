@@ -18,10 +18,6 @@ from yggdrasil.pickle.ser import dumps, loads
 # ``yggdrasil.spark.dependencies`` module so the scan logic can be
 # tested / imported in environments where ``pyspark`` is not installed
 # (which is the common path for the Spark Connect client).
-from yggdrasil.spark.dependencies import (
-    _function_top_modules as _function_top_modules,  # re-export
-    _stdlib_modules as _stdlib_modules,  # re-export
-)
 
 LOGGER = logging.getLogger(__name__)
 

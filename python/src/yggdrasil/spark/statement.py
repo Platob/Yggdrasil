@@ -183,10 +183,10 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         (Spark caches lazily on the frame itself, not on this handle).
         """
         if data is not None:
-            from yggdrasil.io.tabular import Dataset
+            from yggdrasil.spark.tabular import SparkTabular
             from yggdrasil.spark.cast import any_to_spark_dataframe
 
-            self._persisted_data = Dataset(any_to_spark_dataframe(data))
+            self._persisted_data = SparkTabular(any_to_spark_dataframe(data))
         return self
 
     # -------------------------------------------------------------------------

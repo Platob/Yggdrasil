@@ -3233,7 +3233,7 @@ class Table(DatabricksPath):
                 service=self.service.volumes,
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
-                volume_name=self.client.safe_tag_value(self.table_name, repl="_").lower()
+                volume_name="tmp" # self.client.safe_tag_value(self.table_name, repl="_").lower()
             )
         return self._staging_volume
 

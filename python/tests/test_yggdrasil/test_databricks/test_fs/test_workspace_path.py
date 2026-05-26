@@ -191,7 +191,7 @@ class TestWrite:
         workspace.workspace.get_status.side_effect = NotFound()
         workspace.workspace.upload.side_effect = upload_side_effect
 
-        with patch("yggdrasil.io.path._retry.time.sleep"):
+        with patch("yggdrasil.path._retry.time.sleep"):
             WorkspacePath("/Workspace/y", service=service).write_bytes(
                 io.BytesIO(b"abcdef"),
             )

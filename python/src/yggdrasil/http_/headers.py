@@ -11,16 +11,16 @@ replacement at the transport layer.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import collections.abc
-from typing import Any, ClassVar, Iterator, Mapping, MutableMapping, Optional, Tuple, Union
-import hashlib
-import re
 import platform
-import os
+import re
 import socket
-from yggdrasil.version import __version_info__
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Iterator, Mapping, MutableMapping, Optional, Tuple, Union, Literal
 
+from yggdrasil.enums import MediaType, MimeTypes, Codec
+from yggdrasil.io.holder import IO
+from yggdrasil.version import __version_info__, __version__
 
 __all__ = ["HTTPHeaderDict"]
 
@@ -370,7 +370,7 @@ def normalize_headers(
     add_missing: bool = True,
     mode: Literal["remove", "redact"] = "remove",
     anonymize: bool = False,
-    body: Optional[Holder] = None,
+    body: Optional[IO] = None,
 ) -> "Headers":
     """Backwards-compatible thin wrapper around :meth:`Headers.normalized`.
 
