@@ -1114,12 +1114,14 @@ class FolderPath(IO[bytes, FolderOptions]):
         ).repartition(n_parts)
 
         bc_leaves = spark.sparkContext.broadcast(leaf_bytes)
+        bc_options = spark.sparkContext.broadcast(options)
 
         def _read_holders(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+            opts = bc_options.value
             for batch in batches:
                 for idx in batch.column("_idx").to_pylist():
                     leaf = pickle.loads(bc_leaves.value[idx])
-                    yield from leaf.read_arrow_batches()
+                    yield from leaf.read_arrow_batches(options=opts)
 
         return index_df.mapInArrow(_read_holders, schema=spark_schema)
 
