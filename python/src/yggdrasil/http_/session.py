@@ -1368,41 +1368,21 @@ class HTTPSession(Session):
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
         """Process one config group: local cache → remote cache → network → writeback."""
-        local_cache = cfg.local_cache
-        remote_cache = cfg.remote_cache
-        spark = cfg.get_spark_session()
         n = len(reqs)
-        LOGGER.debug(
-            "Processing batch (requests=%d, local=%r, remote=%r)",
-            n, local_cache, remote_cache,
+        spark = cfg.get_spark_session()
+
+        local_hits, remote_hits, misses = cfg.split_requests(
+            reqs, session=self,
         )
-        local_hits: list[Response] = []
-        remote_hits: list[Response] = []
-        misses = reqs
 
-        if local_cache is not None and local_cache.mode in (Mode.AUTO, Mode.APPEND):
-            local_hits, misses = local_cache.read_responses(
-                reqs, spark_session=spark,
+        if local_hits is not None:
+            LOGGER.info(
+                "Local cache hit %d/%d request(s)", n - len(misses), n,
             )
-            if local_hits:
-                LOGGER.info(
-                    "Local cache hit %d/%d request(s)", len(local_hits), n,
-                )
-
-        if remote_cache is not None and misses and remote_cache.mode in (Mode.AUTO, Mode.APPEND):
-            before = len(misses)
-            remote_hits, misses = remote_cache.read_responses(
-                misses, spark_session=spark,
+        if remote_hits is not None:
+            LOGGER.info(
+                "Remote cache hit for request(s)",
             )
-            if remote_hits:
-                LOGGER.info(
-                    "Remote cache hit %d/%d request(s)", len(remote_hits), before,
-                )
-                if local_cache is not None:
-                    local_cache.write_responses(
-                        remote_hits, mode=Mode.OVERWRITE,
-                        spark_session=spark,
-                    )
 
         if not misses or cfg.cache_only:
             if misses:
@@ -1460,12 +1440,12 @@ class HTTPSession(Session):
         # Stage 4: persist to caches
         if new_data is not None:
             wb: list[Callable] = []
-            if remote_cache is not None:
-                wb.append(lambda: remote_cache.write_responses_tabular(
+            if cfg.remote_cache is not None:
+                wb.append(lambda: cfg.remote_cache.write_responses_tabular(
                     new_data, spark_session=spark,
                 ))
-            if local_cache is not None:
-                wb.append(lambda: local_cache.write_responses_tabular(
+            if cfg.local_cache is not None:
+                wb.append(lambda: cfg.local_cache.write_responses_tabular(
                     new_data, spark_session=spark,
                 ))
             if wb:

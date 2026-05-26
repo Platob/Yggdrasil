@@ -796,6 +796,82 @@ class SendConfig:
         except Exception:
             return None
 
+    def split_requests(
+        self,
+        requests: list[PreparedRequest],
+        *,
+        session: "Any" = None,
+    ) -> "tuple[Any, Any, list[PreparedRequest]]":
+        """Split requests into local hits, remote hits, and remaining misses.
+
+        Performs lightweight hash-only lookups against local then remote
+        cache to determine which requests are already cached, then
+        refetches full response rows only for the hits.
+
+        Returns ``(local_tabular, remote_tabular, misses)``.
+        """
+        import pyarrow as pa
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.execution.expr import col
+        from yggdrasil.io.response import RESPONSE_SCHEMA
+
+        local_tabular = None
+        remote_tabular = None
+        misses = requests
+
+        if not requests:
+            return None, None, []
+
+        match_key = CacheConfig.request_by[0]
+        request_hashes = {r.match_value(match_key): r for r in requests}
+        partition_keys = sorted({r.partition_key for r in requests})
+        predicate = col("partition_key").is_in(partition_keys)
+
+        match_col = _request_column_sql_name(CacheConfig.request_by[0])
+
+        def _probe_cache(cache: CacheConfig) -> set[int]:
+            holder = cache.tabular or cache.cache_tabular(session=session)
+            if holder is None:
+                return set()
+            try:
+                table = holder.read_arrow_table(
+                    predicate=predicate, columns=[match_col],
+                )
+                if table is None or table.num_rows == 0:
+                    return set()
+                return set(table.column(match_col).to_pylist())
+            except Exception:
+                return set()
+
+        def _fetch_hits(cache: CacheConfig, hit_requests: list[PreparedRequest]):
+            holder = cache.tabular or cache.cache_tabular(session=session)
+            if holder is None:
+                return None
+            batch_predicate = cache.make_batch_lookup_predicate(hit_requests)
+            opts = CastOptions(predicate=batch_predicate, target=RESPONSE_SCHEMA)
+            return holder.read_table(options=opts)
+
+        if self.local_cache is not None and self.local_cache.mode in (Mode.AUTO, Mode.APPEND):
+            cached_hashes = _probe_cache(self.local_cache)
+            existing = cached_hashes & set(request_hashes)
+            if existing:
+                hit_reqs = [r for r in misses if r.match_value(match_key) in existing]
+                misses = [r for r in misses if r.match_value(match_key) not in existing]
+                if hit_reqs:
+                    local_tabular = _fetch_hits(self.local_cache, hit_reqs)
+
+        if self.remote_cache is not None and misses and self.remote_cache.mode in (Mode.AUTO, Mode.APPEND):
+            cached_hashes = _probe_cache(self.remote_cache)
+            remaining = {r.match_value(match_key) for r in misses}
+            existing = cached_hashes & remaining
+            if existing:
+                hit_reqs = [r for r in misses if r.match_value(match_key) in existing]
+                misses = [r for r in misses if r.match_value(match_key) not in existing]
+                if hit_reqs:
+                    remote_tabular = _fetch_hits(self.remote_cache, hit_reqs)
+
+        return local_tabular, remote_tabular, misses
+
     def __repr__(self):
         parts = []
         if not self.raise_error:
