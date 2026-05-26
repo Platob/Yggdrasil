@@ -6,8 +6,6 @@ from typing import Any, Callable, ClassVar, IO, Mapping, Union, Iterable, Iterat
 
 __all__ = ["MimeType", "MimeTypes"]
 
-from yggdrasil.lazy_imports import io_class
-
 MagicMatcher = Callable[[bytes], bool]
 
 
@@ -362,6 +360,7 @@ class MimeType:
             return _miss(default, "empty magic buffer")
 
         if not isinstance(magic, (bytes, bytearray)):
+            from yggdrasil.lazy_imports import io_class
             IO = io_class()
 
             if isinstance(magic, IO):
@@ -377,6 +376,8 @@ class MimeType:
                 finally:
                     fh.seek(saved)
             else:
+                from yggdrasil.lazy_imports import bytes_io_class
+                BytesIO = bytes_io_class()
                 bio = BytesIO(magic)
                 bio.acquire()
                 try:

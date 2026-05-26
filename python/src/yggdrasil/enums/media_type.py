@@ -41,7 +41,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Iterable, Union, Any
 
-from yggdrasil.lazy_imports import path_class
+def _path_class():
+    from yggdrasil.lazy_imports import path_class
+    return path_class()
 
 
 def _url_class():
@@ -241,7 +243,7 @@ class MediaType:
         *,
         default: "MediaType" = ...,
     ):
-        path = path_class().from_(path, default=None)
+        path = _path_class().from_(path, default=None)
         if path is None:
             if default is ...:
                 raise ValueError(
