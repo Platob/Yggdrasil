@@ -1129,47 +1129,16 @@ class Tabular(ABC, Generic[O]):
     # Arrow surface
     # ==================================================================
 
-    def _read_arrow_batches_resolved(
-        self, options: O,
-    ) -> Iterator[pa.RecordBatch]:
-        """Inner read entry — applies target cast + post-read passes.
-
-        Every public read path (:meth:`read_arrow_batches`,
-        :meth:`_read_arrow_table`, :meth:`_read_arrow_batch_reader`)
-        funnels through this method so the schema-driven post-passes
-        fire exactly once regardless of which entry point the caller
-        picks:
-
-        * :meth:`CastOptions.cast_arrow_tabular` — per-batch target
-          cast (column selection + type coercion). Applies first so
-          downstream passes see the projected/typed schema.
-        * :meth:`CastOptions.resample_arrow_batches` — snap rows to
-          the target's ``time_sampling`` grid (Field tag), aggregating
-          finer-grained sources via
-          :func:`yggdrasil.arrow.ops.resample_arrow_table`.
-        * :meth:`CastOptions.dedup_arrow_batches` — collapse duplicate
-          rows on columns flagged ``unique`` via
-          :func:`yggdrasil.arrow.ops.dedup_arrow_table`.
-
-        Resample runs **before** dedup: the resample's bucket collapse
-        already implicitly dedupes on the time column, so a downstream
-        unique-tagged column (typically the same time axis) sees a
-        much smaller input. Both passes identity-short-circuit when
-        no matching tag fires, so the common case stays zero-cost.
-        """
-        stream = self._read_arrow_batches(options)
-        cast = options.cast_arrow_tabular
-        if options.target is not None:
-            stream = (cast(batch) for batch in stream)
-        stream = options.resample_arrow_batches(stream)
-        stream = options.dedup_arrow_batches(stream)
-        return stream
-
     def read_arrow_batches(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
         resolved = self.check_options(options, overrides=locals())
-        stream = self._read_arrow_batches_resolved(resolved)
+        stream = self._read_arrow_batches(resolved)
+        if resolved.target is not None:
+            cast = resolved.cast_arrow_tabular
+            stream = (cast(batch) for batch in stream)
+        stream = resolved.resample_arrow_batches(stream)
+        stream = resolved.dedup_arrow_batches(stream)
         if not logger.isEnabledFor(logging.DEBUG):
             yield from stream
             return
@@ -1216,9 +1185,15 @@ class Tabular(ABC, Generic[O]):
 
     def _read_arrow_batch_reader(self, options: O) -> "pa.RecordBatchReader":
         schema = options.check_target(obj=self.collect_schema).merged
+        stream = self._read_arrow_batches(options)
+        if options.target is not None:
+            cast = options.cast_arrow_tabular
+            stream = (cast(batch) for batch in stream)
+        stream = options.resample_arrow_batches(stream)
+        stream = options.dedup_arrow_batches(stream)
         return pa.RecordBatchReader.from_batches(
             schema.to_arrow_schema(),
-            self._read_arrow_batches_resolved(options),
+            stream,
         )
 
     def read_arrow_dataset(

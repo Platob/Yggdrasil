@@ -73,7 +73,7 @@ def _to_polars(value: Any) -> Any:
     if isinstance(value, Field):
         import polars as pl
 
-        source = value.alias if value.has_alias else value.name
+        source = value.alias or value.name
         expr = pl.col(source)
         if value.dtype is not None and hasattr(value.dtype, "to_polars"):
             try:

@@ -18,9 +18,9 @@ def _id_field() -> Field:
 
 
 class TestAlias:
-    def test_alias_falls_back_to_name(self) -> None:
+    def test_alias_returns_none_when_unset(self) -> None:
         f = _id_field()
-        assert f.alias == "id"
+        assert f.alias is None
         assert f.has_alias is False
 
     def test_set_alias_records_in_metadata(self) -> None:
@@ -33,7 +33,7 @@ class TestAlias:
         f = _id_field()
         f.set_alias("id")
         assert f.has_alias is False
-        assert f.alias == "id"
+        assert f.alias is None
 
     def test_set_alias_promotes_to_name_when_name_missing(self) -> None:
         f = Field.from_(pa.field("", pa.int64()))
@@ -47,7 +47,7 @@ class TestAlias:
         f.set_alias("user_id")
         f.set_alias(None)
         assert f.has_alias is False
-        assert f.alias == "id"
+        assert f.alias is None
 
     def test_with_alias_returns_copy(self) -> None:
         f = _id_field()

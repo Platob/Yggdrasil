@@ -335,7 +335,7 @@ def _selector_to_polars(spec: Any) -> Any:
     if isinstance(spec, str):
         return pl.col(spec)
     if isinstance(spec, Field):
-        source = spec.alias if spec.has_alias else spec.name
+        source = spec.alias or spec.name
         expr = pl.col(source)
         if spec.dtype is not None and hasattr(spec.dtype, "to_polars"):
             try:
@@ -537,7 +537,7 @@ def _apply_statement_select(
             out_columns.append(table[spec])
             continue
         if isinstance(spec, Field):
-            source = spec.alias if spec.has_alias else spec.name
+            source = spec.alias or spec.name
             col = table[source]
             if spec.dtype is not None and hasattr(spec.dtype, "to_arrow"):
                 try:

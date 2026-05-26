@@ -1097,31 +1097,17 @@ class Field(BaseChildrenFields):
     # ==================================================================
 
     @property
-    def alias(self) -> str:
-        """Alternate name for this field — falls back to :attr:`name`.
+    def alias(self) -> "str | None":
+        """Explicit alias stored under :data:`ALIAS_KEY`, or ``None``.
 
-        Stored in :attr:`metadata` under :data:`ALIAS_KEY`. Used by
-        :meth:`select_in` (and the engine-specific ``select_in_*``
-        helpers) to resolve a column from a frame whose schema
-        labels it differently than :attr:`name` — common when a
-        source table has been renamed, or when a field carries
-        both a wire name and a friendly name.
-
-        Always returns a string: when no alias is configured the
-        getter returns :attr:`name` so downstream lookups don't
-        have to fork on ``None``. Use :attr:`has_alias` to tell
-        "configured alias" from "name fallback".
-
-        ``Field`` is a frozen dataclass — mutating the alias goes
-        through :meth:`with_alias` (immutable copy) or
-        :meth:`set_alias` (in-place dict mutation, same shape as
-        the rest of the metadata setters).
+        Returns ``None`` when no alias is configured — callers must
+        fall back to :attr:`name` explicitly if needed.
         """
         if self.metadata:
             value = self.metadata.get(ALIAS_KEY)
             if value is not None:
                 return value.decode("utf-8") if isinstance(value, bytes) else str(value)
-        return self.name
+        return None
 
     @property
     def has_alias(self) -> bool:
