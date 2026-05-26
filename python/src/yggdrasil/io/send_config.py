@@ -7,6 +7,7 @@ import time
 from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
+from yggdrasil.data.cast.datetime import truncate_datetime
 from yggdrasil.data.enums import Mode
 from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.environ import PyEnv
@@ -65,16 +66,19 @@ DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
 
-def _truncate_to_hour(value: dt.datetime) -> dt.datetime:
-    return value.replace(minute=0, second=0, microsecond=0)
+_TRUNCATE_INTERVAL = dt.timedelta(minutes=1)
 
 
-def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
+def _truncate_from(value: Any) -> Optional[dt.datetime]:
     if value in (None, ""):
         return None
-    if isinstance(value, dt.datetime):
-        return _truncate_to_hour(value)
-    return _truncate_to_hour(any_to_datetime(value))
+    return truncate_datetime(value, _TRUNCATE_INTERVAL)
+
+
+def _truncate_to(value: Any) -> Optional[dt.datetime]:
+    if value in (None, ""):
+        return None
+    return truncate_datetime(value, _TRUNCATE_INTERVAL, add_interval=True)
 
 
 class CacheConfig:
@@ -116,8 +120,8 @@ class CacheConfig:
         self.cleanup_ttl = cleanup_ttl
         self._derived = None
 
-        self.received_from = _coerce_optional_datetime(received_from)
-        self.received_to = _coerce_optional_datetime(received_to)
+        self.received_from = _truncate_from(received_from)
+        self.received_to = _truncate_to(received_to)
 
         if tabular is not None:
             from yggdrasil.io.tabular import Tabular
@@ -164,11 +168,11 @@ class CacheConfig:
 
         received_from = values.get("received_from")
         if received_from is not None:
-            values["received_from"] = _coerce_optional_datetime(received_from)
+            values["received_from"] = _truncate_from(received_from)
 
         received_to = values.get("received_to")
         if received_to is not None:
-            values["received_to"] = _coerce_optional_datetime(received_to)
+            values["received_to"] = _truncate_to(received_to)
 
         # ``tabular`` accepts a live Tabular or a path-shaped sugar;
         # ``__post_init__`` resolves the sugar to a FolderPath. We
@@ -752,6 +756,62 @@ class SendConfig:
                     remote_tabular = _fetch_hits(self.remote_cache, hit_reqs)
 
         return local_tabular, remote_tabular, misses
+
+    def write_responses(
+        self,
+        responses: "list[Response]",
+        *,
+        session: "Any" = None,
+    ) -> None:
+        """Write responses to both local and remote caches asynchronously."""
+        if not responses:
+            return
+        import pyarrow as pa
+        from yggdrasil.io.response import Response
+
+        table = pa.Table.from_batches(
+            [Response.values_to_arrow_batch(responses)]
+        )
+        self.write_responses_tabular(table, session=session)
+
+    def write_responses_tabular(
+        self,
+        data: "Any",
+        *,
+        session: "Any" = None,
+    ) -> None:
+        """Write Arrow/Spark response data to local and remote caches.
+
+        Both writes run concurrently via threads when both caches
+        are configured.
+        """
+        if data is None:
+            return
+        spark = self.get_spark_session()
+
+        tasks: list = []
+        if self.local_cache is not None:
+            tasks.append(lambda: self.local_cache.write_responses_tabular(
+                data, spark_session=spark, session=session,
+            ))
+        if self.remote_cache is not None:
+            tasks.append(lambda: self.remote_cache.write_responses_tabular(
+                data, spark_session=spark, session=session,
+            ))
+
+        if not tasks:
+            return
+        if len(tasks) == 1:
+            tasks[0]()
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ygg-wb") as pool:
+            futures = [pool.submit(t) for t in tasks]
+            for f in futures:
+                try:
+                    f.result()
+                except Exception:
+                    LOGGER.warning("Cache writeback failed", exc_info=True)
 
     def __repr__(self):
         parts = []

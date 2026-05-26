@@ -565,7 +565,8 @@ class TestCacheConfigCoercion:
         # (received_to defaults to now, received_from = now - delta).
         assert cfg.received_from is not None
         assert cfg.received_to is not None
-        assert cfg.received_to - cfg.received_from == dt.timedelta(hours=6)
+        window = cfg.received_to - cfg.received_from
+        assert dt.timedelta(hours=6) <= window <= dt.timedelta(hours=6, minutes=2)
 
     def test_from__dict_round_trip(self) -> None:
         cfg = CacheConfig.from_({"mode": "APPEND"})

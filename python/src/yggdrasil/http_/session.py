@@ -993,10 +993,7 @@ class HTTPSession(Session):
         LOGGER.info("Sent %s %s", request.method, request.url)
 
         if response.ok:
-            if config.local_cache is not None:
-                config.local_cache.write_responses([response], session=self)
-            if config.remote_cache is not None:
-                config.remote_cache.write_responses([response], session=self)
+            config.write_responses([response], session=self)
 
         if config.raise_error:
             response.raise_for_status()
@@ -1361,18 +1358,7 @@ class HTTPSession(Session):
 
         # Stage 4: persist to caches
         if new_data is not None:
-            wb: list[Callable] = []
-            if cfg.remote_cache is not None:
-                wb.append(lambda: cfg.remote_cache.write_responses_tabular(
-                    new_data, spark_session=spark,
-                ))
-            if cfg.local_cache is not None:
-                wb.append(lambda: cfg.local_cache.write_responses_tabular(
-                    new_data, spark_session=spark,
-                ))
-            if wb:
-                LOGGER.debug("Writing back to %d cache(s)", len(wb))
-                self._run_concurrently(wb, thread_name_prefix="ygg-wb")
+            cfg.write_responses_tabular(new_data, session=self)
 
         return HTTPResponseBatch(
             local=local_hits or None, remote=remote_hits or None,
