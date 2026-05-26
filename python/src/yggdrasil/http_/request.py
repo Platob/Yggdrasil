@@ -34,7 +34,6 @@ __all__ = [
     "HTTPRequest",
     "PreparedRequest",
     "REQUEST_SCHEMA",
-    "REQUEST_SCHEMA.to_arrow_schema()",
     "REQUEST_URL_STRUCT",
 ]
 
@@ -1216,4 +1215,13 @@ class HTTPRequest:
         func: Callable[["PreparedRequest"], "PreparedRequest"],
     ):
         return func(self)
+
+
+# Backwards-compat alias — the rename from ``PreparedRequest`` to
+# ``HTTPRequest`` (commit 585c977) left stale ``cls is PreparedRequest``
+# guards inside :meth:`from_mapping` and :meth:`prepare`. Rather than
+# papering over them with try/except, re-export the alias so the
+# existing guards resolve, subclass checks work, and downstream code
+# that still imports the old name keeps running.
+PreparedRequest = HTTPRequest
 
