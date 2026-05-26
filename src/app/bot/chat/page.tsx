@@ -23,11 +23,12 @@ function senderColor(name: string): string {
   return SENDER_COLORS[Math.abs(h) % SENDER_COLORS.length];
 }
 
-function formatTime(ts: string): string {
+function formatTime(ts: string | number): string {
   try {
-    return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const date = typeof ts === 'number' ? new Date(ts) : new Date(ts);
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   } catch {
-    return ts.slice(11, 16);
+    return typeof ts === 'string' ? ts.slice(11, 16) : new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 }
 
@@ -89,8 +90,10 @@ export default function ChatPage() {
     setInput("");
     try {
       const msg = await sendMessage(text, sender, channel);
-      setMessages((prev) => [...prev, msg]);
-      lastIdRef.current = msg.id;
+      if (msg) {
+        setMessages((prev) => [...prev, msg]);
+        lastIdRef.current = msg.id;
+      }
     } catch {}
   }
 
@@ -168,9 +171,9 @@ export default function ChatPage() {
                 <span className="font-medium">{ch.name}</span>
               </div>
               <div className="flex items-center gap-2 mt-1 text-[10px] text-muted">
-                <span>{ch.message_count} msgs</span>
+                <span>{ch.message_count || 0} msgs</span>
                 <span className="opacity-50">|</span>
-                <span>{ch.members.length} members</span>
+                <span>{Array.isArray(ch.members) ? ch.members.length : typeof ch.members === 'number' ? ch.members : 0} members</span>
               </div>
             </button>
           ))}
