@@ -33,7 +33,7 @@ from typing import Callable
 from yggdrasil.io import BytesIO
 from yggdrasil.url import URL
 from yggdrasil.io.headers import Headers
-from yggdrasil.io.parameters import anonymize_parameters
+from yggdrasil.url.parameters import anonymize_parameters
 
 
 # ---------------------------------------------------------------------------

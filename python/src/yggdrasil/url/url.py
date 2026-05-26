@@ -37,7 +37,6 @@ import pathlib
 import sys
 import tempfile
 from dataclasses import dataclass, field, replace
-from abc import ABC, abstractmethod
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Iterable, Literal, Mapping, Sequence
 from urllib.parse import (
@@ -59,15 +58,9 @@ from yggdrasil.lazy_imports import (
 )
 
 __all__ = [
-    "HIVE_DEFAULT_PARTITION",
     "URL",
     "URL_SCHEMA",
     "URL_STRUCT",
-    "URLBased",
-    "hive_cast_value",
-    "hive_decode",
-    "hive_encode",
-    "hive_split",
     "resolve_memory_address",
 ]
 
@@ -285,134 +278,6 @@ def _encode_fragment(fragment: str) -> str:
 
 def _decode_maybe(value: str, decode: bool) -> str:
     return unquote(value) if decode and value else value
-
-
-# ---------------------------------------------------------------------------
-# Hive partition layout — ``<col>=<val>/`` directory encoding
-# ---------------------------------------------------------------------------
-#
-# Used by :class:`yggdrasil.io.nested.folder_path.FolderPath` to lay out
-# tabular folders the same way Hive / Spark / Delta do, so the on-disk
-# tree round-trips through any partition-aware reader. The helpers
-# live here next to the URL-component encoders because the convention
-# is fundamentally URL-shaped: each path segment is the URL-quoted
-# value joined onto the column name with an ``=``.
-
-#: Sentinel a Hive writer emits for ``None`` partition values — the
-#: same string Hive, Spark, and Delta agree on, so an externally-
-#: produced tree drops in here without translation.
-HIVE_DEFAULT_PARTITION: str = "__HIVE_DEFAULT_PARTITION__"
-
-
-def hive_encode(value: Any) -> str:
-    """Encode *value* as a filesystem-safe Hive partition value.
-
-    ``None`` → :data:`HIVE_DEFAULT_PARTITION` matching the Hive /
-    Spark / Delta convention. Everything else is ``str(value)`` URL-
-    quoted with the path-separator + ``=`` characters reserved so
-    the encoded value can be split back unambiguously on a single
-    ``=`` and never collides with a directory boundary.
-    """
-    if value is None:
-        return HIVE_DEFAULT_PARTITION
-    return quote(str(value), safe="")
-
-
-def hive_decode(raw: str) -> Any:
-    """Inverse of :func:`hive_encode` — returns the URL-decoded string.
-
-    The caller is responsible for casting the result to the partition
-    column's declared dtype (the URL layer doesn't know the schema
-    at parse time; see :func:`hive_cast_value` for the dtype-aware
-    half).
-    """
-    if raw == HIVE_DEFAULT_PARTITION:
-        return None
-    return unquote(raw)
-
-
-def hive_split(name: str) -> "tuple[str, Any] | None":
-    """Parse a Hive-encoded segment into ``(column, value)``.
-
-    Returns ``None`` when *name* doesn't match the ``<col>=<val>``
-    convention so the caller can treat the entry as a plain (non-
-    Hive) directory.
-    """
-    if "=" not in name:
-        return None
-    col, _, raw = name.partition("=")
-    if not col:
-        return None
-    return col, hive_decode(raw)
-
-
-def hive_cast_value(value: Any, dtype: "pa.DataType | None") -> Any:
-    """Cast a :func:`hive_decode`-d value to *dtype*, leaving raw on failure.
-
-    Used when the partition column's declared dtype is in scope —
-    int64 ``partition_key`` lands as :class:`int`, a timestamp
-    partition as :class:`datetime`. When *dtype* is ``None`` or the
-    cast raises (un-castable value), the decoded string passes
-    through unchanged — every caller's downstream prune is
-    conservative on undecidable shapes so a no-op cast just forces
-    the row-level filter to run.
-
-    Fast path: the common partition dtypes (integers, floats, bool,
-    string, the typed ints we tag on every cached response's
-    ``partition_key``) cast natively with the built-in constructor.
-    Allocating a one-element ``pa.array`` and dispatching the cast
-    kernel on every prune check shows up at the top of the cache
-    hot path — the native path is ~50× faster. Anything outside
-    the fast set (timestamps, decimals, lists, …) falls back to
-    the pyarrow round-trip which still handles arbitrary types.
-    """
-    if value is None or dtype is None:
-        return value
-    fast = _HIVE_FAST_CAST.get(dtype.id)
-    if fast is not None:
-        try:
-            return fast(value)
-        except (TypeError, ValueError):
-            return value
-    try:
-        arr = pa.array([value]).cast(dtype, safe=False)
-    except (pa.ArrowInvalid, pa.ArrowTypeError, NotImplementedError):
-        return value
-    return arr[0].as_py()
-
-
-def _cast_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lo = value.lower()
-        if lo in ("true", "1", "t", "yes"):
-            return True
-        if lo in ("false", "0", "f", "no"):
-            return False
-        raise ValueError(value)
-    return bool(value)
-
-
-# Map :class:`pa.DataType.id` (a small int) to the native Python cast.
-# Built once at import time so the partition prune hot path is a
-# dict lookup + a builtin call.
-_HIVE_FAST_CAST: "dict[int, Any]" = {
-    pa.int8().id: int,
-    pa.int16().id: int,
-    pa.int32().id: int,
-    pa.int64().id: int,
-    pa.uint8().id: int,
-    pa.uint16().id: int,
-    pa.uint32().id: int,
-    pa.uint64().id: int,
-    pa.float16().id: float,
-    pa.float32().id: float,
-    pa.float64().id: float,
-    pa.bool_().id: _cast_bool,
-    pa.string().id: str,
-    pa.large_string().id: str,
-}
 
 
 def _s(value: str | None) -> str:
@@ -1927,7 +1792,7 @@ class URL(os.PathLike):
 
         if self.query:
             current = self.query_dict
-            from yggdrasil.io.parameters import anonymize_parameters
+            from yggdrasil.url.parameters import anonymize_parameters
             anonymized = anonymize_parameters(current, mode=mode)
             if anonymized != current:
                 result = result.with_query_items(anonymized, sort_keys=sort_keys)
@@ -1973,133 +1838,3 @@ def _expand_file_path(path: str) -> str:
     if path.startswith("$TMP/") or path == "$TMP":
         return _TMPDIR_PATH + path[4:]
     return path
-
-
-# ===========================================================================
-# URLBased — registry-driven dispatch for URL-addressable classes
-# ===========================================================================
-
-
-# Per-process registry of :class:`URLBased` subclasses, keyed by their
-# canonical :class:`Scheme` member. Populated by
-# :meth:`URLBased.__init_subclass__` whenever a subclass declares
-# ``scheme = Scheme.X`` on the class body.
-_URL_BASED_REGISTRY: dict[Any, type] = {}
-
-
-class URLBased(ABC):
-    """Mixin for any class addressable by a :class:`URL`.
-
-    Subclasses declare a class-level
-    ``scheme: ClassVar[Scheme | None]`` on the class body; on subclass
-    creation :meth:`__init_subclass__` registers the class against
-    that :class:`Scheme` member in the global
-    :data:`_URL_BASED_REGISTRY`. The registry is the single source of
-    truth for "what class handles ``s3://``" / ``"dbfs://"`` / …;
-    callers either look it up directly (``URLBased.for_scheme(...)``)
-    or hand a URL to :meth:`URLBased.dispatch` and let URLBased pick
-    the right subclass.
-
-    The two abstract hooks every subclass implements:
-
-    - :meth:`from_url(cls, url, **kwargs)` — build an instance of the
-      subclass from a :class:`URL`. Concrete subclasses typically
-      forward to their own ``__init__``.
-    - :meth:`to_url(self) -> URL` — render this instance back to its
-      canonical URL form.
-
-    Together these make a :class:`URLBased` round-trippable through
-    a URL: ``cls.from_url(obj.to_url())`` is the identity for any
-    well-behaved subclass.
-    """
-
-    #: Canonical scheme this class handles. ``None`` on the abstract
-    #: base; concrete subclasses set ``Scheme.X``. May be assigned a
-    #: plain string at the class-body level — :meth:`__init_subclass__`
-    #: coerces it to the matching :class:`Scheme` member so the rest
-    #: of the codebase can rely on the typed form.
-    scheme: ClassVar["Any"] = None
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        scheme = cls.__dict__.get("scheme", None)
-        # ``None`` and the empty-string sentinel both mean "abstract /
-        # not directly registrable" — intermediate bases (e.g.
-        # :class:`Path`, :class:`RemotePath`, :class:`DatabricksPath`
-        # before it gets its own scheme) leave it unset.
-        if scheme is None or scheme == "":
-            return
-        from yggdrasil.enums import Scheme
-        coerced = Scheme.from_(scheme)
-        # Store the typed form back on the class so ``cls.scheme`` is
-        # always a :class:`Scheme` member from this point on.
-        cls.scheme = coerced
-        existing = _URL_BASED_REGISTRY.get(coerced)
-        if existing is not None and existing is not cls and not issubclass(cls, existing):
-            raise RuntimeError(
-                f"Duplicate URLBased registration for scheme "
-                f"{coerced!r}: {cls.__name__} clashes with "
-                f"{existing.__name__}."
-            )
-        _URL_BASED_REGISTRY[coerced] = cls
-
-    # ------------------------------------------------------------------
-    # Registry lookup
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def for_scheme(cls, scheme: Any) -> "type[URLBased]":
-        """Return the :class:`URLBased` subclass registered for *scheme*.
-
-        Lazy: if no subclass is registered yet, this routes through
-        :meth:`Scheme.path_class` which imports the backend module on
-        demand (firing :meth:`__init_subclass__` as a side effect).
-
-        Raises :class:`ValueError` for an unknown scheme and
-        :class:`ImportError` when the backend's optional dependencies
-        aren't installed.
-        """
-        from yggdrasil.enums import Scheme
-        s = Scheme.from_(scheme)
-        registered = _URL_BASED_REGISTRY.get(s)
-        if registered is not None:
-            return registered
-        # Cold dispatch — lazy-import the backend module.
-        return s.path_class()
-
-    @classmethod
-    def dispatch(cls, url: Any, **kwargs: Any) -> "URLBased":
-        """Build the right :class:`URLBased` subclass from *url*.
-
-        Looks up the subclass via :meth:`for_scheme`, then delegates
-        to that subclass's :meth:`from_url`. Used as the cross-cutting
-        entry point when the caller has a URL but doesn't know (or
-        care) which concrete class owns its scheme.
-
-        ``URL.from_(url).scheme`` drives the lookup; an empty scheme
-        falls back to the ``file://`` handler so bare paths work.
-        """
-        u = URL.from_(url)
-        scheme = u.scheme or "file"
-        target = cls.for_scheme(scheme)
-        return target.from_url(u, **kwargs)
-
-    # ------------------------------------------------------------------
-    # Abstract hooks
-    # ------------------------------------------------------------------
-
-    @classmethod
-    @abstractmethod
-    def from_url(cls, url: "URL | str", **kwargs: Any) -> "URLBased":
-        """Construct an instance of *cls* from *url*.
-
-        Concrete subclasses typically forward to ``cls(url=url, **kwargs)``;
-        backends with extra construction knobs (auth tokens, sessions,
-        workspace clients) override to thread those through.
-        """
-        ...
-
-    @abstractmethod
-    def to_url(self) -> "URL":
-        """The canonical :class:`URL` that addresses this instance."""
-        ...

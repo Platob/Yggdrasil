@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.parameters import anonymize_parameters
+from yggdrasil.url.parameters import anonymize_parameters
 
 
 class TestAnonymizeRemove:
