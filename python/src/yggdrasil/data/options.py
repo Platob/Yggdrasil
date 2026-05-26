@@ -1240,23 +1240,12 @@ class CastOptions:
         raise TypeError(f"cast_arrow: unsupported type {type(data).__name__}")
 
     def cast_tabular(self, data: Any) -> Any:
-        """Cast any Tabular-like object.
-
-        Dispatches ArrowTabular and Spark Dataset to their specific
-        cast methods. For generic Tabular, delegates to
-        :meth:`Tabular.cast` which reads and returns the cast result.
-        """
-        from yggdrasil.arrow.tabular import ArrowTabular
-        from yggdrasil.spark.tabular import Dataset
+        """Cast any Tabular-like object."""
         from yggdrasil.io.tabular.base import Tabular
 
-        if isinstance(data, ArrowTabular):
-            return self.cast_arrow_tabular(data)
-        if isinstance(data, Dataset):
-            return self.cast_spark_tabular(data)
         if isinstance(data, Tabular):
             return data.cast(options=self)
-        raise TypeError(f"cast_tabular: unsupported type {type(data).__name__}")
+        return Tabular.from_(data).cast(options=self)
 
     def dedup_columns_on_read(self) -> "list[str]":
         """Return the column names that need client-side dedup at read time.
