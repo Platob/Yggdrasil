@@ -99,8 +99,8 @@ class SparkSQLStatement(Tabular, Awaitable):
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         if self._dataframe is None:
             raise RuntimeError("Cannot read before start()")
-        for batch in self._dataframe.toArrow().to_batches():
-            yield batch
+        from yggdrasil.spark.cast import spark_dataframe_to_arrow
+        yield from spark_dataframe_to_arrow(self._dataframe).to_batches()
 
     def _read_spark_frame(self, options: CastOptions) -> "DataFrame":
         if self._dataframe is None:

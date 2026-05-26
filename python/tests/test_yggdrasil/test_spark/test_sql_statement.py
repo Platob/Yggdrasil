@@ -171,13 +171,25 @@ class TestCancel:
 class TestReadArrow:
 
     def test_read_arrow_batches(self):
+        import sys
         table = pa.table({"a": [1, 2], "b": ["x", "y"]})
-        session, _ = _mock_session(table)
+        session, df = _mock_session(table)
         s = SparkSQLStatement("SELECT 1", spark_session=session)
         s.start(wait=False)
-        batches = list(s._read_arrow_batches(CastOptions()))
+        cast_mock = MagicMock()
+        cast_mock.spark_dataframe_to_arrow = MagicMock(return_value=table)
+        saved = sys.modules.get("yggdrasil.spark.cast")
+        sys.modules["yggdrasil.spark.cast"] = cast_mock
+        try:
+            batches = list(s._read_arrow_batches(CastOptions()))
+        finally:
+            if saved is not None:
+                sys.modules["yggdrasil.spark.cast"] = saved
+            else:
+                sys.modules.pop("yggdrasil.spark.cast", None)
         total = sum(b.num_rows for b in batches)
         assert total == 2
+        cast_mock.spark_dataframe_to_arrow.assert_called_once_with(df)
 
     def test_read_before_start_raises(self):
         s = SparkSQLStatement("SELECT 1")
