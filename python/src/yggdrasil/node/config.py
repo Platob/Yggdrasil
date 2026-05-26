@@ -46,7 +46,7 @@ def _default_front_home() -> Path:
 @dataclass(frozen=True, slots=True)
 class Settings:
     app_name: str = "yggdrasil-node"
-    app_version: str = "0.1.1"
+    app_version: str = "0.1.0"
     host: str = "0.0.0.0"
     port: int = 8100
     front_port: int = 3000

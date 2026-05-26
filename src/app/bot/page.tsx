@@ -353,7 +353,7 @@ export default function BotDashboard() {
             <InfoRow label="RAM Total" value={`${metrics.ramTotal} GB`} />
             <InfoRow label="GPU" value={metrics.gpuName} />
             <InfoRow label="GPU Memory" value={`${metrics.gpuMemUsed.toFixed(1)}/${metrics.gpuMemTotal} GB`} />
-            <InfoRow label="Functions" value={`${node.functions.length} registered`} />
+            <InfoRow label="Functions" value={`${(node.functions ?? []).length} registered`} />
           </div>
         </div>
       </div>

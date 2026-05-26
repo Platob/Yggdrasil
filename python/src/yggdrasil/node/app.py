@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, ORJSONResponse
+from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
 from .exceptions import register_exception_handlers
@@ -50,7 +50,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url=settings.docs_url,
         redoc_url=settings.redoc_url,
         openapi_url=settings.openapi_url,
-        default_response_class=ORJSONResponse,
     )
 
     app.state.settings = settings
