@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { botAPI, BotAPIError } from "@/lib/bot-client";
 import type { NodeInfo, ChannelInfo } from "@/lib/api";
 

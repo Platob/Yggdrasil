@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { botFetch, BotAPIError } from "@/lib/bot-client";
 import type { NodeInfo } from "@/lib/api";
 
