@@ -4,6 +4,8 @@ Subcommands::
 
     ygg node serve      Start node server + frontend (foreground)
     ygg node front      Start frontend only (Next.js dev server)
+    ygg node install    Install node+frontend as boot service (systemd/launchd)
+    ygg node uninstall  Remove boot service (--purge to delete data)
     ygg node run        Call a @remote function
     ygg node chat       Open YGGCHAT terminal
     ygg node status     Show running node status
@@ -68,6 +70,16 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--channel", default="general", help="Initial channel.")
     chat.set_defaults(handler=_node_chat)
 
+    install = node_sub.add_parser("install", help="Install node as a boot service (systemd/launchd).")
+    install.add_argument("--no-front", action="store_true", default=False, help="Skip frontend service.")
+    install.add_argument("--port", type=int, default=None, help="Override node port.")
+    install.add_argument("--front-port", type=int, default=None, help="Override frontend port.")
+    install.set_defaults(handler=_node_install)
+
+    uninstall = node_sub.add_parser("uninstall", help="Remove node boot service and stop.")
+    uninstall.add_argument("--purge", action="store_true", default=False, help="Also remove all data in ~/.ygg.")
+    uninstall.set_defaults(handler=_node_uninstall)
+
     status = node_sub.add_parser("status", help="Show node status.")
     status.set_defaults(handler=_node_status)
 
@@ -119,7 +131,7 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None) 
 
     env = {**os.environ, "YGG_NODE_PORT": str(node_port), "PORT": str(port)}
     proc = subprocess.Popen(
-        [npm, "run", "dev", "--", "--port", str(port)],
+        [npm, "run", "dev", "--", "--hostname", "0.0.0.0", "--port", str(port)],
         cwd=str(front_home),
         env=env,
         stdout=subprocess.DEVNULL,
@@ -242,10 +254,73 @@ def _node_chat(args: argparse.Namespace) -> int:
     return run_chat(url=url, username=args.user, channel=args.channel)
 
 
+def _node_install(args: argparse.Namespace) -> int:
+    import os
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, red, yellow
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.node.service import install_service, service_status
+
+    print_logo("YGGNODE")
+
+    if args.port:
+        os.environ["YGG_NODE_PORT"] = str(args.port)
+    if args.front_port:
+        os.environ["YGG_NODE_FRONT_PORT"] = str(args.front_port)
+
+    settings = get_settings()
+
+    out(f"  {cyan('install')} registering boot service...\n")
+    out(f"  {cyan('node')}    port {bold(str(settings.port))}\n")
+    if not args.no_front:
+        out(f"  {cyan('front')}   port {bold(str(settings.front_port))}\n")
+    out(f"  {cyan('home')}    {dim(str(settings.node_home))}\n\n")
+
+    ok, msg = install_service(settings, no_front=args.no_front)
+
+    if ok:
+        out(f"  {green('✓')} {msg}\n\n")
+        status = service_status(settings)
+        for name, state in status.items():
+            color = green if state == "active" or state == "running" else yellow
+            out(f"  {cyan(name)}  {color(state)}\n")
+        out(f"\n  Node will start automatically on boot.\n")
+        out(f"  Uninstall with: {bold('ygg node uninstall')}\n")
+    else:
+        out(f"  {red('✗')} {msg}\n")
+        return 1
+    return 0
+
+
+def _node_uninstall(args: argparse.Namespace) -> int:
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, red, yellow
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.node.service import uninstall_service
+
+    print_logo("YGGNODE")
+
+    settings = get_settings()
+
+    if args.purge:
+        out(f"  {yellow('purge')} will remove all data in {dim(str(settings.node_home))}\n\n")
+
+    ok, msg = uninstall_service(settings, purge=args.purge)
+
+    if ok:
+        out(f"  {green('✓')} {msg}\n")
+        out(f"\n  Node service removed. Will no longer start on boot.\n")
+        if args.purge:
+            out(f"  {dim('All node data has been removed.')}\n")
+    else:
+        out(f"  {red('✗')} {msg}\n")
+        return 1
+    return 0
+
+
 def _node_status(args: argparse.Namespace) -> int:
     from yggdrasil.node.config import get_settings
     from yggdrasil.node.daemon import _is_node_running, ensure_directories
-    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, red
+    from yggdrasil.node.service import service_status
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, red, yellow
 
     print_logo("YGGNODE")
     settings = get_settings()
@@ -260,6 +335,14 @@ def _node_status(args: argparse.Namespace) -> int:
         out(f"  {cyan('url')}     {bold(f'http://127.0.0.1:{port}')}\n")
     else:
         out(f"  {cyan('status')}  {red('stopped')}\n")
+
+    svc = service_status(settings)
+    if svc:
+        out(f"\n  {cyan('boot services:')}\n")
+        for name, state in svc.items():
+            color = green if state in ("active", "running") else (red if state == "not installed" else yellow)
+            out(f"    {dim(name)}  {color(state)}\n")
+
     return 0
 
 
