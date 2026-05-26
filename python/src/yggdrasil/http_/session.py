@@ -29,7 +29,6 @@ import http.client
 import itertools
 import logging
 import os
-import pickle
 import socket
 import ssl
 import time
@@ -50,7 +49,6 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pyarrow as pa
 
-from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data.enums import MediaTypes, Mode
 from yggdrasil.dataclasses.waiting import (
@@ -101,7 +99,6 @@ LOGGER = logging.getLogger(__name__)
 # whole partition's output. A response that is itself larger than the
 # cap is sliced row-wise by the shared rechunker, which never splits a
 # single row across batches.
-_SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 # Rechunk byte target for paginated responses assembled by
 # ``_combine_paginated_pages``.  Targets the IPC page content size
@@ -1256,37 +1253,6 @@ class HTTPSession(Session):
             groups.setdefault(cfg, []).append(r)
         return groups
 
-    # Per-SparkSession cache of the empty :class:`SparkDataFrame` keyed
-    # to :data:`RESPONSE_SCHEMA`. Caching by ``id(spark)`` keeps
-    # this safe across multiple concurrent SparkSessions in the same
-    # process; ``WeakValueDictionary`` would be cleaner but Spark
-    # DataFrames hold a strong reference to their session so the
-    # entries don't outlive the session anyway.
-    _EMPTY_SPARK_FRAMES: "ClassVar[dict[int, SparkDataFrame]]" = {}
-
-    @classmethod
-    def _cached_empty_spark_frame(
-        cls, spark: "SparkSession",
-    ) -> "SparkDataFrame":
-        """Return a process-cached empty :class:`SparkDataFrame` with
-        :data:`RESPONSE_SCHEMA`.
-
-        One DataFrame per :class:`SparkSession` — same identity for
-        repeat callers, so downstream ``unionByName`` paths can keep
-        their plan cached. The cache key is ``id(spark)``: each
-        SparkSession owns its own DataFrames anyway, and the entry
-        is dropped when the session is.
-        """
-        key = id(spark)
-        cached = cls._EMPTY_SPARK_FRAMES.get(key)
-        if cached is not None:
-            return cached
-        df = spark.createDataFrame(
-            [], schema=RESPONSE_SCHEMA.to_spark_schema(),
-        )
-        cls._EMPTY_SPARK_FRAMES[key] = df
-        return df
-
     def _fetch_misses(
         self,
         misses: list[PreparedRequest],
@@ -1540,177 +1506,6 @@ class HTTPSession(Session):
             total_network, total_failed,
         )
 
-    # ------------------------------------------------------------------ #
-    # Spark stage 3 helper                                                #
-    # ------------------------------------------------------------------ #
-
-    def _spark_fetch_misses(
-        self,
-        misses: list[PreparedRequest],
-        spark: "SparkSession",
-    ) -> "SparkDataFrame":
-        """Stage 3 on Spark: scatter misses to workers via mapInArrow.
-
-        Requests cross the wire as an Arrow table with the canonical
-        :data:`~yggdrasil.io.request.REQUEST_SCHEMA` — deterministic
-        columns, no pickled Python objects in the row payload.
-
-        The driver-side :class:`Session` itself is pickled once with
-        :func:`pickle.dumps` and that bytes blob travels with the
-        ``mapInArrow`` closure; each partition rehydrates the same
-        subclass via :func:`pickle.loads`, so user overrides (custom
-        auth, header injection, request hooks) execute on the worker.
-        ``Session.__getstate__`` / ``__setstate__`` strip the
-        threading.RLock and JobPoolExecutor before serialising and
-        re-init them on the way back in, and ``Singleton.__new__``
-        collapses the loads onto the executor's per-``(cls, config)``
-        cached instance so all partitions share one connection pool.
-        Spark Connect / Databricks Connect callers need the user's
-        subclass module on the cluster's ``sys.path`` for the
-        cloudpickle round-trip to resolve — that's the price of running
-        a driver-side subclass on the worker.
-
-        Each Spark partition becomes one :meth:`Session.send_many` call,
-        fanning out via the rehydrated session's thread pool. Both local
-        and remote cache configs are forwarded: workers consult the same
-        caches as the driver, so a request the driver fan-out missed but
-        a peer worker has already cached can still short-circuit before
-        hitting the network.
-        """
-        if not misses:
-            return self._cached_empty_spark_frame(spark)
-
-        # Driver-side prepare before the mapInArrow scatter. Subclasses
-        # use :meth:`prepare_request_before_send` for URL normalisation,
-        # session-wide header injection, auth refresh, request signing
-        # — applying it here means the wire payload, the Arrow row,
-        # and any signed Authorization header all reflect the driver's
-        # view before crossing executors. Workers re-prepare inside
-        # :meth:`send_many` → :meth:`_send` (double-prepare) so
-        # per-executor concerns — stale token refresh on a long-running
-        # partition, executor-local correlation IDs — still apply.
-        # The default hook (session-header merge + cached-token auth
-        # refresh) is idempotent under double-call; subclasses that
-        # mutate non-idempotently should guard on their own state.
-        for req in misses:
-            self.prepare_request_before_send(req)
-        LOGGER.debug(
-            "Driver-prepared %d send_many miss(es) before mapInArrow "
-            "scatter (workers re-prepare via send_many)",
-            len(misses),
-        )
-
-        # One C++-side struct walk turns the request list into a single
-        # Arrow table that matches REQUEST_SCHEMA column-for-column.
-        # No per-row pickle, no closure capture of ``self``.
-        request_table = pa.Table.from_batches(
-            [PreparedRequest.values_to_arrow_batch(misses)]
-        )
-
-        # Spread requests across many partitions so mapInArrow scatters
-        # across the whole cluster instead of piling them onto a handful
-        # of executors. ``createDataFrame`` defaults to a single partition
-        # for small Python lists, which serialises stage 3. Target one
-        # request per partition, capped at ``defaultParallelism * 8`` so
-        # huge request lists don't explode into thousands of micro-tasks
-        # whose scheduler overhead dominates the actual fetch.
-        #
-        # ``sparkContext`` isn't reachable from a Spark Connect proxy
-        # (``PySparkAttributeError(JVM_ATTRIBUTE_NOT_SUPPORTED)``); fall
-        # back to a sensible default for the partition fan-out.
-        try:
-            default_par = max(spark.sparkContext.defaultParallelism, 1)
-        except Exception:
-            default_par = 8
-        n_parts = max(1, min(len(misses), default_par * 8))
-        LOGGER.info(
-            "Scattering %d send_many miss(es) across %d Spark partition(s) "
-            "via mapInArrow (default_parallelism=%d)",
-            len(misses), n_parts, default_par,
-        )
-        request_df = spark.createDataFrame(request_table).repartition(n_parts)
-
-        # Worker-side send config: local cache with 15-min TTL keeps
-        # the executor's disk cache bounded; no remote cache — the
-        # driver handles remote persistence in stage 4.
-        config = misses[0].send_config_or_default
-        worker_send_config = config.copy(
-            remote_cache=None,
-            spark_session=False,
-            raise_error=False,
-        )
-        lc = worker_send_config.local_cache
-        if lc is not None:
-            worker_send_config = worker_send_config.copy(
-                local_cache=lc.copy(
-                    received_to=dt.datetime.now(dt.timezone.utc),
-                    received_from=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=15),
-                ),
-            )
-
-        self_serialized = pickle.dumps(self)
-        response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
-
-        # Broadcast session bytes and send_config so Spark distributes
-        # them once via the broadcast protocol instead of embedding the
-        # blobs in every task closure.
-        try:
-            broadcast_session = spark.sparkContext.broadcast(self_serialized)
-            broadcast_config = spark.sparkContext.broadcast(worker_send_config)
-            _use_broadcast = True
-        except Exception:
-            _use_broadcast = False
-
-        def _send_partition(
-            batches: Iterator[pa.RecordBatch],
-        ) -> Iterator[pa.RecordBatch]:
-            if _use_broadcast:
-                session = pickle.loads(broadcast_session.value)
-                partition_config = broadcast_config.value
-            else:
-                session = pickle.loads(self_serialized)
-                partition_config = worker_send_config
-            for batch in batches:
-                partition_requests = list(PreparedRequest.from_arrow(batch))
-                if not partition_requests:
-                    continue
-
-                def _row_batches() -> Iterator[pa.RecordBatch]:
-                    for resp in session.send_many(
-                        iter(partition_requests), partition_config,
-                    ):
-                        yield resp.to_arrow_batch(parse=False)
-
-                yield from rechunk_arrow_batches(
-                    _row_batches(),
-                    byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
-                )
-
-        result_df = request_df.mapInArrow(
-            _send_partition, schema=response_spark_schema,
-        )
-        # Cache so stage 4's insert (the first action on this frame)
-        # both materialises and caches it. Without the cache, every
-        # later action — including :attr:`HTTPResponseBatch.counts` — would
-        # re-execute the ``mapInArrow``, re-issuing per-partition
-        # network calls AND letting workers' ``send_many`` short-circuit
-        # on the very rows stage 4 has just persisted to the remote
-        # cache table (double-counting them as fresh hits).
-        try:
-            result_df = result_df.cache()
-            LOGGER.info(
-                "Spark stage 3 completed: cached mapInArrow result "
-                "for %d miss(es) across %d partition(s)",
-                len(misses), n_parts,
-            )
-        except Exception:  # noqa: BLE001
-            LOGGER.warning(
-                "Failed to cache stage-3 mapInArrow result; downstream "
-                "counts may re-execute the per-partition fetch",
-                exc_info=True,
-            )
-        return result_df
-    
     def get(
         self,
         url: URL | str | None = None,

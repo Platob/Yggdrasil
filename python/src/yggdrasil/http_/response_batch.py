@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import pickle
 from typing import Any, TYPE_CHECKING, Iterator, Optional
 
 import pyarrow as pa
 
+from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.io.tabular import ArrowTabular, Dataset
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
@@ -22,6 +24,8 @@ if TYPE_CHECKING:
     from yggdrasil.io.send_config import SendConfig
 
 LOGGER = logging.getLogger(__name__)
+
+_SPARK_RESPONSE_BATCH_BYTE_LIMIT: int = 128 * 1024 * 1024
 
 
 __all__ = [
@@ -190,15 +194,15 @@ class HTTPResponseBatch(Tabular):
 
         write_data = None
         if spark is not None:
-            new_data = session._spark_fetch_misses(misses, spark)
+            result_df = self._spark_fetch(misses, spark)
             if cfg.raise_error:
                 from pyspark.sql import functions as F
                 from yggdrasil.spark.cast import spark_dataframe_to_arrow
 
-                ok_df = new_data.where(
+                ok_df = result_df.where(
                     (F.col("status_code") >= 200) & (F.col("status_code") < 400)
                 )
-                err_df = new_data.where(
+                err_df = result_df.where(
                     (F.col("status_code") < 200) | (F.col("status_code") >= 400)
                 )
                 err_table = spark_dataframe_to_arrow(err_df)
@@ -206,8 +210,8 @@ class HTTPResponseBatch(Tabular):
                     self.failed = list(Response.from_arrow_tabular(err_table))
                 write_data = ok_df
             else:
-                write_data = new_data
-            self.new = new_data
+                write_data = result_df
+            self.new = result_df
         else:
             ok_list: list[Response] = []
             all_list: list[Response] = []
@@ -237,6 +241,99 @@ class HTTPResponseBatch(Tabular):
             cfg.write_responses_tabular(write_data, session=session)
 
         return self
+
+    def _spark_fetch(
+        self,
+        misses: "list[PreparedRequest]",
+        spark: "SparkSession",
+    ) -> "SparkDataFrame":
+        """Scatter misses to Spark workers via mapInArrow."""
+        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.io.send_config import SendConfig
+
+        session = self._session
+        cfg = self._send_config
+
+        if not misses:
+            schema = RESPONSE_SCHEMA.to_spark_schema()
+            return spark.createDataFrame([], schema=schema)
+
+        for req in misses:
+            session.prepare_request_before_send(req)
+
+        request_table = pa.Table.from_batches(
+            [PreparedRequest.values_to_arrow_batch(misses)]
+        )
+
+        try:
+            default_par = max(spark.sparkContext.defaultParallelism, 1)
+        except Exception:
+            default_par = 8
+        n_parts = max(1, min(len(misses), default_par * 8))
+        LOGGER.info(
+            "Scattering %d miss(es) across %d Spark partition(s)",
+            len(misses), n_parts,
+        )
+        request_df = spark.createDataFrame(request_table).repartition(n_parts)
+
+        worker_config = cfg.copy(
+            remote_cache=None,
+            spark_session=False,
+            raise_error=False,
+        )
+        lc = worker_config.local_cache
+        if lc is not None:
+            now = dt.datetime.now(dt.timezone.utc)
+            worker_config = worker_config.copy(
+                local_cache=lc.copy(
+                    received_to=now,
+                    received_from=now - dt.timedelta(minutes=15),
+                ),
+            )
+
+        session_bytes = pickle.dumps(session)
+        response_spark_schema = RESPONSE_SCHEMA.to_spark_schema()
+
+        try:
+            bc_session = spark.sparkContext.broadcast(session_bytes)
+            bc_config = spark.sparkContext.broadcast(worker_config)
+            use_broadcast = True
+        except Exception:
+            use_broadcast = False
+
+        def _send_partition(
+            batches: Iterator[pa.RecordBatch],
+        ) -> Iterator[pa.RecordBatch]:
+            if use_broadcast:
+                sess = pickle.loads(bc_session.value)
+                part_config = bc_config.value
+            else:
+                sess = pickle.loads(session_bytes)
+                part_config = worker_config
+            for batch in batches:
+                reqs = list(PreparedRequest.from_arrow(batch))
+                if not reqs:
+                    continue
+
+                def _row_batches() -> Iterator[pa.RecordBatch]:
+                    for resp in sess.send_many(iter(reqs), part_config):
+                        yield resp.to_arrow_batch(parse=False)
+
+                yield from rechunk_arrow_batches(
+                    _row_batches(),
+                    byte_size=_SPARK_RESPONSE_BATCH_BYTE_LIMIT,
+                )
+
+        result_df = request_df.mapInArrow(
+            _send_partition, schema=response_spark_schema,
+        )
+        try:
+            result_df = result_df.cache()
+        except Exception:
+            LOGGER.warning(
+                "Failed to cache mapInArrow result", exc_info=True,
+            )
+        return result_df
 
     @property
     def misses(self) -> list:
