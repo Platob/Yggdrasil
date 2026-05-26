@@ -8,10 +8,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
 from yggdrasil.data.cast import any_to_timedelta
 from yggdrasil.execution.expr import Predicate
 from yggdrasil.data.cast.datetime import truncate_datetime
+from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.enums import Mode
 
 if TYPE_CHECKING:
     from yggdrasil.io.tabular.base import Tabular
+
+_HASH_CACHE_TTL = 15 * 60
+_GLOBAL_HASH_CACHE: ExpiringDict[str, set[int]] = ExpiringDict(default_ttl=_HASH_CACHE_TTL)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -73,7 +77,6 @@ class CacheConfig:
     __slots__ = (
         "tabular", "mode", "anonymize",
         "received_from", "received_to", "cleanup_ttl", "_derived",
-        "_hash_cache",
     )
 
 
@@ -107,7 +110,6 @@ class CacheConfig:
         self.anonymize = anonymize
         self.cleanup_ttl = cleanup_ttl
         self._derived = None
-        self._hash_cache: set[int] | None = None
 
         if received_ttl is not None:
             if received_to is None:
@@ -218,7 +220,6 @@ class CacheConfig:
         self.anonymize = state.get("anonymize", "remove")
         self.cleanup_ttl = state.get("cleanup_ttl", dt.timedelta(days=1))
         self._derived = None
-        self._hash_cache = None
 
     @classmethod
     def from_(
@@ -541,25 +542,40 @@ class CacheConfig:
     _HASH_CACHE_MAX = 10 * 1024
     _HASH_CACHE_LOOKBACK = dt.timedelta(days=7)
 
+    def _cache_key(self) -> str | None:
+        """Key for the global hash cache — the tabular's URL string."""
+        t = self.tabular
+        if t is None:
+            return None
+        try:
+            return t.url.to_string() if hasattr(t, "url") and t.url else str(id(t))
+        except Exception:
+            return str(id(t))
+
     def probe_hashes(
         self,
         partition_keys: "list[int]",
         *,
         session: "Any" = None,
     ) -> set[int]:
-        """Return cached public hashes, loading from backend on first call.
+        """Return cached public hashes from the global 15-min TTL cache.
 
-        Hot-loads only hashes received in the last 7 days, capped at
-        10k entries. When the cap is hit, oldest entries (by
-        ``received_at``) are evicted so the set stays bounded.
+        Hot-loads only hashes with ``received_at >= now - 7 days``,
+        capped at 10k entries (newest kept). The result lives in
+        :data:`_GLOBAL_HASH_CACHE` keyed by the tabular's URL so
+        different ``CacheConfig`` instances pointing at the same
+        backend share one set.
         """
-        if self._hash_cache is not None:
-            return self._hash_cache
-        from yggdrasil.execution.expr import col
         holder = self.tabular or self.cache_tabular(session=session)
         if holder is None:
-            self._hash_cache = set()
-            return self._hash_cache
+            return set()
+        key = self._cache_key()
+        if key is None:
+            return set()
+        cached = _GLOBAL_HASH_CACHE.get(key)
+        if cached is not None:
+            return cached
+        from yggdrasil.execution.expr import col
         cutoff = dt.datetime.now(dt.timezone.utc) - self._HASH_CACHE_LOOKBACK
         predicates = col("received_at") >= cutoff
         if partition_keys:
@@ -570,33 +586,32 @@ class CacheConfig:
                 columns=[MATCH_COLUMN, "received_at"],
             )
             if table is None or table.num_rows == 0:
-                self._hash_cache = set()
+                result: set[int] = set()
             elif table.num_rows <= self._HASH_CACHE_MAX:
-                self._hash_cache = set(table.column(MATCH_COLUMN).to_pylist())
+                result = set(table.column(MATCH_COLUMN).to_pylist())
             else:
                 import pyarrow.compute as pc
                 indices = pc.sort_indices(table, sort_keys=[("received_at", "descending")])
                 trimmed = table.take(indices[:self._HASH_CACHE_MAX])
-                self._hash_cache = set(trimmed.column(MATCH_COLUMN).to_pylist())
+                result = set(trimmed.column(MATCH_COLUMN).to_pylist())
         except Exception:
-            self._hash_cache = set()
-        return self._hash_cache
+            result = set()
+        _GLOBAL_HASH_CACHE.set(key, result)
+        return result
 
     def _add_hashes(self, hashes: set[int]) -> None:
-        """Extend the in-memory hash cache after a cache write.
-
-        Evicts oldest entries when the cache exceeds the cap. Since
-        the set doesn't track insertion order, a full eviction just
-        discards a random subset — acceptable because the next
-        ``probe_hashes`` reload will re-sort by ``received_at``.
-        """
-        if self._hash_cache is None:
-            self._hash_cache = hashes
+        """Extend the global hash cache after a cache write."""
+        key = self._cache_key()
+        if key is None:
+            return
+        existing = _GLOBAL_HASH_CACHE.get(key)
+        if existing is None:
+            _GLOBAL_HASH_CACHE.set(key, hashes)
         else:
-            self._hash_cache |= hashes
-        if len(self._hash_cache) > self._HASH_CACHE_MAX:
-            keep = set(list(self._hash_cache)[:self._HASH_CACHE_MAX])
-            self._hash_cache = keep
+            existing |= hashes
+            if len(existing) > self._HASH_CACHE_MAX:
+                existing = set(list(existing)[:self._HASH_CACHE_MAX])
+            _GLOBAL_HASH_CACHE.set(key, existing)
 
     def filter_response(
         self,
