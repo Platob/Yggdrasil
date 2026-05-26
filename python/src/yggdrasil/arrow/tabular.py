@@ -278,10 +278,10 @@ class ArrowTabular(Tabular[CastOptions]):
             self._owns_spill_dir = False
 
         if data is not None:
-            self._ingest(data)
+            self.write_table(data, mode=Mode.APPEND)
         for src in more:
             if src is not None:
-                self._ingest(src)
+                self.write_table(src, mode=Mode.APPEND)
 
         # Tabular leaves are stateless w.r.t. Disposable — there is
         # no separate acquire phase to wait for, so just leave the
@@ -407,7 +407,7 @@ class ArrowTabular(Tabular[CastOptions]):
         # holder is always Arrow-backed.
         if data is not None:
             self.unpersist()
-            self._ingest(data)
+            self.write_table(data, mode=Mode.APPEND)
         return self
 
     def _release(self) -> None:
@@ -734,13 +734,3 @@ class ArrowTabular(Tabular[CastOptions]):
             f"valid: AUTO, OVERWRITE, TRUNCATE, APPEND, IGNORE, ERROR_IF_EXISTS."
         )
 
-    def _ingest(self, source: ArrowSource) -> None:
-        if source is None:
-            return
-        if isinstance(source, pa.RecordBatch):
-            batches = [source]
-        elif isinstance(source, pa.Table):
-            batches = source.to_batches()
-        else:
-            return
-        self._write_arrow_batches(batches, CastOptions(mode=Mode.APPEND))
