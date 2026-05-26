@@ -1663,7 +1663,7 @@ class HTTPSession(Session):
         rc = reqs[0].remote_cache_config
         if remote_holder is not None and rc is not None:
             LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
-            self._spark_persist_remote(result_df, rc, spark=spark)
+            self._spark_persist_remote(remote_holder, result_df, spark=spark)
 
         raise_error = misses[0].send_config_or_default.raise_error
         failed: list[Response] = []
@@ -2098,8 +2098,12 @@ class HTTPSession(Session):
     ) -> None:
         """Stage 4 on Spark: bulk-insert ok responses into the remote cache.
 
-        APPEND-mode writes are de-duplicated against existing rows via
-        a ``left_anti`` join on ``(partition_key, public_hash)``.
+        APPEND-mode writes are de-duplicated against existing rows.
+        Existing ``(partition_key, public_hash)`` pairs are eagerly
+        collected from the remote table and used as a broadcast
+        anti-join filter — this decouples the read from the write plan
+        so Spark doesn't have to scan the remote table during the
+        write action.
         """
         from pyspark.sql import functions as F
 
@@ -2120,16 +2124,25 @@ class HTTPSession(Session):
         try:
             if wanted:
                 literals = ", ".join(str(int(v)) for v in wanted)
-                existing = spark.sql(
+                existing_rows = spark.sql(
                     "SELECT DISTINCT partition_key, public_hash "
                     f"FROM {table_name} WHERE partition_key IN ({literals})"
-                )
+                ).collect()
             else:
-                existing = spark.sql(
+                existing_rows = spark.sql(
                     "SELECT DISTINCT partition_key, public_hash "
                     f"FROM {table_name}"
+                ).collect()
+            if existing_rows:
+                existing_df = spark.createDataFrame(
+                    [(r["partition_key"], r["public_hash"]) for r in existing_rows],
+                    ["partition_key", "public_hash"],
                 )
-            ok_df = ok_df.join(existing, on=["partition_key", "public_hash"], how="left_anti")
+                ok_df = ok_df.join(
+                    F.broadcast(existing_df),
+                    on=["partition_key", "public_hash"],
+                    how="left_anti",
+                )
         except Exception as exc:
             if "TABLE_OR_VIEW_NOT_FOUND" not in str(exc):
                 raise
