@@ -1,4 +1,4 @@
-from yggdrasil.io.request import PreparedRequest
+from yggdrasil.http_.request_base import PreparedRequest
 
 
 __all__ = [

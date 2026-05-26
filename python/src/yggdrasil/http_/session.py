@@ -58,10 +58,10 @@ from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCFile
-from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
+from yggdrasil.http_.request_base import PreparedRequest
+from yggdrasil.http_.response_base import Response
 from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig
-from yggdrasil.io.session import Session
+from yggdrasil.http_.session_base import Session
 from yggdrasil.url import URL
 
 from .exceptions import (

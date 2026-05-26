@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, MutableMapping, Option
 
 from yggdrasil.io.holder import IO
 from yggdrasil.io.memory_stream import MemoryStream
-from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response, _media_type_from_headers
+from yggdrasil.http_.request_base import PreparedRequest
+from yggdrasil.http_.response_base import Response, _media_type_from_headers
 
 from .headers import HTTPHeaderDict
 
