@@ -422,7 +422,7 @@ class TestCheckedCast:
         # Without ``checked_cast`` the cast pass runs (no-op cast here
         # but the dispatch fires); with it the input passes through
         # by identity.
-        same_id = opts.copy(checked_cast=True).cast_arrow_tabular(batch)
+        same_id = opts.copy(checked_cast=True).cast_arrow_batch(batch)
         assert same_id is batch
 
     def test_write_arrow_batches_with_checked_cast_uses_first_batch_schema(

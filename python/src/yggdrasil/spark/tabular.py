@@ -468,7 +468,7 @@ class Dataset(Tabular[CastOptions]):
                 arrow_table.num_rows,
             )
         for batch in arrow_table.to_batches(max_chunksize=options.row_size):
-            yield options.cast_arrow_tabular(batch)
+            yield options.cast_arrow_batch(batch)
 
     def _read_records(self, options: CastOptions) -> "Iterator[Any]":
         # Skip the Arrow round-trip — `toLocalIterator()` streams

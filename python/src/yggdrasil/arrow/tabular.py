@@ -327,7 +327,7 @@ class ArrowTabular(Tabular[CastOptions]):
         if options is None:
             return self.num_rows
         return sum(
-            options.cast_arrow_tabular(b).num_rows for b in self._batches
+            options.cast_arrow_batch(b).num_rows for b in self._batches
         )
 
     def __bool__(self) -> bool:
@@ -424,9 +424,9 @@ class ArrowTabular(Tabular[CastOptions]):
         # the per-part mmap. The in-memory tail follows in append order.
         for tbl in self._spilled_tables:
             for batch in tbl.to_batches():
-                yield options.cast_arrow_tabular(batch)
+                yield options.cast_arrow_batch(batch)
         for batch in self._batches:
-            yield options.cast_arrow_tabular(batch)
+            yield options.cast_arrow_batch(batch)
 
     def _read_arrow_table(self, options: CastOptions) -> pa.Table:
         """Materialize a :class:`pa.Table` from spilled + in-memory state.
@@ -456,7 +456,7 @@ class ArrowTabular(Tabular[CastOptions]):
             # No cast or rechunk requested — hand back the cached table
             # by reference (pyarrow tables are immutable; safe to share).
             return table
-        return options.cast_arrow_tabular(table)
+        return options.cast_arrow_table(table)
 
     def _materialize_table(self) -> "pa.Table | None":
         """Concatenate spilled parts + in-memory tail into one Table.

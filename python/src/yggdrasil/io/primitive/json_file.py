@@ -138,7 +138,7 @@ class JSONFile(IO[bytes, JsonOptions]):
                 return
             try:
                 for batch in reader:
-                    yield options.cast_arrow_tabular(batch)
+                    yield options.cast_arrow_batch(batch)
             finally:
                 reader.close()
 
@@ -159,12 +159,12 @@ class JSONFile(IO[bytes, JsonOptions]):
         parsed = json.loads(data.decode(options.encoding))
         if isinstance(parsed, list):
             if parsed:
-                yield options.cast_arrow_tabular(
+                yield options.cast_arrow_batch(
                     pa.RecordBatch.from_pylist(parsed)
                 )
             return
         if isinstance(parsed, dict):
-            yield options.cast_arrow_tabular(
+            yield options.cast_arrow_batch(
                 pa.RecordBatch.from_pylist([parsed])
             )
             return
@@ -228,9 +228,9 @@ class JSONFile(IO[bytes, JsonOptions]):
 
         # Materialize all batches into one pylist; it's a JSON array
         # so the whole document goes out at once.
-        rows: list[dict] = list(cast_opts.cast_arrow_tabular(first).to_pylist())
+        rows: list[dict] = list(cast_opts.cast_arrow_batch(first).to_pylist())
         for batch in iterator:
-            rows.extend(cast_opts.cast_arrow_tabular(batch).to_pylist())
+            rows.extend(cast_opts.cast_arrow_batch(batch).to_pylist())
 
         text = json.dumps(
             rows,

@@ -486,14 +486,14 @@ def cast_arrow_batch_iterator(
     bound = options.check_source(first)
 
     def _cast_stream() -> Iterator[pa.RecordBatch]:
-        yield bound.cast_arrow_tabular(first)
+        yield bound.cast_arrow_batch(first)
         for batch in iterator:
             if not isinstance(batch, pa.RecordBatch):
                 raise TypeError(
                     f"cast_arrow_batch_iterator expected pa.RecordBatch items, "
                     f"got {type(batch).__name__}."
                 )
-            yield bound.cast_arrow_tabular(batch)
+            yield bound.cast_arrow_batch(batch)
 
     if not bound.byte_size and not bound.row_size:
         yield from _cast_stream()

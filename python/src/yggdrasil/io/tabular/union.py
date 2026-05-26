@@ -204,7 +204,7 @@ class UnionTabular(LazyTabular):
             )
         row_size = getattr(options, "row_size", None) or None
         for batch in table.to_batches(max_chunksize=row_size):
-            yield options.cast_arrow_tabular(batch)
+            yield options.cast_arrow_batch(batch)
 
     def _scan_polars_frame(self, options: CastOptions) -> "pl.LazyFrame":
         return self._build_lazy(options)

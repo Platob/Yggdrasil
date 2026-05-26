@@ -846,7 +846,7 @@ def any_to_arrow_table(
             pl = polars_module()
             table, options = _polars_to_arrow(pl.DataFrame(obj), options)
 
-    return options.cast_arrow_tabular(table)
+    return options.cast_arrow_table(table)
 
 
 @register_converter(Any, pa.RecordBatch)
@@ -859,7 +859,7 @@ def any_to_arrow_record_batch(
 
     if isinstance(obj, pa.RecordBatch):
         options = _bind_source(options, obj)
-        return options.cast_arrow_tabular(obj)
+        return options.cast_arrow_batch(obj)
 
     table = any_to_arrow_table(obj, options)
     batches = table.to_batches()
@@ -1097,7 +1097,10 @@ def cast_arrow_tabular(
     options: Optional[CastOptions] = None,
 ) -> Union[pa.Table, pa.RecordBatch]:
     """Cast pyarrow Table/RecordBatch with skip-cast on schema match."""
-    return CastOptions.check(options).cast_arrow_tabular(data)
+    opts = CastOptions.check(options)
+    if isinstance(data, pa.Table):
+        return opts.cast_arrow_table(data)
+    return opts.cast_arrow_batch(data)
 
 
 @register_converter(pa.RecordBatchReader, pa.RecordBatchReader)

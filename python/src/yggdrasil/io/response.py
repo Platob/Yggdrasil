@@ -666,9 +666,9 @@ class Response(Tabular["ResponseOptions"]):
         ) is not None:
             with self.open(mode="rb") as b:
                 for batch in b.read_arrow_batches():
-                    yield options.cast_arrow_tabular(batch)
+                    yield options.cast_arrow_batch(batch)
             return
-        yield options.cast_arrow_tabular(self._arrow_batch_from_values())
+        yield options.cast_arrow_batch(self._arrow_batch_from_values())
 
     def _write_arrow_batches(
         self,

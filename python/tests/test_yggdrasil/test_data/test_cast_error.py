@@ -71,7 +71,7 @@ class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
             source=Field.from_arrow(src),
             target=Field.from_arrow(tgt),
         )
-        out = opts.cast_arrow_tabular(tbl)
+        out = opts.cast_arrow_table(tbl)
 
         self.assertEqual(out.num_rows, 3)
         self.assertEqual(out.column("id").to_pylist(), [1, 2, 3])
@@ -94,7 +94,7 @@ class TestBadJsonRowsNullOutByDefault(ArrowTestCase):
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
-            opts.cast_arrow_tabular(tbl)
+            opts.cast_arrow_table(tbl)
 
         err = ctx.exception
         # Source / target fields are accessible programmatically.
@@ -133,7 +133,7 @@ class TestCastErrorBackCompat(ArrowTestCase):
         # Existing callers catch pa.ArrowInvalid — the CastError
         # subclass should still land in that net.
         with self.assertRaises(pa.ArrowInvalid):
-            opts.cast_arrow_tabular(tbl)
+            opts.cast_arrow_table(tbl)
 
     def test_is_subclass_of_value_error(self) -> None:
         # ArrowInvalid is itself a ValueError, so CastError inherits
@@ -224,7 +224,7 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
-            opts.cast_arrow_tabular(tbl)
+            opts.cast_arrow_table(tbl)
 
         # The leaf is what got bound — not the outer ``row`` field.
         self.assertEqual(ctx.exception.target.name, "bad")
@@ -250,7 +250,7 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
-            opts.cast_arrow_tabular(tbl)
+            opts.cast_arrow_table(tbl)
         self.assertEqual(ctx.exception.target.name, "count")
 
     def test_deeply_nested_leaf_failure(self) -> None:
@@ -279,7 +279,7 @@ class TestNestedCastErrorPropagation(ArrowTestCase):
             safe=True,
         )
         with self.assertRaises(CastError) as ctx:
-            opts.cast_arrow_tabular(tbl)
+            opts.cast_arrow_table(tbl)
         # Bound to the deepest leaf, not the outer ``outer`` / ``inner``
         # wrappers.
         self.assertEqual(ctx.exception.target.name, "val")

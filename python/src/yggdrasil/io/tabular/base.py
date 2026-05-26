@@ -1146,7 +1146,7 @@ class Tabular(ABC, Generic[O]):
         resolved = self.check_options(options, overrides=locals())
         stream = self._read_arrow_batches(resolved)
         if resolved.target is not None:
-            cast = resolved.cast_arrow_tabular
+            cast = resolved.cast_arrow_batch
             stream = (cast(batch) for batch in stream)
         stream = resolved.resample_arrow_batches(stream)
         stream = resolved.dedup_arrow_batches(stream)
@@ -1184,7 +1184,7 @@ class Tabular(ABC, Generic[O]):
             )
             return schema.to_arrow_schema().empty_table()
         table = pa.Table.from_batches(batches)
-        table = options.cast_arrow_tabular(table)
+        table = options.cast_arrow_table(table)
         return options.apply_post_read_table(table)
 
     def read_arrow_batch_reader(
@@ -1198,7 +1198,7 @@ class Tabular(ABC, Generic[O]):
         schema = options.check_target(obj=self.collect_schema).merged
         stream = self._read_arrow_batches(options)
         if options.target is not None:
-            cast = options.cast_arrow_tabular
+            cast = options.cast_arrow_batch
             stream = (cast(batch) for batch in stream)
         stream = options.resample_arrow_batches(stream)
         stream = options.dedup_arrow_batches(stream)
@@ -1398,7 +1398,7 @@ class Tabular(ABC, Generic[O]):
         )
 
     def _write_arrow_table(self, table: pa.Table, options: O) -> None:
-        casted = options.cast_arrow_tabular(table)
+        casted = options.cast_arrow_table(table)
 
         # Keep ``target`` set: downstream writers (delta partition
         # inference, schema-driven SQL DDL, …) read tags off the

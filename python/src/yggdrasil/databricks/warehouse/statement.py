@@ -1124,7 +1124,7 @@ class WarehouseStatementResult(StatementResult):
             # those buffers vanish.  `concat_batches` materializes a
             # fresh batch owned by `memory_pool`, breaking the alias.
             combined = pa.concat_batches(pending, memory_pool=memory_pool)
-            casted = options.cast_arrow_tabular(combined)
+            casted = options.cast_arrow_table(combined)
             pending = []
             pending_bytes = 0
             yielded_any = True

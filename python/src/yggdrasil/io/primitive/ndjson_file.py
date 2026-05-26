@@ -201,7 +201,7 @@ class NDJSONFile(IO[bytes, NDJsonOptions]):
                 return
             try:
                 for batch in reader:
-                    yield options.cast_arrow_tabular(batch)
+                    yield options.cast_arrow_batch(batch)
             finally:
                 reader.close()
         finally:
@@ -317,7 +317,7 @@ class NDJSONFile(IO[bytes, NDJsonOptions]):
             if first is None:
                 return
             for batch in _it.chain([first], iterator):
-                casted = cast_opts.cast_arrow_tabular(batch)
+                casted = cast_opts.cast_arrow_batch(batch)
                 sink.write(_encode_batch(casted))
 
     # ==================================================================

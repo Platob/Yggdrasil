@@ -267,7 +267,7 @@ class CSVFile(IO[bytes, CsvOptions]):
                 return
             try:
                 for batch in reader:
-                    yield options.cast_arrow_tabular(batch)
+                    yield options.cast_arrow_batch(batch)
             finally:
                 reader.close()
         finally:
@@ -381,7 +381,7 @@ class CSVFile(IO[bytes, CsvOptions]):
         # reshapes the rows to the caller's schema before the
         # encoder sees them.
         cast_opts = options.check_source(first.schema)
-        first_casted = cast_opts.cast_arrow_tabular(first)
+        first_casted = cast_opts.cast_arrow_batch(first)
 
         # CSV can't encode nested arrow types — pyarrow's CSVWriter
         # raises ``ArrowInvalid: Unsupported Type`` on the first
@@ -421,7 +421,7 @@ class CSVFile(IO[bytes, CsvOptions]):
                     if first_casted.num_rows > 0:
                         writer.write_batch(first_casted)
                     for batch in iterator:
-                        casted = cast_opts.cast_arrow_tabular(batch)
+                        casted = cast_opts.cast_arrow_batch(batch)
                         if nested_indices:
                             casted = _encode_nested_as_json(
                                 casted,
@@ -442,7 +442,7 @@ class CSVFile(IO[bytes, CsvOptions]):
                 if first_casted.num_rows > 0:
                     writer.write_batch(first_casted)
                 for batch in iterator:
-                    casted = cast_opts.cast_arrow_tabular(batch)
+                    casted = cast_opts.cast_arrow_batch(batch)
                     if nested_indices:
                         casted = _encode_nested_as_json(
                             casted,

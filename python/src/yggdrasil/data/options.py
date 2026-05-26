@@ -1202,28 +1202,26 @@ class CastOptions:
             return array
         return self.target.cast_arrow_array(array, options=self)
 
-    def cast_arrow_tabular(self, data: Any) -> Any:
-        """Filter + cast Arrow data (Table, RecordBatch, or ArrowTabular).
-
-        Applies :attr:`predicate` (when set) then delegates to
-        :meth:`Field.cast_arrow_tabular` for schema coercion.
-        ``checked_cast=True`` skips the cast but still applies the
-        predicate.
-
-        :class:`ArrowTabular` is handled by casting each batch and
-        returning a new :class:`ArrowTabular`.
-        """
-        from yggdrasil.arrow.tabular import ArrowTabular
-
-        if isinstance(data, ArrowTabular):
-            batches = [self.cast_arrow_tabular(b) for b in data.batches]
-            return ArrowTabular(batches)
-
+    def _apply_predicate_and_cast(self, data: Any) -> Any:
         if self.predicate is not None:
             data = self.predicate.filter_arrow_batch(data)
         if self.target is None or self.checked_cast:
             return data
         return self.target.cast_arrow_tabular(data, options=self)
+
+    def cast_arrow_batch(self, batch: "pa.RecordBatch") -> "pa.RecordBatch":
+        """Filter + cast a :class:`pa.RecordBatch`."""
+        return self._apply_predicate_and_cast(batch)
+
+    def cast_arrow_table(self, table: "pa.Table") -> "pa.Table":
+        """Filter + cast a :class:`pa.Table`."""
+        return self._apply_predicate_and_cast(table)
+
+    def cast_arrow_tabular(self, data: "ArrowTabular") -> "ArrowTabular":
+        """Filter + cast an :class:`ArrowTabular` (batch by batch)."""
+        from yggdrasil.arrow.tabular import ArrowTabular
+        batches = [self.cast_arrow_batch(b) for b in data.batches]
+        return ArrowTabular(batches)
 
     def dedup_columns_on_read(self) -> "list[str]":
         """Return the column names that need client-side dedup at read time.

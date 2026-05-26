@@ -160,7 +160,7 @@ class TestCastBenchmarkRegression(ArrowTestCase):
             pa.field("v", pa.float32()),
             pa.field("t", pa.string()),
         ]))
-        out = CastOptions(source=src, target=tgt).cast_arrow_tabular(rb)
+        out = CastOptions(source=src, target=tgt).cast_arrow_batch(rb)
         self.assertEqual(out.num_rows, n)
 
     def test_chunked_identity_cast_path(self) -> None:
@@ -276,12 +276,12 @@ class TestCastBenchmarks(ArrowTestCase):
         ]))
         # Identity: source = target. Hits the tabular bypass.
         ms, _ = _time_cast(
-            lambda: CastOptions(source=src, target=src).cast_arrow_tabular(rb),
+            lambda: CastOptions(source=src, target=src).cast_arrow_batch(rb),
         )
         report.add("identity (source == target)", ms)
         # Widen i32→i64 + f64→f32.
         ms, _ = _time_cast(
-            lambda: CastOptions(source=src, target=widen).cast_arrow_tabular(rb),
+            lambda: CastOptions(source=src, target=widen).cast_arrow_batch(rb),
         )
         report.add("widen i32->i64, narrow f64->f32", ms)
         report.flush()
@@ -900,7 +900,7 @@ class TestCastBenchmarks(ArrowTestCase):
             ms, _ = _time_cast(
                 lambda b=batches: CastOptions(
                     source=src, target=tgt,
-                ).cast_arrow_tabular(
+                ).cast_arrow_batch(
                     pa.Table.from_batches(b).combine_chunks().to_batches()[0]
                 ),
             )
