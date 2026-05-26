@@ -175,22 +175,13 @@ class SQLWarehouse(DatabricksResource):
         "_external_link_pool_instance",
     })
 
-    # ``Disposable`` carries its open/close bookkeeping in ``__slots__``,
-    # so it isn't in ``__dict__`` and the parent ``DatabricksResource``
-    # ``__getstate__`` would silently drop it. Carry it explicitly.
-    _DISPOSABLE_SLOTS: ClassVar[tuple[str, ...]] = ("_acquired", "_dirty", "_depth")
-
     def __getstate__(self):
         state = super().__getstate__()
         for attr in self._TRANSIENT_STATE_ATTRS:
             state.pop(attr, None)
-        for slot in self._DISPOSABLE_SLOTS:
-            state[slot] = getattr(self, slot)
         return state
 
     def __setstate__(self, state):
-        for slot in self._DISPOSABLE_SLOTS:
-            object.__setattr__(self, slot, state.pop(slot, 0 if slot == "_depth" else False))
         super().__setstate__(state)
         # Rebuild the per-process external-link pool guard fresh; the new
         # process gets its own lock and a None pool that will lazily build
