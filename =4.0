@@ -1,0 +1,1728 @@
+  error: subprocess-exited-with-error
+  
+  × python setup.py bdist_wheel did not run successfully.
+  │ exit code: 1
+  ╰─> [1718 lines of output]
+      running bdist_wheel
+      running build
+      running build_py
+      creating build
+      creating build/lib
+      creating build/lib/pyspark
+      copying pyspark/traceback_utils.py -> build/lib/pyspark
+      copying pyspark/serializers.py -> build/lib/pyspark
+      copying pyspark/worker.py -> build/lib/pyspark
+      copying pyspark/errors_doc_gen.py -> build/lib/pyspark
+      copying pyspark/instrumentation_utils.py -> build/lib/pyspark
+      copying pyspark/resultiterable.py -> build/lib/pyspark
+      copying pyspark/__init__.py -> build/lib/pyspark
+      copying pyspark/java_gateway.py -> build/lib/pyspark
+      copying pyspark/shuffle.py -> build/lib/pyspark
+      copying pyspark/install.py -> build/lib/pyspark
+      copying pyspark/daemon.py -> build/lib/pyspark
+      copying pyspark/storagelevel.py -> build/lib/pyspark
+      copying pyspark/taskcontext.py -> build/lib/pyspark
+      copying pyspark/statcounter.py -> build/lib/pyspark
+      copying pyspark/util.py -> build/lib/pyspark
+      copying pyspark/rddsampler.py -> build/lib/pyspark
+      copying pyspark/shell.py -> build/lib/pyspark
+      copying pyspark/profiler.py -> build/lib/pyspark
+      copying pyspark/worker_util.py -> build/lib/pyspark
+      copying pyspark/find_spark_home.py -> build/lib/pyspark
+      copying pyspark/join.py -> build/lib/pyspark
+      copying pyspark/loose_version.py -> build/lib/pyspark
+      copying pyspark/accumulators.py -> build/lib/pyspark
+      copying pyspark/version.py -> build/lib/pyspark
+      copying pyspark/conf.py -> build/lib/pyspark
+      copying pyspark/_globals.py -> build/lib/pyspark
+      creating build/lib/pyspark/core
+      copying pyspark/core/rdd.py -> build/lib/pyspark/core
+      copying pyspark/core/__init__.py -> build/lib/pyspark/core
+      copying pyspark/core/files.py -> build/lib/pyspark/core
+      copying pyspark/core/broadcast.py -> build/lib/pyspark/core
+      copying pyspark/core/status.py -> build/lib/pyspark/core
+      copying pyspark/core/context.py -> build/lib/pyspark/core
+      creating build/lib/pyspark/cloudpickle
+      copying pyspark/cloudpickle/cloudpickle.py -> build/lib/pyspark/cloudpickle
+      copying pyspark/cloudpickle/__init__.py -> build/lib/pyspark/cloudpickle
+      copying pyspark/cloudpickle/cloudpickle_fast.py -> build/lib/pyspark/cloudpickle
+      creating build/lib/pyspark/mllib
+      copying pyspark/mllib/common.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/recommendation.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/evaluation.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/classification.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/fpm.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/__init__.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/tree.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/feature.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/regression.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/clustering.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/util.py -> build/lib/pyspark/mllib
+      copying pyspark/mllib/random.py -> build/lib/pyspark/mllib
+      creating build/lib/pyspark/mllib/linalg
+      copying pyspark/mllib/linalg/__init__.py -> build/lib/pyspark/mllib/linalg
+      copying pyspark/mllib/linalg/distributed.py -> build/lib/pyspark/mllib/linalg
+      creating build/lib/pyspark/mllib/stat
+      copying pyspark/mllib/stat/__init__.py -> build/lib/pyspark/mllib/stat
+      copying pyspark/mllib/stat/KernelDensity.py -> build/lib/pyspark/mllib/stat
+      copying pyspark/mllib/stat/_statistics.py -> build/lib/pyspark/mllib/stat
+      copying pyspark/mllib/stat/distribution.py -> build/lib/pyspark/mllib/stat
+      copying pyspark/mllib/stat/test.py -> build/lib/pyspark/mllib/stat
+      creating build/lib/pyspark/ml
+      copying pyspark/ml/common.py -> build/lib/pyspark/ml
+      copying pyspark/ml/stat.py -> build/lib/pyspark/ml
+      copying pyspark/ml/image.py -> build/lib/pyspark/ml
+      copying pyspark/ml/recommendation.py -> build/lib/pyspark/ml
+      copying pyspark/ml/evaluation.py -> build/lib/pyspark/ml
+      copying pyspark/ml/functions.py -> build/lib/pyspark/ml
+      copying pyspark/ml/wrapper.py -> build/lib/pyspark/ml
+      copying pyspark/ml/classification.py -> build/lib/pyspark/ml
+      copying pyspark/ml/fpm.py -> build/lib/pyspark/ml
+      copying pyspark/ml/base.py -> build/lib/pyspark/ml
+      copying pyspark/ml/__init__.py -> build/lib/pyspark/ml
+      copying pyspark/ml/model_cache.py -> build/lib/pyspark/ml
+      copying pyspark/ml/tree.py -> build/lib/pyspark/ml
+      copying pyspark/ml/feature.py -> build/lib/pyspark/ml
+      copying pyspark/ml/regression.py -> build/lib/pyspark/ml
+      copying pyspark/ml/clustering.py -> build/lib/pyspark/ml
+      copying pyspark/ml/util.py -> build/lib/pyspark/ml
+      copying pyspark/ml/dl_util.py -> build/lib/pyspark/ml
+      copying pyspark/ml/tuning.py -> build/lib/pyspark/ml
+      copying pyspark/ml/pipeline.py -> build/lib/pyspark/ml
+      creating build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/evaluation.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/functions.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/classification.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/serialize.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/base.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/__init__.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/summarizer.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/feature.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/util.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/readwrite.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/tuning.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/io_utils.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/pipeline.py -> build/lib/pyspark/ml/connect
+      copying pyspark/ml/connect/proto.py -> build/lib/pyspark/ml/connect
+      creating build/lib/pyspark/ml/linalg
+      copying pyspark/ml/linalg/__init__.py -> build/lib/pyspark/ml/linalg
+      creating build/lib/pyspark/ml/param
+      copying pyspark/ml/param/_shared_params_code_gen.py -> build/lib/pyspark/ml/param
+      copying pyspark/ml/param/__init__.py -> build/lib/pyspark/ml/param
+      copying pyspark/ml/param/shared.py -> build/lib/pyspark/ml/param
+      creating build/lib/pyspark/ml/torch
+      copying pyspark/ml/torch/log_communication.py -> build/lib/pyspark/ml/torch
+      copying pyspark/ml/torch/__init__.py -> build/lib/pyspark/ml/torch
+      copying pyspark/ml/torch/data.py -> build/lib/pyspark/ml/torch
+      copying pyspark/ml/torch/torch_run_process_wrapper.py -> build/lib/pyspark/ml/torch
+      copying pyspark/ml/torch/distributor.py -> build/lib/pyspark/ml/torch
+      creating build/lib/pyspark/ml/deepspeed
+      copying pyspark/ml/deepspeed/__init__.py -> build/lib/pyspark/ml/deepspeed
+      copying pyspark/ml/deepspeed/deepspeed_distributor.py -> build/lib/pyspark/ml/deepspeed
+      creating build/lib/pyspark/sql
+      copying pyspark/sql/datasource.py -> build/lib/pyspark/sql
+      copying pyspark/sql/tvf.py -> build/lib/pyspark/sql
+      copying pyspark/sql/readwriter.py -> build/lib/pyspark/sql
+      copying pyspark/sql/internal.py -> build/lib/pyspark/sql
+      copying pyspark/sql/table_arg.py -> build/lib/pyspark/sql
+      copying pyspark/sql/datasource_internal.py -> build/lib/pyspark/sql
+      copying pyspark/sql/geo_utils.py -> build/lib/pyspark/sql
+      copying pyspark/sql/conversion.py -> build/lib/pyspark/sql
+      copying pyspark/sql/__init__.py -> build/lib/pyspark/sql
+      copying pyspark/sql/metrics.py -> build/lib/pyspark/sql
+      copying pyspark/sql/window.py -> build/lib/pyspark/sql
+      copying pyspark/sql/merge.py -> build/lib/pyspark/sql
+      copying pyspark/sql/dataframe.py -> build/lib/pyspark/sql
+      copying pyspark/sql/profiler.py -> build/lib/pyspark/sql
+      copying pyspark/sql/column.py -> build/lib/pyspark/sql
+      copying pyspark/sql/observation.py -> build/lib/pyspark/sql
+      copying pyspark/sql/sql_formatter.py -> build/lib/pyspark/sql
+      copying pyspark/sql/catalog.py -> build/lib/pyspark/sql
+      copying pyspark/sql/types.py -> build/lib/pyspark/sql
+      copying pyspark/sql/session.py -> build/lib/pyspark/sql
+      copying pyspark/sql/context.py -> build/lib/pyspark/sql
+      copying pyspark/sql/tvf_argument.py -> build/lib/pyspark/sql
+      copying pyspark/sql/conf.py -> build/lib/pyspark/sql
+      copying pyspark/sql/udf.py -> build/lib/pyspark/sql
+      copying pyspark/sql/group.py -> build/lib/pyspark/sql
+      copying pyspark/sql/udtf.py -> build/lib/pyspark/sql
+      copying pyspark/sql/variant_utils.py -> build/lib/pyspark/sql
+      copying pyspark/sql/utils.py -> build/lib/pyspark/sql
+      creating build/lib/pyspark/sql/avro
+      copying pyspark/sql/avro/functions.py -> build/lib/pyspark/sql/avro
+      copying pyspark/sql/avro/__init__.py -> build/lib/pyspark/sql/avro
+      creating build/lib/pyspark/sql/classic
+      copying pyspark/sql/classic/table_arg.py -> build/lib/pyspark/sql/classic
+      copying pyspark/sql/classic/__init__.py -> build/lib/pyspark/sql/classic
+      copying pyspark/sql/classic/window.py -> build/lib/pyspark/sql/classic
+      copying pyspark/sql/classic/dataframe.py -> build/lib/pyspark/sql/classic
+      copying pyspark/sql/classic/column.py -> build/lib/pyspark/sql/classic
+      creating build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/datasource.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/tvf.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/readwriter.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/table_arg.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/conversion.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/__init__.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/window.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/merge.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/_typing.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/plan.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/dataframe.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/profiler.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/column.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/observation.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/expressions.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/sql_formatter.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/catalog.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/types.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/session.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/logging.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/conf.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/udf.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/group.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/udtf.py -> build/lib/pyspark/sql/connect
+      copying pyspark/sql/connect/utils.py -> build/lib/pyspark/sql/connect
+      creating build/lib/pyspark/sql/connect/avro
+      copying pyspark/sql/connect/avro/functions.py -> build/lib/pyspark/sql/connect/avro
+      copying pyspark/sql/connect/avro/__init__.py -> build/lib/pyspark/sql/connect/avro
+      creating build/lib/pyspark/sql/connect/client
+      copying pyspark/sql/connect/client/__init__.py -> build/lib/pyspark/sql/connect/client
+      copying pyspark/sql/connect/client/core.py -> build/lib/pyspark/sql/connect/client
+      copying pyspark/sql/connect/client/artifact.py -> build/lib/pyspark/sql/connect/client
+      copying pyspark/sql/connect/client/retries.py -> build/lib/pyspark/sql/connect/client
+      copying pyspark/sql/connect/client/reattach.py -> build/lib/pyspark/sql/connect/client
+      creating build/lib/pyspark/sql/connect/functions
+      copying pyspark/sql/connect/functions/partitioning.py -> build/lib/pyspark/sql/connect/functions
+      copying pyspark/sql/connect/functions/__init__.py -> build/lib/pyspark/sql/connect/functions
+      copying pyspark/sql/connect/functions/builtin.py -> build/lib/pyspark/sql/connect/functions
+      creating build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/commands_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/ml_common_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/__init__.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/relations_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/example_plugins_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/pipelines_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/types_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/base_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/ml_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/base_pb2_grpc.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/catalog_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/common_pb2.py -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/expressions_pb2.py -> build/lib/pyspark/sql/connect/proto
+      creating build/lib/pyspark/sql/connect/protobuf
+      copying pyspark/sql/connect/protobuf/functions.py -> build/lib/pyspark/sql/connect/protobuf
+      copying pyspark/sql/connect/protobuf/__init__.py -> build/lib/pyspark/sql/connect/protobuf
+      creating build/lib/pyspark/sql/connect/resource
+      copying pyspark/sql/connect/resource/__init__.py -> build/lib/pyspark/sql/connect/resource
+      copying pyspark/sql/connect/resource/profile.py -> build/lib/pyspark/sql/connect/resource
+      creating build/lib/pyspark/sql/connect/shell
+      copying pyspark/sql/connect/shell/__init__.py -> build/lib/pyspark/sql/connect/shell
+      copying pyspark/sql/connect/shell/progress.py -> build/lib/pyspark/sql/connect/shell
+      creating build/lib/pyspark/sql/connect/streaming
+      copying pyspark/sql/connect/streaming/readwriter.py -> build/lib/pyspark/sql/connect/streaming
+      copying pyspark/sql/connect/streaming/query.py -> build/lib/pyspark/sql/connect/streaming
+      copying pyspark/sql/connect/streaming/__init__.py -> build/lib/pyspark/sql/connect/streaming
+      creating build/lib/pyspark/sql/connect/streaming/worker
+      copying pyspark/sql/connect/streaming/worker/foreach_batch_worker.py -> build/lib/pyspark/sql/connect/streaming/worker
+      copying pyspark/sql/connect/streaming/worker/__init__.py -> build/lib/pyspark/sql/connect/streaming/worker
+      copying pyspark/sql/connect/streaming/worker/listener_worker.py -> build/lib/pyspark/sql/connect/streaming/worker
+      creating build/lib/pyspark/sql/functions
+      copying pyspark/sql/functions/partitioning.py -> build/lib/pyspark/sql/functions
+      copying pyspark/sql/functions/__init__.py -> build/lib/pyspark/sql/functions
+      copying pyspark/sql/functions/builtin.py -> build/lib/pyspark/sql/functions
+      creating build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/functions.py -> build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/serializers.py -> build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/conversion.py -> build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/__init__.py -> build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/types.py -> build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/group_ops.py -> build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/map_ops.py -> build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/typehints.py -> build/lib/pyspark/sql/pandas
+      copying pyspark/sql/pandas/utils.py -> build/lib/pyspark/sql/pandas
+      creating build/lib/pyspark/sql/plot
+      copying pyspark/sql/plot/__init__.py -> build/lib/pyspark/sql/plot
+      copying pyspark/sql/plot/core.py -> build/lib/pyspark/sql/plot
+      copying pyspark/sql/plot/plotly.py -> build/lib/pyspark/sql/plot
+      creating build/lib/pyspark/sql/protobuf
+      copying pyspark/sql/protobuf/functions.py -> build/lib/pyspark/sql/protobuf
+      copying pyspark/sql/protobuf/__init__.py -> build/lib/pyspark/sql/protobuf
+      creating build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/value_state_client.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/transform_with_state_driver_worker.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/readwriter.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/query.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/__init__.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/python_streaming_source_runner.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/state.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/stateful_processor_util.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/listener.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/stateful_processor_api_client.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/stateful_processor.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/list_state_client.py -> build/lib/pyspark/sql/streaming
+      copying pyspark/sql/streaming/map_state_client.py -> build/lib/pyspark/sql/streaming
+      creating build/lib/pyspark/sql/streaming/proto
+      copying pyspark/sql/streaming/proto/__init__.py -> build/lib/pyspark/sql/streaming/proto
+      copying pyspark/sql/streaming/proto/StateMessage_pb2.py -> build/lib/pyspark/sql/streaming/proto
+      creating build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/plan_data_source_read.py -> build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/python_streaming_sink_runner.py -> build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/write_into_data_source.py -> build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/__init__.py -> build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/lookup_data_sources.py -> build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/create_data_source.py -> build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/commit_data_source_write.py -> build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/data_source_pushdown_filters.py -> build/lib/pyspark/sql/worker
+      copying pyspark/sql/worker/analyze_udtf.py -> build/lib/pyspark/sql/worker
+      creating build/lib/pyspark/streaming
+      copying pyspark/streaming/__init__.py -> build/lib/pyspark/streaming
+      copying pyspark/streaming/kinesis.py -> build/lib/pyspark/streaming
+      copying pyspark/streaming/util.py -> build/lib/pyspark/streaming
+      copying pyspark/streaming/listener.py -> build/lib/pyspark/streaming
+      copying pyspark/streaming/dstream.py -> build/lib/pyspark/streaming
+      copying pyspark/streaming/context.py -> build/lib/pyspark/streaming
+      creating build/lib/pyspark/pandas
+      copying pyspark/pandas/internal.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/extensions.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/config.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/base.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/__init__.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/series.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/window.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/frame.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/numpy_compat.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/sql_processor.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/mlflow.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/supported_api_gen.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/generic.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/strings.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/_typing.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/exceptions.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/namespace.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/indexing.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/testing.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/correlation.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/datetimes.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/sql_formatter.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/groupby.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/categorical.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/accessors.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/resample.py -> build/lib/pyspark/pandas
+      copying pyspark/pandas/utils.py -> build/lib/pyspark/pandas
+      creating build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/string_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/udt_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/base.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/__init__.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/num_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/date_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/binary_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/complex_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/categorical_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/datetime_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/boolean_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/timedelta_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      copying pyspark/pandas/data_type_ops/null_ops.py -> build/lib/pyspark/pandas/data_type_ops
+      creating build/lib/pyspark/pandas/indexes
+      copying pyspark/pandas/indexes/base.py -> build/lib/pyspark/pandas/indexes
+      copying pyspark/pandas/indexes/__init__.py -> build/lib/pyspark/pandas/indexes
+      copying pyspark/pandas/indexes/multi.py -> build/lib/pyspark/pandas/indexes
+      copying pyspark/pandas/indexes/timedelta.py -> build/lib/pyspark/pandas/indexes
+      copying pyspark/pandas/indexes/datetimes.py -> build/lib/pyspark/pandas/indexes
+      copying pyspark/pandas/indexes/category.py -> build/lib/pyspark/pandas/indexes
+      creating build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/common.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/general_functions.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/__init__.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/series.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/indexes.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/window.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/frame.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/scalars.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/groupby.py -> build/lib/pyspark/pandas/missing
+      copying pyspark/pandas/missing/resample.py -> build/lib/pyspark/pandas/missing
+      creating build/lib/pyspark/pandas/plot
+      copying pyspark/pandas/plot/matplotlib.py -> build/lib/pyspark/pandas/plot
+      copying pyspark/pandas/plot/__init__.py -> build/lib/pyspark/pandas/plot
+      copying pyspark/pandas/plot/core.py -> build/lib/pyspark/pandas/plot
+      copying pyspark/pandas/plot/plotly.py -> build/lib/pyspark/pandas/plot
+      creating build/lib/pyspark/pandas/spark
+      copying pyspark/pandas/spark/__init__.py -> build/lib/pyspark/pandas/spark
+      copying pyspark/pandas/spark/accessors.py -> build/lib/pyspark/pandas/spark
+      copying pyspark/pandas/spark/utils.py -> build/lib/pyspark/pandas/spark
+      creating build/lib/pyspark/pandas/typedef
+      copying pyspark/pandas/typedef/__init__.py -> build/lib/pyspark/pandas/typedef
+      copying pyspark/pandas/typedef/typehints.py -> build/lib/pyspark/pandas/typedef
+      creating build/lib/pyspark/pandas/usage_logging
+      copying pyspark/pandas/usage_logging/usage_logger.py -> build/lib/pyspark/pandas/usage_logging
+      copying pyspark/pandas/usage_logging/__init__.py -> build/lib/pyspark/pandas/usage_logging
+      creating build/lib/pyspark/pipelines
+      copying pyspark/pipelines/cli.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/init_cli.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/source_code_location.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/block_connect_access.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/output.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/type_error_utils.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/__init__.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/graph_element_registry.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/flow.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/spark_connect_graph_element_registry.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/api.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/add_pipeline_analysis_context.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/spark_connect_pipeline.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/logging_utils.py -> build/lib/pyspark/pipelines
+      copying pyspark/pipelines/block_session_mutations.py -> build/lib/pyspark/pipelines
+      creating build/lib/pyspark/python
+      creating build/lib/pyspark/python/pyspark
+      copying pyspark/python/pyspark/shell.py -> build/lib/pyspark/python/pyspark
+      creating build/lib/pyspark/testing
+      copying pyspark/testing/streamingutils.py -> build/lib/pyspark/testing
+      copying pyspark/testing/mlutils.py -> build/lib/pyspark/testing
+      copying pyspark/testing/sqlutils.py -> build/lib/pyspark/testing
+      copying pyspark/testing/pandasutils.py -> build/lib/pyspark/testing
+      copying pyspark/testing/connectutils.py -> build/lib/pyspark/testing
+      copying pyspark/testing/__init__.py -> build/lib/pyspark/testing
+      copying pyspark/testing/objects.py -> build/lib/pyspark/testing
+      copying pyspark/testing/mllibutils.py -> build/lib/pyspark/testing
+      copying pyspark/testing/utils.py -> build/lib/pyspark/testing
+      creating build/lib/pyspark/resource
+      copying pyspark/resource/requests.py -> build/lib/pyspark/resource
+      copying pyspark/resource/__init__.py -> build/lib/pyspark/resource
+      copying pyspark/resource/information.py -> build/lib/pyspark/resource
+      copying pyspark/resource/profile.py -> build/lib/pyspark/resource
+      creating build/lib/pyspark/errors
+      copying pyspark/errors/__init__.py -> build/lib/pyspark/errors
+      copying pyspark/errors/error_classes.py -> build/lib/pyspark/errors
+      copying pyspark/errors/utils.py -> build/lib/pyspark/errors
+      creating build/lib/pyspark/errors/exceptions
+      copying pyspark/errors/exceptions/tblib.py -> build/lib/pyspark/errors/exceptions
+      copying pyspark/errors/exceptions/captured.py -> build/lib/pyspark/errors/exceptions
+      copying pyspark/errors/exceptions/base.py -> build/lib/pyspark/errors/exceptions
+      copying pyspark/errors/exceptions/__init__.py -> build/lib/pyspark/errors/exceptions
+      copying pyspark/errors/exceptions/connect.py -> build/lib/pyspark/errors/exceptions
+      creating build/lib/pyspark/examples
+      creating build/lib/pyspark/examples/src
+      creating build/lib/pyspark/examples/src/main
+      creating build/lib/pyspark/examples/src/main/python
+      copying deps/examples/als.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/parquet_inputformat.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/status_api_demo.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/kmeans.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/__init__.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/sort.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/avro_inputformat.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/pi.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/logistic_regression.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/wordcount.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/pagerank.py -> build/lib/pyspark/examples/src/main/python
+      copying deps/examples/transitive_closure.py -> build/lib/pyspark/examples/src/main/python
+      creating build/lib/pyspark/logger
+      copying pyspark/logger/__init__.py -> build/lib/pyspark/logger
+      copying pyspark/logger/worker_io.py -> build/lib/pyspark/logger
+      copying pyspark/logger/logger.py -> build/lib/pyspark/logger
+      running egg_info
+      writing pyspark.egg-info/PKG-INFO
+      writing dependency_links to pyspark.egg-info/dependency_links.txt
+      writing requirements to pyspark.egg-info/requires.txt
+      writing top-level names to pyspark.egg-info/top_level.txt
+      reading manifest file 'pyspark.egg-info/SOURCES.txt'
+      reading manifest template 'MANIFEST.in'
+      warning: no previously-included files matching '*.py[cod]' found anywhere in distribution
+      warning: no previously-included files matching '__pycache__' found anywhere in distribution
+      warning: no previously-included files matching '.DS_Store' found anywhere in distribution
+      writing manifest file 'pyspark.egg-info/SOURCES.txt'
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.data.graphx' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.data.graphx' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.data.graphx' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.data.graphx' to be distributed and are
+              already explicitly excluding 'pyspark.data.graphx' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.data.mllib' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.data.mllib' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.data.mllib' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.data.mllib' to be distributed and are
+              already explicitly excluding 'pyspark.data.mllib' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.data.mllib.als' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.data.mllib.als' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.data.mllib.als' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.data.mllib.als' to be distributed and are
+              already explicitly excluding 'pyspark.data.mllib.als' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.data.mllib.images' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.data.mllib.images' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.data.mllib.images' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.data.mllib.images' to be distributed and are
+              already explicitly excluding 'pyspark.data.mllib.images' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.data.mllib.images.origin' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.data.mllib.images.origin' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.data.mllib.images.origin' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.data.mllib.images.origin' to be distributed and are
+              already explicitly excluding 'pyspark.data.mllib.images.origin' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.data.mllib.images.origin.kittens' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.data.mllib.images.origin.kittens' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.data.mllib.images.origin.kittens' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.data.mllib.images.origin.kittens' to be distributed and are
+              already explicitly excluding 'pyspark.data.mllib.images.origin.kittens' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.data.streaming' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.data.streaming' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.data.streaming' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.data.streaming' to be distributed and are
+              already explicitly excluding 'pyspark.data.streaming' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.examples.src.main.python.ml' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.examples.src.main.python.ml' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.examples.src.main.python.ml' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.examples.src.main.python.ml' to be distributed and are
+              already explicitly excluding 'pyspark.examples.src.main.python.ml' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.examples.src.main.python.mllib' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.examples.src.main.python.mllib' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.examples.src.main.python.mllib' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.examples.src.main.python.mllib' to be distributed and are
+              already explicitly excluding 'pyspark.examples.src.main.python.mllib' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.examples.src.main.python.sql' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.examples.src.main.python.sql' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.examples.src.main.python.sql' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.examples.src.main.python.sql' to be distributed and are
+              already explicitly excluding 'pyspark.examples.src.main.python.sql' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.examples.src.main.python.sql.streaming' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.examples.src.main.python.sql.streaming' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.examples.src.main.python.sql.streaming' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.examples.src.main.python.sql.streaming' to be distributed and are
+              already explicitly excluding 'pyspark.examples.src.main.python.sql.streaming' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.examples.src.main.python.streaming' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.examples.src.main.python.streaming' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.examples.src.main.python.streaming' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.examples.src.main.python.streaming' to be distributed and are
+              already explicitly excluding 'pyspark.examples.src.main.python.streaming' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.sql.pandas._typing' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.sql.pandas._typing' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.sql.pandas._typing' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.sql.pandas._typing' to be distributed and are
+              already explicitly excluding 'pyspark.sql.pandas._typing' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      /usr/lib/python3/dist-packages/setuptools/command/build_py.py:204: _Warning: Package 'pyspark.sql.pandas._typing.protocols' is absent from the `packages` configuration.
+      !!
+      
+              ********************************************************************************
+              ############################
+              # Package would be ignored #
+              ############################
+              Python recognizes 'pyspark.sql.pandas._typing.protocols' as an importable package[^1],
+              but it is absent from setuptools' `packages` configuration.
+      
+              This leads to an ambiguous overall configuration. If you want to distribute this
+              package, please make sure that 'pyspark.sql.pandas._typing.protocols' is explicitly added
+              to the `packages` configuration field.
+      
+              Alternatively, you can also rely on setuptools' discovery methods
+              (for example by using `find_namespace_packages(...)`/`find_namespace:`
+              instead of `find_packages(...)`/`find:`).
+      
+              You can read more about "package discovery" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/package_discovery.html
+      
+              If you don't want 'pyspark.sql.pandas._typing.protocols' to be distributed and are
+              already explicitly excluding 'pyspark.sql.pandas._typing.protocols' via
+              `find_namespace_packages(...)/find_namespace` or `find_packages(...)/find`,
+              you can try to use `exclude_package_data`, or `include-package-data=False` in
+              combination with a more fine grained `package-data` configuration.
+      
+              You can read more about "package data files" on setuptools documentation page:
+      
+              - https://setuptools.pypa.io/en/latest/userguide/datafiles.html
+      
+      
+              [^1]: For Python, any directory (with suitable naming) can be imported,
+                    even if it does not contain any `.py` files.
+                    On the other hand, currently there is no concept of package data
+                    directory, all directories are treated like packages.
+              ********************************************************************************
+      
+      !!
+        check.warn(importable)
+      copying pyspark/_typing.pyi -> build/lib/pyspark
+      copying pyspark/py.typed -> build/lib/pyspark
+      copying pyspark/mllib/_typing.pyi -> build/lib/pyspark/mllib
+      copying pyspark/ml/_typing.pyi -> build/lib/pyspark/ml
+      copying pyspark/sql/_typing.pyi -> build/lib/pyspark/sql
+      copying pyspark/sql/connect/proto/base_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/catalog_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/commands_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/common_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/example_plugins_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/expressions_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/ml_common_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/ml_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/pipelines_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/relations_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/connect/proto/types_pb2.pyi -> build/lib/pyspark/sql/connect/proto
+      copying pyspark/sql/pandas/functions.pyi -> build/lib/pyspark/sql/pandas
+      creating build/lib/pyspark/sql/pandas/_typing
+      copying pyspark/sql/pandas/_typing/__init__.pyi -> build/lib/pyspark/sql/pandas/_typing
+      creating build/lib/pyspark/sql/pandas/_typing/protocols
+      copying pyspark/sql/pandas/_typing/protocols/__init__.pyi -> build/lib/pyspark/sql/pandas/_typing/protocols
+      copying pyspark/sql/pandas/_typing/protocols/frame.pyi -> build/lib/pyspark/sql/pandas/_typing/protocols
+      copying pyspark/sql/pandas/_typing/protocols/series.pyi -> build/lib/pyspark/sql/pandas/_typing/protocols
+      copying pyspark/sql/streaming/proto/StateMessage_pb2.pyi -> build/lib/pyspark/sql/streaming/proto
+      creating build/lib/pyspark/bin
+      copying deps/bin/beeline -> build/lib/pyspark/bin
+      copying deps/bin/beeline.cmd -> build/lib/pyspark/bin
+      copying deps/bin/docker-image-tool.sh -> build/lib/pyspark/bin
+      copying deps/bin/find-spark-home -> build/lib/pyspark/bin
+      copying deps/bin/find-spark-home.cmd -> build/lib/pyspark/bin
+      copying deps/bin/load-spark-env.cmd -> build/lib/pyspark/bin
+      copying deps/bin/load-spark-env.sh -> build/lib/pyspark/bin
+      copying deps/bin/pyspark -> build/lib/pyspark/bin
+      copying deps/bin/pyspark.cmd -> build/lib/pyspark/bin
+      copying deps/bin/pyspark2.cmd -> build/lib/pyspark/bin
+      copying deps/bin/run-example -> build/lib/pyspark/bin
+      copying deps/bin/run-example.cmd -> build/lib/pyspark/bin
+      copying deps/bin/spark-class -> build/lib/pyspark/bin
+      copying deps/bin/spark-class.cmd -> build/lib/pyspark/bin
+      copying deps/bin/spark-class2.cmd -> build/lib/pyspark/bin
+      copying deps/bin/spark-connect-shell -> build/lib/pyspark/bin
+      copying deps/bin/spark-pipelines -> build/lib/pyspark/bin
+      copying deps/bin/spark-shell -> build/lib/pyspark/bin
+      copying deps/bin/spark-shell.cmd -> build/lib/pyspark/bin
+      copying deps/bin/spark-shell2.cmd -> build/lib/pyspark/bin
+      copying deps/bin/spark-sql -> build/lib/pyspark/bin
+      copying deps/bin/spark-sql.cmd -> build/lib/pyspark/bin
+      copying deps/bin/spark-sql2.cmd -> build/lib/pyspark/bin
+      copying deps/bin/spark-submit -> build/lib/pyspark/bin
+      copying deps/bin/spark-submit.cmd -> build/lib/pyspark/bin
+      copying deps/bin/spark-submit2.cmd -> build/lib/pyspark/bin
+      copying deps/bin/sparkR -> build/lib/pyspark/bin
+      copying deps/bin/sparkR.cmd -> build/lib/pyspark/bin
+      copying deps/bin/sparkR2.cmd -> build/lib/pyspark/bin
+      creating build/lib/pyspark/sbin
+      copying deps/sbin/spark-config.sh -> build/lib/pyspark/sbin
+      copying deps/sbin/spark-daemon.sh -> build/lib/pyspark/sbin
+      copying deps/sbin/start-history-server.sh -> build/lib/pyspark/sbin
+      copying deps/sbin/stop-history-server.sh -> build/lib/pyspark/sbin
+      creating build/lib/pyspark/jars
+      copying deps/jars/HikariCP-2.5.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/JLargeArrays-1.5.jar -> build/lib/pyspark/jars
+      copying deps/jars/JTransforms-3.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/RoaringBitmap-1.3.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/ST4-4.0.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/aircompressor-2.0.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/algebra_2.13-2.8.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/antlr-runtime-3.5.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/antlr4-runtime-4.13.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/aopalliance-repackaged-3.0.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/arpack-3.0.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/arpack_combined_all-0.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/arrow-compression-18.3.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/arrow-format-18.3.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/arrow-memory-core-18.3.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/arrow-memory-netty-18.3.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/arrow-memory-netty-buffer-patch-18.3.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/arrow-vector-18.3.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/audience-annotations-0.12.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/avro-1.12.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/avro-ipc-1.12.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/avro-mapred-1.12.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/blas-3.0.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/breeze-macros_2.13-2.1.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/breeze_2.13-2.1.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/cats-kernel_2.13-2.8.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/chill-java-0.10.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/chill_2.13-0.10.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-cli-1.10.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-codec-1.19.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-collections4-4.5.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-compiler-3.1.9.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-compress-1.28.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-crypto-1.1.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-dbcp-1.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-io-2.21.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-lang-2.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-lang3-3.19.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-math3-3.6.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-pool-1.5.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/commons-text-1.14.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/compress-lzf-1.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/curator-client-5.9.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/curator-framework-5.9.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/curator-recipes-5.9.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/datanucleus-api-jdo-4.2.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/datanucleus-core-4.1.17.jar -> build/lib/pyspark/jars
+      copying deps/jars/datanucleus-rdbms-4.1.19.jar -> build/lib/pyspark/jars
+      copying deps/jars/datasketches-java-6.2.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/datasketches-memory-3.0.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/derby-10.16.1.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/derbyshared-10.16.1.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/derbytools-10.16.1.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/dropwizard-metrics-hadoop-metrics2-reporter-0.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/failureaccess-1.0.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/flatbuffers-java-25.2.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/gson-2.11.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/guava-33.4.8-jre.jar -> build/lib/pyspark/jars
+      copying deps/jars/hadoop-client-api-3.4.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/hadoop-client-runtime-3.4.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-beeline-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-cli-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-common-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-exec-2.3.10-core.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-jdbc-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-metastore-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-serde-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-service-rpc-4.0.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-shims-0.23-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-shims-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-shims-common-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-shims-scheduler-2.3.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/hive-storage-api-2.8.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/hk2-api-3.0.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/hk2-locator-3.0.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/hk2-utils-3.0.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/httpclient-4.5.14.jar -> build/lib/pyspark/jars
+      copying deps/jars/httpcore-4.4.16.jar -> build/lib/pyspark/jars
+      copying deps/jars/icu4j-77.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/istack-commons-runtime-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/ivy-2.5.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/jackson-annotations-2.21.jar -> build/lib/pyspark/jars
+      copying deps/jars/jackson-core-2.21.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/jackson-databind-2.21.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/jackson-dataformat-yaml-2.21.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/jackson-datatype-jsr310-2.21.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/jackson-module-scala_2.13-2.21.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/jakarta.activation-api-2.1.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/jakarta.annotation-api-2.1.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/jakarta.inject-api-2.0.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/jakarta.servlet-api-5.0.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/jakarta.validation-api-3.0.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/jakarta.ws.rs-api-3.0.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/jakarta.xml.bind-api-4.0.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/janino-3.1.9.jar -> build/lib/pyspark/jars
+      copying deps/jars/java-diff-utils-4.16.jar -> build/lib/pyspark/jars
+      copying deps/jars/javassist-3.30.2-GA.jar -> build/lib/pyspark/jars
+      copying deps/jars/javax.jdo-3.2.0-m3.jar -> build/lib/pyspark/jars
+      copying deps/jars/javax.servlet-api-4.0.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/javolution-5.5.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/jaxb-core-4.0.5.jar -> build/lib/pyspark/jars
+      copying deps/jars/jaxb-runtime-4.0.5.jar -> build/lib/pyspark/jars
+      copying deps/jars/jcl-over-slf4j-2.0.17.jar -> build/lib/pyspark/jars
+      copying deps/jars/jdo-api-3.0.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/jersey-client-3.0.18.jar -> build/lib/pyspark/jars
+      copying deps/jars/jersey-common-3.0.18.jar -> build/lib/pyspark/jars
+      copying deps/jars/jersey-container-servlet-3.0.18.jar -> build/lib/pyspark/jars
+      copying deps/jars/jersey-container-servlet-core-3.0.18.jar -> build/lib/pyspark/jars
+      copying deps/jars/jersey-hk2-3.0.18.jar -> build/lib/pyspark/jars
+      copying deps/jars/jersey-server-3.0.18.jar -> build/lib/pyspark/jars
+      copying deps/jars/jjwt-api-0.12.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/jjwt-impl-0.12.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/jjwt-jackson-0.12.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/jline-2.14.6.jar -> build/lib/pyspark/jars
+      copying deps/jars/jline-3.29.0-jdk8.jar -> build/lib/pyspark/jars
+      copying deps/jars/joda-time-2.14.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/jpam-1.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/json-1.8.jar -> build/lib/pyspark/jars
+      copying deps/jars/json4s-ast_2.13-4.0.7.jar -> build/lib/pyspark/jars
+      copying deps/jars/json4s-core_2.13-4.0.7.jar -> build/lib/pyspark/jars
+      copying deps/jars/json4s-jackson-core_2.13-4.0.7.jar -> build/lib/pyspark/jars
+      copying deps/jars/json4s-jackson_2.13-4.0.7.jar -> build/lib/pyspark/jars
+      copying deps/jars/json4s-scalap_2.13-4.0.7.jar -> build/lib/pyspark/jars
+      copying deps/jars/jsr305-3.0.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/jta-1.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/jts-core-1.20.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/jul-to-slf4j-2.0.17.jar -> build/lib/pyspark/jars
+      copying deps/jars/kryo-shaded-4.0.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-client-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-client-api-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-httpclient-vertx-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-admissionregistration-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-apiextensions-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-apps-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-autoscaling-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-batch-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-certificates-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-common-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-coordination-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-core-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-discovery-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-events-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-extensions-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-flowcontrol-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-gatewayapi-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-metrics-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-networking-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-node-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-policy-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-rbac-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-resource-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-scheduling-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/kubernetes-model-storageclass-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/lapack-3.0.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/leveldbjni-all-1.8.jar -> build/lib/pyspark/jars
+      copying deps/jars/libfb303-0.9.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/libthrift-0.16.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/log4j-1.2-api-2.24.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/log4j-api-2.24.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/log4j-core-2.24.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/log4j-layout-template-json-2.24.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/log4j-slf4j2-impl-2.24.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/lz4-java-1.8.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/metrics-core-4.2.37.jar -> build/lib/pyspark/jars
+      copying deps/jars/metrics-graphite-4.2.37.jar -> build/lib/pyspark/jars
+      copying deps/jars/metrics-jmx-4.2.37.jar -> build/lib/pyspark/jars
+      copying deps/jars/metrics-json-4.2.37.jar -> build/lib/pyspark/jars
+      copying deps/jars/metrics-jvm-4.2.37.jar -> build/lib/pyspark/jars
+      copying deps/jars/minlog-1.3.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-all-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-buffer-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-base-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-classes-quic-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-compression-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-dns-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-http-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-http2-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-http3-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-marshalling-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-native-quic-4.2.7.Final-linux-aarch_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-native-quic-4.2.7.Final-linux-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-native-quic-4.2.7.Final-osx-aarch_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-native-quic-4.2.7.Final-osx-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-native-quic-4.2.7.Final-windows-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-protobuf-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-codec-socks-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-common-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-handler-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-handler-proxy-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-resolver-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-resolver-dns-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-tcnative-boringssl-static-2.0.74.Final-linux-aarch_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-tcnative-boringssl-static-2.0.74.Final-linux-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-tcnative-boringssl-static-2.0.74.Final-osx-aarch_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-tcnative-boringssl-static-2.0.74.Final-osx-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-tcnative-boringssl-static-2.0.74.Final-windows-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-tcnative-classes-2.0.74.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-classes-epoll-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-classes-io_uring-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-classes-kqueue-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-epoll-4.2.7.Final-linux-aarch_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-epoll-4.2.7.Final-linux-riscv64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-epoll-4.2.7.Final-linux-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-io_uring-4.2.7.Final-linux-aarch_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-io_uring-4.2.7.Final-linux-riscv64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-io_uring-4.2.7.Final-linux-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-kqueue-4.2.7.Final-osx-aarch_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-kqueue-4.2.7.Final-osx-x86_64.jar -> build/lib/pyspark/jars
+      copying deps/jars/netty-transport-native-unix-common-4.2.7.Final.jar -> build/lib/pyspark/jars
+      copying deps/jars/objenesis-3.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/opencsv-2.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/orc-core-2.2.2-shaded-protobuf.jar -> build/lib/pyspark/jars
+      copying deps/jars/orc-format-1.1.1-shaded-protobuf.jar -> build/lib/pyspark/jars
+      copying deps/jars/orc-mapreduce-2.2.2-shaded-protobuf.jar -> build/lib/pyspark/jars
+      copying deps/jars/orc-shims-2.2.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/oro-2.0.8.jar -> build/lib/pyspark/jars
+      copying deps/jars/osgi-resource-locator-1.0.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/paranamer-2.8.3.jar -> build/lib/pyspark/jars
+      copying deps/jars/parquet-column-1.16.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/parquet-common-1.16.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/parquet-encoding-1.16.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/parquet-format-structures-1.16.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/parquet-hadoop-1.16.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/parquet-jackson-1.16.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/pickle-1.5.jar -> build/lib/pyspark/jars
+      copying deps/jars/py4j-0.10.9.9.jar -> build/lib/pyspark/jars
+      copying deps/jars/rocksdbjni-9.8.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/scala-compiler-2.13.17.jar -> build/lib/pyspark/jars
+      copying deps/jars/scala-library-2.13.17.jar -> build/lib/pyspark/jars
+      copying deps/jars/scala-parallel-collections_2.13-1.2.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/scala-parser-combinators_2.13-2.4.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/scala-reflect-2.13.17.jar -> build/lib/pyspark/jars
+      copying deps/jars/scala-xml_2.13-2.4.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/slf4j-api-2.0.17.jar -> build/lib/pyspark/jars
+      copying deps/jars/snakeyaml-2.5.jar -> build/lib/pyspark/jars
+      copying deps/jars/snakeyaml-engine-2.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/snappy-java-1.1.10.8.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-catalyst_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-common-utils-java_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-common-utils_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-connect_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-core_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-graphx_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-hive-thriftserver_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-hive_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-kubernetes_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-kvstore_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-launcher_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-mllib-local_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-mllib_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-network-common_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-network-shuffle_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-pipelines_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-repl_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-sketch_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-sql-api_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-sql_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-streaming_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-tags_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-unsafe_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-variant_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spark-yarn_2.13-4.1.2.jar -> build/lib/pyspark/jars
+      copying deps/jars/spire-macros_2.13-0.18.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/spire-platform_2.13-0.18.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/spire-util_2.13-0.18.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/spire_2.13-0.18.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/stax-api-1.0.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/stream-2.9.8.jar -> build/lib/pyspark/jars
+      copying deps/jars/super-csv-2.2.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/threeten-extra-1.8.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/tink-1.16.0.jar -> build/lib/pyspark/jars
+      copying deps/jars/transaction-api-1.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/univocity-parsers-2.9.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/vertx-auth-common-4.5.25.jar -> build/lib/pyspark/jars
+      copying deps/jars/vertx-core-4.5.25.jar -> build/lib/pyspark/jars
+      copying deps/jars/vertx-web-client-4.5.25.jar -> build/lib/pyspark/jars
+      copying deps/jars/vertx-web-common-4.5.25.jar -> build/lib/pyspark/jars
+      copying deps/jars/xbean-asm9-shaded-4.28.jar -> build/lib/pyspark/jars
+      copying deps/jars/xmlschema-core-2.3.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/xz-1.10.jar -> build/lib/pyspark/jars
+      copying deps/jars/zjsonpatch-7.4.1.jar -> build/lib/pyspark/jars
+      copying deps/jars/zookeeper-3.9.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/zookeeper-jute-3.9.4.jar -> build/lib/pyspark/jars
+      copying deps/jars/zstd-jni-1.5.7-6.jar -> build/lib/pyspark/jars
+      creating build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-compiler-2.13.17_2.13.17-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-compiler-interface-2.13.17_2.13.17-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-interp-2.13.17_2.13.17-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-interp-api-2.13.17_2.13.17-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-repl-2.13.17_2.13.17-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-repl-api-2.13.17_2.13.17-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-runtime-2.13.17_2.13.17-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-terminal-2.13.17_2.13-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite-util-2.13.17_2.13-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ammonite_2.13.17-3.0.3.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/bsp4j-2.1.1.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/class-path-util_2.13-0.1.4.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/common_2.13-4.13.10.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/dependency-interface_2.13-0.3.2.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/dependency_2.13-0.3.2.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/fansi_2.13-0.5.1.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/fastparse_2.13-3.1.1.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/geny_2.13-1.1.1.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/interface-1.0.28.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/io_2.13-4.13.10.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/javaparser-core-3.2.12.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/lenses_2.13-0.11.15.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/mainargs_2.13-0.7.6.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/org.eclipse.lsp4j.generator-0.20.1.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/org.eclipse.lsp4j.jsonrpc-0.20.1.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/org.eclipse.xtend.lib-2.28.0.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/org.eclipse.xtend.lib.macro-2.28.0.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/org.eclipse.xtext.xbase.lib-2.28.0.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/os-lib_2.13-0.11.5.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/os-zip-0.11.5.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/parsers_2.13-4.13.10.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/pprint_2.13-0.9.0.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/requests_2.13-0.9.0.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/scalameta_2.13-4.13.10.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/scalaparse_2.13-3.1.1.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/scalapb-runtime_2.13-0.11.15.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/semanticdb-shared_2.13-4.13.10.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/sourcecode_2.13-0.4.4.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/spark-connect-client-jdbc_2.13-4.1.2.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/spark-connect-client-jvm_2.13-4.1.2.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/trees_2.13-4.13.10.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/typename_2.13-1.1.0.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/ujson_2.13-4.3.2.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/upack_2.13-4.3.2.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/upickle-core_2.13-4.3.2.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/upickle-implicits_2.13-4.3.2.jar -> build/lib/pyspark/jars/connect-repl
+      copying deps/jars/connect-repl/upickle_2.13-4.3.2.jar -> build/lib/pyspark/jars/connect-repl
+      creating build/lib/pyspark/python/lib
+      copying lib/py4j-0.10.9.9-src.zip -> build/lib/pyspark/python/lib
+      copying lib/pyspark.zip -> build/lib/pyspark/python/lib
+      creating build/lib/pyspark/data
+      creating build/lib/pyspark/data/artifact-tests
+      creating build/lib/pyspark/data/artifact-tests/crc
+      copying deps/data/artifact-tests/crc/junitLargeJar.txt -> build/lib/pyspark/data/artifact-tests/crc
+      copying deps/data/artifact-tests/crc/smallJar.txt -> build/lib/pyspark/data/artifact-tests/crc
+      creating build/lib/pyspark/data/graphx
+      copying deps/data/graphx/followers.txt -> build/lib/pyspark/data/graphx
+      copying deps/data/graphx/users.txt -> build/lib/pyspark/data/graphx
+      creating build/lib/pyspark/data/mllib
+      copying deps/data/mllib/gmm_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/kmeans_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/pagerank_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/pic_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_binary_classification_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_fpgrowth.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_isotonic_regression_libsvm_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_kmeans_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_lda_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_lda_libsvm_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_libsvm_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_linear_regression_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_movielens_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_multiclass_classification_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/sample_svm_data.txt -> build/lib/pyspark/data/mllib
+      copying deps/data/mllib/streaming_kmeans_data_test.txt -> build/lib/pyspark/data/mllib
+      creating build/lib/pyspark/data/mllib/als
+      copying deps/data/mllib/als/sample_movielens_ratings.txt -> build/lib/pyspark/data/mllib/als
+      copying deps/data/mllib/als/test.data -> build/lib/pyspark/data/mllib/als
+      creating build/lib/pyspark/data/mllib/images
+      copying deps/data/mllib/images/license.txt -> build/lib/pyspark/data/mllib/images
+      creating build/lib/pyspark/data/mllib/images/origin
+      copying deps/data/mllib/images/origin/license.txt -> build/lib/pyspark/data/mllib/images/origin
+      creating build/lib/pyspark/data/mllib/images/origin/kittens
+      copying deps/data/mllib/images/origin/kittens/not-image.txt -> build/lib/pyspark/data/mllib/images/origin/kittens
+      creating build/lib/pyspark/data/mllib/ridge-data
+      copying deps/data/mllib/ridge-data/lpsa.data -> build/lib/pyspark/data/mllib/ridge-data
+      creating build/lib/pyspark/data/streaming
+      copying deps/data/streaming/AFINN-111.txt -> build/lib/pyspark/data/streaming
+      creating build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-AnchorJS.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-CC0.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-bootstrap.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-cloudpickle.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-d3.min.js.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-dagre-d3.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-datatables.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-graphlib-dot.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-jdom.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-join.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-jquery.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-json-formatter.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-loose-version.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-matchMedia-polyfill.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-modernizr.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-mustache.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-py4j.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-respond.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-sbt-launch-lib.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-sorttable.js.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-vis-timeline.txt -> build/lib/pyspark/licenses
+      copying deps/licenses/LICENSE-xz.txt -> build/lib/pyspark/licenses
+      copying pyspark/errors/error-conditions.json -> build/lib/pyspark/errors
+      creating build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/aft_survival_regression.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/als_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/binarizer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/bisecting_k_means_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/bucketed_random_projection_lsh_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/bucketizer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/chi_square_test_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/chisq_selector_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/correlation_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/count_vectorizer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/cross_validator.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/dataframe_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/dct_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/decision_tree_classification_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/decision_tree_regression_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/elementwise_product_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/estimator_transformer_param_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/feature_hasher_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/fm_classifier_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/fm_regressor_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/fpgrowth_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/gaussian_mixture_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/generalized_linear_regression_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/gradient_boosted_tree_classifier_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/gradient_boosted_tree_regressor_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/imputer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/index_to_string_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/interaction_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/isotonic_regression_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/kmeans_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/lda_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/linear_regression_with_elastic_net.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/linearsvc.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/logistic_regression_summary_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/logistic_regression_with_elastic_net.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/max_abs_scaler_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/min_hash_lsh_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/min_max_scaler_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/multiclass_logistic_regression_with_elastic_net.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/multilayer_perceptron_classification.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/n_gram_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/naive_bayes_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/normalizer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/one_vs_rest_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/onehot_encoder_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/pca_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/pipeline_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/polynomial_expansion_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/power_iteration_clustering_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/prefixspan_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/quantile_discretizer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/random_forest_classifier_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/random_forest_regressor_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/rformula_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/robust_scaler_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/sql_transformer.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/standard_scaler_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/stopwords_remover_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/string_indexer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/summarizer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/target_encoder_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/tf_idf_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/tokenizer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/train_validation_split.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/univariate_feature_selector_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/variance_threshold_selector_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/vector_assembler_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/vector_indexer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/vector_size_hint_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/vector_slicer_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      copying deps/examples/ml/word2vec_example.py -> build/lib/pyspark/examples/src/main/python/ml
+      creating build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/__init__.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/binary_classification_metrics_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/bisecting_k_means_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/correlations.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/correlations_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/decision_tree_classification_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/decision_tree_regression_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/elementwise_product_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/fpgrowth_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/gaussian_mixture_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/gaussian_mixture_model.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/gradient_boosting_classification_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/gradient_boosting_regression_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/hypothesis_testing_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/hypothesis_testing_kolmogorov_smirnov_test_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/isotonic_regression_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/k_means_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/kernel_density_estimation_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/kmeans.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/latent_dirichlet_allocation_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/linear_regression_with_sgd_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/logistic_regression.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/logistic_regression_with_lbfgs_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/multi_class_metrics_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/multi_label_metrics_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/naive_bayes_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/normalizer_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/pca_rowmatrix_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/power_iteration_clustering_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/random_forest_classification_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/random_forest_regression_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/random_rdd_generation.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/ranking_metrics_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/recommendation_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/regression_metrics_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/sampled_rdds.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/standard_scaler_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/stratified_sampling_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/streaming_k_means_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/streaming_linear_regression_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/summary_statistics_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/svd_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/svm_with_sgd_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/tf_idf_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/word2vec.py -> build/lib/pyspark/examples/src/main/python/mllib
+      copying deps/examples/mllib/word2vec_example.py -> build/lib/pyspark/examples/src/main/python/mllib
+      creating build/lib/pyspark/examples/src/main/python/sql
+      copying deps/examples/sql/__init__.py -> build/lib/pyspark/examples/src/main/python/sql
+      copying deps/examples/sql/arrow.py -> build/lib/pyspark/examples/src/main/python/sql
+      copying deps/examples/sql/basic.py -> build/lib/pyspark/examples/src/main/python/sql
+      copying deps/examples/sql/datasource.py -> build/lib/pyspark/examples/src/main/python/sql
+      copying deps/examples/sql/hive.py -> build/lib/pyspark/examples/src/main/python/sql
+      copying deps/examples/sql/udtf.py -> build/lib/pyspark/examples/src/main/python/sql
+      creating build/lib/pyspark/examples/src/main/python/sql/streaming
+      copying deps/examples/sql/streaming/structured_kafka_wordcount.py -> build/lib/pyspark/examples/src/main/python/sql/streaming
+      copying deps/examples/sql/streaming/structured_network_wordcount.py -> build/lib/pyspark/examples/src/main/python/sql/streaming
+      copying deps/examples/sql/streaming/structured_network_wordcount_session_window.py -> build/lib/pyspark/examples/src/main/python/sql/streaming
+      copying deps/examples/sql/streaming/structured_network_wordcount_windowed.py -> build/lib/pyspark/examples/src/main/python/sql/streaming
+      copying deps/examples/sql/streaming/structured_sessionization.py -> build/lib/pyspark/examples/src/main/python/sql/streaming
+      creating build/lib/pyspark/examples/src/main/python/streaming
+      copying deps/examples/streaming/__init__.py -> build/lib/pyspark/examples/src/main/python/streaming
+      copying deps/examples/streaming/hdfs_wordcount.py -> build/lib/pyspark/examples/src/main/python/streaming
+      copying deps/examples/streaming/network_wordcount.py -> build/lib/pyspark/examples/src/main/python/streaming
+      copying deps/examples/streaming/network_wordjoinsentiments.py -> build/lib/pyspark/examples/src/main/python/streaming
+      copying deps/examples/streaming/queue_stream.py -> build/lib/pyspark/examples/src/main/python/streaming
+      copying deps/examples/streaming/recoverable_network_wordcount.py -> build/lib/pyspark/examples/src/main/python/streaming
+      copying deps/examples/streaming/sql_network_wordcount.py -> build/lib/pyspark/examples/src/main/python/streaming
+      copying deps/examples/streaming/stateful_network_wordcount.py -> build/lib/pyspark/examples/src/main/python/streaming
+      running build_scripts
+      creating build/scripts-3.11
+      copying deps/bin/pyspark -> build/scripts-3.11
+      copying deps/bin/spark-class.cmd -> build/scripts-3.11
+      copying deps/bin/spark-class -> build/scripts-3.11
+      copying deps/bin/find-spark-home -> build/scripts-3.11
+      copying deps/bin/spark-submit2.cmd -> build/scripts-3.11
+      copying deps/bin/spark-sql2.cmd -> build/scripts-3.11
+      copying deps/bin/load-spark-env.sh -> build/scripts-3.11
+      copying deps/bin/spark-submit -> build/scripts-3.11
+      copying deps/bin/spark-shell -> build/scripts-3.11
+      copying deps/bin/spark-shell2.cmd -> build/scripts-3.11
+      copying deps/bin/run-example.cmd -> build/scripts-3.11
+      copying deps/bin/pyspark.cmd -> build/scripts-3.11
+      copying deps/bin/spark-shell.cmd -> build/scripts-3.11
+      copying deps/bin/find-spark-home.cmd -> build/scripts-3.11
+      copying deps/bin/spark-submit.cmd -> build/scripts-3.11
+      copying deps/bin/spark-pipelines -> build/scripts-3.11
+      copying deps/bin/spark-connect-shell -> build/scripts-3.11
+      copying deps/bin/sparkR2.cmd -> build/scripts-3.11
+      copying deps/bin/spark-sql.cmd -> build/scripts-3.11
+      copying deps/bin/beeline -> build/scripts-3.11
+      copying deps/bin/docker-image-tool.sh -> build/scripts-3.11
+      copying deps/bin/beeline.cmd -> build/scripts-3.11
+      copying deps/bin/spark-class2.cmd -> build/scripts-3.11
+      copying deps/bin/sparkR.cmd -> build/scripts-3.11
+      copying deps/bin/run-example -> build/scripts-3.11
+      copying deps/bin/spark-sql -> build/scripts-3.11
+      copying deps/bin/pyspark2.cmd -> build/scripts-3.11
+      copying deps/bin/sparkR -> build/scripts-3.11
+      copying deps/bin/load-spark-env.cmd -> build/scripts-3.11
+      copying and adjusting pyspark/find_spark_home.py -> build/scripts-3.11
+      changing mode of build/scripts-3.11/spark-class.cmd from 644 to 755
+      changing mode of build/scripts-3.11/spark-submit2.cmd from 644 to 755
+      changing mode of build/scripts-3.11/spark-sql2.cmd from 644 to 755
+      changing mode of build/scripts-3.11/load-spark-env.sh from 644 to 755
+      changing mode of build/scripts-3.11/spark-shell2.cmd from 644 to 755
+      changing mode of build/scripts-3.11/run-example.cmd from 644 to 755
+      changing mode of build/scripts-3.11/pyspark.cmd from 644 to 755
+      changing mode of build/scripts-3.11/spark-shell.cmd from 644 to 755
+      changing mode of build/scripts-3.11/find-spark-home.cmd from 644 to 755
+      changing mode of build/scripts-3.11/spark-submit.cmd from 644 to 755
+      changing mode of build/scripts-3.11/sparkR2.cmd from 644 to 755
+      changing mode of build/scripts-3.11/spark-sql.cmd from 644 to 755
+      changing mode of build/scripts-3.11/beeline.cmd from 644 to 755
+      changing mode of build/scripts-3.11/sparkR.cmd from 644 to 755
+      changing mode of build/scripts-3.11/pyspark2.cmd from 644 to 755
+      changing mode of build/scripts-3.11/load-spark-env.cmd from 644 to 755
+      changing mode of build/scripts-3.11/find_spark_home.py from 644 to 755
+      /usr/lib/python3/dist-packages/setuptools/_distutils/cmd.py:66: SetuptoolsDeprecationWarning: setup.py install is deprecated.
+      !!
+      
+              ********************************************************************************
+              Please avoid running ``setup.py`` directly.
+              Instead, use pypa/build, pypa/installer or other
+              standards-based tools.
+      
+              See https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html for details.
+              ********************************************************************************
+      
+      !!
+        self.initialize_options()
+      installing to build/bdist.linux-x86_64/wheel
+      running install
+      running install_lib
+      Traceback (most recent call last):
+        File "<string>", line 2, in <module>
+        File "<pip-setuptools-caller>", line 34, in <module>
+        File "/tmp/pip-install-mhtniwum/pyspark_4de95487a42747ada1e1848351eb1214/setup.py", line 257, in <module>
+          setup(
+        File "/usr/lib/python3/dist-packages/setuptools/__init__.py", line 107, in setup
+          return distutils.core.setup(**attrs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/core.py", line 185, in setup
+          return run_commands(dist)
+                 ^^^^^^^^^^^^^^^^^^
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/core.py", line 201, in run_commands
+          dist.run_commands()
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/dist.py", line 969, in run_commands
+          self.run_command(cmd)
+        File "/usr/lib/python3/dist-packages/setuptools/dist.py", line 1233, in run_command
+          super().run_command(command)
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/dist.py", line 988, in run_command
+          cmd_obj.run()
+        File "/usr/lib/python3/dist-packages/wheel/bdist_wheel.py", line 403, in run
+          self.run_command("install")
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/cmd.py", line 318, in run_command
+          self.distribution.run_command(command)
+        File "/usr/lib/python3/dist-packages/setuptools/dist.py", line 1233, in run_command
+          super().run_command(command)
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/dist.py", line 988, in run_command
+          cmd_obj.run()
+        File "/tmp/pip-install-mhtniwum/pyspark_4de95487a42747ada1e1848351eb1214/setup.py", line 167, in run
+          install.run(self)
+        File "/usr/lib/python3/dist-packages/setuptools/command/install.py", line 78, in run
+          return orig.install.run(self)
+                 ^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/command/install.py", line 708, in run
+          self.run_command(cmd_name)
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/cmd.py", line 318, in run_command
+          self.distribution.run_command(command)
+        File "/usr/lib/python3/dist-packages/setuptools/dist.py", line 1233, in run_command
+          super().run_command(command)
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/dist.py", line 987, in run_command
+          cmd_obj.ensure_finalized()
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/cmd.py", line 111, in ensure_finalized
+          self.finalize_options()
+        File "/usr/lib/python3/dist-packages/setuptools/command/install_lib.py", line 17, in finalize_options
+          self.set_undefined_options('install',('install_layout','install_layout'))
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/cmd.py", line 296, in set_undefined_options
+          setattr(self, dst_option, getattr(src_cmd_obj, src_option))
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/usr/lib/python3/dist-packages/setuptools/_distutils/cmd.py", line 107, in __getattr__
+          raise AttributeError(attr)
+      AttributeError: install_layout. Did you mean: 'install_platlib'?
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building wheel for pyspark
+ERROR: Could not build wheels for pyspark, which is required to install pyproject.toml-based projects
