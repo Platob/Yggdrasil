@@ -456,3 +456,20 @@ class TestEnumEdgeCases:
 
         assert convert("RED", Color) is Color.RED
         assert convert("red", Color) is Color.RED
+
+    def test_name_takes_priority_over_value(self) -> None:
+        class Tricky(enum.Enum):
+            A = "B"
+            B = "A"
+
+        assert convert("A", Tricky) is Tricky.A
+        assert convert("B", Tricky) is Tricky.B
+
+    def test_name_lookup_from_widget_string(self) -> None:
+        class Mode(enum.Enum):
+            OVERWRITE = "ow"
+            APPEND = "ap"
+
+        assert convert("OVERWRITE", Mode) is Mode.OVERWRITE
+        assert convert("APPEND", Mode) is Mode.APPEND
+        assert convert("ow", Mode) is Mode.OVERWRITE

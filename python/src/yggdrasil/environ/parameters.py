@@ -42,7 +42,7 @@ import os
 import sys
 from collections.abc import Mapping as MappingABC
 from enum import Enum
-from typing import Any, ClassVar, Iterator, Mapping, get_origin, get_type_hints
+from typing import Any, ClassVar, Iterator, Mapping, get_args, get_origin, get_type_hints
 
 from yggdrasil.data.cast import convert
 
@@ -580,6 +580,20 @@ class SystemParameters(MappingABC):
             return value.name
         return str(value)
 
+    @staticmethod
+    def _element_enum_type(field_type: Any) -> type[Enum] | None:
+        """Extract the ``Enum`` subclass from a parameterized iterable type.
+
+        ``list[Color]`` → ``Color``, ``set[Mode]`` → ``Mode``,
+        ``list[str]`` → ``None``.
+        """
+        args = get_args(field_type)
+        if args:
+            elem = args[0]
+            if isinstance(elem, type) and issubclass(elem, Enum):
+                return elem
+        return None
+
     @classmethod
     def _create_widget(
         cls,
@@ -595,13 +609,17 @@ class SystemParameters(MappingABC):
             options = ["true", "false"]
         elif isinstance(field_type, type) and issubclass(field_type, Enum):
             options = [e.name for e in field_type]
-        elif isinstance(default, (list, set, tuple, frozenset)) and default:
-            options = [
-                v.name if isinstance(v, Enum) else str(v)
-                for v in default
-            ]
         else:
-            options = [cls._format_widget_default(default, widget_type)]
+            elem_enum = cls._element_enum_type(field_type)
+            if elem_enum is not None:
+                options = [e.name for e in elem_enum]
+            elif isinstance(default, (list, set, tuple, frozenset)) and default:
+                options = [
+                    v.name if isinstance(v, Enum) else str(v)
+                    for v in default
+                ]
+            else:
+                options = [cls._format_widget_default(default, widget_type)]
         if not options:
             options = [ALL_VALUES_TAG]
 
