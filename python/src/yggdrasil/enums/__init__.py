@@ -11,3 +11,4 @@ from .jointype import *  # noqa: F403
 from .scheme import *  # noqa: F403
 from .nodetype import *  # noqa: F403
 from .state import *  # noqa: F403
+from .dialect import *  # noqa: F403

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import datetime as dt
 from decimal import Decimal
-from enum import Enum
 from typing import Any
 
 from ..nodes import (
@@ -42,28 +41,9 @@ from ..nodes import (
 from ..operators import ArithmeticOp, CompareOp, LogicalOp
 
 
+from yggdrasil.enums.dialect import Dialect
+
 __all__ = ["to_sql", "from_sql", "Dialect", "DEFAULT_DIALECT"]
-
-
-# ---------------------------------------------------------------------------
-# Dialect — identifier quoting + literal escapes
-# ---------------------------------------------------------------------------
-
-
-class Dialect(str, Enum):
-    """SQL dialects supported by :func:`to_sql`.
-
-    Differences are intentionally minimal — we render a portable
-    subset and only branch where the dialect's syntax is
-    incompatible (identifier quote chars, ``ILIKE`` availability).
-    Unsupported dialects fall back to ANSI-ish defaults.
-    """
-
-    ANSI = "ansi"
-    DATABRICKS = "databricks"
-    POSTGRES = "postgres"
-    SQLITE = "sqlite"
-    MYSQL = "mysql"
 
 
 DEFAULT_DIALECT: Dialect = Dialect.DATABRICKS
