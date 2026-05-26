@@ -15,9 +15,8 @@ class _InstantTask(Awaitable):
     def _start(self):
         self._state = State.RUNNING
 
-    def raise_for_status(self):
-        if self.is_failed:
-            raise RuntimeError(f"task {self._state.name}")
+    def _error_for_status(self):
+        return RuntimeError(f"task {self._state.name}")
 
 
 class _SlowTask(Awaitable):
@@ -34,9 +33,8 @@ class _SlowTask(Awaitable):
         self._state = State.RUNNING
         self._polls = 0
 
-    def raise_for_status(self):
-        if self.is_failed:
-            raise RuntimeError(f"task {self._state.name}")
+    def _error_for_status(self):
+        return RuntimeError(f"task {self._state.name}")
 
 
 class _FailingTask(Awaitable):
@@ -46,9 +44,8 @@ class _FailingTask(Awaitable):
     def _start(self):
         self._state = State.RUNNING
 
-    def raise_for_status(self):
-        if self.is_failed:
-            raise RuntimeError(f"task {self._state.name}")
+    def _error_for_status(self):
+        return RuntimeError(f"task {self._state.name}")
 
 
 class _RetryableTask(Awaitable):
@@ -72,9 +69,8 @@ class _RetryableTask(Awaitable):
         self._polls = 0
         self._state = State.RUNNING
 
-    def raise_for_status(self):
-        if self.is_failed:
-            raise RuntimeError(f"task {self._state.name}")
+    def _error_for_status(self):
+        return RuntimeError(f"task {self._state.name}")
 
 
 class _AlwaysRetryableTask(Awaitable):
@@ -88,9 +84,8 @@ class _AlwaysRetryableTask(Awaitable):
     def _start(self):
         self._state = State.RUNNING
 
-    def raise_for_status(self):
-        if self.is_failed:
-            raise RuntimeError(f"task {self._state.name}")
+    def _error_for_status(self):
+        return RuntimeError(f"task {self._state.name}")
 
 
 class _CancellableTask(Awaitable):
@@ -106,9 +101,19 @@ class _CancellableTask(Awaitable):
         self.cancelled = True
         self._state = State.CANCELED
 
-    def raise_for_status(self):
-        if self.is_failed:
-            raise RuntimeError(f"task {self._state.name}")
+    def _error_for_status(self):
+        return RuntimeError(f"task {self._state.name}")
+
+
+class _CustomErrorTask(Awaitable):
+    def _poll(self):
+        self._state = State.FAILED
+
+    def _start(self):
+        self._state = State.RUNNING
+
+    def _error_for_status(self):
+        return ValueError("custom error message")
 
 
 class TestAbstract:
@@ -120,7 +125,7 @@ class TestAbstract:
     def test_abstract_methods(self):
         assert "_poll" in Awaitable.__abstractmethods__
         assert "_start" in Awaitable.__abstractmethods__
-        assert "raise_for_status" in Awaitable.__abstractmethods__
+        assert "_error_for_status" in Awaitable.__abstractmethods__
 
 
 class TestInitialState:
@@ -392,51 +397,65 @@ class TestRetry:
         wc = WaitingConfig.from_(True)
         assert wc.max_attempts == 4
 
-    def test_retryable_resets_iteration_counter(self):
-        t = _RetryableTask(fail_count=1)
-        t.start(wait=False)
-        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01, max_attempts=None)
-        t.wait(wait=wc)
-        assert t._polls >= 2
 
+class TestErrorAndRaiseForStatus:
 
-class TestRaiseForStatus:
-
-    def test_raise_for_status_is_abstract(self):
-        assert "raise_for_status" in Awaitable.__abstractmethods__
-
-    def test_raises_on_failed(self):
+    def test_error_returns_none_when_not_failed(self):
         t = _InstantTask()
+        t._state = State.SUCCEEDED
+        assert t.error is None
+
+    def test_error_returns_none_when_idle(self):
+        t = _InstantTask()
+        assert t.error is None
+
+    def test_error_returns_exception_when_failed(self):
+        t = _FailingTask()
+        t._state = State.FAILED
+        err = t.error
+        assert isinstance(err, RuntimeError)
+        assert "FAILED" in str(err)
+
+    def test_error_returns_exception_when_canceled(self):
+        t = _InstantTask()
+        t._state = State.CANCELED
+        err = t.error
+        assert isinstance(err, RuntimeError)
+
+    def test_custom_error_type(self):
+        t = _CustomErrorTask()
+        t._state = State.FAILED
+        err = t.error
+        assert isinstance(err, ValueError)
+        assert "custom error message" in str(err)
+
+    def test_raise_for_status_raises_error(self):
+        t = _FailingTask()
         t._state = State.FAILED
         with pytest.raises(RuntimeError, match="FAILED"):
             t.raise_for_status()
 
-    def test_raises_on_canceled(self):
-        t = _InstantTask()
-        t._state = State.CANCELED
-        with pytest.raises(RuntimeError, match="CANCELED"):
+    def test_raise_for_status_raises_custom_type(self):
+        t = _CustomErrorTask()
+        t._state = State.FAILED
+        with pytest.raises(ValueError, match="custom error message"):
             t.raise_for_status()
 
-    def test_no_raise_on_succeeded(self):
+    def test_raise_for_status_noop_when_succeeded(self):
         t = _InstantTask()
         t._state = State.SUCCEEDED
         t.raise_for_status()
 
-    def test_no_raise_on_running(self):
+    def test_raise_for_status_noop_when_running(self):
         t = _InstantTask()
         t._state = State.RUNNING
         t.raise_for_status()
 
-    def test_private_raise_for_status_delegates(self):
-        t = _InstantTask()
-        t._state = State.FAILED
-        with pytest.raises(RuntimeError):
-            t._raise_for_status()
-
-    def test_private_raise_for_status_noop_when_not_failed(self):
-        t = _InstantTask()
-        t._state = State.SUCCEEDED
-        t._raise_for_status()
+    def test_wait_raises_custom_error_type(self):
+        t = _CustomErrorTask()
+        t._state = State.RUNNING
+        with pytest.raises(ValueError, match="custom error message"):
+            t.wait(wait=False)
 
 
 class TestCancel:

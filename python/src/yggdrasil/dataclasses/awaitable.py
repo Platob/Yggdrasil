@@ -71,15 +71,22 @@ class Awaitable(ABC):
         ...
 
     @abstractmethod
-    def raise_for_status(self) -> None:
+    def _error_for_status(self) -> BaseException | None:
         ...
 
     def _cancel(self) -> None:
         self._state = State.CANCELED
 
-    def _raise_for_status(self) -> None:
+    @property
+    def error(self) -> BaseException | None:
         if self.is_failed:
-            self.raise_for_status()
+            return self._error_for_status()
+        return None
+
+    def raise_for_status(self) -> None:
+        err = self.error
+        if err is not None:
+            raise err
 
     def start(
         self,
@@ -107,8 +114,8 @@ class Awaitable(ABC):
     ) -> "Awaitable":
         if wait is False:
             self._poll()
-            if self.is_done and self.is_failed and raise_error:
-                self._raise_for_status()
+            if self.is_failed and raise_error:
+                self.raise_for_status()
             return self
         wc = WaitingConfig.from_(wait)
         return self._wait(wc, raise_error=raise_error)
@@ -136,7 +143,7 @@ class Awaitable(ABC):
                             f"{type(self).__name__} timed out after {wait.timeout:.1f}s "
                             f"(state={self._state})"
                         )
-                    self._raise_for_status()
+                    self.raise_for_status()
                 return self
             if wait.is_expired(start):
                 if raise_error:
