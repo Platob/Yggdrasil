@@ -1371,7 +1371,7 @@ class HTTPSession(Session):
             )
             batches = combined_table.to_batches(max_chunksize=max_chunksize)
         else:
-            batches = combined_table.to_batches()
+            batches = combined_table.combine_chunks().to_batches()
 
         new_holder = Memory()
         new_holder.media_type = MediaTypes.ARROW_IPC
