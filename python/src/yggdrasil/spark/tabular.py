@@ -237,7 +237,11 @@ class Dataset(Tabular[CastOptions]):
     def _count(self, options=None) -> int:
         if self._frame is None:
             return 0
-        return self._frame.count()
+        df = self._frame
+        predicate = getattr(options, "predicate", None)
+        if predicate is not None:
+            df = predicate.filter_spark_frame(df)
+        return df.count()
 
     # ------------------------------------------------------------------
     # DataFrame proxy — fall through to the underlying frame for any
