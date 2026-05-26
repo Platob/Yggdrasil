@@ -19,8 +19,13 @@ LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
+<<<<<<< HEAD
     from yggdrasil.http_.response import Response
     from yggdrasil.http_.io_session import Session
+=======
+    from yggdrasil.http_.io_response import Response
+    from yggdrasil.http_.session import Session
+>>>>>>> 7d53e95
     from yggdrasil.io.tabular.base import Tabular
 
 
@@ -407,7 +412,11 @@ class CacheConfig:
         Returns ``(hits, misses)`` — matched by ``public_hash``
         and filtered by ``received_from`` / ``received_to``.
         """
+<<<<<<< HEAD
         from yggdrasil.http_.response import Response
+=======
+        from yggdrasil.http_.io_response import Response
+>>>>>>> 7d53e95
 
         tab = self.read_responses_tabular(
             requests, spark_session=spark_session, session=session,
@@ -451,7 +460,11 @@ class CacheConfig:
         from :attr:`tabular` (or the default local cache folder).
         """
         from yggdrasil.data.options import CastOptions
+<<<<<<< HEAD
         from yggdrasil.http_.response import RESPONSE_SCHEMA
+=======
+        from yggdrasil.http_.io_response import RESPONSE_SCHEMA
+>>>>>>> 7d53e95
 
         holder = self.tabular or self.cache_tabular(session=session)
         if holder is None:
@@ -478,7 +491,11 @@ class CacheConfig:
         if not responses:
             return
         import pyarrow as pa
+<<<<<<< HEAD
         from yggdrasil.http_.response import Response
+=======
+        from yggdrasil.http_.io_response import Response
+>>>>>>> 7d53e95
 
         table = pa.Table.from_batches(
             [Response.values_to_arrow_batch(responses)]
@@ -743,7 +760,11 @@ class SendConfig:
     ) -> "Tabular | None":
         """Read full response rows for hit requests from a cache."""
         from yggdrasil.data.options import CastOptions
+<<<<<<< HEAD
         from yggdrasil.http_.response import RESPONSE_SCHEMA
+=======
+        from yggdrasil.http_.io_response import RESPONSE_SCHEMA
+>>>>>>> 7d53e95
 
         holder = cache.tabular or cache.cache_tabular(session=session)
         if holder is None or not requests:
@@ -762,7 +783,11 @@ class SendConfig:
         if not responses:
             return
         import pyarrow as pa
+<<<<<<< HEAD
         from yggdrasil.http_.response import Response
+=======
+        from yggdrasil.http_.io_response import Response
+>>>>>>> 7d53e95
 
         table = pa.Table.from_batches(
             [Response.values_to_arrow_batch(responses)]

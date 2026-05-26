@@ -18,7 +18,11 @@ import pickle
 import pytest
 
 from yggdrasil.http_ import HTTPSession
+<<<<<<< HEAD
 from yggdrasil.http_.io_session import Session
+=======
+from yggdrasil.http_.session import Session
+>>>>>>> 7d53e95
 from yggdrasil.url import URL
 
 from ._helpers import StubSession

@@ -21,7 +21,11 @@ from yggdrasil.http_.response import HTTPResponse
 from yggdrasil.http_.session import HTTPSession, _PAGINATED_RECHUNK_BYTE_SIZE
 from yggdrasil.io.memory import Memory
 from yggdrasil.http_.request import PreparedRequest
+<<<<<<< HEAD
 from yggdrasil.http_.io_session import Session
+=======
+from yggdrasil.http_.session import Session
+>>>>>>> 7d53e95
 
 EPOCH = dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
 

@@ -16,9 +16,19 @@ from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.data import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.http_.request import PreparedRequest, REQUEST_SCHEMA
+<<<<<<< HEAD
 from yggdrasil.http_.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 from yggdrasil.http_.send_config import SendConfig, CacheConfig, MATCH_KEY
 from yggdrasil.io.tabular import ArrowTabular, Dataset
+=======
+from yggdrasil.http_.io_response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
+from yggdrasil.http_.send_config import SendConfig, CacheConfig, MATCH_KEY
+from yggdrasil.io.tabular import ArrowTabular
+try:
+    from yggdrasil.io.tabular import SparkDataset as Dataset
+except ImportError:
+    Dataset = None
+>>>>>>> 7d53e95
 from yggdrasil.io.tabular.base import Tabular
 
 if TYPE_CHECKING:

@@ -20,7 +20,11 @@ import pytest
 
 from yggdrasil.io.authorization import Authorization
 from yggdrasil.http_.request import PreparedRequest
+<<<<<<< HEAD
 from yggdrasil.http_.io_session import Session
+=======
+from yggdrasil.http_.session import Session
+>>>>>>> 7d53e95
 
 from .._helpers import StubSession, make_request, make_response
 

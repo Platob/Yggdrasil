@@ -43,7 +43,11 @@ from typing import Callable, List
 from yggdrasil.io.memory import Memory
 from yggdrasil.http_.request import PreparedRequest
 from yggdrasil.http_.response import Response
+<<<<<<< HEAD
 from yggdrasil.http_.io_session import Session
+=======
+from yggdrasil.http_.session import Session
+>>>>>>> 7d53e95
 
 
 # ---------------------------------------------------------------------------
