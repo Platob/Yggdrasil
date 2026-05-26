@@ -8,14 +8,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
 from yggdrasil.data.cast import any_to_timedelta
 from yggdrasil.execution.expr import Predicate
 from yggdrasil.data.cast.datetime import truncate_datetime
-from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.enums import Mode
 
 if TYPE_CHECKING:
     from yggdrasil.io.tabular.base import Tabular
-
-_HASH_CACHE_TTL = 15 * 60
-_GLOBAL_HASH_CACHE: ExpiringDict[str, set[int]] = ExpiringDict(default_ttl=_HASH_CACHE_TTL)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -529,89 +525,6 @@ class CacheConfig:
             LOGGER.warning(
                 "Cache write failed for %r", holder, exc_info=True,
             )
-            return
-        try:
-            if isinstance(data, (pa.RecordBatch, pa.Table)):
-                self._add_hashes(set(data.column(MATCH_COLUMN).to_pylist()))
-            elif hasattr(data, "select"):
-                arrow = data.select(MATCH_COLUMN).toPandas()
-                self._add_hashes(set(arrow[MATCH_COLUMN].tolist()))
-        except Exception:
-            pass
-
-    _HASH_CACHE_MAX = 10 * 1024
-    _HASH_CACHE_LOOKBACK = dt.timedelta(days=7)
-
-    def _cache_key(self) -> str | None:
-        """Key for the global hash cache — the tabular's URL string."""
-        t = self.tabular
-        if t is None:
-            return None
-        try:
-            return t.url.to_string() if hasattr(t, "url") and t.url else str(id(t))
-        except Exception:
-            return str(id(t))
-
-    def probe_hashes(
-        self,
-        partition_keys: "list[int]",
-        *,
-        session: "Any" = None,
-    ) -> set[int]:
-        """Return cached public hashes from the global 15-min TTL cache.
-
-        Hot-loads only hashes with ``received_at >= now - 7 days``,
-        capped at 10k entries (newest kept). The result lives in
-        :data:`_GLOBAL_HASH_CACHE` keyed by the tabular's URL so
-        different ``CacheConfig`` instances pointing at the same
-        backend share one set.
-        """
-        holder = self.tabular or self.cache_tabular(session=session)
-        if holder is None:
-            return set()
-        key = self._cache_key()
-        if key is None:
-            return set()
-        cached = _GLOBAL_HASH_CACHE.get(key)
-        if cached is not None:
-            return cached
-        from yggdrasil.execution.expr import col
-        cutoff = dt.datetime.now(dt.timezone.utc) - self._HASH_CACHE_LOOKBACK
-        predicates = col("received_at") >= cutoff
-        if partition_keys:
-            predicates = predicates & col("partition_key").is_in(partition_keys)
-        try:
-            table = holder.read_arrow_table(
-                predicate=predicates,
-                columns=[MATCH_COLUMN, "received_at"],
-            )
-            if table is None or table.num_rows == 0:
-                result: set[int] = set()
-            elif table.num_rows <= self._HASH_CACHE_MAX:
-                result = set(table.column(MATCH_COLUMN).to_pylist())
-            else:
-                import pyarrow.compute as pc
-                indices = pc.sort_indices(table, sort_keys=[("received_at", "descending")])
-                trimmed = table.take(indices[:self._HASH_CACHE_MAX])
-                result = set(trimmed.column(MATCH_COLUMN).to_pylist())
-        except Exception:
-            result = set()
-        _GLOBAL_HASH_CACHE.set(key, result)
-        return result
-
-    def _add_hashes(self, hashes: set[int]) -> None:
-        """Extend the global hash cache after a cache write."""
-        key = self._cache_key()
-        if key is None:
-            return
-        existing = _GLOBAL_HASH_CACHE.get(key)
-        if existing is None:
-            _GLOBAL_HASH_CACHE.set(key, hashes)
-        else:
-            existing |= hashes
-            if len(existing) > self._HASH_CACHE_MAX:
-                existing = set(list(existing)[:self._HASH_CACHE_MAX])
-            _GLOBAL_HASH_CACHE.set(key, existing)
 
     def filter_response(
         self,

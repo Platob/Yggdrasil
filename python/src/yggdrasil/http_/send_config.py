@@ -84,11 +84,12 @@ class SendConfig:
     ) -> "tuple[set[int], set[int], list[PreparedRequest]]":
         """Split requests into local hit hashes, remote hit hashes, and misses.
 
-        Uses :meth:`CacheConfig.probe_hashes` which caches the int64
-        hash set in memory after the first backend read — subsequent
-        chunks in a ``send_many`` pipeline hit the in-memory set
-        instead of re-reading parquet.
+        Performs lightweight hash-only lookups against local then remote
+        cache. Returns ``(local_hashes, remote_hashes, misses)`` —
+        full response rows are read on demand, not here.
         """
+        from yggdrasil.execution.expr import col
+
         local_hashes: set[int] = set()
         remote_hashes: set[int] = set()
         misses = requests
@@ -98,17 +99,30 @@ class SendConfig:
 
         request_hash_set = {r.match_value(MATCH_KEY) for r in requests}
         partition_keys = sorted({r.partition_key for r in requests})
+        predicate = col("partition_key").is_in(partition_keys)
+
+        def _probe(cache: CacheConfig) -> set[int]:
+            holder = cache.tabular or cache.cache_tabular(session=session)
+            if holder is None:
+                return set()
+            try:
+                table = holder.read_arrow_table(
+                    predicate=predicate, columns=[MATCH_COLUMN],
+                )
+                if table is None or table.num_rows == 0:
+                    return set()
+                return set(table.column(MATCH_COLUMN).to_pylist())
+            except Exception:
+                return set()
 
         if self.local_cache is not None:
-            cached = self.local_cache.probe_hashes(partition_keys, session=session)
-            local_hashes = cached & request_hash_set
+            local_hashes = _probe(self.local_cache) & request_hash_set
             if local_hashes:
                 misses = [r for r in misses if r.match_value(MATCH_KEY) not in local_hashes]
 
         if self.remote_cache is not None and misses:
             remaining = {r.match_value(MATCH_KEY) for r in misses}
-            cached = self.remote_cache.probe_hashes(partition_keys, session=session)
-            remote_hashes = cached & remaining
+            remote_hashes = _probe(self.remote_cache) & remaining
             if remote_hashes:
                 misses = [r for r in misses if r.match_value(MATCH_KEY) not in remote_hashes]
 

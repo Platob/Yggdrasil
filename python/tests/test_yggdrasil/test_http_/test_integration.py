@@ -78,8 +78,6 @@ def server():
 def base_url(server):
     _Handler.call_count = 0
     HTTPSession._INSTANCES.clear()
-    from yggdrasil.http_.cache_config import _GLOBAL_HASH_CACHE
-    _GLOBAL_HASH_CACHE.clear()
     return server
 
 
