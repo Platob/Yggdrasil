@@ -91,7 +91,7 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.concurrent` | `Job`, `AsyncJob`, `ThreadJob`, `JobPoolExecutor` | [concurrent](modules/concurrent/README.md) |
 | `yggdrasil.environ` | Runtime import / install logic | [optional libs](modules/libs/README.md) |
 | `yggdrasil.fastapi` | FastAPI service powering the Power Query connector | [API Reference](api/index.md) |
-| `yggdrasil.blake3` / `yggdrasil.xxhash` | Optional hashing | — |
+| `yggdrasil.blake3` | Optional hashing | — |
 
 ## See also
 

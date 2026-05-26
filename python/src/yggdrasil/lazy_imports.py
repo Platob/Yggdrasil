@@ -228,10 +228,6 @@ def requests_module(*, install: bool = False):
     return _lazy_import("requests", install=install)
 
 
-def xxhash_module(*, install: bool = False):
-    return _lazy_import("xxhash", install=install)
-
-
 def confluent_kafka_module(*, install: bool = False):
     return _lazy_import("confluent_kafka", "confluent-kafka", install=install)
 
@@ -531,7 +527,6 @@ _LAZY_ATTRS: "dict[str, Any]" = {
     "pyarrow": pyarrow_module,
     "fastapi": fastapi_module,
     "requests": requests_module,
-    "xxhash": xxhash_module,
     "confluent_kafka": confluent_kafka_module,
     "databricks_sdk": databricks_sdk_module,
     "AccountClient": databricks_account_client_class,
