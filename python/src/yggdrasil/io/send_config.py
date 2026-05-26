@@ -687,75 +687,70 @@ class SendConfig:
         requests: list[PreparedRequest],
         *,
         session: "Any" = None,
-    ) -> "tuple[Tabular | None, Tabular | None, list[PreparedRequest]]":
-        """Split requests into local hits, remote hits, and remaining misses.
+    ) -> "tuple[set[int], set[int], list[PreparedRequest]]":
+        """Split requests into local hit hashes, remote hit hashes, and misses.
 
         Performs lightweight hash-only lookups against local then remote
-        cache to determine which requests are already cached, then
-        refetches full response rows only for the hits.
-
-        Returns ``(local_tabular, remote_tabular, misses)``.
+        cache. Returns ``(local_hashes, remote_hashes, misses)`` —
+        full response rows are read on demand, not here.
         """
-        import pyarrow as pa
-        from yggdrasil.data.options import CastOptions
         from yggdrasil.execution.expr import col
-        from yggdrasil.io.response import RESPONSE_SCHEMA
 
-        local_tabular = None
-        remote_tabular = None
+        local_hashes: set[int] = set()
+        remote_hashes: set[int] = set()
         misses = requests
 
         if not requests:
-            return None, None, []
+            return set(), set(), []
 
-        request_hashes = {r.match_value(MATCH_KEY): r for r in requests}
+        request_hash_set = {r.match_value(MATCH_KEY) for r in requests}
         partition_keys = sorted({r.partition_key for r in requests})
         predicate = col("partition_key").is_in(partition_keys)
 
-        match_col = MATCH_COLUMN
-
-        def _probe_cache(cache: CacheConfig) -> set[int]:
+        def _probe(cache: CacheConfig) -> set[int]:
             holder = cache.tabular or cache.cache_tabular(session=session)
             if holder is None:
                 return set()
             try:
                 table = holder.read_arrow_table(
-                    predicate=predicate, columns=[match_col],
+                    predicate=predicate, columns=[MATCH_COLUMN],
                 )
                 if table is None or table.num_rows == 0:
                     return set()
-                return set(table.column(match_col).to_pylist())
+                return set(table.column(MATCH_COLUMN).to_pylist())
             except Exception:
                 return set()
 
-        def _fetch_hits(cache: CacheConfig, hit_requests: list[PreparedRequest]):
-            holder = cache.tabular or cache.cache_tabular(session=session)
-            if holder is None:
-                return None
-            batch_predicate = cache.make_batch_lookup_predicate(hit_requests)
-            opts = CastOptions(predicate=batch_predicate, target=RESPONSE_SCHEMA)
-            return holder.read_table(options=opts)
-
         if self.local_cache is not None:
-            cached_hashes = _probe_cache(self.local_cache)
-            existing = cached_hashes & set(request_hashes)
-            if existing:
-                hit_reqs = [r for r in misses if r.match_value(MATCH_KEY) in existing]
-                misses = [r for r in misses if r.match_value(MATCH_KEY) not in existing]
-                if hit_reqs:
-                    local_tabular = _fetch_hits(self.local_cache, hit_reqs)
+            local_hashes = _probe(self.local_cache) & request_hash_set
+            if local_hashes:
+                misses = [r for r in misses if r.match_value(MATCH_KEY) not in local_hashes]
 
         if self.remote_cache is not None and misses:
-            cached_hashes = _probe_cache(self.remote_cache)
             remaining = {r.match_value(MATCH_KEY) for r in misses}
-            existing = cached_hashes & remaining
-            if existing:
-                hit_reqs = [r for r in misses if r.match_value(MATCH_KEY) in existing]
-                misses = [r for r in misses if r.match_value(MATCH_KEY) not in existing]
-                if hit_reqs:
-                    remote_tabular = _fetch_hits(self.remote_cache, hit_reqs)
+            remote_hashes = _probe(self.remote_cache) & remaining
+            if remote_hashes:
+                misses = [r for r in misses if r.match_value(MATCH_KEY) not in remote_hashes]
 
-        return local_tabular, remote_tabular, misses
+        return local_hashes, remote_hashes, misses
+
+    def read_hits(
+        self,
+        cache: "CacheConfig",
+        requests: "list[PreparedRequest]",
+        *,
+        session: "Any" = None,
+    ) -> "Tabular | None":
+        """Read full response rows for hit requests from a cache."""
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.io.response import RESPONSE_SCHEMA
+
+        holder = cache.tabular or cache.cache_tabular(session=session)
+        if holder is None or not requests:
+            return None
+        batch_predicate = cache.make_batch_lookup_predicate(requests)
+        opts = CastOptions(predicate=batch_predicate, target=RESPONSE_SCHEMA)
+        return holder.read_table(options=opts)
 
     def write_responses(
         self,

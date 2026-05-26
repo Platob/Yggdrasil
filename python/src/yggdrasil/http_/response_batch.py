@@ -77,8 +77,10 @@ class HTTPResponseBatch(Tabular):
     """
 
     __slots__ = (
-        "_send_config", "_requests", "_session", "_local", "_remote",
-        "_new", "_split_done", "_misses", "failed",
+        "_send_config", "_requests", "_session",
+        "_local_hashes", "_remote_hashes",
+        "_local", "_remote", "_new",
+        "_split_done", "_misses", "failed",
     )
 
     def __init__(
@@ -95,8 +97,10 @@ class HTTPResponseBatch(Tabular):
         super().__init__()
         self._send_config = send_config
         self._requests = requests
-        self._local: Optional[Tabular] = None
-        self._remote: Optional[Tabular] = None
+        self._local_hashes: set[int] = set()
+        self._remote_hashes: set[int] = set()
+        self._local: Optional[Tabular] = ...
+        self._remote: Optional[Tabular] = ...
         self._split_done = False
         self._session = session
 
@@ -114,45 +118,35 @@ class HTTPResponseBatch(Tabular):
         self._split_done = True
         if self._send_config is None or not self._requests:
             return
-        local_tab, remote_tab, remaining = self._send_config.split_requests(
+        local_hashes, remote_hashes, remaining = self._send_config.split_requests(
             self._requests, session=self._session,
         )
-
-        request_map = {r.match_value("public_hash"): r for r in self._requests}
-
-        def _filter_tab(tab, cache_cfg):
-            if tab is None or cache_cfg is None:
-                return tab, []
-            kept: list[Response] = []
-            rejected_keys: list = []
-            for resp in Response.from_arrow_tabular(tab.read_arrow_batches()):
-                req = request_map.get(
-                    resp.match_value("public_hash") if hasattr(resp, "match_value") else None
-                )
-                if req is not None and cache_cfg.filter_response(resp, request=req):
-                    kept.append(resp)
-                else:
-                    rejected_keys.append(resp)
-            if not kept:
-                return None, rejected_keys
-            return responses_to_tabular(kept), rejected_keys
-
-        local_tab, local_rejected = _filter_tab(local_tab, self._send_config.local_cache)
-        if local_rejected:
-            local_rejected_hashes = {
-                r.match_value("public_hash") for r in local_rejected
-                if hasattr(r, "match_value")
-            }
-            remaining = remaining + [
-                r for r in self._requests
-                if r.match_value("public_hash") in local_rejected_hashes
-            ]
-
-        remote_tab, _ = _filter_tab(remote_tab, self._send_config.remote_cache)
-
-        self._local = local_tab
-        self._remote = remote_tab
+        self._local_hashes = local_hashes
+        self._remote_hashes = remote_hashes
         self._misses = remaining
+
+    def _read_cache_hits(
+        self, cache: "CacheConfig | None", hashes: set[int],
+    ) -> "Tabular | None":
+        """Read full responses for hit hashes from a cache, filtering stale."""
+        if not hashes or cache is None:
+            return None
+        from yggdrasil.io.send_config import MATCH_KEY
+        hit_reqs = [r for r in self._requests if r.match_value(MATCH_KEY) in hashes]
+        if not hit_reqs:
+            return None
+        tab = self._send_config.read_hits(cache, hit_reqs, session=self._session)
+        if tab is None:
+            return None
+        request_map = {r.match_value(MATCH_KEY): r for r in hit_reqs}
+        kept: list[Response] = []
+        for resp in Response.from_arrow_tabular(tab.read_arrow_batches()):
+            req = request_map.get(
+                resp.match_value(MATCH_KEY) if hasattr(resp, "match_value") else None
+            )
+            if req is not None and cache.filter_response(resp, request=req):
+                kept.append(resp)
+        return responses_to_tabular(kept) if kept else None
 
     def _fetch(
         self,
@@ -168,18 +162,47 @@ class HTTPResponseBatch(Tabular):
         """
         cfg = self._send_config
         session = self._session
-        misses = self.misses
+        from yggdrasil.io.send_config import MATCH_KEY
 
-        if self._remote is not None and cfg.local_cache is not None:
+        # Trigger split + resolve cache reads (may reject stale rows)
+        misses = list(self.misses)
+        local_tab = self.local
+        remote_tab = self.remote
+
+        # Stale-rejected hits go back to misses
+        served = set()
+        if local_tab is not None:
+            for resp in Response.from_arrow_tabular(local_tab.read_arrow_batches()):
+                req = resp.request
+                if req is not None:
+                    served.add(req.match_value(MATCH_KEY))
+        if remote_tab is not None:
+            for resp in Response.from_arrow_tabular(remote_tab.read_arrow_batches()):
+                req = resp.request
+                if req is not None:
+                    served.add(req.match_value(MATCH_KEY))
+        expected_hits = self._local_hashes | self._remote_hashes
+        rejected = expected_hits - served
+        if rejected:
+            misses = misses + [
+                r for r in self._requests
+                if r.match_value(MATCH_KEY) in rejected
+                and r not in misses
+            ]
+            self._misses = misses
+
+        if self._remote_hashes and cfg.local_cache is not None:
             from yggdrasil.data.enums import Mode
-            try:
-                remote_table = self._remote.read_arrow_table()
-                if remote_table.num_rows > 0:
-                    cfg.local_cache.write_responses_tabular(
-                        remote_table, mode=Mode.OVERWRITE, session=session,
-                    )
-            except Exception:
-                LOGGER.debug("Remote→local backfill failed", exc_info=True)
+            remote_tab = self.remote
+            if remote_tab is not None:
+                try:
+                    remote_table = remote_tab.read_arrow_table()
+                    if remote_table.num_rows > 0:
+                        cfg.local_cache.write_responses_tabular(
+                            remote_table, mode=Mode.OVERWRITE, session=session,
+                        )
+                except Exception:
+                    LOGGER.debug("Remote→local backfill failed", exc_info=True)
 
         if not misses or cfg.cache_only:
             if misses:
@@ -347,11 +370,21 @@ class HTTPResponseBatch(Tabular):
     @property
     def local(self) -> "Tabular | None":
         self._ensure_split()
+        if self._local is ...:
+            self._local = self._read_cache_hits(
+                self._send_config.local_cache if self._send_config else None,
+                self._local_hashes,
+            )
         return self._local
 
     @property
     def remote(self) -> "Tabular | None":
         self._ensure_split()
+        if self._remote is ...:
+            self._remote = self._read_cache_hits(
+                self._send_config.remote_cache if self._send_config else None,
+                self._remote_hashes,
+            )
         return self._remote
 
     @property
@@ -461,12 +494,12 @@ class HTTPResponseBatch(Tabular):
     # ------------------------------------------------------------------
 
     def extend(self, other: "HTTPResponseBatch") -> "HTTPResponseBatch":
-        other._ensure_split()
-        self._ensure_split()
-        self._local = _union(self._local, other._local)
-        self._remote = _union(self._remote, other._remote)
+        self._local = _union(self.local, other.local)
+        self._remote = _union(self.remote, other.remote)
         self._new = _union(self._new, other._new)
         self._misses.extend(other._misses)
+        self._local_hashes |= other._local_hashes
+        self._remote_hashes |= other._remote_hashes
         self.failed.extend(other.failed)
         return self
 
