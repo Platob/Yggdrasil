@@ -584,7 +584,7 @@ class URL(os.PathLike):
         string-level walk this implementation does. The parsed result
         is memoised on :attr:`_extensions_cache` so repeat reads
         collapse to one slot lookup — the cache layer's
-        :meth:`FolderPath._leaf_for` walk hits every child URL's
+        :meth:`Folder._leaf_for` walk hits every child URL's
         extensions on every iter_children.
         """
         cached = self._extensions_cache

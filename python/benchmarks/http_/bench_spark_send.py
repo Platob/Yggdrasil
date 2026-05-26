@@ -23,7 +23,7 @@ from yggdrasil.http_.cache_config import CacheConfig
 from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.http_.session import HTTPSession
-from yggdrasil.io.nested.folder_path import FolderPath
+from yggdrasil.path.folder import Folder
 from yggdrasil.io.path.local_path import LocalPath
 
 
@@ -109,7 +109,7 @@ def main():
     # --- Spark with local cache (cold then warm) ---
     import tempfile, shutil
     cache_dir = tempfile.mkdtemp()
-    cache = CacheConfig(tabular=FolderPath(path=LocalPath.from_(cache_dir)))
+    cache = CacheConfig(tabular=Folder(path=LocalPath.from_(cache_dir)))
 
     cold_reqs = [HTTPRequest.prepare(method="GET", url=f"{base}/cache_{i}") for i in range(n)]
     for r in cold_reqs:

@@ -21,7 +21,7 @@ without pulling the whole stack:
   writers (single parquet vs manifest+sidecars) and the
   ``_last_checkpoint`` pointer updater.
 - :mod:`yggdrasil.io.nested.delta.delta_folder` — :class:`DeltaFolder`, the
-  :class:`yggdrasil.io.nested.FolderPath` that runs the snapshot and
+  :class:`yggdrasil.io.nested.Folder` that runs the snapshot and
   surfaces the active files as Arrow batches with predicate /
   partition pruning, deletion-vector masking, and a write path that
   emits parquet parts plus a fresh commit. Engine fan-out (Polars /

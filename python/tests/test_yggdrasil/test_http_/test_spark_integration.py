@@ -19,7 +19,7 @@ from yggdrasil.http_.cache_config import CacheConfig
 from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.http_.session import HTTPSession
-from yggdrasil.io.nested.folder_path import FolderPath
+from yggdrasil.path.folder import Folder
 from yggdrasil.path.local_path import LocalPath
 
 
@@ -78,8 +78,8 @@ def cache_dir(tmp_path):
     shutil.rmtree(d, ignore_errors=True)
 
 
-def _folder(path) -> FolderPath:
-    return FolderPath(path=LocalPath.from_(str(path)))
+def _folder(path) -> Folder:
+    return Folder(path=LocalPath.from_(str(path)))
 
 
 class TestSparkSendMany:

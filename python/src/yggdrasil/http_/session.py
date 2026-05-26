@@ -107,7 +107,7 @@ from .timeout import _resolve_timeout
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
-    from yggdrasil.io.nested.folder_path import FolderPath
+    from yggdrasil.path.folder import Folder
 
 __all__ = ["Session", "HTTPSession"]
 
@@ -274,7 +274,7 @@ class Session(Singleton, ABC):
         )
         self._lock = threading.RLock()
         self._job_pool: Optional[JobPoolExecutor] = None
-        self._local_cache: Optional["FolderPath"] = None
+        self._local_cache: Optional["Folder"] = None
         self._initialized = True
 
     def __enter__(self) -> "Session":
@@ -371,7 +371,7 @@ class Session(Singleton, ABC):
                     LOGGER.debug("Created job pool with max_workers=%s", self.pool_maxsize)
         return self._job_pool
 
-    def local_cache(self) -> "FolderPath":
+    def local_cache(self) -> "Folder":
         """Return the session-scoped local cache folder, creating the directory on first access.
 
         The folder lives under ``~/.cache/http/<host>/<path>``
@@ -379,7 +379,7 @@ class Session(Singleton, ABC):
         don't collide), or ``~/.cache/http/default`` otherwise.
 
         Thread-safe: the directory is created under the session lock and
-        the resulting :class:`FolderPath` is cached for the lifetime of
+        the resulting :class:`Folder` is cached for the lifetime of
         the singleton.
         """
         cached = getattr(self, "_local_cache", None)
@@ -389,7 +389,7 @@ class Session(Singleton, ABC):
             cached = getattr(self, "_local_cache", None)
             if cached is not None:
                 return cached
-            from yggdrasil.io.nested.folder_path import FolderPath
+            from yggdrasil.path.folder import Folder
             from yggdrasil.path import Path
 
             root = pathlib.Path.home() / ".cache" / "http"
@@ -401,7 +401,7 @@ class Session(Singleton, ABC):
                 url_path = (getattr(base_url, "path", "") or "").strip("/")
                 folder = root / host / url_path if url_path else root / host
             path = Path.from_(folder)
-            self._local_cache: "FolderPath" = FolderPath(path=path)
+            self._local_cache: "Folder" = Folder(path=path)
             return self._local_cache
 
 
@@ -424,13 +424,13 @@ _PAGINATED_RECHUNK_BYTE_SIZE: int = 128 * 1024 * 1024
 
 
 # Local cache is a partitioned tabular tree backed by
-# :class:`yggdrasil.io.nested.folder_path.FolderPath`:
+# :class:`yggdrasil.path.folder.Folder`:
 # ``<root>/partition_key=<int>/part-{epoch_ms}-{seed}.<ext>``.
 # Same Hive-style partition shape the remote :class:`Tabular` cache
 # uses, so the same lookup primitives — :meth:`CacheConfig.make_lookup_predicate`
 # / :meth:`CacheConfig.make_batch_lookup_predicate` — prune both
 # backends identically. The predicate's ``partition_key IN (...)``
-# clause flows through :meth:`FolderPath.iter_children`'s candidate
+# clause flows through :meth:`Folder.iter_children`'s candidate
 # probe, so a batch lookup ``stat``s only the partition directories
 # its requests touch instead of walking the whole tree.
 

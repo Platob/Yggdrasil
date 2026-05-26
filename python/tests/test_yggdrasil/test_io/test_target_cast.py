@@ -2,7 +2,7 @@
 
 Verifies that ``read_arrow_table(target=...)`` and
 ``read_arrow_table(columns=...)`` correctly project and cast columns
-across ArrowIPC, Parquet, and FolderPath backends.
+across ArrowIPC, Parquet, and Folder backends.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import pytest
 from yggdrasil.data import field, schema
 from yggdrasil.enums.media_type import MediaTypes
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
+from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.primitive.parquet_file import ParquetFile
 
@@ -109,7 +109,7 @@ class TestParquetTargetCast:
 class TestFolderPathTargetCast:
 
     def _write_and_read(self, tmp_path, target=None, columns=None):
-        folder = FolderPath(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(_source_table())
         return folder.read_arrow_table(target=target, columns=columns)
 
@@ -145,7 +145,7 @@ class TestFolderPathTargetCast:
             pa.field("id", pa.int64()),
             pa.field("price", pa.float64()),
         ])
-        folder = FolderPath(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         batch = pa.record_batch(
             [pa.array([1, 2], pa.int64()), pa.array([10, 20], pa.int64()), pa.array([1.5, 2.5], pa.float64())],
             schema=src_schema,
@@ -184,7 +184,7 @@ class TestBatchLevelTargetCast:
         assert batches[0].schema.field("price").type == pa.float32()
 
     def test_folder_batches_cast_dtype(self, tmp_path):
-        folder = FolderPath(path=str(tmp_path))
+        folder = Folder(path=str(tmp_path))
         folder.write_arrow_table(_source_table())
         target = schema(fields=[field("id", pa.int32()), field("name", pa.large_string())])
         batches = list(folder.read_arrow_batches(target=target))

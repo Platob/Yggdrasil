@@ -1,4 +1,4 @@
-"""Tests for opening a Path on a folder to get FolderPath behavior."""
+"""Tests for opening a Path on a folder to get Folder behavior."""
 from __future__ import annotations
 
 import os
@@ -10,7 +10,7 @@ import pytest
 from yggdrasil.enums import Mode
 from yggdrasil.enums.media_type import MediaTypes
 from yggdrasil.execution.expr import col
-from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
+from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.path.local_path import LocalPath
 
 
@@ -44,11 +44,11 @@ def _partitioned_batch(
 
 @pytest.fixture(autouse=True)
 def _clear_singletons():
-    FolderPath._INSTANCES.clear()
-    FolderPath._PARTITION_DATA_CACHE.clear()
+    Folder._INSTANCES.clear()
+    Folder._PARTITION_DATA_CACHE.clear()
     yield
-    FolderPath._INSTANCES.clear()
-    FolderPath._PARTITION_DATA_CACHE.clear()
+    Folder._INSTANCES.clear()
+    Folder._PARTITION_DATA_CACHE.clear()
 
 
 # ===================================================================
@@ -63,13 +63,13 @@ class TestPathOpenFolder:
     ) -> None:
         lp = LocalPath(str(tmp_path), singleton_ttl=False)
         fp = lp.as_media("folder")
-        assert isinstance(fp, FolderPath)
+        assert isinstance(fp, Folder)
 
     def test_folder_path_write_table_read_arrow_table_roundtrip(
         self, tmp_path: pathlib.Path,
     ) -> None:
         lp = LocalPath(str(tmp_path / "data"), singleton_ttl=False)
-        fp = FolderPath(path=lp)
+        fp = Folder(path=lp)
         src = _simple_table()
         fp.write_table(src)
         out = fp.read_arrow_table()
@@ -81,7 +81,7 @@ class TestPathOpenFolder:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "parts"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         fp.write_table(_simple_table(3))
         entries = [
             e for e in os.listdir(str(root))
@@ -93,19 +93,19 @@ class TestPathOpenFolder:
     def test_folder_path_iter_children_lists_child_files(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "children"))
+        fp = Folder(path=str(tmp_path / "children"))
         fp.write_table(_simple_table(2))
         fp.write_table(_simple_table(3))
         children = list(fp.iter_children())
         assert len(children) >= 2
-        # None of the children should be a FolderPath (flat folder)
-        assert all(not isinstance(c, FolderPath) for c in children)
+        # None of the children should be a Folder (flat folder)
+        assert all(not isinstance(c, Folder) for c in children)
 
     def test_folder_path_partition_by_creates_hive_directories(
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "hive"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         batch = _partitioned_batch(["alpha", "beta", "alpha"], [1, 2, 3])
         fp.write_arrow_batches([batch])
         dirs = sorted(
@@ -126,7 +126,7 @@ class TestFolderModes:
     def test_overwrite_clears_old_files(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "ow"))
+        fp = Folder(path=str(tmp_path / "ow"))
         fp.write_table(_simple_table(10))
         assert fp.read_arrow_table().num_rows == 10
         fp.write_table(
@@ -140,7 +140,7 @@ class TestFolderModes:
     def test_append_adds_new_files(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "ap"))
+        fp = Folder(path=str(tmp_path / "ap"))
         fp.write_table(_simple_table(3), options=FolderOptions(mode=Mode.APPEND))
         fp.write_table(_simple_table(4), options=FolderOptions(mode=Mode.APPEND))
         out = fp.read_arrow_table()
@@ -149,7 +149,7 @@ class TestFolderModes:
     def test_ignore_noops_when_files_exist(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "ig"))
+        fp = Folder(path=str(tmp_path / "ig"))
         fp.write_table(_simple_table(3))
         fp.write_table(
             _simple_table(100),
@@ -161,7 +161,7 @@ class TestFolderModes:
     def test_multiple_appends_accumulate_rows(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "multi"))
+        fp = Folder(path=str(tmp_path / "multi"))
         opts = FolderOptions(mode=Mode.APPEND)
         fp.write_table(_simple_table(2), options=opts)
         fp.write_table(_simple_table(3), options=opts)
@@ -181,7 +181,7 @@ class TestFolderMultiFormat:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "pq"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         opts = FolderOptions(child_media_type=MediaTypes.PARQUET)
         fp.write_table(_simple_table(4), options=opts)
         # Verify parquet files were created
@@ -198,7 +198,7 @@ class TestFolderMultiFormat:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "ipc"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         opts = FolderOptions(child_media_type=MediaTypes.ARROW_IPC)
         fp.write_table(_simple_table(3), options=opts)
         files = [
@@ -214,7 +214,7 @@ class TestFolderMultiFormat:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "mixed"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         # Write two batches as separate part files via two write calls
         fp.write_table(pa.table({"v": [1, 2]}))
         fp.write_table(pa.table({"v": [3, 4, 5]}))
@@ -233,7 +233,7 @@ class TestFolderPredicate:
     def test_hive_partitioned_read_with_predicate_prunes(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "part"))
+        fp = Folder(path=str(tmp_path / "part"))
         batch = _partitioned_batch(
             ["a", "a", "b", "c", "c"], [10, 20, 30, 40, 50],
         )
@@ -247,7 +247,7 @@ class TestFolderPredicate:
     def test_read_with_inlist_predicate(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "part"))
+        fp = Folder(path=str(tmp_path / "part"))
         batch = _partitioned_batch(
             ["x", "y", "z", "w"], [1, 2, 3, 4],
         )
@@ -261,7 +261,7 @@ class TestFolderPredicate:
     def test_read_all_returns_all_rows(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "part"))
+        fp = Folder(path=str(tmp_path / "part"))
         batch = _partitioned_batch(
             ["a", "b", "c"], [10, 20, 30],
         )

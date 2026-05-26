@@ -544,7 +544,7 @@ class LocalPath(Path):
                 # the child's ``_media_type`` slot. Pre-computing it
                 # during ``_ls`` ran a URL extension parse for every
                 # scandir entry — even non-tabular siblings the
-                # ``FolderPath._leaf_for`` cache already short-circuits.
+                # ``Folder._leaf_for`` cache already short-circuits.
                 child._persist_stat_cache(IOStats(
                     size=int(st.st_size),
                     mtime=float(st.st_mtime),

@@ -1377,7 +1377,7 @@ class Field(BaseChildrenFields):
         :meth:`MediaType.from_`. ``None`` when no media-type hint has
         been stamped.
 
-        Populated by :class:`FolderPath._persist_schema` so a schema
+        Populated by :class:`Folder._persist_schema` so a schema
         loaded from a folder's ``.ygg/schema.arrow`` sidecar tells the
         reader which on-disk format the rows were last written in
         (Arrow IPC, Parquet, …) without walking the part files.

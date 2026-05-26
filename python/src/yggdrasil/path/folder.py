@@ -1,13 +1,13 @@
 """Filesystem folder of tabular files.
 
-:class:`FolderPath` is a :class:`Tabular` over a directory whose
+:class:`Folder` is a :class:`Tabular` over a directory whose
 entries are tabular files (parquet, csv, arrow IPC, ndjson, …) and /
 or sub-directories. The class has no byte buffer of its own — its
 state is the bound :attr:`path` plus the children walk.
 
 It is :class:`Singleton`-cached with a 15-minute TTL keyed on the
 folder's URL string + the ``yggmeta`` flag, so every
-``FolderPath(path=p)`` and every recursive
+``Folder(path=p)`` and every recursive
 ``iter_children`` /  partition-candidate probe with the same URL
 hands back the same live instance. The schema cache,
 ``free_columns`` memo, and Hive ``static_values`` cache stay warm
@@ -23,7 +23,7 @@ non-private entry:
 * Files resolve through :class:`MediaType.from_` (extension first,
   magic-byte fallback) to a :class:`Tabular` leaf, or to a generic
   :class:`BytesIO` if the resolution fails.
-* Directories come back as a fresh :class:`FolderPath` of the same
+* Directories come back as a fresh :class:`Folder` of the same
   concrete class, so a tree of folders flattens transparently into
   one batch stream.
 
@@ -99,7 +99,7 @@ from yggdrasil.url import hive_cast_value, hive_encode, hive_split
 # arrow / ndjson / json / xlsx) has registered itself in the
 # :data:`yggdrasil.io.holder._HOLDER_FORMAT_REGISTRY` so
 # :meth:`IO.class_for_media_type` actually finds them. Hoisted to
-# module-top so :meth:`FolderPath._leaf_for` (per-child during
+# module-top so :meth:`Folder._leaf_for` (per-child during
 # :meth:`iter_children`) doesn't pay a dict lookup on every iter.
 import yggdrasil.io.primitive  # noqa: F401
 
@@ -108,10 +108,10 @@ if TYPE_CHECKING:
     from yggdrasil.path import Path
 
 
-__all__ = ["FolderPath", "FolderOptions"]
+__all__ = ["Folder", "FolderOptions"]
 
 
-# 15-minute TTL for the FolderPath singleton cache. The cache holds
+# 15-minute TTL for the Folder singleton cache. The cache holds
 # the schema, free_columns memo, and Hive static_values lookup that
 # every send_many cache-scan loop walks; collapsing repeat
 # constructors onto one instance keeps those warm across calls
@@ -143,7 +143,7 @@ class FolderOptions(CastOptions):
     #: Source priority (most specific wins) when the folder needs to
     #: resolve the layout: the incoming batch's
     #: ``Schema.from_arrow(batch.schema)`` on writes, then
-    #: :meth:`FolderPath.collect_schema` (the persisted ``.ygg/`` sidecar
+    #: :meth:`Folder.collect_schema` (the persisted ``.ygg/`` sidecar
     #: or the first-batch fallback), then ``options.target``.
     child_media_type: MediaType = MediaTypes.ARROW_IPC
 
@@ -164,7 +164,7 @@ class FolderOptions(CastOptions):
 LOGGER = logging.getLogger(__name__)
 
 
-class FolderPath(IO[bytes, FolderOptions]):
+class Folder(IO[bytes, FolderOptions]):
     """:class:`Tabular` over a directory of tabular files.
 
     Inherits :class:`Holder` so it registers in the cross-cutting
@@ -175,7 +175,7 @@ class FolderPath(IO[bytes, FolderOptions]):
 
     :class:`Singleton`-cached with a 15-minute TTL, keyed on the
     backing URL string + the ``yggmeta`` flag (see
-    :meth:`_singleton_key`). Every ``FolderPath(path=p)`` and every
+    :meth:`_singleton_key`). Every ``Folder(path=p)`` and every
     recursive partition-candidate probe with the same URL collapses
     to one live instance, so the on-instance schema cache,
     ``free_columns`` memo, and Hive ``static_values`` cache stay
@@ -205,7 +205,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     #: round-trips byte-for-byte through pyarrow.
     YGGMETA_SCHEMA_FILENAME: ClassVar[str] = "schema.arrow"
 
-    # 15-minute cache shared across every FolderPath. The default
+    # 15-minute cache shared across every Folder. The default
     # Singleton ``_INSTANCES`` is process-lifetime — overriding to
     # an :class:`ExpiringDict` with TTL + bounded capacity stops
     # long-running ingestion workers from accumulating one entry
@@ -406,10 +406,14 @@ class FolderPath(IO[bytes, FolderOptions]):
     def _clear(self) -> None:
         raise NotImplementedError(f"{type(self).__name__} is a directory.")
 
+    def is_dir(self) -> bool:
+        return True
+
+    def is_file(self) -> bool:
+        return False
+
     @property
     def size(self) -> int:
-        # Folders don't have a size in the Holder sense; the byte
-        # primitives all raise, so report 0 for stat-like callers.
         return 0
 
     def _stat(self) -> "IOStats":
@@ -437,7 +441,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     # against either a BytesIO (real Disposable) or a folder.
     # ==================================================================
 
-    def __enter__(self) -> "FolderPath":
+    def __enter__(self) -> "Folder":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -456,7 +460,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         ``<base>/year=2024/month=05/`` reports
         ``{"year": 2024, "month": 5}`` without any constructor seed.
         Values are cast to their declared dtype when a parent
-        :class:`FolderPath` (or this folder itself) already has the
+        :class:`Folder` (or this folder itself) already has the
         schema cached, otherwise the decoded string passes through;
         the downstream :meth:`matches_static` prune is conservative
         and just degrades to a row-level filter on undecidable
@@ -508,10 +512,10 @@ class FolderPath(IO[bytes, FolderOptions]):
     # The sidecar tree is private to :meth:`_collect_schema` /
     # :meth:`_persist_schema` — they build the ``<path>/.ygg/...``
     # paths inline because the sidecar folder is opened at most twice
-    # per FolderPath lifetime (one read on first ``_collect_schema``,
+    # per Folder lifetime (one read on first ``_collect_schema``,
     # one write per persisted schema), and the recursion guard is just
     # ``self._yggmeta_enabled`` propagating ``yggmeta=False`` to the
-    # sidecar's own FolderPath. No public surface for fishing it out
+    # sidecar's own Folder. No public surface for fishing it out
     # currently has a caller — add one back if a real consumer shows
     # up.
 
@@ -693,7 +697,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     ) -> "Iterator[Tabular]":
         """Yield every non-private direct entry of :attr:`path`.
 
-        Sub-directories come back as a fresh :class:`FolderPath`. File
+        Sub-directories come back as a fresh :class:`Folder`. File
         entries route through :class:`MediaType.from_` (extension
         first, magic-byte fallback) to a registered :class:`Tabular`
         leaf — :class:`ParquetFile` for ``.parquet``,
@@ -888,7 +892,7 @@ class FolderPath(IO[bytes, FolderOptions]):
           on 64 hits) but the full Session.send_many time barely
           moves — the read is I/O dominated.
         * On a sparse cache (all-miss / cold) the lazy variant adds
-          a fresh :class:`FolderPath` allocation per non-existent
+          a fresh :class:`Folder` allocation per non-existent
           candidate. ``Session._split_local_cache (all miss, 64
           req)`` regressed from 3.1 ms to 5.3 ms (+68 %), and
           ``Session._store_cached_response`` from 3.8 ms to 4.3 ms
@@ -919,7 +923,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         column: str,
         value: Any,
     ) -> "Tabular":
-        """Mint a child FolderPath bound to the partition sub-path.
+        """Mint a child Folder bound to the partition sub-path.
 
         ``column`` / ``value`` are accepted for the call-site
         readability of "this child carries the partition <col>=<val>"
@@ -1221,7 +1225,7 @@ class FolderPath(IO[bytes, FolderOptions]):
             # above already eliminated whole sub-trees the predicate
             # rejects on a partition column; this is the residual
             # non-partition filter.
-            if isinstance(child, FolderPath):
+            if isinstance(child, Folder):
                 # Recursive sub-folder branch: any inner partition
                 # leaf populates its own cache entry via the same
                 # mechanism; we don't double-cache the recursive
@@ -1261,7 +1265,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     def _partition_cache_key(self) -> "str | None":
         """Return the in-memory partition-cache key, or ``None`` to skip caching.
 
-        Only :class:`FolderPath` instances bound to a real Hive
+        Only :class:`Folder` instances bound to a real Hive
         ``<col>=<val>/`` partition (non-empty :attr:`static_values`)
         cache their batches — the root cache folder doesn't, since
         its read flows into per-partition child reads that each
@@ -1324,7 +1328,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         Walks ``tabular_parent`` looking for an already-cached
         ``(id(predicate), free_cols)`` tuple; on miss, computes the
         free-column tuple once and stashes it on the *topmost*
-        :class:`FolderPath` ancestor so every recursive child read
+        :class:`Folder` ancestor so every recursive child read
         finds it without re-walking the AST.
 
         Predicate AST nodes are immutable and short-lived (their
@@ -1336,15 +1340,15 @@ class FolderPath(IO[bytes, FolderOptions]):
             return None
         pid = id(predicate)
         # Search self + ancestors for a cached entry. The top-level
-        # FolderPath is where we stash, but any ancestor along the way
+        # Folder is where we stash, but any ancestor along the way
         # may already hold the cache.
         node: Any = self
-        topmost: "FolderPath" = self
+        topmost: "Folder" = self
         while node is not None:
             cached = getattr(node, "_predicate_free_cols", None)
             if cached is not None and cached[0] == pid:
                 return cached[1]
-            if isinstance(node, FolderPath):
+            if isinstance(node, Folder):
                 topmost = node
             node = getattr(node, "tabular_parent", None)
         try:
@@ -1352,7 +1356,7 @@ class FolderPath(IO[bytes, FolderOptions]):
             cols = free_columns(predicate)
         except Exception:
             return None
-        # Stash on the topmost FolderPath so every recursive child read
+        # Stash on the topmost Folder so every recursive child read
         # finds the cache on its first parent walk.
         try:
             topmost._predicate_free_cols = (pid, cols)
@@ -1476,7 +1480,7 @@ class FolderPath(IO[bytes, FolderOptions]):
             head = partition_columns[0]
             if head not in first.schema.names:
                 raise ValueError(
-                    f"FolderPath partition write: batches are missing the "
+                    f"Folder partition write: batches are missing the "
                     f"partition column {head!r}. Schema has "
                     f"{first.schema.names!r}; partition_columns="
                     f"{partition_columns!r}."
@@ -1544,7 +1548,7 @@ class FolderPath(IO[bytes, FolderOptions]):
             # through 16, at both 100 and 10_000 rows per partition.
             # Pool spawn + per-job GIL handoff dominated the small
             # per-partition Python pre-amble (subset slice, child
-            # FolderPath mint, schema cache walk) and pyarrow's own
+            # Folder mint, schema cache walk) and pyarrow's own
             # parquet writer already releases the GIL during the
             # encode that's actually parallelisable. Keep the inline
             # loop until a workload appears where parallelism wins.
@@ -1754,7 +1758,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     ) -> "set[tuple]":
         keys: "set[tuple]" = set()
         for child in self.iter_children():
-            if isinstance(child, FolderPath):
+            if isinstance(child, Folder):
                 continue
             try:
                 for batch in child._read_arrow_batches(child.options_class()()):
@@ -1769,7 +1773,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     ) -> "set[tuple]":
         keys: "set[tuple]" = set()
         for batch in batches:
-            FolderPath._extend_keys_from_batch(keys, batch, match_by)
+            Folder._extend_keys_from_batch(keys, batch, match_by)
         return keys
 
     @staticmethod
@@ -1827,7 +1831,7 @@ class FolderPath(IO[bytes, FolderOptions]):
     ) -> "Iterator[pa.RecordBatch]":
         """Walk existing leaves, yielding only rows whose key isn't in *drop_keys*."""
         for child in self.iter_children():
-            if isinstance(child, FolderPath):
+            if isinstance(child, Folder):
                 continue
             try:
                 stream = child._read_arrow_batches(child.options_class()())
@@ -1896,7 +1900,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         not_pred = ~predicate
         deleted = 0
         for child in self.iter_children():
-            if isinstance(child, FolderPath):
+            if isinstance(child, Folder):
                 deleted += child._delete(predicate, child.options_class()())
                 continue
             deleted += self._delete_leaf(child, not_pred, options)
@@ -2090,7 +2094,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                     bin_sizes.append(size)
 
         compacted = 0
-        leaf_folder = FolderPath(path=directory)
+        leaf_folder = Folder(path=directory)
         write_options = FolderOptions(
             mode=Mode.APPEND, child_media_type=target_media_type,
         )

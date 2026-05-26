@@ -1,4 +1,4 @@
-"""Spark integration tests for FolderPath._read_spark_frame.
+"""Spark integration tests for Folder._read_spark_frame.
 
 Exercises the Spark read path that scatters pickled leaf Tabulars to
 executors via mapInArrow: basic round-trip correctness, partitioned
@@ -23,7 +23,7 @@ from pyspark.sql import SparkSession  # noqa: E402
 
 from yggdrasil.enums import Mode  # noqa: E402
 from yggdrasil.execution.expr import col  # noqa: E402
-from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions  # noqa: E402
+from yggdrasil.path.folder import Folder, FolderOptions  # noqa: E402
 from yggdrasil.path.local_path import LocalPath  # noqa: E402
 from yggdrasil.spark.tests import SparkTestCase  # noqa: E402
 
@@ -39,9 +39,9 @@ def _simple_table(n: int = 5) -> pa.Table:
     })
 
 
-def _write_folder(root, table: pa.Table | None = None) -> FolderPath:
+def _write_folder(root, table: pa.Table | None = None) -> Folder:
     table = table if table is not None else _simple_table()
-    folder = FolderPath(path=str(root))
+    folder = Folder(path=str(root))
     folder.write_arrow_table(table)
     return folder
 
@@ -54,9 +54,9 @@ def _partitioned_schema() -> pa.Schema:
     ])
 
 
-def _write_partitioned_folder(root, partitions: dict[str, list[dict]]) -> FolderPath:
+def _write_partitioned_folder(root, partitions: dict[str, list[dict]]) -> Folder:
     schema = _partitioned_schema()
-    folder = FolderPath(path=str(root))
+    folder = Folder(path=str(root))
     rows = []
     for pk_val, items in partitions.items():
         for item in items:
@@ -168,7 +168,7 @@ class TestSparkReadEmpty(SparkTestCase):
     def test_empty_folder_returns_empty_dataframe(self) -> None:
         empty_dir = self.tmp_path / "empty"
         empty_dir.mkdir()
-        folder = FolderPath(path=str(empty_dir))
+        folder = Folder(path=str(empty_dir))
         spark_df = folder.read_spark_frame()
         self.assertEqual(spark_df.count(), 0)
 

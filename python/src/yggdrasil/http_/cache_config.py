@@ -160,7 +160,7 @@ class CacheConfig:
             values["received_to"] = _truncate_to(received_to)
 
         # ``tabular`` accepts a live Tabular or a path-shaped sugar;
-        # ``__post_init__`` resolves the sugar to a FolderPath. We
+        # ``__post_init__`` resolves the sugar to a Folder. We
         # don't pre-coerce here so the canonical normalisation lives
         # in one place.
 
@@ -200,9 +200,9 @@ class CacheConfig:
         if tabular is None:
             tabular_url = state.get("tabular_url", state.get("path"))
             if tabular_url is not None:
-                from yggdrasil.io.nested.folder_path import FolderPath
+                from yggdrasil.path.folder import Folder
                 from yggdrasil.path import Path as _Path
-                tabular = FolderPath(path=_Path.from_(tabular_url))
+                tabular = Folder(path=_Path.from_(tabular_url))
         self.tabular = tabular
         self.anonymize = state.get("anonymize", "remove")
         self.cleanup_ttl = state.get("cleanup_ttl", dt.timedelta(days=1))
@@ -307,7 +307,7 @@ class CacheConfig:
     def local_cache_folder(self, session: "Session | None" = None) -> Path:
         """Backend-agnostic root for the local cache.
 
-        Returns the bound :class:`FolderPath`'s :attr:`path` when
+        Returns the bound :class:`Folder`'s :attr:`path` when
         :attr:`tabular` is local (any :class:`yggdrasil.io.path.Path`
         subclass — LocalPath on disk, VolumePath on a Databricks
         Volume, S3Path on a bucket, …); otherwise builds the default
@@ -345,11 +345,11 @@ class CacheConfig:
         through:
 
         * :attr:`tabular` already set (constructor-supplied: live
-          :class:`FolderPath` for local, Databricks Table or any
+          :class:`Folder` for local, Databricks Table or any
           third-party adapter for remote) — returned as-is.
         * Unset but the cache is otherwise enabled (``received_*``
           window) — the default
-          ``~/.yggdrasil/cache/response/...`` :class:`FolderPath`
+          ``~/.yggdrasil/cache/response/...`` :class:`Folder`
           is materialised via :meth:`local_cache_folder` and
           memoised back on :attr:`tabular` so the next call
           short-circuits.
@@ -365,13 +365,13 @@ class CacheConfig:
         """
         if self.tabular is not None:
             return self.tabular
-        from yggdrasil.io.nested.folder_path import FolderPath
+        from yggdrasil.path.folder import Folder
 
-        tabular = FolderPath(path=self.local_cache_folder(session=session))
+        tabular = Folder(path=self.local_cache_folder(session=session))
         # Stash the built folder back on the config so subsequent
         # cache scans reuse the same instance — the schema cache and
         # predicate ``free_columns`` memo only stay warm across calls
-        # if the FolderPath is itself reused. ``tabular`` is
+        # if the Folder is itself reused. ``tabular`` is
         # ``compare=False, hash=False`` and excluded from
         # ``__getstate__``, so the mutation doesn't affect equality
         # or pickling.
@@ -535,7 +535,7 @@ class CacheConfig:
     # Predicate builders — single source of truth for cache lookups
     # ------------------------------------------------------------------
     #
-    # Both backends (local :class:`FolderPath` and remote
+    # Both backends (local :class:`Folder` and remote
     # :class:`~yggdrasil.databricks.table.table.Table`) read through
     # :meth:`Tabular.read_arrow_batches` with the same ``options.predicate``
     # — :class:`Field`-aware backends translate the predicate to whatever

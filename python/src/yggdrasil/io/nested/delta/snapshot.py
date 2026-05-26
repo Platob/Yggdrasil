@@ -149,7 +149,7 @@ class Snapshot:
         """Yield active files whose partition values pass *prune_values*.
 
         Empty / ``None`` prune dict → yield everything. Per-column
-        ``IN``-set semantics — same shape :class:`FolderPath` uses
+        ``IN``-set semantics — same shape :class:`Folder` uses
         for its prune knob, so callers compose without re-mapping.
         """
         if not prune_values:

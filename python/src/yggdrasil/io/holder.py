@@ -1295,7 +1295,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
 
         The returned class is a :class:`Tabular` subclass — typically a
         :class:`Holder` byte-backed leaf, occasionally a non-Holder
-        leaf (:class:`FolderPath`, :class:`DeltaFolder`). Returns *default*
+        leaf (:class:`Folder`, :class:`DeltaFolder`). Returns *default*
         on miss when supplied; otherwise raises :class:`KeyError` with
         the list of registered names.
         """
@@ -1314,7 +1314,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
 
         # Miss may just mean the leaf package hasn't been imported
         # yet — force the side-effect bootstrap once and retry. This
-        # is what catches nested leaves (ZipFile / FolderPath / DeltaFolder)
+        # is what catches nested leaves (ZipFile / Folder / DeltaFolder)
         # for callers that never touched ``yggdrasil.io.nested``.
         if not _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
             _bootstrap_holder_format_registry()

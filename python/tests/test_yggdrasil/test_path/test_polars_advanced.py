@@ -9,7 +9,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.enums import Mode
 from yggdrasil.execution.expr import col
-from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
+from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.path.local_path import LocalPath
 
 
@@ -141,9 +141,9 @@ class TestPolarsLazyPredicate:
         )
         root = tmp_path / "partitioned"
         # Construct via LocalPath to avoid the holder __new__ relative-import
-        # issue with path=str(...); FolderPath(path=LocalPath) is the stable
+        # issue with path=str(...); Folder(path=LocalPath) is the stable
         # construction shape.
-        fp = FolderPath(path=LocalPath(str(root) + "/"))
+        fp = Folder(path=LocalPath(str(root) + "/"))
         fp.write_arrow_batches([batch])
 
         pred = col("pk") == "b"

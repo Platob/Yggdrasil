@@ -16,11 +16,15 @@ Concrete remote backends register themselves on import (see
 from __future__ import annotations
 
 from .path import Path
+from .file import File
+from .folder import Folder
 from .remote_path import RemotePath
 from .local_path import LocalPath
 
 __all__ = [
     "Path",
+    "File",
+    "Folder",
     "RemotePath",
     "LocalPath",
 ]

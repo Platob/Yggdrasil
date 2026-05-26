@@ -673,10 +673,10 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
           ``default=None``).
         * :class:`Tabular` — returned as-is. When *as_folder* is
           ``True`` and *obj* is a local :class:`Path`, wraps it in
-          a :class:`FolderPath`.
+          a :class:`Folder`.
         * ``str`` / :class:`os.PathLike` — coerced via
           :class:`Path.from_`. When *as_folder* is ``True``,
-          wraps in :class:`FolderPath`.
+          wraps in :class:`Folder`.
         * File-like objects — drained into :class:`Memory`;
           *media_type* required.
 
@@ -690,9 +690,9 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
         if isinstance(obj, Tabular):
             if as_folder and isinstance(obj, Holder) and obj.is_local:
-                from yggdrasil.io.nested.folder_path import FolderPath
-                if not isinstance(obj, FolderPath):
-                    return FolderPath(path=obj)
+                from yggdrasil.path.folder import Folder
+                if not isinstance(obj, Folder):
+                    return Folder(path=obj)
             if media_type is not None and isinstance(obj, Holder):
                 return Holder.for_holder(obj, media_type=media_type, **kwargs)
             return obj
@@ -709,8 +709,8 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             from yggdrasil.path import Path as YggPath
             path = YggPath.from_(obj)
             if as_folder:
-                from yggdrasil.io.nested.folder_path import FolderPath
-                return FolderPath(path=path)
+                from yggdrasil.path.folder import Folder
+                return Folder(path=path)
             if media_type is not None:
                 return Holder.for_holder(path, media_type=media_type, **kwargs)
             return path
@@ -812,7 +812,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
         Default implementation is a no-op and returns ``0`` — single-file
         leaves (parquet, csv, arrow IPC, …) don't have a compaction
-        concept. Aggregator subclasses (:class:`FolderPath`) override
+        concept. Aggregator subclasses (:class:`Folder`) override
         this to walk their child leaves and bin-pack small part files
         into bundles near *byte_size*.
         Files already close to the target size are left alone so a
@@ -857,7 +857,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         The default implementation reads every batch, drops rows the
         predicate accepts, and rewrites the leaf with the survivors.
         Aggregator subclasses
-        (:class:`yggdrasil.io.nested.folder_path.FolderPath`) override
+        (:class:`yggdrasil.path.folder.Folder`) override
         to walk children, prune subtrees whose partition bounds make
         the predicate trivially false, and only rewrite the leaves
         that actually hold matched rows — so a delete on a hive-

@@ -151,7 +151,7 @@ class TestMetadata:
         from yggdrasil.enums.media_type import MediaTypes
 
         # Field.media_type round-trips through the canonical mime
-        # string — same shape FolderPath._persist_schema stamps.
+        # string — same shape Folder._persist_schema stamps.
         s_arrow = schema(
             [_int_field("a")],
             metadata={"media_type": "application/vnd.apache.arrow.file"},

@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.nested.folder_path.FolderPath`."""
+"""Tests for :class:`yggdrasil.io.nested.folder_path.Folder`."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 
 from yggdrasil.enums import Mode
 from yggdrasil.execution.expr import col
-from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
+from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.path.local_path import LocalPath
 
 
@@ -47,15 +47,15 @@ def _partitioned_batch(
 def _clear_singletons():
     """Reset singleton + partition-data caches between tests.
 
-    FolderPath is Singleton-cached by URL — stale entries from prior
+    Folder is Singleton-cached by URL — stale entries from prior
     tests sharing the same (or overlapping) tmp_path URL would hand
     back a cached instance with warm caches, poisoning assertions.
     """
-    FolderPath._INSTANCES.clear()
-    FolderPath._PARTITION_DATA_CACHE.clear()
+    Folder._INSTANCES.clear()
+    Folder._PARTITION_DATA_CACHE.clear()
     yield
-    FolderPath._INSTANCES.clear()
-    FolderPath._PARTITION_DATA_CACHE.clear()
+    Folder._INSTANCES.clear()
+    Folder._PARTITION_DATA_CACHE.clear()
 
 
 # ===================================================================
@@ -66,27 +66,27 @@ def _clear_singletons():
 class TestConstruction:
 
     def test_from_string_path(self, tmp_path: pathlib.Path) -> None:
-        fp = FolderPath(path=str(tmp_path))
+        fp = Folder(path=str(tmp_path))
         assert fp.path is not None
-        assert "FolderPath" in repr(fp)
+        assert "Folder" in repr(fp)
 
     def test_from_pathlib(self, tmp_path: pathlib.Path) -> None:
-        fp = FolderPath(path=tmp_path)
+        fp = Folder(path=tmp_path)
         assert fp.path is not None
 
     def test_from_url(self, tmp_path: pathlib.Path) -> None:
         url = f"file://{tmp_path}"
-        fp = FolderPath(path=url)
+        fp = Folder(path=url)
         assert fp.path is not None
 
     def test_missing_path_raises(self) -> None:
         with pytest.raises(ValueError, match="requires a path"):
-            FolderPath(path=None)
+            Folder(path=None)
 
     def test_repr_contains_class_and_path(self, tmp_path: pathlib.Path) -> None:
-        fp = FolderPath(path=str(tmp_path))
+        fp = Folder(path=str(tmp_path))
         r = repr(fp)
-        assert r.startswith("FolderPath(")
+        assert r.startswith("Folder(")
         assert "path=" in r
 
 
@@ -100,7 +100,7 @@ class TestWriteRead:
     def test_write_table_read_arrow_table_round_trip(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         src = _simple_table()
         fp.write_table(src)
         out = fp.read_arrow_table()
@@ -111,7 +111,7 @@ class TestWriteRead:
     def test_append_mode_accumulates_rows(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         t1 = _simple_table(2)
         t2 = _simple_table(3)
         fp.write_table(t1)
@@ -122,7 +122,7 @@ class TestWriteRead:
     def test_overwrite_clears_previous(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(5))
         assert fp.read_arrow_table().num_rows == 5
 
@@ -135,7 +135,7 @@ class TestWriteRead:
     def test_ignore_skips_when_data_exists(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(3))
         fp.write_table(_simple_table(10), options=FolderOptions(mode=Mode.IGNORE))
         out = fp.read_arrow_table()
@@ -145,7 +145,7 @@ class TestWriteRead:
     def test_error_if_exists_raises(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(3))
         with pytest.raises(FileExistsError):
             fp.write_table(
@@ -156,7 +156,7 @@ class TestWriteRead:
     def test_write_record_batch(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         batch = pa.record_batch(
             {"x": pa.array([10, 20]), "y": pa.array(["a", "b"])},
         )
@@ -168,7 +168,7 @@ class TestWriteRead:
     def test_write_list_of_dicts(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
         out = fp.read_arrow_table()
         assert out.num_rows == 2
@@ -177,7 +177,7 @@ class TestWriteRead:
     def test_empty_folder_yields_empty_table(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "empty"))
+        fp = Folder(path=str(tmp_path / "empty"))
         out = fp.read_arrow_table()
         assert out.num_rows == 0
 
@@ -193,7 +193,7 @@ class TestPartitionedWrite:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "partitioned"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         batch = _partitioned_batch(["a", "a", "b"], [1, 2, 3])
         fp.write_arrow_batches([batch])
 
@@ -207,7 +207,7 @@ class TestPartitionedWrite:
     def test_read_back_preserves_partition_values(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "partitioned"))
+        fp = Folder(path=str(tmp_path / "partitioned"))
         batch = _partitioned_batch(["x", "y", "x"], [10, 20, 30])
         fp.write_arrow_batches([batch])
 
@@ -223,7 +223,7 @@ class TestPartitionedWrite:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "partitioned"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         fp.write_arrow_batches([_partitioned_batch(["a", "b", "c"], [1, 2, 3])])
         # Verify partition c exists
         assert (root / "pk=c").exists()
@@ -240,7 +240,7 @@ class TestPartitionedWrite:
     def test_predicate_prunes_partitions_on_read(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "partitioned"))
+        fp = Folder(path=str(tmp_path / "partitioned"))
         batch = _partitioned_batch(
             ["a", "a", "b", "c"], [1, 2, 3, 4],
         )
@@ -270,7 +270,7 @@ class TestPartitionedWrite:
             schema=schema,
         )
         root = tmp_path / "multi_part"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         fp.write_arrow_batches([batch])
 
         out = fp.read_arrow_table()
@@ -283,7 +283,7 @@ class TestPartitionedWrite:
     def test_inlist_predicate_on_partition_column(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "partitioned"))
+        fp = Folder(path=str(tmp_path / "partitioned"))
         batch = _partitioned_batch(
             ["a", "b", "c", "d"], [1, 2, 3, 4],
         )
@@ -304,17 +304,17 @@ class TestPartitionedWrite:
 class TestIterChildren:
 
     def test_yields_leaf_files(self, tmp_path: pathlib.Path) -> None:
-        fp = FolderPath(path=str(tmp_path))
+        fp = Folder(path=str(tmp_path))
         fp.write_table(_simple_table(2))
         children = list(fp.iter_children())
         # At least one leaf child (part-*.ipc)
         assert len(children) >= 1
-        assert all(not isinstance(c, FolderPath) for c in children)
+        assert all(not isinstance(c, Folder) for c in children)
 
     def test_skips_dotfiles_and_ygg_metadata(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path))
+        fp = Folder(path=str(tmp_path))
         fp.write_table(_simple_table(1))
         # The .ygg sidecar exists but should not appear in children
         ygg_dir = tmp_path / ".ygg"
@@ -336,20 +336,20 @@ class TestIterChildren:
         # Create a subdirectory with data
         subdir = tmp_path / "subdir"
         subdir.mkdir()
-        sub_fp = FolderPath(path=str(subdir))
+        sub_fp = Folder(path=str(subdir))
         sub_fp.write_table(_simple_table(1))
 
         # Also write data in root
-        root_fp = FolderPath(path=str(tmp_path))
+        root_fp = Folder(path=str(tmp_path))
         root_fp.write_table(_simple_table(1))
 
         children = list(root_fp.iter_children())
         types = [type(c).__name__ for c in children]
-        # Should have at least one FolderPath child (the subdirectory)
-        assert "FolderPath" in types
+        # Should have at least one Folder child (the subdirectory)
+        assert "Folder" in types
 
     def test_missing_folder_yields_nothing(self) -> None:
-        fp = FolderPath(path="/tmp/_ygg_test_nonexistent_xyz_98765")
+        fp = Folder(path="/tmp/_ygg_test_nonexistent_xyz_98765")
         children = list(fp.iter_children())
         assert children == []
 
@@ -364,7 +364,7 @@ class TestSchema:
     def test_collect_schema_from_written_data(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table())
         schema = fp.collect_schema()
         names = [c.name for c in schema.children]
@@ -375,7 +375,7 @@ class TestSchema:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "data"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         fp.write_table(_simple_table())
         sidecar = root / ".ygg" / "schema.arrow"
         assert sidecar.exists()
@@ -384,7 +384,7 @@ class TestSchema:
     def test_column_projection_on_read(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table())
         out = fp.read_arrow_table(columns=["id"])
         assert out.column_names == ["id"]
@@ -405,12 +405,12 @@ class TestSchema:
             schema=arrow_s,
         )
         root = tmp_path / "meta"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         fp.write_table(table)
 
-        # Fresh FolderPath reads the sidecar
-        FolderPath._INSTANCES.clear()
-        fp2 = FolderPath(path=str(root))
+        # Fresh Folder reads the sidecar
+        Folder._INSTANCES.clear()
+        fp2 = Folder(path=str(root))
         recovered = fp2.collect_schema()
         assert recovered is not None
         recovered_arrow = recovered.to_arrow_schema()
@@ -428,7 +428,7 @@ class TestPredicateFiltering:
     def test_predicate_filters_rows_on_read(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(5))
         pred = col("id") > 2
         opts = FolderOptions(predicate=pred)
@@ -440,7 +440,7 @@ class TestPredicateFiltering:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "partitioned"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         batch = _partitioned_batch(["a", "b", "c"], [1, 2, 3])
         fp.write_arrow_batches([batch])
 
@@ -453,7 +453,7 @@ class TestPredicateFiltering:
     def test_combined_partition_prune_and_row_filter(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "partitioned"))
+        fp = Folder(path=str(tmp_path / "partitioned"))
         batch = _partitioned_batch(
             ["a", "a", "a", "b", "b"], [10, 20, 30, 40, 50],
         )
@@ -470,7 +470,7 @@ class TestPredicateFiltering:
     def test_empty_predicate_reads_all(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(4))
         opts = FolderOptions(predicate=None)
         out = fp.read_arrow_table(options=opts)
@@ -479,7 +479,7 @@ class TestPredicateFiltering:
     def test_inlist_predicate_on_partition_column(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "partitioned"))
+        fp = Folder(path=str(tmp_path / "partitioned"))
         batch = _partitioned_batch(
             ["alpha", "beta", "gamma", "delta"],
             [1, 2, 3, 4],
@@ -501,7 +501,7 @@ class TestPredicateFiltering:
 class TestModes:
 
     def test_append_mode_appends(self, tmp_path: pathlib.Path) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(2), options=FolderOptions(mode=Mode.APPEND))
         fp.write_table(_simple_table(3), options=FolderOptions(mode=Mode.APPEND))
         out = fp.read_arrow_table()
@@ -510,7 +510,7 @@ class TestModes:
     def test_overwrite_mode_replaces(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(10))
         fp.write_table(
             _simple_table(2),
@@ -520,7 +520,7 @@ class TestModes:
         assert out.num_rows == 2
 
     def test_ignore_mode_no_ops(self, tmp_path: pathlib.Path) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(3))
         fp.write_table(
             _simple_table(100),
@@ -532,7 +532,7 @@ class TestModes:
     def test_error_if_exists_mode_raises(
         self, tmp_path: pathlib.Path,
     ) -> None:
-        fp = FolderPath(path=str(tmp_path / "data"))
+        fp = Folder(path=str(tmp_path / "data"))
         fp.write_table(_simple_table(1))
         with pytest.raises(FileExistsError, match="already contains"):
             fp.write_table(
@@ -552,7 +552,7 @@ class TestOptimize:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "data"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         # Write three separate part files
         for _ in range(3):
             fp.write_table(_simple_table(2))
@@ -574,7 +574,7 @@ class TestOptimize:
         self, tmp_path: pathlib.Path,
     ) -> None:
         root = tmp_path / "data"
-        fp = FolderPath(path=str(root))
+        fp = Folder(path=str(root))
         fp.write_table(pa.table({"v": [1, 2]}))
         fp.write_table(pa.table({"v": [3, 4]}))
 
