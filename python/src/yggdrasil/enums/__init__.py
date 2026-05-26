@@ -12,3 +12,4 @@ from .scheme import *  # noqa: F403
 from .nodetype import *  # noqa: F403
 from .state import *  # noqa: F403
 from .dialect import *  # noqa: F403
+from .io_kind import *  # noqa: F403
