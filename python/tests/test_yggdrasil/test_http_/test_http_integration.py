@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from yggdrasil.enums import Mode
-from yggdrasil.io.send_config import CacheConfig, SendConfig
+from yggdrasil.http_.send_config import CacheConfig, SendConfig
 from ._helpers import StubSession, make_request, make_response
 
 
@@ -52,7 +52,7 @@ class TestRequestShape:
         # ``normalize_headers`` previously called it eagerly and raised
         # ``ValueError: Cannot resolve Codec from non-codec MIME type
         # 'gzip, deflate, br, zstd'`` for any such request.
-        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.http_.request import PreparedRequest
         req = PreparedRequest.prepare(
             "POST",
             "https://example.com/refresh",
@@ -276,7 +276,7 @@ class TestRequestsCompat:
         assert "n=10" in seen.url.query
 
     def test_send_false_returns_prepared_request(self) -> None:
-        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.http_.request import PreparedRequest
 
         s = StubSession()
         prepared = s.get("https://example.com/x", params={"q": "1"}, send=False)
@@ -287,7 +287,7 @@ class TestRequestsCompat:
         assert s.calls == []
 
     def test_send_false_post_carries_body_and_headers(self) -> None:
-        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.http_.request import PreparedRequest
 
         s = StubSession()
         prepared = s.post(
@@ -302,7 +302,7 @@ class TestRequestsCompat:
         assert s.calls == []
 
     def test_send_true_default_still_sends(self) -> None:
-        from yggdrasil.io.response import Response
+        from yggdrasil.http_.response import Response
 
         s = StubSession()
         s.queue(make_response())

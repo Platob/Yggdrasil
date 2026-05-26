@@ -41,9 +41,9 @@ import time
 from typing import Callable, List
 
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
-from yggdrasil.io.session import Session
+from yggdrasil.http_.request import PreparedRequest
+from yggdrasil.http_.response import Response
+from yggdrasil.http_.io_session import Session
 
 
 # ---------------------------------------------------------------------------

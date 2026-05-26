@@ -1435,7 +1435,7 @@ class Tabular(ABC, Generic[O]):
             return self._union(ArrowTabular(other), mode=resolved)
         if isinstance(other, list):
             from yggdrasil.arrow.tabular import ArrowTabular
-            from yggdrasil.io.response import Response as _Resp
+            from yggdrasil.http_.response import Response as _Resp
             batches = [r.to_arrow_batch(parse=False) for r in other if isinstance(r, _Resp)]
             if not batches:
                 return self

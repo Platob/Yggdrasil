@@ -1676,7 +1676,7 @@ class AutonomousAgent(GenieAgent):
         max_workers: Optional[int] = None,
     ) -> list[Any]:
         """Fetch multiple URLs concurrently."""
-        from yggdrasil.io.request import PreparedRequest
+        from yggdrasil.http_.request import PreparedRequest
 
         session = self._get_http_session()
         requests = [

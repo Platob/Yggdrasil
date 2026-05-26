@@ -18,7 +18,7 @@ import pickle
 import pytest
 
 from yggdrasil.http_ import HTTPSession
-from yggdrasil.io.session import Session
+from yggdrasil.http_.io_session import Session
 from yggdrasil.url import URL
 
 from ._helpers import StubSession

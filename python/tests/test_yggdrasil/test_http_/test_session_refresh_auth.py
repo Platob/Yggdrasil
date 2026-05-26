@@ -36,7 +36,7 @@ import pytest
 from yggdrasil.exceptions import AuthRequiredError
 from yggdrasil.io.authorization.base import Authorization
 from yggdrasil.http_ import HTTPSession
-from yggdrasil.io.session import Session
+from yggdrasil.http_.io_session import Session
 
 from ._helpers import make_request, make_response
 

@@ -60,8 +60,8 @@ os.environ["PYTHONPATH"] = (
 )
 
 from yggdrasil.http_ import HTTPSession  # noqa: E402
-from yggdrasil.io.request import PreparedRequest  # noqa: E402
-from yggdrasil.io.send_config import SendConfig  # noqa: E402
+from yggdrasil.http_.request import PreparedRequest  # noqa: E402
+from yggdrasil.http_.send_config import SendConfig  # noqa: E402
 
 from _bench_http_server import start_bench_server  # noqa: E402
 

@@ -15,9 +15,9 @@ import pyarrow as pa
 from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.data import Mode
 from yggdrasil.environ import PyEnv
-from yggdrasil.io.request import PreparedRequest, REQUEST_SCHEMA
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
-from yggdrasil.io.send_config import SendConfig, CacheConfig, MATCH_KEY
+from yggdrasil.http_.request import PreparedRequest, REQUEST_SCHEMA
+from yggdrasil.http_.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
+from yggdrasil.http_.send_config import SendConfig, CacheConfig, MATCH_KEY
 from yggdrasil.io.tabular import ArrowTabular, Dataset
 from yggdrasil.io.tabular.base import Tabular
 

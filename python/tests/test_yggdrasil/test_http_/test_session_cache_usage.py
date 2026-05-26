@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.session import Session
+from yggdrasil.http_.io_session import Session
 
 from ._helpers import StubSession, make_request, make_response
 from .test_session_cache_integration import (

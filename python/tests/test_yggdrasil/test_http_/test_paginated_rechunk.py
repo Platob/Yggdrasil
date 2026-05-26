@@ -20,8 +20,8 @@ import pytest
 from yggdrasil.http_.response import HTTPResponse
 from yggdrasil.http_.session import HTTPSession, _PAGINATED_RECHUNK_BYTE_SIZE
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.session import Session
+from yggdrasil.http_.request import PreparedRequest
+from yggdrasil.http_.io_session import Session
 
 EPOCH = dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
 

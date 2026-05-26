@@ -17,9 +17,9 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.enums import Mode
-from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import CacheConfig, SendConfig
-from yggdrasil.io.session import Session
+from yggdrasil.http_.response import Response
+from yggdrasil.http_.send_config import CacheConfig, SendConfig
+from yggdrasil.http_.io_session import Session
 from yggdrasil.io.tabular import Tabular
 
 from ._helpers import StubSession, make_request, make_response

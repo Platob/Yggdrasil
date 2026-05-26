@@ -26,8 +26,8 @@ from typing import ClassVar, Mapping
 
 import pyarrow as pa
 
-from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
+from yggdrasil.http_.request import PreparedRequest
+from yggdrasil.http_.response import Response
 from yggdrasil.pickle.ser.constants import CODEC_NONE
 from yggdrasil.pickle.ser.pyarrow import (
     _merge_metadata,

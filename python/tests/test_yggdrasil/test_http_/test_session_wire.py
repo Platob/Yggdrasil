@@ -25,7 +25,7 @@ import pytest
 from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.http_ import HTTPSession
 from yggdrasil.http_.exceptions import MaxRetryError, ReadTimeoutError
-from yggdrasil.io.request import PreparedRequest
+from yggdrasil.http_.request import PreparedRequest
 from yggdrasil.url import URL
 
 
