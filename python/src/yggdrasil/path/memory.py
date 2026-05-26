@@ -56,7 +56,7 @@ from yggdrasil.enums import Scheme
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.io_stats import IOKind, IOStats
 
-from .holder import IO
+from yggdrasil.io.holder import IO
 
 
 __all__ = ["Memory"]

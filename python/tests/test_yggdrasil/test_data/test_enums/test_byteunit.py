@@ -232,35 +232,35 @@ class TestMemoryIntegration:
     """:class:`Memory` accepts ``ByteUnit``-style input for ``spill_bytes``."""
 
     def test_int_threshold(self) -> None:
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
         m = Memory(spill_bytes=4 * 1024)
         m.write_bytes(b"x" * (8 * 1024), 0)
         assert m.is_spilled
         m.clear()
 
     def test_string_threshold(self) -> None:
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
         m = Memory(spill_bytes="4 KiB")
         m.write_bytes(b"x" * (8 * 1024), 0)
         assert m.is_spilled
         m.clear()
 
     def test_byteunit_member_threshold(self) -> None:
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
         m = Memory(spill_bytes=ByteUnit.KIB)
         m.write_bytes(b"x" * (4 * 1024), 0)
         assert m.is_spilled
         m.clear()
 
     def test_arithmetic_threshold(self) -> None:
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
         m = Memory(spill_bytes=4 * ByteUnit.KIB)
         m.write_bytes(b"x" * (16 * 1024), 0)
         assert m.is_spilled
         m.clear()
 
     def test_invalid_threshold_raises(self) -> None:
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
         with pytest.raises(ValueError, match="non-negative byte count"):
             Memory(spill_bytes="not a size")
         with pytest.raises(ValueError, match="non-negative byte count"):

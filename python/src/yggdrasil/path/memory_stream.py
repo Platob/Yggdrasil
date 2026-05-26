@@ -49,7 +49,7 @@ from typing import Any, BinaryIO, Callable, Iterable, Iterator, Optional, Union
 from yggdrasil.enums.codec import Codec
 from yggdrasil.io.io_stats import IOKind, IOStats
 
-from .holder import Holder, _resolve_pos
+from yggdrasil.io.holder import Holder, _resolve_pos
 
 __all__ = ["MemoryStream"]
 

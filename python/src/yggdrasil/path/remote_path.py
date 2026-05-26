@@ -23,7 +23,7 @@ from typing import Any, ClassVar, Optional
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.path.path import Path
 
 __all__ = ["RemotePath"]

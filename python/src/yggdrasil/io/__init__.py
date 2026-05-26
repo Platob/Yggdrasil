@@ -29,9 +29,9 @@ def __getattr__(name: str):
         if name == "Holder":
             from .holder import Holder as value
         elif name == "Memory":
-            from .memory import Memory as value
+            from yggdrasil.path.memory import Memory as value
         else:
-            from .memory_stream import MemoryStream as value
+            from yggdrasil.path.memory_stream import MemoryStream as value
         globals()[name] = value
         return value
     if name in _LAZY_BUFFER_NAMES:

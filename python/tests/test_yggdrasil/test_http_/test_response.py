@@ -8,7 +8,7 @@ import pytest
 
 from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.response import HTTPResponse, RESPONSE_SCHEMA
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.url import URL
 
 

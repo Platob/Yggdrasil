@@ -20,7 +20,7 @@ from yggdrasil.io.base import IO
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.url import URL
 
 if TYPE_CHECKING:

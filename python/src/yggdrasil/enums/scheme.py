@@ -59,7 +59,7 @@ _PATH_CLASS_CACHE: dict[str, type] = {}
 
 _PATH_CLASS_TARGETS: dict[str, tuple[str, str]] = {
     "file":           ("yggdrasil.io.path.local_path", "LocalPath"),
-    "mem":            ("yggdrasil.io.memory", "Memory"),
+    "mem":            ("yggdrasil.path.memory", "Memory"),
     "dbks":           ("yggdrasil.databricks.client", "DatabricksClient"),
     # ``dbfs://`` resolves to the abstract Databricks dispatcher —
     # :class:`DatabricksPath` inspects the URL and forwards to the

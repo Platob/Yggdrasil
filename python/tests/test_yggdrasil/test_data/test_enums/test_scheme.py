@@ -110,7 +110,7 @@ class TestPathClass:
         assert Scheme.FILE.path_class() is LocalPath
 
     def test_resolves_memory(self) -> None:
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
         assert Scheme.MEMORY.path_class() is Memory
 
     def test_resolve_shortcut_routes_through_from(self) -> None:

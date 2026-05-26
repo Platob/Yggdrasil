@@ -61,7 +61,7 @@ from yggdrasil.enums.media_type import MediaType
 from yggdrasil.enums.mime_type import MimeType
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 
 

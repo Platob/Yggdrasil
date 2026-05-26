@@ -21,7 +21,7 @@ from yggdrasil.enums import MimeTypes
 from yggdrasil.enums.codec import Codecs
 from yggdrasil.enums.media_type import MediaType
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.primitive.csv_file import CSVFile

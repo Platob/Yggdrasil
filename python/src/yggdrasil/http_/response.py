@@ -19,12 +19,12 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io.base import IO
-from yggdrasil.io.memory_stream import MemoryStream
+from yggdrasil.path.memory_stream import MemoryStream
 from yggdrasil.enums import Codec, MediaType, MimeTypes
 from yggdrasil.io.headers import Headers
 from yggdrasil.http_.headers import HTTPHeaderDict
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from yggdrasil.http_.request import (

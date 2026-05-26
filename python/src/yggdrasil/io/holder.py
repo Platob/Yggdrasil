@@ -239,7 +239,7 @@ def _resolve_subclass(
         return type(data)
 
     # binary, str, pathlib.Path, None, bytes-like — all default to memory
-    from .memory import Memory
+    from yggdrasil.path.memory import Memory
 
     return Memory
 
@@ -1117,7 +1117,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         if isinstance(obj, (bytes, bytearray, memoryview)):
             if is_storage:
                 return cls(binary=obj, url=url, **kwargs)
-            from .memory import Memory
+            from yggdrasil.path.memory import Memory
 
             return cls(
                 holder=Memory(binary=obj),
@@ -1151,7 +1151,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
                     url=url,
                     **kwargs,
                 )
-            from yggdrasil.io.memory_stream import MemoryStream
+            from yggdrasil.path.memory_stream import MemoryStream
 
             if is_storage:
                 return (

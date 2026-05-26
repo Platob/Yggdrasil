@@ -7,7 +7,7 @@ import zlib
 
 import pytest
 
-from yggdrasil.io.memory_stream import MemoryStream
+from yggdrasil.path.memory_stream import MemoryStream
 
 
 class TestSourceTypes:

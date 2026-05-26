@@ -39,7 +39,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.io.base import IO
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 
 __all__ = ["XLSXFile", "XlsxOptions", "XLSXSheetFile"]
 

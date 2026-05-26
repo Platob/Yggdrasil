@@ -25,7 +25,7 @@ import pathlib
 import pytest
 
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
 
 

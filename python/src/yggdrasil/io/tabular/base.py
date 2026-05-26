@@ -725,7 +725,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
                     f"inputs ({type(obj).__name__}); no URL extension "
                     "to sniff the format."
                 )
-            from yggdrasil.io.memory import Memory
+            from yggdrasil.path.memory import Memory
             data = read()
             if isinstance(data, str):
                 data = data.encode()

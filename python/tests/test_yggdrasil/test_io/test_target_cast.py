@@ -11,7 +11,7 @@ import pytest
 
 from yggdrasil.data import field, schema
 from yggdrasil.enums.media_type import MediaTypes
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.primitive.parquet_file import ParquetFile

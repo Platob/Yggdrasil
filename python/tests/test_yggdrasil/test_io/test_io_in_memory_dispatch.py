@@ -167,14 +167,14 @@ class TestIORegressionPathDispatch(unittest.TestCase):
 
     def test_bytes_still_resolves_to_memory(self) -> None:
         io = IO(b"\x00\x01\x02")
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
         self.assertIsInstance(io, Memory)
 
     def test_in_memory_dispatch_only_on_io_class(self) -> None:
         # When called on a concrete subclass (e.g. Memory), the
         # in-memory branch shouldn't fire — that subclass's __new__
         # owns the dispatch decision.
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
 
         # ``Memory`` doesn't claim to handle pa.Table; the existing
         # Memory dispatch decides. We just verify the IO-level branch

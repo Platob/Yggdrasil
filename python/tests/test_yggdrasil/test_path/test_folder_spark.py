@@ -76,6 +76,17 @@ def _write_partitioned_folder(root, partitions: dict[str, list[dict]]) -> Folder
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _clear_singletons():
+    Folder._INSTANCES.clear()
+    Folder._PARTITION_DATA_CACHE.clear()
+    LocalPath._INSTANCES.clear()
+    yield
+    Folder._INSTANCES.clear()
+    Folder._PARTITION_DATA_CACHE.clear()
+    LocalPath._INSTANCES.clear()
+
+
 class TestSparkReadBasic(SparkTestCase):
 
     def test_returns_pyspark_dataframe(self) -> None:

@@ -18,6 +18,8 @@ from __future__ import annotations
 from .path import Path
 from .file import File
 from .folder import Folder
+from .memory import Memory
+from .memory_stream import MemoryStream
 from .remote_path import RemotePath
 from .local_path import LocalPath
 
@@ -25,6 +27,8 @@ __all__ = [
     "Path",
     "File",
     "Folder",
+    "Memory",
+    "MemoryStream",
     "RemotePath",
     "LocalPath",
 ]
