@@ -1,13 +1,12 @@
 """Carrier for batched ``HTTPSession.send_many`` results.
 
-:class:`HTTPResponseBatch` holds three optional :class:`Tabular` buckets
-(local cache hits, remote cache hits, network fetches) and exposes
-iteration, counts, and union across them.
+:class:`HTTPResponseBatch` holds the send config and requests, lazily
+resolving cache hits (local/remote) and network responses on access.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import Any, TYPE_CHECKING, Iterator, Optional
 
 import pyarrow as pa
 
@@ -17,6 +16,8 @@ from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Respon
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
+    from yggdrasil.io.request import PreparedRequest
+    from yggdrasil.io.send_config import SendConfig
 
 
 __all__ = [
@@ -26,69 +27,116 @@ __all__ = [
 
 
 def responses_to_tabular(responses: list[Response]) -> ArrowTabular:
-    """Wrap a non-empty list of :class:`Response` in an :class:`ArrowTabular`."""
     return ArrowTabular(
         [Response.values_to_arrow_batch(responses)],
         schema=RESPONSE_ARROW_SCHEMA,
     )
 
 
-def _union(a: Optional[Tabular], b: Optional[Tabular]) -> Optional[Tabular]:
-    if b is None:
-        return a
-    if a is None:
-        return b
-    return a.union(b)
+def _to_tabular(data) -> "Tabular | None":
+    if data is None:
+        return None
+    if isinstance(data, list):
+        return responses_to_tabular(data) if data else None
+    if isinstance(data, pa.Table):
+        return ArrowTabular(data.to_batches(), schema=data.schema) if data.num_rows > 0 else None
+    if isinstance(data, pa.RecordBatch):
+        return ArrowTabular([data], schema=data.schema) if data.num_rows > 0 else None
+    if isinstance(data, Tabular):
+        return data
+    if hasattr(data, "toArrow") or hasattr(data, "toPandas"):
+        return Dataset(data)
+    return None
 
 
 class HTTPResponseBatch(Tabular):
-    """Origin-tagged view of a batch of responses.
+    """Lazy batch of responses with send config context.
 
-    Three optional :class:`Tabular` buckets:
-
-    - ``local``  — served from the local cache.
-    - ``remote`` — served from the remote cache.
-    - ``new``    — fetched from the network.
-
-    Also a :class:`Tabular` itself — ``read_arrow_batches`` chains
-    all buckets, ``read_spark_frame`` unions Spark frames directly.
+    Holds the send config and original requests. Cache hits (local/remote)
+    are resolved lazily via ``send_config.split_requests`` on first access.
+    Network responses are set eagerly after fetch.
     """
+
+    __slots__ = (
+        "_send_config", "_requests", "_session", "_local", "_remote",
+        "_new", "_split_done", "_misses", "failed",
+    )
 
     def __init__(
         self,
-        local: "Tabular | list[Response] | None" = None,
-        remote: "Tabular | list[Response] | None" = None,
-        new: "Tabular | list[Response] | SparkDataFrame | pa.Table | None" = None,
+        send_config: "SendConfig",
+        requests: "list[PreparedRequest]",
+        new_responses: "list[Response] | None" = None,
+        new_responses_tabular: "Tabular | pa.Table | SparkDataFrame | None" = None,
         *,
-        misses: "list | None" = None,
-        failed: "list | None" = None,
+        misses: "list[PreparedRequest] | None" = None,
+        failed: "list[Response] | None" = None,
+        session: "Any" = None,
     ) -> None:
         super().__init__()
-        self.local: Optional[Tabular] = (
-            responses_to_tabular(local) if isinstance(local, list) and local
-            else None if isinstance(local, list) else local
-        )
-        self.remote: Optional[Tabular] = (
-            responses_to_tabular(remote) if isinstance(remote, list) and remote
-            else None if isinstance(remote, list) else remote
-        )
-        if isinstance(new, list):
-            self.new: Optional[Tabular] = responses_to_tabular(new) if new else None
-        elif isinstance(new, pa.Table):
-            self.new = ArrowTabular(new.to_batches(), schema=new.schema)
-        elif isinstance(new, pa.RecordBatch):
-            self.new = ArrowTabular([new], schema=new.schema)
-        elif new is not None and not isinstance(new, Tabular):
-            self.new = Dataset(new)
+        self._send_config = send_config
+        self._requests = requests
+        self._local: Optional[Tabular] = None
+        self._remote: Optional[Tabular] = None
+        self._split_done = False
+        self._session = session
+
+        if new_responses is not None:
+            self._new: Optional[Tabular] = responses_to_tabular(new_responses)
         else:
-            self.new = new
-        self.misses: list = misses or []
+            self._new = _to_tabular(new_responses_tabular)
+
+        self._misses: list = misses if misses is not None else list(requests)
         self.failed: list = failed or []
+
+    def _ensure_split(self) -> None:
+        if self._split_done:
+            return
+        self._split_done = True
+        if self._send_config is None or not self._requests:
+            return
+        local_tab, remote_tab, remaining = self._send_config.split_requests(
+            self._requests, session=self._session,
+        )
+        self._local = local_tab
+        self._remote = remote_tab
+        self._misses = remaining
+
+    @property
+    def misses(self) -> list:
+        self._ensure_split()
+        return self._misses
+
+    @misses.setter
+    def misses(self, value: list) -> None:
+        self._misses = value
+
+    @property
+    def local(self) -> "Tabular | None":
+        self._ensure_split()
+        return self._local
+
+    @property
+    def remote(self) -> "Tabular | None":
+        self._ensure_split()
+        return self._remote
+
+    @property
+    def new(self) -> "Tabular | None":
+        return self._new
+
+    @new.setter
+    def new(self, value) -> None:
+        self._new = _to_tabular(value)
+
+    @property
+    def send_config(self) -> "SendConfig":
+        return self._send_config
 
     def __repr__(self) -> str:
         return (
-            f"HTTPResponseBatch(local={self.local!r}, "
-            f"remote={self.remote!r}, new={self.new!r})"
+            f"HTTPResponseBatch(requests={len(self._requests)}, "
+            f"split={self._split_done})"
         )
 
     # ------------------------------------------------------------------
@@ -170,11 +218,7 @@ class HTTPResponseBatch(Tabular):
         return self.iter_responses()
 
     def iter_responses(self) -> Iterator[Response]:
-        for label, holder in (
-            ("local", self.local),
-            ("remote", self.remote),
-            ("new", self.new),
-        ):
+        for holder in self._holders():
             if holder is None:
                 continue
             yield from Response.from_records(holder.read_records())
@@ -184,9 +228,19 @@ class HTTPResponseBatch(Tabular):
     # ------------------------------------------------------------------
 
     def extend(self, other: "HTTPResponseBatch") -> "HTTPResponseBatch":
-        self.local = _union(self.local, other.local)
-        self.remote = _union(self.remote, other.remote)
-        self.new = _union(self.new, other.new)
-        self.misses.extend(other.misses)
+        other._ensure_split()
+        self._ensure_split()
+        self._local = _union(self._local, other._local)
+        self._remote = _union(self._remote, other._remote)
+        self._new = _union(self._new, other._new)
+        self._misses.extend(other._misses)
         self.failed.extend(other.failed)
         return self
+
+
+def _union(a: Optional[Tabular], b: Optional[Tabular]) -> Optional[Tabular]:
+    if b is None:
+        return a
+    if a is None:
+        return b
+    return a.union(b)

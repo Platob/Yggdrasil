@@ -1286,41 +1286,24 @@ class HTTPSession(Session):
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
-        """Process one config group: local cache → remote cache → network → writeback."""
-        n = len(reqs)
-        spark = cfg.get_spark_session()
+        """Process one config group: split cache → fetch misses → writeback."""
+        batch = HTTPResponseBatch(cfg, reqs, session=self)
 
-        local_hits, remote_hits, misses = cfg.split_requests(
-            reqs, session=self,
-        )
-
-        if local_hits is not None:
-            LOGGER.info(
-                "Local cache hit %d/%d request(s)", n - len(misses), n,
-            )
-        if remote_hits is not None:
-            LOGGER.info(
-                "Remote cache hit for request(s)",
-            )
-
+        misses = batch.misses
         if not misses or cfg.cache_only:
             if misses:
                 LOGGER.info(
                     "Synthesising %d 404 response(s) (cache_only=True)",
                     len(misses),
                 )
-            new_hits = [_synthetic_not_found(r) for r in misses] if misses else None
-            return HTTPResponseBatch(
-                local=local_hits or None, remote=remote_hits or None,
-                new=new_hits, misses=misses,
-            )
+                batch.new = [_synthetic_not_found(r) for r in misses]
+            return batch
 
-        # Stage 3: fetch misses
+        spark = cfg.get_spark_session()
         LOGGER.debug(
             "Fetching %d miss(es) via %s",
             len(misses), "spark" if spark else "thread pool",
         )
-        failed: list[Response] = []
         if spark is not None:
             new_data = self._spark_fetch_misses(misses, spark)
             if cfg.raise_error:
@@ -1335,8 +1318,9 @@ class HTTPSession(Session):
                 )
                 err_table = spark_dataframe_to_arrow(err_df)
                 if len(err_table) > 0:
-                    failed = list(Response.from_arrow_tabular(err_table))
+                    batch.failed = list(Response.from_arrow_tabular(err_table))
                 new_data = ok_df
+            batch.new = new_data
         else:
             new_list: list[Response] = []
             for response in self._fetch_misses(
@@ -1345,25 +1329,23 @@ class HTTPSession(Session):
                 if response.ok:
                     new_list.append(response)
                 elif cfg.raise_error:
-                    failed.append(response)
+                    batch.failed.append(response)
             LOGGER.info(
                 "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-                len(new_list) + len(failed), len(misses),
-                len(new_list), len(failed),
+                len(new_list) + len(batch.failed), len(misses),
+                len(new_list), len(batch.failed),
             )
-            new_data = (
-                pa.Table.from_batches([Response.values_to_arrow_batch(new_list)])
-                if new_list else None
-            )
+            if new_list:
+                batch.new = pa.Table.from_batches(
+                    [Response.values_to_arrow_batch(new_list)]
+                )
 
-        # Stage 4: persist to caches
-        if new_data is not None:
-            cfg.write_responses_tabular(new_data, session=self)
+        if batch.new is not None:
+            new_tab = batch.new
+            write_data = new_tab.read_arrow_table() if hasattr(new_tab, 'read_arrow_table') else new_tab
+            cfg.write_responses_tabular(write_data, session=self)
 
-        return HTTPResponseBatch(
-            local=local_hits or None, remote=remote_hits or None,
-            new=new_data, misses=misses, failed=failed,
-        )
+        return batch
 
     @staticmethod
     def _group_by_config(
