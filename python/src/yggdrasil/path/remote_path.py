@@ -342,6 +342,31 @@ class RemotePath(Path):
         cached.mtime = now
         self._persist_stat_cache(cached)
 
+    def _cache_after_upload(self, content: bytes, size: int) -> None:
+        """Populate the page cache with committed content after upload.
+
+        Called after a successful ``_upload`` so that a subsequent
+        read on the same instance hits the local cache instead of
+        re-downloading. Also sets ``_buffered_size`` to the committed
+        size and clears dirty markers — the backend is now
+        authoritative for these bytes.
+        """
+        self._buffered_size = size
+        self._dirty_pages.clear()
+        if self._page_size is None or size == 0:
+            return
+        page_size = self._page_size
+        pages = self._ensure_pages()
+        pages.clear()
+        n_pages = (size + page_size - 1) // page_size
+        for idx in range(n_pages):
+            start = idx * page_size
+            end = min(start + page_size, size)
+            chunk = content[start:end]
+            buf = bytearray(page_size)
+            buf[: len(chunk)] = chunk
+            pages.set(idx, Memory.from_bytearray(buf, size=len(chunk)))
+
     def read_mv(
         self,
         size: int = -1,
@@ -508,11 +533,8 @@ class RemotePath(Path):
         if self._dirty_pages:
             size = self._effective_total()
             payload = bytes(self._paged_read(size, 0)) if size > 0 else b""
-            self._buffered_size = None
-            try:
-                self._upload(payload)
-            finally:
-                self._dirty_pages.clear()
+            self._upload(payload)
+            self._cache_after_upload(payload, len(payload))
         super().flush()
 
     def _release(self) -> None:

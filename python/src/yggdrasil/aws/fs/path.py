@@ -662,7 +662,6 @@ class S3Path(RemotePath):
             Body=content,
         )
         LOGGER.info("Wrote S3 object %r (bytes=%d)", self, size)
-        self._buffered_size = None
         self._persist_stat_cache(
             IOStats(
                 size=size,
@@ -671,6 +670,7 @@ class S3Path(RemotePath):
                 media_type=self.media_type,
             )
         )
+        self._cache_after_upload(bytes(content), size)
         return size
 
     def reserve(self, n: int) -> None:

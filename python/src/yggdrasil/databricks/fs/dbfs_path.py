@@ -343,12 +343,16 @@ class DBFSPath(DatabricksPath):
                         offset += _DBFS_CHUNK
 
         self._call(_do_upload)
-        self._buffered_size = None
-        # The upload just established the object's full size; seed
-        # the cache so the next ``size`` / ``exists`` lookup is local
-        # and any concurrent reader on the singleton path sees the
-        # post-write metadata without a fresh ``dbfs.get_status``.
+        committed = None
         if size >= 0:
+            if hasattr(content, "read"):
+                try:
+                    content.seek(0)
+                    committed = content.read()
+                except Exception:
+                    pass
+            else:
+                committed = bytes(content)
             self._persist_stat_cache(
                 IOStats(
                     size=size,
@@ -360,6 +364,10 @@ class DBFSPath(DatabricksPath):
             logger.info("Uploaded DBFS file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded DBFS file %r (size=stream)", self)
+        if committed is not None:
+            self._cache_after_upload(committed, len(committed))
+        else:
+            self._buffered_size = None
         return size
 
     def _clear(self) -> None:
