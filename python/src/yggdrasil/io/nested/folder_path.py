@@ -1086,16 +1086,31 @@ class FolderPath(IO[bytes, FolderOptions]):
         if not leaves:
             return spark.createDataFrame([], schema=spark_schema)
 
-        leaf_table = pa.table({"_pkl": pa.array([pickle.dumps(leaf) for leaf in leaves], type=pa.large_binary())})
+        import zlib
+
+        _COMPRESS_THRESHOLD = 4 * 1024 * 1024
+
+        blobs = []
+        for leaf in leaves:
+            raw = pickle.dumps(leaf)
+            if len(raw) > _COMPRESS_THRESHOLD:
+                raw = b"Z" + zlib.compress(raw)
+            else:
+                raw = b"\x00" + raw
+            blobs.append(raw)
+
+        leaf_table = pa.table({"_pkl": pa.array(blobs, type=pa.binary())})
         leaf_df = spark.createDataFrame(leaf_table)
 
         bc_options = spark.sparkContext.broadcast(options)
 
         def _read_holders(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+            import pickle as _pkl, zlib as _zlib
             opts = bc_options.value
             for batch in batches:
-                for pkl in batch.column("_pkl").to_pylist():
-                    yield from pickle.loads(pkl).read_arrow_batches(options=opts)
+                for blob in batch.column("_pkl").to_pylist():
+                    raw = _zlib.decompress(blob[1:]) if blob[0:1] == b"Z" else blob[1:]
+                    yield from _pkl.loads(raw).read_arrow_batches(options=opts)
 
         return leaf_df.mapInArrow(_read_holders, schema=spark_schema)
 
