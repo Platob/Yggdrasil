@@ -12,7 +12,8 @@ from fastapi.concurrency import run_in_threadpool
 from ..config import Settings
 from ..exceptions import NotFoundError, TimeoutError
 from ..schemas.cmd import CmdEntry, CmdListResponse, CmdRequest, CmdResponse
-from .execution import PyEnvironment, ShellCommand
+from .environment.py import PyEnvironment
+from .execution.shell import ShellCommand
 
 LOGGER = logging.getLogger(__name__)
 

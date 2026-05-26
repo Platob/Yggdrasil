@@ -1,19 +1,22 @@
 from .call import CallService
 from .cmd import CmdService
 from .dag import DagService
-from .execution import (
+from .discovery import DiscoveryService
+from .env import EnvService
+from .environment import (
     Environment,
+    EnvironmentService,
+    PyEnvironment,
+    venv_python,
+)
+from .execution import (
     Executable,
     Execution,
-    PyEnvironment,
     PyFunction,
     PyFunctionExecution,
     ShellCommand,
     ShellCommandExecution,
 )
-from .discovery import DiscoveryService
-from .env import EnvService
-from .environment import EnvironmentService
 from .filesystem import FilesystemService
 from .function import FunctionService
 from .job import JobService
@@ -44,4 +47,5 @@ __all__ = [
     "RunService",
     "ShellCommand",
     "ShellCommandExecution",
+    "venv_python",
 ]

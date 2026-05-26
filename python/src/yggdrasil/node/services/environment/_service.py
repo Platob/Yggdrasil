@@ -6,14 +6,15 @@ import shutil
 import subprocess
 from collections import OrderedDict
 from functools import partial
+from pathlib import Path
 from threading import Lock
 
 from fastapi.concurrency import run_in_threadpool
 
-from ..config import Settings
-from ..exceptions import NotFoundError
-from ..ids import make_id
-from ..schemas.environment import (
+from ...config import Settings
+from ...exceptions import NotFoundError
+from ...ids import make_id
+from ...schemas.environment import (
     EnvironmentCreate,
     EnvironmentEntry,
     EnvironmentListResponse,
@@ -39,7 +40,6 @@ class EnvironmentService:
     # -- CRUD ---------------------------------------------------------------
 
     async def create(self, req: EnvironmentCreate) -> EnvironmentResponse:
-        """Create-or-update: if an environment with the same name exists, update deps."""
         return await self.create_or_update(req)
 
     async def create_or_update(self, req: EnvironmentCreate) -> EnvironmentResponse:
@@ -51,7 +51,6 @@ class EnvironmentService:
             )
 
         if existing:
-            # Update existing: keep ID and venv path, install new deps
             new_deps = [d for d in req.dependencies if d not in existing.dependencies]
             updates: dict = {"updated_at": now}
             if new_deps:
@@ -69,7 +68,6 @@ class EnvironmentService:
             LOGGER.info("Upserted environment %r (name=%r, mode=update)", existing.id, req.name)
             return EnvironmentResponse(environment=updated)
         else:
-            # Create new
             env_id = make_id(req.name)
             env_path = self._envs_root / str(env_id)
 
@@ -90,7 +88,6 @@ class EnvironmentService:
 
             LOGGER.info("Upserted environment %r (name=%r, mode=create, python=%s)", env_id, req.name, req.python_version)
 
-            # Build the venv in a threadpool so we don't block the event loop
             await self._run(self._build_env, env_id, req.python_version, list(req.dependencies), env_path)
 
             with self._lock:
@@ -127,7 +124,6 @@ class EnvironmentService:
         with self._lock:
             self._envs[env_id] = updated
 
-        # If dependencies were provided, install them
         if req.dependencies is not None:
             await self._run(self._install_packages, env_id, list(req.dependencies))
             with self._lock:
@@ -142,7 +138,6 @@ class EnvironmentService:
         if entry is None:
             raise NotFoundError(f"Environment {env_id!r} not found")
 
-        # Remove the filesystem venv
         env_path = self._envs_root / str(env_id)
         if env_path.exists():
             shutil.rmtree(env_path, ignore_errors=True)
@@ -163,7 +158,6 @@ class EnvironmentService:
         return EnvironmentResponse(environment=entry)
 
     async def clone(self, env_id: int, new_name: str | None = None) -> EnvironmentResponse:
-        """Clone an environment (copies venv directory)."""
         with self._lock:
             entry = self._envs.get(env_id)
         if entry is None:
@@ -191,7 +185,6 @@ class EnvironmentService:
 
         LOGGER.info("Cloning environment %r -> %r (name=%r)", env_id, clone_id, clone_name)
 
-        # Copy the venv directory in a threadpool
         await self._run(self._clone_venv, env_id, clone_id, clone_path)
 
         with self._lock:
@@ -199,14 +192,11 @@ class EnvironmentService:
         return EnvironmentResponse(environment=clone_entry)
 
     def _clone_venv(self, source_id: int, dest_id: int, dest_path) -> None:
-        """Copy source venv to dest path."""
-        from pathlib import Path
         try:
             source_path = self._envs_root / str(source_id)
             if source_path.exists():
                 shutil.copytree(str(source_path), str(dest_path))
             else:
-                # Source venv missing, create a fresh one from deps
                 with self._lock:
                     entry = self._envs.get(dest_id)
                 if entry is not None:
@@ -220,16 +210,14 @@ class EnvironmentService:
             LOGGER.error("Environment clone %r failed: %s", dest_id, exc)
 
     def get_python_path(self, env_id: int) -> str | None:
-        """Return the python binary path for a given environment, or None."""
         with self._lock:
             entry = self._envs.get(env_id)
         if entry is None:
             return None
         if entry.status != "ready":
             return None
-        from .execution import venv_python
+        from . import venv_python
         python = venv_python(entry.path)
-        from pathlib import Path
         if Path(python).exists():
             return python
         return None
@@ -248,7 +236,6 @@ class EnvironmentService:
                     text=True,
                 )
             else:
-                # Fallback to stdlib venv
                 import sys
                 subprocess.run(
                     [sys.executable, "-m", "venv", str(env_path)],
@@ -258,16 +245,14 @@ class EnvironmentService:
                     text=True,
                 )
 
-            # Always install base packages (uv + yggdrasil from source if available)
             from pathlib import Path as _Path
             base_packages: list[str] = ["uv"]
-            ygg_root = _Path(__file__).resolve().parents[4]
+            ygg_root = _Path(__file__).resolve().parents[5]
             if (ygg_root / "pyproject.toml").exists():
                 base_packages.append(str(ygg_root))
             try:
                 self._pip_install(env_id, env_path, base_packages, uv=uv)
             except subprocess.CalledProcessError:
-                # Non-fatal: base package install failure should not block env creation
                 LOGGER.warning("Base package install failed for env %r, continuing", env_id)
 
             if dependencies:
@@ -290,7 +275,6 @@ class EnvironmentService:
         if entry is None:
             return
 
-        from pathlib import Path
         env_path = Path(entry.path)
         uv = shutil.which("uv")
 
@@ -311,7 +295,7 @@ class EnvironmentService:
             LOGGER.error("Package install failed for env %r: %s", env_id, error_msg)
 
     def _pip_install(self, env_id: int, env_path, packages: list[str], *, uv: str | None) -> None:
-        from .execution import venv_python
+        from . import venv_python
         python_bin = venv_python(env_path)
         if uv:
             cmd = [uv, "pip", "install", "--python", python_bin] + packages
@@ -337,7 +321,6 @@ class EnvironmentService:
     def _evict(self) -> None:
         while len(self._envs) > self.settings.max_environments:
             evicted_id, evicted = self._envs.popitem(last=False)
-            # Clean up filesystem for evicted envs
             evicted_path = self._envs_root / str(evicted_id)
             if evicted_path.exists():
                 shutil.rmtree(evicted_path, ignore_errors=True)

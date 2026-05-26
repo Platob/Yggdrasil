@@ -21,9 +21,10 @@ from ..schemas.run import (
     RunListResponse,
     RunResponse,
 )
-from .execution import PyEnvironment, PyFunction
-from .function import FunctionService
 from .environment import EnvironmentService
+from .environment.py import PyEnvironment
+from .execution.pyfunction import PyFunction
+from .function import FunctionService
 
 LOGGER = logging.getLogger(__name__)
 

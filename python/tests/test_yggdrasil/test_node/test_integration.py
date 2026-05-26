@@ -1051,16 +1051,18 @@ class TestImportSafety:
 
     def test_resource_module_not_at_top_level(self):
         import importlib
-        import sys
-        if "yggdrasil.node.services.run" in sys.modules:
-            del sys.modules["yggdrasil.node.services.run"]
-        mod = importlib.import_module("yggdrasil.node.services.run")
-        source = open(mod.__file__).read()
-        lines = source.split("\n")
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("import resource") or stripped.startswith("from resource"):
-                indent = len(line) - len(line.lstrip())
-                assert indent > 0, (
-                    f"'resource' module must not be imported at module level (line {i+1})"
-                )
+        for mod_name in (
+            "yggdrasil.node.services.run",
+            "yggdrasil.node.services.environment.py",
+        ):
+            mod = importlib.import_module(mod_name)
+            source = open(mod.__file__).read()
+            lines = source.split("\n")
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("import resource") or stripped.startswith("from resource"):
+                    indent = len(line) - len(line.lstrip())
+                    assert indent > 0, (
+                        f"'resource' module must not be imported at module level "
+                        f"in {mod_name} (line {i+1})"
+                    )

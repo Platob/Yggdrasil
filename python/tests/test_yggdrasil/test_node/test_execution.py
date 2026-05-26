@@ -7,16 +7,22 @@ from unittest.mock import patch
 
 import pytest
 
-from yggdrasil.node.services.execution import (
+from yggdrasil.node.services.environment import (
     Environment,
+    PyEnvironment,
+    venv_python,
+)
+from yggdrasil.node.services.execution import (
     Executable,
     Execution,
-    PyEnvironment,
+)
+from yggdrasil.node.services.execution.pyfunction import (
     PyFunction,
     PyFunctionExecution,
+)
+from yggdrasil.node.services.execution.shell import (
     ShellCommand,
     ShellCommandExecution,
-    venv_python,
 )
 
 
@@ -26,12 +32,12 @@ from yggdrasil.node.services.execution import (
 
 class TestVenvPython:
     def test_linux_path(self):
-        with patch("yggdrasil.node.services.execution._IS_WINDOWS", False):
+        with patch("yggdrasil.node.services.environment._IS_WINDOWS", False):
             result = venv_python("/opt/envs/myenv")
         assert result.endswith("bin/python")
 
     def test_windows_path(self):
-        with patch("yggdrasil.node.services.execution._IS_WINDOWS", True):
+        with patch("yggdrasil.node.services.environment._IS_WINDOWS", True):
             result = venv_python("/opt/envs/myenv")
         assert "Scripts" in result
         assert result.endswith("python.exe")
