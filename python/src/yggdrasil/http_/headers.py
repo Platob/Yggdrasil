@@ -5,7 +5,7 @@ urllib3-shim error path in :mod:`yggdrasil.exceptions.http`) speaks the
 urllib3-shaped :class:`HTTPHeaderDict`: same name, same multi-value
 semantics, lowercase-keyed storage with first-seen original casing
 preserved on iteration. The high-level
-:class:`yggdrasil.io.headers.Headers` is a different abstraction
+:class:`yggdrasil.io.headers.HTTPHeaders` is a different abstraction
 (normalised, anonymisation-aware, hash-stable) and isn't a drop-in
 replacement at the transport layer.
 """
@@ -88,7 +88,7 @@ class HTTPHeaderDict(collections.abc.MutableMapping):
         return f"HTTPHeaderDict({dict(self.items())!r})"
 # yggdrasil.io.headers
 __all__ = [
-    "Headers",
+    "HTTPHeaders",
     "HeaderValue",
     "PromotedHeaders",
     "normalize_headers",
@@ -364,24 +364,24 @@ def _looks_like_token(value: str) -> bool:
 
 
 def normalize_headers(
-    headers: "Headers | Mapping[HeaderValue, HeaderValue] | None",
+    headers: "HTTPHeaders | Mapping[HeaderValue, HeaderValue] | None",
     *,
     is_request: bool,
     add_missing: bool = True,
     mode: Literal["remove", "redact"] = "remove",
     anonymize: bool = False,
     body: Optional[IO] = None,
-) -> "Headers":
-    """Backwards-compatible thin wrapper around :meth:`Headers.normalized`.
+) -> "HTTPHeaders":
+    """Backwards-compatible thin wrapper around :meth:`HTTPHeaders.normalized`.
 
     The whole normalization vocabulary (canonical names, sensitive
     detection, body-derived Content-* backfill, request defaults)
-    lives on :class:`Headers` so a single audit covers the whole
+    lives on :class:`HTTPHeaders` so a single audit covers the whole
     behaviour. This free function stays so existing callers
     (``normalize_headers(some_dict, is_request=True)``) keep working
     without rewriting every site.
     """
-    return Headers.from_(headers).normalized(
+    return HTTPHeaders.from_(headers).normalized(
         is_request=is_request,
         add_missing=add_missing,
         mode=mode,
@@ -390,7 +390,7 @@ def normalize_headers(
     )
 
 
-# Sentinel used by :class:`Headers` to tell "key absent" from "key
+# Sentinel used by :class:`HTTPHeaders` to tell "key absent" from "key
 # present with the same value" without paying for an extra ``in``
 # probe. ``object()`` would work; ``...`` is already the codebase's
 # blessed missing-arg singleton (see CLAUDE.md → "Use `...` as the
@@ -439,7 +439,7 @@ class HTTPHeaders(MutableMapping[str, str]):
 
     def __init__(
         self,
-        data: "Headers | Mapping[Any, Any] | Iterable[tuple[Any, Any]] | None" = None,
+        data: "HTTPHeaders | Mapping[Any, Any] | Iterable[tuple[Any, Any]] | None" = None,
     ) -> None:
         # ``_version`` starts at 0; the cache slots use ``-1`` so the
         # first read is always a miss even when no mutation has fired.
@@ -450,14 +450,14 @@ class HTTPHeaders(MutableMapping[str, str]):
         self._xxh3_64_version: int = -1
         self._canonical_bytes: bytes = b""
         self._canonical_bytes_version: int = -1
-        # Lazy: most Headers instances never have :meth:`anonymized`
+        # Lazy: most HTTPHeaders instances never have :meth:`anonymized`
         # called on them, so don't pay the per-construct dict alloc.
-        self._anonymized_cache: dict[str, "Headers"] | None = None
+        self._anonymized_cache: dict[str, "HTTPHeaders"] | None = None
         self._anonymized_cache_version: int = -1
         if data is None:
             self._data = {}
             return
-        if isinstance(data, Headers):
+        if isinstance(data, HTTPHeaders):
             # Already string-keyed string-valued — copy in one shot.
             self._data = dict(data._data)
             return
@@ -479,10 +479,10 @@ class HTTPHeaders(MutableMapping[str, str]):
     @classmethod
     def from_(
         cls,
-        arg: "Headers | Mapping[Any, Any] | Iterable[tuple[Any, Any]] | None" = None,
-    ) -> "Headers":
-        """Coerce *arg* to :class:`Headers` — passing an existing
-        instance through unchanged so callers can ``Headers.from_(x)``
+        arg: "HTTPHeaders | Mapping[Any, Any] | Iterable[tuple[Any, Any]] | None" = None,
+    ) -> "HTTPHeaders":
+        """Coerce *arg* to :class:`HTTPHeaders` — passing an existing
+        instance through unchanged so callers can ``HTTPHeaders.from_(x)``
         regardless of what ``x`` is."""
         if isinstance(arg, cls):
             return arg
@@ -518,7 +518,7 @@ class HTTPHeaders(MutableMapping[str, str]):
         return key in self._data
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, Headers):
+        if isinstance(other, HTTPHeaders):
             return self._data == other._data
         if isinstance(other, Mapping):
             return self._data == dict(other)
@@ -531,7 +531,7 @@ class HTTPHeaders(MutableMapping[str, str]):
         return not eq
 
     def __repr__(self) -> str:
-        return f"Headers({self._data!r})"
+        return f"HTTPHeaders({self._data!r})"
 
     def __bool__(self) -> bool:
         return bool(self._data)
@@ -559,7 +559,7 @@ class HTTPHeaders(MutableMapping[str, str]):
         merged: dict[str, str] = {}
         if args:
             other = args[0]
-            if isinstance(other, Headers):
+            if isinstance(other, HTTPHeaders):
                 merged.update(other._data)
             elif isinstance(other, Mapping):
                 for k, v in other.items():
@@ -582,14 +582,14 @@ class HTTPHeaders(MutableMapping[str, str]):
         self._data.clear()
         self._version += 1
 
-    def copy(self) -> "Headers":
-        """Shallow copy as a fresh :class:`Headers` (version reset).
+    def copy(self) -> "HTTPHeaders":
+        """Shallow copy (version reset).
 
         Bypasses ``__init__``'s per-item ``str()`` coercion — we already
         know the source's keys / values are strings and the rest of the
         cache slots start fresh.
         """
-        new = Headers.__new__(Headers)
+        new = HTTPHeaders.__new__(HTTPHeaders)
         new._data = dict(self._data)
         new._version = 0
         new._byte_length = 0
@@ -619,7 +619,7 @@ class HTTPHeaders(MutableMapping[str, str]):
         when the header isn't in the registry."""
         return _normalize_header_name(name)[0]
 
-    def anonymized(self, mode: Literal["remove", "redact"] = "remove") -> "Headers":
+    def anonymized(self, mode: Literal["remove", "redact"] = "remove") -> "HTTPHeaders":
         """Return a copy with sensitive values dropped/redacted.
 
         Authorization scheme (``Bearer``, ``Basic``, …) is preserved
@@ -640,7 +640,7 @@ class HTTPHeaders(MutableMapping[str, str]):
             if cached is not None:
                 return cached
 
-        out = Headers()
+        out = HTTPHeaders()
         for raw_name, raw_value in self._data.items():
             name, name_lower = _normalize_header_name(raw_name)
             value = _to_text(raw_value)
@@ -667,8 +667,8 @@ class HTTPHeaders(MutableMapping[str, str]):
         mode: Literal["remove", "redact"] = "remove",
         anonymize: bool = False,
         body: "Optional[Holder]" = None,
-    ) -> "Headers":
-        """Return a fresh :class:`Headers` with names canonicalized,
+    ) -> "HTTPHeaders":
+        """Return a fresh :class:`HTTPHeaders` with names canonicalized,
         sensitive values optionally sanitized, and (when
         ``add_missing``) request defaults / body-derived ``Content-*``
         slots filled in.
@@ -677,7 +677,7 @@ class HTTPHeaders(MutableMapping[str, str]):
         is a thin wrapper that calls into this method so every
         canonicalization site goes through one piece of code.
         """
-        out = Headers()
+        out = HTTPHeaders()
 
         has_content_type = False
         has_content_length = False
@@ -798,8 +798,8 @@ class HTTPHeaders(MutableMapping[str, str]):
     def canonical_bytes(self) -> bytes:
         """Sorted ``key=value\\x00key=value\\x00…`` byte sequence —
         the canonical wire form used by digest mixing. Order is
-        deterministic (sorted by key) so ``Headers({A:1, B:2})`` and
-        ``Headers({B:2, A:1})`` produce the same payload. Memoized
+        deterministic (sorted by key) so ``HTTPHeaders({A:1, B:2})`` and
+        ``HTTPHeaders({B:2, A:1})`` produce the same payload. Memoized
         against :attr:`version` so each request pays the encode walk
         once across :attr:`xxh3_64`, :attr:`PreparedRequest.hash`,
         and :attr:`Response.hash`.
@@ -863,4 +863,3 @@ class HTTPHeaders(MutableMapping[str, str]):
         self._canonical_bytes_version = -1
         self._anonymized_cache = None
         self._anonymized_cache_version = -1
-Headers = HTTPHeaders

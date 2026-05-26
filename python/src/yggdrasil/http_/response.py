@@ -21,8 +21,7 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io.base import IO
 from yggdrasil.path.memory_stream import MemoryStream
 from yggdrasil.enums import Codec, MediaType, MimeTypes
-from yggdrasil.io.headers import Headers
-from yggdrasil.http_.headers import HTTPHeaderDict
+from yggdrasil.http_.headers import HTTPHeaders, HTTPHeaderDict
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
@@ -341,14 +340,14 @@ _RESPONSE_ARROW_STRUCT_TYPE: pa.StructType = pa.struct(RESPONSE_SCHEMA.to_arrow_
 def _compute_response_identity_hash(
     request_hash: int,
     status_code: int,
-    headers: "Headers | Mapping[str, str] | None",
+    headers: "HTTPHeaders | Mapping[str, str] | None",
     body: Holder | None,
 ) -> int:
     """Mix (request_hash, status, headers, body) into one xxh3_64.
 
     Each component arrives pre-digested where possible:
     :attr:`HTTPRequest.hash` already collapses method / url /
-    headers / body upstream, :class:`Headers` caches
+    headers / body upstream, :class:`HTTPHeaders` caches
     :attr:`canonical_bytes`, :class:`Holder` caches
     :attr:`xxh3_64_digest`. The response identity is the request
     digest mixed with the response-side bytes.
@@ -360,8 +359,8 @@ def _compute_response_identity_hash(
     h.update(int(status_code).to_bytes(4, "little", signed=False))
     h.update(b"\x00")
     if headers is not None:
-        if not isinstance(headers, Headers):
-            headers = Headers.from_(headers)
+        if not isinstance(headers, HTTPHeaders):
+            headers = HTTPHeaders.from_(headers)
         h.update(headers.canonical_bytes)
     if body is not None:
         h.update(body.xxh3_64_digest)
@@ -537,9 +536,9 @@ class HTTPResponse(IO):  # IO inherits Tabular
         self._cache = {}
         self._cache_token = ()
         # Re-coerce in case an old pickle carried ``headers`` as a
-        # plain dict — :class:`Headers.from_` is a no-op on an
+        # plain dict — :class:`HTTPHeaders.from_` is a no-op on an
         # already-built instance.
-        self.headers = Headers.from_(self.headers)
+        self.headers = HTTPHeaders.from_(self.headers)
 
     # ------------------------------------------------------------------
     # Memoization — cheap fingerprint check, refresh on change
@@ -551,7 +550,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
 
         Trusts each inner object to track its own state: the embedded
         request's :meth:`_state_token` rolls up its method / URL /
-        headers / body fingerprint; :class:`Headers` exposes
+        headers / body fingerprint; :class:`HTTPHeaders` exposes
         ``version`` for in-place tracking; :class:`Holder` is keyed
         by ``id`` + size. No byte-length shadows — when the inner
         object changes, the token shifts on its own.
@@ -592,9 +591,9 @@ class HTTPResponse(IO):  # IO inherits Tabular
 
     def _invalidate_cache(self) -> None:
         """Drop every memoized derivation — call after a value-equal
-        :class:`Headers` swap or any other mutation the inner-object
+        :class:`HTTPHeaders` swap or any other mutation the inner-object
         fingerprint can't see (none of the standard setters need
-        this; :class:`Headers` already bumps its own version on
+        this; :class:`HTTPHeaders` already bumps its own version on
         in-place writes)."""
         self._cache.clear()
         self._cache_token = ()
@@ -667,7 +666,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         receiver = _parse_receiver(obj)
 
         if normalize:
-            headers = Headers.from_(headers).normalized(body=buffer, is_request=False)
+            headers = HTTPHeaders.from_(headers).normalized(body=buffer, is_request=False)
 
         _ensure_media_headers(headers, buffer)
 
@@ -1357,7 +1356,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         buffer = _coerce_buffer(body_bytes, media_type=pre_media)
 
         if normalize:
-            headers = Headers.from_(headers).normalized(body=buffer, is_request=False)
+            headers = HTTPHeaders.from_(headers).normalized(body=buffer, is_request=False)
 
 
         receiver_value = get("receiver")
@@ -1471,7 +1470,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         super().__init__()
         self.request = request
         self.status_code = int(status_code)
-        self.headers: Headers = Headers.from_(headers)
+        self.headers: HTTPHeaders = HTTPHeaders.from_(headers)
         self.tags = _string_dict(tags)
         self.received_at = any_to_datetime(received_at)
         self.buffer = _coerce_buffer(buffer)

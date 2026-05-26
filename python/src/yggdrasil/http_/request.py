@@ -17,7 +17,7 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from yggdrasil.http_.authorization.base import Authorization
 from yggdrasil.io.base import IO
-from yggdrasil.io.headers import Headers
+from yggdrasil.http_.headers import HTTPHeaders
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.url import URL
@@ -183,7 +183,7 @@ class HTTPRequest:
     ) -> None:
         self.method = method or "GET"
         self.url = URL.from_(url)
-        self.headers: Headers = Headers.from_(headers)
+        self.headers: HTTPHeaders = HTTPHeaders.from_(headers)
         self.tags = _string_dict(tags)
         self.sent_at = (
             any_to_datetime(sent_at) if sent_at
@@ -281,9 +281,9 @@ class HTTPRequest:
         if "send_config" not in self.__dict__:
             self.send_config = None
         # Re-coerce in case an old pickle carried ``headers`` as a
-        # plain dict — :class:`Headers.from_` is a no-op on an
+        # plain dict — :class:`HTTPHeaders.from_` is a no-op on an
         # already-built instance, so the live path stays cheap.
-        self.headers = Headers.from_(self.headers)
+        self.headers = HTTPHeaders.from_(self.headers)
 
     # ------------------------------------------------------------------
     # Memoization — cheap fingerprint check, refresh on change
@@ -295,7 +295,7 @@ class HTTPRequest:
 
         We trust each inner object to track its own state:
         :class:`URL` is value-equal so it identifies itself,
-        :class:`Headers` exposes a monotonic ``version`` (one int
+        :class:`HTTPHeaders` exposes a monotonic ``version`` (one int
         compare beats walking the dict), and :class:`Holder` is
         identified by ``id`` + size. No byte-length or stat shadows
         on :class:`PreparedRequest` itself — the inner objects are
@@ -333,11 +333,11 @@ class HTTPRequest:
     def _invalidate_cache(self) -> None:
         """Drop every memoized derivation.
 
-        :class:`Headers` already bumps its own ``version`` on every
+        :class:`HTTPHeaders` already bumps its own ``version`` on every
         mutation, so header rewrites flow through :meth:`_state_token`
         without help. This entry point stays for the rare case where
         callers swap :attr:`headers` for a fresh value-equal
-        :class:`Headers` (``id`` flips, contents identical) or mutate
+        :class:`HTTPHeaders` (``id`` flips, contents identical) or mutate
         a slot the fingerprint doesn't watch — clearing the memo
         here forces a clean recompute on the next access.
         """
@@ -586,7 +586,7 @@ class HTTPRequest:
             method=str(method),
             url=parsed_url,
             headers=(
-                Headers.from_(out_headers).normalized(is_request=True, body=request_body)
+                HTTPHeaders.from_(out_headers).normalized(is_request=True, body=request_body)
                 if normalize else out_headers
             ),
             tags=_string_dict(tags),
@@ -616,13 +616,13 @@ class HTTPRequest:
         copy_buffer: bool = False,
     ) -> "HTTPRequest":
         new_url = self.url if url is None else URL.from_(url, normalize=normalize)
-        # Clone the existing :class:`Headers` directly — ``dict(self.headers)``
-        # would iterate via ``__getitem__`` only for ``Headers.from_`` to
-        # immediately rebuild a :class:`Headers` from that dict. Going
-        # ``Headers -> Headers`` short-circuits the round trip via the
-        # ``isinstance(data, Headers)`` branch in ``Headers.__init__``,
+        # Clone the existing :class:`HTTPHeaders` directly — ``dict(self.headers)``
+        # would iterate via ``__getitem__`` only for ``HTTPHeaders.from_`` to
+        # immediately rebuild a :class:`HTTPHeaders` from that dict. Going
+        # ``HTTPHeaders -> HTTPHeaders`` short-circuits the round trip via the
+        # ``isinstance(data, HTTPHeaders)`` branch in ``HTTPHeaders.__init__``,
         # which lifts the internal dict in one C-level shallow copy.
-        new_headers = Headers(self.headers) if headers is None else _string_dict(headers)
+        new_headers = HTTPHeaders(self.headers) if headers is None else _string_dict(headers)
 
         if buffer is ...:
             new_buffer = self.buffer
@@ -692,7 +692,7 @@ class HTTPRequest:
             self._auth = value
             return
         if self.headers is None:
-            self.headers = Headers()
+            self.headers = HTTPHeaders()
         if value is None:
             self.headers.pop("Authorization", None)
         else:
@@ -731,7 +731,7 @@ class HTTPRequest:
             return self
         value = self._auth.authorization
         if self.headers is None:
-            self.headers = Headers()
+            self.headers = HTTPHeaders()
         self.headers["Authorization"] = value
         return self
 
@@ -742,7 +742,7 @@ class HTTPRequest:
     @x_api_key.setter
     def x_api_key(self, value: Optional[str]):
         if self.headers is None:
-            self.headers = Headers()
+            self.headers = HTTPHeaders()
         if value is None:
             self.headers.pop("X-API-Key", None)
         else:
@@ -761,7 +761,7 @@ class HTTPRequest:
     @accept_media_type.setter
     def accept_media_type(self, value: MediaType):
         if self.headers is None:
-            self.headers = Headers()
+            self.headers = HTTPHeaders()
         self.headers["Accept"] = value.mime_type.value
         if value.codec:
             self.headers["Accept-Encoding"] = value.codec.name
@@ -858,7 +858,7 @@ class HTTPRequest:
         """Mix (method, url, headers, body) into one xxh3_64 digest.
 
         Each component arrives in its own pre-cached form:
-        :class:`URL` caches ``to_string()``, :class:`Headers` caches
+        :class:`URL` caches ``to_string()``, :class:`HTTPHeaders` caches
         :attr:`canonical_bytes`, :class:`Holder` caches
         :attr:`xxh3_64_digest`. Repeat calls — common at the cache
         layer where ``hash`` and ``public_hash`` both fire — pay one
@@ -1051,16 +1051,16 @@ class HTTPRequest:
         if not headers:
             return self
 
-        next_headers: "Headers | Mapping[str, str]" = headers
+        next_headers: "HTTPHeaders | Mapping[str, str]" = headers
         if normalize:
-            next_headers = Headers.from_(headers).normalized(
+            next_headers = HTTPHeaders.from_(headers).normalized(
                 is_request=True,
                 anonymize=False,
                 add_missing=False,
             )
 
         if not self.headers:
-            self.headers = Headers.from_(next_headers)
+            self.headers = HTTPHeaders.from_(next_headers)
         else:
             self.headers.update(next_headers)
 
