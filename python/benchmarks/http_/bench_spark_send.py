@@ -24,7 +24,7 @@ from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.http_.session import HTTPSession
 from yggdrasil.path.folder import Folder
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.local_path import LocalPath
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):

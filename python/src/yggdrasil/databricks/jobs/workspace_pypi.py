@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Union
 
-from yggdrasil.io.pypi import PyPIPath
+from yggdrasil.path.pypi import PyPIPath
 
 if TYPE_CHECKING:
     from ..client import DatabricksClient

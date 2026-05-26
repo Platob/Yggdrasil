@@ -7,7 +7,7 @@ import textwrap
 import unittest
 from pathlib import Path as _LocalPath
 
-from yggdrasil.io.pypi import (
+from yggdrasil.path.pypi import (
     PyPIPath,
     normalize_pep503_name,
     parse_wheel_filename,
