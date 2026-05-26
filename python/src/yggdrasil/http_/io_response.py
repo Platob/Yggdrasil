@@ -1,3 +1,6 @@
+<<<<<<< HEAD:python/src/yggdrasil/io/response.py
+from yggdrasil.http_.response import *  # noqa: F401,F403
+=======
 # yggdrasil.io.response
 """HTTP response model with Arrow, Polars, pandas, and ASGI serialisation."""
 from __future__ import annotations
@@ -8,15 +11,8 @@ import warnings
 from dataclasses import MISSING
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
 
-<<<<<<< HEAD
 import polars as pl
 import pyarrow as pa
-=======
-from yggdrasil.io.holder import IO
-from yggdrasil.io.memory_stream import MemoryStream
-from yggdrasil.http_.request import PreparedRequest
-from yggdrasil.http_.io_response import Response, _media_type_from_headers
->>>>>>> 7d53e95
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.cast import any_to_datetime
@@ -1659,3 +1655,4 @@ def _any_to_arrow_record_batch_with_response(obj, options=None):
 
 _any_registry[pa.Table] = _any_to_arrow_table_with_response
 _any_registry[pa.RecordBatch] = _any_to_arrow_record_batch_with_response
+>>>>>>> 7d53e95:python/src/yggdrasil/http_/io_response.py

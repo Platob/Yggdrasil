@@ -18,7 +18,7 @@ from yggdrasil.enums import Mode
 from yggdrasil.http_.session import HTTPSession
 from yggdrasil.http_.response import RESPONSE_SCHEMA, Response
 from yggdrasil.http_.send_config import CacheConfig
-from yggdrasil.http_.io_session import Session
+from yggdrasil.http_.session import Session
 from yggdrasil.io.tabular import Tabular
 
 from ._helpers import StubSession, make_request, make_response

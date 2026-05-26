@@ -25,11 +25,17 @@ from __future__ import annotations
 import collections
 import datetime as dt
 import http.client
+import inspect
 import itertools
 import logging
 import os
+<<<<<<< HEAD
+=======
+import pathlib
+>>>>>>> 7d53e95
 import socket
 import ssl
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import takewhile
@@ -46,6 +52,10 @@ from typing import (
 from urllib.parse import urlsplit, urlunsplit
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
+<<<<<<< HEAD
+=======
+from yggdrasil.dataclasses.singleton import Singleton
+>>>>>>> 7d53e95
 from yggdrasil.enums import MediaTypes
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
@@ -61,7 +71,10 @@ from yggdrasil.io.primitive import ArrowIPCFile
 from yggdrasil.http_.request import PreparedRequest
 from yggdrasil.http_.response import Response
 from yggdrasil.http_.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig
+<<<<<<< HEAD
 from yggdrasil.http_.io_session import Session
+=======
+>>>>>>> 7d53e95
 from yggdrasil.url import URL
 
 from .exceptions import (
@@ -79,7 +92,7 @@ from .timeout import _resolve_timeout
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
-__all__ = ["HTTPSession"]
+__all__ = ["HTTPSession", "Session"]
 
 
 LOGGER = logging.getLogger(__name__)
@@ -217,31 +230,133 @@ class _TieredRetry(Retry):
         return float(min(_BACKOFF_5XX_MAX, backoff))
 
 
-class HTTPSession(Session):
-    """HTTP/HTTPS session — singleton-keyed by ``(base_url, verify, pool_maxsize, headers, waiting, auth)``.
+def _hashable_identity_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, URL):
+        return value.to_string()
+    if isinstance(value, Mapping):
+        return tuple(sorted(value.items()))
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted(value))
+    if isinstance(value, list):
+        return tuple(value)
+    return value
 
-    Inherits the singleton + pickle + ``job_pool`` plumbing from
-    :class:`~yggdrasil.io.session.Session` and adds every HTTP-specific
-    concern: a stdlib-backed connection pool (HTTPSession owns the per-host
-    socket cache directly — no separate ``PoolManager`` indirection)
-    connection pool, the prepare → cache-lookup → wire-send → cache-writeback
-    pipeline (both single-request :meth:`send` and bulk :meth:`send_many`),
-    Spark fan-out via ``mapInArrow``, the verb sugar
-    (:meth:`get` / :meth:`post` / :meth:`put` / :meth:`patch` /
-    :meth:`delete` / :meth:`head` / :meth:`options` / :meth:`request`),
-    cookie-header coercion, and the 403 auth-refresh retry loop.
 
-    No User-Agent generator, cookie jar, or browser-emulation layering is
-    built in — per-vendor integrations subclass this for their own auth /
-    pagination / rate-limit policy (see :class:`yggdrasil.fxrate.FxRate` for
-    a worked example).
-    """
+class HTTPSession(Singleton):
+    """HTTP/HTTPS session — singleton-keyed, connection-pooled."""
 
-    _PREPARED_CLASS: ClassVar[type] = PreparedRequest
-    _RESPONSE_CLASS: ClassVar[type] = Response
-    _BATCH_CLASS: ClassVar[type] = HTTPResponseBatch
+    _SINGLETON_TTL: ClassVar[Any] = None
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_lock", "_job_pool", "_local_cache", "_connections", "_retry",
+    })
+    _IDENTITY_BOOKKEEPING_ATTRS: ClassVar[frozenset[str]] = frozenset({
+        "_initialized", "_singleton_key_",
+    })
+    DEFAULT_POOL_MAXSIZE: ClassVar[int] = 8
 
-    _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_connections", "_retry"}
+    @classmethod
+    def _identity_excluded_attrs(cls) -> frozenset[str]:
+        return cls._TRANSIENT_STATE_ATTRS | cls._IDENTITY_BOOKKEEPING_ATTRS
+
+    @classmethod
+    def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
+        kwargs.pop("singleton_ttl", None)
+        probe = object.__new__(cls)
+        object.__setattr__(probe, "_initialized", False)
+        object.__setattr__(probe, "_in_probe", True)
+        cls.__init__(probe, *args, **kwargs)
+        param_names = cls._init_param_names()
+        excluded = cls._identity_excluded_attrs()
+        items = tuple(
+            (k, _hashable_identity_value(v))
+            for k, v in sorted(probe.__dict__.items())
+            if k in param_names and k not in excluded
+        )
+        return (cls, items)
+
+    @classmethod
+    def _init_param_names(cls) -> frozenset[str]:
+        cached = cls.__dict__.get("_INIT_PARAM_NAMES_CACHE")
+        if cached is not None:
+            return cached
+        names: set[str] = set()
+        for klass in cls.__mro__:
+            init = klass.__dict__.get("__init__")
+            if init is None or init is object.__init__:
+                continue
+            try:
+                sig = inspect.signature(init)
+            except (TypeError, ValueError):
+                continue
+            for name, param in sig.parameters.items():
+                if name == "self":
+                    continue
+                if param.kind in (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
+                    continue
+                names.add(name)
+        result = frozenset(names)
+        type.__setattr__(cls, "_INIT_PARAM_NAMES_CACHE", result)
+        return result
+
+    def __enter__(self) -> "HTTPSession":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._job_pool:
+            self._job_pool.shutdown(wait=True)
+            self._job_pool = None
+
+    def __getnewargs_ex__(self):
+        param_names = self._init_param_names()
+        excluded = self._identity_excluded_attrs()
+        state = {
+            k: v for k, v in self.__dict__.items()
+            if k in param_names and k not in excluded
+        }
+        return (), state
+
+    def __setstate__(self, state):
+        if getattr(self, "_initialized", False):
+            return
+        super().__setstate__(state)
+        self._lock = threading.RLock()
+        self._local_cache = None
+        self._initialized = True
+
+    @property
+    def job_pool(self) -> JobPoolExecutor:
+        if self._job_pool is None:
+            with self._lock:
+                if self._job_pool is None:
+                    self._job_pool = JobPoolExecutor(max_workers=self.pool_maxsize)
+        return self._job_pool
+
+    def local_cache(self):
+        cached = getattr(self, "_local_cache", None)
+        if cached is not None:
+            return cached
+        with self._lock:
+            cached = getattr(self, "_local_cache", None)
+            if cached is not None:
+                return cached
+            from yggdrasil.io.nested.folder_path import FolderPath
+            from yggdrasil.io.path import Path
+
+            root = pathlib.Path.home() / ".cache" / "http"
+            base_url = getattr(self, "base_url", None)
+            host = getattr(base_url, "host", None) if base_url is not None else None
+            if not host:
+                folder = root / "default"
+            else:
+                url_path = (getattr(base_url, "path", "") or "").strip("/")
+                folder = root / host / url_path if url_path else root / host
+            self._local_cache = FolderPath(path=Path.from_(folder))
+            return self._local_cache
 
     # Status codes that trigger an automatic redirect when ``redirect=True``.
     # 303 always falls back to GET (per RFC 7231); 307/308 preserve method.
@@ -1896,3 +2011,6 @@ class HTTPSession(Session):
             session=self
         )
         return request
+
+
+Session = HTTPSession

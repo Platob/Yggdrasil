@@ -19,7 +19,11 @@ import pytest
 from yggdrasil.enums import Mode
 from yggdrasil.http_.response import Response
 from yggdrasil.http_.send_config import CacheConfig, SendConfig
+<<<<<<< HEAD
 from yggdrasil.http_.io_session import Session
+=======
+from yggdrasil.http_.session import Session
+>>>>>>> 7d53e95
 from yggdrasil.io.tabular import Tabular
 
 from ._helpers import StubSession, make_request, make_response
