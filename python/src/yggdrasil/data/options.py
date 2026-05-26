@@ -1255,10 +1255,7 @@ class CastOptions:
         if isinstance(data, Dataset):
             return self.cast_spark_tabular(data)
         if isinstance(data, Tabular):
-            table = data.read_arrow_table()
-            return ArrowTabular(
-                self.cast_arrow_table(table).to_batches()
-            )
+            return data.cast(options=self)
         raise TypeError(f"cast_tabular: unsupported type {type(data).__name__}")
 
     def dedup_columns_on_read(self) -> "list[str]":

@@ -2109,14 +2109,24 @@ class Tabular(ABC, Generic[O]):
         """
         return _default_filter(self, predicate=predicate)
 
-    def cast(self, schema: "Schema") -> "Tabular":
-        """Cast rows to *schema*, returning a new :class:`Tabular`.
+    def cast(self, schema: "Schema | None" = None, options: "O | None" = None) -> "Tabular":
+        """Cast rows, returning a new :class:`Tabular`.
 
-        Each batch is cast through
-        :meth:`Schema.cast_arrow_batch_iterator`. The result is an
-        :class:`ArrowTabular` with the target schema applied.
+        Accepts a :class:`Schema` or :class:`CastOptions`. When
+        *options* is given, reads to arrow and casts each batch
+        through :meth:`CastOptions.cast_arrow_batch`.
         """
         from yggdrasil.arrow.tabular import ArrowTabular as _ArrowTabular
+
+        if options is not None:
+            batches = [
+                options.cast_arrow_batch(b)
+                for b in self.read_arrow_batches()
+            ]
+            return _ArrowTabular(batches) if batches else _ArrowTabular([])
+
+        if schema is None:
+            return self
 
         batches = list(schema.cast_arrow_batch_iterator(
             self.read_arrow_batches(),
