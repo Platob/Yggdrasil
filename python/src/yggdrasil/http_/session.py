@@ -122,17 +122,6 @@ _PAGINATED_RECHUNK_BYTE_SIZE: int = 128 * 1024 * 1024
 
 
 
-def _synthetic_not_found(request: PreparedRequest) -> Response:
-    """Build a synthetic 404 response for a cache-only miss."""
-    return Response(
-        request=request,
-        status_code=404,
-        headers={"Content-Type": "application/json"},
-        tags={"synthetic": "cache_only_miss"},
-        buffer=b'{"error": "not found in cache"}',
-        received_at=dt.datetime.now(dt.timezone.utc),
-    )
-
 
 
 def _encode_request_data(
@@ -804,10 +793,10 @@ class HTTPSession(Session):
             lc.cache_tabular(session=self)
         if not start:
             return self._build_idle_response(request, cfg)
-        if cfg.spark_session:
-            for response in self._send_many(iter([request])):
-                return response
-        return self._send(request)
+        for response in self._send_many(iter([request])):
+            if cfg.raise_error:
+                response.raise_for_status()
+            return response
 
     def _build_idle_response(
         self,
@@ -957,47 +946,12 @@ class HTTPSession(Session):
         self,
         request: PreparedRequest,
     ) -> Response:
-        """Core send pipeline: split cache → network → writeback."""
-        config = request.send_config_or_default
-
-        local_tab, remote_tab, misses = config.split_requests(
-            [request], session=self,
-        )
-
-        if local_tab is not None and config.local_cache is not None:
-            for resp in Response.from_arrow_tabular(local_tab.read_arrow_batches()):
-                if config.local_cache.filter_response(resp, request=request):
-                    if config.raise_error:
-                        resp.raise_for_status()
-                    return resp
-
-        if remote_tab is not None and config.remote_cache is not None:
-            for resp in Response.from_arrow_tabular(remote_tab.read_arrow_batches()):
-                if config.remote_cache.filter_response(resp, request=request):
-                    if config.local_cache is not None:
-                        config.local_cache.write_responses([resp], mode=Mode.OVERWRITE, session=self)
-                    if config.raise_error:
-                        resp.raise_for_status()
-                    return resp
-
-        if config.cache_only:
-            response = _synthetic_not_found(request)
-            if config.raise_error:
-                response.raise_for_status()
-            return response
-
+        """Wire send — no cache logic, just prepare → send → post-process."""
         request = self.prepare_request_before_send(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
         response = self._local_send(request)
         response = self.prepare_response_after_received(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
-
-        if response.ok:
-            config.write_responses([response], session=self)
-
-        if config.raise_error:
-            response.raise_for_status()
-
         return response
 
     # ------------------------------------------------------------------
@@ -1287,65 +1241,9 @@ class HTTPSession(Session):
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
         """Process one config group: split cache → fetch misses → writeback."""
-        batch = HTTPResponseBatch(cfg, reqs, session=self)
-
-        misses = batch.misses
-        if not misses or cfg.cache_only:
-            if misses:
-                LOGGER.info(
-                    "Synthesising %d 404 response(s) (cache_only=True)",
-                    len(misses),
-                )
-                batch.new = [_synthetic_not_found(r) for r in misses]
-            return batch
-
-        spark = cfg.get_spark_session()
-        LOGGER.debug(
-            "Fetching %d miss(es) via %s",
-            len(misses), "spark" if spark else "thread pool",
+        return HTTPResponseBatch(cfg, reqs, session=self).send(
+            ordered=ordered, max_in_flight=max_in_flight,
         )
-        if spark is not None:
-            new_data = self._spark_fetch_misses(misses, spark)
-            if cfg.raise_error:
-                from pyspark.sql import functions as F
-                from yggdrasil.spark.cast import spark_dataframe_to_arrow
-
-                ok_df = new_data.where(
-                    (F.col("status_code") >= 200) & (F.col("status_code") < 400)
-                )
-                err_df = new_data.where(
-                    (F.col("status_code") < 200) | (F.col("status_code") >= 400)
-                )
-                err_table = spark_dataframe_to_arrow(err_df)
-                if len(err_table) > 0:
-                    batch.failed = list(Response.from_arrow_tabular(err_table))
-                new_data = ok_df
-            batch.new = new_data
-        else:
-            new_list: list[Response] = []
-            for response in self._fetch_misses(
-                misses, ordered=ordered, max_in_flight=max_in_flight,
-            ):
-                if response.ok:
-                    new_list.append(response)
-                elif cfg.raise_error:
-                    batch.failed.append(response)
-            LOGGER.info(
-                "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-                len(new_list) + len(batch.failed), len(misses),
-                len(new_list), len(batch.failed),
-            )
-            if new_list:
-                batch.new = pa.Table.from_batches(
-                    [Response.values_to_arrow_batch(new_list)]
-                )
-
-        if batch.new is not None:
-            new_tab = batch.new
-            write_data = new_tab.read_arrow_table() if hasattr(new_tab, 'read_arrow_table') else new_tab
-            cfg.write_responses_tabular(write_data, session=self)
-
-        return batch
 
     @staticmethod
     def _group_by_config(

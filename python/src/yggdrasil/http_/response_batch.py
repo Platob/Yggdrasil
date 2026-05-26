@@ -6,6 +6,8 @@ resolving cache hits (local/remote) and network responses on access.
 
 from __future__ import annotations
 
+import datetime as dt
+import logging
 from typing import Any, TYPE_CHECKING, Iterator, Optional
 
 import pyarrow as pa
@@ -19,11 +21,24 @@ if TYPE_CHECKING:
     from yggdrasil.io.request import PreparedRequest
     from yggdrasil.io.send_config import SendConfig
 
+LOGGER = logging.getLogger(__name__)
+
 
 __all__ = [
     "HTTPResponseBatch",
     "responses_to_tabular",
 ]
+
+
+def _synthetic_not_found(request: "PreparedRequest") -> Response:
+    return Response(
+        request=request,
+        status_code=404,
+        headers={"Content-Type": "application/json"},
+        tags={"synthetic": "cache_only_miss"},
+        buffer=b'{"error": "not found in cache"}',
+        received_at=dt.datetime.now(dt.timezone.utc),
+    )
 
 
 def responses_to_tabular(responses: list[Response]) -> ArrowTabular:
@@ -98,9 +113,130 @@ class HTTPResponseBatch(Tabular):
         local_tab, remote_tab, remaining = self._send_config.split_requests(
             self._requests, session=self._session,
         )
+
+        request_map = {r.match_value("public_hash"): r for r in self._requests}
+
+        def _filter_tab(tab, cache_cfg):
+            if tab is None or cache_cfg is None:
+                return tab, []
+            kept: list[Response] = []
+            rejected_keys: list = []
+            for resp in Response.from_arrow_tabular(tab.read_arrow_batches()):
+                req = request_map.get(
+                    resp.match_value("public_hash") if hasattr(resp, "match_value") else None
+                )
+                if req is not None and cache_cfg.filter_response(resp, request=req):
+                    kept.append(resp)
+                else:
+                    rejected_keys.append(resp)
+            if not kept:
+                return None, rejected_keys
+            return responses_to_tabular(kept), rejected_keys
+
+        local_tab, local_rejected = _filter_tab(local_tab, self._send_config.local_cache)
+        if local_rejected:
+            local_rejected_hashes = {
+                r.match_value("public_hash") for r in local_rejected
+                if hasattr(r, "match_value")
+            }
+            remaining = remaining + [
+                r for r in self._requests
+                if r.match_value("public_hash") in local_rejected_hashes
+            ]
+
+        remote_tab, _ = _filter_tab(remote_tab, self._send_config.remote_cache)
+
         self._local = local_tab
         self._remote = remote_tab
         self._misses = remaining
+
+    def send(
+        self,
+        *,
+        ordered: bool = False,
+        max_in_flight: int | None = None,
+    ) -> "HTTPResponseBatch":
+        """Resolve cache hits, fetch misses, and write back.
+
+        Triggers the lazy split (local → remote → misses), fetches
+        remaining misses via the session's thread pool or Spark,
+        writes ok responses back to caches, and returns self.
+        """
+        cfg = self._send_config
+        session = self._session
+        misses = self.misses
+
+        if self._remote is not None and cfg.local_cache is not None:
+            from yggdrasil.data.enums import Mode
+            try:
+                remote_table = self._remote.read_arrow_table()
+                if remote_table.num_rows > 0:
+                    cfg.local_cache.write_responses_tabular(
+                        remote_table, mode=Mode.OVERWRITE, session=session,
+                    )
+            except Exception:
+                LOGGER.debug("Remote→local backfill failed", exc_info=True)
+
+        if not misses or cfg.cache_only:
+            if misses:
+                self.new = [_synthetic_not_found(r) for r in misses]
+            return self
+
+        spark = cfg.get_spark_session()
+        LOGGER.debug(
+            "Fetching %d miss(es) via %s",
+            len(misses), "spark" if spark else "thread pool",
+        )
+
+        write_data = None
+        if spark is not None:
+            new_data = session._spark_fetch_misses(misses, spark)
+            if cfg.raise_error:
+                from pyspark.sql import functions as F
+                from yggdrasil.spark.cast import spark_dataframe_to_arrow
+
+                ok_df = new_data.where(
+                    (F.col("status_code") >= 200) & (F.col("status_code") < 400)
+                )
+                err_df = new_data.where(
+                    (F.col("status_code") < 200) | (F.col("status_code") >= 400)
+                )
+                err_table = spark_dataframe_to_arrow(err_df)
+                if len(err_table) > 0:
+                    self.failed = list(Response.from_arrow_tabular(err_table))
+                write_data = ok_df
+            else:
+                write_data = new_data
+            self.new = new_data
+        else:
+            ok_list: list[Response] = []
+            all_list: list[Response] = []
+            for response in session._fetch_misses(
+                misses, ordered=ordered, max_in_flight=max_in_flight,
+            ):
+                all_list.append(response)
+                if response.ok:
+                    ok_list.append(response)
+                elif cfg.raise_error:
+                    self.failed.append(response)
+            LOGGER.info(
+                "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
+                len(ok_list) + len(self.failed), len(misses),
+                len(ok_list), len(self.failed),
+            )
+            if all_list:
+                self.new = pa.Table.from_batches(
+                    [Response.values_to_arrow_batch(all_list)]
+                )
+            if ok_list:
+                write_data = pa.Table.from_batches(
+                    [Response.values_to_arrow_batch(ok_list)]
+                )
+
+        if write_data is not None:
+            cfg.write_responses_tabular(write_data, session=session)
+
+        return self
 
     @property
     def misses(self) -> list:
