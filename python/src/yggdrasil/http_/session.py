@@ -1260,30 +1260,10 @@ class HTTPSession(Session):
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> Iterator[Response]:
-        """Stage 3: send misses through the job pool."""
-        miss_send_config = misses[0].send_config_or_default.copy(
-            remote_cache=None,
-            local_cache=None,
-            spark_session=False,
-            raise_error=False,
-        )
-
+        """Send misses through the job pool — no caching, just wire calls."""
         pool = self.job_pool
-        LOGGER.info(
-            "Fetching %d send_many miss(es) through job pool "
-            "(max_in_flight=%d, ordered=%s)",
-            len(misses),
-            max_in_flight or pool.max_workers,
-            ordered,
-        )
         for result in pool.as_completed(
-            (
-                Job.make(
-                    self._send,
-                    r.copy(send_config=miss_send_config),
-                )
-                for r in misses
-            ),
+            (Job.make(self._send, r) for r in misses),
             ordered=ordered,
             max_in_flight=max_in_flight or self.pool_maxsize,
             cancel_on_exit=False,
