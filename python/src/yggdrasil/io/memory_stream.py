@@ -44,7 +44,6 @@ from __future__ import annotations
 import io
 import tempfile
 import time
-import zlib
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Optional, Union
 
 from yggdrasil.io.io_stats import IOKind, IOStats
@@ -57,33 +56,18 @@ __all__ = ["MemoryStream"]
 _DEFAULT_PULL_CHUNK = 1024 * 1024  # 1 MiB
 
 
-def _wrap_decoder(
-    read_fn: Callable[[int], Any],
-    encoding: str,
-) -> Callable[[int], bytes]:
-    enc = encoding.strip().lower()
-    if enc in ("gzip", "x-gzip"):
-        dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    elif enc == "deflate":
-        dec = zlib.decompressobj()
-    else:
-        return read_fn
+class _ReadCallableAsFile:
+    __slots__ = ("_read",)
 
-    state = {"dec": dec}
+    def __init__(self, read_fn: Callable) -> None:
+        self._read = read_fn
 
-    def _read(amt: Optional[int] = None) -> bytes:
-        chunk = read_fn(amt) if amt is not None else read_fn()
-        d = state["dec"]
-        if not chunk:
-            if d is not None:
-                state["dec"] = None
-                return d.flush()
-            return b""
-        if d is not None:
-            return d.decompress(chunk)
-        return chunk
+    def read(self, n: int = -1) -> bytes:
+        return self._read(n) if n >= 0 else self._read()
 
-    return _read
+    def readable(self) -> bool:
+        return True
+
 
 #: In-memory window cap. Bytes beyond this spill to a tempfile.
 _DEFAULT_SPILL_THRESHOLD = 128 * 1024 * 1024  # 128 MiB
@@ -206,7 +190,19 @@ class MemoryStream(Holder):
         self._read_chunk: Optional[Callable[[int], Any]] = None
         self._bind_source(source)
         if content_encoding and self._read_chunk is not None:
-            self._read_chunk = _wrap_decoder(self._read_chunk, content_encoding)
+            from yggdrasil.enums.codec import Codec
+            enc = content_encoding.strip().lower()
+            if enc == "x-gzip":
+                enc = "gzip"
+            codec = Codec.from_(enc, default=None)
+            if codec is not None:
+                raw_read = self._read_chunk
+                wrapper = _ReadCallableAsFile(raw_read)
+                reader = codec._open_decompress_reader(wrapper)
+                if reader is not None:
+                    self._read_chunk = reader.read
+                else:
+                    self._read_chunk = lambda n, _r=raw_read, _c=codec: _c.decompress_bytes(_r(n))
 
         # Skip Holder.__init__'s ``data`` routing — ``source`` is the
         # content feed, not a bytes/path/url seed. Pass only the

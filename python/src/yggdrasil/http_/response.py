@@ -47,7 +47,6 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "Response",
     "ResponseOptions",
     "RESPONSE_SCHEMA",
     "HTTPResponse",
@@ -1779,4 +1778,3 @@ _any_registry[pa.RecordBatch] = _any_to_arrow_record_batch_with_response
 
 
 
-Response = HTTPResponse
