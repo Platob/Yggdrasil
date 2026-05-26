@@ -236,6 +236,120 @@ class TestClearTabularChildren:
 
 
 
+class TestPartitionedUpsert:
+    """OVERWRITE + match_by must upsert per partition, not purge all."""
+
+    @staticmethod
+    def _batch(part_values, ids, values):
+        schema = pa.schema([
+            pa.field("pk", pa.int64(), metadata={b"t:partition_by": b"True"}),
+            pa.field("id", pa.int64()),
+            pa.field("v", pa.int64()),
+        ])
+        return pa.record_batch(
+            [
+                pa.array(part_values, pa.int64()),
+                pa.array(ids, pa.int64()),
+                pa.array(values, pa.int64()),
+            ],
+            schema=schema,
+        )
+
+    def test_overwrite_match_by_preserves_other_partitions(self, tmp_path) -> None:
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (self._batch([1, 1, 2, 2], [10, 11, 20, 21], [100, 110, 200, 210]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+        assert (tmp_path / "pk=1").is_dir()
+        assert (tmp_path / "pk=2").is_dir()
+
+        # OVERWRITE with match_by=["id"] — only touches pk=1, pk=2 untouched
+        folder.write_arrow_batches(
+            (self._batch([1], [10], [999]),),
+            options=FolderOptions(mode=Mode.OVERWRITE, match_by=["id"]),
+        )
+        assert (tmp_path / "pk=1").is_dir()
+        assert (tmp_path / "pk=2").is_dir()
+
+        out = folder.read_arrow_table()
+        rows = sorted(out.to_pylist(), key=lambda r: (r["pk"], r["id"]))
+        # pk=1: id=10 updated to 999, id=11 preserved
+        assert rows[0] == {"pk": 1, "id": 10, "v": 999}
+        assert rows[1] == {"pk": 1, "id": 11, "v": 110}
+        # pk=2: untouched
+        assert rows[2] == {"pk": 2, "id": 20, "v": 200}
+        assert rows[3] == {"pk": 2, "id": 21, "v": 210}
+
+    def test_overwrite_match_by_inserts_new_rows(self, tmp_path) -> None:
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (self._batch([1], [10], [100]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+
+        # New id=99 in existing partition pk=1
+        folder.write_arrow_batches(
+            (self._batch([1], [99], [999]),),
+            options=FolderOptions(mode=Mode.OVERWRITE, match_by=["id"]),
+        )
+
+        out = folder.read_arrow_table()
+        rows = sorted(out.to_pylist(), key=lambda r: r["id"])
+        assert len(rows) == 2
+        assert rows[0] == {"pk": 1, "id": 10, "v": 100}
+        assert rows[1] == {"pk": 1, "id": 99, "v": 999}
+
+    def test_overwrite_match_by_new_partition_created(self, tmp_path) -> None:
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (self._batch([1], [10], [100]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+
+        # Write to a new partition pk=3 while pk=1 exists
+        folder.write_arrow_batches(
+            (self._batch([3], [30], [300]),),
+            options=FolderOptions(mode=Mode.OVERWRITE, match_by=["id"]),
+        )
+
+        assert (tmp_path / "pk=1").is_dir()
+        assert (tmp_path / "pk=3").is_dir()
+        out = folder.read_arrow_table()
+        rows = sorted(out.to_pylist(), key=lambda r: r["id"])
+        assert len(rows) == 2
+        assert rows[0] == {"pk": 1, "id": 10, "v": 100}
+        assert rows[1] == {"pk": 3, "id": 30, "v": 300}
+
+    def test_overwrite_without_match_by_still_purges(self, tmp_path) -> None:
+        from yggdrasil.data.enums import Mode
+        from yggdrasil.io.nested.folder_path import FolderOptions
+
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_batches(
+            (self._batch([1, 2], [10, 20], [100, 200]),),
+            options=FolderOptions(mode=Mode.APPEND),
+        )
+
+        # Plain OVERWRITE (no match_by) still purges all partitions
+        folder.write_arrow_batches(
+            (self._batch([3], [30], [300]),),
+            options=FolderOptions(mode=Mode.OVERWRITE),
+        )
+        assert not (tmp_path / "pk=1").exists()
+        assert not (tmp_path / "pk=2").exists()
+        assert (tmp_path / "pk=3").is_dir()
+
+
 class TestCheckedCast:
     """``CastOptions.checked_cast=True`` opts out of per-batch schema
     re-binding and casts.
