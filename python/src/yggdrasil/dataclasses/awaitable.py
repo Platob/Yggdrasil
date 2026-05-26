@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums.state import State
@@ -134,6 +137,10 @@ class Awaitable(ABC):
                     if wait.max_attempts is not None and self._attempts >= wait.max_attempts:
                         pass
                     else:
+                        logger.warning(
+                            "%s retry %d: %s",
+                            type(self).__name__, self._attempts, self.error,
+                        )
                         self.start(reset=True, wait=False)
                         iteration = 0
                         continue
