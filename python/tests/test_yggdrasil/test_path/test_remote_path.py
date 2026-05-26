@@ -32,7 +32,6 @@ class _StubRemotePath(RemotePath):
     # skips the Scheme enum coercion, yet ``IO.__new__`` sees a truthy
     # value and treats the class as a storage leaf (not a cursor).
 
-
     def __init__(
         self,
         data: Any = None,
@@ -90,7 +89,7 @@ class _StubRemotePath(RemotePath):
         for k in sorted(self._STORAGE):
             if not k.startswith(prefix):
                 continue
-            remainder = k[len(prefix) :]
+            remainder = k[len(prefix):]
             if not recursive:
                 top = remainder.split("/")[0]
                 if top in seen:
@@ -170,6 +169,11 @@ class TestRemoteReadWrite:
         p.write_mv(memoryview(b"ABCDE"), 0, overwrite=True)
         assert bytes(p.read_mv(5, 0)) == b"ABCDE"
 
+    def test_size_matches_written_data(self) -> None:
+        p = _make("/rw/size.bin")
+        payload = b"x" * 128
+        p.write_bytes(payload)
+        assert p.size == 128
 
     def test_overwrite_replaces_content(self) -> None:
         p = _make("/rw/overwrite.bin")
@@ -181,6 +185,96 @@ class TestRemoteReadWrite:
         p = _make("/rw/ghost.bin")
         result = p._bread(10, 0, Mode.READ_ONLY)
         assert bytes(result.to_bytes()) == b""
+
+    def test_write_then_stat_shows_correct_size(self) -> None:
+        p = _make("/rw/stat_size.bin")
+        p.write_bytes(b"0123456789")
+        p.invalidate_singleton()
+        stat = p._stat()
+        assert stat.size == 10
+        assert stat.kind == IOKind.FILE
+
+
+# ---------------------------------------------------------------------------
+# TestRemotePageBuffer
+# ---------------------------------------------------------------------------
+
+
+class TestRemotePageBuffer:
+
+    def test_page_cache_reduces_read_mv_calls(self) -> None:
+        p = _StubRemotePath("/page/cached.bin", singleton_ttl=False, page_size=64)
+        _StubRemotePath._STORAGE["/page/cached.bin"] = b"A" * 64
+        p._persist_stat_cache(IOStats(size=64, kind=IOKind.FILE, mtime=time.time()))
+
+        call_count = 0
+        original_read_mv = _StubRemotePath._read_mv
+
+        def counting_read(self_inner, n, pos):
+            nonlocal call_count
+            call_count += 1
+            return original_read_mv(self_inner, n, pos)
+
+        with patch.object(_StubRemotePath, "_read_mv", counting_read):
+            p.read_mv(10, 0)
+            first_count = call_count
+            p.read_mv(10, 0)
+            assert call_count == first_count, (
+                "Second read from same page should not call _read_mv again"
+            )
+
+    def test_dirty_page_flush_writes_to_storage(self) -> None:
+        p = _StubRemotePath("/page/dirty.bin", singleton_ttl=False, page_size=64)
+        _StubRemotePath._STORAGE["/page/dirty.bin"] = b"\x00" * 64
+        p._persist_stat_cache(IOStats(size=64, kind=IOKind.FILE, mtime=time.time()))
+
+        with p:
+            p.write_mv(memoryview(b"PATCHED"), 0)
+        assert _StubRemotePath._STORAGE["/page/dirty.bin"][:7] == b"PATCHED"
+
+    def test_multiple_reads_within_same_page_use_cache(self) -> None:
+        p = _StubRemotePath("/page/multi.bin", singleton_ttl=False, page_size=256)
+        content = bytes(range(256))
+        _StubRemotePath._STORAGE["/page/multi.bin"] = content
+        p._persist_stat_cache(IOStats(size=256, kind=IOKind.FILE, mtime=time.time()))
+
+        call_count = 0
+        original_read_mv = _StubRemotePath._read_mv
+
+        def counting_read(self_inner, n, pos):
+            nonlocal call_count
+            call_count += 1
+            return original_read_mv(self_inner, n, pos)
+
+        with patch.object(_StubRemotePath, "_read_mv", counting_read):
+            _ = p.read_mv(10, 0)
+            _ = p.read_mv(10, 50)
+            _ = p.read_mv(10, 100)
+        # All three reads fall within page 0 — only one backend fetch.
+        assert call_count == 1
+
+    def test_page_eviction_on_cache_pressure(self) -> None:
+        # Use a tiny page size so four distinct pages cover the 128-byte file.
+        p = _StubRemotePath("/page/evict.bin", singleton_ttl=False, page_size=32)
+        content = b"A" * 32 + b"B" * 32 + b"C" * 32 + b"D" * 32
+        _StubRemotePath._STORAGE["/page/evict.bin"] = content
+        p._persist_stat_cache(IOStats(size=128, kind=IOKind.FILE, mtime=time.time()))
+
+        # Force the pages dict to have a tiny max_size so pages get evicted.
+        p._pages = ExpiringDict(default_ttl=300.0, max_size=2)
+
+        _ = p.read_mv(10, 0)    # page 0
+        _ = p.read_mv(10, 32)   # page 1
+        _ = p.read_mv(10, 64)   # page 2
+        _ = p.read_mv(10, 96)   # page 3
+
+        # The live page count should not exceed max_size.
+        assert len(p._pages) <= 2
+
+
+# ---------------------------------------------------------------------------
+# TestRemoteTabular
+# ---------------------------------------------------------------------------
 
 
 class TestRemoteTabular:
