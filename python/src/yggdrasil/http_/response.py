@@ -535,7 +535,8 @@ def _compute_response_identity_hash(
 # Response dataclass
 # ---------------------------------------------------------------------------
 
-class _ResponseBase(Tabular["ResponseOptions"]):
+
+class HTTPResponse(IO):  # IO inherits Tabular
     """HTTP response model — paired with the originating :class:`PreparedRequest`.
 
     Implements :class:`Tabular` over the deterministic metadata
@@ -1691,8 +1692,6 @@ class _DecodingReader:
             return self._decoder.decompress(chunk)
         return chunk
 
-
-class HTTPResponse(_ResponseBase, IO):
     """HTTP-shaped :class:`Response` that IS an IO cursor over its buffer.
 
     Single access point for every HTTP response in yggdrasil: the
@@ -2024,5 +2023,6 @@ class HTTPResponse(_ResponseBase, IO):
             tags=tags,
             received_at=received_at,
         )
+
 
 Response = HTTPResponse

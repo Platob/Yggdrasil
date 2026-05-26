@@ -251,7 +251,7 @@ def _hashable_identity_value(value: Any) -> Any:
     return value
 
 
-class _SessionBase(Singleton, ABC):
+class HTTPSession(Singleton, ABC):
     """Abstract per-transport session base — singleton-keyed by post-init ``__dict__``.
 
     Inherits the standard :class:`Singleton` plumbing:
@@ -505,8 +505,6 @@ class _SessionBase(Singleton, ABC):
             self._local_cache: "FolderPath" = FolderPath(path=path)
             return self._local_cache
 
-
-class HTTPSession(_SessionBase):
     """HTTP/HTTPS session — singleton-keyed by ``(base_url, verify, pool_maxsize, headers, waiting, auth)``.
 
     Inherits the singleton + pickle + ``job_pool`` plumbing from
@@ -530,7 +528,7 @@ class HTTPSession(_SessionBase):
     _RESPONSE_CLASS: ClassVar[type] = Response
     _BATCH_CLASS: ClassVar[type] = HTTPResponseBatch
 
-    _TRANSIENT_STATE_ATTRS = _SessionBase._TRANSIENT_STATE_ATTRS | {"_connections", "_retry"}
+    _TRANSIENT_STATE_ATTRS = frozenset({"_lock", "_job_pool", "_local_cache"}) | {"_connections", "_retry"}
 
     # Status codes that trigger an automatic redirect when ``redirect=True``.
     # 303 always falls back to GET (per RFC 7231); 307/308 preserve method.
@@ -2185,5 +2183,6 @@ class HTTPSession(_SessionBase):
             session=self
         )
         return request
+
 
 Session = HTTPSession
