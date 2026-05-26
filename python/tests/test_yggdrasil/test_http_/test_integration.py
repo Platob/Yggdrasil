@@ -1,6 +1,3 @@
-import pytest
-pytestmark = pytest.mark.skip(reason="Session internals need further name migration")
-
 """Integration tests for HTTPSession with real HTTP calls and caching."""
 from __future__ import annotations
 
@@ -136,12 +133,12 @@ class TestGet:
 
     def test_get_404(self, base_url):
         session = HTTPSession(base_url=base_url)
-        resp = session.get("/nonexistent")
+        resp = session.get("/nonexistent", raise_error=False)
         assert resp.status_code == 404
 
     def test_get_500(self, base_url):
         session = HTTPSession(base_url=base_url)
-        resp = session.get("/error")
+        resp = session.get("/error", raise_error=False)
         assert resp.status_code == 500
         assert not resp.ok
 
@@ -166,11 +163,11 @@ class TestResponseProperties:
     def test_ok_property(self, base_url):
         session = HTTPSession(base_url=base_url)
         assert session.get("/json").ok
-        assert not session.get("/error").ok
+        assert not session.get("/error", raise_error=False).ok
 
     def test_raise_for_status(self, base_url):
         session = HTTPSession(base_url=base_url)
-        resp = session.get("/error")
+        resp = session.get("/error", raise_error=False)
         with pytest.raises(Exception):
             resp.raise_for_status()
 
@@ -208,8 +205,7 @@ class TestLocalCache:
 
     def test_cache_hit_skips_network(self, base_url, cache_dir):
         session = HTTPSession(base_url=base_url)
-        cache = CacheConfig(root=cache_dir)
-        cfg = SendConfig(local_cache=cache)
+        cfg = SendConfig(local_cache=CacheConfig())
 
         req = HTTPRequest.prepare(method="GET", url=f"{base_url}/json")
         req.send_config = cfg
@@ -227,8 +223,7 @@ class TestLocalCache:
 
     def test_different_urls_not_cached(self, base_url, cache_dir):
         session = HTTPSession(base_url=base_url)
-        cache = CacheConfig(root=cache_dir)
-        cfg = SendConfig(local_cache=cache)
+        cfg = SendConfig(local_cache=CacheConfig())
 
         req1 = HTTPRequest.prepare(method="GET", url=f"{base_url}/json")
         req1.send_config = cfg
@@ -255,8 +250,7 @@ class TestSendMany:
             HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
             HTTPRequest.prepare(method="GET", url=f"{base_url}/text"),
         ]
-        batch = session.send_many(reqs)
-        responses = list(batch.responses())
+        responses = list(session.send_many(reqs))
         assert len(responses) == 2
 
 

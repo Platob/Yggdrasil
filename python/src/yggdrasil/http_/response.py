@@ -434,44 +434,6 @@ class HTTPResponse(IO):  # IO inherits Tabular
         "_receiver",
     })
 
-    def __init__(
-        self,
-        request: HTTPRequest,
-        status_code: int,
-        headers: MutableMapping[str, str],
-        tags: MutableMapping[str, str],
-        buffer: Holder,
-        received_at: dt.datetime,
-        receiver: Optional[UserInfo] = None,
-    ) -> None:
-        super().__init__()
-        self.request = request
-        self.status_code = int(status_code)
-        self.headers: Headers = Headers.from_(headers)
-        self.tags = _string_dict(tags)
-        self.received_at = any_to_datetime(received_at)
-        self.buffer = _coerce_buffer(buffer)
-        self._receiver: UserInfo | None = (
-            _coerce_userinfo(receiver) if receiver is not None else _default_sender()
-        )
-
-        media = _ensure_media_headers(self.headers, self.buffer)
-
-        self._session: "Session | None" = None
-        # Memoization for the deterministic projection — hashes,
-        # arrow_values dict. Invalidated when :meth:`_state_token`
-        # shifts (status / headers swap or :class:`Headers` version
-        # bump / buffer swap or size change, or the embedded
-        # request's own state shifted). :class:`Headers` already
-        # tracks its own mutations through ``version``, so the only
-        # blind spot is a same-content :class:`Headers` *swap* on
-        # the same response — :meth:`_invalidate_cache` covers that.
-        # Seed the media-type slot with the result we just computed:
-        # ``_ensure_media_headers`` is heavy (MIME / codec lookups,
-        # body sniff) and the next ``self.media_type`` access would
-        # otherwise rerun it once before the cache caught.
-        self._cache: dict[str, Any] = {"media_type": media}
-        self._cache_token: tuple = self._state_token()
 
     # ------------------------------------------------------------------
     # Holder access — :attr:`buffer` IS the durable :class:`Holder`.
@@ -1514,16 +1476,20 @@ class HTTPResponse(IO):  # IO inherits Tabular
         # :class:`Tabular` → :class:`Disposable`) so cursor /
         # disposable / tabular_parent state lands with default values
         # before we wire the buffer in.
-        Response.__init__(
-            self,
-            request=request,
-            status_code=status_code,
-            headers=headers,
-            tags=tags,
-            buffer=buffer,
-            received_at=received_at,
-            receiver=receiver,
+        super().__init__()
+        self.request = request
+        self.status_code = int(status_code)
+        self.headers: Headers = Headers.from_(headers)
+        self.tags = _string_dict(tags)
+        self.received_at = any_to_datetime(received_at)
+        self.buffer = _coerce_buffer(buffer)
+        self._receiver: UserInfo | None = (
+            _coerce_userinfo(receiver) if receiver is not None else _default_sender()
         )
+        media = _ensure_media_headers(self.headers, self.buffer)
+        self._session: "HTTPSession | None" = None
+        self._cache: dict[str, Any] = {}
+        self._cache_token: tuple = ()
         # Wire the IO cursor's parent to the response buffer so every
         # byte primitive (:meth:`IO.read` / :meth:`IO.seek` /
         # :meth:`IO.read_mv` / :meth:`IO.write_mv`, plus the

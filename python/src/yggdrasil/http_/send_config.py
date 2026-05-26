@@ -43,6 +43,7 @@ _SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
     list(_CACHE_CONFIG_FIELDS) + [
         "remote_cache", "local_cache", "max_batch_ttl",
         "batch_predicate", "cache_only",
+        "raise_error", "wait",
     ]
 )
 

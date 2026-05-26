@@ -237,6 +237,7 @@ class ArrowTabular(Tabular[CastOptions]):
         # explicitly here.
         super().__init__(**kwargs)
         self._batches: list[pa.RecordBatch] = []
+        self._schema: Optional[pa.Schema] = schema.to_arrow_schema() if isinstance(schema, StructField) else schema if isinstance(schema, pa.Schema) else None
         self._schema_cache: Optional[StructField] = None if schema is None else StructField.from_arrow(schema)
 
         # Spill state. ``_spill_bytes_threshold == 0`` (or None) keeps
