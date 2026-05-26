@@ -52,7 +52,7 @@ DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
 
-_TRUNCATE_INTERVAL = dt.timedelta(minutes=1)
+_TRUNCATE_INTERVAL = dt.timedelta(hours=1)
 
 
 def _truncate_from(value: Any) -> Optional[dt.datetime]:
