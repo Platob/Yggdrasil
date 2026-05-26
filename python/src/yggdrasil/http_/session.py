@@ -1737,6 +1737,7 @@ class HTTPSession(Session):
         total_cache_hits = 0
         total_network = 0
         total_failed = 0
+        total_ignored = 0
 
         def _batched(
             it: Iterator[HTTPRequest],
@@ -1794,13 +1795,14 @@ class HTTPSession(Session):
                 total_cache_hits += len(reqs) - len(batch.misses)
                 total_network += batch.counts.get("new", 0)
                 total_failed += batch.failed_count
+                total_ignored += batch.ignored_count
                 yield batch
 
         LOGGER.info(
             "Finished send_many pipeline (chunks=%d, cache_hits=%d, "
-            "network=%d, failed=%d)",
+            "network=%d, failed=%d, ignored=%d)",
             chunk_index, total_cache_hits,
-            total_network, total_failed,
+            total_network, total_failed, total_ignored,
         )
 
     def get(

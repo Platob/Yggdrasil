@@ -86,7 +86,7 @@ class HTTPResponseBatch(Tabular):
         "_send_config", "_requests", "_session",
         "_local_hashes", "_remote_hashes",
         "_local_tabular", "_remote_tabular", "_new_tabular", "_failed",
-        "_split_done", "_misses",
+        "_split_done", "_misses", "_ignored_count",
     )
 
     def __init__(
@@ -119,6 +119,7 @@ class HTTPResponseBatch(Tabular):
         self._failed: Optional[Tabular] = (
             responses_to_tabular(failed) if failed else None
         )
+        self._ignored_count: int = 0
 
     def _ensure_split(self) -> None:
         if self._split_done:
@@ -249,6 +250,7 @@ class HTTPResponseBatch(Tabular):
                 r.request.method, r.request.url, r.status_code, r.body_size,
             )
 
+        self._ignored_count = len(ignored)
         LOGGER.info(
             "Fetched %d miss(es): ok=%d, failed=%d, ignored=%d",
             len(misses), len(ok_list), len(err_list), len(ignored),
@@ -430,6 +432,10 @@ class HTTPResponseBatch(Tabular):
     @property
     def failed_count(self) -> int:
         return self._failed.count() if self._failed is not None else 0
+
+    @property
+    def ignored_count(self) -> int:
+        return self._ignored_count
 
     @property
     def send_config(self) -> "SendConfig":
