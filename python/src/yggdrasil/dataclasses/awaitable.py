@@ -130,8 +130,17 @@ class Awaitable(ABC):
     ) -> "Awaitable":
         start = time.time()
         iteration = 0
+        next_log_at = 120.0
         while True:
             self._poll()
+            if not self.is_done and logger.isEnabledFor(logging.INFO):
+                elapsed = time.time() - start
+                if elapsed >= next_log_at:
+                    logger.info(
+                        "%s still waiting after %.0fs (state=%s)",
+                        type(self).__name__, elapsed, self._state,
+                    )
+                    next_log_at = elapsed + 900.0
             if self.is_done:
                 if self.is_failed and self.retryable and not wait.is_expired(start):
                     if wait.max_attempts is not None and self._attempts >= wait.max_attempts:
