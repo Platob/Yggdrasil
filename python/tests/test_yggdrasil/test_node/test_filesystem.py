@@ -1,281 +1,249 @@
-"""Tests for filesystem endpoints and service."""
 from __future__ import annotations
 
 import base64
-import tempfile
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
-from fastapi.testclient import TestClient
-
-from yggdrasil.node.app import create_app
-from yggdrasil.node.config import Settings
 
 
-@pytest.fixture
-def tmp_home(tmp_path):
-    return tmp_path / "ygg_home"
+PREFIX = "/api/fs"
 
 
-@pytest.fixture
-def settings(tmp_home):
-    return Settings(
-        node_home=tmp_home,
-        node_id="test-node-001",
+def test_ls_root(client):
+    resp = client.get(f"{PREFIX}/ls")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["node_id"] == "test-node"
+    assert data["path"] == ""
+    names = {e["name"] for e in data["entries"]}
+    assert "data" in names
+    assert "logs" in names
+    assert "cache" in names
+    assert "mirrors" in names
+
+
+def test_ls_with_files(client, settings):
+    (settings.node_home / "file_a.txt").write_text("aaa")
+    (settings.node_home / "file_b.txt").write_text("bbb")
+    resp = client.get(f"{PREFIX}/ls")
+    assert resp.status_code == 200
+    names = [e["name"] for e in resp.json()["entries"]]
+    assert "file_a.txt" in names
+    assert "file_b.txt" in names
+
+
+def test_ls_subdirectory(client, settings):
+    sub = settings.node_home / "data" / "files" / "tmp"
+    (sub / "inner.txt").write_text("hello")
+    resp = client.get(f"{PREFIX}/ls", params={"path": "data/files/tmp"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["path"] == "data/files/tmp"
+    names = [e["name"] for e in data["entries"]]
+    assert "inner.txt" in names
+
+
+def test_ls_nonexistent_404(client):
+    resp = client.get(f"{PREFIX}/ls", params={"path": "does/not/exist"})
+    assert resp.status_code == 404
+
+
+def test_ls_traversal_blocked_403(client):
+    resp = client.get(f"{PREFIX}/ls", params={"path": "../../etc"})
+    assert resp.status_code == 403
+
+
+def test_write_and_read_text(client):
+    resp = client.post(f"{PREFIX}/write", json={
+        "path": "hello.txt",
+        "content": "Hello, Yggdrasil!",
+    })
+    assert resp.status_code == 200
+    info = resp.json()
+    assert info["name"] == "hello.txt"
+    assert info["is_dir"] is False
+    assert info["size"] > 0
+
+    resp = client.get(f"{PREFIX}/read", params={"path": "hello.txt"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["content"] == "Hello, Yggdrasil!"
+    assert data["encoding"] == "utf-8"
+    assert data["size"] > 0
+
+
+def test_write_and_read_binary(client):
+    raw = bytes(range(256))
+    encoded = base64.b64encode(raw).decode("ascii")
+    resp = client.post(f"{PREFIX}/write", json={
+        "path": "binary.bin",
+        "content": encoded,
+        "encoding": "base64",
+    })
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "binary.bin"
+
+    resp = client.get(f"{PREFIX}/read", params={"path": "binary.bin"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["encoding"] == "base64"
+    decoded = base64.b64decode(data["content"])
+    assert decoded == raw
+
+
+def test_write_creates_parent_dirs(client, settings):
+    resp = client.post(f"{PREFIX}/write", json={
+        "path": "deep/nested/dir/file.txt",
+        "content": "created",
+    })
+    assert resp.status_code == 200
+    assert (settings.node_home / "deep" / "nested" / "dir" / "file.txt").exists()
+
+
+def test_write_no_mkdir_404(client):
+    resp = client.post(f"{PREFIX}/write", json={
+        "path": "nonexistent_parent/child.txt",
+        "content": "data",
+        "mkdir": False,
+    })
+    assert resp.status_code == 404
+
+
+def test_read_nonexistent_404(client):
+    resp = client.get(f"{PREFIX}/read", params={"path": "no_such_file.txt"})
+    assert resp.status_code == 404
+
+
+def test_read_traversal_403(client):
+    resp = client.get(f"{PREFIX}/read", params={"path": "../../../etc/passwd"})
+    assert resp.status_code == 403
+
+
+def test_delete_file(client, settings):
+    target = settings.node_home / "to_delete.txt"
+    target.write_text("bye")
+    assert target.exists()
+
+    resp = client.delete(f"{PREFIX}/delete", params={"path": "to_delete.txt"})
+    assert resp.status_code == 204
+    assert not target.exists()
+
+
+def test_delete_directory(client, settings):
+    d = settings.node_home / "dir_to_delete" / "sub"
+    d.mkdir(parents=True)
+    (d / "file.txt").write_text("content")
+
+    resp = client.delete(f"{PREFIX}/delete", params={"path": "dir_to_delete"})
+    assert resp.status_code == 204
+    assert not (settings.node_home / "dir_to_delete").exists()
+
+
+def test_delete_nonexistent_404(client):
+    resp = client.delete(f"{PREFIX}/delete", params={"path": "ghost.txt"})
+    assert resp.status_code == 404
+
+
+def test_move_file(client, settings):
+    src = settings.node_home / "move_src.txt"
+    src.write_text("movable")
+
+    resp = client.post(f"{PREFIX}/move", json={
+        "source": "move_src.txt",
+        "destination": "moved/move_dst.txt",
+    })
+    assert resp.status_code == 200
+    info = resp.json()
+    assert info["name"] == "move_dst.txt"
+    assert not src.exists()
+    assert (settings.node_home / "moved" / "move_dst.txt").exists()
+
+
+def test_move_nonexistent_404(client):
+    resp = client.post(f"{PREFIX}/move", json={
+        "source": "nowhere.txt",
+        "destination": "somewhere.txt",
+    })
+    assert resp.status_code == 404
+
+
+def test_mkdir(client, settings):
+    resp = client.post(f"{PREFIX}/mkdir", params={"path": "new/nested/dir"})
+    assert resp.status_code == 200
+    info = resp.json()
+    assert info["is_dir"] is True
+    assert info["name"] == "dir"
+    assert (settings.node_home / "new" / "nested" / "dir").is_dir()
+
+
+def test_stat_file(client, settings):
+    target = settings.node_home / "stat_target.txt"
+    target.write_text("stat me")
+
+    resp = client.get(f"{PREFIX}/stat", params={"path": "stat_target.txt"})
+    assert resp.status_code == 200
+    info = resp.json()
+    assert info["name"] == "stat_target.txt"
+    assert info["is_dir"] is False
+    assert info["size"] == len("stat me")
+    assert info["modified_at"] != ""
+    assert info["created_at"] != ""
+
+
+def test_stat_nonexistent_404(client):
+    resp = client.get(f"{PREFIX}/stat", params={"path": "nonexistent.dat"})
+    assert resp.status_code == 404
+
+
+def test_stream_download(client, settings):
+    target = settings.node_home / "download_me.txt"
+    target.write_text("stream content here")
+
+    resp = client.get(f"{PREFIX}/stream", params={"path": "download_me.txt"})
+    assert resp.status_code == 200
+    assert resp.content == b"stream content here"
+    assert "attachment" in resp.headers.get("content-disposition", "")
+    assert "download_me.txt" in resp.headers.get("content-disposition", "")
+
+
+def test_stream_upload(client, settings):
+    payload = b"uploaded binary data \x00\xff"
+    resp = client.post(
+        f"{PREFIX}/upload",
+        params={"path": "uploaded.bin"},
+        content=payload,
     )
+    assert resp.status_code == 200
+    info = resp.json()
+    assert info["name"] == "uploaded.bin"
+    assert (settings.node_home / "uploaded.bin").read_bytes() == payload
 
 
-@pytest.fixture
-def client(settings):
-    app = create_app(settings)
-    return TestClient(app)
+def test_write_traversal_403(client):
+    resp = client.post(f"{PREFIX}/write", json={
+        "path": "../../etc/evil.txt",
+        "content": "hacked",
+    })
+    assert resp.status_code == 403
 
 
-class TestFilesystemListDir:
-    def test_list_root_has_defaults(self, client):
-        resp = client.get("/api/fs/ls")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["node_id"] == "test-node-001"
-        names = [e["name"] for e in data["entries"]]
-        for d in ("data", "cache", "logs"):
-            assert d in names, f"{d} missing from root listing"
-
-    def test_list_with_files(self, client, settings):
-        # Create some files in a subdirectory of node home
-        fs_root = settings.node_home
-        test_dir = fs_root / "workspace"
-        test_dir.mkdir(parents=True, exist_ok=True)
-        (test_dir / "hello.txt").write_text("hi")
-        (test_dir / "subdir").mkdir()
-        (test_dir / "subdir" / "nested.txt").write_text("nested")
-
-        resp = client.get("/api/fs/ls", params={"path": "workspace"})
-        assert resp.status_code == 200
-        data = resp.json()
-        entries = data["entries"]
-        assert len(entries) == 2
-        # Directories should come first
-        assert entries[0]["name"] == "subdir"
-        assert entries[0]["is_dir"] is True
-        assert entries[1]["name"] == "hello.txt"
-        assert entries[1]["is_dir"] is False
-
-    def test_list_subdirectory(self, client, settings):
-        fs_root = settings.node_home
-        fs_root.mkdir(parents=True, exist_ok=True)
-        (fs_root / "mydir").mkdir()
-        (fs_root / "mydir" / "a.txt").write_text("aaa")
-
-        resp = client.get("/api/fs/ls", params={"path": "mydir"})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["path"] == "mydir"
-        assert len(data["entries"]) == 1
-        assert data["entries"][0]["name"] == "a.txt"
-
-    def test_list_nonexistent(self, client):
-        resp = client.get("/api/fs/ls", params={"path": "noexist"})
-        assert resp.status_code == 404
-
-    def test_list_traversal_blocked(self, client):
-        resp = client.get("/api/fs/ls", params={"path": "../../etc"})
-        assert resp.status_code == 403
+def test_delete_traversal_403(client):
+    resp = client.delete(f"{PREFIX}/delete", params={"path": "../../etc/passwd"})
+    assert resp.status_code == 403
 
 
-class TestFilesystemReadWrite:
-    def test_write_and_read_text(self, client):
-        # Write
-        resp = client.post("/api/fs/write", json={
-            "path": "docs/readme.txt",
-            "content": "Hello Yggdrasil!",
-        })
-        assert resp.status_code == 200
-        info = resp.json()
-        assert info["name"] == "readme.txt"
-        assert info["is_dir"] is False
-        assert info["size"] > 0
-
-        # Read
-        resp = client.get("/api/fs/read", params={"path": "docs/readme.txt"})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["content"] == "Hello Yggdrasil!"
-        assert data["encoding"] == "utf-8"
-        assert data["size"] == 16
-
-    def test_write_and_read_binary(self, client):
-        binary_data = bytes(range(256))
-        encoded = base64.b64encode(binary_data).decode("ascii")
-
-        resp = client.post("/api/fs/write", json={
-            "path": "data/binary.bin",
-            "content": encoded,
-            "encoding": "base64",
-        })
-        assert resp.status_code == 200
-
-        resp = client.get("/api/fs/read", params={"path": "data/binary.bin"})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["encoding"] == "base64"
-        assert base64.b64decode(data["content"]) == binary_data
-
-    def test_write_no_mkdir(self, client):
-        resp = client.post("/api/fs/write", json={
-            "path": "nonexist/deep/file.txt",
-            "content": "x",
-            "mkdir": False,
-        })
-        assert resp.status_code == 404
-
-    def test_read_nonexistent(self, client):
-        resp = client.get("/api/fs/read", params={"path": "nope.txt"})
-        assert resp.status_code == 404
-
-    def test_read_traversal_blocked(self, client):
-        resp = client.get("/api/fs/read", params={"path": "../../../etc/passwd"})
-        assert resp.status_code == 403
+def test_move_source_traversal_403(client):
+    resp = client.post(f"{PREFIX}/move", json={
+        "source": "../../../etc/passwd",
+        "destination": "stolen.txt",
+    })
+    assert resp.status_code == 403
 
 
-class TestFilesystemDelete:
-    def test_delete_file(self, client, settings):
-        fs_root = settings.node_home
-        fs_root.mkdir(parents=True, exist_ok=True)
-        (fs_root / "doomed.txt").write_text("bye")
-
-        resp = client.delete("/api/fs/delete", params={"path": "doomed.txt"})
-        assert resp.status_code == 204
-        assert not (fs_root / "doomed.txt").exists()
-
-    def test_delete_directory(self, client, settings):
-        fs_root = settings.node_home
-        d = fs_root / "dir_to_rm"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "inner.txt").write_text("x")
-
-        resp = client.delete("/api/fs/delete", params={"path": "dir_to_rm"})
-        assert resp.status_code == 204
-        assert not d.exists()
-
-    def test_delete_nonexistent(self, client):
-        resp = client.delete("/api/fs/delete", params={"path": "ghost.txt"})
-        assert resp.status_code == 404
+def test_mkdir_traversal_403(client):
+    resp = client.post(f"{PREFIX}/mkdir", params={"path": "../../evil_dir"})
+    assert resp.status_code == 403
 
 
-class TestFilesystemMove:
-    def test_move_file(self, client, settings):
-        fs_root = settings.node_home
-        fs_root.mkdir(parents=True, exist_ok=True)
-        (fs_root / "src.txt").write_text("moving")
-
-        resp = client.post("/api/fs/move", json={
-            "source": "src.txt",
-            "destination": "dest.txt",
-        })
-        assert resp.status_code == 200
-        info = resp.json()
-        assert info["name"] == "dest.txt"
-        assert not (fs_root / "src.txt").exists()
-        assert (fs_root / "dest.txt").read_text() == "moving"
-
-    def test_move_nonexistent(self, client):
-        resp = client.post("/api/fs/move", json={
-            "source": "nope.txt",
-            "destination": "also_nope.txt",
-        })
-        assert resp.status_code == 404
-
-
-class TestFilesystemMkdir:
-    def test_mkdir(self, client, settings):
-        resp = client.post("/api/fs/mkdir", params={"path": "new/nested/dir"})
-        assert resp.status_code == 200
-        info = resp.json()
-        assert info["is_dir"] is True
-        assert info["name"] == "dir"
-
-        fs_root = settings.node_home
-        assert (fs_root / "new" / "nested" / "dir").is_dir()
-
-
-class TestFilesystemStat:
-    def test_stat_file(self, client, settings):
-        fs_root = settings.node_home
-        fs_root.mkdir(parents=True, exist_ok=True)
-        (fs_root / "info.txt").write_text("data")
-
-        resp = client.get("/api/fs/stat", params={"path": "info.txt"})
-        assert resp.status_code == 200
-        info = resp.json()
-        assert info["name"] == "info.txt"
-        assert info["is_dir"] is False
-        assert info["size"] == 4
-        assert info["modified_at"] != ""
-
-    def test_stat_nonexistent(self, client):
-        resp = client.get("/api/fs/stat", params={"path": "ghost"})
-        assert resp.status_code == 404
-
-
-class TestFilesystemStream:
-    def test_stream_download(self, client, settings):
-        fs_root = settings.node_home
-        fs_root.mkdir(parents=True, exist_ok=True)
-        content = b"streaming content " * 100
-        (fs_root / "big.bin").write_bytes(content)
-
-        resp = client.get("/api/fs/stream", params={"path": "big.bin"})
-        assert resp.status_code == 200
-        assert resp.content == content
-        assert "attachment" in resp.headers.get("content-disposition", "")
-
-    def test_stream_upload(self, client, settings):
-        payload = b"uploaded chunk data"
-        resp = client.post(
-            "/api/fs/upload",
-            params={"path": "uploaded.bin"},
-            content=payload,
-        )
-        assert resp.status_code == 200
-        info = resp.json()
-        assert info["name"] == "uploaded.bin"
-
-        fs_root = settings.node_home
-        assert (fs_root / "uploaded.bin").read_bytes() == payload
-
-
-class TestFilesystemSecurity:
-    """Ensure path traversal is blocked in all endpoints."""
-
-    def test_write_traversal(self, client):
-        resp = client.post("/api/fs/write", json={
-            "path": "../../evil.txt",
-            "content": "pwned",
-        })
-        assert resp.status_code == 403
-
-    def test_move_source_traversal(self, client, settings):
-        # Create a file within root to have a valid dest
-        fs_root = settings.node_home
-        fs_root.mkdir(parents=True, exist_ok=True)
-        (fs_root / "legit.txt").write_text("ok")
-
-        resp = client.post("/api/fs/move", json={
-            "source": "../../etc/passwd",
-            "destination": "stolen.txt",
-        })
-        assert resp.status_code == 403
-
-    def test_delete_traversal(self, client):
-        resp = client.delete("/api/fs/delete", params={"path": "../../../etc"})
-        assert resp.status_code == 403
-
-    def test_mkdir_traversal(self, client):
-        resp = client.post("/api/fs/mkdir", params={"path": "../../outside"})
-        assert resp.status_code == 403
-
-    def test_stat_traversal(self, client):
-        resp = client.get("/api/fs/stat", params={"path": "../../etc/passwd"})
-        assert resp.status_code == 403
+def test_stat_traversal_403(client):
+    resp = client.get(f"{PREFIX}/stat", params={"path": "../../etc/passwd"})
+    assert resp.status_code == 403
