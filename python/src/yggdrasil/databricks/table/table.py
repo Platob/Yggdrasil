@@ -58,7 +58,7 @@ from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.url import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.path import Path
+from yggdrasil.path import Path
 from yggdrasil.io.primitive import ParquetFile
 from yggdrasil.io.tabular import Tabular, O
 from yggdrasil.execution.expr import (

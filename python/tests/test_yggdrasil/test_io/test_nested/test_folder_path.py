@@ -11,7 +11,7 @@ import pytest
 from yggdrasil.enums import Mode
 from yggdrasil.execution.expr import col
 from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.local_path import LocalPath
 
 
 # ---------------------------------------------------------------------------

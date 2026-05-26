@@ -137,7 +137,7 @@ class TestEnsureInstalled:
         df = MagicMock()
         df.sparkSession = session
 
-        from yggdrasil.io.path import _module_pack
+        from yggdrasil.path import _module_pack
         import pathlib
 
         monkeypatch.setattr(

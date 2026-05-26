@@ -67,7 +67,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.fs import VolumePath
     from yggdrasil.databricks.sql.engine import SQLEngine
     from yggdrasil.databricks.warehouse import SQLWarehouse
-    from yggdrasil.io.path import Path
+    from yggdrasil.path import Path
     from .table import Table
 
 

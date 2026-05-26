@@ -390,7 +390,7 @@ class Session(Singleton, ABC):
             if cached is not None:
                 return cached
             from yggdrasil.io.nested.folder_path import FolderPath
-            from yggdrasil.io.path import Path
+            from yggdrasil.path import Path
 
             root = pathlib.Path.home() / ".cache" / "http"
             base_url = getattr(self, "base_url", None)

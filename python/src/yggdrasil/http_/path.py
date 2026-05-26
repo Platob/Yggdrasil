@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterator
 from yggdrasil.enums import Mode, Scheme
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.path import RemotePath
+from yggdrasil.path import RemotePath
 from yggdrasil.url import URL
 from yggdrasil.dataclasses import WaitingConfig
 

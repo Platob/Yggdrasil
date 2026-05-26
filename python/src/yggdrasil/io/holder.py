@@ -323,7 +323,7 @@ def _resolve_format_target(
     return IO.class_for_media_type(mt, default=None)
 
 
-class IO(Singleton, Tabular[O], BinaryIO, Generic[T, O]):
+class IO(Tabular[O], BinaryIO, Generic[T, O]):
     """Position-addressable byte holder + seekable cursor + tabular handle.
 
     Three layered shapes share the class:
@@ -1136,7 +1136,7 @@ class IO(Singleton, Tabular[O], BinaryIO, Generic[T, O]):
             # to :class:`MemoryStream`.
             local_path = _local_path_for_handle(obj)
             if local_path is not None:
-                from yggdrasil.io.path.local_path import LocalPath
+                from yggdrasil.path.local_path import LocalPath
 
                 if is_storage:
                     return (
@@ -2854,7 +2854,7 @@ class IO(Singleton, Tabular[O], BinaryIO, Generic[T, O]):
         ``CopyObject`` when ``self`` and *src* share an
         underlying bucket).
         """
-        from yggdrasil.io.path.path import Path
+        from yggdrasil.path.path import Path
 
         if (
             offset == 0
@@ -2938,7 +2938,7 @@ class IO(Singleton, Tabular[O], BinaryIO, Generic[T, O]):
         ``sendfile``, local→remote chunked stream) override
         :meth:`_transfer_to`, not this method.
         """
-        from yggdrasil.io.path.path import Path
+        from yggdrasil.path.path import Path
 
         source = IO.from_(src)
         target = _join_dir_hint(self, source)
@@ -2996,7 +2996,7 @@ class IO(Singleton, Tabular[O], BinaryIO, Generic[T, O]):
         reads to EOF, ``size>=0`` caps the byte count, ``offset``
         is the starting offset. Returns the resolved target.
         """
-        from yggdrasil.io.path.path import Path
+        from yggdrasil.path.path import Path
 
         if to is None:
             to = _default_download_target(self.url.name)
@@ -3720,7 +3720,7 @@ def _join_dir_hint(
     :meth:`IO._transfer_filename` so :class:`Memory` / nameless IOs
     fall back to ``"download"``.
     """
-    from yggdrasil.io.path.path import Path
+    from yggdrasil.path.path import Path
 
     if isinstance(dst, Path) and _looks_like_directory(dst.url):
         return dst / src._transfer_filename()
@@ -3735,7 +3735,7 @@ def _default_download_target(name: str) -> "IO":
     … before the suffix until a free slot is found. The directory
     is created on demand; the file itself is not.
     """
-    from yggdrasil.io.path.local_path import LocalPath
+    from yggdrasil.path.local_path import LocalPath
 
     downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(downloads_dir, exist_ok=True)

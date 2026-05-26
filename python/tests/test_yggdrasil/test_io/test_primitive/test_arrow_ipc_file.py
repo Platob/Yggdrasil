@@ -7,7 +7,7 @@ import pytest
 
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.local_path import LocalPath
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 
 

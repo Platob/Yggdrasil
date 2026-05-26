@@ -508,7 +508,7 @@ class Volume(DatabricksResource, Singleton):
         if self._storage_path is not None and not refresh:
             return self._storage_path
 
-        from yggdrasil.io.path import Path
+        from yggdrasil.path import Path
 
         raw = self.storage_location(refresh=refresh)
         scheme = URL.from_str(raw).scheme or ""

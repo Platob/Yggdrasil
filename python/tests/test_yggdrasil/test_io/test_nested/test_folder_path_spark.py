@@ -24,7 +24,7 @@ from pyspark.sql import SparkSession  # noqa: E402
 from yggdrasil.enums import Mode  # noqa: E402
 from yggdrasil.execution.expr import col  # noqa: E402
 from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions  # noqa: E402
-from yggdrasil.io.path.local_path import LocalPath  # noqa: E402
+from yggdrasil.path.local_path import LocalPath  # noqa: E402
 from yggdrasil.spark.tests import SparkTestCase  # noqa: E402
 
 

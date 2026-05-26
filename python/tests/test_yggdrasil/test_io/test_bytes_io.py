@@ -59,7 +59,7 @@ class TestConstruction:
         assert b.parent is mem
 
     def test_path_kwarg_creates_local_path_parent(self, tmp_path) -> None:
-        from yggdrasil.io.path.local_path import LocalPath
+        from yggdrasil.path.local_path import LocalPath
 
         b = BytesIO(path=str(tmp_path / "x.bin"))
         assert isinstance(b.parent, LocalPath)

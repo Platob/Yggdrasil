@@ -201,7 +201,7 @@ class CacheConfig:
             tabular_url = state.get("tabular_url", state.get("path"))
             if tabular_url is not None:
                 from yggdrasil.io.nested.folder_path import FolderPath
-                from yggdrasil.io.path import Path as _Path
+                from yggdrasil.path import Path as _Path
                 tabular = FolderPath(path=_Path.from_(tabular_url))
         self.tabular = tabular
         self.anonymize = state.get("anonymize", "remove")
@@ -333,7 +333,7 @@ class CacheConfig:
         else:
             url_path = (getattr(base_url, "path", "") or "").strip("/")
             folder = root / host / url_path if url_path else root / host
-        from yggdrasil.io.path import Path as _Path
+        from yggdrasil.path import Path as _Path
         return _Path.from_(folder)
 
     def cache_tabular(

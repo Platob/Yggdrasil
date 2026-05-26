@@ -40,7 +40,7 @@ from pathlib import Path as LocalPath
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 if TYPE_CHECKING:
-    from yggdrasil.io.path.path import Path
+    from yggdrasil.path.path import Path
 
 
 __all__ = [
@@ -106,7 +106,7 @@ class PyPIPath:
     """
 
     def __init__(self, root: Union[str, "Path", LocalPath]) -> None:
-        from yggdrasil.io.path.path import Path as _Path
+        from yggdrasil.path.path import Path as _Path
 
         if isinstance(root, _Path):
             self.root: "Path" = root

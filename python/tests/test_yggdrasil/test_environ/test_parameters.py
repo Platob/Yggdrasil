@@ -15,7 +15,7 @@ from yggdrasil.environ import SystemParameters
 
 # Force registration of the IO / Path converters.
 from yggdrasil.io import Holder  # noqa: F401, E402
-from yggdrasil.io.path.path import Path  # noqa: F401, E402
+from yggdrasil.path.path import Path  # noqa: F401, E402
 
 
 class _Color(Enum):
@@ -868,7 +868,7 @@ class TestConverters:
 
     def test_any_to_path_from_str(self) -> None:
         from yggdrasil.data.cast import convert
-        from yggdrasil.io.path.path import Path
+        from yggdrasil.path.path import Path
 
         p = convert("/tmp/test.txt", Path)
         assert isinstance(p, Path)
@@ -876,8 +876,8 @@ class TestConverters:
 
     def test_any_to_path_identity(self) -> None:
         from yggdrasil.data.cast import convert
-        from yggdrasil.io.path.path import Path
-        from yggdrasil.io.path.local_path import LocalPath
+        from yggdrasil.path.path import Path
+        from yggdrasil.path.local_path import LocalPath
 
         p = LocalPath("/tmp/x")
         assert convert(p, Path) is p

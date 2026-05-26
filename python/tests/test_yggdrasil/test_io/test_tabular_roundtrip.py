@@ -30,7 +30,7 @@ import pytest
 
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.local_path import LocalPath
 
 
 # ---------------------------------------------------------------------------

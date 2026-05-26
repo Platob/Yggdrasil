@@ -12,7 +12,7 @@ from yggdrasil.enums import Mode
 from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.path import Path
+from yggdrasil.path import Path
 from yggdrasil.io.request import PreparedRequest
 
 LOGGER = logging.getLogger(__name__)

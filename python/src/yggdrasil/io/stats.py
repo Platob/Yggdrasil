@@ -76,7 +76,7 @@ from yggdrasil.io.types import BytesLike  # noqa: F401  (re-export hook)
 
 if TYPE_CHECKING:
     from yggdrasil.io.bytes_io import BytesIO
-    from yggdrasil.io.path import Path
+    from yggdrasil.path import Path
 
 
 __all__ = [
@@ -537,7 +537,7 @@ class Stats:
         the underlying ``write_bytes`` (folder writes go through
         stage+rename; raw paths get a single write).
         """
-        from yggdrasil.io.path import Path as _Path  # local — avoid cycle
+        from yggdrasil.path import Path as _Path  # local — avoid cycle
         from yggdrasil.io.base import IO as _BytesIO
 
         payload = self.to_ipc()
@@ -557,7 +557,7 @@ class Stats:
     ) -> "Stats":
         """Inverse of :meth:`write`. EAFP — missing files raise
         :class:`FileNotFoundError`."""
-        from yggdrasil.io.path import Path as _Path
+        from yggdrasil.path import Path as _Path
         from yggdrasil.io.base import IO as _BytesIO
 
         if isinstance(source, (bytes, bytearray, memoryview)):

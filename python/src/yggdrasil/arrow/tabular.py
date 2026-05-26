@@ -134,7 +134,7 @@ def _write_spill_part(
     codec / legacy-format options) instead of re-implementing the
     same :func:`pa.ipc.new_file` sequence inline.
     """
-    from yggdrasil.io.path.local_path import LocalPath
+    from yggdrasil.path.local_path import LocalPath
     from yggdrasil.io.primitive.arrow_ipc_file import (
         ArrowIPCFile,
         ArrowIPCOptions,

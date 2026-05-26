@@ -9,7 +9,7 @@ from yggdrasil.url.based import URLBased, _URL_BASED_REGISTRY
 
 # Force the LocalPath import so the FILE handler is registered before
 # any test inspects _URL_BASED_REGISTRY directly.
-from yggdrasil.io.path.local_path import LocalPath  # noqa: F401
+from yggdrasil.path.local_path import LocalPath  # noqa: F401
 
 
 # ---------------------------------------------------------------------------

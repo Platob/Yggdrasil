@@ -105,7 +105,7 @@ import yggdrasil.io.primitive  # noqa: F401
 
 if TYPE_CHECKING:
     from yggdrasil.execution.expr import Predicate
-    from yggdrasil.io.path import Path
+    from yggdrasil.path import Path
 
 
 __all__ = ["FolderPath", "FolderOptions"]
@@ -264,7 +264,7 @@ class FolderPath(IO[bytes, FolderOptions]):
         if hasattr(raw, "full_path"):
             url_key = raw.full_path()
         else:
-            from yggdrasil.io.path.path import Path as _Path
+            from yggdrasil.path.path import Path as _Path
             try:
                 url_key = _Path.from_(raw).full_path()
             except Exception:
@@ -340,7 +340,7 @@ class FolderPath(IO[bytes, FolderOptions]):
                 "Pass path=... or a path-ish positional."
             )
 
-        from yggdrasil.io.path.path import Path as _Path
+        from yggdrasil.path.path import Path as _Path
         self.path: "Path" = raw if isinstance(raw, _Path) else _Path.from_(raw)
         self._yggmeta_enabled: bool = bool(yggmeta)
         # Predicate-id-keyed cache of :func:`free_columns` results.

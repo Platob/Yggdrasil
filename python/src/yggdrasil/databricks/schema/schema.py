@@ -45,7 +45,7 @@ from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.url import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.path import Path
+from yggdrasil.path import Path
 from yggdrasil.enums.mode import Mode, ModeLike
 
 from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal

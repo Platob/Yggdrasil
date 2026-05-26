@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 from yggdrasil.data.data_field import Field as _Field
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.enums import MediaType, MimeType, Mode, ModeLike
 from yggdrasil.data.options import CastOptions
@@ -488,7 +489,7 @@ O = TypeVar("O", bound=CastOptions)
 _ChildT = TypeVar("_ChildT", bound="Tabular")
 
 
-class Tabular(URLBased, Disposable, Generic[O]):
+class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     """Pure interface — Arrow record-batch source/sink + engine fan-out.
 
     No state, no lifecycle, with the single exception of a
@@ -705,7 +706,7 @@ class Tabular(URLBased, Disposable, Generic[O]):
                     "pass a URL, a filesystem path, or a name with an "
                     "extension (e.g. 'data.parquet')."
                 )
-            from yggdrasil.io.path import Path as YggPath
+            from yggdrasil.path import Path as YggPath
             path = YggPath.from_(obj)
             if as_folder:
                 from yggdrasil.io.nested.folder_path import FolderPath

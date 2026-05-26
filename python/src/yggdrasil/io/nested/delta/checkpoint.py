@@ -64,7 +64,7 @@ from yggdrasil.io.nested.delta.protocol import Txn
 
 if TYPE_CHECKING:
     from yggdrasil.io.nested.delta.snapshot import Snapshot
-    from yggdrasil.io.path import Path
+    from yggdrasil.path import Path
 
 
 __all__ = ["write_checkpoint", "update_last_checkpoint"]

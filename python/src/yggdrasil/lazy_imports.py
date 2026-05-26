@@ -60,13 +60,13 @@ def mime_types_class():
 
 @lru_cache(maxsize=1)
 def path_class():
-    from yggdrasil.io.path.path import Path
+    from yggdrasil.path.path import Path
     return Path
 
 
 @lru_cache(maxsize=1)
 def local_path_class():
-    from yggdrasil.io.path.local_path import LocalPath
+    from yggdrasil.path.local_path import LocalPath
     return LocalPath
 
 
