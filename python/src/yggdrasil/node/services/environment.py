@@ -227,10 +227,11 @@ class EnvironmentService:
             return None
         if entry.status != "ready":
             return None
+        from .execution import venv_python
+        python = venv_python(entry.path)
         from pathlib import Path
-        python = Path(entry.path) / "bin" / "python"
-        if python.exists():
-            return str(python)
+        if Path(python).exists():
+            return python
         return None
 
     # -- internals ----------------------------------------------------------
@@ -310,7 +311,8 @@ class EnvironmentService:
             LOGGER.error("Package install failed for env %r: %s", env_id, error_msg)
 
     def _pip_install(self, env_id: int, env_path, packages: list[str], *, uv: str | None) -> None:
-        python_bin = str(env_path / "bin" / "python")
+        from .execution import venv_python
+        python_bin = venv_python(env_path)
         if uv:
             cmd = [uv, "pip", "install", "--python", python_bin] + packages
         else:

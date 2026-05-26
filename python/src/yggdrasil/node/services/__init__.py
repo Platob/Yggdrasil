@@ -1,6 +1,16 @@
 from .call import CallService
 from .cmd import CmdService
 from .dag import DagService
+from .execution import (
+    Environment,
+    Executable,
+    Execution,
+    PyEnvironment,
+    PyFunction,
+    PyFunctionExecution,
+    ShellCommand,
+    ShellCommandExecution,
+)
 from .discovery import DiscoveryService
 from .env import EnvService
 from .environment import EnvironmentService
@@ -18,12 +28,20 @@ __all__ = [
     "DagService",
     "DiscoveryService",
     "EnvService",
+    "Environment",
     "EnvironmentService",
+    "Executable",
+    "Execution",
     "FilesystemService",
     "FunctionService",
     "JobService",
     "MessengerService",
     "MonitorService",
+    "PyEnvironment",
+    "PyFunction",
+    "PyFunctionExecution",
     "PythonExecService",
     "RunService",
+    "ShellCommand",
+    "ShellCommandExecution",
 ]

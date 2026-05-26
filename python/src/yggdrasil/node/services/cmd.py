@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import subprocess
-import time
 import uuid
 from collections import OrderedDict
 from functools import partial
@@ -14,6 +12,7 @@ from fastapi.concurrency import run_in_threadpool
 from ..config import Settings
 from ..exceptions import NotFoundError, TimeoutError
 from ..schemas.cmd import CmdEntry, CmdListResponse, CmdRequest, CmdResponse
+from .execution import PyEnvironment, ShellCommand
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,6 +23,7 @@ class CmdService:
         self._history: OrderedDict[str, CmdEntry] = OrderedDict()
         self._results: dict[str, CmdResponse] = {}
         self._lock = Lock()
+        self._env = PyEnvironment()
 
     async def _run(self, fn, /, *args, **kwargs):
         return await run_in_threadpool(partial(fn, *args, **kwargs))
@@ -66,40 +66,32 @@ class CmdService:
     def _exec_sync(
         self, cmd_id: str, req: CmdRequest, timeout: float
     ) -> CmdResponse:
-        env = dict(req.env) if req.env else None
-        t0 = time.monotonic()
+        exe = ShellCommand(
+            command=req.command,
+            cwd=req.cwd,
+            env=dict(req.env) if req.env else {},
+            stdin=req.stdin,
+            timeout=timeout,
+        )
 
-        try:
-            proc = subprocess.run(
-                req.command,
-                cwd=req.cwd,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                input=req.stdin,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            duration = time.monotonic() - t0
+        execution = self._env.execute_shell_command(exe)
+
+        if execution.status == "failed" and execution.stderr and "Timed out" in execution.stderr:
             raise TimeoutError(
                 f"Command timed out after {timeout:.0f}s: {req.command}"
             )
 
-        duration = time.monotonic() - t0
-        status = "completed" if proc.returncode == 0 else "failed"
-
-        LOGGER.info("Completed command %r (id=%s, rc=%d, %.2fs)", req.command, cmd_id, proc.returncode, duration)
+        LOGGER.info("Completed command %r (id=%s, rc=%s, %.2fs)", req.command, cmd_id, execution.returncode, execution.duration or 0)
 
         response = CmdResponse(
             id=cmd_id,
             node_id=self.settings.node_id,
             command=req.command,
-            returncode=proc.returncode,
-            stdout=proc.stdout,
-            stderr=proc.stderr,
-            duration=round(duration, 3),
-            status=status,
+            returncode=execution.returncode,
+            stdout=execution.stdout,
+            stderr=execution.stderr,
+            duration=execution.duration,
+            status=execution.status,
         )
         with self._lock:
             self._results[cmd_id] = response

@@ -2,18 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import json
 import logging
-import os
-import platform
-import resource as resource_mod
-import subprocess
-import sys
-import tempfile
 import time
 from collections import OrderedDict
 from functools import partial
-from pathlib import Path
 from threading import Lock
 from typing import Any, AsyncIterator
 
@@ -29,6 +21,7 @@ from ..schemas.run import (
     RunListResponse,
     RunResponse,
 )
+from .execution import PyEnvironment, PyFunction
 from .function import FunctionService
 from .environment import EnvironmentService
 
@@ -54,10 +47,8 @@ class RunService:
     # -- CRUD ---------------------------------------------------------------
 
     async def create(self, req: RunCreate) -> RunResponse:
-        # Validate function exists
         function = await self._function_service.get(req.function_id)
 
-        # Determine environment
         env_id = req.environment_id or function.environment_id
         env_python: str | None = None
         if env_id is not None:
@@ -84,16 +75,13 @@ class RunService:
 
         LOGGER.info("Triggering run %r for function %r", run_id, req.function_id)
 
-        # Determine effective timeout: explicit > settings default
         effective_timeout = req.timeout if req.timeout is not None else self.settings.max_python_timeout
 
-        # Execute in threadpool
         result = await self._run(
             self._execute, run_id, function, env_python, req.args,
             effective_timeout, req.max_memory_mb,
         )
 
-        # Bump function run counter
         self._function_service.increment_run_count(req.function_id)
 
         return RunResponse(run=result)
@@ -124,18 +112,11 @@ class RunService:
         return RunResponse(run=entry)
 
     async def stream_logs(self, run_id: int) -> AsyncIterator[dict[str, Any]]:
-        """Async generator yielding log events for an SSE stream.
-
-        If the run is already completed, yields the stored stdout/stderr
-        as a batch then the complete event. For in-progress runs, yields
-        whatever stdout/stderr has been captured.
-        """
         with self._lock:
             entry = self._runs.get(run_id)
         if entry is None:
             raise NotFoundError(f"Run {run_id!r} not found")
 
-        # Poll until the run settles (completed/failed/cancelled)
         while entry.status in ("pending", "running"):
             await asyncio.sleep(0.3)
             with self._lock:
@@ -159,19 +140,6 @@ class RunService:
 
     # -- internals ----------------------------------------------------------
 
-    def _make_preexec_fn(self, max_memory_mb: int | None):
-        """Build a preexec_fn that sets resource limits in the child process (Linux only)."""
-        if max_memory_mb is None or platform.system() != "Linux":
-            return None
-
-        memory_bytes = max_memory_mb * 1024 * 1024
-
-        def _set_limits():
-            # RLIMIT_AS = virtual memory limit
-            resource_mod.setrlimit(resource_mod.RLIMIT_AS, (memory_bytes, memory_bytes))
-
-        return _set_limits
-
     def _execute(
         self,
         run_id: int,
@@ -183,104 +151,40 @@ class RunService:
     ) -> RunEntry:
         self._update_entry(run_id, status="running")
 
-        python_bin = env_python or sys.executable
-        t0 = time.monotonic()
-        tmp = None
-        outputs_file = None
+        py_env = PyEnvironment(
+            python_bin=env_python,
+            node_env={
+                "YGG_RUNTIME_VERSION": self.settings.app_version,
+                "YGG_NODE_ID": self.settings.node_id,
+                "YGG_NODE_PORT": str(self.settings.port),
+            },
+        )
 
-        try:
-            # Write function code to a temp file
-            tmp = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".py", delete=False,
-            )
-            # Inject args into the script namespace
-            preamble = f"import json\nargs = json.loads({json.dumps(json.dumps(args))!r})\n"
-            tmp.write(preamble + function.code)
-            tmp.flush()
-            tmp.close()
+        exe = PyFunction(
+            code=function.code,
+            args=args,
+            timeout=timeout,
+            max_memory_mb=max_memory_mb,
+        )
 
-            # Create outputs file for structured DAG outputs
-            outputs_file = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False,
-            )
-            outputs_file.close()
+        execution = py_env.execute(exe)
 
-            # Build subprocess environment with ygg runtime variables
-            env = os.environ.copy()
-            env["YGG_RUNTIME_VERSION"] = self.settings.app_version
-            env["YGG_NODE_ID"] = self.settings.node_id
-            env["YGG_NODE_PORT"] = str(self.settings.port)
-            env["__ygg_inputs__"] = json.dumps(args)
-            env["__ygg_outputs_file__"] = outputs_file.name
+        entry = self._update_entry(
+            run_id,
+            status=execution.status,
+            completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            duration=execution.duration,
+            returncode=execution.returncode,
+            stdout=execution.stdout,
+            stderr=execution.stderr,
+            result=execution.result,
+        )
 
-            preexec_fn = self._make_preexec_fn(max_memory_mb)
-
-            proc = subprocess.run(
-                [python_bin, tmp.name],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                preexec_fn=preexec_fn,
-                env=env,
-            )
-
-            duration = round(time.monotonic() - t0, 3)
-            status = "completed" if proc.returncode == 0 else "failed"
-
-            # Read structured outputs if any were written
-            result: Any = None
-            outputs_path = Path(outputs_file.name)
-            if outputs_path.exists() and outputs_path.stat().st_size > 0:
-                try:
-                    with open(outputs_path) as f:
-                        result = json.load(f)
-                except (json.JSONDecodeError, OSError):
-                    pass
-
-            entry = self._update_entry(
-                run_id,
-                status=status,
-                completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                duration=duration,
-                returncode=proc.returncode,
-                stdout=proc.stdout or None,
-                stderr=proc.stderr or None,
-                result=result,
-            )
-
-            LOGGER.info("Run %r %s (rc=%s, %.2fs)", run_id, status, proc.returncode, duration)
-            return entry
-
-        except subprocess.TimeoutExpired:
-            duration = round(time.monotonic() - t0, 3)
-            entry = self._update_entry(
-                run_id,
-                status="failed",
-                completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                duration=duration,
-                stderr=f"Timed out after {timeout:.0f}s",
-            )
-            LOGGER.error("Run %r timed out after %.0fs", run_id, timeout)
-            return entry
-
-        except Exception as exc:
-            duration = round(time.monotonic() - t0, 3)
-            entry = self._update_entry(
-                run_id,
-                status="failed",
-                completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                duration=duration,
-                stderr=str(exc),
-            )
-            LOGGER.error("Run %r failed: %s", run_id, exc)
-            return entry
-
-        finally:
-            if tmp is not None:
-                Path(tmp.name).unlink(missing_ok=True)
-            if outputs_file is not None:
-                Path(outputs_file.name).unlink(missing_ok=True)
+        LOGGER.info(
+            "Run %r %s (rc=%s, %.2fs)",
+            run_id, execution.status, execution.returncode, execution.duration or 0,
+        )
+        return entry
 
     def _update_entry(self, run_id: int, **updates) -> RunEntry:
         with self._lock:
@@ -289,7 +193,6 @@ class RunService:
                 entry = entry.model_copy(update=updates)
                 self._runs[run_id] = entry
                 return entry
-        # Should not happen in normal flow, but satisfy type checker
         raise NotFoundError(f"Run {run_id!r} not found")
 
     def _evict(self) -> None:
