@@ -513,11 +513,11 @@ def _enum_lookups(target: type[enum.Enum]) -> tuple[dict[str, Any], dict[Any, An
     value_lookup: dict[Any, Any] = {}
     for m in target:
         name_lookup.setdefault(m.name.casefold(), m)
+    for m in target:
         name_lookup.setdefault(str(m.value).casefold(), m)
         try:
             value_lookup.setdefault(m.value, m)
         except TypeError:
-            # Unhashable member values fall back to the name-only path.
             pass
 
     cached = (name_lookup, value_lookup, type(first.value))

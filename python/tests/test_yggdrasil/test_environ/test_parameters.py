@@ -602,6 +602,36 @@ class TestInitWidgets:
         assert dd[1][0] == "color"
         assert dd[1][2] == ("RED", "BLUE")
 
+    def test_multiselect_for_list_enum_shows_all_members(self) -> None:
+        class Config(SystemParameters):
+            colors: list[_Color] = [_Color.RED]
+
+        dbutils = _RecordingDBUtils()
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        ms = next(c for c in dbutils.widgets.calls if c[0] == "multiselect")
+        assert ms[1][0] == "colors"
+        assert ms[1][2] == ("RED", "BLUE")
+
+    def test_multiselect_for_set_enum_shows_all_members(self) -> None:
+        class Config(SystemParameters):
+            colors: set[_Color] = set()
+
+        dbutils = _RecordingDBUtils()
+        with mock.patch.object(SystemParameters, "_get_dbutils", return_value=dbutils):
+            Config.init_widgets()
+
+        ms = next(c for c in dbutils.widgets.calls if c[0] == "multiselect")
+        assert ms[1][0] == "colors"
+        assert ms[1][2] == ("RED", "BLUE")
+
+    def test_enum_name_round_trips_through_convert(self) -> None:
+        from yggdrasil.data.cast import convert
+
+        assert convert("RED", _Color) is _Color.RED
+        assert convert("BLUE", _Color) is _Color.BLUE
+
     def test_datetime_widget_isoformat(self) -> None:
         import datetime as dt
 
