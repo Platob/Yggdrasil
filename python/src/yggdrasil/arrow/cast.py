@@ -1097,10 +1097,7 @@ def cast_arrow_tabular(
     options: Optional[CastOptions] = None,
 ) -> Union[pa.Table, pa.RecordBatch]:
     """Cast pyarrow Table/RecordBatch with skip-cast on schema match."""
-    opts = CastOptions.check(options)
-    if isinstance(data, pa.Table):
-        return opts.cast_arrow_table(data)
-    return opts.cast_arrow_batch(data)
+    return CastOptions.check(options).cast_arrow(data)
 
 
 @register_converter(pa.RecordBatchReader, pa.RecordBatchReader)

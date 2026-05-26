@@ -1177,13 +1177,13 @@ class CastOptions:
     def cast(self, obj: Any) -> Any:
         """Cast *obj* to :attr:`target` using its native engine.
 
-        Short-circuits to *obj* unchanged when ``target is None``.
-        Otherwise delegates to :meth:`Field.cast`, which handles engine
-        detection (pyarrow/polars/pandas/spark + iterable fallback) and
-        shape dispatch (tabular vs array/series/column/expr). Source-side
-        metadata still flows through via ``options=self`` for the inner
-        cast paths that need it.
+        Dispatches arrow types through :meth:`cast_arrow` (which
+        applies predicate + target cast). Everything else delegates
+        to :meth:`Field.cast`.
         """
+        from yggdrasil.arrow.tabular import ArrowTabular
+        if isinstance(obj, (pa.Table, pa.RecordBatch, ArrowTabular)):
+            return self.cast_arrow(obj)
         if self.target is None:
             return obj
         return self.target.cast(obj, options=self)
@@ -1222,6 +1222,17 @@ class CastOptions:
         from yggdrasil.arrow.tabular import ArrowTabular
         batches = [self.cast_arrow_batch(b) for b in data.batches]
         return ArrowTabular(batches)
+
+    def cast_arrow(self, data: Any) -> Any:
+        """Dispatch to cast_arrow_batch, cast_arrow_table, or cast_arrow_tabular."""
+        from yggdrasil.arrow.tabular import ArrowTabular
+        if isinstance(data, ArrowTabular):
+            return self.cast_arrow_tabular(data)
+        if isinstance(data, pa.Table):
+            return self.cast_arrow_table(data)
+        if isinstance(data, pa.RecordBatch):
+            return self.cast_arrow_batch(data)
+        raise TypeError(f"cast_arrow: unsupported type {type(data).__name__}")
 
     def dedup_columns_on_read(self) -> "list[str]":
         """Return the column names that need client-side dedup at read time.
