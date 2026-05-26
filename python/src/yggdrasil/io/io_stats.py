@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 from yggdrasil.data.cast import any_to_datetime
 
 if TYPE_CHECKING:
-    from yggdrasil.data.enums import MediaType
+    from yggdrasil.enums import MediaType
 
 
 __all__ = ["IOStats", "IOKind", "TimeLike"]

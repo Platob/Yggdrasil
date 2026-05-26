@@ -7,11 +7,11 @@ import socket
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional, Union
 
-from yggdrasil.data.enums import MimeTypes
+from yggdrasil.enums import MimeTypes
 from yggdrasil.version import __version_info__, __version__
 
 from .holder import Holder
-from yggdrasil.data.enums import Codec, MediaType
+from yggdrasil.enums import Codec, MediaType
 
 __all__ = [
     "Headers",

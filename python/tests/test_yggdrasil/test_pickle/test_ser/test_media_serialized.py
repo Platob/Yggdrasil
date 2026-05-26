@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.codec import Codec, GZIP, ZSTD, LZ4, BROTLI
-from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.data.enums.mime_type import MimeType, MimeTypes
+from yggdrasil.enums.codec import Codec, GZIP, ZSTD, LZ4, BROTLI
+from yggdrasil.enums.media_type import MediaType
+from yggdrasil.enums.mime_type import MimeType, MimeTypes
 from yggdrasil.pickle.ser.media import (
     CodecSerialized,
     MediaTypeSerialized,

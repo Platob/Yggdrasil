@@ -29,7 +29,7 @@ from databricks.sdk.service.compute import (
     Library,
 )
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 
 from .cluster import Cluster

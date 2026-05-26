@@ -38,7 +38,7 @@ from databricks.sdk.service.catalog import (
     SecurableType,
 )
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.data.enums import MediaTypes, MimeType, MimeTypes, Scheme
+from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.databricks.path import DatabricksPath
@@ -46,7 +46,7 @@ from yggdrasil.io import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import Path
-from yggdrasil.data.enums.mode import Mode, ModeLike
+from yggdrasil.enums.mode import Mode, ModeLike
 
 from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
 

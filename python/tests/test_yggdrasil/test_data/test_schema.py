@@ -148,7 +148,7 @@ class TestMetadata:
         assert s_none.comment is None
 
     def test_media_type_decodes_from_mime_string(self) -> None:
-        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.enums.media_type import MediaTypes
 
         # Field.media_type round-trips through the canonical mime
         # string — same shape FolderPath._persist_schema stamps.

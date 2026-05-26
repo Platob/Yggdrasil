@@ -2029,7 +2029,7 @@ class URLBased(ABC):
         # before it gets its own scheme) leave it unset.
         if scheme is None or scheme == "":
             return
-        from yggdrasil.data.enums import Scheme
+        from yggdrasil.enums import Scheme
         coerced = Scheme.from_(scheme)
         # Store the typed form back on the class so ``cls.scheme`` is
         # always a :class:`Scheme` member from this point on.
@@ -2059,7 +2059,7 @@ class URLBased(ABC):
         :class:`ImportError` when the backend's optional dependencies
         aren't installed.
         """
-        from yggdrasil.data.enums import Scheme
+        from yggdrasil.enums import Scheme
         s = Scheme.from_(scheme)
         registered = _URL_BASED_REGISTRY.get(s)
         if registered is not None:

@@ -31,7 +31,7 @@ from yggdrasil.io.tabular import Tabular
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.tabular.base import O
-from yggdrasil.data.enums import MimeType, MimeTypes, State
+from yggdrasil.enums import MimeType, MimeTypes, State
 
 if TYPE_CHECKING:
     from yggdrasil.spark.executor import SparkStatementExecutor

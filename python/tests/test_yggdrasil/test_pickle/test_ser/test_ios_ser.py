@@ -4,9 +4,9 @@ import io
 
 from yggdrasil.io import BytesIO
 from yggdrasil.io.base import IO
-from yggdrasil.data.enums.codec import GZIP
-from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.data.enums.mime_type import MimeTypes
+from yggdrasil.enums.codec import GZIP
+from yggdrasil.enums.media_type import MediaType
+from yggdrasil.enums.mime_type import MimeTypes
 from yggdrasil.pickle.ser.ios import IOSerialized
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags

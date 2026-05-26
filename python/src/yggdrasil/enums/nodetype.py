@@ -22,7 +22,7 @@ expects one.
 
 Usage::
 
-    from yggdrasil.data.enums import NodeType
+    from yggdrasil.enums import NodeType
 
     # Direct use — the member is a str.
     spec = {"node_type_id": NodeType.DEFAULT}

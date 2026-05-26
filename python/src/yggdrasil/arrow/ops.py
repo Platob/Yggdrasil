@@ -47,8 +47,8 @@ def _row_index_array(n: int) -> pa.Array:
     """
     return pa.array(np.arange(n, dtype=np.int64))
 
-from yggdrasil.data.enums.jointype import JoinType
-from yggdrasil.data.enums.mode import Mode, ModeLike
+from yggdrasil.enums.jointype import JoinType
+from yggdrasil.enums.mode import Mode, ModeLike
 
 from ._typing import ArrowTabular
 from .cast import rechunk_arrow_batches, rechunk_arrow_table

@@ -12,8 +12,8 @@ import pyarrow as pa
 
 from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.data.data_field import field as schema_field
-from yggdrasil.data.enums import GZIP, Codec, MimeType
-from yggdrasil.data.enums import MediaType, MimeTypes
+from yggdrasil.enums import GZIP, Codec, MimeType
+from yggdrasil.enums import MediaType, MimeTypes
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo

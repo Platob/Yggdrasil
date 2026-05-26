@@ -38,7 +38,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Iterator, List, Tuple, Optional
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.base import IO
 from yggdrasil.io.bytes_io import BytesIO

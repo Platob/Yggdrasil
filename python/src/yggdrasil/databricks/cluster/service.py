@@ -290,7 +290,7 @@ class Clusters(DatabricksService):
             new_details.aws_attributes = None
             new_details.gcp_attributes = None
         elif not new_details.node_type_id:
-            from yggdrasil.data.enums import NodeType
+            from yggdrasil.enums import NodeType
             new_details.node_type_id = NodeType.DEFAULT.value
 
         if (

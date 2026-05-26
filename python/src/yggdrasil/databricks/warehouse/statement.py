@@ -55,9 +55,9 @@ from databricks.sdk.service.sql import (
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema
-from yggdrasil.data.enums import MimeType, MimeTypes, Mode
-from yggdrasil.data.enums.media_type import MediaTypes
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums import MimeType, MimeTypes, Mode
+from yggdrasil.enums.media_type import MediaTypes
+from yggdrasil.enums.state import State
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import (
     ExternalStatementData,

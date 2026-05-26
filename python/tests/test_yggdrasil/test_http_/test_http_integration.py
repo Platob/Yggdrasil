@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.io.send_config import CacheConfig, SendConfig
 from ._helpers import StubSession, make_request, make_response
 

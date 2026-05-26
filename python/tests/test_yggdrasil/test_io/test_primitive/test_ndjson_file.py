@@ -16,7 +16,7 @@ from yggdrasil.io.primitive.ndjson_file import NDJSONFile
 class TestRegistration:
 
     def test_class_for_media_type(self) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         assert Holder.class_for_media_type(MimeTypes.NDJSON) is NDJSONFile
 

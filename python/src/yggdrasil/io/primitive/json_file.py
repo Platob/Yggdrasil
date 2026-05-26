@@ -30,7 +30,7 @@ import pyarrow.json as pa_json
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
+from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import pyarrow_dataset_module
 from yggdrasil.io.base import IO
 

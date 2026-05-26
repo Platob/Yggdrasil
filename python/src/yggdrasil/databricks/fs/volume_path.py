@@ -46,8 +46,8 @@ from databricks.sdk.errors import PermissionDenied
 
 from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
-from yggdrasil.data.enums import Mode, ModeLike, Scheme
-from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.enums import Mode, ModeLike, Scheme
+from yggdrasil.enums.media_type import MediaType
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL

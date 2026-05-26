@@ -13,7 +13,7 @@ The client round-trips through a single ``dbks://...`` URL:
 """
 from __future__ import annotations
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.databricks import DatabricksClient
 from yggdrasil.io.url import URL, URLBased
 

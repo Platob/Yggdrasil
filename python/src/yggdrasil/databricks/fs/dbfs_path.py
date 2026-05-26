@@ -15,7 +15,7 @@ import logging
 import time
 from typing import Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.io.url import URL
 

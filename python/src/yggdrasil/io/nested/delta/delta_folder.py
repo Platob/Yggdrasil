@@ -74,7 +74,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, L
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import MimeTypes, Mode
+from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
 from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 from yggdrasil.pickle import json as ygg_json

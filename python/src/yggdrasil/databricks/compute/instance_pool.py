@@ -51,7 +51,7 @@ from databricks.sdk.service.compute import (
 )
 
 from yggdrasil.data.cast.registry import identity
-from yggdrasil.data.enums import NodeType
+from yggdrasil.enums import NodeType
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg

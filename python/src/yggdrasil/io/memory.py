@@ -52,7 +52,7 @@ import tempfile
 import time
 from typing import Any, ClassVar, Optional, Union
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.io_stats import IOKind, IOStats
 
@@ -163,7 +163,7 @@ class Memory(IO):
         # All three converge on the same byte count — the centralized
         # parser is the single place that decides "what does '128 MB'
         # mean" for the entire codebase.
-        from yggdrasil.data.enums.byteunit import ByteUnit
+        from yggdrasil.enums.byteunit import ByteUnit
         if spill_bytes is None:
             self._spill_bytes: Optional[int] = None
         else:

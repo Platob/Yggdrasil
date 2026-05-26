@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.scheme import Scheme
+from yggdrasil.enums.scheme import Scheme
 
 
 class TestCanonicalMembers:

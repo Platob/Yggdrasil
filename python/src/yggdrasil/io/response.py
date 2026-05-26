@@ -18,7 +18,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from .base import IO
-from yggdrasil.data.enums import Codec, MediaType, MimeTypes
+from yggdrasil.enums import Codec, MediaType, MimeTypes
 from .headers import Headers
 from .holder import Holder
 from .memory import Memory

@@ -17,7 +17,7 @@ class TestRegistration:
         assert issubclass(FolderPath, Holder)
 
     def test_folder_in_registry(self) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         assert Holder.class_for_media_type(MimeTypes.FOLDER) is FolderPath
 
@@ -133,7 +133,7 @@ class TestMediaTypeMetadata:
     """``FolderPath._persist_schema`` stamps ``Field.media_type``."""
 
     def test_in_memory_schema_carries_media_type(self, tmp_path) -> None:
-        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.enums.media_type import MediaTypes
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -144,7 +144,7 @@ class TestMediaTypeMetadata:
         assert folder.collect_schema().media_type == MediaTypes.ARROW_IPC
 
     def test_sidecar_round_trips_media_type(self, tmp_path) -> None:
-        from yggdrasil.data.enums.media_type import MediaTypes
+        from yggdrasil.enums.media_type import MediaTypes
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -192,7 +192,7 @@ class TestPartitionWriteModes:
     """
 
     def test_overwrite_clears_stale_partitions(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -215,7 +215,7 @@ class TestPartitionWriteModes:
         assert (tmp_path / "pk=3").is_dir()
 
     def test_ignore_short_circuits_when_any_partition_present(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -232,7 +232,7 @@ class TestPartitionWriteModes:
         assert not (tmp_path / "pk=2").exists()
 
     def test_error_if_exists_raises(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -251,7 +251,7 @@ class TestClearTabularChildren:
     """``_clear_tabular_children`` must remove partition directories too."""
 
     def test_removes_partition_subtrees_not_just_files(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -291,7 +291,7 @@ class TestPartitionedUpsert:
         )
 
     def test_overwrite_match_by_preserves_other_partitions(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -320,7 +320,7 @@ class TestPartitionedUpsert:
         assert rows[3] == {"pk": 2, "id": 21, "v": 210}
 
     def test_overwrite_match_by_inserts_new_rows(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -342,7 +342,7 @@ class TestPartitionedUpsert:
         assert rows[1] == {"pk": 1, "id": 99, "v": 999}
 
     def test_overwrite_match_by_new_partition_created(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -366,7 +366,7 @@ class TestPartitionedUpsert:
         assert rows[1] == {"pk": 3, "id": 30, "v": 300}
 
     def test_overwrite_without_match_by_still_purges(self, tmp_path) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -523,7 +523,7 @@ class TestUniqueByDedup:
         # collapses them on disk, then a unique_by read returns one
         # row per id even if the on-disk shape still carries dupes.
         from yggdrasil.data import field
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.nested.folder_path import FolderOptions
 
         folder = FolderPath(path=str(tmp_path))
@@ -1077,7 +1077,7 @@ class TestComplexNestedTypeDedupResample:
         # payload, then read back with ``unique_by`` set.
         from yggdrasil.data import field
         from yggdrasil.io.nested.folder_path import FolderOptions
-        from yggdrasil.data.enums import MediaTypes
+        from yggdrasil.enums import MediaTypes
 
         t = self._build_table_with_list_of_struct(rows=8)
         folder = FolderPath(path=str(tmp_path))

@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.response import RESPONSE_SCHEMA, Response
 from yggdrasil.io.send_config import CacheConfig

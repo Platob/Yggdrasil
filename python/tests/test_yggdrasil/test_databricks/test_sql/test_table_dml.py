@@ -33,7 +33,7 @@ import pytest
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data import Field
 from yggdrasil.databricks.table.table import (

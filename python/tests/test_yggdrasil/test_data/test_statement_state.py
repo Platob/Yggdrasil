@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from yggdrasil.data.enums import State
+from yggdrasil.enums import State
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 
 

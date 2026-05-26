@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums.state import State
 
 
 class TestCanonicalMembers:

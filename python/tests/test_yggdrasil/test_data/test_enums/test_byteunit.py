@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.byteunit import ByteUnit
+from yggdrasil.enums.byteunit import ByteUnit
 
 
 class TestCanonicalMembers:
@@ -224,7 +224,7 @@ class TestEnumExportedFromPackage:
     """``ByteUnit`` is reachable from ``yggdrasil.data.enums``."""
 
     def test_top_level_import(self) -> None:
-        from yggdrasil.data.enums import ByteUnit as Top
+        from yggdrasil.enums import ByteUnit as Top
         assert Top is ByteUnit
 
 

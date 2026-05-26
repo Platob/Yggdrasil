@@ -35,7 +35,7 @@ from yggdrasil.arrow.cast import get_arrow_nbytes
 from yggdrasil.arrow.ops import upsert_arrow_batches
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import ByteUnit, MimeTypes, Mode
+from yggdrasil.enums import ByteUnit, MimeTypes, Mode
 from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:

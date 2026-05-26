@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Mode, Scheme
+from yggdrasil.enums import Mode, Scheme
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import RemotePath

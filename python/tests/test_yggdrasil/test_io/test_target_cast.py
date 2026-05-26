@@ -10,7 +10,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.data import field, schema
-from yggdrasil.data.enums.media_type import MediaTypes
+from yggdrasil.enums.media_type import MediaTypes
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile

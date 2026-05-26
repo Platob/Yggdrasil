@@ -52,8 +52,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
-from yggdrasil.data.enums import Scheme
-from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.enums import Scheme
+from yggdrasil.enums.media_type import MediaType
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call

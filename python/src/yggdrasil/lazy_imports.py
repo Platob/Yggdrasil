@@ -36,25 +36,25 @@ def io_class():
 
 @lru_cache(maxsize=1)
 def media_type_class():
-    from yggdrasil.data.enums import MediaType
+    from yggdrasil.enums import MediaType
     return MediaType
 
 
 @lru_cache(maxsize=1)
 def media_types_class():
-    from yggdrasil.data.enums import MediaTypes
+    from yggdrasil.enums import MediaTypes
     return MediaTypes
 
 
 @lru_cache(maxsize=1)
 def mime_type_class():
-    from yggdrasil.data.enums import MimeType
+    from yggdrasil.enums import MimeType
     return MimeType
 
 
 @lru_cache(maxsize=1)
 def mime_types_class():
-    from yggdrasil.data.enums import MimeTypes
+    from yggdrasil.enums import MimeTypes
     return MimeTypes
 
 

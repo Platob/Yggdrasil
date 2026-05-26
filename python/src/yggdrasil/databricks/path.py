@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, ClassVar, Optional, Tuple
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.url import URL

@@ -44,8 +44,8 @@ from typing import IO, Iterable, Union, Any
 from yggdrasil.io.url import URL
 from yggdrasil.lazy_imports import path_class
 
-from yggdrasil.data.enums.codec import Codec
-from yggdrasil.data.enums.mime_type import MimeType, MimeTypes
+from yggdrasil.enums.codec import Codec
+from yggdrasil.enums.mime_type import MimeType, MimeTypes
 
 __all__ = ["MediaType", "MediaTypes"]
 

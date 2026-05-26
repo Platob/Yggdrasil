@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 
-from yggdrasil.data.enums import NodeSpec, NodeType
+from yggdrasil.enums import NodeSpec, NodeType
 
 
 class TestNodeTypeCoercion(unittest.TestCase):

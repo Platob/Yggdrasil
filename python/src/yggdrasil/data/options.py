@@ -82,7 +82,7 @@ import pyarrow as pa
 
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.lazy_imports import field_class, schema_class
 

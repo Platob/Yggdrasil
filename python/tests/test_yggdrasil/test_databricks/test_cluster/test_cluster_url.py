@@ -18,7 +18,7 @@ variant under ``Scheme.DATABRICKS_SERVERLESS_CLUSTER``
 """
 from __future__ import annotations
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.databricks.cluster import Cluster, ServerlessCluster
 from yggdrasil.databricks.tests import DatabricksTestCase
 from yggdrasil.io.url import URL, URLBased

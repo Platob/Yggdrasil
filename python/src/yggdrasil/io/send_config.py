@@ -8,7 +8,7 @@ from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Op
 
 from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
 from yggdrasil.data.cast.datetime import truncate_datetime
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.holder import Holder

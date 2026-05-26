@@ -29,7 +29,7 @@ from typing import Any
 
 import pytest
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.http_ import HTTPSession
 from yggdrasil.io.send_config import CacheConfig
 from yggdrasil.io.session import Session

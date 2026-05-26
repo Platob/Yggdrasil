@@ -63,8 +63,8 @@ from typing import (
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import MediaType, MimeType
-from yggdrasil.data.enums.mode import Mode, ModeLike
+from yggdrasil.enums import MediaType, MimeType
+from yggdrasil.enums.mode import Mode, ModeLike
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
@@ -1837,7 +1837,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             self._media_type = None
             return
         try:
-            from yggdrasil.data.enums.media_type import MediaType
+            from yggdrasil.enums.media_type import MediaType
 
             mt = MediaType.from_(value, default=None)
         except Exception:
@@ -3591,7 +3591,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         :class:`Tabular` leaf and returns ``read_pylist()``.
         """
         import json as _json
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
 
         mt = (
             MediaType.from_(media_type, default=None)
@@ -3673,7 +3673,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             if inner is not None:
                 codec_obj = inner
             else:
-                from yggdrasil.data.enums.codec import Codec
+                from yggdrasil.enums.codec import Codec
 
                 codec_obj = Codec.from_(codec, default=None)
         if codec_obj is None:

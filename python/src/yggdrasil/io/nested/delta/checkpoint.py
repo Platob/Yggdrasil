@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.pickle import json as ygg_json
 
 from yggdrasil.io.nested.delta._names import (

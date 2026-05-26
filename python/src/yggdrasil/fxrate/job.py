@@ -245,7 +245,7 @@ def dash_fxrate_entrypoint(
     from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.data import DataType
     from yggdrasil.data.data_field import field as _field
-    from yggdrasil.data.enums.currency import Currency
+    from yggdrasil.enums.currency import Currency
     from yggdrasil.data.schema import Schema
     from yggdrasil.databricks.standardize import standardized_column_name
 
@@ -697,7 +697,7 @@ def _normalise_dash_targets(targets: Iterable[str]) -> list[str]:
     matches the caller's expectation (``["EUR","USD","CHF"]`` →
     ``value_eur, value_usd, value_chf``).
     """
-    from yggdrasil.data.enums.currency import Currency
+    from yggdrasil.enums.currency import Currency
 
     seen: set[str] = set()
     out: list[str] = []

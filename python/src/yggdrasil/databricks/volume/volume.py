@@ -46,7 +46,7 @@ from databricks.sdk.service.catalog import (
 )
 
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.data.enums import Mode, ModeLike, Scheme
+from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 from yggdrasil.databricks.client import DatabricksResource

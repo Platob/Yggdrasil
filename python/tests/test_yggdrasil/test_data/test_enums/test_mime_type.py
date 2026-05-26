@@ -17,7 +17,7 @@ import io
 
 import pytest
 
-from yggdrasil.data.enums.mime_type import MimeType, MimeTypes
+from yggdrasil.enums.mime_type import MimeType, MimeTypes
 
 
 class TestRegistryConstants:

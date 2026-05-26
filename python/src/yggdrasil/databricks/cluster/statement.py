@@ -35,7 +35,7 @@ import pyarrow.dataset as pds
 
 from databricks.sdk.service.compute import CommandStatus, Language
 
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums.state import State
 from yggdrasil.data.statement import (
     PreparedStatement,
     StatementBatch,
