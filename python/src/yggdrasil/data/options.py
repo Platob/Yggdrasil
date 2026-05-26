@@ -1203,14 +1203,15 @@ class CastOptions:
         return self.target.cast_arrow_array(array, options=self)
 
     def cast_arrow_tabular(self, table: Any) -> Any:
-        """Cast a :class:`pa.Table` or :class:`pa.RecordBatch`.
+        """Filter + cast a :class:`pa.Table` or :class:`pa.RecordBatch`.
 
-        ``checked_cast=True`` short-circuits to the input unchanged —
-        the caller guarantees every batch already matches the target,
-        so the per-batch cast pass (and the schema rebuild upstream
-        in :meth:`check_source`) is wasted work. Use only when you
-        control the source.
+        Applies :attr:`predicate` (when set) then delegates to
+        :meth:`Field.cast_arrow_tabular` for schema coercion.
+        ``checked_cast=True`` skips the cast but still applies the
+        predicate.
         """
+        if self.predicate is not None:
+            table = self.predicate.filter_arrow_batch(table)
         if self.target is None or self.checked_cast:
             return table
         return self.target.cast_arrow_tabular(table, options=self)
