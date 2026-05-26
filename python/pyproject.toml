@@ -125,7 +125,6 @@ asyncio_mode = "strict"
 markers = [
   "integration: marks tests that require a live Databricks workspace (skipped when DATABRICKS_HOST is not set)",
   "pyenv_install_integration: marks tests that pip-install a real package into the active venv (skipped when YGGDRASIL_PYENV_INSTALL_TEST is not set)",
-  "fxrate_integration: marks tests that hit the free public FX APIs (Frankfurter / fawazahmed / open.er-api.com); skipped unless YGGDRASIL_FXRATE_INTEGRATION is set",
 ]
 
 [tool.setuptools]

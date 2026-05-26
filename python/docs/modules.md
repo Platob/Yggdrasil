@@ -72,7 +72,6 @@ Engines register their converters **on import** — pull them in once at startup
 
 | Module | Purpose | Page |
 |---|---|---|
-| `yggdrasil.fxrate` | FX rate fetching with multi-source fallback, geo enrichment, Databricks Job factory | [fxrate](modules/fxrate/README.md) |
 | `yggdrasil.jwt` | Parsing-only JWT primitives (`JWTToken`, `JWTParseError`) | [jwt](modules/jwt/README.md) |
 
 ## Platform and utilities
