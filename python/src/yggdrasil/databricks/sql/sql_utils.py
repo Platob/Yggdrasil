@@ -14,6 +14,7 @@ __all__ = [
     "_qualify_fk_ref",
     "databricks_tag_literal",
     "is_glob_pattern",
+    "looks_like_query",
     "name_matcher",
     "normalize_databricks_collation",
     "safe_table_name",
@@ -25,6 +26,35 @@ __all__ = [
     "quote_principal",
     "sql_literal",
 ]
+
+
+# Detect query-shaped SQL by checking for leading keywords after stripping
+# comments. Replaces the old PreparedStatement.looks_like_query static
+# method that lived on the now-deleted abstract class.
+_QUERY_HEAD_RE = re.compile(
+    r"\A(?:\s+|--[^\n]*\n|--[^\n]*\Z|/\*.*?\*/)*"
+    r"(?P<kw>[A-Za-z]+)",
+    re.DOTALL,
+)
+_QUERY_KEYWORDS: frozenset[str] = frozenset({
+    "SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXPLAIN",
+    "VALUES", "TABLE",
+})
+
+
+def looks_like_query(text: Any) -> bool:
+    """Return ``True`` when *text* looks like a SQL query (SELECT / WITH / ...).
+
+    Strips leading whitespace and SQL comments, then checks the first
+    keyword against a fixed set of query-shaped heads. Non-string
+    values return ``False``.
+    """
+    if not isinstance(text, str):
+        return False
+    m = _QUERY_HEAD_RE.match(text)
+    if not m:
+        return False
+    return m.group("kw").upper() in _QUERY_KEYWORDS
 
 
 # Unity Catalog rejects identifiers longer than 255 chars. Generated table
