@@ -1663,7 +1663,7 @@ class HTTPSession(Session):
         rc = reqs[0].remote_cache_config
         if remote_holder is not None and rc is not None:
             LOGGER.debug("Persisting Spark results to remote cache %r", remote_holder)
-            self._spark_persist_remote(remote_holder, result_df, spark=spark)
+            self._spark_persist_remote(remote_holder, result_df, rc, spark=spark)
 
         raise_error = misses[0].send_config_or_default.raise_error
         failed: list[Response] = []
@@ -2093,17 +2093,18 @@ class HTTPSession(Session):
         self,
         holder: "Tabular",
         new_responses_df: "SparkDataFrame",
+        cache_config: CacheConfig,
         *,
         spark: "SparkSession",
     ) -> None:
         """Stage 4 on Spark: bulk-insert ok responses into the remote cache.
 
         APPEND-mode writes are de-duplicated against existing rows.
-        Existing ``(partition_key, public_hash)`` pairs are eagerly
-        collected from the remote table and used as a broadcast
-        anti-join filter — this decouples the read from the write plan
-        so Spark doesn't have to scan the remote table during the
-        write action.
+        The dedup key is ``partition_key`` plus the config's
+        ``match_by_columns`` (derived from ``request_by`` /
+        ``response_by``).  Existing key tuples are eagerly collected
+        and used as a broadcast anti-join so the write plan is
+        independent of the remote table scan.
         """
         from pyspark.sql import functions as F
 
@@ -2113,6 +2114,13 @@ class HTTPSession(Session):
             & (F.col("status_code") < 300)
         )
 
+        dedup_columns: list[str] = ["partition_key"]
+        seen = {"partition_key"}
+        for c in cache_config.match_by_columns:
+            if c not in seen:
+                dedup_columns.append(c)
+                seen.add(c)
+
         try:
             wanted = [
                 row["partition_key"]
@@ -2121,26 +2129,28 @@ class HTTPSession(Session):
         except Exception:
             wanted = []
 
+        safe = "`"
+        select_clause = ", ".join(f"{safe}{c}{safe}" for c in dedup_columns)
         try:
             if wanted:
                 literals = ", ".join(str(int(v)) for v in wanted)
                 existing_rows = spark.sql(
-                    "SELECT DISTINCT partition_key, public_hash "
+                    f"SELECT DISTINCT {select_clause} "
                     f"FROM {table_name} WHERE partition_key IN ({literals})"
                 ).collect()
             else:
                 existing_rows = spark.sql(
-                    "SELECT DISTINCT partition_key, public_hash "
+                    f"SELECT DISTINCT {select_clause} "
                     f"FROM {table_name}"
                 ).collect()
             if existing_rows:
                 existing_df = spark.createDataFrame(
-                    [(r["partition_key"], r["public_hash"]) for r in existing_rows],
-                    ["partition_key", "public_hash"],
+                    [tuple(r[c] for c in dedup_columns) for r in existing_rows],
+                    dedup_columns,
                 )
                 ok_df = ok_df.join(
                     F.broadcast(existing_df),
-                    on=["partition_key", "public_hash"],
+                    on=dedup_columns,
                     how="left_anti",
                 )
         except Exception as exc:
