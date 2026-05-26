@@ -29,6 +29,25 @@ export interface ProcessInfo {
   status: string;
 }
 
+export interface PythonResponse {
+  id: string;
+  status: string;
+  stdout: string | null;
+  stderr: string | null;
+  result: unknown;
+  duration: number | null;
+  returncode: number | null;
+}
+
+export interface CmdResponse {
+  id: string;
+  status: string;
+  stdout: string | null;
+  stderr: string | null;
+  duration: number | null;
+  returncode: number | null;
+}
+
 // ── Bot API Client ───────────────────────────────────────────────────────────
 
 class BotClient {
@@ -88,6 +107,40 @@ class BotClient {
       throw err;
     }
   }
+
+  async executePython(code: string): Promise<PythonResponse> {
+    try {
+      const res = await fetch(`${this.baseUrl}/execute/python`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    } catch (err) {
+      console.error("[v0] executePython failed:", err);
+      throw err;
+    }
+  }
+
+  async executeCmd(args: string[]): Promise<CmdResponse> {
+    try {
+      const res = await fetch(`${this.baseUrl}/execute/cmd`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ args }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    } catch (err) {
+      console.error("[v0] executeCmd failed:", err);
+      throw err;
+    }
+  }
 }
 
 export const bot = new BotClient();
+
+// Standalone execution functions for convenience
+export const executePython = (code: string) => bot.executePython(code);
+export const executeCmd = (args: string[]) => bot.executeCmd(args);
