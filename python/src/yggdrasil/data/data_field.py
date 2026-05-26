@@ -29,7 +29,6 @@ from yggdrasil.data.base_meta import (
     _to_bytes,
 )
 from yggdrasil.data.constants import (
-    ALIAS_KEY,
     DEFAULT_VALUE_KEY,
     DEFAULT_FIELD_NAME,
     MEDIA_TYPE_METADATA_KEY,
@@ -1097,83 +1096,18 @@ class Field(BaseChildrenFields):
     # ==================================================================
 
     @property
-    def alias(self) -> "str | None":
-        """Explicit alias stored under :data:`ALIAS_KEY`, or ``None``.
-
-        Returns ``None`` when no alias is configured — callers must
-        fall back to :attr:`name` explicitly if needed.
-        """
-        if self.metadata:
-            value = self.metadata.get(ALIAS_KEY)
-            if value is not None:
-                return value.decode("utf-8") if isinstance(value, bytes) else str(value)
-        return None
-
-    @property
-    def has_alias(self) -> bool:
-        """Whether an explicit alias is set in :attr:`metadata`.
-
-        Distinguishes "alias configured" from the
-        :attr:`alias` → :attr:`name` fallback so callers that care
-        (schema diffs, nested-cast lookup precedence) can branch on
-        the real bit.
-        """
-        return bool(self.metadata and self.metadata.get(ALIAS_KEY))
-
-    def set_alias(self, value: str | None) -> "Field":
-        """Set / clear :attr:`alias` on *self* in place.
-
-        Frozen-dataclass property setters trip the auto-generated
-        ``__setattr__`` (cpython #44477), so the alias write path
-        is a method instead. Returns ``self`` so calls chain.
-
-        Normalization rules:
-
-        * ``value == self.name`` → no-op. Storing the canonical name
-          in the alias slot is meaningless — :attr:`alias` already
-          falls back to :attr:`name`.
-        * Field has no name yet (empty or unset) → promote the
-          incoming value to :attr:`name` instead of stashing it in
-          metadata, so the field gets a usable identity in one
-          step.
-        * Otherwise → record under :data:`ALIAS_KEY`.
-        """
-        if value is None or value == self.name:
-            if not self.metadata or ALIAS_KEY not in self.metadata:
-                return self
-            self.metadata.pop(ALIAS_KEY, None)
-            if not self.metadata:
-                object.__setattr__(self, "metadata", None)
-            self._on_metadata_mutated()
-            return self
-        if not self.name:
-            object.__setattr__(self, "name", value)
-            if self.metadata and ALIAS_KEY in self.metadata:
-                self.metadata.pop(ALIAS_KEY, None)
-                if not self.metadata:
-                    object.__setattr__(self, "metadata", None)
-            self._on_metadata_mutated()
-            return self
-        if self.metadata is None:
-            object.__setattr__(self, "metadata", {})
-        self.metadata[ALIAS_KEY] = value.encode("utf-8")
-        self._on_metadata_mutated()
-        return self
-
-    @property
     def position(self) -> int | None:
         """Optional 0-based index this field claims in a parent schema.
 
         Stored in :attr:`metadata` under :data:`POSITION_KEY`. Used
         by :meth:`select_in_field` (and the engine-specific
         ``select_in_*`` helpers) as the last-resort fallback when
-        neither :attr:`name` nor :attr:`alias` matches a child name
-        in the receiving schema — the receiver's
-        ``children[position]`` (or column at ``position``)
-        is then resolved by name and used.
+        :attr:`name` doesn't match a child name in the receiving
+        schema — the receiver's ``children[position]`` (or column
+        at ``position``) is then resolved by name and used.
 
         ``None`` (the default) leaves position-based lookup
-        disabled, matching the historical name/alias-only resolver.
+        disabled, matching the historical name-only resolver.
         """
         if not self.metadata:
             return None
@@ -1229,29 +1163,6 @@ class Field(BaseChildrenFields):
         else:
             metadata[POSITION_KEY] = str(position).encode("utf-8")
         return self.copy(metadata=metadata or None)
-
-    def with_alias(self, alias: str | None) -> "Field":
-        """Return a copy of this field with :attr:`alias` set / cleared.
-
-        Mirrors :meth:`with_default` — immutable shape for callers
-        that don't want to mutate the existing instance. Same
-        normalization rules as :meth:`set_alias`: no-op on
-        ``alias == self.name``; promote to :attr:`name` when the
-        receiver has no name yet.
-        """
-        if alias is None or alias == self.name:
-            if not self.has_alias:
-                return self
-            metadata = dict(self.metadata)
-            metadata.pop(ALIAS_KEY, None)
-            return self.copy(metadata=metadata or None)
-        if not self.name:
-            metadata = dict(self.metadata) if self.metadata else {}
-            metadata.pop(ALIAS_KEY, None)
-            return self.copy(name=alias, metadata=metadata or None)
-        metadata = dict(self.metadata) if self.metadata else {}
-        metadata[ALIAS_KEY] = alias.encode("utf-8")
-        return self.copy(metadata=metadata)
 
     @property
     def has_default(self) -> bool:

@@ -323,26 +323,21 @@ def _selector_to_polars(spec: Any) -> Any:
     """Translate a projection entry to a polars expression.
 
     Strings → bare column reference. :class:`Field` →
-    cast-on-select with rename — :attr:`Field.alias` (when
-    different from :attr:`Field.name`) is the source-side label
-    and :attr:`Field.name` is the projected output name; the
-    target dtype comes from :attr:`Field.dtype`. Anything else
-    falls through to :meth:`Expression.to_polars` so a builder-
-    side ``col(...).alias("...")`` chain works directly.
+    ``pl.col(name).cast(dtype)``. Anything else falls through to
+    :meth:`Expression.to_polars`.
     """
     import polars as pl
 
     if isinstance(spec, str):
         return pl.col(spec)
     if isinstance(spec, Field):
-        source = spec.alias or spec.name
-        expr = pl.col(source)
+        expr = pl.col(spec.name)
         if spec.dtype is not None and hasattr(spec.dtype, "to_polars"):
             try:
                 expr = expr.cast(spec.dtype.to_polars())
             except Exception:
                 pass
-        return expr.alias(spec.name) if spec.name and spec.name != source else expr
+        return expr
     if isinstance(spec, Column):
         return pl.col(spec.name)
     if isinstance(spec, Expression):
@@ -537,8 +532,7 @@ def _apply_statement_select(
             out_columns.append(table[spec])
             continue
         if isinstance(spec, Field):
-            source = spec.alias or spec.name
-            col = table[source]
+            col = table[spec.name]
             if spec.dtype is not None and hasattr(spec.dtype, "to_arrow"):
                 try:
                     col = col.cast(spec.dtype.to_arrow())

@@ -1,7 +1,6 @@
 TAG_PREFIX = b"t:"
 DBX_META_PREFIX = b"databricks:"
 DEFAULT_VALUE_KEY = b"default"
-ALIAS_KEY = b"alias"
 POSITION_KEY = b"position"
 DEFAULT_FIELD_NAME = ""
 # Field.media_type stores the on-disk MediaType under this metadata

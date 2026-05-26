@@ -324,14 +324,11 @@ class CastOptions:
     use_threads: bool = True
     recursive: bool = False
     #: Field-typed column references to dedup on. Each entry's
-    #: :attr:`Field.name` resolves to the target column; the optional
-    #: :attr:`Field.alias` lets a source frame label the column
-    #: differently (consumers route through
-    #: :meth:`Field.select_in_arrow_tabular` etc. when they need the
-    #: alias-aware lookup). Bare strings passed in ``__init__`` are
-    #: coerced to a default-typed :class:`Field` in
-    #: :meth:`__post_init__` so callers can still pass plain key
-    #: names — the Field-typed shape is the canonical surface.
+    #: :attr:`Field.name` resolves to the target column. Bare strings
+    #: passed in ``__init__`` are coerced to a default-typed
+    #: :class:`Field` in :meth:`__post_init__` so callers can still
+    #: pass plain key names — the Field-typed shape is the canonical
+    #: surface.
     match_by: list["Field"] | None = None
     #: Field-typed column references to dedup on at read time. Same
     #: shape as :attr:`match_by` — each entry's :attr:`Field.name`

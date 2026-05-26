@@ -54,8 +54,7 @@ them together:
 - :class:`yggdrasil.data.data_field.Field` is the cross-engine
   projection. The ``select=`` kwarg accepts a list of names /
   Fields / columns to apply on the way out — the Field carries
-  the output name (and source-side :attr:`Field.alias` when
-  different) plus the cast-on-select :attr:`Field.dtype`.
+  the output name plus the cast-on-select :attr:`Field.dtype`.
 - :class:`yggdrasil.data.statement.StatementResult` is the
   lifecycle + Arrow-IO base.
 - :class:`yggdrasil.io.buffer.memory.ArrowTabular` is the
