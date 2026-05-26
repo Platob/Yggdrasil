@@ -8,7 +8,7 @@ import http.client
 import zlib
 import warnings
 from dataclasses import MISSING
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional, Tuple
 
 import polars as pl
 import pyarrow as pa
@@ -43,10 +43,8 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, Row as SparkRow
     from starlette.responses import Response as StarletteResponse
 
-    from yggdrasil.http_.session import Session
-    from yggdrasil.environ.userinfo import UserInfo
+    from yggdrasil.http_.session import HTTPSession, Session
     from yggdrasil.http_.path import HTTPPath
-    from yggdrasil.http_.session import HTTPSession
 
 
 __all__ = [
@@ -537,7 +535,7 @@ def _compute_response_identity_hash(
 # Response dataclass
 # ---------------------------------------------------------------------------
 
-class Response(Tabular["ResponseOptions"]):
+class _ResponseBase(Tabular["ResponseOptions"]):
     """HTTP response model — paired with the originating :class:`PreparedRequest`.
 
     Implements :class:`Tabular` over the deterministic metadata
@@ -1694,7 +1692,7 @@ class _DecodingReader:
         return chunk
 
 
-class HTTPResponse(Response, IO):
+class HTTPResponse(_ResponseBase, IO):
     """HTTP-shaped :class:`Response` that IS an IO cursor over its buffer.
 
     Single access point for every HTTP response in yggdrasil: the
@@ -2026,3 +2024,5 @@ class HTTPResponse(Response, IO):
             tags=tags,
             received_at=received_at,
         )
+
+Response = HTTPResponse

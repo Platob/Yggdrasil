@@ -27,6 +27,9 @@ import datetime as dt
 import http.client
 import itertools
 import logging
+import pathlib
+import threading
+from abc import ABC
 import os
 import socket
 import ssl
@@ -248,7 +251,7 @@ def _hashable_identity_value(value: Any) -> Any:
     return value
 
 
-class Session(Singleton, ABC):
+class _SessionBase(Singleton, ABC):
     """Abstract per-transport session base — singleton-keyed by post-init ``__dict__``.
 
     Inherits the standard :class:`Singleton` plumbing:
@@ -503,7 +506,7 @@ class Session(Singleton, ABC):
             return self._local_cache
 
 
-class HTTPSession(Session):
+class HTTPSession(_SessionBase):
     """HTTP/HTTPS session — singleton-keyed by ``(base_url, verify, pool_maxsize, headers, waiting, auth)``.
 
     Inherits the singleton + pickle + ``job_pool`` plumbing from
@@ -527,7 +530,7 @@ class HTTPSession(Session):
     _RESPONSE_CLASS: ClassVar[type] = Response
     _BATCH_CLASS: ClassVar[type] = HTTPResponseBatch
 
-    _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_connections", "_retry"}
+    _TRANSIENT_STATE_ATTRS = _SessionBase._TRANSIENT_STATE_ATTRS | {"_connections", "_retry"}
 
     # Status codes that trigger an automatic redirect when ``redirect=True``.
     # 303 always falls back to GET (per RFC 7231); 307/308 preserve method.
@@ -2182,3 +2185,5 @@ class HTTPSession(Session):
             session=self
         )
         return request
+
+Session = HTTPSession

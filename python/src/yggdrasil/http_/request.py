@@ -345,7 +345,7 @@ def _fold_cache_into_send_config(
     return _SendConfig(local_cache=lc, remote_cache=rc)
 
 
-class PreparedRequest:
+class HTTPRequest:
     """Immutable-ish request descriptor — fields are normalized in __init__.
 
     ``_session`` is a transient back-reference used by
@@ -1409,4 +1409,4 @@ class PreparedRequest:
     ):
         return func(self)
 
-HTTPRequest = PreparedRequest
+PreparedRequest = HTTPRequest

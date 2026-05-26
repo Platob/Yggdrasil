@@ -1,2 +1,3 @@
-from yggdrasil.http_.session import *
-from yggdrasil.http_.session import Session
+from yggdrasil.http_.session import Session, HTTPSession
+
+__all__ = ["Session", "HTTPSession"]

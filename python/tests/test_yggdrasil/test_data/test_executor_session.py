@@ -70,8 +70,9 @@ class _DummyExecutor(StatementExecutor):
 
 
 class TestExecutorInheritsSession:
-    def test_statement_executor_is_session_subclass(self):
-        assert issubclass(StatementExecutor, Session)
+    def test_statement_executor_is_singleton_subclass(self):
+        from yggdrasil.dataclasses.singleton import Singleton
+        assert issubclass(StatementExecutor, Singleton)
 
     def test_session_classvars_declared_on_base(self):
         """Session declares the prepared / response / batch slots so each
