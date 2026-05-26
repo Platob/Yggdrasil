@@ -67,7 +67,7 @@ from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ArrowIPCFile
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
-from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig, _request_column_sql_name
+from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.io.session import Session
 from yggdrasil.http_.response_batch import responses_to_tabular
 from yggdrasil.io.url import URL
@@ -731,12 +731,7 @@ class HTTPSession(Session):
 
         from yggdrasil.data.options import CastOptions
 
-        lookup_request = (
-            request
-            if cache_cfg.request_by_is_public
-            else request.anonymize(mode=cache_cfg.anonymize)
-        )
-        predicate = cache_cfg.make_lookup_predicate(request=lookup_request)
+        predicate = cache_cfg.make_lookup_predicate(request=request)
         spark = request.send_config_or_default.get_spark_session()
         opts = CastOptions(predicate=predicate, spark_session=spark)
         batches = tabular.read_arrow_batches(options=opts.check_target(RESPONSE_SCHEMA))

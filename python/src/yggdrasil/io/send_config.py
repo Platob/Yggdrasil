@@ -12,7 +12,7 @@ from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.path import Path
-from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
+from yggdrasil.io.request import PreparedRequest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from yggdrasil.io.response import Response
     from yggdrasil.io.session import Session
+    from yggdrasil.io.tabular.base import Tabular
 
 
 __all__ = ["CacheConfig", "SendConfig"]
@@ -30,9 +31,8 @@ __all__ = ["CacheConfig", "SendConfig"]
 _DEFAULT_CACHE_ROOT: pathlib.Path = pathlib.Path.home() / ".cache" / "http" / "response"
 
 
-_DEFAULT_REQUEST_BY: tuple[str, ...] = (
-    "public_hash",
-)
+MATCH_COLUMN: str = "request_public_hash"
+MATCH_KEY: str = "public_hash"
 
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
@@ -64,25 +64,6 @@ _SEND_CONFIG_FIELDS: frozenset[str] = frozenset(
 DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
-def _request_column_sql_name(key: str) -> str:
-    """Cache-table column name for a request-side ``request_by`` key.
-
-    The response cache stores requests as flattened ``request_<col>``
-    columns (cf. :data:`RESPONSE_SCHEMA`), so a user-supplied
-    ``request_by`` key that names a bare request column
-    (``public_url_hash``, ``method`` …) needs the ``request_``
-    prefix when used as a column reference (predicate match clause,
-    :meth:`Tabular.write_arrow_batches` match-by). Already-prefixed
-    keys pass through.
-    """
-    head, sep, tail = key.partition(".")
-    if head in REQUEST_ARROW_SCHEMA.names:
-        prefixed = f"request_{head}"
-    else:
-        prefixed = head
-    return prefixed + (sep + tail if sep else "")
-
-
 
 def _truncate_to_hour(value: dt.datetime) -> dt.datetime:
     return value.replace(minute=0, second=0, microsecond=0)
@@ -104,7 +85,6 @@ class CacheConfig:
         "received_from", "received_to", "cleanup_ttl", "_derived",
     )
 
-    request_by: ClassVar[tuple[str, ...]] = _DEFAULT_REQUEST_BY
 
     @classmethod
     def default(cls):
@@ -313,62 +293,6 @@ class CacheConfig:
             return False
         return self.tabular is not None
 
-    @property
-    def match_by_columns(self) -> list[str]:
-        """Flattened column names for keyed cache operations.
-
-        Request-side keys are stored on the response table under the
-        flattened ``request_<col>`` form (cf. :data:`RESPONSE_SCHEMA`),
-        so a bare ``public_url_hash`` / ``method`` / etc. needs the
-        ``request_`` prefix.
-        """
-        cache = self._derived_cache()
-        out = cache.get("match_by_columns", ...)
-        if out is ...:
-            out = [_request_column_sql_name(k) for k in (self.request_by or ())]
-            cache["match_by_columns"] = out
-        return out
-
-    @property
-    def request_match_columns(self) -> list[str]:
-        """Flattened column names for every ``request_by`` key.
-
-        :meth:`make_batch_lookup_predicate` walks N requests and
-        emits the same column name for each (it depends only on
-        the config), so precomputing the list cuts the per-request
-        loop's cost — at ``BATCH_SIZE=64`` requests that is 64
-        ``_request_column_sql_name`` calls replaced by one shared
-        list of strings.
-        """
-        cache = self._derived_cache()
-        out = cache.get("request_match_columns", ...)
-        if out is ...:
-            out = [_request_column_sql_name(k) for k in (self.request_by or ())]
-            cache["request_match_columns"] = out
-        return out
-
-    @property
-    def request_by_is_public(self) -> bool:
-        """True when every ``request_by`` key is anonymization-invariant.
-
-        ``public_hash`` / ``public_url_hash`` (and any future ``public_*``
-        column) are computed against ``url.anonymize('remove')`` plus
-        ``normalize_headers(anonymize=True)``, so they hash to the same
-        int64 whether the caller looks them up on the original request or
-        on the anonymized form stored in the cache. When this predicate
-        holds the lookup paths can skip the per-request ``anonymize()``
-        pass before computing ``request_tuple`` / building the lookup
-        :class:`Predicate` — the saving is one URL parse + one header
-        normalize per request per lookup, which adds up on send_many
-        bursts.
-        """
-        cache = self._derived_cache()
-        out = cache.get("request_by_is_public", ...)
-        if out is ...:
-            keys = self.request_by or ()
-            out = bool(keys) and all(str(k).startswith("public_") for k in keys)
-            cache["request_by_is_public"] = out
-        return out
 
     @property
     def defined_received_from(self) -> dt.datetime:
@@ -476,7 +400,7 @@ class CacheConfig:
     ) -> "tuple[list[Response], list[PreparedRequest]]":
         """Read cache hits as :class:`Response` objects.
 
-        Returns ``(hits, misses)`` — hits matched by ``request_by``
+        Returns ``(hits, misses)`` — matched by ``public_hash``
         and filtered by ``received_from`` / ``received_to``.
         """
         from yggdrasil.io.response import Response
@@ -488,25 +412,22 @@ class CacheConfig:
         if tab is None:
             return [], list(request_list)
 
-        request_tuple = self.request_tuple
-        lookup_keys = [request_tuple(r) for r in request_list]
-
-        result_map: dict[tuple, Response] = {}
+        result_map: dict[int, Response] = {}
         for response in Response.from_arrow_tabular(tab.read_arrow_batches()):
             req = response.request
             if req is None:
                 continue
-            key = request_tuple(req)
+            key = req.match_value(MATCH_KEY)
             existing = result_map.get(key)
             if existing is None or response.received_at >= existing.received_at:
                 result_map[key] = response
 
         hits: list[Response] = []
         misses: list[PreparedRequest] = []
-        filter_response = self.filter_response
-        for req, key in zip(request_list, lookup_keys):
+        for req in request_list:
+            key = req.match_value(MATCH_KEY)
             candidate = result_map.get(key)
-            if candidate is not None and filter_response(candidate, request=req):
+            if candidate is not None and self.filter_response(candidate, request=req):
                 hits.append(candidate)
             else:
                 misses.append(req)
@@ -584,7 +505,7 @@ class CacheConfig:
 
         opts = CastOptions(
             mode=mode if mode is not None else self.mode,
-            match_by=self.match_by_columns or None,
+            match_by=[MATCH_COLUMN],
             spark_session=spark_session,
         )
         try:
@@ -605,42 +526,19 @@ class CacheConfig:
                 "Cache write failed for %r", holder, exc_info=True,
             )
 
-    def request_values(
-        self,
-        request: PreparedRequest,
-    ) -> dict[str, Any]:
-        return {
-            key: request.match_value(key)
-            for key in (self.request_by or [])
-        }
-
     def filter_response(
         self,
         response: "Response",
         request: PreparedRequest | None = None,
     ) -> bool:
         if request is not None:
-            for key, expected in self.request_values(request).items():
-                actual = response.match_value(key)
-                if actual != expected:
-                    return False
-
-        if self.received_from is not None:
-            if response.received_at < self.received_from:
+            if response.match_value(MATCH_KEY) != request.match_value(MATCH_KEY):
                 return False
-
-        if self.received_to is not None:
-            if response.received_at >= self.received_to:
-                return False
-
+        if self.received_from is not None and response.received_at < self.received_from:
+            return False
+        if self.received_to is not None and response.received_at >= self.received_to:
+            return False
         return True
-
-    def request_tuple(
-        self,
-        request: PreparedRequest,
-    ) -> tuple[Any, ...]:
-        values = self.request_values(request)
-        return tuple(values[key] for key in (self.request_by or []))
 
     # ------------------------------------------------------------------
     # Predicate builders — single source of truth for cache lookups
@@ -654,32 +552,16 @@ class CacheConfig:
     # folder, SQL ``WHERE`` for Databricks Tables). No SQL is built
     # here.
 
+    @staticmethod
     def request_predicate(
-        self,
         request: PreparedRequest | None,
     ) -> "Any | None":
-        """Build the per-request match predicate as an :class:`Expression`.
-
-        Walks ``request_by`` keys, builds ``col(request_<key>) ==
-        request.match_value(key)`` per entry, and ANDs them together.
-        ``None`` request → ``None`` (no per-request constraint).
-        """
-        if request is None or not self.request_by:
+        if request is None:
             return None
-        from yggdrasil.execution.expr import all_of, col
+        from yggdrasil.execution.expr import col
 
-        clauses: list[Any] = []
-        match_value = request.match_value
-        for column, key in zip(self.request_match_columns, self.request_by):
-            value = match_value(key)
-            clauses.append(
-                col(column).is_null() if value is None else col(column) == value
-            )
-        if not clauses:
-            return None
-        if len(clauses) == 1:
-            return clauses[0]
-        return all_of(*clauses)
+        value = request.match_value(MATCH_KEY)
+        return col(MATCH_COLUMN).is_null() if value is None else col(MATCH_COLUMN) == value
 
     def make_lookup_predicate(
         self,
@@ -801,7 +683,7 @@ class SendConfig:
         requests: list[PreparedRequest],
         *,
         session: "Any" = None,
-    ) -> "tuple[Any, Any, list[PreparedRequest]]":
+    ) -> "tuple[Tabular | None, Tabular | None, list[PreparedRequest]]":
         """Split requests into local hits, remote hits, and remaining misses.
 
         Performs lightweight hash-only lookups against local then remote
@@ -822,12 +704,11 @@ class SendConfig:
         if not requests:
             return None, None, []
 
-        match_key = CacheConfig.request_by[0]
-        request_hashes = {r.match_value(match_key): r for r in requests}
+        request_hashes = {r.match_value(MATCH_KEY): r for r in requests}
         partition_keys = sorted({r.partition_key for r in requests})
         predicate = col("partition_key").is_in(partition_keys)
 
-        match_col = _request_column_sql_name(CacheConfig.request_by[0])
+        match_col = MATCH_COLUMN
 
         def _probe_cache(cache: CacheConfig) -> set[int]:
             holder = cache.tabular or cache.cache_tabular(session=session)
@@ -855,18 +736,18 @@ class SendConfig:
             cached_hashes = _probe_cache(self.local_cache)
             existing = cached_hashes & set(request_hashes)
             if existing:
-                hit_reqs = [r for r in misses if r.match_value(match_key) in existing]
-                misses = [r for r in misses if r.match_value(match_key) not in existing]
+                hit_reqs = [r for r in misses if r.match_value(MATCH_KEY) in existing]
+                misses = [r for r in misses if r.match_value(MATCH_KEY) not in existing]
                 if hit_reqs:
                     local_tabular = _fetch_hits(self.local_cache, hit_reqs)
 
         if self.remote_cache is not None and misses and self.remote_cache.mode in (Mode.AUTO, Mode.APPEND):
             cached_hashes = _probe_cache(self.remote_cache)
-            remaining = {r.match_value(match_key) for r in misses}
+            remaining = {r.match_value(MATCH_KEY) for r in misses}
             existing = cached_hashes & remaining
             if existing:
-                hit_reqs = [r for r in misses if r.match_value(match_key) in existing]
-                misses = [r for r in misses if r.match_value(match_key) not in existing]
+                hit_reqs = [r for r in misses if r.match_value(MATCH_KEY) in existing]
+                misses = [r for r in misses if r.match_value(MATCH_KEY) not in existing]
                 if hit_reqs:
                     remote_tabular = _fetch_hits(self.remote_cache, hit_reqs)
 
