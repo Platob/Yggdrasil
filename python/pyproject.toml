@@ -109,10 +109,6 @@ Repository = "https://github.com/Platob/Yggdrasil"
 Documentation = "https://platob.github.io/Yggdrasil/"
 
 [project.scripts]
-ygg = "yggdrasil.cli.main:main"
-ygg-node = "yggdrasil.node.main:main"
-ygg-genie = "yggdrasil.cli.databricks.genie:main"
-ygg-databricks = "yggdrasil.databricks.cli:main"
 
 # ── setuptools ────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]

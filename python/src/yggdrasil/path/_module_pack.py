@@ -162,7 +162,7 @@ def build_module_archive(
 
     archive_name = f"{local_root.name}.zip"
     if dest is None:
-        from yggdrasil.io.path.local_path import LocalPath
+        from yggdrasil.path.local_path import LocalPath
         # Staging file is closed (no fd) — fine to write via stdlib
         # zipfile.
         staging = LocalPath.staging_path()
