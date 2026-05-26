@@ -73,13 +73,21 @@ F = TypeVar("F", bound=Callable[..., Any])
 _EDIT_ARG_NAMES = set(inspect.signature(ClustersAPI.edit).parameters.keys())
 _GROUPNAME_RE = re.compile(r"\bGroupName\((?P<group>[^)]*)\)")
 
+_POOL_MANAGED_FIELDS: frozenset[str] = frozenset({
+    "node_type_id",
+    "driver_node_type_id",
+    "enable_elastic_disk",
+    "aws_attributes",
+    "gcp_attributes",
+})
 
-def _library_sig(lib: Library) -> tuple[str, Any]:
-    """
-    Return a stable-ish signature for a library definition.
 
-    This is used to deduplicate install requests against already installed
-    cluster libraries.
+def _library_dedup_key(lib: Library) -> tuple[str, str]:
+    """Return a key suitable for deduplicating library install requests.
+
+    PyPI libraries are keyed by their normalized bare package name so that
+    different version specs (``pkg==1.0`` vs ``pkg==2.0``) or repos collapse
+    to the same key.  JARs, wheels, and requirements files are keyed by path.
     """
     if getattr(lib, "jar", None):
         return ("jar", lib.jar)
@@ -87,9 +95,18 @@ def _library_sig(lib: Library) -> tuple[str, Any]:
         return ("whl", lib.whl)
     if getattr(lib, "requirements", None):
         return ("requirements", lib.requirements)
-    if getattr(lib, "pypi", None):
-        return ("pypi", lib.pypi.package, lib.pypi.repo)
+    if getattr(lib, "pypi", None) and lib.pypi.package:
+        return ("pypi", _normalize_pip_pkg_name(lib.pypi.package))
     return ("other", repr(lib))
+
+
+def _dedupe_libraries(libraries: list[Library]) -> list[Library]:
+    """Deduplicate a list of libraries, keeping the last occurrence."""
+    seen: dict[tuple[str, str], int] = {}
+    for idx, lib in enumerate(libraries):
+        seen[_library_dedup_key(lib)] = idx
+    keep = sorted(seen.values())
+    return [libraries[i] for i in keep]
 
 
 # ---------------------------------------------------------------------------
@@ -628,13 +645,19 @@ class Cluster(Singleton, DatabricksResource, URLBased):
     def _editable_details_from(details: Optional[ClusterDetails]) -> dict[str, Any]:
         """
         Extract editable fields from cluster details for Databricks ``edit``.
+
+        When ``instance_pool_id`` is set, fields that Databricks auto-populates
+        from the pool are stripped so they don't cause spurious diffs.
         """
         if details is None:
             return {}
+        raw = details.as_shallow_dict()
+        has_pool = bool(raw.get("instance_pool_id"))
         return {
             key: value
-            for key, value in details.as_shallow_dict().items()
+            for key, value in raw.items()
             if key in _EDIT_ARG_NAMES
+            and not (has_pool and key in _POOL_MANAGED_FIELDS)
         }
 
     # ------------------------------------------------------------------ #
@@ -811,6 +834,7 @@ class Cluster(Singleton, DatabricksResource, URLBased):
                 self, ", ".join(skipped),
             )
 
+        allowed = _dedupe_libraries(allowed)
         normalized = self._dedupe_uninstalled_libraries(allowed)
 
         if not normalized:
@@ -966,12 +990,12 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         """
         Remove libraries that are already present on the cluster.
         """
-        existing_sigs = {
-            _library_sig(status.library)
+        existing_keys = {
+            _library_dedup_key(status.library)
             for status in self.installed_library_statuses()
             if getattr(status, "library", None) is not None
         }
-        return [lib for lib in libraries if _library_sig(lib) not in existing_sigs]
+        return [lib for lib in libraries if _library_dedup_key(lib) not in existing_keys]
 
     @staticmethod
     def _check_library(
