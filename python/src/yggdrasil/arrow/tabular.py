@@ -324,6 +324,11 @@ class ArrowTabular(Tabular[CastOptions]):
         return self.num_rows
 
     def _count(self, options=None) -> int:
+        if options is not None and options.predicate is not None:
+            return sum(
+                options.predicate.filter_arrow_batch(b).num_rows
+                for b in self._batches
+            )
         return self.num_rows
 
     def __bool__(self) -> bool:
