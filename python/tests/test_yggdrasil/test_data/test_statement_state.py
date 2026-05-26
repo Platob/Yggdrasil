@@ -48,17 +48,16 @@ class _CountingResult(StatementResult[_StubStatement]):
     def refresh_status(self) -> None:
         return None
 
-    def start(self, reset: bool = False, **kwargs: Any) -> "_CountingResult":
+    def _start(self) -> None:
         self._state_value = State.SUCCEEDED
-        return self
 
-    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "_CountingResult":
+    def _cancel(self) -> None:
         self._state_value = State.CANCELED
-        return self
 
-    def _raise_for_status(self) -> None:
+    def _error_for_status(self):
         if self._state_value.is_failed:
-            raise RuntimeError("stub failed")
+            return RuntimeError("stub failed")
+        return None
 
     # Unused Tabular hooks.
     def _read_arrow_batches(self, options):  # pragma: no cover
