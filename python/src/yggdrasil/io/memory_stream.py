@@ -44,6 +44,7 @@ from __future__ import annotations
 import io
 import tempfile
 import time
+import zlib
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Optional, Union
 
 from yggdrasil.io.io_stats import IOKind, IOStats
@@ -54,6 +55,35 @@ __all__ = ["MemoryStream"]
 
 
 _DEFAULT_PULL_CHUNK = 1024 * 1024  # 1 MiB
+
+
+def _wrap_decoder(
+    read_fn: Callable[[int], Any],
+    encoding: str,
+) -> Callable[[int], bytes]:
+    enc = encoding.strip().lower()
+    if enc in ("gzip", "x-gzip"):
+        dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    elif enc == "deflate":
+        dec = zlib.decompressobj()
+    else:
+        return read_fn
+
+    state = {"dec": dec}
+
+    def _read(amt: Optional[int] = None) -> bytes:
+        chunk = read_fn(amt) if amt is not None else read_fn()
+        d = state["dec"]
+        if not chunk:
+            if d is not None:
+                state["dec"] = None
+                return d.flush()
+            return b""
+        if d is not None:
+            return d.decompress(chunk)
+        return chunk
+
+    return _read
 
 #: In-memory window cap. Bytes beyond this spill to a tempfile.
 _DEFAULT_SPILL_THRESHOLD = 128 * 1024 * 1024  # 128 MiB
@@ -130,6 +160,7 @@ class MemoryStream(Holder):
         self,
         source: SourceLike = None,
         *,
+        content_encoding: Optional[str] = None,
         byte_size: int = _DEFAULT_BYTE_SIZE,
         spill_threshold: int = _DEFAULT_SPILL_THRESHOLD,
         pull_chunk: Optional[int] = None,
@@ -174,6 +205,8 @@ class MemoryStream(Holder):
         self._source_iter: Optional[Iterator] = None
         self._read_chunk: Optional[Callable[[int], Any]] = None
         self._bind_source(source)
+        if content_encoding and self._read_chunk is not None:
+            self._read_chunk = _wrap_decoder(self._read_chunk, content_encoding)
 
         # Skip Holder.__init__'s ``data`` routing — ``source`` is the
         # content feed, not a bytes/path/url seed. Pass only the

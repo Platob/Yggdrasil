@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import http.client
-import zlib
 import warnings
 from dataclasses import MISSING
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional, Tuple
@@ -51,9 +50,7 @@ __all__ = [
     "Response",
     "ResponseOptions",
     "RESPONSE_SCHEMA",
-    "RESPONSE_SCHEMA.to_arrow_schema()",
     "HTTPResponse",
-    "_DecodingReader",
 ]
 
 
@@ -1641,7 +1638,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         intermediary — :class:`HTTPSession` builds the wire response
         directly through this factory. The body is wrapped in a
         :class:`MemoryStream` whose source is the
-        :class:`_DecodingReader` over the raw socket; the connection
+        the raw socket; the connection
         / pool-key pair lets :meth:`release_conn` return the socket
         to the session's idle cache after drain.
         """
@@ -1655,9 +1652,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
             response_headers[k] = f"{existing}, {v}" if existing is not None else v
 
         encoding = response_headers.get("Content-Encoding") if decode_content else None
-        source_fn = _DecodingReader(raw.read, encoding).read
-
-        buffer = MemoryStream(source=source_fn)
+        buffer = MemoryStream(source=raw.read, content_encoding=encoding)
 
         pre_media = _media_type_from_headers(response_headers)
         if pre_media is not None and buffer.media_type is None:
@@ -1781,38 +1776,6 @@ def _any_to_arrow_record_batch_with_response(obj, options=None):
 _any_registry[pa.Table] = _any_to_arrow_table_with_response
 _any_registry[pa.RecordBatch] = _any_to_arrow_record_batch_with_response
 
-
-
-
-class _DecodingReader:
-    """Wraps a chunked source iterator and decodes gzip/deflate on the fly.
-
-    The :class:`MemoryStream` backing every :class:`HTTPResponse` body
-    binds this reader's ``.read`` callable as its source. Each pull
-    feeds the next decoded chunk into the stream — no separate buffer,
-    no second copy.
-    """
-
-    def __init__(self, raw_read, content_encoding: Optional[str]) -> None:
-        self._raw_read = raw_read
-        self._encoding = (content_encoding or "").lower()
-        self._decoder: Any = None
-        if self._encoding in ("gzip", "x-gzip"):
-            self._decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        elif self._encoding == "deflate":
-            self._decoder = zlib.decompressobj()
-
-    def read(self, amt: Optional[int] = None) -> bytes:
-        chunk = self._raw_read(amt) if amt is not None else self._raw_read()
-        if not chunk:
-            if self._decoder is not None:
-                tail = self._decoder.flush()
-                self._decoder = None
-                return tail
-            return b""
-        if self._decoder is not None:
-            return self._decoder.decompress(chunk)
-        return chunk
 
 
 
