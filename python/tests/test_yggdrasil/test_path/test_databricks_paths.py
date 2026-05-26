@@ -1,231 +1,371 @@
 """Tests for Databricks path types: VolumePath, DBFSPath, WorkspacePath.
 
-Mock tests verify minimum SDK calls. Integration tests (marked
-@pytest.mark.integration) run against a live workspace when
-DATABRICKS_HOST is set.
+Mock tests verify construction, singleton caching, and minimum SDK
+calls.  Integration tests (marked ``@pytest.mark.integration``) run
+against a live workspace when ``DATABRICKS_HOST`` is set.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch, PropertyMock
-import io
+import base64
+import os
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
-try:
-    from databricks.sdk.service.files import (
-        DirectoryEntry,
-        DownloadResponse,
-    )
-    from databricks.sdk.service.workspace import (
-        ObjectInfo,
-        ObjectType,
-    )
-    HAS_SDK = True
-except ImportError:
-    HAS_SDK = False
+pytest.importorskip("databricks.sdk", reason="databricks-sdk not installed")
 
-pytestmark = pytest.mark.skipif(not HAS_SDK, reason="databricks-sdk not installed")
-
-
-def _mock_client(host="https://test.cloud.databricks.com"):
-    client = MagicMock()
-    client.base_url = MagicMock()
-    client.base_url.to_string.return_value = host
-    client.base_url.host = "test.cloud.databricks.com"
-    wc = MagicMock()
-    client.workspace_client.return_value = wc
-    return client, wc
+from yggdrasil.databricks.fs import DBFSPath, VolumePath, WorkspacePath  # noqa: E402
+from yggdrasil.databricks.fs.service import DBFSService  # noqa: E402
+from yggdrasil.databricks.volume.volumes import Volumes  # noqa: E402
+from yggdrasil.databricks.workspaces.service import Workspaces  # noqa: E402
+from yggdrasil.path.remote_path import RemotePath  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# VolumePath mock tests
+# Stub helpers
+# ---------------------------------------------------------------------------
+
+
+def _volumes_service(client: MagicMock | None = None) -> MagicMock:
+    svc = MagicMock(spec=Volumes)
+    svc.client = client or MagicMock()
+    return svc
+
+
+def _workspaces_service(client: MagicMock | None = None) -> MagicMock:
+    svc = MagicMock(spec=Workspaces)
+    svc.client = client or MagicMock()
+    return svc
+
+
+def _dbfs_service(client: MagicMock | None = None) -> MagicMock:
+    svc = MagicMock(spec=DBFSService)
+    svc.client = client or MagicMock()
+    return svc
+
+
+def _volume_round_trip_client(store: dict) -> MagicMock:
+    """Mock client that round-trips bytes through the Files API surface."""
+    client = MagicMock()
+    ws = client.workspace_client.return_value
+
+    def get_metadata(path):
+        buf = store.get("buf")
+        if buf is None:
+            raise FileNotFoundError(path)
+        return SimpleNamespace(
+            content_length=len(buf),
+            content_type=None,
+            last_modified=None,
+        )
+
+    def get_directory_metadata(path):
+        raise FileNotFoundError(path)
+
+    def download(path):
+        buf = store.get("buf")
+        if buf is None:
+            raise FileNotFoundError(path)
+        return SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: buf),
+            content_type=None,
+            last_modified=None,
+        )
+
+    def upload(*, file_path, contents, overwrite):
+        store["buf"] = (
+            bytes(contents)
+            if isinstance(contents, (bytes, bytearray, memoryview))
+            else contents.read()
+        )
+
+    ws.files.get_metadata.side_effect = get_metadata
+    ws.files.get_directory_metadata.side_effect = get_directory_metadata
+    ws.files.download.side_effect = download
+    ws.files.upload.side_effect = upload
+    return client
+
+
+@pytest.fixture(autouse=True)
+def _clear_singletons():
+    RemotePath._INSTANCES.clear()
+    yield
+    RemotePath._INSTANCES.clear()
+
+
+# ---------------------------------------------------------------------------
+# VolumePath — construction
 # ---------------------------------------------------------------------------
 
 
 class TestVolumePathConstruction:
 
-    def test_from_volumes_url(self):
-        from yggdrasil.databricks.fs.volume_path import VolumePath
-        client, _ = _mock_client()
-        VolumePath._INSTANCES.clear()
-        p = VolumePath(
-            catalog_name="cat",
-            schema_name="sch",
-            volume_name="vol",
-            path="data/file.parquet",
-            client=client,
-        )
+    def test_from_posix_path(self):
+        svc = _volumes_service()
+        p = VolumePath("/Volumes/cat/sch/vol/data/file.parquet", service=svc)
+        assert isinstance(p, VolumePath)
+        assert p.catalog_name == "cat"
+        assert p.schema_name == "sch"
+        assert p.volume_name == "vol"
         assert "cat" in p.full_path()
         assert "vol" in p.full_path()
 
-    def test_api_path(self):
-        from yggdrasil.databricks.fs.volume_path import VolumePath
-        client, _ = _mock_client()
-        VolumePath._INSTANCES.clear()
-        p = VolumePath(
-            catalog_name="cat",
-            schema_name="sch",
-            volume_name="vol",
-            path="sub/file.csv",
-            client=client,
-        )
+    def test_from_dbfs_url(self):
+        svc = _volumes_service()
+        p = VolumePath("dbfs:///Volumes/cat/sch/vol/file.txt", service=svc)
+        assert p.catalog_name == "cat"
+        assert p.volume_name == "vol"
+
+    def test_api_path_starts_with_volumes(self):
+        svc = _volumes_service()
+        p = VolumePath("/Volumes/cat/sch/vol/sub/file.csv", service=svc)
         assert p.api_path.startswith("/Volumes/")
         assert "cat" in p.api_path
+
+    def test_full_path(self):
+        svc = _volumes_service()
+        p = VolumePath("/Volumes/cat/sch/vol/deep/nested/file.csv", service=svc)
+        fp = p.full_path()
+        assert fp.startswith("/Volumes/")
+        assert "cat/sch/vol/deep/nested/file.csv" in fp
+
+
+# ---------------------------------------------------------------------------
+# VolumePath — mock read / write / mkdir / remove
+# ---------------------------------------------------------------------------
 
 
 class TestVolumePathMockReadWrite:
 
     def test_read_calls_files_download_once(self):
-        from yggdrasil.databricks.fs.volume_path import VolumePath
-        client, wc = _mock_client()
-        VolumePath._INSTANCES.clear()
-
         content = b"hello volume"
-        resp = MagicMock()
-        resp.contents = io.BytesIO(content)
-        resp.read.return_value = content
-        wc.files.download.return_value = resp
-
-        p = VolumePath(
-            catalog_name="cat", schema_name="sch", volume_name="vol",
-            path="test.bin", client=client,
+        client = MagicMock()
+        ws = client.workspace_client.return_value
+        ws.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: content),
+            content_type=None,
+            last_modified=None,
         )
+        svc = _volumes_service(client)
+        p = VolumePath("/Volumes/cat/sch/vol/test.bin", service=svc)
         data = bytes(p._read_mv(len(content), 0))
-        wc.files.download.assert_called_once()
+        ws.files.download.assert_called_once()
         assert data == content
 
-    def test_write_calls_files_upload_once(self):
-        from yggdrasil.databricks.fs.volume_path import VolumePath
-        client, wc = _mock_client()
-        VolumePath._INSTANCES.clear()
-
-        p = VolumePath(
-            catalog_name="cat", schema_name="sch", volume_name="vol",
-            path="out.bin", client=client,
-        )
-        p._write_mv(memoryview(b"written"), 0)
-        wc.files.upload.assert_called_once()
+    def test_write_calls_files_upload(self):
+        store = {}
+        client = _volume_round_trip_client(store)
+        svc = _volumes_service(client)
+        p = VolumePath("/Volumes/cat/sch/vol/out.bin", service=svc)
+        p.write_bytes(b"written", overwrite=True)
+        ws = client.workspace_client.return_value
+        ws.files.upload.assert_called()
+        assert store["buf"] == b"written"
 
     def test_mkdir_calls_create_directory(self):
-        from yggdrasil.databricks.fs.volume_path import VolumePath
-        client, wc = _mock_client()
-        VolumePath._INSTANCES.clear()
-
-        p = VolumePath(
-            catalog_name="cat", schema_name="sch", volume_name="vol",
-            path="newdir/", client=client,
-        )
+        client = MagicMock()
+        svc = _volumes_service(client)
+        p = VolumePath("/Volumes/cat/sch/vol/newdir/", service=svc)
         p._mkdir(parents=True, exist_ok=True)
-        wc.files.create_directory.assert_called()
+        ws = client.workspace_client.return_value
+        ws.files.create_directory.assert_called()
 
     def test_remove_calls_files_delete(self):
-        from yggdrasil.databricks.fs.volume_path import VolumePath
-        client, wc = _mock_client()
-        VolumePath._INSTANCES.clear()
-
-        p = VolumePath(
-            catalog_name="cat", schema_name="sch", volume_name="vol",
-            path="del.bin", client=client,
-        )
+        client = MagicMock()
+        svc = _volumes_service(client)
+        p = VolumePath("/Volumes/cat/sch/vol/del.bin", service=svc)
         p._remove_file(missing_ok=True, wait=None)
-        wc.files.delete.assert_called()
+        ws = client.workspace_client.return_value
+        ws.files.delete.assert_called()
+
+
+class TestVolumePathRoundTrip:
+
+    def test_write_read_bytes_roundtrip(self):
+        store = {}
+        client = _volume_round_trip_client(store)
+        svc = _volumes_service(client)
+        payload = b"roundtrip data!"
+        p = VolumePath("/Volumes/cat/sch/vol/rt.bin", service=svc)
+        p.write_bytes(payload, overwrite=True)
+
+        p.invalidate_singleton()
+        p2 = VolumePath("/Volumes/cat/sch/vol/rt.bin", service=svc)
+        got = bytes(p2.read_bytes())
+        assert got == payload
+
+    def test_size_after_write(self):
+        store = {}
+        client = _volume_round_trip_client(store)
+        svc = _volumes_service(client)
+        p = VolumePath("/Volumes/cat/sch/vol/sized.bin", service=svc)
+        p.write_bytes(b"x" * 42, overwrite=True)
+        assert p.size == 42
 
 
 # ---------------------------------------------------------------------------
-# DBFSPath mock tests
+# DBFSPath — construction
 # ---------------------------------------------------------------------------
 
 
 class TestDBFSPathConstruction:
 
     def test_from_dbfs_url(self):
-        from yggdrasil.databricks.fs.dbfs_path import DBFSPath
-        client, _ = _mock_client()
-        DBFSPath._INSTANCES.clear()
-        p = DBFSPath(data="dbfs:/test/file.parquet", client=client)
-        assert "test" in p.full_path()
+        svc = _dbfs_service()
+        p = DBFSPath("dbfs+dbfs:///tmp/data.parquet", service=svc)
+        assert isinstance(p, DBFSPath)
+        assert p.full_path() == "/dbfs/tmp/data.parquet"
+
+    def test_from_posix_path(self):
+        svc = _dbfs_service()
+        p = DBFSPath("/dbfs/mnt/delta/table", service=svc)
+        assert p.api_path == "/mnt/delta/table"
+        assert p.full_path() == "/dbfs/mnt/delta/table"
 
     def test_api_path_strips_dbfs_prefix(self):
-        from yggdrasil.databricks.fs.dbfs_path import DBFSPath
-        client, _ = _mock_client()
-        DBFSPath._INSTANCES.clear()
-        p = DBFSPath(data="dbfs:/mnt/data/table", client=client)
+        svc = _dbfs_service()
+        p = DBFSPath("dbfs:/mnt/data/table", service=svc)
         assert p.api_path.startswith("/")
+
+
+# ---------------------------------------------------------------------------
+# DBFSPath — mock read / mkdir
+# ---------------------------------------------------------------------------
 
 
 class TestDBFSPathMockReadWrite:
 
-    def test_read_calls_dbfs_read_once(self):
-        from yggdrasil.databricks.fs.dbfs_path import DBFSPath
-        client, wc = _mock_client()
-        DBFSPath._INSTANCES.clear()
-
-        resp = MagicMock()
-        resp.data = b"dbfs content"
-        resp.bytes_read = len(resp.data)
-        wc.dbfs.read.return_value = resp
-
-        p = DBFSPath(data="dbfs:/test/read.bin", client=client)
+    def test_read_calls_dbfs_read(self):
+        raw = b"dbfs content"
+        encoded = base64.b64encode(raw).decode()
+        client = MagicMock()
+        ws = client.workspace_client.return_value
+        ws.dbfs.read.return_value = SimpleNamespace(
+            data=encoded,
+            bytes_read=len(raw),
+        )
+        svc = _dbfs_service(client)
+        p = DBFSPath("/dbfs/test/read.bin", service=svc)
         data = bytes(p._read_mv(100, 0))
-        wc.dbfs.read.assert_called()
+        ws.dbfs.read.assert_called()
+        assert data == raw
 
     def test_mkdir_calls_dbfs_mkdirs(self):
-        from yggdrasil.databricks.fs.dbfs_path import DBFSPath
-        client, wc = _mock_client()
-        DBFSPath._INSTANCES.clear()
-
-        p = DBFSPath(data="dbfs:/test/newdir/", client=client)
+        client = MagicMock()
+        svc = _dbfs_service(client)
+        p = DBFSPath("/dbfs/test/newdir/", service=svc)
         p._mkdir(parents=True, exist_ok=True)
-        wc.dbfs.mkdirs.assert_called()
+        ws = client.workspace_client.return_value
+        ws.dbfs.mkdirs.assert_called()
+
+    def test_remove_calls_dbfs_delete(self):
+        client = MagicMock()
+        svc = _dbfs_service(client)
+        p = DBFSPath("/dbfs/test/del.bin", service=svc)
+        p._remove_file(missing_ok=True, wait=None)
+        ws = client.workspace_client.return_value
+        ws.dbfs.delete.assert_called()
 
 
 # ---------------------------------------------------------------------------
-# WorkspacePath mock tests
+# WorkspacePath — construction
 # ---------------------------------------------------------------------------
 
 
 class TestWorkspacePathConstruction:
 
     def test_from_workspace_url(self):
-        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
-        client, _ = _mock_client()
-        WorkspacePath._INSTANCES.clear()
-        p = WorkspacePath(data="/Workspace/test/notebook", client=client)
-        assert "test" in p.full_path()
+        svc = _workspaces_service()
+        p = WorkspacePath("dbfs+workspace:///Users/me/notebook", service=svc)
+        assert isinstance(p, WorkspacePath)
+        assert "/Workspace/" in p.full_path()
+
+    def test_from_posix_path(self):
+        svc = _workspaces_service()
+        p = WorkspacePath("/Workspace/Users/someone/dir/file.py", service=svc)
+        fp = p.full_path()
+        assert fp.startswith("/Workspace/")
+        assert "Users/someone/dir/file.py" in fp
+
+
+# ---------------------------------------------------------------------------
+# WorkspacePath — mock read / write / mkdir
+# ---------------------------------------------------------------------------
 
 
 class TestWorkspacePathMockReadWrite:
 
     def test_read_calls_workspace_download(self):
-        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
-        client, wc = _mock_client()
-        WorkspacePath._INSTANCES.clear()
-
-        resp = MagicMock()
-        resp.read.return_value = b"workspace content"
-        wc.workspace.download.return_value = resp
-
-        p = WorkspacePath(data="/Workspace/test/file.py", client=client)
+        content = b"workspace content"
+        client = MagicMock()
+        ws = client.workspace_client.return_value
+        ws.workspace.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: content),
+            content_type=None,
+            last_modified=None,
+        )
+        svc = _workspaces_service(client)
+        p = WorkspacePath("/Workspace/test/file.py", service=svc)
         data = bytes(p._read_mv(100, 0))
-        wc.workspace.download.assert_called()
+        ws.workspace.download.assert_called()
+        assert data == content
 
     def test_write_calls_workspace_upload(self):
-        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
-        client, wc = _mock_client()
-        WorkspacePath._INSTANCES.clear()
-
-        p = WorkspacePath(data="/Workspace/test/out.py", client=client)
+        client = MagicMock()
+        svc = _workspaces_service(client)
+        p = WorkspacePath("/Workspace/test/out.py", service=svc)
         p._write_mv(memoryview(b"print('hello')"), 0)
-        wc.workspace.upload.assert_called()
+        ws = client.workspace_client.return_value
+        ws.workspace.upload.assert_called()
 
     def test_mkdir_calls_workspace_mkdirs(self):
-        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
-        client, wc = _mock_client()
-        WorkspacePath._INSTANCES.clear()
-
-        p = WorkspacePath(data="/Workspace/test/newdir", client=client)
+        client = MagicMock()
+        svc = _workspaces_service(client)
+        p = WorkspacePath("/Workspace/test/newdir", service=svc)
         p._mkdir(parents=True, exist_ok=True)
-        wc.workspace.mkdirs.assert_called()
+        ws = client.workspace_client.return_value
+        ws.workspace.mkdirs.assert_called()
+
+    def test_remove_calls_workspace_delete(self):
+        client = MagicMock()
+        svc = _workspaces_service(client)
+        p = WorkspacePath("/Workspace/test/del.py", service=svc)
+        p._remove_file(missing_ok=True, wait=None)
+        ws = client.workspace_client.return_value
+        ws.workspace.delete.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Singleton caching
+# ---------------------------------------------------------------------------
+
+
+class TestDatabricksPathSingleton:
+
+    def test_same_url_same_instance(self):
+        svc = _volumes_service()
+        a = VolumePath("/Volumes/cat/sch/vol/file.txt", service=svc)
+        b = VolumePath("/Volumes/cat/sch/vol/file.txt", service=svc)
+        assert a is b
+
+    def test_different_url_different_instance(self):
+        svc = _volumes_service()
+        a = VolumePath("/Volumes/cat/sch/vol/file_a.txt", service=svc)
+        b = VolumePath("/Volumes/cat/sch/vol/file_b.txt", service=svc)
+        assert a is not b
+
+    def test_dbfs_singleton(self):
+        svc = _dbfs_service()
+        a = DBFSPath("/dbfs/test/same.bin", service=svc)
+        b = DBFSPath("/dbfs/test/same.bin", service=svc)
+        assert a is b
+
+    def test_workspace_singleton(self):
+        svc = _workspaces_service()
+        a = WorkspacePath("/Workspace/test/same.py", service=svc)
+        b = WorkspacePath("/Workspace/test/same.py", service=svc)
+        assert a is b
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +373,6 @@ class TestWorkspacePathMockReadWrite:
 # ---------------------------------------------------------------------------
 
 
-import os
 _HAS_WORKSPACE = bool(os.getenv("DATABRICKS_HOST"))
 
 
@@ -249,11 +388,10 @@ class TestVolumePathIntegration:
         self.volume = os.getenv("DATABRICKS_VOLUME", "ygg_test")
 
     def _volume_path(self, path):
-        from yggdrasil.databricks.fs.volume_path import VolumePath
-        VolumePath._INSTANCES.clear()
+        RemotePath._INSTANCES.clear()
         return VolumePath(
-            catalog_name=self.catalog, schema_name=self.schema,
-            volume_name=self.volume, path=path, client=self.client,
+            f"/Volumes/{self.catalog}/{self.schema}/{self.volume}/{path}",
+            client=self.client,
         )
 
     def test_write_read_bytes_roundtrip(self):
