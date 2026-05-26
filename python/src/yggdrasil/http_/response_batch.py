@@ -154,52 +154,39 @@ class HTTPResponseBatch(Tabular):
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> "HTTPResponseBatch":
-        """Resolve cache hits, fetch misses, and write back.
-
-        Triggers the lazy split (local → remote → misses), fetches
-        remaining misses via the session's thread pool or Spark,
-        writes ok responses back to caches, and returns self.
-        """
+        """Resolve cache hits, fetch misses, write back."""
         cfg = self._send_config
-        session = self._session
         from yggdrasil.io.send_config import MATCH_KEY
 
-        # Trigger split + resolve cache reads (may reject stale rows)
         misses = list(self.misses)
         local_tab = self.local
         remote_tab = self.remote
 
-        # Stale-rejected hits go back to misses
         served = set()
-        if local_tab is not None:
-            for resp in Response.from_arrow_tabular(local_tab.read_arrow_batches()):
+        for tab in (local_tab, remote_tab):
+            if tab is None:
+                continue
+            for resp in Response.from_arrow_tabular(tab.read_arrow_batches()):
                 req = resp.request
                 if req is not None:
                     served.add(req.match_value(MATCH_KEY))
-        if remote_tab is not None:
-            for resp in Response.from_arrow_tabular(remote_tab.read_arrow_batches()):
-                req = resp.request
-                if req is not None:
-                    served.add(req.match_value(MATCH_KEY))
-        expected_hits = self._local_hashes | self._remote_hashes
-        rejected = expected_hits - served
+
+        rejected = (self._local_hashes | self._remote_hashes) - served
         if rejected:
             misses = misses + [
                 r for r in self._requests
-                if r.match_value(MATCH_KEY) in rejected
-                and r not in misses
+                if r.match_value(MATCH_KEY) in rejected and r not in misses
             ]
             self._misses = misses
 
         if self._remote_hashes and cfg.local_cache is not None:
             from yggdrasil.data.enums import Mode
-            remote_tab = self.remote
             if remote_tab is not None:
                 try:
                     remote_table = remote_tab.read_arrow_table()
                     if remote_table.num_rows > 0:
                         cfg.local_cache.write_responses_tabular(
-                            remote_table, mode=Mode.OVERWRITE, session=session,
+                            remote_table, mode=Mode.OVERWRITE, session=self._session,
                         )
                 except Exception:
                     LOGGER.debug("Remote→local backfill failed", exc_info=True)
@@ -210,62 +197,76 @@ class HTTPResponseBatch(Tabular):
             return self
 
         spark = cfg.get_spark_session()
-        LOGGER.debug(
-            "Fetching %d miss(es) via %s",
-            len(misses), "spark" if spark else "thread pool",
-        )
-
-        write_data = None
         if spark is not None:
-            result_df = self._spark_fetch(misses, spark)
-            if cfg.raise_error:
-                from pyspark.sql import functions as F
-                from yggdrasil.spark.cast import spark_dataframe_to_arrow
-
-                ok_df = result_df.where(
-                    (F.col("status_code") >= 200) & (F.col("status_code") < 400)
-                )
-                err_df = result_df.where(
-                    (F.col("status_code") < 200) | (F.col("status_code") >= 400)
-                )
-                err_table = spark_dataframe_to_arrow(err_df)
-                if len(err_table) > 0:
-                    self.failed = list(Response.from_arrow_tabular(err_table))
-                write_data = ok_df
-            else:
-                write_data = result_df
-            self.new = result_df
+            self._fetch_spark(misses, spark)
         else:
-            ok_list: list[Response] = []
-            all_list: list[Response] = []
-            for response in session._fetch_misses(
-                misses, ordered=ordered, max_in_flight=max_in_flight,
-            ):
-                all_list.append(response)
-                if response.ok:
-                    ok_list.append(response)
-                elif cfg.raise_error:
-                    self.failed.append(response)
-            LOGGER.info(
-                "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-                len(ok_list) + len(self.failed), len(misses),
-                len(ok_list), len(self.failed),
-            )
-            if all_list:
-                self.new = pa.Table.from_batches(
-                    [Response.values_to_arrow_batch(all_list)]
-                )
-            if ok_list:
-                write_data = pa.Table.from_batches(
-                    [Response.values_to_arrow_batch(ok_list)]
-                )
-
-        if write_data is not None:
-            cfg.write_responses_tabular(write_data, session=session)
+            self._fetch_local(misses, ordered=ordered, max_in_flight=max_in_flight)
 
         return self
 
-    def _spark_fetch(
+    def _fetch_local(
+        self,
+        misses: "list[PreparedRequest]",
+        *,
+        ordered: bool = False,
+        max_in_flight: int | None = None,
+    ) -> None:
+        """Fetch misses via the session's thread pool."""
+        cfg = self._send_config
+        ok_list: list[Response] = []
+        all_list: list[Response] = []
+        for response in self._session._fetch_misses(
+            misses, ordered=ordered, max_in_flight=max_in_flight,
+        ):
+            all_list.append(response)
+            if response.ok:
+                ok_list.append(response)
+            elif cfg.raise_error:
+                self.failed.append(response)
+        LOGGER.info(
+            "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
+            len(ok_list) + len(self.failed), len(misses),
+            len(ok_list), len(self.failed),
+        )
+        if all_list:
+            self.new = pa.Table.from_batches(
+                [Response.values_to_arrow_batch(all_list)]
+            )
+        if ok_list:
+            write_data = pa.Table.from_batches(
+                [Response.values_to_arrow_batch(ok_list)]
+            )
+            cfg.write_responses_tabular(write_data, session=self._session)
+
+    def _fetch_spark(
+        self,
+        misses: "list[PreparedRequest]",
+        spark: "SparkSession",
+    ) -> None:
+        """Fetch misses via Spark mapInArrow."""
+        cfg = self._send_config
+        result_df = self._spark_scatter(misses, spark)
+        write_data = result_df
+
+        if cfg.raise_error:
+            from pyspark.sql import functions as F
+            from yggdrasil.spark.cast import spark_dataframe_to_arrow
+
+            ok_df = result_df.where(
+                (F.col("status_code") >= 200) & (F.col("status_code") < 400)
+            )
+            err_df = result_df.where(
+                (F.col("status_code") < 200) | (F.col("status_code") >= 400)
+            )
+            err_table = spark_dataframe_to_arrow(err_df)
+            if len(err_table) > 0:
+                self.failed = list(Response.from_arrow_tabular(err_table))
+            write_data = ok_df
+
+        self.new = result_df
+        cfg.write_responses_tabular(write_data, session=self._session)
+
+    def _spark_scatter(
         self,
         misses: "list[PreparedRequest]",
         spark: "SparkSession",
