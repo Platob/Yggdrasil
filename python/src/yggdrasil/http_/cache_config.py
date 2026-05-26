@@ -5,6 +5,7 @@ import logging
 import pathlib
 from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
 
+from yggdrasil.data.cast import any_to_timedelta
 from yggdrasil.execution.expr import Predicate
 from yggdrasil.data.cast.datetime import truncate_datetime
 from yggdrasil.enums import Mode
@@ -99,11 +100,19 @@ class CacheConfig:
         received_from: Optional[dt.datetime] = None,
         received_to: Optional[dt.datetime] = None,
         cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1),
+        received_ttl: Optional[dt.timedelta] = None,
     ):
         self.mode = Mode.from_(mode, default=Mode.APPEND)
         self.anonymize = anonymize
         self.cleanup_ttl = cleanup_ttl
         self._derived = None
+
+        if received_ttl is not None:
+            if received_to is None:
+                received_to = dt.datetime.now(dt.timezone.utc)
+
+            if received_from is None:
+                received_from = received_to - any_to_timedelta(received_ttl)
 
         self.received_from = _truncate_from(received_from)
         self.received_to = _truncate_to(received_to)
