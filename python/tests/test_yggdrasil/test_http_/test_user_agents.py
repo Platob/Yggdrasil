@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from yggdrasil.io.user_agents import UserAgentGenerator, random_user_agent
+from yggdrasil.http_.user_agents import UserAgentGenerator, random_user_agent
 
 
 class TestUserAgentGenerator:
