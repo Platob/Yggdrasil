@@ -671,7 +671,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
 
         _ensure_media_headers(headers, buffer)
 
-        if cls is Response:
+        if False:  # removed: no separate Response class
             if request.url.is_http:
                 from yggdrasil.http_ import HTTPResponse
 
@@ -1359,15 +1359,11 @@ class HTTPResponse(IO):  # IO inherits Tabular
         if normalize:
             headers = Headers.from_(headers).normalized(body=buffer, is_request=False)
 
-        out_class = cls
-        if cls is Response and request.url.is_http:
-            from yggdrasil.http_ import HTTPResponse
-            out_class = HTTPResponse
 
         receiver_value = get("receiver")
         receiver = _coerce_userinfo(receiver_value) if receiver_value is not None else None
 
-        return out_class(
+        return cls(
             request=request,
             status_code=get("status_code") or 0,
             headers=headers,

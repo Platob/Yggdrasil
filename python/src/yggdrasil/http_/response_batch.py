@@ -15,8 +15,9 @@ import pyarrow as pa
 from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.data import Mode
 from yggdrasil.environ import PyEnv
-from yggdrasil.io.request import PreparedRequest, REQUEST_SCHEMA
-from yggdrasil.io.response import RESPONSE_SCHEMA, Response
+from yggdrasil.http_.request import HTTPRequest
+from yggdrasil.http_.response import HTTPResponse
+from yggdrasil.http_.schemas import RESPONSE_SCHEMA
 from yggdrasil.http_.cache_config import CacheConfig, MATCH_KEY
 from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.io.tabular import ArrowTabular
@@ -38,8 +39,8 @@ __all__ = [
 ]
 
 
-def _synthetic_not_found(request: "PreparedRequest") -> Response:
-    return Response(
+def _synthetic_not_found(request: "HTTPRequest") -> HTTPResponse:
+    return HTTPResponse(
         request=request,
         status_code=404,
         headers={"Content-Type": "application/json"},
@@ -49,9 +50,9 @@ def _synthetic_not_found(request: "PreparedRequest") -> Response:
     )
 
 
-def responses_to_tabular(responses: list[Response]) -> ArrowTabular:
+def responses_to_tabular(responses: list[HTTPResponse]) -> ArrowTabular:
     return ArrowTabular(
-        [Response.values_to_arrow_batch(responses)],
+        [HTTPResponse.values_to_arrow_batch(responses)],
         schema=RESPONSE_SCHEMA.to_arrow_schema(),
     )
 
@@ -90,12 +91,12 @@ class HTTPResponseBatch(Tabular):
     def __init__(
         self,
         send_config: "SendConfig",
-        requests: "list[PreparedRequest]",
-        new_responses: "list[Response] | None" = None,
+        requests: "list[HTTPRequest]",
+        new_responses: "list[HTTPResponse] | None" = None,
         new_responses_tabular: "Tabular | pa.Table | SparkDataFrame | None" = None,
         *,
-        misses: "list[PreparedRequest] | None" = None,
-        failed: "list[Response] | None" = None,
+        misses: "list[HTTPRequest] | None" = None,
+        failed: "list[HTTPResponse] | None" = None,
         session: "Any" = None,
     ) -> None:
         super().__init__()
@@ -144,8 +145,8 @@ class HTTPResponseBatch(Tabular):
         if tab is None:
             return None
         request_map = {r.match_value(MATCH_KEY): r for r in hit_reqs}
-        kept: list[Response] = []
-        for resp in Response.from_arrow_tabular(tab.read_arrow_batches()):
+        kept: list[HTTPResponse] = []
+        for resp in HTTPResponse.from_arrow_tabular(tab.read_arrow_batches()):
             req = request_map.get(
                 resp.match_value(MATCH_KEY) if hasattr(resp, "match_value") else None
             )
@@ -170,7 +171,7 @@ class HTTPResponseBatch(Tabular):
         for tab in (local_tab, remote_tab):
             if tab is None:
                 continue
-            for resp in Response.from_arrow_tabular(tab.read_arrow_batches()):
+            for resp in HTTPResponse.from_arrow_tabular(tab.read_arrow_batches()):
                 req = resp.request
                 if req is not None:
                     served.add(req.match_value(MATCH_KEY))
@@ -209,16 +210,16 @@ class HTTPResponseBatch(Tabular):
 
     def _fetch_local(
         self,
-        misses: "list[PreparedRequest]",
+        misses: "list[HTTPRequest]",
         *,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> None:
         """Fetch misses via the session's thread pool."""
         cfg = self._send_config
-        ok_list: list[Response] = []
-        all_list: list[Response] = []
-        err_list: list[Response] = []
+        ok_list: list[HTTPResponse] = []
+        all_list: list[HTTPResponse] = []
+        err_list: list[HTTPResponse] = []
         for response in self._session._fetch_misses(
             misses, ordered=ordered, max_in_flight=max_in_flight,
         ):
@@ -238,17 +239,17 @@ class HTTPResponseBatch(Tabular):
 
         if all_list:
             self.new_tabular = pa.Table.from_batches(
-                [Response.values_to_arrow_batch(all_list)]
+                [HTTPResponse.values_to_arrow_batch(all_list)]
             )
         if ok_list:
             write_data = pa.Table.from_batches(
-                [Response.values_to_arrow_batch(ok_list)]
+                [HTTPResponse.values_to_arrow_batch(ok_list)]
             )
             cfg.write_responses_tabular(write_data, session=self._session)
 
     def _fetch_spark(
         self,
-        misses: "list[PreparedRequest]",
+        misses: "list[HTTPRequest]",
         spark: "SparkSession",
     ) -> None:
         """Fetch misses via Spark mapInArrow."""
@@ -274,7 +275,7 @@ class HTTPResponseBatch(Tabular):
 
     def _spark_scatter(
         self,
-        misses: "list[PreparedRequest]",
+        misses: "list[HTTPRequest]",
         spark: "SparkSession",
     ) -> "Dataset":
         """Scatter misses to Spark workers via mapInArrow."""
@@ -289,7 +290,7 @@ class HTTPResponseBatch(Tabular):
             session.prepare_request_before_send(req)
 
         request_table = pa.Table.from_batches(
-            [PreparedRequest.values_to_arrow_batch(misses)]
+            [HTTPRequest.values_to_arrow_batch(misses)]
         )
 
         try:
@@ -342,7 +343,7 @@ class HTTPResponseBatch(Tabular):
                 sess = pickle.loads(session_bytes)
                 part_config = worker_config
             for batch in batches:
-                reqs = list(PreparedRequest.from_arrow(batch))
+                reqs = list(HTTPRequest.from_arrow(batch))
                 if not reqs:
                     continue
 
@@ -490,14 +491,14 @@ class HTTPResponseBatch(Tabular):
     # Iteration
     # ------------------------------------------------------------------
 
-    def __iter__(self) -> Iterator[Response]:
+    def __iter__(self) -> Iterator[HTTPResponse]:
         return self.responses()
 
-    def responses(self) -> Iterator[Response]:
+    def responses(self) -> Iterator[HTTPResponse]:
         for holder in self._holders():
             if holder is None:
                 continue
-            yield from Response.from_records(holder.read_records())
+            yield from HTTPResponse.from_records(holder.read_records())
 
     # ------------------------------------------------------------------
     # Merge

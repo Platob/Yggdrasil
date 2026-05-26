@@ -1822,7 +1822,7 @@ class HTTPSession(Session):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | HTTPRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "GET",
             url,
@@ -1863,7 +1863,7 @@ class HTTPSession(Session):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | HTTPRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "POST",
             url,
@@ -1905,7 +1905,7 @@ class HTTPSession(Session):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | HTTPRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "PUT",
             url,
@@ -1947,7 +1947,7 @@ class HTTPSession(Session):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | HTTPRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "PATCH",
             url,
@@ -1989,7 +1989,7 @@ class HTTPSession(Session):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | HTTPRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "DELETE",
             url,
@@ -2030,7 +2030,7 @@ class HTTPSession(Session):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | HTTPRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "HEAD",
             url,
@@ -2071,7 +2071,7 @@ class HTTPSession(Session):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | HTTPRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "OPTIONS",
             url,
@@ -2114,7 +2114,7 @@ class HTTPSession(Session):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | HTTPRequest:
+    ) -> HTTPResponse | HTTPRequest:
         # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
         # form-urlencoding for mappings/sequences), ``timeout=`` becomes
         # ``wait=``, and ``cookies=`` joins ``headers={'Cookie': ...}``.
