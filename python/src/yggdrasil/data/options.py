@@ -1177,13 +1177,16 @@ class CastOptions:
     def cast(self, obj: Any) -> Any:
         """Cast *obj* to :attr:`target` using its native engine.
 
-        Dispatches arrow types through :meth:`cast_arrow` (which
-        applies predicate + target cast). Everything else delegates
-        to :meth:`Field.cast`.
+        Dispatches arrow types through :meth:`cast_arrow`, Tabular
+        through :meth:`cast_tabular`. Everything else delegates to
+        :meth:`Field.cast`.
         """
         from yggdrasil.arrow.tabular import ArrowTabular
-        if isinstance(obj, (pa.Table, pa.RecordBatch, ArrowTabular)):
+        from yggdrasil.io.tabular.base import Tabular
+        if isinstance(obj, (pa.Table, pa.RecordBatch, pa.Array, pa.ChunkedArray, ArrowTabular)):
             return self.cast_arrow(obj)
+        if isinstance(obj, Tabular):
+            return self.cast_tabular(obj)
         if self.target is None:
             return obj
         return self.target.cast(obj, options=self)
@@ -1224,7 +1227,7 @@ class CastOptions:
         return ArrowTabular(batches)
 
     def cast_arrow(self, data: Any) -> Any:
-        """Dispatch to cast_arrow_batch, cast_arrow_table, or cast_arrow_tabular."""
+        """Dispatch arrow types to the specific cast method."""
         from yggdrasil.arrow.tabular import ArrowTabular
         if isinstance(data, ArrowTabular):
             return self.cast_arrow_tabular(data)
@@ -1232,7 +1235,32 @@ class CastOptions:
             return self.cast_arrow_table(data)
         if isinstance(data, pa.RecordBatch):
             return self.cast_arrow_batch(data)
+        if isinstance(data, (pa.Array, pa.ChunkedArray)):
+            return self.cast_arrow_array(data)
         raise TypeError(f"cast_arrow: unsupported type {type(data).__name__}")
+
+    def cast_tabular(self, data: Any) -> Any:
+        """Cast any Tabular-like object.
+
+        Dispatches ArrowTabular and Spark Dataset to their specific
+        cast methods. For generic Tabular, reads to arrow and returns
+        a cast ArrowTabular.
+        """
+        from yggdrasil.arrow.tabular import ArrowTabular
+        from yggdrasil.io.tabular.base import Tabular
+
+        if isinstance(data, ArrowTabular):
+            return self.cast_arrow_tabular(data)
+        if hasattr(data, "toArrow") or hasattr(data, "toPandas"):
+            return self.cast_spark_tabular(data)
+        if isinstance(data, Tabular):
+            batches = list(data.read_arrow_batches())
+            if not batches:
+                return ArrowTabular([])
+            return self.cast_arrow_tabular(
+                ArrowTabular(batches, schema=batches[0].schema)
+            )
+        raise TypeError(f"cast_tabular: unsupported type {type(data).__name__}")
 
     def dedup_columns_on_read(self) -> "list[str]":
         """Return the column names that need client-side dedup at read time.
