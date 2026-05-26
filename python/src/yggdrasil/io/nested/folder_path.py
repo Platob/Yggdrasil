@@ -1221,22 +1221,20 @@ class FolderPath(IO[bytes, FolderOptions]):
                 # output here.
                 yield from stream
                 continue
+            needs_row_filter = predicate is not None and (
+                free_cols is None or not set(free_cols).issubset(self.static_values.keys())
+            )
             for batch in stream:
                 if batch.num_rows == 0:
                     continue
                 if accumulated is not None:
                     accumulated.append(batch)
-                if predicate is None:
+                if not needs_row_filter:
                     yield batch
                     continue
                 kept = predicate.filter_arrow_batch(batch)
                 if kept.num_rows > 0:
                     yield kept
-                elif batch.num_rows > 0:
-                    LOGGER.debug(
-                        "Predicate filtered %d row(s) to 0 in %r",
-                        batch.num_rows, self,
-                    )
 
         if accumulated is not None and cache_key is not None:
             if accumulated:
