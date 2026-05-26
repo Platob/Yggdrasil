@@ -527,6 +527,18 @@ class Tabular(URLBased, Disposable, Generic[O]):
         super().__init__()
         self.tabular_parent: "Tabular | None" = tabular_parent
         self._schema_cache: "Schema | Any" = ...
+        self._url: "URL | None" = None
+
+    def to_url(self) -> "URL":
+        if self._url is not None:
+            return self._url
+        from yggdrasil.url import URL
+        self._url = URL.from_memory_address(self)
+        return self._url
+
+    @property
+    def url(self) -> "URL":
+        return self.to_url()
 
     # ==================================================================
     # Parent / child linkage
