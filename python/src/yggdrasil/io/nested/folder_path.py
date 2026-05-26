@@ -1071,6 +1071,71 @@ class FolderPath(IO[bytes, FolderOptions]):
     # Tabular hooks — derived from children
     # ==================================================================
 
+    def _read_spark_frame(self, options: FolderOptions) -> "Any":
+        """Read via Spark: scatter leaf Holders to executors via mapInArrow.
+
+        1. Driver walks iter_children with predicate pruning (cheap).
+        2. Collects leaf Tabular children.
+        3. Pickles + broadcasts the children.
+        4. mapInArrow: each executor unpickles its Holders and reads Arrow batches.
+        """
+        import pickle
+        from yggdrasil.environ import PyEnv
+
+        spark = PyEnv.spark_session(create=True, import_error=True)
+
+        leaves: list = []
+        self._collect_leaves(leaves, options)
+
+        if not leaves:
+            schema = self._collect_schema(options)
+            spark_schema = schema.to_spark_schema() if hasattr(schema, "to_spark_schema") else None
+            if spark_schema:
+                return spark.createDataFrame([], schema=spark_schema)
+            return options.cast_spark(
+                spark.createDataFrame(self._read_arrow_table(options).to_pandas())
+            )
+
+        arrow_schema = self._collect_schema(options)
+        if hasattr(arrow_schema, "to_arrow_schema"):
+            arrow_schema = arrow_schema.to_arrow_schema()
+        from yggdrasil.data.schema import Schema
+        spark_schema = Schema.from_arrow(arrow_schema).to_spark_schema()
+
+        try:
+            default_par = max(spark.sparkContext.defaultParallelism, 1)
+        except Exception:
+            default_par = 4
+        n_parts = max(1, min(len(leaves), default_par * 2))
+
+        leaf_bytes = [pickle.dumps(leaf) for leaf in leaves]
+        index_df = spark.createDataFrame(
+            [(i,) for i in range(len(leaf_bytes))], schema=["_idx"]
+        ).repartition(n_parts)
+
+        bc_leaves = spark.sparkContext.broadcast(leaf_bytes)
+
+        def _read_holders(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
+            for batch in batches:
+                for idx in batch.column("_idx").to_pylist():
+                    leaf = pickle.loads(bc_leaves.value[idx])
+                    yield from leaf.read_arrow_batches()
+
+        return index_df.mapInArrow(_read_holders, schema=spark_schema)
+
+    def _collect_leaves(
+        self, out: list, options: "FolderOptions",
+    ) -> None:
+        """Recursively collect leaf Tabular children, applying predicate pruning."""
+        free_cols = self._free_cols_for(options.predicate) if options.predicate else None
+        if self._should_prune_by_predicate(options, free_cols=free_cols):
+            return
+        for child in self.iter_children(options=options):
+            if isinstance(child, type(self)):
+                child._collect_leaves(out, self._child_read_options(child, options))
+            else:
+                out.append(child)
+
     def _read_arrow_batches(
         self, options: FolderOptions,
     ) -> Iterator[pa.RecordBatch]:
