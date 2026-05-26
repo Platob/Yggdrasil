@@ -538,37 +538,65 @@ class CacheConfig:
         except Exception:
             pass
 
+    _HASH_CACHE_MAX = 10 * 1024
+    _HASH_CACHE_LOOKBACK = dt.timedelta(days=7)
+
     def probe_hashes(
         self,
         partition_keys: "list[int]",
         *,
         session: "Any" = None,
     ) -> set[int]:
-        """Return cached public hashes, loading from backend on first call."""
+        """Return cached public hashes, loading from backend on first call.
+
+        Hot-loads only hashes received in the last 7 days, capped at
+        10k entries. When the cap is hit, oldest entries (by
+        ``received_at``) are evicted so the set stays bounded.
+        """
         if self._hash_cache is not None:
             return self._hash_cache
-        import pyarrow as pa
         from yggdrasil.execution.expr import col
         holder = self.tabular or self.cache_tabular(session=session)
         if holder is None:
             self._hash_cache = set()
             return self._hash_cache
-        predicate = col("partition_key").is_in(partition_keys) if partition_keys else None
+        cutoff = dt.datetime.now(dt.timezone.utc) - self._HASH_CACHE_LOOKBACK
+        predicates = col("received_at") >= cutoff
+        if partition_keys:
+            predicates = predicates & col("partition_key").is_in(partition_keys)
         try:
             table = holder.read_arrow_table(
-                predicate=predicate, columns=[MATCH_COLUMN],
+                predicate=predicates,
+                columns=[MATCH_COLUMN, "received_at"],
             )
-            self._hash_cache = set(table.column(MATCH_COLUMN).to_pylist()) if table and table.num_rows > 0 else set()
+            if table is None or table.num_rows == 0:
+                self._hash_cache = set()
+            elif table.num_rows <= self._HASH_CACHE_MAX:
+                self._hash_cache = set(table.column(MATCH_COLUMN).to_pylist())
+            else:
+                import pyarrow.compute as pc
+                indices = pc.sort_indices(table, sort_keys=[("received_at", "descending")])
+                trimmed = table.take(indices[:self._HASH_CACHE_MAX])
+                self._hash_cache = set(trimmed.column(MATCH_COLUMN).to_pylist())
         except Exception:
             self._hash_cache = set()
         return self._hash_cache
 
     def _add_hashes(self, hashes: set[int]) -> None:
-        """Extend the in-memory hash cache after a cache write."""
+        """Extend the in-memory hash cache after a cache write.
+
+        Evicts oldest entries when the cache exceeds the cap. Since
+        the set doesn't track insertion order, a full eviction just
+        discards a random subset — acceptable because the next
+        ``probe_hashes`` reload will re-sort by ``received_at``.
+        """
         if self._hash_cache is None:
             self._hash_cache = hashes
         else:
             self._hash_cache |= hashes
+        if len(self._hash_cache) > self._HASH_CACHE_MAX:
+            keep = set(list(self._hash_cache)[:self._HASH_CACHE_MAX])
+            self._hash_cache = keep
 
     def filter_response(
         self,
