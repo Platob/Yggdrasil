@@ -489,6 +489,9 @@ O = TypeVar("O", bound=CastOptions)
 _ChildT = TypeVar("_ChildT", bound="Tabular")
 
 
+_TABULAR_FORMAT_REGISTRY: "dict[str, type[Tabular]]" = {}
+
+
 class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     """Pure interface — Arrow record-batch source/sink + engine fan-out.
 
@@ -507,6 +510,26 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     :meth:`Holder.__init_subclass__` auto-registers it. Look up via
     :meth:`Holder.class_for_media_type` / :meth:`Holder.for_holder`.
     """
+
+    mime_type: "ClassVar[MimeType | None]" = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        mt = cls.__dict__.get("mime_type")
+        if mt is None:
+            return
+        key = mt.name if hasattr(mt, "name") else str(mt)
+        _TABULAR_FORMAT_REGISTRY[key] = cls
+
+    @classmethod
+    def class_for_media_type(cls, media_type: Any, *, default: Any = None) -> "type[Tabular] | None":
+        if media_type is None:
+            return default
+        mt = media_type if hasattr(media_type, "mime_type") else None
+        if mt is not None:
+            media_type = mt.mime_type
+        key = media_type.name if hasattr(media_type, "name") else str(media_type)
+        return _TABULAR_FORMAT_REGISTRY.get(key, default)
 
     def __init__(
         self,
