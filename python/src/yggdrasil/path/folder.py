@@ -91,6 +91,7 @@ from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.enums.media_type import MediaType, MediaTypes
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.path.path import Path
 from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.url import hive_cast_value, hive_encode, hive_split
@@ -164,7 +165,7 @@ class FolderOptions(CastOptions):
 LOGGER = logging.getLogger(__name__)
 
 
-class Folder(IO[bytes, FolderOptions]):
+class Folder(Path):
     """:class:`Tabular` over a directory of tabular files.
 
     Inherits :class:`Holder` so it registers in the cross-cutting
@@ -383,6 +384,27 @@ class Folder(IO[bytes, FolderOptions]):
     # ==================================================================
     # Holder byte primitives — folder is a directory, not a buffer
     # ==================================================================
+
+    def full_path(self) -> str:
+        return self.path.full_path()
+
+    def _bread(self, n, pos, mode):
+        raise NotImplementedError(f"{type(self).__name__} is a directory.")
+
+    def _bwrite(self, data, pos, mode):
+        raise NotImplementedError(f"{type(self).__name__} is a directory.")
+
+    def _ls(self, *, recursive=False, include_dirs=False, **kwargs):
+        return self.path._ls(recursive=recursive, include_dirs=include_dirs, **kwargs)
+
+    def _mkdir(self, parents=True, exist_ok=True):
+        return self.path._mkdir(parents=parents, exist_ok=exist_ok)
+
+    def _remove_file(self, missing_ok=True, wait=None):
+        raise NotImplementedError(f"{type(self).__name__} is a directory, use _remove_dir.")
+
+    def _remove_dir(self, recursive=True, missing_ok=True, wait=None, **kwargs):
+        return self.path._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait, **kwargs)
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         raise NotImplementedError(
