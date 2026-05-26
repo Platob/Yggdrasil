@@ -234,7 +234,7 @@ class Dataset(Tabular[CastOptions]):
     def __iter__(self) -> Iterator[Any]:
         return self.to_local_iterator()
 
-    def count(self) -> int:
+    def _count(self, options=None) -> int:
         if self._frame is None:
             return 0
         return self._frame.count()

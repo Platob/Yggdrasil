@@ -1126,6 +1126,17 @@ class Tabular(ABC, Generic[O]):
         ]
 
     # ==================================================================
+    # Count
+    # ==================================================================
+
+    def count(self, options: "O | None" = None, **kwargs: Any) -> int:
+        """Return the number of rows in this tabular."""
+        return self._count(self.check_options(options, overrides=locals()))
+
+    def _count(self, options: O) -> int:
+        return sum(b.num_rows for b in self._read_arrow_batches(options))
+
+    # ==================================================================
     # Arrow surface
     # ==================================================================
 

@@ -323,6 +323,9 @@ class ArrowTabular(Tabular[CastOptions]):
     def __len__(self) -> int:
         return self.num_rows
 
+    def _count(self, options=None) -> int:
+        return self.num_rows
+
     def __bool__(self) -> bool:
         return not self.is_empty()
 

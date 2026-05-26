@@ -456,11 +456,7 @@ class HTTPResponseBatch(Tabular):
     def _count(holder: Optional[Tabular]) -> int:
         if holder is None:
             return 0
-        if isinstance(holder, ArrowTabular):
-            return holder.num_rows
-        if isinstance(holder, Dataset):
-            return holder.frame.count() if holder.frame is not None else 0
-        return sum(b.num_rows for b in holder.read_arrow_batches())
+        return holder.count()
 
     @property
     def counts(self) -> dict[str, int]:
