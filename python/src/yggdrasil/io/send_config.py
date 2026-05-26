@@ -15,7 +15,6 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.path import Path
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,7 +46,6 @@ _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
         "tabular",
         "request_by",
-        "response_by",
         "mode",
         "anonymize",
         "received_from",
@@ -87,11 +85,6 @@ def _is_valid_request_key(key: str) -> bool:
     return False
 
 
-def _is_valid_response_key(key: str) -> bool:
-    head, _, _ = key.partition(".")
-    return head in RESPONSE_ARROW_SCHEMA.names
-
-
 def _request_column_sql_name(key: str) -> str:
     """Cache-table column name for a request-side ``request_by`` key.
 
@@ -122,20 +115,6 @@ def _validate_request_by(arg: list[str] | tuple[str, ...] | None = None) -> list
     return keys
 
 
-def _validate_response_by(
-    arg: list[str] | tuple[str, ...] | None = None,
-) -> list[str] | None:
-    if arg is None:
-        return None
-
-    keys = list(arg)
-    invalid = [key for key in keys if not _is_valid_response_key(key)]
-    if invalid:
-        raise ValueError(
-            f"Invalid response_by key(s): {invalid!r}. "
-            f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
-        )
-    return keys
 
 
 def _truncate_to_hour(value: dt.datetime) -> dt.datetime:
@@ -154,7 +133,7 @@ class CacheConfig:
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
     __slots__ = (
-        "tabular", "request_by", "response_by", "mode", "anonymize",
+        "tabular", "request_by", "mode", "anonymize",
         "received_from", "received_to", "cleanup_ttl", "_derived",
     )
 
@@ -178,7 +157,6 @@ class CacheConfig:
         self,
         tabular: Optional[Holder] = None,
         request_by: Optional[list[str]] = None,
-        response_by: Optional[list[str]] = None,
         mode: Mode = Mode.APPEND,
         anonymize: Literal["remove", "redact"] = "remove",
         received_from: Optional[dt.datetime] = None,
@@ -191,7 +169,6 @@ class CacheConfig:
         self._derived = None
 
         self.request_by = _validate_request_by(request_by)
-        self.response_by = _validate_response_by(response_by)
 
         self.received_from = _coerce_optional_datetime(received_from)
         self.received_to = _coerce_optional_datetime(received_to)
@@ -210,8 +187,6 @@ class CacheConfig:
             parts.append(f"mode={self.mode!r}")
         if self.request_by and self.request_by != list(_DEFAULT_REQUEST_BY):
             parts.append(f"request_by={self.request_by!r}")
-        if self.response_by:
-            parts.append(f"response_by={self.response_by!r}")
         if self.received_from is not None:
             parts.append(f"received_from={self.received_from!r}")
         if self.received_to is not None:
@@ -278,7 +253,6 @@ class CacheConfig:
             "mode": self.mode,
             "tabular": self.tabular,
             "request_by": self.request_by,
-            "response_by": self.response_by,
             "received_from": self.received_from,
             "received_to": self.received_to,
             "anonymize": self.anonymize,
@@ -288,7 +262,6 @@ class CacheConfig:
     def __setstate__(self, state):
         self.mode = state["mode"]
         self.request_by = state["request_by"]
-        self.response_by = state["response_by"]
         self.received_from = state["received_from"]
         self.received_to = state["received_to"]
         tabular = state.get("tabular")
@@ -378,36 +351,18 @@ class CacheConfig:
         return self.tabular is not None
 
     @property
-    def match_by(self) -> list[str]:
-        cache = self._derived_cache()
-        out = cache.get("match_by", ...)
-        if out is ...:
-            out = [
-                *(self.request_by or ()),
-                *(self.response_by or ()),
-            ]
-            cache["match_by"] = out
-        return out
-
-    @property
     def match_by_columns(self) -> list[str]:
         """Flattened column names for keyed cache operations.
 
         Request-side keys are stored on the response table under the
         flattened ``request_<col>`` form (cf. :data:`RESPONSE_SCHEMA`),
         so a bare ``public_url_hash`` / ``method`` / etc. needs the
-        ``request_`` prefix before it can be referenced as a target
-        column in :meth:`Tabular.insert(match_by=...)` /
-        :meth:`Tabular.write_arrow_batches`. Response-side keys map
-        1:1 already.
+        ``request_`` prefix.
         """
         cache = self._derived_cache()
         out = cache.get("match_by_columns", ...)
         if out is ...:
-            out = [
-                *(_request_column_sql_name(k) for k in (self.request_by or ())),
-                *(self.response_by or ()),
-            ]
+            out = [_request_column_sql_name(k) for k in (self.request_by or ())]
             cache["match_by_columns"] = out
         return out
 
@@ -558,8 +513,8 @@ class CacheConfig:
     ) -> "tuple[list[Response], list[PreparedRequest]]":
         """Read cache hits as :class:`Response` objects.
 
-        Returns ``(hits, misses)`` — hits matched by ``request_by`` /
-        ``response_by`` and filtered by ``received_from`` / ``received_to``.
+        Returns ``(hits, misses)`` — hits matched by ``request_by``
+        and filtered by ``received_from`` / ``received_to``.
         """
         from yggdrasil.io.response import Response
 
@@ -696,20 +651,6 @@ class CacheConfig:
             for key in (self.request_by or [])
         }
 
-    def response_values(
-        self,
-        response: "Response",
-    ) -> dict[str, Any]:
-        return {key: response.match_value(key) for key in (self.response_by or [])}
-
-    def filter_request(
-        self,
-        request: PreparedRequest,
-    ) -> bool:
-        for key in self.request_by or []:
-            request.match_value(key)
-        return True
-
     def filter_response(
         self,
         response: "Response",
@@ -720,9 +661,6 @@ class CacheConfig:
                 actual = response.match_value(key)
                 if actual != expected:
                     return False
-
-        for key in self.response_by or []:
-            response.match_value(key)
 
         if self.received_from is not None:
             if response.received_at < self.received_from:
@@ -740,24 +678,6 @@ class CacheConfig:
     ) -> tuple[Any, ...]:
         values = self.request_values(request)
         return tuple(values[key] for key in (self.request_by or []))
-
-    def response_tuple(
-        self,
-        response: "Response",
-    ) -> tuple[Any, ...]:
-        values = self.response_values(response)
-        return tuple(values[key] for key in (self.response_by or []))
-
-    def identity_tuple(
-        self,
-        response: "Response",
-        request: PreparedRequest | None = None,
-    ) -> tuple[Any, ...]:
-        out: list[Any] = []
-        if request is not None:
-            out.extend(self.request_tuple(request))
-        out.extend(self.response_tuple(response))
-        return tuple(out)
 
     # ------------------------------------------------------------------
     # Predicate builders — single source of truth for cache lookups
@@ -798,56 +718,14 @@ class CacheConfig:
             return clauses[0]
         return all_of(*clauses)
 
-    def response_predicate(
-        self,
-        response: "Response | None" = None,
-    ) -> "Any | None":
-        """Build the response-side match predicate as an :class:`Expression`.
-
-        Carries the response-side match keys (when *response* is
-        supplied). Returns ``None`` when no clauses apply so callers
-        can compose with :func:`all_of` cleanly.
-
-        ``received_from`` / ``received_to`` are NOT included — they
-        are staleness checks applied post-read by
-        :meth:`filter_response`, not identity filters. Baking them
-        into the predicate would reject backfilled rows whose
-        original ``received_at`` falls outside the window.
-        """
-        if response is None:
-            return None
-        from yggdrasil.execution.expr import all_of, col
-
-        clauses: list[Any] = []
-        for key, value in self.response_values(response).items():
-            clauses.append(
-                col(key).is_null() if value is None else col(key) == value
-            )
-        if not clauses:
-            return None
-        if len(clauses) == 1:
-            return clauses[0]
-        return all_of(*clauses)
-
     def make_lookup_predicate(
         self,
         request: PreparedRequest | None = None,
-        response: "Response | None" = None,
     ) -> "Any | None":
         """Single-request :class:`Predicate` for the cache read.
 
         Shape: ``partition_key == <req.partition_key>`` AND the
-        per-request match clause AND the response/time-window
-        clause. Returns ``None`` when no clauses apply (an
-        unconstrained :class:`Tabular` read).
-
-        The same predicate drives both backends: a :class:`FolderPath`
-        consumes it via :meth:`Predicate.filter_arrow_batches` (with
-        ``extract_partition_filters`` short-circuiting the
-        ``<col>=<val>/`` listing), and a remote
-        :class:`Tabular` (Databricks Table, …) translates it to its
-        engine's native filter (SQL ``WHERE``) inside
-        :meth:`Tabular.read_arrow_batches`.
+        per-request match clause.
         """
         from yggdrasil.execution.expr import all_of, col
 
@@ -857,9 +735,6 @@ class CacheConfig:
         req_pred = self.request_predicate(request)
         if req_pred is not None:
             clauses.append(req_pred)
-        resp_pred = self.response_predicate(response)
-        if resp_pred is not None:
-            clauses.append(resp_pred)
         if not clauses:
             return None
         if len(clauses) == 1:
@@ -873,16 +748,7 @@ class CacheConfig:
         """Batch :class:`Predicate` for the cache read.
 
         Shape: ``partition_key IN (<distinct keys>)`` AND
-        ``(req1_match) OR (req2_match) OR …``. Returns ``None``
-        when the batch is empty.
-
-        Drives both backends through :meth:`Tabular.read_arrow_batches`:
-        :class:`FolderPath` lets :meth:`iter_children` probe candidate
-        ``partition_key=<v>/`` sub-folders directly (one ``stat``
-        per accepted value, no ``iterdir`` over the full tree) and
-        :meth:`Predicate.filter_arrow_batches` keeps the matching
-        rows on the read side; remote Tabular backends translate the
-        same predicate into their engine's native filter.
+        ``(req1_match) OR (req2_match) OR …``.
         """
         from yggdrasil.execution.expr import (
             all_of,
@@ -891,28 +757,23 @@ class CacheConfig:
         )
 
         request_list = list(requests)
-        clauses: list[Any] = []
-
-        if request_list:
-            partition_keys = sorted({r.partition_key for r in request_list})
-            clauses.append(col("partition_key").is_in(partition_keys))
-
-            request_preds = [
-                pred
-                for pred in (self.request_predicate(r) for r in request_list)
-                if pred is not None
-            ]
-            if len(request_preds) == 1:
-                clauses.append(request_preds[0])
-            elif request_preds:
-                clauses.append(any_of(*request_preds))
-
-        resp_pred = self.response_predicate(None)
-        if resp_pred is not None:
-            clauses.append(resp_pred)
-
-        if not clauses:
+        if not request_list:
             return None
+
+        clauses: list[Any] = []
+        partition_keys = sorted({r.partition_key for r in request_list})
+        clauses.append(col("partition_key").is_in(partition_keys))
+
+        request_preds = [
+            pred
+            for pred in (self.request_predicate(r) for r in request_list)
+            if pred is not None
+        ]
+        if len(request_preds) == 1:
+            clauses.append(request_preds[0])
+        elif request_preds:
+            clauses.append(any_of(*request_preds))
+
         if len(clauses) == 1:
             return clauses[0]
         return all_of(*clauses)
