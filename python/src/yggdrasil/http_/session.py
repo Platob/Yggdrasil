@@ -1362,14 +1362,15 @@ class HTTPSession(Session):
     def _send_batch(
         self,
         reqs: list[PreparedRequest],
+        cfg: "SendConfig",
         *,
-        local_cache: "CacheConfig | None" = None,
-        remote_cache: "CacheConfig | None" = None,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
-        """Process one holder group: local cache → remote cache → network → writeback."""
-        spark = reqs[0].send_config_or_default.get_spark_session() if reqs else None
+        """Process one config group: local cache → remote cache → network → writeback."""
+        local_cache = cfg.local_cache
+        remote_cache = cfg.remote_cache
+        spark = cfg.get_spark_session()
         n = len(reqs)
         LOGGER.debug(
             "Processing batch (requests=%d, local=%r, remote=%r)",
@@ -1403,7 +1404,6 @@ class HTTPSession(Session):
                         spark_session=spark,
                     )
 
-        cfg = reqs[0].send_config_or_default
         if not misses or cfg.cache_only:
             if misses:
                 LOGGER.info(
@@ -1478,14 +1478,14 @@ class HTTPSession(Session):
         )
 
     @staticmethod
-    def _group_by_holders(
+    def _group_by_config(
         batch: list[PreparedRequest],
-    ) -> dict[tuple, list[PreparedRequest]]:
-        """Group requests by cache config."""
-        groups: dict[tuple, list[PreparedRequest]] = {}
+    ) -> dict["SendConfig", list[PreparedRequest]]:
+        """Group requests by send config."""
+        groups: dict[SendConfig, list[PreparedRequest]] = {}
         for r in batch:
-            key = (r.local_cache_config, r.remote_cache_config)
-            groups.setdefault(key, []).append(r)
+            cfg = r.send_config_or_default
+            groups.setdefault(cfg, []).append(r)
         return groups
 
     # Per-SparkSession cache of the empty :class:`SparkDataFrame` keyed
@@ -1749,17 +1749,15 @@ class HTTPSession(Session):
                 continue
 
             chunk_index += 1
-            groups = self._group_by_holders(chunk)
+            groups = self._group_by_config(chunk)
             LOGGER.debug(
                 "Processing chunk #%d (requests=%d, groups=%d)",
                 chunk_index, len(chunk), len(groups),
             )
 
-            for (local_cache, remote_cache), reqs in groups.items():
+            for cfg, reqs in groups.items():
                 batch = self._send_batch(
-                    reqs,
-                    local_cache=local_cache,
-                    remote_cache=remote_cache,
+                    reqs, cfg,
                     ordered=ordered, max_in_flight=max_in_flight,
                 )
                 total_cache_hits += len(reqs) - len(batch.misses)

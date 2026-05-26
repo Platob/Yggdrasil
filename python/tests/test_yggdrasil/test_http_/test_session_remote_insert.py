@@ -473,7 +473,7 @@ class TestSendManyUpsertOverwritePersist:
 
 
 class TestHolderGrouping:
-    """Verify _group_by_holders separates by mode and spark_session."""
+    """Verify _group_by_config separates by mode and spark_session."""
 
     def test_groups_separate_by_mode(self):
         from yggdrasil.http_.session import HTTPSession
@@ -489,7 +489,7 @@ class TestHolderGrouping:
             send_config=SendConfig(remote_cache=upsert_cfg),
         )
 
-        groups = HTTPSession._group_by_holders([a, b])
+        groups = HTTPSession._group_by_config([a, b])
         assert len(groups) == 2, (
             "APPEND and UPSERT must be in separate groups"
         )
@@ -511,7 +511,7 @@ class TestHolderGrouping:
             send_config=SendConfig(local_cache=cfg_overwrite),
         )
 
-        groups = HTTPSession._group_by_holders([a, b])
+        groups = HTTPSession._group_by_config([a, b])
         assert len(groups) == 2, (
             "APPEND and OVERWRITE local modes must be in separate groups"
         )
@@ -529,7 +529,7 @@ class TestHolderGrouping:
             send_config=SendConfig(remote_cache=cfg),
         )
 
-        groups = HTTPSession._group_by_holders([a, b])
+        groups = HTTPSession._group_by_config([a, b])
         assert len(groups) == 1, (
             "same holder + same mode → single group"
         )
