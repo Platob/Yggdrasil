@@ -437,6 +437,7 @@ class WorkspacePath(DatabricksPath):
                 if not _looks_like_not_found(del_exc):
                     raise
             self._call_ensuring_parents(_do_upload)
+        self._buffered_size = None
         if size >= 0:
             self._persist_stat_cache(
                 IOStats(

@@ -662,6 +662,7 @@ class S3Path(RemotePath):
             Body=content,
         )
         LOGGER.info("Wrote S3 object %r (bytes=%d)", self, size)
+        self._buffered_size = None
         self._persist_stat_cache(
             IOStats(
                 size=size,

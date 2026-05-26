@@ -797,6 +797,7 @@ class VolumePath(DatabricksPath):
                 )
 
         self._call_ensuring_parents(_do_upload)
+        self._buffered_size = None
         if size >= 0:
             self._persist_stat_cache(
                 IOStats(

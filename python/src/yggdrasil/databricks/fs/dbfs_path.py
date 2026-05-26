@@ -343,6 +343,7 @@ class DBFSPath(DatabricksPath):
                         offset += _DBFS_CHUNK
 
         self._call(_do_upload)
+        self._buffered_size = None
         # The upload just established the object's full size; seed
         # the cache so the next ``size`` / ``exists`` lookup is local
         # and any concurrent reader on the singleton path sees the
