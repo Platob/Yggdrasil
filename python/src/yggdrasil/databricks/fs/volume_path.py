@@ -785,7 +785,7 @@ class VolumePath(DatabricksPath):
 
         else:
             # ``FilesExt.upload`` calls ``contents.seekable()`` — wrap
-            # raw bytes in a fresh ``BytesIO`` each attempt so retries
+            # raw bytes in a fresh ``IO`` each attempt so retries
             # always PUT the full body from offset zero.
             payload = bytes(content)
 

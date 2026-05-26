@@ -382,7 +382,7 @@ class TestS3WriteColdPath:
     """A cold remote path (no prior stat) must write in 1 SDK call."""
 
     def _fresh_s3(self, store: dict) -> S3Path:
-        from yggdrasil.io.path.remote_path import RemotePath
+        from yggdrasil.path.remote_path import RemotePath
         RemotePath._INSTANCES.clear()
         client = _s3_round_trip_client(store)
         s3 = S3Path("s3://my-bucket/data.bin", service=_s3_service(client))

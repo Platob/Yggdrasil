@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import struct
-from typing import IO, Mapping
+from typing import IO as TypingIO, Mapping
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser._scratch import _ScratchBuf
 from yggdrasil.pickle.ser.constants import HEADER_SIZE
 from yggdrasil.pickle.ser.errors import HeaderDecodeError, MetadataDecodeError
@@ -165,7 +165,7 @@ class Header:
     @classmethod
     def read_from(
         cls,
-        buffer: BytesIO,
+        buffer: IO,
         *,
         pos: int | None = None,
     ) -> "Header":
@@ -208,7 +208,7 @@ class Header:
             _meta_blob=meta_blob,
         )
 
-    def payload_view(self, buffer: BytesIO) -> BytesIO:
+    def payload_view(self, buffer: IO) -> IO:
         """Return a zero-copy view of the payload bytes."""
         return buffer.view(pos=self.start, size=self.size)
 
@@ -216,13 +216,13 @@ class Header:
         self,
         data: bytes | bytearray | memoryview,
         *,
-        buffer: "BytesIO | IO[bytes] | None" = None,
-    ) -> "BytesIO | IO[bytes]":
+        buffer: "IO | TypingIO[bytes] | None" = None,
+    ) -> "IO | TypingIO[bytes]":
         """Write header + payload into a buffer and return that buffer.
 
         Streams via the universal :class:`IO[bytes].write` method so a
         stdlib ``io.BytesIO`` or any open file handle works as a sink —
-        not just the yggdrasil :class:`BytesIO`. Avoids the extra
+        not just the yggdrasil :class:`IO`. Avoids the extra
         ``to_bytes()`` materialization that previous shapes incurred.
         """
         if buffer is None:

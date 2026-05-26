@@ -21,9 +21,9 @@ class TestRegistration:
         assert Holder.class_for_media_type(MimeTypes.NDJSON) is NDJSONFile
 
     def test_path_dispatches(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(path=str(tmp_path / "x.ndjson"))
+        b = IO(path=str(tmp_path / "x.ndjson"))
         assert isinstance(b, NDJSONFile)
 
 

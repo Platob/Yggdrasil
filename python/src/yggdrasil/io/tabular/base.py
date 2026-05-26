@@ -9,7 +9,7 @@ derived from those hooks.
 Implementers compose :class:`Tabular` with whatever concrete
 substrate they need:
 
-- :class:`yggdrasil.io.buffer.bytes_io.BytesIO` mixes Tabular with
+- :class:`yggdrasil.io.holder.IO` mixes Tabular with
   :class:`Disposable` and a :class:`Holder` cursor — the default
   byte-backed implementation.
 - A hypothetical :class:`SparkCatalogTabular` could mix Tabular with
@@ -939,63 +939,6 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         return deleted
 
     # ==================================================================
-    # Execution-plan entry point
-    # ==================================================================
-
-    def execute_plan(
-        self,
-        plan: "Any",
-        *,
-        options: "O | None" = None,
-        **kwargs: Any,
-    ) -> "Tabular":
-        """Apply an :class:`ExecutionPlan` to this Tabular.
-
-        The default returns a :class:`LazyTabular` wrapping ``self``
-        with the plan attached — execution stays lazy and routes
-        through whatever read hook the caller pulls (Arrow, polars
-        LazyFrame, …). An empty plan returns ``self`` unchanged so
-        callers can hand a possibly-empty plan in without an explicit
-        guard.
-
-        Subclasses with native plan execution (a SQL engine that can
-        push the whole plan to a remote, an in-engine LazyFrame
-        source, …) override to bypass the LazyTabular wrapper. The
-        contract is just: return a :class:`Tabular` whose reads
-        produce the same rows the wrapper would.
-        """
-        from yggdrasil.execution.plan import ExecutionPlan
-        from yggdrasil.io.tabular.lazy import LazyTabular
-
-        coerced = (
-            plan if isinstance(plan, ExecutionPlan)
-            else ExecutionPlan(tuple(plan)) if plan is not None
-            else ExecutionPlan.empty()
-        )
-        if coerced.is_empty():
-            return self
-        # ``options`` / ``**kwargs`` are accepted for forward-compat
-        # so subclasses can wire engine-specific knobs through;
-        # the default LazyTabular doesn't need them — its reads
-        # carry their own options.
-        del options, kwargs
-        return LazyTabular(self, plan=coerced)
-
-    def lazy(self) -> "Tabular":
-        """Return a :class:`LazyTabular` view with a ``SELECT *`` plan.
-
-        Entry point for the builder API — chain :meth:`select`,
-        :meth:`filter`, :meth:`group_by`, :meth:`apply` off the result
-        without each call paying the wrapping cost. The seeded plan is
-        a single :class:`Select` over ``"*"`` so the lazy frame still
-        round-trips every column when collected with no further ops.
-        """
-        from yggdrasil.execution.plan import ExecutionPlan, Select
-        from yggdrasil.io.tabular.lazy import LazyTabular
-
-        return LazyTabular(self, plan=ExecutionPlan((Select(("*",)),)))
-
-    # ==================================================================
     # Abstract batch hooks — the two things every implementer overrides
     # ==================================================================
 
@@ -1447,8 +1390,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
           from both sides survives).
 
         Concrete subclasses override :meth:`_union` for in-place
-        mutation (Arrow batch append, Spark ``unionByName``).  The
-        base falls back to :class:`UnionTabular`.
+        mutation (Arrow batch append, Spark ``unionByName``).
 
         Accepts :class:`Tabular`, ``pa.RecordBatch``, ``pa.Table``,
         ``list[Response]``, or a Spark DataFrame.
@@ -1482,8 +1424,10 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
     def _union(self, other: "Tabular", *, mode: Mode = Mode.IGNORE) -> "Tabular":
         """Engine-specific union hook.  Override in subclasses."""
-        from .union import UnionTabular
-        return UnionTabular([self, other])
+        raise NotImplementedError(
+            f"{type(self).__name__}._union is not implemented; "
+            f"use ArrowTabular or SparkTabular which override this."
+        )
 
     # ==================================================================
     # Polars

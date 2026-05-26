@@ -22,8 +22,6 @@ Spark doesn't pay the import cost of :mod:`yggdrasil.spark.tabular`.
 """
 
 from .base import O, Tabular, is_tabular_source
-from yggdrasil.io.tabular.lazy import LazyTabular
-from yggdrasil.io.tabular.union import UnionTabular
 from yggdrasil.io.tabular.engine import (
     SYSTEM_ENGINE,
     TabularEngine,
@@ -36,8 +34,6 @@ __all__ = [
     "ArrowTabular",
     "SparkDataset",
     "SparkTabular",
-    "LazyTabular",
-    "UnionTabular",
     "TabularEngine",
     "TabularEntry",
     "SYSTEM_ENGINE",

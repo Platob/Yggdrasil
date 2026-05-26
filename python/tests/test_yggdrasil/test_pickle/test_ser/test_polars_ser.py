@@ -5,7 +5,7 @@ from collections import OrderedDict
 import polars as pl
 import pytest
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io import IO
 from yggdrasil.pickle.ser.polars import (
     PolarsDataFrameSerialized,
     PolarsDataTypeSerialized,
@@ -19,7 +19,7 @@ from yggdrasil.pickle.ser.tags import Tags
 
 
 def _roundtrip(serialized: Serialized[object]) -> Serialized[object]:
-    buf = BytesIO()
+    buf = IO()
     serialized.write_to(buf)
     return Serialized.read_from(buf, pos=0)
 

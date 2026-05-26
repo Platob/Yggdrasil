@@ -56,7 +56,7 @@ from yggdrasil.databricks.sql.sql_utils import (
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.url import URL
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import Path
 from yggdrasil.io.primitive import ParquetFile
@@ -1087,10 +1087,10 @@ class Table(DatabricksPath):
             media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_TABLE
         )
 
-    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
         raise NotImplementedError("Table is a read-only resource")
 
-    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
         raise NotImplementedError("Table is a read-only resource")
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
@@ -1267,7 +1267,7 @@ class Table(DatabricksPath):
     @property
     def size(self) -> int:
         # A SQL table has no positional byte size. Return 0 so
-        # ``BytesIO(holder=table)``-style code sees an empty buffer
+        # ``IO(holder=table)``-style code sees an empty buffer
         # instead of crashing; the byte primitives still raise on
         # actual read/write attempts.
         return 0

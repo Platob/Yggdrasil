@@ -16,7 +16,7 @@ import pyarrow as pa
 
 from yggdrasil.data.data_field import Field, field as make_field
 from yggdrasil.data.schema import Schema, schema as make_schema
-from yggdrasil.io import BytesIO
+from yggdrasil.io import IO
 from yggdrasil.pickle.ser import dumps, loads
 from yggdrasil.pickle.ser.constants import CODEC_NONE
 from yggdrasil.pickle.ser.data import (
@@ -34,7 +34,7 @@ from yggdrasil.pickle.ser.tags import Tags
 
 def _wire_roundtrip(ser: Serialized) -> Serialized:
     """Write *ser* to a buffer then read it back."""
-    buf = BytesIO()
+    buf = IO()
     ser.write_to(buf)
     return Serialized.read_from(buf, pos=0)
 

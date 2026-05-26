@@ -1,4 +1,4 @@
-"""CSV Tabular leaf over the new :class:`BytesIO` substrate.
+"""CSV Tabular leaf over the new :class:`IO` substrate.
 
 CSV is a pure stream — no footer, no random access, no cheap
 schema. Schema collection reads the first batch; reads parse from

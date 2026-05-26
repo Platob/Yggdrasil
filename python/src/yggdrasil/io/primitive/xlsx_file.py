@@ -1,9 +1,9 @@
 """XLSX Tabular leaf with lazy per-sheet entries.
 
-:class:`XLSXFile` IS-A :class:`BytesIO` whose backing bytes are an
+:class:`XLSXFile` IS-A :class:`IO` whose backing bytes are an
 xlsx workbook (a ZIP archive). Mirrors the :class:`ZipFile` shape:
 
-1. **Byte surface** — inherited from :class:`BytesIO`. Read / write
+1. **Byte surface** — inherited from :class:`IO`. Read / write
    the raw workbook bytes.
 2. **Children surface** — :meth:`iter_children` walks every
    worksheet as a :class:`XLSXSheetFile`. Sheets are **lazy**: rows
@@ -145,7 +145,7 @@ def _write_sheet_rows(
 
 
 class XLSXSheetFile(IO[bytes, XlsxOptions]):
-    """:class:`BytesIO` over a single worksheet's rows.
+    """:class:`IO` over a single worksheet's rows.
 
     A sheet has no standalone byte representation — the workbook
     keeps everything in one ZIP archive. The Tabular hooks read /

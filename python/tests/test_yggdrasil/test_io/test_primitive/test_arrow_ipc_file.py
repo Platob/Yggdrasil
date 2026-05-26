@@ -19,9 +19,9 @@ class TestRegistration:
         assert Holder.class_for_media_type(MimeTypes.ARROW_IPC) is ArrowIPCFile
 
     def test_path_dispatches_arrow_ext(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(path=str(tmp_path / "x.arrow"))
+        b = IO(path=str(tmp_path / "x.arrow"))
         assert isinstance(b, ArrowIPCFile)
 
 

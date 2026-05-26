@@ -7,9 +7,9 @@ the serializer creates and immediately consumes.  :class:`_ScratchBuf`
 wraps :class:`io.BytesIO` (stdlib) and exposes exactly the surface that
 ``header.py`` / ``serialized.py`` / ``collections.py`` / ``serde.py`` use.
 This cuts per-object allocation overhead by ~10× compared with the full
-:class:`~yggdrasil.io.BytesIO`.
+:class:`~yggdrasil.io.IO`.
 
-The interface is intentionally kept identical to the yggdrasil BytesIO
+The interface is intentionally kept identical to the yggdrasil IO
 subset used in the pickle module — no new abstractions, no leaking outside
 this package.
 """
@@ -76,7 +76,7 @@ class _ScratchBuf:
         return self._buf.getbuffer()
 
     # ------------------------------------------------------------------
-    # slice view (positional, like yggdrasil BytesIO.view)
+    # slice view (positional, like yggdrasil IO.view)
     # ------------------------------------------------------------------
 
     def view(self, *, pos: int = 0, size: int = -1) -> "_ScratchBuf":

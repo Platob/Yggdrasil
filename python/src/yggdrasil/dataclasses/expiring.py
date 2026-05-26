@@ -13,7 +13,7 @@ ExpiringDict[K, V]
     Thread-safe dict where every key has an individual TTL.  No subclassing
     required — pass a ``refresher`` callable if per-key auto-refresh is wanted.
     Pass ``on_evict`` to receive notifications when an entry leaves the cache,
-    so values that own external resources (file handles, spilled BytesIO temp
+    so values that own external resources (file handles, spilled IO temp
     files, GPU buffers, …) can release them deterministically.
 
 Change log vs previous version

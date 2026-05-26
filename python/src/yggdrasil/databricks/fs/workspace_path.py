@@ -402,7 +402,7 @@ class WorkspacePath(DatabricksPath):
 
             def _do_upload() -> None:
                 # Bytes-like input — ``WorkspaceExt.upload`` will
-                # build a fresh ``BytesIO`` per request, so no
+                # build a fresh ``IO`` per request, so no
                 # cursor state crosses retry attempts.
                 upload(path=api_path, content=content, format=fmt, overwrite=True)
 

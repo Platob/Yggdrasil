@@ -1,4 +1,4 @@
-"""JSON Tabular leaf over the new :class:`BytesIO` substrate.
+"""JSON Tabular leaf over the new :class:`IO` substrate.
 
 :class:`JSONFile` writes a single JSON document — either an array of
 objects (``[{...}, {...}, …]``) or a single object — and reads

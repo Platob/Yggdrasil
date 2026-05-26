@@ -4,7 +4,7 @@ DBFS is the legacy cluster-attached filesystem. Reads chunk via
 ``dbfs.read`` (1 MiB max per call, base64-encoded payload); writes
 stream via ``dbfs.open(write=True)`` which the SDK chunk-uploads
 under the hood. The new design folds those calls into the
-:class:`Holder` byte primitives so :class:`BytesIO` over a DBFS
+:class:`Holder` byte primitives so :class:`IO` over a DBFS
 path Just Works.
 """
 

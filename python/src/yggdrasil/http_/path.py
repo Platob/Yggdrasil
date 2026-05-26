@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator
 
 from yggdrasil.enums import Mode, Scheme
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import RemotePath
 from yggdrasil.url import URL
@@ -152,7 +152,7 @@ class HTTPPath(RemotePath):
     # Read / write — GET / PUT
     # ==================================================================
 
-    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
         del mode  # HTTP is read-only on this hook; mode is informational
         from .request import HTTPRequest
 
@@ -163,9 +163,9 @@ class HTTPPath(RemotePath):
 
         req = HTTPRequest.prepare("GET", self.url, headers=headers or None)
         resp = self.session.send(req)
-        return BytesIO(resp.content, copy=False, media_type=resp.media_type)
+        return IO(resp.content, copy=False, media_type=resp.media_type)
 
-    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
         del pos, mode  # HTTP PUT is whole-resource; positional writes
                        # would require multipart support the server may
                        # not advertise. Whole-resource semantics match

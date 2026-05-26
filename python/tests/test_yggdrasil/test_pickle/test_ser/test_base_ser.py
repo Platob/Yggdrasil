@@ -4,7 +4,7 @@ import base64
 
 import pytest
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io import IO
 from yggdrasil.pickle.ser import dump, dumps, load, loads
 from yggdrasil.pickle.ser.constants import MAGIC
 from yggdrasil.pickle.ser.errors import SerializationError, HeaderDecodeError
@@ -34,7 +34,7 @@ def test_dumps_b64_returns_base64_ascii_string() -> None:
 
 
 def test_dump_writes_magic_and_payload_to_file_object() -> None:
-    with BytesIO() as buffer:
+    with IO() as buffer:
         result = dump({"x": 42}, buffer)
 
         # Current implementation does not return anything
@@ -76,7 +76,7 @@ def test_load_roundtrip_via_file_object() -> None:
 
     payload = dumps(obj)
 
-    with BytesIO(payload, copy=False) as buffer:
+    with IO(payload, copy=False) as buffer:
         loaded = load(buffer)
 
     assert loaded == obj

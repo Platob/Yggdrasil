@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Optional, Tuple
 
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.execution.plan import ExecutionPlan, PlanOp
 
 if TYPE_CHECKING:
     from yggdrasil.data.schema import Schema
@@ -31,7 +30,6 @@ __all__ = [
     "deregister",
     "get",
     "resolve",
-    "execute_plan",
 ]
 
 
@@ -329,41 +327,6 @@ class TabularEngine:
         return self.qualified_names()
 
     # ------------------------------------------------------------------
-    # Plan execution
-    # ------------------------------------------------------------------
-
-    def execute_plan(
-        self,
-        source: "Tabular | str | _Key",
-        plan: "ExecutionPlan | Iterable[PlanOp] | None",
-    ) -> Tabular:
-        """Apply *plan* to *source* and return the resulting Tabular.
-
-        *source* accepts a :class:`Tabular` directly, a 3-tuple key,
-        or a flat / dotted name resolvable via :meth:`resolve`. The
-        plan is coerced to an :class:`ExecutionPlan` (or treated as
-        empty when ``None``); join ops with string ``right`` will
-        resolve back through :data:`SYSTEM_ENGINE` at apply time.
-        """
-        if isinstance(source, Tabular):
-            tabular = source
-        elif isinstance(source, tuple) and len(source) == 3:
-            tabular = self.get_tabular(*source)
-        elif isinstance(source, str):
-            tabular = self.resolve(source)
-        else:
-            raise TypeError(
-                f"execute_plan source must be a Tabular, 3-tuple key, or "
-                f"name; got {type(source).__name__}: {source!r}."
-            )
-        coerced = (
-            plan if isinstance(plan, ExecutionPlan)
-            else ExecutionPlan(tuple(plan)) if plan is not None
-            else ExecutionPlan.empty()
-        )
-        return tabular.execute_plan(coerced)
-
-    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -425,11 +388,3 @@ def get(catalog: str, schema: str, name: str) -> "TabularEntry | None":
 def resolve(name: str) -> Tabular:
     """Resolve a flat / dotted *name* on :data:`SYSTEM_ENGINE`."""
     return SYSTEM_ENGINE.resolve(name)
-
-
-def execute_plan(
-    source: "Tabular | str | _Key",
-    plan: "ExecutionPlan | Iterable[PlanOp] | None",
-) -> Tabular:
-    """Apply *plan* to *source* on :data:`SYSTEM_ENGINE`."""
-    return SYSTEM_ENGINE.execute_plan(source, plan)

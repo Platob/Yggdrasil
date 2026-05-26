@@ -22,7 +22,7 @@ non-private entry:
 
 * Files resolve through :class:`MediaType.from_` (extension first,
   magic-byte fallback) to a :class:`Tabular` leaf, or to a generic
-  :class:`BytesIO` if the resolution fails.
+  :class:`IO` if the resolution fails.
 * Directories come back as a fresh :class:`Folder` of the same
   concrete class, so a tree of folders flattens transparently into
   one batch stream.
@@ -90,7 +90,6 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.enums.media_type import MediaType, MediaTypes
 from yggdrasil.dataclasses import ExpiringDict
-from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.path.path import Path
 from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
@@ -337,7 +336,7 @@ class Folder(Path):
         # :class:`Holder` so the URL-keyed surfaces (singleton key,
         # repr, equality) line up with the underlying path.
         # ``holder`` rides through ``**kwargs`` when :meth:`IO.for_holder`
-        # or :meth:`BytesIO.as_media` constructs us — treat it as an
+        # or :meth:`IO.as_media` constructs us — treat it as an
         # alias for ``path`` so ``Path.as_media("folder")`` works.
         raw = path if path is not None else data
         if raw is None:
@@ -460,7 +459,7 @@ class Folder(Path):
     # Context-manager protocol — folder leaves are stateless w.r.t.
     # open/close. Provide a no-op ``with`` block so call sites that
     # do ``with cache:`` (e.g. the session lookup helper) work
-    # against either a BytesIO (real Disposable) or a folder.
+    # against either an IO (real Disposable) or a folder.
     # ==================================================================
 
     def __enter__(self) -> "Folder":
@@ -724,7 +723,7 @@ class Folder(Path):
         first, magic-byte fallback) to a registered :class:`Tabular`
         leaf — :class:`ParquetFile` for ``.parquet``,
         :class:`ArrowIPCFile` for ``.arrow``, etc. Files that don't
-        resolve fall back to a plain :class:`BytesIO`, which is
+        resolve fall back to a plain :class:`IO`, which is
         useful for the children-surface walk but raises on the
         Tabular hooks (so they're transparently skipped by
         :meth:`_read_arrow_batches`).
@@ -1075,7 +1074,7 @@ class Folder(Path):
         media type via :meth:`IO.class_for_media_type`, so the
         write path doesn't go through the path-extension reverse-
         lookup. A media type with no registered leaf falls back to
-        a raw :class:`BytesIO` so non-tabular extensions still get a
+        a raw :class:`IO` so non-tabular extensions still get a
         working write.
 
         Returns a closed leaf. Caller opens it inside a ``with``
@@ -1095,7 +1094,7 @@ class Folder(Path):
         child_path = self.path / name
         cls = IO.class_for_media_type(opts.child_media_type, default=None)
         if cls is None:
-            leaf: "Tabular" = BytesIO(holder=child_path, owns_holder=False)
+            leaf: "Tabular" = IO(holder=child_path, owns_holder=False)
         else:
             leaf = cls(holder=child_path, owns_holder=False)
         return self.adopt_child(leaf)

@@ -342,7 +342,7 @@ class MediaType:
         reuse it as the key without re-resolving. For streaming
         codecs (gzip / zstd / lz4 / bz2 / xz / zlib / lzma) the
         decompressor is opened directly on the IO via
-        :meth:`Codec._open_decompress_reader` — no BytesIO wrap, no
+        :meth:`Codec._open_decompress_reader` — no IO wrap, no
         full-buffer materialization. Non-streaming codecs (snappy,
         brotli) fall back to reading the compressed body and calling
         :meth:`Codec.decompress_bytes`.
@@ -354,7 +354,7 @@ class MediaType:
         directly.
 
         :param io_obj: Any file-like with ``read`` + ``seek`` (stdlib
-            ``io.BytesIO``, an open file, our own ``BytesIO``, etc.).
+            ``io.BytesIO``, an open file, our own ``IO``, etc.).
         :param default: Fallback when the outer sniff finds nothing.
             ``...`` (default) raises :class:`ValueError`; any other
             value (including ``None``) is returned as-is.
@@ -471,7 +471,7 @@ class MediaType:
         # Wrap the buffer in a stdlib BytesIO and reuse
         # :meth:`_read_inner_head_io` — same code path as :meth:`from_io`.
         # Going through :meth:`Codec.read_start_end` here would pay for
-        # the full yggdrasil BytesIO acquire/release lifecycle plus a
+        # the full yggdrasil IO acquire/release lifecycle plus a
         # tail-collection state machine we don't need (``n_end=0``).
         # A bare ``io.BytesIO`` is enough: streaming decompressors
         # (gzip / zstd / lz4 / bz2 / xz / lzma / zlib) only need a

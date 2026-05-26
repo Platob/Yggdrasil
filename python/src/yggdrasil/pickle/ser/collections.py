@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import ClassVar, Generic, Iterator, Mapping
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser._scratch import _ScratchBuf
 from yggdrasil.pickle.ser.constants import CODEC_NONE
 from yggdrasil.pickle.ser.serialized import Serialized, T
@@ -50,21 +50,21 @@ _U64_STRUCT = struct.Struct(">Q")
 # low-level count helpers
 # ============================================================================
 
-def _read_u32(buffer: BytesIO) -> int:
+def _read_u32(buffer: IO) -> int:
     raw = buffer.read(4)
     if len(raw) != 4:
         raise ValueError(f"Expected 4 bytes for u32, got {len(raw)}")
     return _U32_STRUCT.unpack(raw)[0]
 
 
-def _read_u64(buffer: BytesIO) -> int:
+def _read_u64(buffer: IO) -> int:
     raw = buffer.read(8)
     if len(raw) != 8:
         raise ValueError(f"Expected 8 bytes for u64, got {len(raw)}")
     return _U64_STRUCT.unpack(raw)[0]
 
 
-def _write_count(buffer: BytesIO, count: int, *, large: bool) -> None:
+def _write_count(buffer: IO, count: int, *, large: bool) -> None:
     buffer.write(count.to_bytes(8 if large else 4, "big", signed=False))
 
 
@@ -76,7 +76,7 @@ def _is_large_count(count: int) -> bool:
 # payload builders / readers
 # ============================================================================
 
-def _iter_items(buffer: BytesIO, count: int) -> Iterator[Serialized[object]]:
+def _iter_items(buffer: IO, count: int) -> Iterator[Serialized[object]]:
     for _ in range(count):
         start = buffer.tell()
         item = Serialized.read_from(buffer, pos=start)
@@ -85,7 +85,7 @@ def _iter_items(buffer: BytesIO, count: int) -> Iterator[Serialized[object]]:
 
 
 def _iter_entry_pairs(
-    buffer: BytesIO,
+    buffer: IO,
     count: int,
 ) -> Iterator[tuple[Serialized[object], Serialized[object]]]:
     for _ in range(count):
@@ -194,14 +194,14 @@ class CollectionSerialized(Serialized[T], Generic[T]):
 
     TAG: ClassVar[int]
 
-    def _payload_buffer(self):  # → _ScratchBuf | BytesIO
+    def _payload_buffer(self):  # → _ScratchBuf | IO
         if self.codec == CODEC_NONE:
             # Non-owning view at pos=0. Works for both _ScratchBuf (from
-            # build()) and yggdrasil BytesIO (from read_from()).
+            # build()) and yggdrasil IO (from read_from()).
             return self.data.view(pos=0)
         return _ScratchBuf(self.decode())
 
-    def _read_count(self, buffer: BytesIO) -> int:
+    def _read_count(self, buffer: IO) -> int:
         return _read_u32(buffer)
 
     def _iter_from_payload(self) -> Iterator[Serialized[object]]:
@@ -359,7 +359,7 @@ class CollectionSerialized(Serialized[T], Generic[T]):
 
 @dataclass(frozen=True, slots=True)
 class LargeCollectionSerialized(CollectionSerialized[T], Generic[T]):
-    def _read_count(self, buffer: BytesIO) -> int:
+    def _read_count(self, buffer: IO) -> int:
         return _read_u64(buffer)
 
 

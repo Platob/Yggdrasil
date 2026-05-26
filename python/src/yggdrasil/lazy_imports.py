@@ -23,12 +23,6 @@ from typing import Any
 
 
 @lru_cache(maxsize=1)
-def bytes_io_class():
-    from yggdrasil.io.bytes_io import BytesIO
-    return BytesIO
-
-
-@lru_cache(maxsize=1)
 def io_class():
     from yggdrasil.io.base import IO
     return IO

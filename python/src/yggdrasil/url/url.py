@@ -53,7 +53,7 @@ import pyarrow as pa
 
 from yggdrasil.url.hive import hive_split
 from yggdrasil.lazy_imports import (
-    bytes_io_class,
+    io_class,
     media_type_class,
     mime_type_class,
 )
@@ -900,8 +900,8 @@ class URL(os.PathLike):
                 raise ValueError("Cannot parse URL from None")
             return default
 
-        bio = bytes_io_class()
-        if isinstance(obj, bio):
+        _IO = io_class()
+        if isinstance(obj, _IO):
             return cls.from_(
                 obj.url,
                 default_scheme=default_scheme, decode=decode, normalize=normalize

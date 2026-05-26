@@ -1,4 +1,4 @@
-"""Lazy, pushable execution plans for :class:`Tabular`."""
+"""Expression DSL for predicates and SQL generation."""
 
 from yggdrasil.execution.expr import (
     Arithmetic,
@@ -23,18 +23,9 @@ from yggdrasil.execution.expr import (
     lit,
     neg,
 )
-from yggdrasil.execution.plan import (
-    ExecutionPlan,
-    PlanOp,
-    Filter as FilterOp,
-    Select as SelectOp,
-    GroupByAgg as GroupByAggOp,
-    Apply as ApplyOp,
-)
 
 
 __all__ = [
-    # expr
     "Arithmetic",
     "ArithmeticOp",
     "Between",
@@ -56,11 +47,4 @@ __all__ = [
     "col",
     "lit",
     "neg",
-    # plan
-    "ExecutionPlan",
-    "PlanOp",
-    "FilterOp",
-    "SelectOp",
-    "GroupByAggOp",
-    "ApplyOp",
 ]

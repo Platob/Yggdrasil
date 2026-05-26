@@ -7,7 +7,7 @@ provides:
 * **Bytes roundtrip** — :meth:`compress_bytes`, :meth:`decompress_bytes`
   for small/medium payloads held entirely in memory.
 * **Streaming roundtrip** — :meth:`compress`, :meth:`decompress` stream
-  chunk-by-chunk between :class:`BytesIO` buffers when the underlying
+  chunk-by-chunk between :class:`IO` buffers when the underlying
   library exposes a streaming encoder/decoder (gzip, zstd, lz4, bz2,
   xz, lzma). Snappy and Brotli fall back to a bytes roundtrip since
   their Python bindings don't expose streaming.
@@ -40,12 +40,12 @@ import importlib
 import io as _io
 import logging
 import zlib
-from typing import IO, Any, TYPE_CHECKING
+from typing import IO as TypingIO, Any, TYPE_CHECKING
 
-from yggdrasil.lazy_imports import mime_type_class, bytes_io_class
+from yggdrasil.lazy_imports import mime_type_class, io_class
 
 if TYPE_CHECKING:
-    from yggdrasil.io.bytes_io import BytesIO
+    from yggdrasil.io.holder import IO
     from yggdrasil.enums.mime_type import MimeType
 
 __all__ = [
@@ -82,7 +82,7 @@ def _runtime_import(module_name: str, pip_name: str):
         )
 
 
-def _drain(fh: "IO[bytes]") -> bytes:
+def _drain(fh: "TypingIO[bytes]") -> bytes:
     """Read all remaining bytes from *fh* from the current cursor, restoring cursor.
 
     This reads from ``fh.tell()`` to EOF and then seeks back to where
@@ -151,7 +151,7 @@ class Codec(abc.ABC):
     # Streaming hooks (subclasses override to opt into streaming)
     # ------------------------------------------------------------------
 
-    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_decompress_reader(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         """Return a streaming decompressor over fh (positioned at stream start).
 
         Subclasses override when the underlying library exposes a
@@ -165,7 +165,7 @@ class Codec(abc.ABC):
         """
         return None
 
-    def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_compress_writer(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         """Return a streaming compressor that writes into fh.
 
         Subclasses override when the underlying library exposes a
@@ -186,9 +186,9 @@ class Codec(abc.ABC):
 
     def compress(
         self,
-        src: "IO[bytes] | BytesIO",
-    ) -> "BytesIO":
-        """Compress *src* into a new :class:`BytesIO`.
+        src: "IO",
+    ) -> "IO":
+        """Compress *src* into a new :class:`IO`.
 
         Streams chunk-by-chunk when :meth:`_open_compress_writer` is
         available. Otherwise falls back to a full-in-memory bytes
@@ -201,10 +201,10 @@ class Codec(abc.ABC):
 
     def decompress(
         self,
-        src: "IO[bytes] | BytesIO",
+        src: "IO",
         copy: bool = True
-    ) -> "BytesIO":
-        """Decompress *src* into a new :class:`BytesIO`.
+    ) -> "IO":
+        """Decompress *src* into a new :class:`IO`.
 
         Streams chunk-by-chunk when :meth:`_open_decompress_reader` is
         available. Otherwise falls back to a full-in-memory bytes
@@ -217,14 +217,14 @@ class Codec(abc.ABC):
 
     def _stream_roundtrip(
         self,
-        src: "IO[bytes] | BytesIO",
+        src: "IO",
         *,
         _compress: bool,
-    ) -> "BytesIO":
+    ) -> "IO":
         """Internal helper shared by :meth:`compress` and :meth:`decompress`.
 
         Both directions follow the same shape: wrap src, seek-0,
-        stream-or-fallback, return a new BytesIO, restore cursor in
+        stream-or-fallback, return a new IO, restore cursor in
         the finally.
 
         Streaming adapters are driven with ``with`` so that:
@@ -235,7 +235,7 @@ class Codec(abc.ABC):
           footer is only written on close — surface to the caller
           instead of being swallowed silently.
         """
-        bio = bytes_io_class()
+        bio = io_class()
 
         fh = bio.from_(src)
         out = bio()
@@ -283,7 +283,7 @@ class Codec(abc.ABC):
 
     def read_start_end(
         self,
-        src: "IO[bytes] | BytesIO | bytes | bytearray | memoryview",
+        src: "IO | bytes | bytearray | memoryview",
         *,
         n_start: int = 64,
         n_end: int = 64,
@@ -300,7 +300,7 @@ class Codec(abc.ABC):
         to a full :meth:`decompress_bytes` call, which materializes
         the whole uncompressed payload in memory.
         """
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.holder import IO
 
         if n_start < 0 or n_end < 0:
             raise ValueError("n_start and n_end must be >= 0")
@@ -309,7 +309,7 @@ class Codec(abc.ABC):
         if n_start == 0 and n_end == 0:
             return b"", b""
 
-        fh = BytesIO.from_(src)
+        fh = IO.from_(src)
         with fh:
             saved = fh.tell()
             try:
@@ -330,7 +330,7 @@ class Codec(abc.ABC):
 
     @staticmethod
     def _collect_head_tail(
-        reader: "IO[bytes]",
+        reader: "TypingIO[bytes]",
         n_start: int,
         n_end: int,
         chunk_size: int,
@@ -439,12 +439,12 @@ class _GzipCodec(Codec):
         import gzip
         return gzip.decompress(data)
 
-    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_decompress_reader(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         import gzip
         # GzipFile.close() does NOT close fileobj when passed via fileobj=.
         return gzip.GzipFile(fileobj=fh, mode="rb")
 
-    def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_compress_writer(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         import gzip
         return gzip.GzipFile(fileobj=fh, mode="wb")
 
@@ -484,11 +484,11 @@ class _ZstdCodec(Codec):
         with zstd.ZstdDecompressor().stream_reader(_stdlib_io.BytesIO(data)) as r:
             return r.read()
 
-    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_decompress_reader(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         zstd = _runtime_import("zstandard", "zstandard")
         return zstd.ZstdDecompressor().stream_reader(fh, closefd=False)
 
-    def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_compress_writer(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         # IMPORTANT: ``ZstdCompressionWriter.write()`` raises ZstdError
         # unless the writer is inside an active context manager. The
         # base class's :meth:`_stream_roundtrip` enters it via
@@ -516,11 +516,11 @@ class _Lz4Codec(Codec):
         lz4 = _runtime_import("lz4.frame", "lz4")
         return lz4.decompress(data)
 
-    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_decompress_reader(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         lz4 = _runtime_import("lz4.frame", "lz4")
         return lz4.open(fh, mode="rb")
 
-    def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_compress_writer(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         lz4 = _runtime_import("lz4.frame", "lz4")
         return lz4.open(fh, mode="wb")
 
@@ -543,11 +543,11 @@ class _Bzip2Codec(Codec):
         import bz2
         return bz2.decompress(data)
 
-    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_decompress_reader(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         import bz2
         return bz2.BZ2File(fh, mode="rb")
 
-    def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_compress_writer(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         import bz2
         return bz2.BZ2File(fh, mode="wb")
 
@@ -570,11 +570,11 @@ class _XzCodec(Codec):
         import lzma
         return lzma.decompress(data)
 
-    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_decompress_reader(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         import lzma
         return lzma.LZMAFile(fh, mode="rb")
 
-    def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_compress_writer(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         import lzma
         return lzma.LZMAFile(fh, mode="wb")
 
@@ -646,10 +646,10 @@ class _ZlibCodec(Codec):
     def decompress_bytes(self, data: bytes) -> bytes:
         return zlib.decompress(data)
 
-    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_decompress_reader(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         return _ZlibStreamReader(fh)
 
-    def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_compress_writer(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         return _ZlibStreamWriter(fh)
 
 
@@ -661,7 +661,7 @@ class _ZlibStreamReader(_io.RawIOBase):
     no seek/tell. Close does NOT close the underlying fh.
     """
 
-    def __init__(self, fh: "IO[bytes]", chunk_size: int = _CHUNK) -> None:
+    def __init__(self, fh: "TypingIO[bytes]", chunk_size: int = _CHUNK) -> None:
         super().__init__()
         self._fh = fh
         self._chunk = chunk_size
@@ -714,7 +714,7 @@ class _ZlibStreamWriter(_io.RawIOBase):
     Close flushes the final block into fh. Does NOT close fh.
     """
 
-    def __init__(self, fh: "IO[bytes]", level: int = -1) -> None:
+    def __init__(self, fh: "TypingIO[bytes]", level: int = -1) -> None:
         super().__init__()
         self._fh = fh
         self._comp = zlib.compressobj(level)
@@ -761,11 +761,11 @@ class _LzmaCodec(Codec):
         import lzma
         return lzma.decompress(data, format=lzma.FORMAT_ALONE)
 
-    def _open_decompress_reader(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_decompress_reader(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         import lzma
         return lzma.LZMAFile(fh, mode="rb", format=lzma.FORMAT_ALONE)
 
-    def _open_compress_writer(self, fh: "IO[bytes]") -> "IO[bytes] | None":
+    def _open_compress_writer(self, fh: "TypingIO[bytes]") -> "TypingIO[bytes] | None":
         import lzma
         return lzma.LZMAFile(fh, mode="wb", format=lzma.FORMAT_ALONE)
 

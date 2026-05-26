@@ -389,7 +389,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     #: ``MimeTypes.CSV``, ``MimeTypes.FOLDER``, …) to claim that mime
     #: in :data:`_HOLDER_FORMAT_REGISTRY`. ``None`` (the abstract
     #: default) opts out of registration — :class:`Holder` itself and
-    #: intermediate abstracts (:class:`IO`, :class:`BytesIO`,
+    #: intermediate abstracts (:class:`IO`,
     #: :class:`Memory`, :class:`LocalPath`, :class:`Path`) leave it
     #: unset so they don't shadow the real format leaves. Mirrors
     #: :attr:`scheme`.
@@ -443,7 +443,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         # Cursor / wrapping. ``_parent`` is the underlying byte holder
         # this one delegates to (``LocalPath`` underneath a
         # :class:`ParquetFile` cursor, :class:`Memory` underneath a
-        # :class:`BytesIO`, …). ``None`` on top-level storage leaves
+        # :class:`IO`, …). ``None`` on top-level storage leaves
         # (:class:`Memory`, :class:`LocalPath`, :class:`VolumePath`, …)
         # that own their bytes directly. ``_owns_parent`` decides
         # whether closing this Holder also closes the parent —
@@ -756,7 +756,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
                 **kwargs,
             )
             # When target isn't a subclass of cls (sideways routes
-            # like ``BytesIO(path="x.parquet")`` → :class:`ParquetFile`,
+            # like ``IO(path="x.parquet")`` → :class:`ParquetFile`,
             # which inherits :class:`IO` directly), Python won't
             # auto-invoke ``__init__`` on the returned instance —
             # do it ourselves so the instance is fully set up.
@@ -791,7 +791,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         # Pre-stamp the cursor's parent / ownership before ``__init__``
         # so the parent-probe (``try: self._parent``) sees the bound
         # holder instead of clobbering it. When *cls* is a cursor-only
-        # leaf (e.g. :class:`BytesIO`, :class:`ParquetFile`) and the
+        # leaf (e.g. :class:`IO`, :class:`ParquetFile`) and the
         # caller handed us a ``data`` / ``path`` / ``binary`` / ``url``
         # seed without an explicit ``holder=``, auto-build a storage
         # parent via abstract ``IO(...)`` scheme dispatch so the cursor
@@ -804,7 +804,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             instance._owns_parent = bool(owns_holder)
         elif isinstance(data, IO):
             # Cursor-over-IO: borrow the parent's storage rather than
-            # reconstructing one. ``BytesIO(other_bytes_io)`` shares the
+            # reconstructing one. ``IO(other_io)`` shares the
             # same byte substrate; the new cursor owns nothing of its
             # own beyond the position. ``_resolve_subclass(data=IO)``
             # would return ``type(data)`` and route us back into this
@@ -1072,7 +1072,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
           bytes — ``IO.from_(b"x")`` → :class:`Memory`,
           ``IO.from_("file://...")`` → :class:`LocalPath`.
         - **Cursor / format-leaf subclasses** (``cls`` has no
-          ``scheme`` — :class:`BytesIO`, :class:`ParquetFile`,
+          ``scheme`` — :class:`IO`, :class:`ParquetFile`,
           :class:`CSVFile`, …). The result is an owning cursor over
           a fresh storage parent built from *obj*.
 
@@ -1846,7 +1846,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
 
     # ------------------------------------------------------------------
     # Per-open lifecycle — Path overrides; Memory and other always-live
-    # holders inherit no-ops so :class:`BytesIO` can call them blind.
+    # holders inherit no-ops so :class:`IO` can call them blind.
     # ------------------------------------------------------------------
 
     def acquire(self) -> "IO":
@@ -2187,7 +2187,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         return False
 
     # ------------------------------------------------------------------
-    # Cursorless I/O — the canonical surface :class:`BytesIO` consumes
+    # Cursorless I/O — the canonical surface :class:`IO` consumes
     # ------------------------------------------------------------------
 
     def pread(self, n: int, pos: int, *, cursor: bool = False) -> bytes:
@@ -2701,9 +2701,8 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         if batch_size <= 0:
             raise ValueError("write_stream batch_size must be > 0")
         from yggdrasil.io.base import IO as _IO
-        from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
-        io_src = src if isinstance(src, _IO) else _YggBytesIO.from_(src)
+        io_src = src if isinstance(src, _IO) else IO.from_(src)
         n = self._write_stream(
             io_src,
             offset=offset,
@@ -2879,9 +2878,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
                 offset,
                 overwrite=overwrite,
             )
-        from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
-
-        with _YggBytesIO(holder=src, mode="rb") as io_src:
+        with IO(holder=src, mode="rb") as io_src:
             return self._write_stream(
                 io_src,
                 offset=offset,
@@ -3057,7 +3054,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     # Hashing — full-payload digests over the durable bytes.
     # ------------------------------------------------------------------
     #
-    # Lives on the holder rather than only on :class:`BytesIO` because
+    # Lives on the holder rather than only on :class:`IO` because
     # callers that only have a holder shouldn't have to open a cursor
     # just to compute a digest — the holder owns the bytes.
 

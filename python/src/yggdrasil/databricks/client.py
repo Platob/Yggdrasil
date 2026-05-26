@@ -26,7 +26,7 @@ from yggdrasil.dataclasses import (
     ExpiringDict,
     Singleton,
 )
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.enums import MimeTypes, Scheme
 from yggdrasil.url import URL, URLBased
 from yggdrasil.version import __version__ as ygg_version
@@ -1058,7 +1058,7 @@ class DatabricksClient(Singleton, URLBased):
             return self.account_id
 
         local_cache = self.local_config_folder / "workspaces_latest.parquet"
-        buff = BytesIO(local_cache, copy=False)
+        buff = IO(local_cache, copy=False)
         workspace_id = self.get_workspace_id()
 
         if local_cache.exists() and local_cache.stat().st_size > 0:

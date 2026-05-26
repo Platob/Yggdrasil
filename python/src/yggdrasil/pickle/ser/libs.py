@@ -25,7 +25,7 @@ from types import FunctionType, MethodType, ModuleType
 from typing import ClassVar, Generic, Mapping
 
 from yggdrasil.environ import runtime_import_module
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser.serialized import Serialized, T
 from yggdrasil.pickle.ser.tags import Tags
 
@@ -144,7 +144,7 @@ def _serialize_nested(obj: object) -> bytes:
 
 
 def _deserialize_nested(blob: bytes) -> object:
-    return Serialized.read_from(BytesIO(blob), pos=0).as_python()
+    return Serialized.read_from(IO(blob), pos=0).as_python()
 
 
 # ---------------------------------------------------------------------------

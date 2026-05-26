@@ -32,7 +32,7 @@ which is the single canonical "selector" the tabular API
 accepts — no separate selector node lives here. Build a Field
 with the output :attr:`name`, optional :attr:`alias` for the
 source-side label, and target :attr:`dtype`, then pass it to
-``LazyTabular.select`` or a SQL ``statement.select`` list.
+``Tabular.select`` or a SQL ``statement.select`` list.
 
 Per-engine compilation lives under :mod:`yggdrasil.execution.expr.backends`:
 each backend ships ``to_<target>`` and (where introspection is

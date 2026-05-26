@@ -61,7 +61,7 @@ from typing import Any, ClassVar, Iterator
 
 from yggdrasil.enums import Mode, Scheme
 from yggdrasil.dataclasses import WaitingConfig
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.path import Path
 from yggdrasil.io.io_stats import IOKind, IOStats
 
@@ -627,14 +627,14 @@ class LocalPath(Path):
             if not missing_ok:
                 raise
 
-    def _bread(self, n: int, pos: int, mode: Mode) -> "BytesIO":
-        """Positional read → fresh :class:`BytesIO` over a Memory holder.
+    def _bread(self, n: int, pos: int, mode: Mode) -> "IO":
+        """Positional read → fresh :class:`IO` over a Memory holder.
 
         ``n < 0`` reads to EOF. Caller owns the returned buffer
         (must close it). The :class:`Path` default would route
         through here; LocalPath's :meth:`_read_mv` short-circuits
         to :func:`_fd_pread` directly so this is mostly a fallback
-        for callers that explicitly want a BytesIO instead of bytes.
+        for callers that explicitly want an IO instead of bytes.
         """
         del mode  # read is mode-agnostic
         if self._fd >= 0:
@@ -654,16 +654,16 @@ class LocalPath(Path):
             finally:
                 os.close(fd)
 
-        return BytesIO(data)
+        return IO(data)
 
-    def _bwrite(self, data: "BytesIO", pos: int, mode: Mode) -> int:
+    def _bwrite(self, data: "IO", pos: int, mode: Mode) -> int:
         """Splice *data* at *pos* on the backing.
 
         ``mode`` honors :attr:`Mode.APPEND` by ignoring *pos* and
         landing at EOF; everything else writes positionally.
         :class:`LocalPath`'s :meth:`_write_mv` short-circuits to
         :func:`_fd_pwrite` directly, so this is the fallback for
-        callers that hand in a full BytesIO at once.
+        callers that hand in a full IO at once.
         """
         payload = data.read_bytes() if hasattr(data, "read_bytes") else bytes(data.to_bytes())
         if not payload:

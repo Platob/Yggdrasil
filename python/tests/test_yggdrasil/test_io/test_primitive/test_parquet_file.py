@@ -23,9 +23,9 @@ class TestRegistration:
         )
 
     def test_path_dispatches_via_extension(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(path=str(tmp_path / "x.parquet"))
+        b = IO(path=str(tmp_path / "x.parquet"))
         assert isinstance(b, ParquetFile)
 
     def test_open_local_path_dispatches(self, tmp_path) -> None:
@@ -51,15 +51,15 @@ class TestMemoryRoundTrip:
 
     def test_dispatch_via_stamped_media(self, table) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
-        writer = BytesIO(holder=mem, owns_holder=False)
+        writer = IO(holder=mem, owns_holder=False)
         assert isinstance(writer, ParquetFile)
         writer.write_arrow_table(table)
 
-        reader = BytesIO(holder=mem, owns_holder=False)
+        reader = IO(holder=mem, owns_holder=False)
         assert reader.read_arrow_table().equals(table)
 
 

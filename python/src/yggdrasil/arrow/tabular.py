@@ -10,7 +10,7 @@ and don't want the IPC serialization round-trip.
 Auto-spill via :class:`ArrowIPCFile`
 ------------------------------------
 
-Same shape as :class:`yggdrasil.io.buffer.bytes_io.BytesIO`: when the
+Same shape as :class:`yggdrasil.io.holder.IO`: when the
 in-memory footprint crosses ``spill_bytes`` (default 128 MiB), the
 holder spills the current in-memory tail to a fresh **part file**
 inside a per-holder spill *folder* under ``tempfile.gettempdir()``.
@@ -50,7 +50,7 @@ state is already on disk and there's nothing new to flush.
 Flip the spill threshold off with ``spill_bytes=0`` (or ``None``).
 Pass an explicit ``spill_path=`` to use a caller-owned folder;
 the caller's folder is left intact on :meth:`unpersist` /
-:meth:`_release` (mirrors the BytesIO "external spill path"
+:meth:`_release` (mirrors the IO "external spill path"
 branch — we still mint our own part files under it).
 
 What we ingest
@@ -237,11 +237,15 @@ class ArrowTabular(Tabular[CastOptions]):
         # explicitly here.
         super().__init__(**kwargs)
         self._batches: list[pa.RecordBatch] = []
-        self._schema_cache: Optional[StructField] = None if schema is None else StructField.from_arrow(schema)
+        # Use ``...`` (Ellipsis) as the "not yet resolved" sentinel so
+        # the base Tabular.collect_schema sees it as unset and delegates
+        # to _collect_schema on first access.  ``None`` would short-
+        # circuit the base check (``is not ...``) and be returned as-is.
+        self._schema_cache: "StructField | Any" = ... if schema is None else StructField.from_arrow(schema)
 
         # Spill state. ``_spill_bytes_threshold == 0`` (or None) keeps
         # the holder permanently in-memory. ``_spill_ttl`` matches the
-        # BytesIO convention so the cross-process janitor reaps stale
+        # IO convention so the cross-process janitor reaps stale
         # spill state using the same window.
         self._spill_bytes_threshold: int = int(spill_bytes or 0)
         self._spill_ttl: int = int(spill_ttl)
@@ -271,7 +275,7 @@ class ArrowTabular(Tabular[CastOptions]):
         if spill_path is not None:
             # Caller-supplied spill folder — we mint our own part files
             # inside it but don't rmtree the folder on close (mirrors
-            # the BytesIO "external spill path" branch).
+            # the IO "external spill path" branch).
             spill_dir_path = pathlib.Path(str(spill_path))
             spill_dir_path.mkdir(parents=True, exist_ok=True)
             self._spill_dir = spill_dir_path
@@ -308,7 +312,7 @@ class ArrowTabular(Tabular[CastOptions]):
         if options.target:
             return options.target
 
-        if self._schema_cache is None:
+        if self._schema_cache is ...:
             for batch in self.batches:
                 self._schema_cache = StructField.from_arrow_schema(batch.schema)
                 return self._schema_cache
@@ -416,7 +420,7 @@ class ArrowTabular(Tabular[CastOptions]):
         :class:`Disposable` calls this from ``close()`` — mmaps are
         closed first so the OS releases the page mappings before the
         folder is removed. Owned-folder-only: a caller-supplied
-        ``spill_path`` is left intact (mirrors the BytesIO external-
+        ``spill_path`` is left intact (mirrors the IO external-
         spill convention).
         """
         super()._release()

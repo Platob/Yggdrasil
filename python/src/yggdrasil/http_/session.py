@@ -84,7 +84,7 @@ from yggdrasil.http_.authorization.base import Authorization
 from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.response import HTTPResponse
 from yggdrasil.http_.response_batch import HTTPResponseBatch
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.io.headers import Headers
 from yggdrasil.path.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCFile
@@ -1810,7 +1810,7 @@ class HTTPSession(Session):
         config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         data: Any = None,
         tags: Mapping[str, str] | None = None,
         cookies: "Mapping[str, str] | None" = None,
@@ -1850,7 +1850,7 @@ class HTTPSession(Session):
         config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
@@ -1892,7 +1892,7 @@ class HTTPSession(Session):
         config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
@@ -1934,7 +1934,7 @@ class HTTPSession(Session):
         config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
@@ -1976,7 +1976,7 @@ class HTTPSession(Session):
         config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
@@ -2018,7 +2018,7 @@ class HTTPSession(Session):
         config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         data: Any = None,
         tags: Mapping[str, str] | None = None,
         cookies: "Mapping[str, str] | None" = None,
@@ -2058,7 +2058,7 @@ class HTTPSession(Session):
         config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
@@ -2101,7 +2101,7 @@ class HTTPSession(Session):
         config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         data: Any = None,
         tags: Mapping[str, str] | None = None,
         json: Any | None = None,
@@ -2125,7 +2125,7 @@ class HTTPSession(Session):
                 raise ValueError(
                     "Pass only one of body= or data= (got both). Use data= "
                     "for requests-style form/raw bodies, body= for the "
-                    "native BytesIO/bytes path."
+                    "native IO/bytes path."
                 )
             body, form_content_type = _encode_request_data(data)
             if form_content_type is not None:
@@ -2180,7 +2180,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
-        body: BytesIO | bytes | None = None,
+        body: IO | bytes | None = None,
         tags: Mapping[str, str] | None = None,
         *,
         json: Any | None = None,

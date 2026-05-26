@@ -99,8 +99,8 @@ def _serialize_nested(obj: object) -> bytes:
 
 def _deserialize_nested(blob: bytes) -> object:
     """Deserialize bytes previously produced by :func:`_serialize_nested`."""
-    from yggdrasil.io import BytesIO
-    return Serialized.read_from(BytesIO(blob), pos=0).as_python()
+    from yggdrasil.io.holder import IO
+    return Serialized.read_from(IO(blob), pos=0).as_python()
 
 
 def _opt_serialize(obj: object | None) -> bytes | None:

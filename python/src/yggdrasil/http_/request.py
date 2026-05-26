@@ -17,7 +17,6 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from yggdrasil.http_.authorization.base import Authorization
 from yggdrasil.io.base import IO
-from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
@@ -568,7 +567,7 @@ class HTTPRequest:
                 and compress_codec is not None
                 and request_body.size > compress_threshold
             ):
-                with BytesIO(holder=request_body, owns_holder=False) as src:
+                with IO(holder=request_body, owns_holder=False) as src:
                     compressed = compress_codec.compress(src)
                 request_body = compressed._parent
                 out_headers["Content-Encoding"] = compress_codec.name
@@ -1011,7 +1010,7 @@ class HTTPRequest:
         if not hash_fields:
             hash_fields = ["method", "url", "headers", "buffer"]
 
-        buff = BytesIO()
+        buff = IO()
         for hash_field in sorted(hash_fields):
             v = getattr(self, hash_field, None)
 

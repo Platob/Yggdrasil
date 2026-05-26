@@ -6,7 +6,7 @@ contract (:meth:`read_mv` / :meth:`write_mv` / :meth:`reserve` /
 whole-file primitives — :meth:`_bread` / :meth:`_bwrite` — that
 subclasses override. There is no buffering at this layer; callers
 that want to coalesce wrap the path in
-:class:`yggdrasil.io.buffer.BytesIO`.
+:class:`yggdrasil.io.holder.IO`.
 
 Subclasses implement seven hooks:
 
@@ -16,8 +16,8 @@ Subclasses implement seven hooks:
 - :meth:`_mkdir`            — create directory
 - :meth:`_remove_file`      — unlink one file
 - :meth:`_remove_dir`       — rmtree
-- :meth:`_bread`            — positional read → :class:`BytesIO`
-- :meth:`_bwrite`           — positional write ← :class:`BytesIO`
+- :meth:`_bread`            — positional read → :class:`IO`
+- :meth:`_bwrite`           — positional write ← :class:`IO`
 
 The pure-path API (parts, name, parent, suffix, joinpath, …)
 delegates straight to :class:`URL` — :class:`Path` adds no parsing
@@ -41,7 +41,6 @@ from typing import Any, ClassVar, Iterator, List, Tuple, Optional
 from yggdrasil.enums import Mode
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.base import IO
-from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats, TimeLike
 from yggdrasil.url import URL
 
@@ -197,15 +196,15 @@ class Path(IO, os.PathLike, ABC):
         """Remove the directory at this path."""
 
     @abstractmethod
-    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
-        """Positional read → fresh :class:`BytesIO`. ``n < 0`` → to EOF.
+    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
+        """Positional read → fresh :class:`IO`. ``n < 0`` → to EOF.
 
         Caller owns the returned buffer (must close it). Whole-file
         backends materialize the full payload and slice.
         """
 
     @abstractmethod
-    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
         """Splice *data* at *pos* on the backing. Returns bytes written.
 
         ``mode`` carries disposition (OVERWRITE / APPEND /
@@ -255,7 +254,7 @@ class Path(IO, os.PathLike, ABC):
             bio.close()
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
-        scratch = BytesIO(bytes(data))
+        scratch = IO(bytes(data))
         scratch.open()
         try:
             return self._bwrite(scratch, pos, Mode.OVERWRITE)
@@ -666,7 +665,7 @@ class Path(IO, os.PathLike, ABC):
         return IO.for_holder(self, media_type=media_type)
 
     # ==================================================================
-    # open(mode) — returns a BytesIO bound to self
+    # open(mode) — returns an IO bound to self
     # ==================================================================
 
     def open(

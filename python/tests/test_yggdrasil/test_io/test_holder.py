@@ -66,25 +66,25 @@ class TestFormatDispatch:
     """``Holder.__new__`` redirects IO-hierarchy inputs to the format leaf."""
 
     def test_bytes_io_with_parquet_path_dispatches(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
-        b = BytesIO(path=str(tmp_path / "x.parquet"))
+        b = IO(path=str(tmp_path / "x.parquet"))
         assert isinstance(b, ParquetFile)
 
     def test_bytes_io_with_csv_path_dispatches(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
         from yggdrasil.io.primitive.csv_file import CSVFile
 
-        b = BytesIO(path=str(tmp_path / "x.csv"))
+        b = IO(path=str(tmp_path / "x.csv"))
         assert isinstance(b, CSVFile)
 
     def test_explicit_media_type_wins_over_extension(self, tmp_path) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
-        b = BytesIO(
+        b = IO(
             path=str(tmp_path / "x.csv"),
             media_type=MediaType(MimeTypes.PARQUET),
         )
@@ -92,18 +92,18 @@ class TestFormatDispatch:
 
     def test_storage_holder_media_type_drives_dispatch(self) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
-        assert isinstance(BytesIO(holder=mem), ParquetFile)
+        assert isinstance(IO(holder=mem), ParquetFile)
 
-    def test_no_media_type_falls_back_to_bytes_io(self) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+    def test_no_media_type_falls_back_to_memory(self) -> None:
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(b"plain bytes")
-        assert type(b) is BytesIO
+        b = IO(b"plain bytes")
+        assert type(b) is Memory
 
     def test_data_string_path_dispatches(self, tmp_path) -> None:
         from yggdrasil.io.base import IO
@@ -116,17 +116,17 @@ class TestFormatDispatch:
 class TestConflictingArgs:
 
     def test_holder_and_data_raise(self) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
         mem = Memory()
         with pytest.raises(TypeError, match="holder= OR data OR path="):
-            BytesIO(b"hi", holder=mem)
+            IO(b"hi", holder=mem)
 
     def test_data_and_path_raise(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
         with pytest.raises(TypeError, match="data= OR path="):
-            BytesIO(b"hi", path=str(tmp_path / "x.bin"))
+            IO(b"hi", path=str(tmp_path / "x.bin"))
 
 
 # ---------------------------------------------------------------------------
@@ -523,11 +523,11 @@ class TestFromUrl:
         assert sibling.url == target
 
     def test_cursor_reuses_parent_storage(self) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
         from yggdrasil.url import URL
 
         mem = Memory(b"shared")
-        cursor = BytesIO(holder=mem, owns_holder=False, mode="rb")
+        cursor = IO(holder=mem, owns_holder=False, mode="rb")
         sibling = cursor._from_url(URL.from_("/foo/bar/data.parquet"))
         # Cursor branch: new sibling shares the SAME parent storage.
         assert sibling._parent is mem

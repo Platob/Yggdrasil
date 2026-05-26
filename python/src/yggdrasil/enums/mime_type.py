@@ -351,7 +351,7 @@ class MimeType:
     ) -> "MimeType | None":
         """Resolve by sniffing magic bytes from *magic*.
 
-        Accepts raw bytes/memoryview, a BytesIO, or anything the
+        Accepts raw bytes/memoryview, an IO, or anything the
         buffer class can wrap. Reads the first 64 bytes and walks
         the registered magic matchers in definition order.
 
@@ -378,7 +378,7 @@ class MimeType:
                 finally:
                     fh.seek(saved)
             else:
-                bio = BytesIO(magic)
+                bio = IO(magic)
                 bio.acquire()
                 try:
                     magic = bytes(bio.pread(64, 0))

@@ -383,7 +383,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
     :attr:`arrow_values`, matching :data:`RESPONSE_SCHEMA.to_arrow_schema()`. To
     parse the *body* as a tabular payload (Parquet, CSV, JSON …),
     open a cursor with :meth:`open` and use that cursor's Tabular
-    surface — :class:`BytesIO` dispatches to the right format leaf
+    surface — :class:`IO` dispatches to the right format leaf
     via the holder's media type — or call the existing
     :meth:`to_arrow_batches` with ``parse=True``.
 

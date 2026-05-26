@@ -1,6 +1,6 @@
-"""Parquet Tabular leaf over the new :class:`BytesIO` substrate.
+"""Parquet Tabular leaf over the new :class:`IO` substrate.
 
-:class:`ParquetFile` is a :class:`BytesIO` subclass that auto-registers
+:class:`ParquetFile` is an :class:`IO` subclass that auto-registers
 under :data:`MimeTypes.PARQUET`. The Parquet file format is
 footer-indexed: readers parse the metadata block at the end of the
 file once and use it to plan column reads. Writes buffer row groups

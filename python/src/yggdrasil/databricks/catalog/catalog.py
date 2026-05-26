@@ -38,7 +38,7 @@ from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.url import URL
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import Path
 from yggdrasil.enums.mode import Mode, ModeLike
@@ -237,12 +237,12 @@ class UCCatalog(DatabricksPath, Singleton):
             f"Use ``create()`` / ``update()`` to mutate metadata."
         )
 
-    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
         raise NotImplementedError(
             f"{type(self).__name__} is a logical Unity Catalog resource."
         )
 
-    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
         raise NotImplementedError(
             f"{type(self).__name__} is a logical Unity Catalog resource."
         )

@@ -5,8 +5,8 @@ read/write hits an internally-managed :class:`bytearray`. No fd, no
 spill file, no transaction layer. Capacity grows with the standard
 1.5× amortization pattern so back-to-back appends stay cheap.
 
-Composes with :class:`yggdrasil.io.buffer.BytesIO`: a memory-mode
-``BytesIO`` is conceptually a Memory holder plus a cursor and the
+Composes with :class:`yggdrasil.io.holder.IO`: a memory-mode
+``IO`` is conceptually a Memory holder plus a cursor and the
 Tabular read/write surface.
 
 Auto-spill
@@ -116,7 +116,7 @@ class Memory(IO):
 
     - **Contextual opening (preferred for hot paths):** wrap usage in
       ``with mem.open() as bio:`` (or ``with mem:``). This pins the
-      backing, lets :class:`BytesIO` accumulate writes in a single
+      backing, lets :class:`IO` accumulate writes in a single
       cursor, and gives the spill path a consistent acquire/release
       window. This is the performant pattern for a sequence of
       reads/writes.
@@ -231,7 +231,7 @@ class Memory(IO):
     # past close would be a real fd leak, not just a GC oddity.
 
     @classmethod
-    def view(
+    def from_bytearray(
         cls,
         buf: bytearray,
         size: Optional[int] = None,
@@ -245,8 +245,8 @@ class Memory(IO):
         :meth:`reserve` propagate to ``buf`` directly. Closing the
         returned Memory does not free ``buf``.
 
-        Used by :class:`BytesIO` as the in-memory ``_owner``: the
-        same bytearray BytesIO mutates directly is exposed through
+        Used by :class:`IO` as the in-memory ``_owner``: the
+        same bytearray IO mutates directly is exposed through
         the :class:`Holder` interface for backend-agnostic callers.
 
         ``view``-constructed instances cannot spill: the whole point

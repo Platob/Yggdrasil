@@ -261,16 +261,16 @@ class RemotePath(Path):
     # Resize is a no-op on remote backends — the upload IS the resize
     # ------------------------------------------------------------------
 
-    def _bread(self, n: int, pos: int, mode) -> "BytesIO":
-        from yggdrasil.io.bytes_io import BytesIO
+    def _bread(self, n: int, pos: int, mode) -> "IO":
+        from yggdrasil.io.holder import IO
         del mode
         if n == 0:
-            return BytesIO()
+            return IO()
         try:
             data = bytes(self._read_mv(n, pos))
         except FileNotFoundError:
             data = b""
-        return BytesIO(data)
+        return IO(data)
 
     def _bwrite(self, data, pos: int, mode) -> int:
         del mode
@@ -598,13 +598,13 @@ class RemotePath(Path):
         try:
             chunk = bytes(self._read_mv(page_size, page_offset))
         except FileNotFoundError:
-            return Memory.view(bytearray(page_size), size=0)
+            return Memory.from_bytearray(bytearray(page_size), size=0)
         if not chunk:
-            return Memory.view(bytearray(page_size), size=0)
+            return Memory.from_bytearray(bytearray(page_size), size=0)
         buf = bytearray(page_size)
         n = min(len(chunk), page_size)
         buf[:n] = chunk[:n]
-        return Memory.view(buf, size=n)
+        return Memory.from_bytearray(buf, size=n)
 
     def _paged_write(self, data: memoryview, offset: int) -> None:
         page_size = self._page_size
@@ -630,7 +630,7 @@ class RemotePath(Path):
                 # both this page's slot and any backend tail past the
                 # write — there's nothing to preserve.
                 if slice_start == 0 and slice_end >= page_backend_len:
-                    page = Memory.view(bytearray(page_size), size=slice_end)
+                    page = Memory.from_bytearray(bytearray(page_size), size=slice_end)
                 else:
                     page = self._fetch_page(page_idx)
                 pages.set(page_idx, page)

@@ -17,7 +17,7 @@ import pytest
 
 from yggdrasil.enums.codec import Codec, Codecs
 from yggdrasil.enums.mime_type import MimeTypes
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.io.base import IO
 
 
 _PAYLOAD = (b"yggdrasil-codec-roundtrip-" + b"x" * 16) * 32
@@ -121,7 +121,7 @@ class TestStreamingRoundTrip:
     def test_round_trip_via_bytes_io(self, codec: Codec) -> None:
         if not _codec_available(codec):
             pytest.skip(f"{codec.name} backend not installed")
-        src = BytesIO(_PAYLOAD)
+        src = IO(_PAYLOAD)
         with src:
             compressed = codec.compress(src)
         with compressed:

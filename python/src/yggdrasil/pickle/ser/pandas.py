@@ -7,7 +7,7 @@ from typing import ClassVar, Generic, Mapping, TypeVar
 from yggdrasil.lazy_imports import pandas as pd
 import pyarrow as pa
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
 
@@ -234,7 +234,7 @@ class PandasSerialized(Serialized[TPandas], Generic[TPandas]):
 
     @staticmethod
     def _deserialize_nested_payload(data: bytes) -> object:
-        nested = Serialized.read_from(BytesIO(data), pos=0)
+        nested = Serialized.read_from(IO(data), pos=0)
         return nested.as_python()
 
     @staticmethod
