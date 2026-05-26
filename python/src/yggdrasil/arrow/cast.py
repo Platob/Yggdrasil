@@ -146,10 +146,10 @@ def _is_arrow_dataset(obj: Any) -> bool:
     feeds a Dataset into the cast pipeline.
     """
     try:
-        ds = pyarrow_dataset_module()
-    except Exception:
+        from yggdrasil.spark.tabular import SparkDataset
+        return isinstance(obj, SparkDataset)
+    except ImportError:
         return False
-    return isinstance(obj, ds.SparkDataset)
 
 
 def _is_yggdrasil_tabular(obj: Any) -> bool:
