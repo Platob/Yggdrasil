@@ -1537,11 +1537,17 @@ class CastOptions:
             return obj
         return self.target.cast_spark(obj, options=self)
 
-    def cast_spark_tabular(self, obj: Any) -> Any:
-        """Cast any spark object — delegates to :meth:`Field.cast_spark`."""
+    def cast_spark_tabular(self, df: Any) -> Any:
+        """Filter + cast a Spark DataFrame.
+
+        Applies :attr:`predicate` (when set) then delegates to
+        :meth:`Field.cast_spark_tabular` for schema coercion.
+        """
+        if self.predicate is not None:
+            df = self.predicate.filter_spark_frame(df)
         if self.target is None:
-            return obj
-        return self.target.cast_spark_tabular(obj, options=self)
+            return df
+        return self.target.cast_spark_tabular(df, options=self)
 
     def cast_spark_column(self, obj: Any) -> Any:
         """Cast any spark object — delegates to :meth:`Field.cast_spark`."""

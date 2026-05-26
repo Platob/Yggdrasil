@@ -237,9 +237,7 @@ class Dataset(Tabular[CastOptions]):
     def _count(self, options=None) -> int:
         if self._frame is None:
             return 0
-        df = self._frame
-        if options is not None and options.predicate is not None:
-            df = options.predicate.filter_spark_frame(df)
+        df = options.cast_spark_tabular(self._frame) if options is not None else self._frame
         return df.count()
 
     # ------------------------------------------------------------------
