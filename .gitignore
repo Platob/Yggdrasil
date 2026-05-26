@@ -220,3 +220,8 @@ __marimo__/
 /python/\*/
 .next/
 .claude/worktrees/
+
+# Node.js
+node_modules/
+tsconfig.tsbuildinfo
+*.tsbuildinfo
