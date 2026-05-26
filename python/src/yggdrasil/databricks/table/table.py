@@ -3611,7 +3611,7 @@ class Table(DatabricksPath):
             )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
-        from yggdrasil.spark.sql_statement import SparkSQLStatement
+        from yggdrasil.spark.statement import SparkPreparedStatement
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
 
@@ -3716,9 +3716,9 @@ class Table(DatabricksPath):
 
         retry_cfg = _resolve_retry(retry)
 
-        def _prepare_spark_batch(texts: list[str]) -> list[SparkSQLStatement]:
+        def _prepare_spark_batch(texts: list[str]) -> list[SparkPreparedStatement]:
             return [
-                SparkSQLStatement(text=sql, spark_session=session)
+                SparkPreparedStatement(text=sql, spark_session=session)
                 for sql in texts
             ]
 

@@ -37,7 +37,7 @@ from yggdrasil.databricks.warehouse import (
 from yggdrasil.databricks.warehouse.wh_utils import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import Mode
-from yggdrasil.spark.sql_statement import SparkSQLStatement
+from yggdrasil.spark.statement import SparkPreparedStatement, SparkStatementResult
 from .spark_executor import DatabricksSparkStatementExecutor
 from yggdrasil.databricks.catalog.catalogs import Catalogs
 from yggdrasil.databricks.schema.schemas import Schemas
@@ -352,13 +352,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
     def _submit_statement(
         self,
-        statement: WarehousePreparedStatement | SparkSQLStatement,
+        statement: WarehousePreparedStatement | SparkPreparedStatement,
         start: bool = True,
-    ) -> WarehouseStatementResult | SparkSQLStatement:
-        if isinstance(statement, SparkSQLStatement):
-            if start:
-                statement.start(wait=False, raise_error=False)
-            return statement
+    ) -> WarehouseStatementResult | SparkStatementResult:
+        if isinstance(statement, SparkPreparedStatement):
+            return self.spark.send(statement, start=start)
 
         if not isinstance(statement, WarehousePreparedStatement):
             statement = WarehousePreparedStatement.from_(statement)
@@ -420,17 +418,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
             else:
                 text = str(statement).strip()
 
-            prepared = SparkSQLStatement(
+            prepared = SparkPreparedStatement(
                 text=text,
                 spark_session=session,
                 row_limit=row_limit,
             )
-            prepared.start(wait=False, raise_error=False)
-            if wait is not False:
-                prepared.wait(wait=wait, raise_error=raise_error)
-            elif raise_error:
-                prepared.raise_for_status()
-            return prepared
         else:
             prepared = WarehousePreparedStatement.prepare(
                 statement,
@@ -478,23 +470,12 @@ class SQLEngine(DatabricksService, StatementExecutor):
         engine_choice = self._pick_engine(engine, spark_session)
 
         if engine_choice == "spark":
-            session = spark_session or self.spark.resolve_session(create=True)
-            results = []
-            texts = (
-                statements.values()
-                if isinstance(statements, Mapping)
-                else statements
+            return self.spark.execute_many(
+                statements,
+                wait=wait,
+                raise_error=raise_error,
+                parallel=parallel,
             )
-            for stmt in texts:
-                text = stmt.text if isinstance(stmt, PreparedStatement) else str(stmt).strip()
-                s = SparkSQLStatement(text=text, spark_session=session)
-                s.start(wait=False, raise_error=False)
-                results.append(s)
-            if wait is not False:
-                wc = WaitingConfig.from_(wait)
-                for s in results:
-                    s._wait(wc, raise_error=raise_error)
-            return results
 
         # Warehouse path — broadcast retry config onto warehouse statements.
         if retry is not None:
