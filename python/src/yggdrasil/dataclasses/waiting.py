@@ -25,6 +25,7 @@ class WaitingConfig:
     backoff: float = 1.5
     max_interval: float = 10.0
     retries: int = 4
+    max_attempts: Optional[int] = 4
 
     def __getstate__(self) -> dict:
         return {
@@ -33,6 +34,7 @@ class WaitingConfig:
             "backoff": self.backoff,
             "max_interval": self.max_interval,
             "retries": self.retries,
+            "max_attempts": self.max_attempts,
         }
 
     def __setstate__(self, state: dict) -> None:
@@ -42,6 +44,7 @@ class WaitingConfig:
         object.__setattr__(self, "backoff", state.get("backoff", 1.0))
         object.__setattr__(self, "max_interval", state.get("max_interval", 10.0))
         object.__setattr__(self, "retries", state.get("retries", 8))
+        object.__setattr__(self, "max_attempts", state.get("max_attempts", 4))
 
     def __bool__(self):
         return self.timeout > 0
@@ -105,16 +108,17 @@ class WaitingConfig:
         backoff: Optional[Union[int, float, dt.timedelta]] = None,
         max_interval: Optional[Union[int, float, dt.timedelta]] = None,
         retries: int | None = None,
+        max_attempts: int | None = ...,
     ) -> "WaitingConfig":
         # Hot paths — every backend ``wait`` / ``raise_error`` plumbing
         # routes through here. Cache the three trivial coercions
         # (``None`` / ``True`` / ``False``) so the steady-state lookup
         # is one isinstance + one dict-style branch with no allocation.
-        if arg is None and timeout is None:
+        if arg is None and timeout is None and max_attempts is ...:
             return DEFAULT_WAITING_CONFIG
-        if arg is True and timeout is None and interval is None and backoff is None and max_interval is None and retries is None:
+        if arg is True and timeout is None and interval is None and backoff is None and max_interval is None and retries is None and max_attempts is ...:
             return _TRUE_WAITING_CONFIG
-        if arg is False and timeout is None and interval is None and backoff is None and max_interval is None and retries is None:
+        if arg is False and timeout is None and interval is None and backoff is None and max_interval is None and retries is None and max_attempts is ...:
             return _FALSE_WAITING_CONFIG
 
         base_timeout: float | None = None
@@ -122,10 +126,11 @@ class WaitingConfig:
         base_backoff: float | None = None
         base_max_interval: float | None = None
         base_retries: int | None = None
+        base_max_attempts: int | None = ...
 
         if arg is not None:
             if isinstance(arg, cls):
-                if timeout is None and interval is None and backoff is None and max_interval is None:
+                if timeout is None and interval is None and backoff is None and max_interval is None and max_attempts is ...:
                     return arg
 
                 base_timeout = arg.timeout
@@ -133,6 +138,7 @@ class WaitingConfig:
                 base_backoff = arg.backoff
                 base_max_interval = arg.max_interval
                 base_retries = arg.retries
+                base_max_attempts = arg.max_attempts
 
             elif isinstance(arg, bool):
                 base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
@@ -159,6 +165,8 @@ class WaitingConfig:
                 base_interval = cls._to_seconds(arg.get("interval"))
                 base_backoff = cls._to_seconds(arg.get("backoff"))
                 base_max_interval = cls._to_seconds(arg.get("max_interval"))
+                if "max_attempts" in arg:
+                    base_max_attempts = arg["max_attempts"]
 
             else:
                 raise TypeError(f"Unsupported WaitingOptions arg type: {type(arg)!r}")
@@ -169,6 +177,7 @@ class WaitingConfig:
         final_backoff = cls._to_seconds(backoff) if backoff is not None else base_backoff
         final_max_interval = cls._to_seconds(max_interval) if max_interval is not None else base_max_interval
         final_retries = retries if retries is not None else base_retries
+        final_max_attempts = max_attempts if max_attempts is not ... else base_max_attempts
 
         # defaults to match non-Optional signature
         if final_timeout is None:
@@ -192,12 +201,16 @@ class WaitingConfig:
         elif final_retries < 0:
             final_retries = 0
 
+        if final_max_attempts is ...:
+            final_max_attempts = 4
+
         return cls(
             timeout=float(final_timeout),
             interval=float(final_interval),
             backoff=float(final_backoff),
             max_interval=float(final_max_interval),
-            retries=int(final_retries)
+            retries=int(final_retries),
+            max_attempts=final_max_attempts,
         )
 
     def is_expired(self, start: float):

@@ -12,6 +12,7 @@ __all__ = ["Awaitable"]
 
 class Awaitable(ABC):
     _state: State = State.IDLE
+    _attempts: int = 0
 
     @property
     def state(self) -> State:
@@ -20,6 +21,10 @@ class Awaitable(ABC):
     @state.setter
     def state(self, value: Any) -> None:
         self._state = State.from_(value)
+
+    @property
+    def attempts(self) -> int:
+        return self._attempts
 
     @property
     def is_idle(self) -> bool:
@@ -65,8 +70,16 @@ class Awaitable(ABC):
     def _start(self) -> None:
         ...
 
+    @abstractmethod
+    def raise_for_status(self) -> None:
+        ...
+
     def _cancel(self) -> None:
         self._state = State.CANCELED
+
+    def _raise_for_status(self) -> None:
+        if self.is_failed:
+            self.raise_for_status()
 
     def start(
         self,
@@ -80,6 +93,7 @@ class Awaitable(ABC):
         if reset and self.started and not self.is_done:
             self.cancel(wait=False, raise_error=False)
         self._state = State.PENDING
+        self._attempts += 1
         self._start()
         if wait is not False:
             wc = WaitingConfig.from_(wait)
@@ -94,7 +108,7 @@ class Awaitable(ABC):
         if wait is False:
             self._poll()
             if self.is_done and self.is_failed and raise_error:
-                self.raise_for_status()
+                self._raise_for_status()
             return self
         wc = WaitingConfig.from_(wait)
         return self._wait(wc, raise_error=raise_error)
@@ -110,16 +124,19 @@ class Awaitable(ABC):
             self._poll()
             if self.is_done:
                 if self.is_failed and self.retryable and not wait.is_expired(start):
-                    self.start(reset=True, wait=False)
-                    iteration = 0
-                    continue
+                    if wait.max_attempts is not None and self._attempts >= wait.max_attempts:
+                        pass
+                    else:
+                        self.start(reset=True, wait=False)
+                        iteration = 0
+                        continue
                 if self.is_failed and raise_error:
                     if wait.is_expired(start):
                         raise TimeoutError(
                             f"{type(self).__name__} timed out after {wait.timeout:.1f}s "
                             f"(state={self._state})"
                         )
-                    self.raise_for_status()
+                    self._raise_for_status()
                 return self
             if wait.is_expired(start):
                 if raise_error:
@@ -143,12 +160,6 @@ class Awaitable(ABC):
             wc = WaitingConfig.from_(wait)
             self._wait(wc, raise_error=raise_error)
         return self
-
-    def raise_for_status(self) -> None:
-        if self.is_failed:
-            raise RuntimeError(
-                f"{type(self).__name__} {self._state}: {self._state.name}"
-            )
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} state={self._state}>"

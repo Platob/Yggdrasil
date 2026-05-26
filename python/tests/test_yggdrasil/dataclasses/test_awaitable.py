@@ -15,6 +15,10 @@ class _InstantTask(Awaitable):
     def _start(self):
         self._state = State.RUNNING
 
+    def raise_for_status(self):
+        if self.is_failed:
+            raise RuntimeError(f"task {self._state.name}")
+
 
 class _SlowTask(Awaitable):
     def __init__(self, polls_until_done: int = 3):
@@ -30,6 +34,10 @@ class _SlowTask(Awaitable):
         self._state = State.RUNNING
         self._polls = 0
 
+    def raise_for_status(self):
+        if self.is_failed:
+            raise RuntimeError(f"task {self._state.name}")
+
 
 class _FailingTask(Awaitable):
     def _poll(self):
@@ -38,11 +46,14 @@ class _FailingTask(Awaitable):
     def _start(self):
         self._state = State.RUNNING
 
+    def raise_for_status(self):
+        if self.is_failed:
+            raise RuntimeError(f"task {self._state.name}")
+
 
 class _RetryableTask(Awaitable):
     def __init__(self, fail_count: int = 1):
         self._fail_count = fail_count
-        self._attempts = 0
         self._polls = 0
 
     @property
@@ -58,15 +69,15 @@ class _RetryableTask(Awaitable):
                 self._state = State.SUCCEEDED
 
     def _start(self):
-        self._attempts += 1
         self._polls = 0
         self._state = State.RUNNING
 
+    def raise_for_status(self):
+        if self.is_failed:
+            raise RuntimeError(f"task {self._state.name}")
+
 
 class _AlwaysRetryableTask(Awaitable):
-    def __init__(self):
-        self._attempts = 0
-
     @property
     def retryable(self) -> bool:
         return True
@@ -75,8 +86,11 @@ class _AlwaysRetryableTask(Awaitable):
         self._state = State.FAILED
 
     def _start(self):
-        self._attempts += 1
         self._state = State.RUNNING
+
+    def raise_for_status(self):
+        if self.is_failed:
+            raise RuntimeError(f"task {self._state.name}")
 
 
 class _CancellableTask(Awaitable):
@@ -92,6 +106,10 @@ class _CancellableTask(Awaitable):
         self.cancelled = True
         self._state = State.CANCELED
 
+    def raise_for_status(self):
+        if self.is_failed:
+            raise RuntimeError(f"task {self._state.name}")
+
 
 class TestAbstract:
 
@@ -102,6 +120,7 @@ class TestAbstract:
     def test_abstract_methods(self):
         assert "_poll" in Awaitable.__abstractmethods__
         assert "_start" in Awaitable.__abstractmethods__
+        assert "raise_for_status" in Awaitable.__abstractmethods__
 
 
 class TestInitialState:
@@ -121,6 +140,9 @@ class TestInitialState:
 
     def test_not_active(self):
         assert not _InstantTask().is_active
+
+    def test_zero_attempts(self):
+        assert _InstantTask().attempts == 0
 
 
 class TestStateSetter:
@@ -205,6 +227,11 @@ class TestStart:
         t.start(wait=False)
         assert t.state is State.RUNNING
 
+    def test_start_increments_attempts(self):
+        t = _InstantTask()
+        t.start(wait=False)
+        assert t.attempts == 1
+
     def test_start_with_wait_blocks_until_done(self):
         t = _InstantTask()
         t.start(wait=True)
@@ -228,6 +255,12 @@ class TestStart:
         t._state = State.RUNNING
         t.start(reset=True, wait=False)
         assert t.cancelled
+
+    def test_start_reset_increments_attempts(self):
+        t = _InstantTask()
+        t.start(wait=False)
+        t.start(reset=True, wait=False)
+        assert t.attempts == 2
 
     def test_start_returns_self(self):
         t = _InstantTask()
@@ -305,18 +338,18 @@ class TestRetry:
     def test_retryable_task_retries_on_failure(self):
         t = _RetryableTask(fail_count=1)
         t.start(wait=False)
-        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01)
+        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01, max_attempts=None)
         t.wait(wait=wc)
         assert t.is_succeeded
-        assert t._attempts == 2
+        assert t.attempts == 2
 
     def test_retryable_task_multiple_retries(self):
         t = _RetryableTask(fail_count=3)
         t.start(wait=False)
-        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01)
+        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01, max_attempts=None)
         t.wait(wait=wc)
         assert t.is_succeeded
-        assert t._attempts == 4
+        assert t.attempts == 4
 
     def test_non_retryable_failure_raises_immediately(self):
         t = _FailingTask()
@@ -327,24 +360,83 @@ class TestRetry:
     def test_always_retryable_times_out(self):
         t = _AlwaysRetryableTask()
         t.start(wait=False)
-        wc = WaitingConfig(timeout=0.05, interval=0.001, backoff=1.0, max_interval=0.01)
+        wc = WaitingConfig(timeout=0.05, interval=0.001, backoff=1.0, max_interval=0.01, max_attempts=None)
         with pytest.raises(TimeoutError):
             t.wait(wait=wc)
-        assert t._attempts > 1
+        assert t.attempts > 1
 
     def test_always_retryable_no_raise_returns(self):
         t = _AlwaysRetryableTask()
         t.start(wait=False)
-        wc = WaitingConfig(timeout=0.05, interval=0.001, backoff=1.0, max_interval=0.01)
+        wc = WaitingConfig(timeout=0.05, interval=0.001, backoff=1.0, max_interval=0.01, max_attempts=None)
         result = t.wait(wait=wc, raise_error=False)
         assert result is t
+
+    def test_max_attempts_caps_retries(self):
+        t = _AlwaysRetryableTask()
+        t.start(wait=False)
+        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01, max_attempts=3)
+        with pytest.raises(RuntimeError):
+            t.wait(wait=wc)
+        assert t.attempts == 3
+
+    def test_max_attempts_none_unlimited(self):
+        t = _RetryableTask(fail_count=2)
+        t.start(wait=False)
+        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01, max_attempts=None)
+        t.wait(wait=wc)
+        assert t.is_succeeded
+        assert t.attempts == 3
+
+    def test_max_attempts_default_is_four(self):
+        wc = WaitingConfig.from_(True)
+        assert wc.max_attempts == 4
 
     def test_retryable_resets_iteration_counter(self):
         t = _RetryableTask(fail_count=1)
         t.start(wait=False)
-        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01)
+        wc = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01, max_attempts=None)
         t.wait(wait=wc)
         assert t._polls >= 2
+
+
+class TestRaiseForStatus:
+
+    def test_raise_for_status_is_abstract(self):
+        assert "raise_for_status" in Awaitable.__abstractmethods__
+
+    def test_raises_on_failed(self):
+        t = _InstantTask()
+        t._state = State.FAILED
+        with pytest.raises(RuntimeError, match="FAILED"):
+            t.raise_for_status()
+
+    def test_raises_on_canceled(self):
+        t = _InstantTask()
+        t._state = State.CANCELED
+        with pytest.raises(RuntimeError, match="CANCELED"):
+            t.raise_for_status()
+
+    def test_no_raise_on_succeeded(self):
+        t = _InstantTask()
+        t._state = State.SUCCEEDED
+        t.raise_for_status()
+
+    def test_no_raise_on_running(self):
+        t = _InstantTask()
+        t._state = State.RUNNING
+        t.raise_for_status()
+
+    def test_private_raise_for_status_delegates(self):
+        t = _InstantTask()
+        t._state = State.FAILED
+        with pytest.raises(RuntimeError):
+            t._raise_for_status()
+
+    def test_private_raise_for_status_noop_when_not_failed(self):
+        t = _InstantTask()
+        t._state = State.SUCCEEDED
+        t._raise_for_status()
 
 
 class TestCancel:
@@ -378,31 +470,6 @@ class TestCancel:
         t._state = State.RUNNING
         t.cancel(wait=False)
         assert t.is_canceled
-
-
-class TestRaiseForStatus:
-
-    def test_raises_on_failed(self):
-        t = _InstantTask()
-        t._state = State.FAILED
-        with pytest.raises(RuntimeError, match="FAILED"):
-            t.raise_for_status()
-
-    def test_raises_on_canceled(self):
-        t = _InstantTask()
-        t._state = State.CANCELED
-        with pytest.raises(RuntimeError, match="CANCELED"):
-            t.raise_for_status()
-
-    def test_no_raise_on_succeeded(self):
-        t = _InstantTask()
-        t._state = State.SUCCEEDED
-        t.raise_for_status()
-
-    def test_no_raise_on_running(self):
-        t = _InstantTask()
-        t._state = State.RUNNING
-        t.raise_for_status()
 
 
 class TestRepr:
