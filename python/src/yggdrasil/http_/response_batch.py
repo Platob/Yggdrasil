@@ -79,8 +79,8 @@ class HTTPResponseBatch(Tabular):
     __slots__ = (
         "_send_config", "_requests", "_session",
         "_local_hashes", "_remote_hashes",
-        "_local", "_remote", "_new",
-        "_split_done", "_misses", "failed",
+        "_local", "_remote", "_new", "_failed",
+        "_split_done", "_misses",
     )
 
     def __init__(
@@ -110,7 +110,9 @@ class HTTPResponseBatch(Tabular):
             self._new = _to_tabular(new_responses_tabular)
 
         self._misses: list = misses if misses is not None else list(requests)
-        self.failed: list = failed or []
+        self._failed: Optional[Tabular] = (
+            responses_to_tabular(failed) if failed else None
+        )
 
     def _ensure_split(self) -> None:
         if self._split_done:
@@ -215,6 +217,7 @@ class HTTPResponseBatch(Tabular):
         cfg = self._send_config
         ok_list: list[Response] = []
         all_list: list[Response] = []
+        err_list: list[Response] = []
         for response in self._session._fetch_misses(
             misses, ordered=ordered, max_in_flight=max_in_flight,
         ):
@@ -222,11 +225,13 @@ class HTTPResponseBatch(Tabular):
             if response.ok:
                 ok_list.append(response)
             elif cfg.raise_error:
-                self.failed.append(response)
+                err_list.append(response)
+        if err_list:
+            self.failed = err_list
         LOGGER.info(
             "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-            len(ok_list) + len(self.failed), len(misses),
-            len(ok_list), len(self.failed),
+            len(ok_list) + len(err_list), len(misses),
+            len(ok_list), len(err_list),
         )
         if all_list:
             self.new = pa.Table.from_batches(
@@ -260,7 +265,7 @@ class HTTPResponseBatch(Tabular):
             )
             err_table = spark_dataframe_to_arrow(err_df)
             if len(err_table) > 0:
-                self.failed = list(Response.from_arrow_tabular(err_table))
+                self.failed = err_table
             write_data = ok_df
 
         self.new = result_df
@@ -397,6 +402,21 @@ class HTTPResponseBatch(Tabular):
         self._new = _to_tabular(value)
 
     @property
+    def failed(self) -> "Tabular | None":
+        return self._failed
+
+    @failed.setter
+    def failed(self, value) -> None:
+        if isinstance(value, list):
+            self._failed = responses_to_tabular(value) if value else None
+        else:
+            self._failed = _to_tabular(value)
+
+    @property
+    def failed_count(self) -> int:
+        return self._failed.count() if self._failed is not None else 0
+
+    @property
     def send_config(self) -> "SendConfig":
         return self._send_config
 
@@ -497,7 +517,7 @@ class HTTPResponseBatch(Tabular):
         self._misses.extend(other._misses)
         self._local_hashes |= other._local_hashes
         self._remote_hashes |= other._remote_hashes
-        self.failed.extend(other.failed)
+        self._failed = _union(self._failed, other._failed)
         return self
 
 

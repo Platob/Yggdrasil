@@ -1476,7 +1476,7 @@ class HTTPSession(Session):
                 )
                 total_cache_hits += len(reqs) - len(batch.misses)
                 total_network += batch.counts.get("new", 0)
-                total_failed += len(batch.failed)
+                total_failed += batch.failed_count
                 yield batch
 
         LOGGER.info(
