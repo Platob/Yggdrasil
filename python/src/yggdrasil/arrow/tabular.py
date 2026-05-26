@@ -85,8 +85,11 @@ import pathlib
 from typing import Any, ClassVar, Iterable, Iterator, Optional, Union
 
 import pyarrow as pa
+from yggdrasil.data import StructField, Schema
 
 from yggdrasil.data.options import CastOptions
+from yggdrasil.io import IOStats
+from yggdrasil.io.tabular import O
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.data.enums import MimeType, Mode
 from yggdrasil.pickle.serde import ObjectSerde
@@ -204,11 +207,25 @@ class ArrowTabular(Tabular[CastOptions]):
         # win factory dispatch by accident.
         return None
 
+    @classmethod
+    def from_arrow_batches(
+        cls,
+        batches: Iterable[pa.RecordBatch],
+        *,
+        schema: StructField = None,
+        **kwargs
+    ) -> "ArrowTabular":
+        return cls(
+            batches,
+            schema=schema,
+            **kwargs
+        )
+
     def __init__(
         self,
         data: ArrowSource = None,
         *more: ArrowSource,
-        schema: Optional[pa.Schema] = None,
+        schema: Optional[StructField] = None,
         spill_bytes: Optional[int] = _DEFAULT_SPILL_BYTES,
         spill_ttl: int = _DEFAULT_SPILL_TTL,
         spill_path: "Any | None" = None,
@@ -220,7 +237,7 @@ class ArrowTabular(Tabular[CastOptions]):
         # explicitly here.
         super().__init__(**kwargs)
         self._batches: list[pa.RecordBatch] = []
-        self._schema: Optional[pa.Schema] = schema
+        self._schema_cache: Optional[StructField] = None if schema is None else StructField.from_arrow(schema)
 
         # Spill state. ``_spill_bytes_threshold == 0`` (or None) keeps
         # the holder permanently in-memory. ``_spill_ttl`` matches the
@@ -287,6 +304,18 @@ class ArrowTabular(Tabular[CastOptions]):
     # Public accessors
     # ------------------------------------------------------------------
 
+    def _collect_schema(self, options: O) -> Schema:
+        if options.target:
+            return options.target
+
+        if self._schema_cache is None:
+            for batch in self.batches:
+                self._schema_cache = StructField.from_arrow_schema(batch.schema)
+                return self._schema_cache
+
+            return StructField.empty()
+        return self._schema_cache
+
     @property
     def batches(self) -> list[pa.RecordBatch]:
         """Defensive copy of every held batch — spilled + in-memory."""
@@ -295,21 +324,6 @@ class ArrowTabular(Tabular[CastOptions]):
             out.extend(tbl.to_batches())
         out.extend(self._batches)
         return out
-
-    @property
-    def schema(self) -> Optional[pa.Schema]:
-        """Arrow schema, when known.
-
-        Set by the first ingested batch / table, by an explicit
-        constructor argument, or by :meth:`_write_arrow_batches` on
-        its first write. ``None`` only when the buffer has never seen
-        data and no schema was passed in.
-        """
-        return self._schema
-
-    @schema.setter
-    def schema(self, value: Optional[pa.Schema]) -> None:
-        self._schema = value
 
     def is_empty(self) -> bool:
         return not self._batches and not self._spilled_tables
@@ -417,7 +431,9 @@ class ArrowTabular(Tabular[CastOptions]):
     # ------------------------------------------------------------------
 
     def stat(self):
-        return self._stats
+        return IOStats(
+
+        )
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         # Spilled parts first — those batches are zero-copy views into

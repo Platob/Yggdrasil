@@ -458,7 +458,7 @@ class CSVFile(IO[bytes, CsvOptions]):
     # Native engine overrides
     # ==================================================================
 
-    def _read_arrow_dataset(self, options: CsvOptions) -> "pds.Dataset":
+    def _read_arrow_dataset(self, options: CsvOptions) -> "pds.SparkDataset":
         pds = pyarrow_dataset_module()
         path = self._local_path_str()
         if path is not None:

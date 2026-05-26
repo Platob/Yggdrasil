@@ -24,7 +24,7 @@ from .statement import SparkPreparedStatement, SparkStatementResult, SparkStatem
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
-    from .tabular import Dataset
+    from .tabular import SparkDataset
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +230,7 @@ class SparkStatementExecutor(
         *,
         schema: "Any | None" = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Distribute *function* over *inputs* via Spark executors.
 
         Resolves a :class:`SparkSession` through :meth:`resolve_session`,
@@ -239,10 +239,10 @@ class SparkStatementExecutor(
         directly (it picks the right Databricks Connect / classic / local
         session for the caller's context).
         """
-        from .tabular import Dataset
+        from .tabular import SparkDataset
 
         session = self.resolve_session(create=True)
-        return Dataset.parallelize(
+        return SparkDataset.parallelize(
             function,
             inputs,
             schema=schema,

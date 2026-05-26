@@ -324,7 +324,7 @@ class NDJSONFile(IO[bytes, NDJsonOptions]):
     # Native engine overrides
     # ==================================================================
 
-    def _read_arrow_dataset(self, options: NDJsonOptions) -> "pds.Dataset":
+    def _read_arrow_dataset(self, options: NDJsonOptions) -> "pds.SparkDataset":
         pds = pyarrow_dataset_module()
         path = self._local_path_str()
         if path is not None:

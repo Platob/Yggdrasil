@@ -62,6 +62,7 @@ property over the underlying ``frame`` slot so call sites using either
 from __future__ import annotations
 
 import logging
+import pickle
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -73,10 +74,10 @@ from typing import (
 )
 
 import pyarrow as pa
-
+from yggdrasil.data.enums import MimeType, Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.data.enums import MimeType, Mode
+from yggdrasil.spark.frame import spark_typed_cast
 
 if TYPE_CHECKING:
     from pyspark import StorageLevel
@@ -85,13 +86,13 @@ if TYPE_CHECKING:
     from yggdrasil.execution.expr import Predicate
 
 
-__all__ = ["Dataset", "SparkTabular"]
+__all__ = ["SparkDataset", "SparkTabular"]
 
 
 logger = logging.getLogger(__name__)
 
 
-class Dataset(Tabular[CastOptions]):
+class SparkDataset(Tabular[CastOptions]):
     """:class:`Tabular` + Spark-DataFrame surface in one class.
 
     The frame is the holder's only state; reads of
@@ -302,7 +303,7 @@ class Dataset(Tabular[CastOptions]):
         *,
         data: Any = None,
         storage_level: "StorageLevel | str | None" = None,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Cache the underlying frame on Spark executors.
 
         ``data=`` replaces the held frame first (legacy stash path
@@ -395,7 +396,7 @@ class Dataset(Tabular[CastOptions]):
         frame = options.cast_spark_frame(self._frame)
         return options.apply_post_read_spark_frame(frame)
 
-    def _read_spark_dataset(self, options: CastOptions) -> "Dataset":
+    def _read_spark_dataset(self, options: CastOptions) -> "SparkDataset":
         # Source already speaks Spark — skip the
         # :meth:`Tabular.from_spark_frame` rewrap when no target schema
         # forces a recast. Returning ``self`` keeps the holder identity
@@ -433,7 +434,7 @@ class Dataset(Tabular[CastOptions]):
             f"OVERWRITE / APPEND / IGNORE; got {action!r}."
         )
 
-    def _union(self, other: "Tabular", *, mode: "Mode" = ...) -> "Dataset":
+    def _union(self, other: "Tabular", *, mode: "Mode" = ...) -> "SparkDataset":
         other_frame = other._native_spark_frame()
         if other_frame is None:
             merged = self.collect_schema().merge_with(
@@ -512,7 +513,7 @@ class Dataset(Tabular[CastOptions]):
     # install record, forcing a re-install on the next transform.
     # ------------------------------------------------------------------
 
-    def _select(self, *, columns: list[str]) -> "Dataset":
+    def _select(self, *, columns: list[str]) -> "SparkDataset":
         if self._frame is None:
             return self
         new_frame = self._frame.select(*columns)
@@ -526,7 +527,7 @@ class Dataset(Tabular[CastOptions]):
             installed_modules=self.installed_modules,
         )
 
-    def _drop(self, *, columns: list[str]) -> "Dataset":
+    def _drop(self, *, columns: list[str]) -> "SparkDataset":
         if self._frame is None:
             return self
         present = [c for c in columns if c in self._frame.columns]
@@ -537,7 +538,7 @@ class Dataset(Tabular[CastOptions]):
             installed_modules=self.installed_modules,
         )
 
-    def _filter(self, *, predicate: "Predicate") -> "Dataset":
+    def _filter(self, *, predicate: "Predicate") -> "SparkDataset":
         if self._frame is None:
             return self
         new_frame = predicate.filter_spark_frame(self._frame)
@@ -556,7 +557,7 @@ class Dataset(Tabular[CastOptions]):
         cls,
         df: "SparkDataFrame",
         schema: "Schema | None" = None,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Wrap a Spark frame, optionally re-casting it against ``schema``.
 
         ``schema=None`` infers a yggdrasil :class:`Schema` from the
@@ -587,7 +588,7 @@ class Dataset(Tabular[CastOptions]):
         *,
         spark_session: Optional["SparkSession"] = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Build a frame from an in-memory iterable.
 
         ``schema=None`` pickles each element into a dynamic frame.
@@ -659,7 +660,7 @@ class Dataset(Tabular[CastOptions]):
         *,
         spark_session: Optional["SparkSession"] = None,
         schema: "Schema | None" = None,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Execute SQL and wrap the resulting Spark frame as a :class:`Dataset`.
 
         Resolves a :class:`SparkSession` through the environment when
@@ -684,7 +685,7 @@ class Dataset(Tabular[CastOptions]):
         *,
         spark_session: Optional["SparkSession"] = None,
         schema: "Schema | None" = None,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Read a table by its fully-qualified name (``catalog.schema.table``).
 
         Thin wrapper around ``spark.table(name)`` that auto-resolves
@@ -708,7 +709,7 @@ class Dataset(Tabular[CastOptions]):
         mode: str = "overwrite",
         format: str = "delta",
         partition_by: "list[str] | None" = None,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Write the held frame to a Unity Catalog / Spark table.
 
         Returns ``self`` so the call can be chained::
@@ -738,7 +739,7 @@ class Dataset(Tabular[CastOptions]):
         *,
         spark_session: Optional["SparkSession"] = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Distribute ``function`` over ``inputs`` via ``mapInArrow``,
         or create a frame directly from ``inputs`` when no function is
         given.
@@ -774,7 +775,7 @@ class Dataset(Tabular[CastOptions]):
             DYNAMIC_SCHEMA,
             _dynamic_rows,
             _emit_pickled,
-            _typed_cast,
+            spark_typed_cast,
         )
 
         if spark_session is None:
@@ -843,7 +844,7 @@ class Dataset(Tabular[CastOptions]):
                         continue
                     yield [invoke(loads(col[i].as_py())) for i in range(n)]
 
-            return _typed_cast(_groups(), schema, byte_size=byte_size)
+            return spark_typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = input_df.mapInArrow(
             _typed_runner,
@@ -1050,7 +1051,7 @@ class Dataset(Tabular[CastOptions]):
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """1:1 map over rows.
 
         Input rows are unpickled objects (dynamic mode) or row-dicts
@@ -1078,7 +1079,7 @@ class Dataset(Tabular[CastOptions]):
             DYNAMIC_SCHEMA,
             _dynamic_rows,
             _emit_pickled,
-            _typed_cast,
+            spark_typed_cast,
             _typed_rows,
         )
 
@@ -1131,7 +1132,7 @@ class Dataset(Tabular[CastOptions]):
                             continue
                         yield invoke_batch(batch)
 
-            return _typed_cast(_groups(), schema, byte_size=byte_size)
+            return spark_typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
             _typed_runner,
@@ -1149,7 +1150,7 @@ class Dataset(Tabular[CastOptions]):
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Map ``function`` over each row, optionally casting against ``schema``.
 
         ``function`` may carry any signature — single-arg
@@ -1203,7 +1204,7 @@ class Dataset(Tabular[CastOptions]):
             build_row_invoker,
         )
         from yggdrasil.pickle.ser import dumps, loads
-        from yggdrasil.spark.frame import _typed_cast
+        from yggdrasil.spark.frame import spark_typed_cast
 
         if schema is None:
             return self.map(function, byte_size=byte_size)
@@ -1237,7 +1238,7 @@ class Dataset(Tabular[CastOptions]):
                             continue
                         yield invoke_batch(batch)
 
-            return _typed_cast(_groups(), schema, byte_size=byte_size)
+            return spark_typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
             _runner,
@@ -1255,7 +1256,7 @@ class Dataset(Tabular[CastOptions]):
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Drop rows where *predicate* is false.
 
         Two shapes, dispatched by the predicate's runtime type:
@@ -1303,7 +1304,7 @@ class Dataset(Tabular[CastOptions]):
             DYNAMIC_SCHEMA,
             PICKLE_COLUMN_NAME,
             _ARROW_DYNAMIC_SCHEMA,
-            _typed_cast,
+            spark_typed_cast,
         )
 
         self._ensure_installed(predicate)
@@ -1375,7 +1376,7 @@ class Dataset(Tabular[CastOptions]):
                         if kept:
                             yield kept
 
-            return _typed_cast(_groups(), out_schema, byte_size=byte_size)
+            return spark_typed_cast(_groups(), out_schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
             _typed_runner,
@@ -1392,7 +1393,7 @@ class Dataset(Tabular[CastOptions]):
         schema: "Schema | None" = None,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Explode rows of iterables into one row per element.
 
         Only meaningful in dynamic mode — typed rows are dicts, not
@@ -1403,7 +1404,7 @@ class Dataset(Tabular[CastOptions]):
         from yggdrasil.spark.frame import (
             DYNAMIC_SCHEMA,
             _emit_pickled,
-            _typed_cast,
+            spark_typed_cast,
         )
 
         if not self.is_dynamic:
@@ -1451,7 +1452,7 @@ class Dataset(Tabular[CastOptions]):
                     if group:
                         yield group
 
-            return _typed_cast(_groups(), schema, byte_size=byte_size)
+            return spark_typed_cast(_groups(), schema, byte_size=byte_size)
 
         result_df = self._frame.mapInArrow(
             _typed_runner,
@@ -1463,19 +1464,12 @@ class Dataset(Tabular[CastOptions]):
             installed_modules=self.installed_modules,
         )
 
-    def cast(
+    def _cast(
         self,
-        schema: "Schema",
-        *,
-        byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
-        """Materialise rows against ``schema`` as a typed frame."""
-        from yggdrasil.data.schema import Schema as _Schema
-        from yggdrasil.pickle.ser import loads
-        from yggdrasil.spark.frame import _typed_cast
-
+        options: CastOptions
+    ) -> "SparkDataset":
         self._ensure_installed()
-        schema = _Schema.from_any(schema)
+        schema = options.target
         is_dynamic_in = self.is_dynamic
 
         def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
@@ -1486,14 +1480,14 @@ class Dataset(Tabular[CastOptions]):
                         n = batch.num_rows
                         if n == 0:
                             continue
-                        yield [loads(col[i].as_py()) for i in range(n)]
+                        yield [pickle.loads(col[i].as_py()) for i in range(n)]
                 else:
                     for batch in batches:
                         rows = batch.to_pylist()
                         if rows:
                             yield rows
 
-            return _typed_cast(_groups(), schema, byte_size=byte_size)
+            return spark_typed_cast(_groups(), schema, byte_size=128 * 1024 * 1024)
 
         result_df = self._frame.mapInArrow(
             _runner,
@@ -1509,7 +1503,7 @@ class Dataset(Tabular[CastOptions]):
         self,
         *,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Drop typing: re-pickle row-dicts back into a dynamic frame.
 
         No-op when already dynamic.
@@ -1694,7 +1688,7 @@ def _wrap(
     value: Any,
     *,
     schema: "Schema | None" = None,
-    owner: "Dataset | None" = None,
+    owner: "SparkDataset | None" = None,
 ) -> Any:
     """Wrap ``DataFrame`` results as :class:`Dataset`; pass others through."""
     try:
@@ -1715,7 +1709,7 @@ def _wrap(
 
             out_schema = _Schema.from_any(value.schema)
         installed = owner.installed_modules if owner is not None else None
-        return Dataset(
+        return SparkDataset(
             frame=value,
             schema=out_schema,
             installed_modules=installed,
@@ -1738,7 +1732,7 @@ class _ProxiedCallable:
         self,
         fn: "Callable[..., Any]",
         *,
-        owner: "Dataset | None" = None,
+        owner: "SparkDataset | None" = None,
     ) -> None:
         self._callable = fn
         self._owner = owner
@@ -1762,4 +1756,4 @@ class _ProxiedCallable:
 # to the same class — the alias is the same object, not a subclass,
 # so ``isinstance(x, SparkTabular)`` and ``isinstance(x, Dataset)``
 # are interchangeable.
-SparkTabular = Dataset
+SparkTabular = SparkDataset

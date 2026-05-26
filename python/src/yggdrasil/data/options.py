@@ -317,83 +317,19 @@ class CastOptions:
     row_size: int | None = None
     byte_size: int | None = None
     row_limit: int | None = None
-    #: Allow format readers / writers to use a thread pool when the
-    #: backend supports it. Universally honored across CSV, Parquet,
-    #: Arrow IPC, and NDJSON; format-specific options can override
-    #: the default by re-declaring the field.
     use_threads: bool = True
     recursive: bool = False
-    #: Field-typed column references to dedup on. Each entry's
-    #: :attr:`Field.name` resolves to the target column. Bare strings
-    #: passed in ``__init__`` are coerced to a default-typed
-    #: :class:`Field` in :meth:`__post_init__` so callers can still
-    #: pass plain key names — the Field-typed shape is the canonical
-    #: surface.
     match_by: list["Field"] | None = None
-    #: Field-typed column references to dedup on at read time. Same
-    #: shape as :attr:`match_by` — each entry's :attr:`Field.name`
-    #: names the column whose values must be distinct in the read
-    #: output. :meth:`dedup_arrow_batches` collapses duplicates on
-    #: these columns via :func:`yggdrasil.arrow.ops.dedup_arrow_table`
-    #: (first occurrence wins). Unset → no dedup pass; the read
-    #: pipeline yields rows unchanged.
     unique_by: list["Field"] | None = None
-    #: Field-typed timestamp references to resample on at read time.
-    #: Each entry's :attr:`Field.metadata` carries a non-tag
-    #: ``b"time_sampling"`` key whose value is the ISO-8601 duration
-    #: (``"PT1H"``, ``"P1D"``, etc.) that
-    #: :func:`yggdrasil.arrow.ops.resample_arrow_table` snaps the
-    #: column to. Unset → no resample pass; the read pipeline yields
-    #: rows unchanged. Plain ``list[Field]`` keeps the API shape
-    #: parallel to :attr:`match_by` / :attr:`unique_by` — the
-    #: sampling rides on the Field itself rather than a separate
-    #: ``dict`` so the bundle is a single round-trippable Field
-    #: collection.
     time_sample_by: list["Field"] | None = None
-    #: How to fill nulls left by the resample pass. ``"ffill"``
-    #: (default) propagates the last non-null value forward into
-    #: subsequent nulls within the same partition; ``"bfill"``
-    #: propagates the next non-null backward; ``"none"`` / ``None``
-    #: disables the pass so resample emits whatever the ``"first"``
-    #: aggregate picked. Same vocabulary on every engine — the
-    #: arrow / spark ops in :mod:`yggdrasil.arrow.ops` and
-    #: :mod:`yggdrasil.spark.ops` consume this verbatim.
     fill_strategy: str = "ffill"
-    read_seek: int | None = None
-    write_seek: int | None = None
-    #: Row-level predicate. Evaluated by every IO that reads tabular
-    #: rows: applied to each Arrow batch before it leaves the read
-    #: pipeline so callers don't have to wrap the result by hand.
-    #:
-    #: When the predicate references a column the *source* doesn't
-    #: have (different schema, optional column not present in this
-    #: file), the predicate degrades to *accept everything* —
-    #: missing inputs can't yield a coherent boolean, and the
-    #: alternative ("drop everything") is almost always wrong for
-    #: heterogeneous-source folders. Backends that can push the
-    #: predicate down (Delta, warehouse SQL) skip the per-batch
-    #: filter once they've translated it.
     predicate: Predicate | None = None
-    #: Predicate evaluated against a discovered child (``name``,
-    #: ``path``, ``is_dir``, ``is_private``) for IOs that aggregate
-    #: sub-IOs (folders, zips, partitioned tables). Replaces the
-    #: legacy ``include_patterns`` / ``exclude_patterns`` /
-    #: ``exclude_private`` glob knobs with one composable predicate
-    #: backed by :mod:`yggdrasil.data.expr` — for example
-    #: ``~col("name").like(".%") & col("name").like("%.parquet")``.
-    children_predicate: Predicate | None = None
-    read_write_upsert: bool = False
     wait: WaitingConfig = WaitingConfig.default()
     spark_session: "SparkSession | None" = None
     arrow_memory_pool: pa.MemoryPool | None = None
 
     # --- Upsert / merge shape -------------------------------------------
     update_column_names: list[str] | None = None
-
-    # --- Partition pruning ----------------------------------------------
-    # ``prune_by`` accepts the literal string ``"auto"`` to mean
-    # "use the partition columns from the target schema" — Table.*_insert
-    # resolves that into a real column list.
     prune_by: "list[str] | str | None" = None
     prune_values: Mapping[str, tuple[Any, ...]] | None = None
 
@@ -403,74 +339,12 @@ class CastOptions:
     vacuum_hours: int | None = None
 
     # --- Engine knobs ----------------------------------------------------
-    overwrite_schema: bool | None = None
     spark_options: dict[str, Any] | None = None
 
-    # --- Statement-level retry ------------------------------------------
-    # Threaded onto each DML WarehousePreparedStatement on the warehouse
-    # path; ignored on Spark (driver-side retry handles it there).
     retry: WaitingConfigArg | None = None
-
-    # --- Capture inserted rows as a return value -----------------------
-    # When True, mutating tabular operations (table inserts, MERGE-style
-    # writes, …) hand back the rows they actually wrote as a
-    # :class:`Tabular` — typically a :class:`ArrowTabular` or a
-    # :class:`Dataset` depending on the engine that ran the write.
-    # Default ``False`` keeps the historical "fire-and-forget" return
-    # contract; flip it on when downstream code wants to chain on the
-    # newly-appended payload (logging, follow-up tasks, downstream
-    # writes) without re-querying the target.
     return_data: bool = False
-
-    # --- Keyed-write strategy toggle ------------------------------------
-    # When False (the default), keyed inserts use the engine's native
-    # ``MERGE INTO`` statement — Databricks / Delta plans the dedup
-    # once. When True, the table layer sidesteps MERGE entirely:
-    # ``Mode.APPEND`` becomes ``INSERT ... WHERE NOT EXISTS`` (or a
-    # Spark DataFrame anti-join, when a session is reachable);
-    # ``Mode.UPSERT`` / ``Mode.MERGE`` become a keyed ``DELETE``
-    # followed by ``INSERT``. Useful for backends without native
-    # MERGE, for callers that want explicit dedup semantics, or for
-    # the Spark fast path where pre-filtering the DataFrame is much
-    # cheaper than the SQL ``NOT EXISTS`` plan.
     safe_merge: bool = False
-
-    # --- Metadata sync after writes -------------------------------------
-    # When True (the default), a writer commits the holder-side IO
-    # metadata (size, mtime, media_type) once the operation finishes.
-    # Bulk writers (``_write_arrow_table``, ``_write_polars_frame``,
-    # ``_write_records``) flip this to False on the per-batch sub-call
-    # and run a single ``_commit_metadata`` at the end so multi-batch
-    # writes don't pay the stat-refresh cost on every batch. Set to
-    # False at the call site to suppress the final commit too — for
-    # callers that intend to chain another write before any reader sees
-    # the result.
     sync_metadata: bool = True
-
-    # --- Memoization slot ----------------------------------------------
-    # ``merged`` is read repeatedly by every cast / fill / alias
-    # entry point on this class — once per dispatch call, often dozens
-    # of times across a single batch pipeline. The underlying
-    # ``Field.merge_with`` walks the full struct tree on each call.
-    # ``CastOptions`` is frozen, so the inputs to that merge
-    # (``source``, ``target``, ``schema_mode``) cannot change for a
-    # given instance — the result is safe to cache for the lifetime
-    # of the options object.
-    #
-    # ``merged_schema`` returns the same object: now that
-    # :class:`StructField` *is* a :class:`Field`, the merged result
-    # for struct sides already satisfies the Schema interface — one
-    # cache slot covers both views.  The same logic collapses
-    # ``source`` / ``target`` themselves: a single :class:`Field`
-    # slot serves both "I want a column-ish Field" and "I want a
-    # schema-shaped Field" callers — no parallel ``*_schema`` cache
-    # is necessary.
-    #
-    # ``init=False`` keeps the slot out of the constructor signature;
-    # ``compare=False`` keeps two functionally identical CastOptions
-    # equal regardless of which one happened to have its cache warmed;
-    # ``repr=False`` keeps the cache out of the dataclass-generated
-    # repr (the custom repr below also skips non-repr fields).
     _merged_cache: Any = dataclasses.field(
         default=..., init=False, repr=False, compare=False
     )
@@ -1577,14 +1451,14 @@ class CastOptions:
 
     def cast_spark_tabular(self, data: Any) -> Any:
         """Filter + cast a :class:`Dataset` (Spark Tabular wrapper)."""
-        from yggdrasil.spark.tabular import Dataset
-        if isinstance(data, Dataset):
+        from yggdrasil.spark.tabular import SparkDataset
+        if isinstance(data, SparkDataset):
             if data.frame is None:
                 return data
             casted = self.cast_spark_frame(data.frame)
             if casted is data.frame:
                 return data
-            return Dataset(frame=casted)
+            return SparkDataset(frame=casted)
         return self.cast_spark_frame(data)
 
     def cast_spark_column(self, obj: Any) -> Any:
@@ -1595,8 +1469,8 @@ class CastOptions:
 
     def cast_spark(self, obj: Any) -> Any:
         """Dispatch spark types to the specific cast method."""
-        from yggdrasil.spark.tabular import Dataset
-        if isinstance(obj, Dataset):
+        from yggdrasil.spark.tabular import SparkDataset
+        if isinstance(obj, SparkDataset):
             return self.cast_spark_tabular(obj)
         if hasattr(obj, "toArrow") or hasattr(obj, "toPandas"):
             return self.cast_spark_frame(obj)

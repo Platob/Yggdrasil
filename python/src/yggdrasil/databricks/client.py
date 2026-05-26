@@ -1459,12 +1459,12 @@ class DatabricksClient(Singleton, URLBased):
         ``.filter``, ``.to_table``, ``.toArrow``, etc. on it.
         """
         from yggdrasil.data.statement import PreparedStatement
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         session = self.spark()
         if PreparedStatement.looks_like_query(sql_or_table):
-            return Dataset.from_sql(sql_or_table, spark_session=session, schema=schema)
-        return Dataset.from_table(sql_or_table, spark_session=session, schema=schema)
+            return SparkDataset.from_sql(sql_or_table, spark_session=session, schema=schema)
+        return SparkDataset.from_table(sql_or_table, spark_session=session, schema=schema)
 
     def parallelize(
         self,
@@ -1484,9 +1484,9 @@ class DatabricksClient(Singleton, URLBased):
             # Without function — just wrap inputs as a Dataset
             ds = dbc.parallelize(rows, schema=output_schema)
         """
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
-        return Dataset.parallelize(
+        return SparkDataset.parallelize(
             inputs,
             function,
             schema=schema,

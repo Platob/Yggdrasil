@@ -149,7 +149,7 @@ def _is_arrow_dataset(obj: Any) -> bool:
         ds = pyarrow_dataset_module()
     except Exception:
         return False
-    return isinstance(obj, ds.Dataset)
+    return isinstance(obj, ds.SparkDataset)
 
 
 def _is_yggdrasil_tabular(obj: Any) -> bool:

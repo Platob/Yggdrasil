@@ -25,12 +25,12 @@ ds = dbc.parallelize(fetch_data, urls, schema=output_schema)
 Or directly without a client:
 
 ```python
-from yggdrasil.spark.tabular import Dataset
+from yggdrasil.spark.tabular import SparkDataset
 
-ds = Dataset.from_sql("SELECT 1", spark_session=spark)
-ds = Dataset.from_table("main.sales.orders", spark_session=spark)
-ds = Dataset.from_iterable([{"a": 1}, {"a": 2}], schema=my_schema, spark_session=spark)
-ds = Dataset.parallelize(fn, inputs, schema=output_schema, spark_session=spark)
+ds = SparkDataset.from_sql("SELECT 1", spark_session=spark)
+ds = SparkDataset.from_table("main.sales.orders", spark_session=spark)
+ds = SparkDataset.from_iterable([{"a": 1}, {"a": 2}], schema=my_schema, spark_session=spark)
+ds = SparkDataset.parallelize(fn, inputs, schema=output_schema, spark_session=spark)
 ```
 
 ## Transforms

@@ -264,7 +264,7 @@ class JSONFile(IO[bytes, JsonOptions]):
     # Native engine override — pyarrow.dataset(format="json")
     # ==================================================================
 
-    def _read_arrow_dataset(self, options: JsonOptions) -> "pds.Dataset":
+    def _read_arrow_dataset(self, options: JsonOptions) -> "pds.SparkDataset":
         pds = pyarrow_dataset_module()
         holder = self._parent
         if holder is not None and getattr(holder, "is_local_path", False):

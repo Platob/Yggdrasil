@@ -23,7 +23,6 @@ should not import them directly.
 from __future__ import annotations
 
 import collections
-import dataclasses
 import datetime as dt
 import http.client
 import itertools
@@ -39,7 +38,6 @@ from typing import (
     Any,
     Callable,
     ClassVar,
-    Iterable,
     Iterator,
     Mapping,
     Optional,
@@ -47,10 +45,8 @@ from typing import (
 )
 from urllib.parse import urlsplit, urlunsplit
 
-import pyarrow as pa
-
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
-from yggdrasil.data.enums import MediaTypes, Mode
+from yggdrasil.data.enums import MediaTypes
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
     WaitingConfig,
@@ -61,14 +57,13 @@ from yggdrasil.io.authorization.base import Authorization
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
 from yggdrasil.io.memory import Memory
-from yggdrasil.io.path import Path
 from yggdrasil.io.primitive import ArrowIPCFile
 from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, Response, RESPONSE_SCHEMA
+from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.io.session import Session
-from yggdrasil.http_.response_batch import responses_to_tabular
 from yggdrasil.io.url import URL
+
 from .exceptions import (
     LocationParseError,
     LocationValueError,
@@ -80,12 +75,9 @@ from .exceptions import (
 from .response import HTTPResponse
 from .retry import Retry
 from .timeout import _resolve_timeout
-from ..data.options import CastOptions
-from ..io.holder import IO
 
 if TYPE_CHECKING:
-    from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
-    from yggdrasil.io.tabular import Tabular
+    from pyspark.sql import SparkSession
 
 __all__ = ["HTTPSession"]
 
@@ -1330,7 +1322,7 @@ class HTTPSession(Session):
         boundary so a single failure doesn't poison a whole partition.
         """
         for batch in self._send_many_batches(requests, **batch_kw):
-            yield from batch.iter_responses()
+            yield from batch.responses()
 
     def send_many_batches(
         self,

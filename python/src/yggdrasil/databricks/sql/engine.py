@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     import pyspark
     from pyspark.sql import SparkSession
 
-    from yggdrasil.spark.tabular import Dataset
+    from yggdrasil.spark.tabular import SparkDataset
 
 __all__ = ["SQLEngine"]
 
@@ -904,22 +904,22 @@ class SQLEngine(DatabricksService, StatementExecutor):
         sql_or_table: str,
         *,
         schema: Any = None,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Return a :class:`Dataset` from a SQL query or table name.
 
         Auto-detects SQL (``SELECT``, ``WITH``, …) vs table name.
         Session resolved through Databricks Connect.
         """
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         session = self.spark.resolve_session(create=True)
         if PreparedStatement.looks_like_query(sql_or_table):
-            return Dataset.from_sql(
+            return SparkDataset.from_sql(
                 sql_or_table,
                 spark_session=session,
                 schema=schema,
             )
-        return Dataset.from_table(
+        return SparkDataset.from_table(
             sql_or_table,
             spark_session=session,
             schema=schema,
@@ -932,13 +932,13 @@ class SQLEngine(DatabricksService, StatementExecutor):
         *,
         schema: Any = None,
         byte_size: int = 128 * 1024 * 1024,
-    ) -> "Dataset":
+    ) -> "SparkDataset":
         """Distribute *function* over *inputs* via Spark executors, or
         create a Dataset directly from *inputs* when no function is given."""
-        from yggdrasil.spark.tabular import Dataset
+        from yggdrasil.spark.tabular import SparkDataset
 
         session = self.spark.resolve_session(create=True)
-        return Dataset.parallelize(
+        return SparkDataset.parallelize(
             inputs,
             function,
             schema=schema,

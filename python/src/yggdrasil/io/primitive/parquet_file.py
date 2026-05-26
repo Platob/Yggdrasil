@@ -556,7 +556,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
     # Native engine overrides — push reads to format-aware scanners
     # ==================================================================
 
-    def _read_arrow_dataset(self, options: ParquetOptions) -> "pds.Dataset":
+    def _read_arrow_dataset(self, options: ParquetOptions) -> "pds.SparkDataset":
         """Native :class:`pyarrow.dataset.Dataset` over the Parquet bytes."""
         pds = pyarrow_dataset_module()
         path = self._local_path_str()

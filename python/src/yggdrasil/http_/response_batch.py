@@ -12,16 +12,18 @@ import pickle
 from typing import Any, TYPE_CHECKING, Iterator, Optional
 
 import pyarrow as pa
-
 from yggdrasil.arrow.cast import rechunk_arrow_batches
+from yggdrasil.data import Mode
+from yggdrasil.environ import PyEnv
+from yggdrasil.io.request import PreparedRequest, REQUEST_SCHEMA
+from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
+from yggdrasil.io.send_config import SendConfig, CacheConfig, MATCH_KEY
 from yggdrasil.io.tabular import ArrowTabular, Dataset
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
-    from yggdrasil.io.request import PreparedRequest
-    from yggdrasil.io.send_config import SendConfig
+    from yggdrasil.spark.frame import Dataset as SparkDataset
 
 LOGGER = logging.getLogger(__name__)
 
@@ -79,7 +81,7 @@ class HTTPResponseBatch(Tabular):
     __slots__ = (
         "_send_config", "_requests", "_session",
         "_local_hashes", "_remote_hashes",
-        "_local", "_remote", "_new", "_failed",
+        "_local_tabular", "_remote_tabular", "_new_tabular", "_failed",
         "_split_done", "_misses",
     )
 
@@ -99,15 +101,15 @@ class HTTPResponseBatch(Tabular):
         self._requests = requests
         self._local_hashes: set[int] = set()
         self._remote_hashes: set[int] = set()
-        self._local: Optional[Tabular] = ...
-        self._remote: Optional[Tabular] = ...
+        self._local_tabular: Optional[Tabular] = ...
+        self._remote_tabular: Optional[Tabular] = ...
         self._split_done = False
         self._session = session
 
         if new_responses is not None:
-            self._new: Optional[Tabular] = responses_to_tabular(new_responses)
+            self._new_tabular: Optional[Tabular] = responses_to_tabular(new_responses)
         else:
-            self._new = _to_tabular(new_responses_tabular)
+            self._new_tabular = _to_tabular(new_responses_tabular)
 
         self._misses: list = misses if misses is not None else list(requests)
         self._failed: Optional[Tabular] = (
@@ -133,7 +135,6 @@ class HTTPResponseBatch(Tabular):
         """Read full responses for hit hashes from a cache, filtering stale."""
         if not hashes or cache is None:
             return None
-        from yggdrasil.io.send_config import MATCH_KEY
         hit_reqs = [r for r in self._requests if r.match_value(MATCH_KEY) in hashes]
         if not hit_reqs:
             return None
@@ -158,11 +159,10 @@ class HTTPResponseBatch(Tabular):
     ) -> "HTTPResponseBatch":
         """Resolve cache hits, fetch misses, write back."""
         cfg = self._send_config
-        from yggdrasil.io.send_config import MATCH_KEY
 
         misses = list(self.misses)
-        local_tab = self.local
-        remote_tab = self.remote
+        local_tab = self.local_tabular
+        remote_tab = self.remote_tabular
 
         served = set()
         for tab in (local_tab, remote_tab):
@@ -182,7 +182,6 @@ class HTTPResponseBatch(Tabular):
             self._misses = misses
 
         if self._remote_hashes and cfg.local_cache is not None:
-            from yggdrasil.data.enums import Mode
             if remote_tab is not None:
                 try:
                     remote_table = remote_tab.read_arrow_table()
@@ -195,7 +194,7 @@ class HTTPResponseBatch(Tabular):
 
         if not misses or cfg.cache_only:
             if misses:
-                self.new = [_synthetic_not_found(r) for r in misses]
+                self.new_tabular = [_synthetic_not_found(r) for r in misses]
             return self
 
         spark = cfg.get_spark_session()
@@ -228,13 +227,15 @@ class HTTPResponseBatch(Tabular):
                 err_list.append(response)
         if err_list:
             self.failed = err_list
+
         LOGGER.info(
             "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
             len(ok_list) + len(err_list), len(misses),
             len(ok_list), len(err_list),
         )
+
         if all_list:
-            self.new = pa.Table.from_batches(
+            self.new_tabular = pa.Table.from_batches(
                 [Response.values_to_arrow_batch(all_list)]
             )
         if ok_list:
@@ -255,7 +256,6 @@ class HTTPResponseBatch(Tabular):
 
         if cfg.raise_error:
             from pyspark.sql import functions as F
-            from yggdrasil.spark.cast import spark_dataframe_to_arrow
 
             ok_df = result_df.where(
                 (F.col("status_code") >= 200) & (F.col("status_code") < 400)
@@ -263,23 +263,19 @@ class HTTPResponseBatch(Tabular):
             err_df = result_df.where(
                 (F.col("status_code") < 200) | (F.col("status_code") >= 400)
             )
-            err_table = spark_dataframe_to_arrow(err_df)
             if len(err_table) > 0:
                 self.failed = err_table
             write_data = ok_df
 
-        self.new = result_df
+        self.new_tabular = result_df
         cfg.write_responses_tabular(write_data, session=self._session)
 
     def _spark_scatter(
         self,
         misses: "list[PreparedRequest]",
         spark: "SparkSession",
-    ) -> "SparkDataFrame":
+    ) -> "Dataset":
         """Scatter misses to Spark workers via mapInArrow."""
-        from yggdrasil.io.request import PreparedRequest
-        from yggdrasil.io.send_config import SendConfig
-
         session = self._session
         cfg = self._send_config
 
@@ -303,7 +299,10 @@ class HTTPResponseBatch(Tabular):
             "Scattering %d miss(es) across %d Spark partition(s)",
             len(misses), n_parts,
         )
-        request_df = spark.createDataFrame(request_table).repartition(n_parts)
+        request_df = spark.createDataFrame(
+            request_table,
+            schema=REQUEST_SCHEMA.to_spark_schema()
+        ).repartition(n_parts)
 
         worker_config = cfg.copy(
             remote_cache=None,
@@ -314,6 +313,7 @@ class HTTPResponseBatch(Tabular):
         if lc is not None:
             now = dt.datetime.now(dt.timezone.utc)
             worker_config = worker_config.copy(
+                raise_error=False,
                 local_cache=lc.copy(
                     received_to=now,
                     received_from=now - dt.timedelta(minutes=15),
@@ -356,12 +356,7 @@ class HTTPResponseBatch(Tabular):
         result_df = request_df.mapInArrow(
             _send_partition, schema=response_spark_schema,
         )
-        try:
-            result_df = result_df.cache()
-        except Exception:
-            LOGGER.warning(
-                "Failed to cache mapInArrow result", exc_info=True,
-            )
+
         return result_df
 
     @property
@@ -374,32 +369,32 @@ class HTTPResponseBatch(Tabular):
         self._misses = value
 
     @property
-    def local(self) -> "Tabular | None":
+    def local_tabular(self) -> "Tabular | None":
         self._ensure_split()
-        if self._local is ...:
-            self._local = self._read_cache_hits(
+        if self._local_tabular is ...:
+            self._local_tabular = self._read_cache_hits(
                 self._send_config.local_cache if self._send_config else None,
                 self._local_hashes,
             )
-        return self._local
+        return self._local_tabular
 
     @property
-    def remote(self) -> "Tabular | None":
+    def remote_tabular(self) -> "Tabular | None":
         self._ensure_split()
-        if self._remote is ...:
-            self._remote = self._read_cache_hits(
+        if self._remote_tabular is ...:
+            self._remote_tabular = self._read_cache_hits(
                 self._send_config.remote_cache if self._send_config else None,
                 self._remote_hashes,
             )
-        return self._remote
+        return self._remote_tabular
 
     @property
-    def new(self) -> "Tabular | None":
-        return self._new
+    def new_tabular(self) -> "Tabular | None":
+        return self._new_tabular
 
-    @new.setter
-    def new(self, value) -> None:
-        self._new = _to_tabular(value)
+    @new_tabular.setter
+    def new_tabular(self, value) -> None:
+        self._new_tabular = _to_tabular(value)
 
     @property
     def failed(self) -> "Tabular | None":
@@ -431,7 +426,7 @@ class HTTPResponseBatch(Tabular):
     # ------------------------------------------------------------------
 
     def _holders(self) -> list[Tabular]:
-        return [h for h in (self.local, self.remote, self.new) if h is not None]
+        return [h for h in (self.local_tabular, self.remote_tabular, self.new_tabular) if h is not None]
 
     @property
     def is_spark(self) -> bool:
@@ -451,18 +446,17 @@ class HTTPResponseBatch(Tabular):
     def _write_arrow_batches(self, batches, options=None):
         raise NotImplementedError("HTTPResponseBatch is read-only")
 
-    def _read_spark_frame(self, options=None):
-        from yggdrasil.environ import PyEnv
-        spark = getattr(options, "spark_session", None) or PyEnv.spark_session(create=True)
+    def _read_spark_frame(self, options):
+        spark = PyEnv.spark_session(options.spark_session, create=True)
         result = None
+
         for holder in self._holders():
-            if isinstance(holder, Dataset) and holder.frame is not None:
-                df = holder.frame
-            else:
-                df = spark.createDataFrame(holder.read_arrow_table())
+            df = holder.read_spark_frame(options=options)
+
             result = df if result is None else result.unionByName(
                 df, allowMissingColumns=True,
             )
+
         if result is None:
             return spark.createDataFrame(
                 [], schema=RESPONSE_SCHEMA.to_spark_schema(),
@@ -473,18 +467,15 @@ class HTTPResponseBatch(Tabular):
     # Counts
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _count(holder: Optional[Tabular]) -> int:
-        if holder is None:
-            return 0
-        return holder.count()
+    def _count(self, options) -> int:
+        return sum(holder.count(options) for holder in self._holders())
 
     @property
-    def counts(self) -> dict[str, int]:
+    def counts(self, options = None) -> dict[str, int]:
         return {
-            "local": self._count(self.local),
-            "remote": self._count(self.remote),
-            "new": self._count(self.new),
+            "local": self.local_tabular.count(options) if self.local_tabular else 0,
+            "remote": self.remote_tabular.count(options) if self.remote_tabular else 0,
+            "new": self.new_tabular.count(options) if self.new_tabular else 0,
         }
 
     def __len__(self) -> int:
@@ -498,9 +489,9 @@ class HTTPResponseBatch(Tabular):
     # ------------------------------------------------------------------
 
     def __iter__(self) -> Iterator[Response]:
-        return self.iter_responses()
+        return self.responses()
 
-    def iter_responses(self) -> Iterator[Response]:
+    def responses(self) -> Iterator[Response]:
         for holder in self._holders():
             if holder is None:
                 continue
@@ -511,9 +502,9 @@ class HTTPResponseBatch(Tabular):
     # ------------------------------------------------------------------
 
     def extend(self, other: "HTTPResponseBatch") -> "HTTPResponseBatch":
-        self._local = _union(self.local, other.local)
-        self._remote = _union(self.remote, other.remote)
-        self._new = _union(self._new, other._new)
+        self._local_tabular = _union(self.local_tabular, other.local_tabular)
+        self._remote_tabular = _union(self.remote_tabular, other.remote_tabular)
+        self._new_tabular = _union(self._new_tabular, other._new_tabular)
         self._misses.extend(other._misses)
         self._local_hashes |= other._local_hashes
         self._remote_hashes |= other._remote_hashes
