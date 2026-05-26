@@ -51,7 +51,7 @@ __all__ = [
     "Response",
     "ResponseOptions",
     "RESPONSE_SCHEMA",
-    "RESPONSE_ARROW_SCHEMA",
+    "RESPONSE_SCHEMA.to_arrow_schema()",
     "HTTPResponse",
     "_DecodingReader",
 ]
@@ -71,7 +71,7 @@ class ResponseOptions(CastOptions):
       tabular leaf claims the media type, preserving the historical
       auto-parse-when-possible behaviour.
     * ``False`` — always yield the deterministic metadata projection
-      that matches :data:`RESPONSE_ARROW_SCHEMA`, regardless of the
+      that matches :data:`RESPONSE_SCHEMA.to_arrow_schema()`, regardless of the
       body's media type.
     """
 
@@ -330,174 +330,16 @@ _HOP_BY_HOP: frozenset[str] = frozenset({
 # Arrow schemas
 # ---------------------------------------------------------------------------
 
-RESPONSE_SCHEMA = schema(
-    fields=[],
-    metadata={
-        "comment": "Response record (single row), designed for deterministic logging and replay.",
-        "time_column": "received_at",
-        # Schema-level identity / partitioning hints — ``autotag`` at
-        # the bottom of this block propagates them to the matching
-        # children. The primary key is composite ``(hash, body_size)``;
-        # ``partition_key`` (the only ``partition_by`` column) is
-        # derived from :meth:`Response.partition_values` and matches
-        # the embedded request's partition_key so they co-locate.
-        "primary_key": ["hash", "body_size"],
-        "partition_by": ["partition_key"],
-    },
-    tags={
-        "domain": "http",
-        "entity": "response",
-        "layer": "bronze",
-        "namespace": "yggdrasil.io.response",
-    },
-)
+from yggdrasil.http_.schemas import RESPONSE_SCHEMA
 
-# Unnest the request schema directly into the response schema with a
-# ``request_`` prefix. Flattening turns nested struct lookups into
-# top-level column accesses, which engines (Delta, Spark, Polars,
-# Arrow) can predicate-push and column-prune against without having
-# to crack the struct open. ``_pkl`` is intentionally skipped — the
-# response carries its own pickle slot and a per-request blob would
-# duplicate the same bytes. Schema-level partition_by / primary_key
-# flags inherited from REQUEST_SCHEMA.autotag() get cleared on the
-# unnested copies — those flags belong to the response's own columns.
-for _req_field in REQUEST_SCHEMA.children:
-    if _req_field.name == "_pkl":
-        continue
-    _copied = _req_field.copy(name=f"request_{_req_field.name}")
-    _copied.with_partition_by(False, inplace=True)
-    _copied.with_primary_key(False, inplace=True)
-    if _req_field.comment:
-        _copied.metadata[b"comment"] = f"[request] {_req_field.comment}".encode("utf-8")
-    RESPONSE_SCHEMA[_copied.name] = _copied.autotag()
 
-RESPONSE_SCHEMA["receiver"] = schema_field(
-    "receiver",
-    USERINFO_STRUCT,
-    nullable=True,
-    metadata={
-        "comment": "Snapshot of :class:`~yggdrasil.environ.UserInfo` for the receiver "
-                   "— defaults to ``UserInfo.current()``. Carries identity (key, "
-                   "email, hostname, product) plus a stable ``hash``. Per-process "
-                   "fields (cwd, url, git_url) are lazy properties on UserInfo and "
-                   "are not part of the wire contract.",
-    },
-).autotag()
-
-RESPONSE_SCHEMA["hash"] = schema_field(
-    "hash",
-    pa.int64(),
-    nullable=False,
-    metadata={
-        "comment": "xxh3_64 digest over (request.hash, status_code, headers, body) — "
-                   "overall response identity, including sensitive bits.",
-        "algorithm": "xxh3_64",
-    },
-).autotag()
-
-RESPONSE_SCHEMA["public_hash"] = schema_field(
-    "public_hash",
-    pa.int64(),
-    nullable=False,
-    metadata={
-        "comment": "xxh3_64 digest over (request.public_hash, status_code, anonymized headers, body) — "
-                   "stable across cache anonymization and the right key for cross-system identity.",
-        "algorithm": "xxh3_64",
-    },
-).autotag()
-
-RESPONSE_SCHEMA["status_code"] = schema_field(
-    "status_code",
-    pa.int32(),
-    nullable=False,
-    metadata={"comment": "HTTP status code returned by the server"},
-).autotag()
-
-RESPONSE_SCHEMA["headers"] = schema_field(
-    "headers",
-    pa.map_(pa.string(), pa.string()),
-    nullable=False,
-    metadata={"comment": "All response headers as a name→value map"},
-).autotag()
-
-RESPONSE_SCHEMA["tags"] = schema_field(
-    "tags",
-    pa.map_(pa.string(), pa.string()),
-    nullable=True,
-    metadata={"comment": "Arbitrary string tags attached to this response"},
-).autotag()
-
-RESPONSE_SCHEMA["body"] = schema_field(
-    "body",
-    pa.large_binary(),
-    nullable=True,
-    metadata={"comment": "Raw binary payload of the response"},
-).autotag()
-
-RESPONSE_SCHEMA["body_size"] = schema_field(
-    "body_size",
-    pa.int64(),
-    nullable=False,
-    metadata={
-        "comment": "Length of body in bytes; 0 when body is absent",
-        "unit": "bytes",
-    },
-).autotag()
-
-RESPONSE_SCHEMA["body_hash"] = schema_field(
-    "body_hash",
-    pa.int64(),
-    nullable=False,
-    metadata={
-        "comment": "xxh3_64 digest of body bytes; 0 when body is absent",
-        "algorithm": "xxh3_64",
-    },
-).autotag()
-
-RESPONSE_SCHEMA["received_at"] = schema_field(
-    "received_at",
-    pa.timestamp("us", "UTC"),
-    nullable=False,
-    metadata={"comment": "UTC timestamp when the response was captured"},
-).autotag()
-
-RESPONSE_SCHEMA["partition_key"] = schema_field(
-    "partition_key",
-    pa.int64(),
-    nullable=False,
-    metadata={
-        "comment": "xxh3_64 digest of the response's ``partition_values`` — the only "
-                   "``partition_by`` column. Equal to the embedded request's "
-                   "``partition_key`` (default behaviour) so request+response always "
-                   "co-locate. Override :meth:`Response.partition_values` to change.",
-        "algorithm": "xxh3_64",
-    },
-).autotag()
-
-RESPONSE_SCHEMA["_pkl"] = schema_field(
-    "_pkl",
-    pa.large_binary(),
-    nullable=True,
-    metadata={
-        "comment": "Placeholder for a full ``Response`` pickle blob — populated by the "
-                   "pickle serializer for lossless round-trips, left null on the "
-                   "deterministic-columns-only path.",
-    },
-).autotag()
-
-# Propagate schema-level ``primary_key`` / ``partition_by`` down to
-# the matching children (consumes those metadata keys in place).
-RESPONSE_SCHEMA = RESPONSE_SCHEMA.autotag()
-
-RESPONSE_ARROW_SCHEMA: pa.Schema = RESPONSE_SCHEMA.to_arrow_schema()
-
-# Struct type that mirrors :data:`RESPONSE_ARROW_SCHEMA` column-for-column.
+# Struct type that mirrors :data:`RESPONSE_SCHEMA.to_arrow_schema()` column-for-column.
 # Building the single-row metadata projection through a struct array
 # and :meth:`pa.RecordBatch.from_struct_array` keeps the per-child
 # array construction inside pyarrow's C++ side, where the request
 # projection benchmark shows a ~2x speedup over the per-column
 # ``pa.array([value], type=…)`` loop.
-_RESPONSE_ARROW_STRUCT_TYPE: pa.StructType = pa.struct(RESPONSE_ARROW_SCHEMA)
+_RESPONSE_ARROW_STRUCT_TYPE: pa.StructType = pa.struct(RESPONSE_SCHEMA.to_arrow_schema())
 
 
 def _compute_response_identity_hash(
@@ -542,7 +384,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
     Implements :class:`Tabular` over the deterministic metadata
     projection: :meth:`read_arrow_batches` (and the engine fan-out
     derived from it) yields a single Arrow row built from
-    :attr:`arrow_values`, matching :data:`RESPONSE_ARROW_SCHEMA`. To
+    :attr:`arrow_values`, matching :data:`RESPONSE_SCHEMA.to_arrow_schema()`. To
     parse the *body* as a tabular payload (Parquet, CSV, JSON …),
     open a cursor with :meth:`open` and use that cursor's Tabular
     surface — :class:`BytesIO` dispatches to the right format leaf
@@ -666,7 +508,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         # (Parquet, CSV, NDJSON, Arrow IPC, …). When ``parse`` is
         # False, or no tabular leaf claims the media type, fall back
         # to the deterministic single-row metadata projection that
-        # matches :data:`RESPONSE_ARROW_SCHEMA` (envelope mime
+        # matches :data:`RESPONSE_SCHEMA.to_arrow_schema()` (envelope mime
         # :attr:`MimeTypes.HTTP_RESPONSE`).
         from yggdrasil.io.holder import Holder
         if options.parse and Holder.class_for_media_type(
@@ -1166,7 +1008,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
     # ------------------------------------------------------------------
 
     def _arrow_value(self, key: str) -> Any:
-        """Compute a single :data:`RESPONSE_ARROW_SCHEMA` column on demand.
+        """Compute a single :data:`RESPONSE_SCHEMA.to_arrow_schema()` column on demand.
 
         Used by :meth:`match_value` so the lookup pays for one column
         instead of materializing every value via :attr:`arrow_values`.
@@ -1210,7 +1052,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         return self._cached("arrow_values", self._build_arrow_values)
 
     def _build_arrow_values(self) -> dict[str, Any]:
-        return {name: self._arrow_value(name) for name in RESPONSE_ARROW_SCHEMA.names}
+        return {name: self._arrow_value(name) for name in RESPONSE_SCHEMA.to_arrow_schema().names}
 
     def match_value(self, key: str) -> Any:
         # Dotted-path lookup walks the nested struct shape:
@@ -1227,7 +1069,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
             except KeyError:
                 raise ValueError(
                     f"Unsupported response match key: {key!r}. "
-                    f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
+                    f"Must be within: {RESPONSE_SCHEMA.to_arrow_schema().names!r}"
                 )
             cursor: Any = container
             for part in tail.split("."):
@@ -1236,7 +1078,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
                 else:
                     raise ValueError(
                         f"Unsupported response match key: {key!r}. "
-                        f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
+                        f"Must be within: {RESPONSE_SCHEMA.to_arrow_schema().names!r}"
                     )
             return cursor
 
@@ -1260,7 +1102,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
             return getattr(self, key)
         raise ValueError(
             f"Unsupported response match key: {key!r}. "
-            f"Must be within: {RESPONSE_ARROW_SCHEMA.names!r}"
+            f"Must be within: {RESPONSE_SCHEMA.to_arrow_schema().names!r}"
         )
 
     def match_values(
@@ -1345,7 +1187,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         # row through a struct array keeps the per-child construction
         # in pyarrow C++ instead of paying a python ``pa.array(...)``
         # per column. The schema is reattached so callers get the same
-        # metadata-rich :data:`RESPONSE_ARROW_SCHEMA` shape.
+        # metadata-rich :data:`RESPONSE_SCHEMA.to_arrow_schema()` shape.
         return self.values_to_arrow_batch([self])
 
     @classmethod
@@ -1372,9 +1214,9 @@ class HTTPResponse(IO):  # IO inherits Tabular
         values = [r.arrow_values for r in responses]
         struct_array = pa.array(values, type=_RESPONSE_ARROW_STRUCT_TYPE)
         batch = pa.RecordBatch.from_struct_array(struct_array)
-        if batch.schema is not RESPONSE_ARROW_SCHEMA:
+        if batch.schema is not RESPONSE_SCHEMA.to_arrow_schema():
             batch = pa.RecordBatch.from_arrays(
-                batch.columns, schema=RESPONSE_ARROW_SCHEMA,
+                batch.columns, schema=RESPONSE_SCHEMA.to_arrow_schema(),
             )
         return batch
 
@@ -1477,7 +1319,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         # ``request`` is included for back-compat with pre-unnest
         # batches that still carry a single nested ``request`` struct
         # column instead of the flattened ``request_*`` columns.
-        response_cols = [f.name for f in RESPONSE_ARROW_SCHEMA] + ["request"]
+        response_cols = [f.name for f in RESPONSE_SCHEMA.to_arrow_schema()] + ["request"]
 
         for rb in _iter_batches(batch):
             available_set = set(rb.schema.names)
