@@ -301,7 +301,7 @@ class TestLocalCacheSend:
             received_to=now,
         )
         req = make_request("https://example.com/x")
-        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
         _seed_local(cache, make_response(
             request=req, body=b'{"v":"old"}', received_at=old,
         ))

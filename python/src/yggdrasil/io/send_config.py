@@ -732,7 +732,7 @@ class SendConfig:
             opts = CastOptions(predicate=batch_predicate, target=RESPONSE_SCHEMA)
             return holder.read_table(options=opts)
 
-        if self.local_cache is not None and self.local_cache.mode in (Mode.AUTO, Mode.APPEND):
+        if self.local_cache is not None:
             cached_hashes = _probe_cache(self.local_cache)
             existing = cached_hashes & set(request_hashes)
             if existing:
@@ -741,7 +741,7 @@ class SendConfig:
                 if hit_reqs:
                     local_tabular = _fetch_hits(self.local_cache, hit_reqs)
 
-        if self.remote_cache is not None and misses and self.remote_cache.mode in (Mode.AUTO, Mode.APPEND):
+        if self.remote_cache is not None and misses:
             cached_hashes = _probe_cache(self.remote_cache)
             remaining = {r.match_value(MATCH_KEY) for r in misses}
             existing = cached_hashes & remaining

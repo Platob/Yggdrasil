@@ -711,76 +711,6 @@ class HTTPSession(Session):
         except Exception:
             return request.url.to_string()
 
-    def _load_cached_response(
-        self,
-        request: PreparedRequest,
-        cache_cfg: "CacheConfig | None",
-    ) -> Optional[Response]:
-        """Resolve one request against a cache backend.
-
-        Returns ``None`` when *cache_cfg* is disabled, the mode
-        disables reads, or no matching response exists.
-        """
-        if cache_cfg is None:
-            return None
-        tabular = cache_cfg.tabular
-        if tabular is None:
-            tabular = cache_cfg.cache_tabular(session=self)
-        if tabular is None:
-            return None
-
-        from yggdrasil.data.options import CastOptions
-
-        predicate = cache_cfg.make_lookup_predicate(request=request)
-        spark = request.send_config_or_default.get_spark_session()
-        opts = CastOptions(predicate=predicate, spark_session=spark)
-        batches = tabular.read_arrow_batches(options=opts.check_target(RESPONSE_SCHEMA))
-
-        best: Optional[Response] = None
-        for response in Response.from_arrow_tabular(iter(batches)):
-            if not cache_cfg.filter_response(response, request=request):
-                LOGGER.debug(
-                    "Cache filter rejected response in %r "
-                    "(received_at=%s, window=[%s, %s))",
-                    tabular, response.received_at,
-                    cache_cfg.received_from, cache_cfg.received_to,
-                )
-                continue
-            if best is None or response.received_at >= best.received_at:
-                best = response
-        if best is not None:
-            LOGGER.info(
-                "Cache hit %s %s in %r (status=%d, received_at=%s) "
-                "— skipping network",
-                request.method, request.url, tabular,
-                best.status_code, best.received_at,
-            )
-        return best
-
-    def _store_cached_response(
-        self,
-        response: Response,
-        cache_cfg: "CacheConfig | None",
-        *,
-        mode: Optional[Mode] = None,
-        async_write: bool = False,
-        received_at: dt.datetime | None = None,
-    ) -> None:
-        """Persist one response to a cache backend."""
-        if not response.ok or cache_cfg is None:
-            return
-        if received_at is not None:
-            response.received_at = received_at
-        if async_write:
-            Job.make(
-                cache_cfg.write_responses,
-                [response], mode=mode, session=self,
-            ).fire_and_forget()
-        else:
-            cache_cfg.write_responses(
-                [response], mode=mode, session=self,
-            )
-
     @classmethod
     def from_url(
         cls,
@@ -1027,34 +957,28 @@ class HTTPSession(Session):
         self,
         request: PreparedRequest,
     ) -> Response:
-        """Core send pipeline: local cache → remote cache → network → writeback.
-
-        Reads the fully-resolved config from
-        :attr:`PreparedRequest.send_config_or_default` — callers
-        (``send``, ``_send_many``, ``_fetch_misses``) are responsible
-        for stamping the effective :class:`SendConfig` on each request
-        *before* this method is reached.
-        """
+        """Core send pipeline: split cache → network → writeback."""
         config = request.send_config_or_default
 
-        local_response = self._load_cached_response(request, config.local_cache)
-        if local_response is not None:
-            if config.raise_error:
-                local_response.raise_for_status()
-            return local_response
+        local_tab, remote_tab, misses = config.split_requests(
+            [request], session=self,
+        )
 
-        remote_response = self._load_cached_response(request, config.remote_cache)
-        if remote_response is not None:
-            self._store_cached_response(
-                remote_response,
-                config.local_cache,
-                async_write=True,
-                received_at=dt.datetime.now(dt.timezone.utc),
-                mode=Mode.OVERWRITE
-            )
-            if config.raise_error:
-                remote_response.raise_for_status()
-            return remote_response
+        if local_tab is not None and config.local_cache is not None:
+            for resp in Response.from_arrow_tabular(local_tab.read_arrow_batches()):
+                if config.local_cache.filter_response(resp, request=request):
+                    if config.raise_error:
+                        resp.raise_for_status()
+                    return resp
+
+        if remote_tab is not None and config.remote_cache is not None:
+            for resp in Response.from_arrow_tabular(remote_tab.read_arrow_batches()):
+                if config.remote_cache.filter_response(resp, request=request):
+                    if config.local_cache is not None:
+                        config.local_cache.write_responses([resp], mode=Mode.OVERWRITE, session=self)
+                    if config.raise_error:
+                        resp.raise_for_status()
+                    return resp
 
         if config.cache_only:
             response = _synthetic_not_found(request)
@@ -1068,8 +992,11 @@ class HTTPSession(Session):
         response = self.prepare_response_after_received(response)
         LOGGER.info("Sent %s %s", request.method, request.url)
 
-        self._store_cached_response(response, config.local_cache, async_write=True)
-        self._store_cached_response(response, config.remote_cache)
+        if response.ok:
+            if config.local_cache is not None:
+                config.local_cache.write_responses([response], session=self)
+            if config.remote_cache is not None:
+                config.remote_cache.write_responses([response], session=self)
 
         if config.raise_error:
             response.raise_for_status()
