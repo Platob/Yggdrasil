@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Literal, Mapping, Optional, Sequence
 import pyarrow as pa
 
 from yggdrasil.dataclasses.singleton import Singleton
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 # Lazy field caches default to ``...`` (the ``Ellipsis`` singleton)
 # to mean "not yet resolved". ``None`` is a valid computed result

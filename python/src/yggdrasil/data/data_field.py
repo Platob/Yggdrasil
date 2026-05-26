@@ -2171,7 +2171,7 @@ class Field(BaseChildrenFields):
         # Routes through ``URL.is_pathish`` (the cross-cutting check) so
         # ``Field.from_any`` doesn't have to know about every Path subtype.
         if isinstance(obj, (pathlib.PurePath, os.PathLike)):
-            from yggdrasil.io.url import URL
+            from yggdrasil.url import URL
 
             if URL.is_pathish(obj):
                 try:

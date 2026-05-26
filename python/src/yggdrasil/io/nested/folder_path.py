@@ -93,7 +93,7 @@ from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.io.url import hive_cast_value, hive_encode, hive_split
+from yggdrasil.url import hive_cast_value, hive_encode, hive_split
 
 # Side-effect import: ensures every primitive leaf (parquet / csv /
 # arrow / ndjson / json / xlsx) has registered itself in the

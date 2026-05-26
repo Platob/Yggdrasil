@@ -48,7 +48,7 @@ from yggdrasil.databricks.cluster import (
     ServerlessClusterStatementExecutor,
 )
 from yggdrasil.databricks.volume.volume import Volume
-from yggdrasil.io.url import URLBased
+from yggdrasil.url import URLBased
 from yggdrasil.spark.statement import SparkPreparedStatement
 
 from .. import DatabricksIntegrationCase

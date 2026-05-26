@@ -50,7 +50,7 @@ from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.enums.media_type import MediaType
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from ..path import DatabricksPath
 
 if TYPE_CHECKING:

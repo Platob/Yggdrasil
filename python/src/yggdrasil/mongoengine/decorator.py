@@ -5,7 +5,7 @@ import os
 from typing import Any, Callable, Mapping, Optional, Sequence, TypeVar, Union, TYPE_CHECKING
 
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from yggdrasil.mongoengine import register_connection
 
 from .lib import (

@@ -3,7 +3,7 @@
 import logging
 from dataclasses import dataclass, field
 
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from .service import Workspaces
 from ..client import DatabricksClient, DatabricksResource

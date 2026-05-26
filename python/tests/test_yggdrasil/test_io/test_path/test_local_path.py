@@ -25,7 +25,7 @@ import pytest
 
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 
 class TestConstruction:

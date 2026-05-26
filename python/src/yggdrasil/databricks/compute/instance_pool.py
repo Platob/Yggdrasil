@@ -56,7 +56,7 @@ from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ import PyEnv
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from yggdrasil.pyutils.equality import dicts_equal
 
 from ..client import DatabricksClient, DatabricksResource, DatabricksService

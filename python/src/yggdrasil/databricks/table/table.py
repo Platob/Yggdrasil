@@ -55,7 +55,7 @@ from yggdrasil.databricks.sql.sql_utils import (
 )
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.io import URL
+from yggdrasil.url import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import Path

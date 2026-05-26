@@ -21,7 +21,7 @@ from __future__ import annotations
 from yggdrasil.enums import Scheme
 from yggdrasil.databricks.cluster import Cluster, ServerlessCluster
 from yggdrasil.databricks.tests import DatabricksTestCase
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.url import URL, URLBased
 
 
 class TestClusterURLBased(DatabricksTestCase):

@@ -11,7 +11,7 @@ from yggdrasil.databricks.jobs.userinfo import (
     userinfo_job_settings,
     userinfo_tags,
 )
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 
 def _info(

@@ -62,7 +62,7 @@ from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.io.session import Session
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from .exceptions import (
     LocationParseError,

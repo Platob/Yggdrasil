@@ -34,7 +34,7 @@ import statistics
 import time
 from typing import Callable
 
-from yggdrasil.io import URL
+from yggdrasil.url import URL
 from yggdrasil.io.headers import Headers
 from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.memory import Memory

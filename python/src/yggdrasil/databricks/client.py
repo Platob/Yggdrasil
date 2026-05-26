@@ -28,7 +28,7 @@ from yggdrasil.dataclasses import (
 )
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.enums import MimeTypes, Scheme
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.url import URL, URLBased
 from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:

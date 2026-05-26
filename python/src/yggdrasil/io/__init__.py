@@ -12,11 +12,11 @@ from __future__ import annotations
 #
 # Buffer (BytesIO / BufferLike) is lazy for the same reason: pulling it
 # would trigger the buffer/primitive/tabular chain.
-from .url import URL
 from .io_stats import IOStats
 
 
 _LAZY_DATA_NAMES = {"Holder", "Memory", "MemoryStream"}
+_LAZY_URL_NAMES = {"URL"}
 _LAZY_BUFFER_NAMES = {"BytesIO", "BufferLike"}
 
 
@@ -34,6 +34,10 @@ def __getattr__(name: str):
         from . import bytes_io as _buffer
 
         value = getattr(_buffer, name)
+        globals()[name] = value
+        return value
+    if name in _LAZY_URL_NAMES:
+        from yggdrasil.url import URL as value
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

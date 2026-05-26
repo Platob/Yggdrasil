@@ -58,7 +58,7 @@ from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.path import RemotePath
 from yggdrasil.io.path._retry import retry_sdk_call
 from yggdrasil.io.io_stats import IOStats, IOKind
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.aws.fs.service import S3Service

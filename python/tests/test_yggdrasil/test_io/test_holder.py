@@ -504,7 +504,7 @@ class TestFromUrl:
     """
 
     def test_storage_builds_at_url(self) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         mem = Memory()
         sibling = mem._from_url(URL.from_("/foo/bar/data.parquet"))
@@ -514,7 +514,7 @@ class TestFromUrl:
 
     def test_local_path_no_override_keeps_url(self, tmp_path) -> None:
         # Path._from_url is gone — Holder default handles it.
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         lp = LocalPath(str(tmp_path / "a.bin"))
         target = URL.from_(f"file://{tmp_path / 'b.bin'}")
@@ -524,7 +524,7 @@ class TestFromUrl:
 
     def test_cursor_reuses_parent_storage(self) -> None:
         from yggdrasil.io.bytes_io import BytesIO
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         mem = Memory(b"shared")
         cursor = BytesIO(holder=mem, owns_holder=False, mode="rb")

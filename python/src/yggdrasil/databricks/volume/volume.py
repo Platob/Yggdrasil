@@ -52,7 +52,7 @@ from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient

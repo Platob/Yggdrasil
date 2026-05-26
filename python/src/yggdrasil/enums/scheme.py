@@ -39,7 +39,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from yggdrasil.io.url import URLBased
+    from yggdrasil.url import URLBased
 
 
 __all__ = ["Scheme"]

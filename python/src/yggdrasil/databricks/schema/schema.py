@@ -42,7 +42,7 @@ from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.databricks.path import DatabricksPath
-from yggdrasil.io import URL
+from yggdrasil.url import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import Path

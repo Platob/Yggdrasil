@@ -608,7 +608,7 @@ class TestLocalCacheFolderPerHost:
         assert path.parent.name == "response"
 
     def test_host_only_base_url(self) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         s = StubSession(base_url=URL.from_("https://api.example.com/"))
         path = CacheConfig().local_cache_folder(session=s)
@@ -616,7 +616,7 @@ class TestLocalCacheFolderPerHost:
         assert path.parent.name == "response"
 
     def test_host_plus_path_base_url(self) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
 
         s = StubSession(base_url=URL.from_("https://api.example.com/v1/markets/"))
         path = CacheConfig().local_cache_folder(session=s)
@@ -627,7 +627,7 @@ class TestLocalCacheFolderPerHost:
         )
 
     def test_explicit_path_overrides_default(self, tmp_path) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
         s = StubSession(base_url=URL.from_("https://api.example.com/"))
         cache = CacheConfig(tabular=str(tmp_path), mode=Mode.APPEND)
         # Explicit ``path`` wins — host derivation is for the
@@ -635,7 +635,7 @@ class TestLocalCacheFolderPerHost:
         assert str(cache.local_cache_folder(session=s)) == str(tmp_path)
 
     def test_distinct_hosts_get_distinct_folders(self) -> None:
-        from yggdrasil.io.url import URL
+        from yggdrasil.url import URL
         a = StubSession(base_url=URL.from_("https://a.example.com/"))
         b = StubSession(base_url=URL.from_("https://b.example.com/"))
         pa = CacheConfig().local_cache_folder(session=a)

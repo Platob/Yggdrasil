@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence, Un
 
 from yggdrasil.databricks.resource import DatabricksResource
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import pandas as pd

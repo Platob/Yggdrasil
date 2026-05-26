@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from yggdrasil.enums import Scheme
 from yggdrasil.databricks import DatabricksClient
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.url import URL, URLBased
 
 
 class TestSchemeRegistration:

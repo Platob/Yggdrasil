@@ -19,7 +19,7 @@ import pytest
 
 from yggdrasil.http_ import HTTPSession
 from yggdrasil.io.session import Session
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from ._helpers import StubSession
 

@@ -17,7 +17,7 @@ from typing import Any, ClassVar, Iterator
 
 from yggdrasil.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from ..path import DatabricksPath
 from .service import DBFSService
