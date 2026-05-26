@@ -169,7 +169,7 @@ def _lazy_import(
 
     *hint* is substituted into the :class:`ImportError` message when
     the import fails and we are not installing — used by packages
-    whose install string is non-obvious (``pymongoarrow``,
+    whose install string is non-obvious (``confluent-kafka``,
     ``adbc-driver-postgresql``, …) so the user sees the right
     ``pip install`` command from the traceback.
     """
@@ -359,125 +359,6 @@ def databricks_error_class():
 
 
 # ---------------------------------------------------------------------------
-# Postgres — psycopg + ADBC; both optional, ADBC is the Arrow fast path
-# ---------------------------------------------------------------------------
-
-
-_PSYCOPG_HINT = (
-    "psycopg (psycopg 3) is required for yggdrasil.postgres; "
-    "install it with `pip install ygg[postgres]` or "
-    "`pip install psycopg[binary]`."
-)
-_ADBC_HINT = (
-    "adbc_driver_postgresql is required for the Arrow-native "
-    "Postgres path; install it with `pip install ygg[postgres]` "
-    "or `pip install adbc-driver-postgresql`."
-)
-
-
-def psycopg_module(*, install: bool = False):
-    return _lazy_import("psycopg", "psycopg[binary]", install=install, hint=_PSYCOPG_HINT)
-
-
-def adbc_dbapi_module(*, install: bool = False):
-    # The dbapi submodule lives under ``adbc_driver_postgresql``; we
-    # install the driver package and return its ``dbapi`` attribute.
-    mod = _lazy_import(
-        "adbc_driver_postgresql.dbapi",
-        "adbc-driver-postgresql",
-        install=install,
-        hint=_ADBC_HINT,
-    )
-    return mod
-
-
-def has_psycopg() -> bool:
-    """Probe-only — never raises."""
-    try:
-        psycopg_module()
-    except ImportError:
-        return False
-    return True
-
-
-def has_adbc() -> bool:
-    """Probe-only — never raises."""
-    try:
-        adbc_dbapi_module()
-    except ImportError:
-        return False
-    return True
-
-
-# ---------------------------------------------------------------------------
-# MongoDB — pymongo (+ bson) and the optional pymongoarrow fast path
-# ---------------------------------------------------------------------------
-
-
-_PYMONGO_HINT = (
-    "pymongo is required for yggdrasil.mongo; install it with "
-    "`pip install ygg[mongo]` or `pip install pymongo>=4.5`."
-)
-_PMA_HINT = (
-    "pymongoarrow is required for the Arrow-native MongoDB path; "
-    "install it with `pip install ygg[mongo]` or "
-    "`pip install pymongoarrow>=1.3`."
-)
-
-
-def pymongo_module(*, install: bool = False):
-    return _lazy_import("pymongo", install=install, hint=_PYMONGO_HINT)
-
-
-def bson_module(*, install: bool = False):
-    return _lazy_import("bson", "pymongo", install=install, hint=_PYMONGO_HINT)
-
-
-def pymongoarrow_module(*, install: bool = False):
-    return _lazy_import("pymongoarrow", install=install, hint=_PMA_HINT)
-
-
-def pymongoarrow_api_module(*, install: bool = False):
-    return _lazy_import("pymongoarrow.api", "pymongoarrow", install=install, hint=_PMA_HINT)
-
-
-def pymongoarrow_schema_module(*, install: bool = False):
-    return _lazy_import("pymongoarrow.schema", "pymongoarrow", install=install, hint=_PMA_HINT)
-
-
-def pymongoarrow_writer_module(*, install: bool = False):
-    """``pymongoarrow.writer`` — only present in newer pymongoarrow.
-
-    Returns ``None`` when the installed pymongoarrow is too old for
-    the writer surface; callers should fall back to
-    ``pymongoarrow.api.write`` or the pymongo bulk path.
-    """
-    pymongoarrow_module(install=install)
-    try:
-        return _lazy_import("pymongoarrow.writer", "pymongoarrow", install=False)
-    except ImportError:
-        return None
-
-
-def has_pymongo() -> bool:
-    """Probe-only — never raises."""
-    try:
-        pymongo_module()
-    except ImportError:
-        return False
-    return True
-
-
-def has_pymongoarrow() -> bool:
-    """Probe-only — never raises."""
-    try:
-        pymongoarrow_module()
-    except ImportError:
-        return False
-    return True
-
-
-# ---------------------------------------------------------------------------
 # SQL — sqlglot is the parser; polars is the preferred execution backend
 # ---------------------------------------------------------------------------
 
@@ -538,11 +419,6 @@ _LAZY_ATTRS: "dict[str, Any]" = {
     "WorkspaceClient": databricks_workspace_client_class,
     "Config": databricks_config_class,
     "DatabricksError": databricks_error_class,
-    "psycopg": psycopg_module,
-    "adbc_dbapi": adbc_dbapi_module,
-    "pymongo": pymongo_module,
-    "bson": bson_module,
-    "pymongoarrow": pymongoarrow_module,
     "sqlglot": sqlglot_module,
 }
 

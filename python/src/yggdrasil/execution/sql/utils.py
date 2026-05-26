@@ -32,8 +32,7 @@ __all__ = [
 ]
 
 
-# Same shape as ``yggdrasil.postgres.sql_utils._DOTTED_PART_RE`` but
-# accepts both double-quoted (ANSI / Postgres / SQLite) and
+# Accepts both double-quoted (ANSI / Postgres / SQLite) and
 # backtick-quoted (Databricks / MySQL) segments. Bare identifiers
 # follow the SQL rule: leading letter or underscore, then alnum /
 # underscore / dollar.
