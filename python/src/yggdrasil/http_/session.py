@@ -61,8 +61,8 @@ from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCFile
-from yggdrasil.http_.request import PreparedRequest
-from yggdrasil.http_.response import Response
+from yggdrasil.http_.request import HTTPRequest
+from yggdrasil.http_.response import HTTPResponse
 from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.concurrent.threading import JobPoolExecutor
 from yggdrasil.dataclasses.singleton import Singleton
@@ -301,7 +301,7 @@ class HTTPSession(Singleton, ABC):
 
     # Prepared / response / batch types the prepare → send pipeline
     # emits. Each transport pins these to its own concrete types —
-    # :class:`HTTPSession` to :class:`PreparedRequest` / :class:`Response`
+    # :class:`HTTPSession` to :class:`HTTPRequest` / :class:`HTTPResponse`
     # / :class:`HTTPResponseBatch`; :class:`StatementExecutor` subclasses
     # to :class:`PreparedStatement` / :class:`StatementResult` /
     # :class:`StatementBatch` — so the same vocabulary covers every
@@ -524,8 +524,8 @@ class HTTPSession(Singleton, ABC):
     a worked example).
     """
 
-    _PREPARED_CLASS: ClassVar[type] = PreparedRequest
-    _RESPONSE_CLASS: ClassVar[type] = Response
+    _PREPARED_CLASS: ClassVar[type] = HTTPRequest
+    _RESPONSE_CLASS: ClassVar[type] = HTTPResponse
     _BATCH_CLASS: ClassVar[type] = HTTPResponseBatch
 
     _TRANSIENT_STATE_ATTRS = frozenset({"_lock", "_job_pool", "_local_cache"}) | {"_connections", "_retry"}
@@ -748,14 +748,14 @@ class HTTPSession(Singleton, ABC):
     ) -> HTTPResponse:
         """Low-level wire fetch — bypasses the cache / auth-refresh pipeline.
 
-        Build a synthetic :class:`PreparedRequest` from ``method`` /
+        Build a synthetic :class:`HTTPRequest` from ``method`` /
         ``url`` / ``headers`` / ``body`` and run it through the same
         retry + redirect machinery :meth:`_send_http` does for the
         regular :meth:`send` path. Useful when the caller just wants a
         raw byte stream off a URL — Databricks external-link readers
         feeding :func:`pa.input_stream` are the canonical case.
         """
-        request = PreparedRequest.prepare(
+        request = HTTPRequest.prepare(
             method=method,
             url=str(url) if isinstance(url, URL) else url,
             headers=dict(headers) if headers is not None else None,
@@ -772,7 +772,7 @@ class HTTPSession(Singleton, ABC):
 
     def _send_http(
         self,
-        request: PreparedRequest,
+        request: HTTPRequest,
         *,
         timeout: Any = None,
         preload_content: bool = True,
@@ -873,7 +873,7 @@ class HTTPSession(Singleton, ABC):
     def _send_once(
         self,
         *,
-        request: PreparedRequest,
+        request: HTTPRequest,
         timeout: Any,
         preload_content: bool,
         decode_content: bool,
@@ -970,7 +970,7 @@ class HTTPSession(Singleton, ABC):
         base = parts.path.rsplit("/", 1)[0] + "/"
         return urlunsplit((parts.scheme, parts.netloc, base + location, "", ""))
 
-    def _request_log_id(self, request: PreparedRequest) -> str:
+    def _request_log_id(self, request: HTTPRequest) -> str:
         try:
             return request.xxh3_b64(url_safe=True)
         except Exception:
@@ -1000,7 +1000,7 @@ class HTTPSession(Singleton, ABC):
 
     def send(
         self,
-        request: PreparedRequest,
+        request: HTTPRequest,
         config: SendConfig | Mapping[str, Any] | None = None,
         *,
         wait: WaitingConfigArg = ...,
@@ -1011,10 +1011,10 @@ class HTTPSession(Singleton, ABC):
         spark_session: Optional["SparkSession"] = ...,
         start: bool = True,
         **options,
-    ) -> Response:
+    ) -> HTTPResponse:
         """Prepare, dispatch, and (optionally) await the response.
 
-        Single-request entry point — always returns a :class:`Response`.
+        Single-request entry point — always returns a :class:`HTTPResponse`.
         adds no value.
 
         When ``spark_session`` is bound (or ``True`` / ``...`` resolved
@@ -1029,11 +1029,11 @@ class HTTPSession(Singleton, ABC):
         same knob to return an idled :class:`StatementResult` whose
         backend submission is deferred until
         :meth:`StatementResult.start` fires. Plain HTTP sessions don't
-        need an idle :class:`Response` (the network call is
+        need an idle :class:`HTTPResponse` (the network call is
         synchronous), so the base raises a clean
         ``NotImplementedError`` via :meth:`_build_idle_response`.
 
-        Per-request :attr:`PreparedRequest.send_config` is used as the
+        Per-request :attr:`HTTPRequest.send_config` is used as the
         base when no explicit *config* is passed — explicit kwargs
         still override individual fields.
         """
@@ -1076,12 +1076,12 @@ class HTTPSession(Singleton, ABC):
 
     def _build_idle_response(
         self,
-        request: PreparedRequest,
+        request: HTTPRequest,
         config: SendConfig,
-    ) -> Response:
+    ) -> HTTPResponse:
         """Return a not-yet-sent response shell for *request*.
 
-        Concrete HTTP sessions don't need an idle :class:`Response`
+        Concrete HTTP sessions don't need an idle :class:`HTTPResponse`
         (the network call is synchronous), so the default raises.
         :class:`StatementExecutor` overrides this to return the
         standard ``start=False`` :class:`StatementResult` so callers
@@ -1096,7 +1096,7 @@ class HTTPSession(Singleton, ABC):
 
     def refresh_auth(
         self,
-        request: PreparedRequest,
+        request: HTTPRequest,
         force: bool = True,
     ) -> "tuple[Session, bool]":
         """Resolve the auth handler and stamp the Authorization header.
@@ -1183,7 +1183,7 @@ class HTTPSession(Singleton, ABC):
             self.headers["Authorization"] = authorization
         return self, True
 
-    def prepare_request_before_send(self, request: PreparedRequest) -> PreparedRequest:
+    def prepare_request_before_send(self, request: HTTPRequest) -> HTTPRequest:
         """Session-wide request hook fired once per outbound request.
 
         Default returns *request* unchanged. Subclasses override to inject
@@ -1206,7 +1206,7 @@ class HTTPSession(Singleton, ABC):
         self.refresh_auth(request, force=False)
         return request
 
-    def prepare_response_after_received(self, response: Response) -> Response:
+    def prepare_response_after_received(self, response: HTTPResponse) -> HTTPResponse:
         """Session-wide response hook fired once per completed network send.
 
         Default returns *response* unchanged. Subclasses override to log,
@@ -1220,8 +1220,8 @@ class HTTPSession(Singleton, ABC):
 
     def _send(
         self,
-        request: PreparedRequest,
-    ) -> Response:
+        request: HTTPRequest,
+    ) -> HTTPResponse:
         """Wire send — no cache logic, just prepare → send → post-process."""
         request = self.prepare_request_before_send(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
@@ -1236,7 +1236,7 @@ class HTTPSession(Singleton, ABC):
 
     def _local_send(
         self,
-        request: PreparedRequest,
+        request: HTTPRequest,
     ) -> HTTPResponse:
         config = request.send_config_or_default
         wait_cfg = config.wait if config.wait is not None else self.waiting
@@ -1279,7 +1279,7 @@ class HTTPSession(Singleton, ABC):
 
     def _wire_send(
         self,
-        request: PreparedRequest,
+        request: HTTPRequest,
         wait_cfg: WaitingConfig,
     ) -> HTTPResponse:
         """Single wire-level send.
@@ -1301,7 +1301,7 @@ class HTTPSession(Singleton, ABC):
     def _fetch_paginated_page(
         self,
         *,
-        request: PreparedRequest,
+        request: HTTPRequest,
         page_num: int,
         body_seed: bytes | None,
         wait_cfg: WaitingConfig,
@@ -1331,7 +1331,7 @@ class HTTPSession(Singleton, ABC):
         self,
         *,
         result: HTTPResponse,
-        request: PreparedRequest,
+        request: HTTPRequest,
         current_page: int,
         total_pages: int,
         wait_cfg: WaitingConfig,
@@ -1417,7 +1417,7 @@ class HTTPSession(Singleton, ABC):
 
     def send_many(
         self,
-        requests: Iterator[PreparedRequest],
+        requests: Iterator[HTTPRequest],
         config: SendConfig | Mapping[str, Any] | None = None,
         *,
         wait: WaitingConfigArg = ...,
@@ -1431,7 +1431,7 @@ class HTTPSession(Singleton, ABC):
         max_in_flight: int | None = None,
         max_batch_ttl: float | None = None,
         **options,
-    ) -> Iterator[Response]:
+    ) -> Iterator[HTTPResponse]:
         """Stream responses for a batch of requests.
 
         Batch orchestration kwargs (``batch_size``, ``ordered``,
@@ -1440,7 +1440,7 @@ class HTTPSession(Singleton, ABC):
         that gets stamped on each request.
 
         Send-config kwargs default to ``...`` (Ellipsis).  When left
-        unset the per-request :attr:`PreparedRequest.send_config` is
+        unset the per-request :attr:`HTTPRequest.send_config` is
         preserved; an explicit value overrides that field on every
         request in the batch.
         """
@@ -1474,7 +1474,7 @@ class HTTPSession(Singleton, ABC):
         if lc is not None and lc.tabular is None:
             lc.cache_tabular(session=self)
 
-        def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
+        def _stamp(reqs: Iterator[HTTPRequest]) -> Iterator[HTTPRequest]:
             for r in reqs:
                 if r.send_config is None:
                     r.send_config = cfg
@@ -1510,7 +1510,7 @@ class HTTPSession(Singleton, ABC):
 
     def _send_batch(
         self,
-        reqs: list[PreparedRequest],
+        reqs: list[HTTPRequest],
         cfg: "SendConfig",
         *,
         ordered: bool = False,
@@ -1523,10 +1523,10 @@ class HTTPSession(Singleton, ABC):
 
     @staticmethod
     def _group_by_config(
-        batch: list[PreparedRequest],
-    ) -> dict["SendConfig", list[PreparedRequest]]:
+        batch: list[HTTPRequest],
+    ) -> dict["SendConfig", list[HTTPRequest]]:
         """Group requests by send config."""
-        groups: dict[SendConfig, list[PreparedRequest]] = {}
+        groups: dict[SendConfig, list[HTTPRequest]] = {}
         for r in batch:
             cfg = r.send_config_or_default
             groups.setdefault(cfg, []).append(r)
@@ -1534,11 +1534,11 @@ class HTTPSession(Singleton, ABC):
 
     def _fetch_misses(
         self,
-        misses: list[PreparedRequest],
+        misses: list[HTTPRequest],
         *,
         ordered: bool = False,
         max_in_flight: int | None = None,
-    ) -> Iterator[Response]:
+    ) -> Iterator[HTTPResponse]:
         """Send misses through the job pool — no caching, just wire calls."""
         pool = self.job_pool
         for result in pool.as_completed(
@@ -1600,9 +1600,9 @@ class HTTPSession(Singleton, ABC):
 
     def _send_many(
         self,
-        requests: Iterator[PreparedRequest],
+        requests: Iterator[HTTPRequest],
         **batch_kw: Any,
-    ) -> Iterator[Response]:
+    ) -> Iterator[HTTPResponse]:
         """Stream responses, flattening the per-chunk :class:`HTTPResponseBatch`.
 
         In Spark mode ``raise_error`` is applied at the driver-iteration
@@ -1613,7 +1613,7 @@ class HTTPSession(Singleton, ABC):
 
     def send_many_batches(
         self,
-        requests: Iterator[PreparedRequest],
+        requests: Iterator[HTTPRequest],
         *,
         wait: WaitingConfigArg = ...,
         raise_error: bool = ...,
@@ -1629,7 +1629,7 @@ class HTTPSession(Singleton, ABC):
         """Yield one :class:`HTTPResponseBatch` per processed chunk.
 
         Send-config kwargs default to ``...`` (Ellipsis).  When left
-        unset the per-request :attr:`PreparedRequest.send_config` is
+        unset the per-request :attr:`HTTPRequest.send_config` is
         preserved; an explicit value overrides that field on every
         request in the batch.
         """
@@ -1650,7 +1650,7 @@ class HTTPSession(Singleton, ABC):
         if overrides:
             cfg = SendConfig.from_(None, **overrides)
 
-            def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
+            def _stamp(reqs: Iterator[HTTPRequest]) -> Iterator[HTTPRequest]:
                 for r in reqs:
                     if r.send_config is None:
                         r.send_config = cfg
@@ -1679,7 +1679,7 @@ class HTTPSession(Singleton, ABC):
 
     def _send_many_batches(
         self,
-        requests: Iterator[PreparedRequest],
+        requests: Iterator[HTTPRequest],
         *,
         batch_size: int | None = None,
         max_batch_size: int | None = None,
@@ -1701,10 +1701,10 @@ class HTTPSession(Singleton, ABC):
         total_failed = 0
 
         def _batched(
-            it: Iterator[PreparedRequest],
+            it: Iterator[HTTPRequest],
             n: int,
             ttl_seconds: float | None,
-        ) -> Iterator[list[PreparedRequest]]:
+        ) -> Iterator[list[HTTPRequest]]:
             # When no TTL is set, fall back to the cheap islice path —
             # avoids the per-request monotonic() probe.
             iterator = iter(it)
@@ -1720,7 +1720,7 @@ class HTTPSession(Singleton, ABC):
             # when either the size cap or the wall-clock deadline is
             # reached. The deadline is reset per chunk so a slow
             # upstream gets a fresh window after each flush.
-            buf: list[PreparedRequest] = []
+            buf: list[HTTPRequest] = []
             deadline: float | None = None
             for item in iterator:
                 if not buf:
@@ -1784,7 +1784,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | PreparedRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "GET",
             url,
@@ -1825,7 +1825,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | PreparedRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "POST",
             url,
@@ -1867,7 +1867,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | PreparedRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "PUT",
             url,
@@ -1909,7 +1909,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | PreparedRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "PATCH",
             url,
@@ -1951,7 +1951,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | PreparedRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "DELETE",
             url,
@@ -1992,7 +1992,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | PreparedRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "HEAD",
             url,
@@ -2033,7 +2033,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | PreparedRequest:
+    ) -> HTTPResponse | HTTPRequest:
         return self.request(
             "OPTIONS",
             url,
@@ -2076,7 +2076,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> Response | PreparedRequest:
+    ) -> HTTPResponse | HTTPRequest:
         # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
         # form-urlencoding for mappings/sequences), ``timeout=`` becomes
         # ``wait=``, and ``cookies=`` joins ``headers={'Cookie': ...}``.
@@ -2149,7 +2149,7 @@ class HTTPSession(Singleton, ABC):
         normalize: bool = True,
         send_config: SendConfig | None = None,
         **send_kwargs: Any,
-    ) -> PreparedRequest:
+    ) -> HTTPRequest:
         full_url: URL | str | None = url
 
         if self.base_url:
@@ -2171,7 +2171,7 @@ class HTTPSession(Singleton, ABC):
             ):
                 object.__setattr__(lc, "tabular", self.local_cache())
 
-        request = PreparedRequest.prepare(
+        request = HTTPRequest.prepare(
             method=method,
             url=full_url,
             headers=headers,
@@ -2185,4 +2185,3 @@ class HTTPSession(Singleton, ABC):
         return request
 
 
-Session = HTTPSession

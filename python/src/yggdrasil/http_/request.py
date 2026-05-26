@@ -26,9 +26,9 @@ from yggdrasil.io.memory import Memory
 from yggdrasil.url import URL, URL_STRUCT
 
 if TYPE_CHECKING:
-    from yggdrasil.http_.response import Response
+    from yggdrasil.http_.response import HTTPResponse
     from yggdrasil.io.send_config import CacheConfig, SendConfig
-    from yggdrasil.http_.session import Session
+    from yggdrasil.http_.session import HTTPSession
 
 
 __all__ = [
@@ -436,7 +436,7 @@ class HTTPRequest:
         sc = self.send_config
         return sc.remote_cache if sc is not None else None
 
-    def with_sender(self, sender: UserInfo | Mapping[str, Any] | None) -> "PreparedRequest":
+    def with_sender(self, sender: UserInfo | Mapping[str, Any] | None) -> "HTTPRequest":
         """Return a copy of this request with :attr:`sender` replaced.
 
         Accepts a :class:`UserInfo`, a struct-shaped mapping (matching
@@ -542,11 +542,11 @@ class HTTPRequest:
     # Session attachment — used by Spark broadcast on the worker side
     # ------------------------------------------------------------------
 
-    def attach_session(self, session: "Session") -> "PreparedRequest":
+    def attach_session(self, session: "HTTPSession") -> "HTTPRequest":
         self._session = session
         return self
 
-    def detach_session(self) -> "PreparedRequest":
+    def detach_session(self) -> "HTTPRequest":
         self._session = None
         return self
 
@@ -562,14 +562,14 @@ class HTTPRequest:
         self,
         config: "SendConfig | Mapping[str, Any] | None" = None,
         **kwargs: Any,
-    ) -> "Response":
+    ) -> "HTTPResponse":
         return self._send(config, **kwargs)
 
     def _send(
         self,
         config: "SendConfig | Mapping[str, Any] | None" = None,
         **kwargs: Any,
-    ) -> "Response":
+    ) -> "HTTPResponse":
         if self._session is None:
             # Orphan request — lazy-build a default session for HTTP(S)
             # URLs so callers can ``PreparedRequest.prepare(...).send()``
@@ -594,7 +594,7 @@ class HTTPRequest:
         obj: Any,
         *,
         normalize: bool = True,
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         if isinstance(obj, str):
             obj = {
                 "url": URL.from_str(obj, normalize=normalize)
@@ -611,7 +611,7 @@ class HTTPRequest:
         obj: Mapping[str, Any],
         *,
         normalize: bool = True,
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         method = cls._parse_method(obj)
         url = cls._parse_url(obj, normalize=normalize)
         headers = cls._parse_headers(obj)
@@ -745,7 +745,7 @@ class HTTPRequest:
         auth: Optional[Authorization] = None,
         send_config: "SendConfig | None" = None,
         session: "Session | None" = None,
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         parsed_url = URL.from_(url, normalize=normalize)
         out_headers: dict[str, str] = _string_dict(headers)
 
@@ -808,7 +808,7 @@ class HTTPRequest:
         remote_cache_config: Optional["CacheConfig"] = ...,
         normalize: bool = True,
         copy_buffer: bool = False,
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         new_url = self.url if url is None else URL.from_(url, normalize=normalize)
         # Clone the existing :class:`Headers` directly — ``dict(self.headers)``
         # would iterate via ``__getitem__`` only for ``Headers.from_`` to
@@ -914,7 +914,7 @@ class HTTPRequest:
             )
         self._auth = value
 
-    def prepare_authorization(self) -> "PreparedRequest":
+    def prepare_authorization(self) -> "HTTPRequest":
         """Resolve the bound :class:`Authorization` handler into the header.
 
         No-op when no handler is bound. Calls ``handler.authorization``
@@ -1241,7 +1241,7 @@ class HTTPRequest:
         headers: MutableMapping[str, str],
         *,
         normalize: bool = True,
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         if not headers:
             return self
 
@@ -1264,7 +1264,7 @@ class HTTPRequest:
     def update_tags(
         self,
         tags: MutableMapping[str, str],
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         if not tags:
             return self
 
@@ -1276,7 +1276,7 @@ class HTTPRequest:
         self._invalidate_cache()
         return self
 
-    def anonymize(self, mode: Literal["remove", "redact"] = "remove") -> "PreparedRequest":
+    def anonymize(self, mode: Literal["remove", "redact"] = "remove") -> "HTTPRequest":
         if not mode:
             return self
 
@@ -1358,7 +1358,7 @@ class HTTPRequest:
         record: "Mapping[str, Any]",
         *,
         normalize: bool = True,
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         """Build a :class:`PreparedRequest` from a row-shaped mapping."""
         return cls._from_get(record.get, normalize=normalize)
 
@@ -1369,7 +1369,7 @@ class HTTPRequest:
         i: int,
         *,
         normalize: bool = True,
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         """Build one :class:`PreparedRequest` from a per-batch column dict + row index."""
         def _arrow_get(name: str) -> Any:
             col = cols.get(name)
@@ -1383,7 +1383,7 @@ class HTTPRequest:
         get: "Callable[[str], Any]",
         *,
         normalize: bool = True,
-    ) -> "PreparedRequest":
+    ) -> "HTTPRequest":
         # Single source of truth for "named-getter → PreparedRequest" —
         # used by both the Arrow-batch path and the Mapping path.
         url_value = get("url")
@@ -1409,4 +1409,3 @@ class HTTPRequest:
     ):
         return func(self)
 
-PreparedRequest = HTTPRequest

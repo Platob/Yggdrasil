@@ -29,7 +29,7 @@ from yggdrasil.io.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
 from yggdrasil.http_.request import (
-    PreparedRequest,
+    HTTPRequest,
     REQUEST_SCHEMA,
     _coerce_userinfo,
     _default_sender,
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, Row as SparkRow
     from starlette.responses import Response as StarletteResponse
 
-    from yggdrasil.http_.session import HTTPSession, Session
+    from yggdrasil.http_.session import HTTPSession
     from yggdrasil.http_.path import HTTPPath
 
 
@@ -263,7 +263,7 @@ def _coerce_buffer(
 ) -> Holder:
     """Normalize *obj* into a :class:`Holder` and stamp *media_type* if absent.
 
-    Accepts the shapes :class:`Response` / :class:`PreparedRequest`
+    Accepts the shapes :class:`Response` / :class:`HTTPRequest`
     constructors hand in: an existing :class:`Holder` (passed through),
     an :class:`IO` cursor (the holder is borrowed), bytes-like input
     (wrapped in a fresh :class:`Memory`), or ``None`` (empty Memory).
@@ -509,7 +509,7 @@ def _compute_response_identity_hash(
     """Mix (request_hash, status, headers, body) into one xxh3_64.
 
     Each component arrives pre-digested where possible:
-    :attr:`PreparedRequest.hash` already collapses method / url /
+    :attr:`HTTPRequest.hash` already collapses method / url /
     headers / body upstream, :class:`Headers` caches
     :attr:`canonical_bytes`, :class:`Holder` caches
     :attr:`xxh3_64_digest`. The response identity is the request
@@ -537,7 +537,7 @@ def _compute_response_identity_hash(
 
 
 class HTTPResponse(IO):  # IO inherits Tabular
-    """HTTP response model — paired with the originating :class:`PreparedRequest`.
+    """HTTP response model — paired with the originating :class:`HTTPRequest`.
 
     Implements :class:`Tabular` over the deterministic metadata
     projection: :meth:`read_arrow_batches` (and the engine fan-out
@@ -594,7 +594,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
 
     def __init__(
         self,
-        request: PreparedRequest,
+        request: HTTPRequest,
         status_code: int,
         headers: MutableMapping[str, str],
         tags: MutableMapping[str, str],
@@ -803,7 +803,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
     # Session attachment
     # ------------------------------------------------------------------
 
-    def attach_session(self, session: "Session") -> "Response":
+    def attach_session(self, session: "HTTPSession") -> "Response":
         self._session = session
         return self
 
@@ -853,7 +853,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
             raise ValueError("Response.from_mapping: empty mapping")
 
         req_obj = get_from_dict(obj, keys=("request",), prefix=None)
-        request = PreparedRequest.from_(
+        request = HTTPRequest.from_(
             obj if req_obj is MISSING or req_obj in (None, "") else req_obj,
             normalize=normalize,
         )
@@ -1039,7 +1039,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         (force-minting a fresh token when ``force=True``) and
         re-stamps ``request.headers["Authorization"]``. The next
         ``self.request.send()`` (or any caller that reuses the same
-        :class:`PreparedRequest`) carries the rotated credential.
+        :class:`HTTPRequest`) carries the rotated credential.
 
         Returns ``(self, refreshed)`` where ``refreshed`` is ``True``
         when the handler ran and the header was stamped, ``False``
@@ -1170,7 +1170,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
 
         Used by :meth:`match_value` so the lookup pays for one column
         instead of materializing every value via :attr:`arrow_values`.
-        ``request_<col>`` keys forward to :meth:`PreparedRequest._arrow_value`
+        ``request_<col>`` keys forward to :meth:`HTTPRequest._arrow_value`
         on the embedded request — its own memoization takes care of
         repeated lookups.
         """
@@ -1542,13 +1542,13 @@ class HTTPResponse(IO):  # IO inherits Tabular
         #     used by ``from_mapping`` callers that bypass the schema.
         request_value = get("request")
         if isinstance(request_value, Mapping):
-            request = PreparedRequest._from_get(request_value.get, normalize=normalize)
+            request = HTTPRequest._from_get(request_value.get, normalize=normalize)
         elif get("request_url") is not None or get("request_method") is not None:
             def _request_get(name: str) -> Any:
                 return get(f"request_{name}")
-            request = PreparedRequest._from_get(_request_get, normalize=normalize)
+            request = HTTPRequest._from_get(_request_get, normalize=normalize)
         else:
-            request = PreparedRequest._from_get(get, normalize=normalize)
+            request = HTTPRequest._from_get(get, normalize=normalize)
 
         headers = _map_as_str_dict(get("headers"))
 
@@ -1717,7 +1717,7 @@ class _DecodingReader:
     """
 
     # No URL-routable scheme — the response's URL is sourced from the
-    # bound :class:`PreparedRequest`, not the class-level scheme
+    # bound :class:`HTTPRequest`, not the class-level scheme
     # registry. Keeping it ``None`` also bypasses the
     # :class:`URLBased`-on-import-time registration step.
     scheme = None
@@ -1738,7 +1738,7 @@ class _DecodingReader:
 
     def __init__(
         self,
-        request: PreparedRequest,
+        request: HTTPRequest,
         status_code: int,
         headers: MutableMapping[str, str],
         tags: MutableMapping[str, str],
@@ -1894,7 +1894,7 @@ class _DecodingReader:
     @classmethod
     def from_wire(
         cls,
-        request: "PreparedRequest",
+        request: "HTTPRequest",
         raw: http.client.HTTPResponse,
         *,
         session: "Optional[HTTPSession]" = None,
@@ -1965,7 +1965,7 @@ class _DecodingReader:
     @classmethod
     def from_pool(
         cls,
-        request: "PreparedRequest",
+        request: "HTTPRequest",
         response: Any,
         tags: Optional[Mapping[str, str]],
         received_at: dt.datetime,
@@ -2025,4 +2025,3 @@ class _DecodingReader:
         )
 
 
-Response = HTTPResponse
