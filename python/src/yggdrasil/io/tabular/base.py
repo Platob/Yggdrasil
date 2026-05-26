@@ -1187,11 +1187,10 @@ class Tabular(ABC, Generic[O]):
 
     def _read_arrow_table(self, options: O) -> pa.Table:
         # Pull the raw batches off the underlying reader and assemble
-        # them into one :class:`pa.Table`, then run the
-        # resample / dedup passes directly on that Table via
-        # :meth:`CastOptions.apply_post_read_table`. The iterator
-        # wraps (:meth:`_read_arrow_batches_resolved`) materialise +
-        # re-batch internally too; calling them here would
+        # them into one :class:`pa.Table`, then cast + project + resample
+        # + dedup via the options pipeline. The iterator wraps
+        # (:meth:`_read_arrow_batches_resolved`) materialise + re-batch
+        # internally too; calling them here would
         # ``Table.from_batches → group_by → to_batches → Table.from_batches``
         # for a wasted round trip. Single-Table path bypasses that.
         batches = list(self._read_arrow_batches(options))
@@ -1203,6 +1202,7 @@ class Tabular(ABC, Generic[O]):
             )
             return schema.to_arrow_schema().empty_table()
         table = pa.Table.from_batches(batches)
+        table = options.cast_arrow_tabular(table)
         return options.apply_post_read_table(table)
 
     def read_arrow_batch_reader(

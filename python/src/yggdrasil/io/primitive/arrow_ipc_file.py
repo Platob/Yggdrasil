@@ -173,7 +173,8 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                 table = reader.read_all()
         except FileNotFoundError:
             return super()._read_arrow_table(options)
-        return options.cast_arrow_tabular(table)
+        table = options.cast_arrow_tabular(table)
+        return options.apply_post_read_table(table)
 
     def _collect_schema(self, options: ArrowIPCOptions) -> Schema:
         """Read the schema straight from the IPC footer.

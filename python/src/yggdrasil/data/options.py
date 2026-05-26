@@ -214,24 +214,6 @@ def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
     return _Schema(children)
 
 
-def _filter_schema_columns(target: "Any", columns: "Iterable[str]") -> "Any":
-    """Filter an existing target schema to only the requested columns.
-
-    Preserves the typed :class:`Field` definitions from the original
-    target so downstream casts retain dtype information.
-    """
-    from yggdrasil.data.schema import Schema as _Schema
-
-    col_set = list(columns)
-    children = []
-    for name in col_set:
-        f = target.field(name=name, raise_error=False)
-        if f is not None:
-            children.append(f)
-    if not children:
-        return _struct_of_objects(col_set)
-    return _Schema(children)
-
 
 # ---------------------------------------------------------------------------
 # Type alias for "anything that can be coerced into a CastOptions"
@@ -771,10 +753,9 @@ class CastOptions:
 
         if columns:
             if instance.target is not None:
-                filtered = _filter_schema_columns(instance.target, columns)
-                instance = instance.copy(target=filtered)
-            else:
-                instance = instance.copy(target=_struct_of_objects(columns))
+                instance = instance.copy(target=instance.target.select(columns))
+            elif instance.source is None:
+                instance = instance.copy(source=_struct_of_objects(columns))
         return instance
 
     @classmethod

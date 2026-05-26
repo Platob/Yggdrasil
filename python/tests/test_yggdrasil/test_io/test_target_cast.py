@@ -1,0 +1,206 @@
+"""Tests for explicit target schema cast across all tabular IO backends.
+
+Verifies that ``read_arrow_table(target=...)`` and
+``read_arrow_table(columns=...)`` correctly project and cast columns
+across ArrowIPC, Parquet, and FolderPath backends.
+"""
+from __future__ import annotations
+
+import pyarrow as pa
+import pytest
+
+from yggdrasil.data import field, schema
+from yggdrasil.data.enums.media_type import MediaTypes
+from yggdrasil.io.memory import Memory
+from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
+from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+
+def _source_table() -> pa.Table:
+    return pa.table({
+        "id": pa.array([1, 2, 3], pa.int64()),
+        "price": pa.array([1.5, 2.5, 3.5], pa.float64()),
+        "name": pa.array(["a", "b", "c"], pa.string()),
+    })
+
+
+def _target_schema() -> "schema":
+    return schema(fields=[
+        field("id", pa.int64()),
+        field("price", pa.float64()),
+        field("name", pa.string()),
+    ])
+
+
+class TestArrowIPCTargetCast:
+
+    def _write_and_read(self, target=None, columns=None):
+        holder = Memory()
+        ipc = ArrowIPCFile(holder=holder, mode="wb")
+        ipc.write_arrow_table(_source_table())
+        ipc = ArrowIPCFile(holder=holder, mode="rb")
+        return ipc.read_arrow_table(target=target, columns=columns)
+
+    def test_target_selects_columns(self):
+        target = schema(fields=[field("id", pa.int64()), field("name", pa.string())])
+        out = self._write_and_read(target=target)
+        assert out.column_names == ["id", "name"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+        assert out.column("name").to_pylist() == ["a", "b", "c"]
+
+    def test_target_casts_datatype(self):
+        target = schema(fields=[
+            field("id", pa.int32()),
+            field("price", pa.float32()),
+        ])
+        out = self._write_and_read(target=target)
+        assert out.schema.field("id").type == pa.int32()
+        assert out.schema.field("price").type == pa.float32()
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_columns_kwarg_projects(self):
+        out = self._write_and_read(columns=["id"])
+        assert out.column_names == ["id"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_target_plus_columns_filters_target(self):
+        target = _target_schema()
+        out = self._write_and_read(target=target, columns=["id", "price"])
+        assert out.column_names == ["id", "price"]
+
+
+class TestParquetTargetCast:
+
+    def _write_and_read(self, target=None, columns=None):
+        holder = Memory()
+        pq = ParquetFile(holder=holder, mode="wb")
+        pq.write_arrow_table(_source_table())
+        pq = ParquetFile(holder=holder, mode="rb")
+        return pq.read_arrow_table(target=target, columns=columns)
+
+    def test_target_selects_columns(self):
+        target = schema(fields=[field("id", pa.int64()), field("name", pa.string())])
+        out = self._write_and_read(target=target)
+        assert out.column_names == ["id", "name"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_target_casts_datatype(self):
+        target = schema(fields=[
+            field("id", pa.int32()),
+            field("price", pa.float32()),
+        ])
+        out = self._write_and_read(target=target)
+        assert out.schema.field("id").type == pa.int32()
+        assert out.schema.field("price").type == pa.float32()
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_columns_kwarg_projects(self):
+        out = self._write_and_read(columns=["id"])
+        assert out.column_names == ["id"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_target_plus_columns_filters_target(self):
+        target = _target_schema()
+        out = self._write_and_read(target=target, columns=["id", "price"])
+        assert out.column_names == ["id", "price"]
+
+
+class TestFolderPathTargetCast:
+
+    def _write_and_read(self, tmp_path, target=None, columns=None):
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_table(_source_table())
+        return folder.read_arrow_table(target=target, columns=columns)
+
+    def test_target_selects_columns(self, tmp_path):
+        target = schema(fields=[field("id", pa.int64()), field("name", pa.string())])
+        out = self._write_and_read(tmp_path, target=target)
+        assert out.column_names == ["id", "name"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_target_casts_datatype(self, tmp_path):
+        target = schema(fields=[
+            field("id", pa.int32()),
+            field("price", pa.float32()),
+        ])
+        out = self._write_and_read(tmp_path, target=target)
+        assert out.schema.field("id").type == pa.int32()
+        assert out.schema.field("price").type == pa.float32()
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_columns_kwarg_projects(self, tmp_path):
+        out = self._write_and_read(tmp_path, columns=["id"])
+        assert out.column_names == ["id"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_target_plus_columns_filters_target(self, tmp_path):
+        target = _target_schema()
+        out = self._write_and_read(tmp_path, target=target, columns=["id", "price"])
+        assert out.column_names == ["id", "price"]
+
+    def test_target_casts_datatype_partitioned(self, tmp_path):
+        src_schema = pa.schema([
+            pa.field("pk", pa.int64(), metadata={b"t:partition_by": b"True"}),
+            pa.field("id", pa.int64()),
+            pa.field("price", pa.float64()),
+        ])
+        folder = FolderPath(path=str(tmp_path))
+        batch = pa.record_batch(
+            [pa.array([1, 2], pa.int64()), pa.array([10, 20], pa.int64()), pa.array([1.5, 2.5], pa.float64())],
+            schema=src_schema,
+        )
+        folder.write_arrow_batches((batch,))
+
+        target = schema(fields=[field("id", pa.int32()), field("price", pa.float32())])
+        out = folder.read_arrow_table(target=target, columns=["id"])
+        assert out.column_names == ["id"]
+        assert out.schema.field("id").type == pa.int32()
+
+
+class TestFieldSelectDrop:
+
+    def test_select_by_name(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string()), field("c", pa.float64())])
+        out = s.select("a", "c")
+        assert out.names == ["a", "c"]
+
+    def test_select_by_list(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string())])
+        out = s.select(["a", "b"])
+        assert out.names == ["a", "b"]
+
+    def test_select_preserves_types(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string())])
+        out = s.select("a")
+        assert out.children[0].dtype.to_arrow() == pa.int64()
+
+    def test_select_skips_none(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string())])
+        out = s.select("a", None)
+        assert out.names == ["a"]
+
+    def test_select_missing_skipped(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string())])
+        out = s.select("a", "missing")
+        assert out.names == ["a"]
+
+    def test_drop_by_name(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string()), field("c", pa.float64())])
+        out = s.drop("b")
+        assert out.names == ["a", "c"]
+
+    def test_drop_multiple(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string()), field("c", pa.float64())])
+        out = s.drop("a", "c")
+        assert out.names == ["b"]
+
+    def test_drop_preserves_types(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string())])
+        out = s.drop("a")
+        assert out.children[0].dtype.to_arrow() == pa.string()
+
+    def test_drop_none_returns_copy(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string())])
+        out = s.drop()
+        assert out.names == ["a", "b"]

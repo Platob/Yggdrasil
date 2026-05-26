@@ -276,7 +276,8 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                     )
         except (FileNotFoundError, pa.ArrowInvalid):
             return super()._read_arrow_table(options)
-        return options.cast_arrow_tabular(table)
+        table = options.cast_arrow_tabular(table)
+        return options.apply_post_read_table(table)
 
     # ==================================================================
     # Write path

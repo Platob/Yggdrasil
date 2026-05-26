@@ -4407,6 +4407,72 @@ class Field(BaseChildrenFields):
             return right.name
         return left.name
 
+    def select(
+        self,
+        *identifiers: "str | int | Field | Iterable[str | int | Field] | None",
+    ) -> "Field":
+        """Return a new struct-shaped Field with only the selected children.
+
+        Accepts strings (by name), ints (by index), Field instances
+        (by name), iterables thereof, or None (skipped).
+        """
+        flat = [i for i in self._flatten_identifiers(identifiers) if i is not None]
+        if not flat:
+            return type(self)._make_struct(
+                name=self.name, nullable=self.nullable, metadata=self.metadata,
+            )
+        resolved = self.select_fields(flat, raise_error=False)
+        children = [f for f in resolved if f is not None]
+        return type(self)._make_struct(
+            children=children,
+            name=self.name,
+            nullable=self.nullable,
+            metadata=dict(self.metadata) if self.metadata else None,
+        )
+
+    def drop(
+        self,
+        *identifiers: "str | int | Field | Iterable[str | int | Field] | None",
+    ) -> "Field":
+        """Return a new struct-shaped Field without the specified children.
+
+        Accepts strings (by name), ints (by index), Field instances
+        (by name), iterables thereof, or None (skipped).
+        """
+        flat = [i for i in self._flatten_identifiers(identifiers) if i is not None]
+        if not flat:
+            return type(self)._make_struct(
+                children=[f.copy() for f in self.children],
+                name=self.name, nullable=self.nullable,
+                metadata=dict(self.metadata) if self.metadata else None,
+            )
+        resolved = self.select_fields(flat, raise_error=False)
+        drop_names = {f.name for f in resolved if f is not None}
+        return type(self)._make_struct(
+            children=[f.copy() for f in self.children if f.name not in drop_names],
+            name=self.name,
+            nullable=self.nullable,
+            metadata=dict(self.metadata) if self.metadata else None,
+        )
+
+    @staticmethod
+    def _flatten_identifiers(args: tuple) -> list:
+        flat: list = []
+        for item in args:
+            if item is None:
+                continue
+            if isinstance(item, (str, int)):
+                flat.append(item)
+            elif hasattr(item, "name") and hasattr(item, "dtype"):
+                flat.append(item)
+            elif hasattr(item, "__iter__"):
+                for sub in item:
+                    if sub is not None:
+                        flat.append(sub)
+            else:
+                flat.append(item)
+        return flat
+
     def __add__(self, other: Any) -> "Field":
         other = self._coerce_other(other)
         merged: "OrderedDict[str, Field]" = OrderedDict(

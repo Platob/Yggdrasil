@@ -297,7 +297,7 @@ class BaseChildrenFields(ABC):
     def field_names(self) -> list[str]:
         return [f.name for f in self.children]
 
-    def select(
+    def select_fields(
         self,
         identifiers: "SelectType | Iterable[SelectType]" = (),
         *others: SelectType,
@@ -312,12 +312,12 @@ class BaseChildrenFields(ABC):
 
         Calling shapes that all work the same way:
 
-        * ``schema.select("price")`` — single identifier.
-        * ``schema.select("price", "qty", 0)`` — multiple positionals.
-        * ``schema.select(["price", "qty"])`` — single iterable.
-        * ``schema.select(other_schema.children)`` — copy
+        * ``schema.select_fields("price")`` — single identifier.
+        * ``schema.select_fields("price", "qty", 0)`` — multiple positionals.
+        * ``schema.select_fields(["price", "qty"])`` — single iterable.
+        * ``schema.select_fields(other_schema.children)`` — copy
           a sibling's fields by name into this schema.
-        * ``schema.select("price", ["qty", "ts"], 0)`` — mixed; each
+        * ``schema.select_fields("price", ["qty", "ts"], 0)`` — mixed; each
           positional is itself flattened so iterables and scalars
           can be interleaved.
 
