@@ -172,7 +172,7 @@ def _install_modules_on_executors(
     logged at INFO / WARNING and swallowed: best-effort
     installs shouldn't crash an otherwise valid transform.
     """
-    from yggdrasil.io.path._module_pack import (
+    from yggdrasil.path._module_pack import (
         build_module_archive,
         resolve_module_root,
     )

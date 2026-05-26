@@ -40,7 +40,7 @@ from typing import Any, Callable, ClassVar, Optional, Tuple
 
 from yggdrasil.enums import Scheme
 from yggdrasil.path import RemotePath
-from yggdrasil.io.path._retry import retry_sdk_call
+from yggdrasil.path._retry import retry_sdk_call
 from yggdrasil.url import URL
 from .resource import DatabricksResource
 from .service import DatabricksService

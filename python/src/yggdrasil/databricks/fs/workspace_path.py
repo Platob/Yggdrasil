@@ -478,7 +478,7 @@ class WorkspacePath(DatabricksPath):
         — the Workspace API detects the binary content type and
         stores the object as a workspace file (not a notebook).
         """
-        from yggdrasil.io.path._module_pack import (
+        from yggdrasil.path._module_pack import (
             build_module_archive,
             resolve_module_root,
         )

@@ -255,6 +255,8 @@ class FolderPath(IO[bytes, FolderOptions]):
             raw = kwargs.get("data")
         if raw is None:
             raw = kwargs.get("url")
+        if raw is None:
+            raw = kwargs.get("holder")
         # Canonicalise through :class:`Path` so every spelling of
         # the same on-disk root resolves to one key — str, pathlib,
         # URL, and live :class:`Path` instances all flow through the
@@ -333,7 +335,12 @@ class FolderPath(IO[bytes, FolderOptions]):
         # Resolve the path first; we hand the folder's URL up to
         # :class:`Holder` so the URL-keyed surfaces (singleton key,
         # repr, equality) line up with the underlying path.
+        # ``holder`` rides through ``**kwargs`` when :meth:`IO.for_holder`
+        # or :meth:`BytesIO.as_media` constructs us — treat it as an
+        # alias for ``path`` so ``Path.as_media("folder")`` works.
         raw = path if path is not None else data
+        if raw is None:
+            raw = kwargs.pop("holder", None)
         if raw is None:
             raise ValueError(
                 f"{type(self).__name__} requires a path; got None. "

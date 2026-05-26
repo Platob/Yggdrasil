@@ -140,7 +140,10 @@ class TestPolarsLazyPredicate:
             schema=schema,
         )
         root = tmp_path / "partitioned"
-        fp = FolderPath(path=str(root))
+        # Construct via LocalPath to avoid the holder __new__ relative-import
+        # issue with path=str(...); FolderPath(path=LocalPath) is the stable
+        # construction shape.
+        fp = FolderPath(path=LocalPath(str(root) + "/"))
         fp.write_arrow_batches([batch])
 
         pred = col("pk") == "b"

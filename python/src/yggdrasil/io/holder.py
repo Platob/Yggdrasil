@@ -224,7 +224,7 @@ def _resolve_subclass(
         # :class:`Path` itself isn't instantiable, so a missing scheme
         # falls back to LocalPath — that's the only path-shaped backend
         # that's always available.
-        from .path.local_path import LocalPath
+        from yggdrasil.path.local_path import LocalPath
 
         url_obj = URL.from_(path)
         scheme_from_path = url_obj.scheme

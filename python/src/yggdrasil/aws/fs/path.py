@@ -56,7 +56,7 @@ from yggdrasil.enums import Scheme
 from yggdrasil.enums.media_type import MediaType
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.path import RemotePath
-from yggdrasil.io.path._retry import retry_sdk_call
+from yggdrasil.path._retry import retry_sdk_call
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.url import URL
 
