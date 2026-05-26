@@ -662,3 +662,153 @@ class TestSendManyAdvanced:
         responses = list(session.send_many(reqs))
         assert len(responses) >= 2
         assert _Handler.call_count == n_after_warm + 1
+
+
+# ---------------------------------------------------------------------------
+# Response batch metadata consistency
+# ---------------------------------------------------------------------------
+
+
+class TestResponseBatchMetadata:
+
+    def test_arrow_batch_has_expected_columns(self, base_url):
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.http_.response import HTTPResponse
+        resp = session.get("/json")
+        batch = HTTPResponse.values_to_arrow_batch([resp])
+        names = batch.schema.names
+        assert "status_code" in names
+        assert "hash" in names
+        assert "public_hash" in names
+        assert "body" in names
+        assert "body_size" in names
+        assert "body_hash" in names
+        assert "headers" in names
+        assert "received_at" in names
+        assert "partition_key" in names
+        assert "request_method" in names
+        assert "request_url" in names
+        assert "request_hash" in names
+
+    def test_hashes_stable_across_runs(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        resp1 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=cfg,
+        )
+        h1 = resp1.arrow_values["hash"]
+        ph1 = resp1.arrow_values["public_hash"]
+        rh1 = resp1.arrow_values["request_hash"]
+
+        resp2 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=cfg,
+        )
+        h2 = resp2.arrow_values["hash"]
+        ph2 = resp2.arrow_values["public_hash"]
+        rh2 = resp2.arrow_values["request_hash"]
+
+        assert h1 == h2
+        assert ph1 == ph2
+        assert rh1 == rh2
+
+    def test_request_hash_matches_response_request_hash(self, base_url):
+        session = HTTPSession(base_url=base_url)
+        resp = session.get("/json")
+        resp_vals = resp.arrow_values
+        assert resp_vals["request_hash"] == resp.request.hash
+
+    def test_body_hash_consistent(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        resp1 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=cfg,
+        )
+        bh1 = resp1.arrow_values["body_hash"]
+        bs1 = resp1.arrow_values["body_size"]
+
+        resp2 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=cfg,
+        )
+        bh2 = resp2.arrow_values["body_hash"]
+        bs2 = resp2.arrow_values["body_size"]
+
+        assert bh1 == bh2
+        assert bs1 == bs2
+        assert bs1 > 0
+
+    def test_status_code_in_arrow(self, base_url):
+        session = HTTPSession(base_url=base_url)
+        resp = session.get("/json")
+        assert resp.arrow_values["status_code"] == 200
+
+    def test_error_status_in_arrow(self, base_url):
+        session = HTTPSession(base_url=base_url)
+        resp = session.get("/error", raise_error=False)
+        assert resp.arrow_values["status_code"] == 500
+
+    def test_partition_key_stable(self, base_url):
+        session = HTTPSession(base_url=base_url)
+        resp1 = session.get("/json")
+        resp2 = session.get("/json")
+        assert resp1.arrow_values["partition_key"] == resp2.arrow_values["partition_key"]
+
+    def test_partition_key_differs_by_url(self, base_url):
+        session = HTTPSession(base_url=base_url)
+        resp1 = session.get("/json")
+        resp2 = session.get("/text")
+        assert resp1.arrow_values["partition_key"] != resp2.arrow_values["partition_key"]
+
+    def test_multi_response_batch_consistent(self, base_url):
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.http_.response import HTTPResponse
+        resps = [session.get("/json"), session.get("/text")]
+        batch = HTTPResponse.values_to_arrow_batch(resps)
+        assert batch.num_rows == 2
+        col_status = batch.column("status_code").to_pylist()
+        assert all(s == 200 for s in col_status)
+
+    def test_cached_metadata_matches_fresh(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        cache = CacheConfig(tabular=_folder(local_cache_dir))
+        cfg = SendConfig(local_cache=cache)
+
+        fresh = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=cfg,
+        )
+        fresh_vals = {
+            "hash": fresh.arrow_values["hash"],
+            "public_hash": fresh.arrow_values["public_hash"],
+            "status_code": fresh.arrow_values["status_code"],
+            "body_size": fresh.arrow_values["body_size"],
+            "body_hash": fresh.arrow_values["body_hash"],
+            "request_hash": fresh.arrow_values["request_hash"],
+            "request_method": fresh.arrow_values["request_method"],
+            "partition_key": fresh.arrow_values["partition_key"],
+        }
+
+        cached = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=cfg,
+        )
+        cached_vals = {
+            "hash": cached.arrow_values["hash"],
+            "public_hash": cached.arrow_values["public_hash"],
+            "status_code": cached.arrow_values["status_code"],
+            "body_size": cached.arrow_values["body_size"],
+            "body_hash": cached.arrow_values["body_hash"],
+            "request_hash": cached.arrow_values["request_hash"],
+            "request_method": cached.arrow_values["request_method"],
+            "partition_key": cached.arrow_values["partition_key"],
+        }
+
+        for key in fresh_vals:
+            assert fresh_vals[key] == cached_vals[key], f"{key}: {fresh_vals[key]} != {cached_vals[key]}"
