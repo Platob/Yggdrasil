@@ -198,6 +198,10 @@ class HTTPResponseBatch(Tabular):
 
         if not misses or cfg.cache_only:
             if misses:
+                LOGGER.warning(
+                    "cache_only=True: %d request(s) not in cache, returning synthetic 404",
+                    len(misses),
+                )
                 self.new_tabular = [_synthetic_not_found(r) for r in misses]
             return self
 
@@ -227,14 +231,20 @@ class HTTPResponseBatch(Tabular):
             all_list.append(response)
             if response.ok:
                 ok_list.append(response)
-            elif cfg.raise_error:
+            else:
                 err_list.append(response)
         if err_list:
-            self.failed = err_list
+            if cfg.raise_error:
+                self.failed = err_list
+            for r in err_list:
+                LOGGER.warning(
+                    "%s %s returned %d",
+                    r.request.method, r.request.url, r.status_code,
+                )
 
         LOGGER.info(
             "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-            len(ok_list) + len(err_list), len(misses),
+            len(ok_list), len(misses),
             len(ok_list), len(err_list),
         )
 
