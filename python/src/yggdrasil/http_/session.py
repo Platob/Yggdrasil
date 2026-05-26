@@ -1480,19 +1480,13 @@ class HTTPSession(Session):
     @staticmethod
     def _group_by_holders(
         batch: list[PreparedRequest],
-    ) -> list[tuple["CacheConfig | None", "CacheConfig | None", list[PreparedRequest]]]:
-        """Group requests by cache config identity."""
-        groups: dict[tuple, tuple["CacheConfig | None", "CacheConfig | None", list[PreparedRequest]]] = {}
+    ) -> dict[tuple, list[PreparedRequest]]:
+        """Group requests by cache config."""
+        groups: dict[tuple, list[PreparedRequest]] = {}
         for r in batch:
-            lc = r.local_cache_config
-            rc = r.remote_cache_config
-            key = (id(lc), id(rc))
-            entry = groups.get(key)
-            if entry is None:
-                groups[key] = (lc, rc, [r])
-            else:
-                entry[2].append(r)
-        return list(groups.values())
+            key = (r.local_cache_config, r.remote_cache_config)
+            groups.setdefault(key, []).append(r)
+        return groups
 
     # Per-SparkSession cache of the empty :class:`SparkDataFrame` keyed
     # to :data:`RESPONSE_SCHEMA`. Caching by ``id(spark)`` keeps
@@ -1761,7 +1755,7 @@ class HTTPSession(Session):
                 chunk_index, len(chunk), len(groups),
             )
 
-            for local_cache, remote_cache, reqs in groups:
+            for (local_cache, remote_cache), reqs in groups.items():
                 batch = self._send_batch(
                     reqs,
                     local_cache=local_cache,

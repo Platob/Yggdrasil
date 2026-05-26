@@ -30,14 +30,8 @@ __all__ = ["CacheConfig", "SendConfig"]
 _DEFAULT_CACHE_ROOT: pathlib.Path = pathlib.Path.home() / ".cache" / "http" / "response"
 
 
-# Identity-by-default — ``public_url_hash`` is the URL-based identity
-# computed against ``url.anonymize('remove')``, so it stays stable
-# across the cache's anonymize step (writes drop userinfo + sensitive
-# query params; reads strip the same; both sides hash to the same
-# int64). For dedup that should also respect body / headers, callers
-# can pass ``request_by=["public_hash"]`` explicitly.
 _DEFAULT_REQUEST_BY: tuple[str, ...] = (
-    "public_url_hash",
+    "public_hash",
 )
 
 _CACHE_CONFIG_FIELDS: frozenset[str] = frozenset(
@@ -167,7 +161,8 @@ class CacheConfig:
         if not isinstance(other, CacheConfig):
             return NotImplemented
         return (
-            self.mode == other.mode
+            self.tabular is other.tabular
+            and self.mode == other.mode
             and self.anonymize == other.anonymize
             and self.received_from == other.received_from
             and self.received_to == other.received_to
@@ -176,7 +171,7 @@ class CacheConfig:
 
     def __hash__(self):
         return hash((
-            self.mode, self.anonymize,
+            id(self.tabular), self.mode, self.anonymize,
             self.received_from, self.received_to,
             self.cleanup_ttl,
         ))
