@@ -1,2 +1,2 @@
-from yggdrasil.http_.request_base import *
-from yggdrasil.http_.request_base import PreparedRequest
+from yggdrasil.http_.request import *
+from yggdrasil.http_.request import PreparedRequest
