@@ -114,29 +114,14 @@ class TestDispatch:
 # ---------------------------------------------------------------------------
 
 
-class TestAbstractHooks:
+class TestDefaultHooks:
 
-    def test_urlbased_not_instantiable(self):
-        with pytest.raises(TypeError):
-            URLBased()
+    def test_from_url_raises_not_implemented(self):
+        with pytest.raises(NotImplementedError):
+            URLBased.from_url("file:///tmp/x")
 
-    def test_missing_from_url_raises(self):
-        with pytest.raises(TypeError):
-            class _NoFromUrl(URLBased):
-                scheme = None
-
-                def to_url(self):
-                    ...
-
-            _NoFromUrl()
-
-    def test_missing_to_url_raises(self):
-        with pytest.raises(TypeError):
-            class _NoToUrl(URLBased):
-                scheme = None
-
-                @classmethod
-                def from_url(cls, url, **kw):
-                    ...
-
-            _NoToUrl()
+    def test_to_url_raises_not_implemented(self):
+        class _Bare(URLBased):
+            scheme = None
+        with pytest.raises(NotImplementedError):
+            _Bare().to_url()

@@ -323,7 +323,7 @@ def _resolve_format_target(
     return IO.class_for_media_type(mt, default=None)
 
 
-class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
+class IO(Singleton, Tabular[O], BinaryIO, Generic[T, O]):
     """Position-addressable byte holder + seekable cursor + tabular handle.
 
     Three layered shapes share the class:

@@ -62,10 +62,12 @@ from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 from yggdrasil.data.data_field import Field as _Field
+from yggdrasil.disposable import Disposable
 from yggdrasil.enums import MediaType, MimeType, Mode, ModeLike
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
+from yggdrasil.url.based import URLBased
 
 if TYPE_CHECKING:
     from yggdrasil.arrow.tabular import ArrowTabular
@@ -486,7 +488,7 @@ O = TypeVar("O", bound=CastOptions)
 _ChildT = TypeVar("_ChildT", bound="Tabular")
 
 
-class Tabular(ABC, Generic[O]):
+class Tabular(URLBased, Disposable, Generic[O]):
     """Pure interface — Arrow record-batch source/sink + engine fan-out.
 
     No state, no lifecycle, with the single exception of a
@@ -554,18 +556,9 @@ class Tabular(ABC, Generic[O]):
 
     @property
     def static_values(self) -> "Mapping[str, Any]":
-        """Column → constant value across every row this Tabular yields.
-
-        Default: empty mapping. Subclasses with a cheap source of
-        invariants override — :class:`FolderPath` parses Hive
-        ``<col>=<val>/`` segments off its bound :attr:`path` URL,
-        a future Parquet-stats-based subclass would read
-        min==max column stats from the footer, a Delta leaf would
-        pull from its ``AddFile.partition_values``, etc. There is
-        no parent-chain inheritance built into the base — each
-        subclass decides what "constant across rows" means for its
-        backing store.
-        """
+        url = getattr(self, "url", None) or getattr(self, "_url", None)
+        if url is not None and hasattr(url, "static_values"):
+            return url.static_values
         return {}
 
     def matches_static(

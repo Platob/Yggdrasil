@@ -51,6 +51,7 @@ from urllib.parse import (
 
 import pyarrow as pa
 
+from yggdrasil.url.hive import hive_split
 from yggdrasil.lazy_imports import (
     bytes_io_class,
     media_type_class,
@@ -433,6 +434,24 @@ class URL(os.PathLike):
     _media_type_cache: "MediaType | None | Any" = field(
         default=..., init=False, repr=False, compare=False,
     )
+    _static_values_cache: "dict[str, Any] | None" = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+
+    @property
+    def static_values(self) -> dict[str, Any]:
+        cached = self._static_values_cache
+        if cached is not None:
+            return cached
+        vals: dict[str, Any] = {}
+        if self.path and self.path != "/":
+            vals["$filepath"] = self.path
+            for part in self.path.strip("/").split("/"):
+                parsed = hive_split(part)
+                if parsed is not None:
+                    vals[parsed[0]] = parsed[1]
+        object.__setattr__(self, "_static_values_cache", vals)
+        return vals
 
     def __hash__(self):
         return hash(self.to_string())

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any, ClassVar
 
 __all__ = ["URLBased", "_URL_BASED_REGISTRY"]
@@ -121,17 +121,8 @@ class URLBased(ABC):
     # ------------------------------------------------------------------
 
     @classmethod
-    @abstractmethod
     def from_url(cls, url: "URL | str", **kwargs: Any) -> "URLBased":
-        """Construct an instance of *cls* from *url*.
+        raise NotImplementedError(f"{cls.__name__} does not support from_url")
 
-        Concrete subclasses typically forward to ``cls(url=url, **kwargs)``;
-        backends with extra construction knobs (auth tokens, sessions,
-        workspace clients) override to thread those through.
-        """
-        ...
-
-    @abstractmethod
     def to_url(self) -> "URL":
-        """The canonical :class:`URL` that addresses this instance."""
-        ...
+        raise NotImplementedError(f"{type(self).__name__} does not support to_url")
