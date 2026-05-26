@@ -1100,7 +1100,13 @@ class FolderPath(IO[bytes, FolderOptions]):
             blobs.append(raw)
 
         leaf_table = pa.table({"_pkl": pa.array(blobs, type=pa.binary())})
-        leaf_df = spark.createDataFrame(leaf_table)
+        n_leaves = len(blobs)
+        try:
+            parallelism = max(spark.sparkContext.defaultParallelism, 1)
+        except Exception:
+            parallelism = 4
+        n_parts = min(n_leaves, parallelism)
+        leaf_df = spark.createDataFrame(leaf_table).coalesce(n_parts)
 
         bc_options = spark.sparkContext.broadcast(options)
 
