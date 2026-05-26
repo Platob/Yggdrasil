@@ -4,7 +4,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 from yggdrasil.http_.request import HTTPRequest
-from yggdrasil.io.headers import Headers
+from yggdrasil.http_.headers import HTTPHeaders
 from yggdrasil.url import URL
 
 
@@ -102,7 +102,7 @@ class TestConstruction:
 
     def test_headers_coerced_to_headers_type(self):
         r = _make(headers={"Foo": "bar"})
-        assert isinstance(r.headers, Headers)
+        assert isinstance(r.headers, HTTPHeaders)
 
     def test_body_property_is_alias_for_buffer(self):
         r = _make(body=b"hello")

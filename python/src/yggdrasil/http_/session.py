@@ -85,7 +85,7 @@ from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.response import HTTPResponse
 from yggdrasil.http_.response_batch import HTTPResponseBatch
 from yggdrasil.io.holder import IO
-from yggdrasil.io.headers import Headers
+from yggdrasil.http_.headers import HTTPHeaders
 from yggdrasil.path.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCFile
 from yggdrasil.http_.cache_config import CacheConfig
@@ -133,7 +133,7 @@ def _hashable_identity_value(value: Any) -> Any:
     * :class:`URL` is stringified, so ``"https://x.com"`` and
       ``URL("https://x.com")`` key the same way once the subclass's
       ``__init__`` has normalised both into a :class:`URL`;
-    * :class:`Headers` / generic :class:`Mapping` collapse to a tuple
+    * :class:`HTTPHeaders` / generic :class:`Mapping` collapse to a tuple
       of sorted items;
     * sets become sorted tuples, lists become tuples.
     """
@@ -578,7 +578,7 @@ class HTTPSession(Session):
         base_url: Optional[URL | str] = None,
         verify: bool = True,
         pool_maxsize: int = 10,
-        headers: "Headers | Mapping[str, str] | None" = None,
+        headers: "HTTPHeaders | Mapping[str, str] | None" = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         auth: Optional[Authorization] = None,
@@ -600,7 +600,7 @@ class HTTPSession(Session):
         pool_maxsize = min(8, int(pool_maxsize)) if pool_maxsize else 8
         self.base_url = URL.from_(base_url) if base_url else None
         self.verify = verify
-        self.headers: Headers = Headers.from_(headers)
+        self.headers: HTTPHeaders = HTTPHeaders.from_(headers)
         self.waiting = waiting
         self.auth: Authorization | None = auth
 
@@ -873,7 +873,7 @@ class HTTPSession(Session):
                         current_request.url.to_string(), location,
                     )
                     if response.status in (301, 302, 303) and current_request.method.upper() != "HEAD":
-                        redirect_headers = Headers(current_request.headers)
+                        redirect_headers = HTTPHeaders(current_request.headers)
                         redirect_headers.pop("Content-Length", None)
                         redirect_headers.pop("Content-Type", None)
                         current_request = current_request.copy(
@@ -1211,7 +1211,7 @@ class HTTPSession(Session):
                 refresh()
         authorization = handler.authorization
         if request.headers is None:
-            request.headers = Headers()
+            request.headers = HTTPHeaders()
         request.headers["Authorization"] = authorization
         # Mirror the refresh on the session-level header when the
         # session-wide handler is what we just ran — a per-request
@@ -2129,7 +2129,7 @@ class HTTPSession(Session):
                 )
             body, form_content_type = _encode_request_data(data)
             if form_content_type is not None:
-                merged = Headers(headers) if headers else Headers()
+                merged = HTTPHeaders(headers) if headers else HTTPHeaders()
                 if "Content-Type" not in merged:
                     merged["Content-Type"] = form_content_type
                 headers = merged
@@ -2145,7 +2145,7 @@ class HTTPSession(Session):
         if cookies:
             cookie_header = _format_cookie_header(cookies)
             if cookie_header:
-                merged = Headers(headers) if headers else Headers()
+                merged = HTTPHeaders(headers) if headers else HTTPHeaders()
                 if "Cookie" not in merged:
                     merged["Cookie"] = cookie_header
                 headers = merged
