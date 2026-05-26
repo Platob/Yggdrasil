@@ -73,6 +73,7 @@ class CacheConfig:
     __slots__ = (
         "tabular", "mode", "anonymize",
         "received_from", "received_to", "cleanup_ttl", "_derived",
+        "_hash_cache",
     )
 
 
@@ -106,6 +107,7 @@ class CacheConfig:
         self.anonymize = anonymize
         self.cleanup_ttl = cleanup_ttl
         self._derived = None
+        self._hash_cache: set[int] | None = None
 
         if received_ttl is not None:
             if received_to is None:
@@ -216,6 +218,7 @@ class CacheConfig:
         self.anonymize = state.get("anonymize", "remove")
         self.cleanup_ttl = state.get("cleanup_ttl", dt.timedelta(days=1))
         self._derived = None
+        self._hash_cache = None
 
     @classmethod
     def from_(
@@ -525,6 +528,47 @@ class CacheConfig:
             LOGGER.warning(
                 "Cache write failed for %r", holder, exc_info=True,
             )
+            return
+        try:
+            if isinstance(data, (pa.RecordBatch, pa.Table)):
+                self._add_hashes(set(data.column(MATCH_COLUMN).to_pylist()))
+            elif hasattr(data, "select"):
+                arrow = data.select(MATCH_COLUMN).toPandas()
+                self._add_hashes(set(arrow[MATCH_COLUMN].tolist()))
+        except Exception:
+            pass
+
+    def probe_hashes(
+        self,
+        partition_keys: "list[int]",
+        *,
+        session: "Any" = None,
+    ) -> set[int]:
+        """Return cached public hashes, loading from backend on first call."""
+        if self._hash_cache is not None:
+            return self._hash_cache
+        import pyarrow as pa
+        from yggdrasil.execution.expr import col
+        holder = self.tabular or self.cache_tabular(session=session)
+        if holder is None:
+            self._hash_cache = set()
+            return self._hash_cache
+        predicate = col("partition_key").is_in(partition_keys) if partition_keys else None
+        try:
+            table = holder.read_arrow_table(
+                predicate=predicate, columns=[MATCH_COLUMN],
+            )
+            self._hash_cache = set(table.column(MATCH_COLUMN).to_pylist()) if table and table.num_rows > 0 else set()
+        except Exception:
+            self._hash_cache = set()
+        return self._hash_cache
+
+    def _add_hashes(self, hashes: set[int]) -> None:
+        """Extend the in-memory hash cache after a cache write."""
+        if self._hash_cache is None:
+            self._hash_cache = hashes
+        else:
+            self._hash_cache |= hashes
 
     def filter_response(
         self,
