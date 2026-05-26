@@ -203,6 +203,15 @@ class TestVolumePathRoundTrip:
         p.write_bytes(b"x" * 42, overwrite=True)
         assert p.size == 42
 
+    def test_write_read_pylist_roundtrip(self):
+        store = {}
+        client = _volume_round_trip_client(store)
+        svc = _volumes_service(client)
+        vp = VolumePath("/Volumes/cat/sch/vol", service=svc)
+        fp = vp / "test.parquet"
+        fp.write_pylist([{"id": 1, "name": "Nika"}])
+        assert fp.read_pylist() == [{"id": 1, "name": "Nika"}]
+
 
 # ---------------------------------------------------------------------------
 # DBFSPath — construction
