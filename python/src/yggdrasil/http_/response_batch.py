@@ -154,7 +154,7 @@ class HTTPResponseBatch(Tabular):
         self._remote = remote_tab
         self._misses = remaining
 
-    def send(
+    def _fetch(
         self,
         *,
         ordered: bool = False,

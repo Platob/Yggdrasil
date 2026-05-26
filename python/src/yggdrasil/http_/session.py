@@ -1238,7 +1238,7 @@ class HTTPSession(Session):
         max_in_flight: int | None = None,
     ) -> HTTPResponseBatch:
         """Process one config group: split cache → fetch misses → writeback."""
-        return HTTPResponseBatch(cfg, reqs, session=self).send(
+        return HTTPResponseBatch(cfg, reqs, session=self)._fetch(
             ordered=ordered, max_in_flight=max_in_flight,
         )
 
