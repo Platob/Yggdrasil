@@ -18,6 +18,30 @@ class wraps the send. The supporting types (:class:`Retry`,
 :mod:`yggdrasil.http_.timeout`, :mod:`yggdrasil.http_.exceptions`,
 :mod:`yggdrasil.http_.headers`); feature code
 should not import them directly.
+
+This module also hosts the abstract :class:`Session` base class — singleton +
+pickle + concurrency-pool plumbing that every concrete session needs.
+Transport-specific surface — URL handling, headers, auth, verb methods,
+``send`` / ``send_many``, local/remote cache pipeline, Spark integration —
+lives on the concrete subclass:
+
+* :class:`HTTPSession` for HTTP/HTTPS;
+* :class:`yggdrasil.data.executor.StatementExecutor` for SQL backends.
+
+Two non-obvious rules every subclass must follow to participate in the
+singleton cache cleanly:
+
+1. ``__init__`` guards on ``getattr(self, "_initialized", False)`` so the
+   re-entry Python performs after a singleton cache hit doesn't clobber
+   live state.
+2. Identity-bearing constructor arguments are written to ``self.__dict__``
+   under names that appear in ``__init__``'s parameter list.
+   :meth:`_singleton_key` runs the subclass's own ``__init__`` on a
+   throwaway probe and projects matching attributes into the key — every
+   normalisation the constructor applies (URL parsing, header coercion,
+   pool-size clamping, …) lands in the key for free; derived caches /
+   lazy handles stay out by construction because their attribute names
+   don't match parameter names.
 """
 
 from __future__ import annotations
@@ -27,13 +51,13 @@ import datetime as dt
 import http.client
 import itertools
 import logging
-import pathlib
-import threading
-from abc import ABC
 import os
+import pathlib
 import socket
 import ssl
+import threading
 import time
+from abc import ABC
 from concurrent.futures import ThreadPoolExecutor
 from itertools import takewhile
 from typing import (
@@ -49,23 +73,23 @@ from typing import (
 from urllib.parse import urlsplit, urlunsplit
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
-from yggdrasil.enums import MediaTypes
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
     WaitingConfig,
     WaitingConfigArg,
 )
-from yggdrasil.http_.response_batch import HTTPResponseBatch
+from yggdrasil.enums import MediaTypes
 from yggdrasil.http_.authorization.base import Authorization
+from yggdrasil.http_.request import HTTPRequest
+from yggdrasil.http_.response import HTTPResponse
+from yggdrasil.http_.response_batch import HTTPResponseBatch
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.headers import Headers
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.primitive import ArrowIPCFile
-from yggdrasil.http_.request import HTTPRequest
-from yggdrasil.http_.response import HTTPResponse
-from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig
-from yggdrasil.concurrent.threading import JobPoolExecutor
-from yggdrasil.dataclasses.singleton import Singleton
+from yggdrasil.http_.cache_config import CacheConfig
+from yggdrasil.http_.send_config import DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.url import URL
 
 from .exceptions import (
@@ -83,142 +107,17 @@ from .timeout import _resolve_timeout
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
-__all__ = ["HTTPSession"]
+    from yggdrasil.io.nested.folder_path import FolderPath
+
+__all__ = ["Session", "HTTPSession"]
 
 
 LOGGER = logging.getLogger(__name__)
 
 
-# Cap on per-batch byte size when emitting responses from a Spark
-# `mapInArrow` worker. 128 MiB matches Spark's default Arrow batch
-# preference and keeps a single oversized response from inflating the
-# whole partition's output. A response that is itself larger than the
-# cap is sliced row-wise by the shared rechunker, which never splits a
-# single row across batches.
-
-# Rechunk byte target for paginated responses assembled by
-# ``_combine_paginated_pages``.  Targets the IPC page content size
-# (``RecordBatch.serialize().size``), not the in-memory buffer size.
-_PAGINATED_RECHUNK_BYTE_SIZE: int = 128 * 1024 * 1024
-
-
-# Local cache is a partitioned tabular tree backed by
-# :class:`yggdrasil.io.nested.folder_path.FolderPath`:
-# ``<root>/partition_key=<int>/part-{epoch_ms}-{seed}.<ext>``.
-# Same Hive-style partition shape the remote :class:`Tabular` cache
-# uses, so the same lookup primitives — :meth:`CacheConfig.make_lookup_predicate`
-# / :meth:`CacheConfig.make_batch_lookup_predicate` — prune both
-# backends identically. The predicate's ``partition_key IN (...)``
-# clause flows through :meth:`FolderPath.iter_children`'s candidate
-# probe, so a batch lookup ``stat``s only the partition directories
-# its requests touch instead of walking the whole tree.
-
-
-
-
-
-def _encode_request_data(
-    data: Any,
-) -> tuple[bytes, "str | None"]:
-    """Encode a ``requests``-style ``data=`` payload into request bytes.
-
-    * ``bytes`` / ``bytearray`` / ``memoryview`` → raw bytes, no header
-      change (caller's ``Content-Type`` wins).
-    * ``str`` → UTF-8 bytes, no header change.
-    * ``Mapping`` / ``Iterable[tuple]`` → ``urlencode(doseq=True)`` with
-      ``application/x-www-form-urlencoded`` as the suggested header,
-      matching :meth:`requests.Session.post`.
-    """
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        return bytes(data), None
-    if isinstance(data, str):
-        return data.encode("utf-8"), None
-    from urllib.parse import urlencode
-
-    return urlencode(data, doseq=True).encode("utf-8"), "application/x-www-form-urlencoded"
-
-
-def _format_cookie_header(cookies: Any) -> str:
-    """Serialize a ``requests``-style ``cookies=`` arg into one ``Cookie`` header value."""
-    if hasattr(cookies, "to_header"):
-        return cookies.to_header()
-    if isinstance(cookies, Mapping):
-        return "; ".join(f"{k}={v}" for k, v in cookies.items())
-    raise TypeError(
-        f"cookies must be a Mapping or expose to_header(); got "
-        f"{type(cookies).__name__}."
-    )
-
-
 # ---------------------------------------------------------------------------
-# Retry tuning — backoff schedule for HTTPSession's connection pool.
+# Session base — singleton + pickle + concurrency-pool plumbing
 # ---------------------------------------------------------------------------
-
-# 429s get a longer schedule than 5xx because rate limits need wall-clock
-# time to clear; both schedules are tight (we'd rather surface an error
-# fast than mask a real outage with a minute-long retry storm).
-# Server-supplied Retry-After always wins over these when present.
-_RETRY_TOTAL = 3
-_RETRY_CONNECT = 2
-_RETRY_READ = 2
-
-# 5xx schedule: 0.5, 1, 2 (capped at backoff_max). Worst-case ~3.5s.
-_BACKOFF_5XX_FACTOR = 0.5
-_BACKOFF_5XX_MAX = 5.0
-
-# 429 schedule: 1, 2, 4 (capped at backoff_max). Worst-case ~7s.
-_BACKOFF_429_FACTOR = 1.0
-_BACKOFF_429_MAX = 5.0
-
-_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
-
-
-class _TieredRetry(Retry):
-    """:class:`Retry` variant with status-aware backoff.
-
-    Standard ``Retry`` exposes a single ``backoff_factor`` shared by every
-    retry, so 429 (rate limit) and 503 (transient outage) get the same
-    schedule. This subclass branches on the most recent response status:
-
-    * **429** uses a longer, gentler exponential schedule, since rate-limit
-      windows are typically wall-clock bound and respond poorly to tight
-      retries.
-    * **Everything else** (5xx, transport errors) uses a shorter schedule.
-    * The server's ``Retry-After`` header — when present and respected via
-      ``respect_retry_after_header=True`` — always overrides this, because
-      the pool checks ``get_retry_after`` before ``get_backoff_time``.
-    """
-
-    BACKOFF_MAX = _BACKOFF_429_MAX
-
-    def get_backoff_time(self) -> float:  # type: ignore[override]
-        # Mirror urllib3's own short-circuit: no backoff before the second
-        # consecutive error. ``history`` is a tuple of RequestHistory entries.
-        consecutive_errors = list(
-            takewhile(lambda x: x.redirect_location is None, reversed(self.history))
-        )
-        if len(consecutive_errors) <= 1:
-            return 0.0
-
-        last_status = consecutive_errors[0].status
-
-        if last_status == 429:
-            # Count *consecutive* 429s only — if the last attempt was a 503,
-            # we want the 5xx schedule, not a 429 schedule inflated by older
-            # rate-limit hits.
-            n = 0
-            for h in consecutive_errors:
-                if h.status == 429:
-                    n += 1
-                else:
-                    break
-            backoff = _BACKOFF_429_FACTOR * (2 ** (n - 1))
-            return float(min(_BACKOFF_429_MAX, backoff))
-
-        # Default 5xx / transport-error schedule, mirroring urllib3's formula
-        # but with our own factor and cap.
-        backoff = _BACKOFF_5XX_FACTOR * (2 ** (len(consecutive_errors) - 1))
-        return float(min(_BACKOFF_5XX_MAX, backoff))
 
 
 def _hashable_identity_value(value: Any) -> Any:
@@ -251,7 +150,7 @@ def _hashable_identity_value(value: Any) -> Any:
     return value
 
 
-class HTTPSession(Singleton, ABC):
+class Session(Singleton, ABC):
     """Abstract per-transport session base — singleton-keyed by post-init ``__dict__``.
 
     Inherits the standard :class:`Singleton` plumbing:
@@ -301,7 +200,7 @@ class HTTPSession(Singleton, ABC):
 
     # Prepared / response / batch types the prepare → send pipeline
     # emits. Each transport pins these to its own concrete types —
-    # :class:`HTTPSession` to :class:`HTTPRequest` / :class:`HTTPResponse`
+    # :class:`HTTPSession` to :class:`PreparedRequest` / :class:`Response`
     # / :class:`HTTPResponseBatch`; :class:`StatementExecutor` subclasses
     # to :class:`PreparedStatement` / :class:`StatementResult` /
     # :class:`StatementBatch` — so the same vocabulary covers every
@@ -505,6 +404,145 @@ class HTTPSession(Singleton, ABC):
             self._local_cache: "FolderPath" = FolderPath(path=path)
             return self._local_cache
 
+
+# ---------------------------------------------------------------------------
+# HTTPSession — concrete HTTP/HTTPS transport
+# ---------------------------------------------------------------------------
+
+
+# Cap on per-batch byte size when emitting responses from a Spark
+# `mapInArrow` worker. 128 MiB matches Spark's default Arrow batch
+# preference and keeps a single oversized response from inflating the
+# whole partition's output. A response that is itself larger than the
+# cap is sliced row-wise by the shared rechunker, which never splits a
+# single row across batches.
+
+# Rechunk byte target for paginated responses assembled by
+# ``_combine_paginated_pages``.  Targets the IPC page content size
+# (``RecordBatch.serialize().size``), not the in-memory buffer size.
+_PAGINATED_RECHUNK_BYTE_SIZE: int = 128 * 1024 * 1024
+
+
+# Local cache is a partitioned tabular tree backed by
+# :class:`yggdrasil.io.nested.folder_path.FolderPath`:
+# ``<root>/partition_key=<int>/part-{epoch_ms}-{seed}.<ext>``.
+# Same Hive-style partition shape the remote :class:`Tabular` cache
+# uses, so the same lookup primitives — :meth:`CacheConfig.make_lookup_predicate`
+# / :meth:`CacheConfig.make_batch_lookup_predicate` — prune both
+# backends identically. The predicate's ``partition_key IN (...)``
+# clause flows through :meth:`FolderPath.iter_children`'s candidate
+# probe, so a batch lookup ``stat``s only the partition directories
+# its requests touch instead of walking the whole tree.
+
+
+
+
+
+def _encode_request_data(
+    data: Any,
+) -> tuple[bytes, "str | None"]:
+    """Encode a ``requests``-style ``data=`` payload into request bytes.
+
+    * ``bytes`` / ``bytearray`` / ``memoryview`` → raw bytes, no header
+      change (caller's ``Content-Type`` wins).
+    * ``str`` → UTF-8 bytes, no header change.
+    * ``Mapping`` / ``Iterable[tuple]`` → ``urlencode(doseq=True)`` with
+      ``application/x-www-form-urlencoded`` as the suggested header,
+      matching :meth:`requests.Session.post`.
+    """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return bytes(data), None
+    if isinstance(data, str):
+        return data.encode("utf-8"), None
+    from urllib.parse import urlencode
+
+    return urlencode(data, doseq=True).encode("utf-8"), "application/x-www-form-urlencoded"
+
+
+def _format_cookie_header(cookies: Any) -> str:
+    """Serialize a ``requests``-style ``cookies=`` arg into one ``Cookie`` header value."""
+    if hasattr(cookies, "to_header"):
+        return cookies.to_header()
+    if isinstance(cookies, Mapping):
+        return "; ".join(f"{k}={v}" for k, v in cookies.items())
+    raise TypeError(
+        f"cookies must be a Mapping or expose to_header(); got "
+        f"{type(cookies).__name__}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Retry tuning — backoff schedule for HTTPSession's connection pool.
+# ---------------------------------------------------------------------------
+
+# 429s get a longer schedule than 5xx because rate limits need wall-clock
+# time to clear; both schedules are tight (we'd rather surface an error
+# fast than mask a real outage with a minute-long retry storm).
+# Server-supplied Retry-After always wins over these when present.
+_RETRY_TOTAL = 3
+_RETRY_CONNECT = 2
+_RETRY_READ = 2
+
+# 5xx schedule: 0.5, 1, 2 (capped at backoff_max). Worst-case ~3.5s.
+_BACKOFF_5XX_FACTOR = 0.5
+_BACKOFF_5XX_MAX = 5.0
+
+# 429 schedule: 1, 2, 4 (capped at backoff_max). Worst-case ~7s.
+_BACKOFF_429_FACTOR = 1.0
+_BACKOFF_429_MAX = 5.0
+
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
+class _TieredRetry(Retry):
+    """:class:`Retry` variant with status-aware backoff.
+
+    Standard ``Retry`` exposes a single ``backoff_factor`` shared by every
+    retry, so 429 (rate limit) and 503 (transient outage) get the same
+    schedule. This subclass branches on the most recent response status:
+
+    * **429** uses a longer, gentler exponential schedule, since rate-limit
+      windows are typically wall-clock bound and respond poorly to tight
+      retries.
+    * **Everything else** (5xx, transport errors) uses a shorter schedule.
+    * The server's ``Retry-After`` header — when present and respected via
+      ``respect_retry_after_header=True`` — always overrides this, because
+      the pool checks ``get_retry_after`` before ``get_backoff_time``.
+    """
+
+    BACKOFF_MAX = _BACKOFF_429_MAX
+
+    def get_backoff_time(self) -> float:  # type: ignore[override]
+        # Mirror urllib3's own short-circuit: no backoff before the second
+        # consecutive error. ``history`` is a tuple of RequestHistory entries.
+        consecutive_errors = list(
+            takewhile(lambda x: x.redirect_location is None, reversed(self.history))
+        )
+        if len(consecutive_errors) <= 1:
+            return 0.0
+
+        last_status = consecutive_errors[0].status
+
+        if last_status == 429:
+            # Count *consecutive* 429s only — if the last attempt was a 503,
+            # we want the 5xx schedule, not a 429 schedule inflated by older
+            # rate-limit hits.
+            n = 0
+            for h in consecutive_errors:
+                if h.status == 429:
+                    n += 1
+                else:
+                    break
+            backoff = _BACKOFF_429_FACTOR * (2 ** (n - 1))
+            return float(min(_BACKOFF_429_MAX, backoff))
+
+        # Default 5xx / transport-error schedule, mirroring urllib3's formula
+        # but with our own factor and cap.
+        backoff = _BACKOFF_5XX_FACTOR * (2 ** (len(consecutive_errors) - 1))
+        return float(min(_BACKOFF_5XX_MAX, backoff))
+
+
+class HTTPSession(Session):
     """HTTP/HTTPS session — singleton-keyed by ``(base_url, verify, pool_maxsize, headers, waiting, auth)``.
 
     Inherits the singleton + pickle + ``job_pool`` plumbing from
@@ -528,7 +566,7 @@ class HTTPSession(Singleton, ABC):
     _RESPONSE_CLASS: ClassVar[type] = HTTPResponse
     _BATCH_CLASS: ClassVar[type] = HTTPResponseBatch
 
-    _TRANSIENT_STATE_ATTRS = frozenset({"_lock", "_job_pool", "_local_cache"}) | {"_connections", "_retry"}
+    _TRANSIENT_STATE_ATTRS = Session._TRANSIENT_STATE_ATTRS | {"_connections", "_retry"}
 
     # Status codes that trigger an automatic redirect when ``redirect=True``.
     # 303 always falls back to GET (per RFC 7231); 307/308 preserve method.
@@ -748,14 +786,14 @@ class HTTPSession(Singleton, ABC):
     ) -> HTTPResponse:
         """Low-level wire fetch — bypasses the cache / auth-refresh pipeline.
 
-        Build a synthetic :class:`HTTPRequest` from ``method`` /
+        Build a synthetic :class:`PreparedRequest` from ``method`` /
         ``url`` / ``headers`` / ``body`` and run it through the same
         retry + redirect machinery :meth:`_send_http` does for the
         regular :meth:`send` path. Useful when the caller just wants a
         raw byte stream off a URL — Databricks external-link readers
         feeding :func:`pa.input_stream` are the canonical case.
         """
-        request = HTTPRequest.prepare(
+        request = PreparedRequest.prepare(
             method=method,
             url=str(url) if isinstance(url, URL) else url,
             headers=dict(headers) if headers is not None else None,
@@ -772,7 +810,7 @@ class HTTPSession(Singleton, ABC):
 
     def _send_http(
         self,
-        request: HTTPRequest,
+        request: PreparedRequest,
         *,
         timeout: Any = None,
         preload_content: bool = True,
@@ -873,7 +911,7 @@ class HTTPSession(Singleton, ABC):
     def _send_once(
         self,
         *,
-        request: HTTPRequest,
+        request: PreparedRequest,
         timeout: Any,
         preload_content: bool,
         decode_content: bool,
@@ -970,7 +1008,7 @@ class HTTPSession(Singleton, ABC):
         base = parts.path.rsplit("/", 1)[0] + "/"
         return urlunsplit((parts.scheme, parts.netloc, base + location, "", ""))
 
-    def _request_log_id(self, request: HTTPRequest) -> str:
+    def _request_log_id(self, request: PreparedRequest) -> str:
         try:
             return request.xxh3_b64(url_safe=True)
         except Exception:
@@ -1000,7 +1038,7 @@ class HTTPSession(Singleton, ABC):
 
     def send(
         self,
-        request: HTTPRequest,
+        request: PreparedRequest,
         config: SendConfig | Mapping[str, Any] | None = None,
         *,
         wait: WaitingConfigArg = ...,
@@ -1011,10 +1049,10 @@ class HTTPSession(Singleton, ABC):
         spark_session: Optional["SparkSession"] = ...,
         start: bool = True,
         **options,
-    ) -> HTTPResponse:
+    ) -> Response:
         """Prepare, dispatch, and (optionally) await the response.
 
-        Single-request entry point — always returns a :class:`HTTPResponse`.
+        Single-request entry point — always returns a :class:`Response`.
         adds no value.
 
         When ``spark_session`` is bound (or ``True`` / ``...`` resolved
@@ -1029,11 +1067,11 @@ class HTTPSession(Singleton, ABC):
         same knob to return an idled :class:`StatementResult` whose
         backend submission is deferred until
         :meth:`StatementResult.start` fires. Plain HTTP sessions don't
-        need an idle :class:`HTTPResponse` (the network call is
+        need an idle :class:`Response` (the network call is
         synchronous), so the base raises a clean
         ``NotImplementedError`` via :meth:`_build_idle_response`.
 
-        Per-request :attr:`HTTPRequest.send_config` is used as the
+        Per-request :attr:`PreparedRequest.send_config` is used as the
         base when no explicit *config* is passed — explicit kwargs
         still override individual fields.
         """
@@ -1076,12 +1114,12 @@ class HTTPSession(Singleton, ABC):
 
     def _build_idle_response(
         self,
-        request: HTTPRequest,
+        request: PreparedRequest,
         config: SendConfig,
-    ) -> HTTPResponse:
+    ) -> Response:
         """Return a not-yet-sent response shell for *request*.
 
-        Concrete HTTP sessions don't need an idle :class:`HTTPResponse`
+        Concrete HTTP sessions don't need an idle :class:`Response`
         (the network call is synchronous), so the default raises.
         :class:`StatementExecutor` overrides this to return the
         standard ``start=False`` :class:`StatementResult` so callers
@@ -1096,7 +1134,7 @@ class HTTPSession(Singleton, ABC):
 
     def refresh_auth(
         self,
-        request: HTTPRequest,
+        request: PreparedRequest,
         force: bool = True,
     ) -> "tuple[Session, bool]":
         """Resolve the auth handler and stamp the Authorization header.
@@ -1183,7 +1221,7 @@ class HTTPSession(Singleton, ABC):
             self.headers["Authorization"] = authorization
         return self, True
 
-    def prepare_request_before_send(self, request: HTTPRequest) -> HTTPRequest:
+    def prepare_request_before_send(self, request: PreparedRequest) -> PreparedRequest:
         """Session-wide request hook fired once per outbound request.
 
         Default returns *request* unchanged. Subclasses override to inject
@@ -1206,7 +1244,7 @@ class HTTPSession(Singleton, ABC):
         self.refresh_auth(request, force=False)
         return request
 
-    def prepare_response_after_received(self, response: HTTPResponse) -> HTTPResponse:
+    def prepare_response_after_received(self, response: Response) -> Response:
         """Session-wide response hook fired once per completed network send.
 
         Default returns *response* unchanged. Subclasses override to log,
@@ -1220,8 +1258,8 @@ class HTTPSession(Singleton, ABC):
 
     def _send(
         self,
-        request: HTTPRequest,
-    ) -> HTTPResponse:
+        request: PreparedRequest,
+    ) -> Response:
         """Wire send — no cache logic, just prepare → send → post-process."""
         request = self.prepare_request_before_send(request)
         LOGGER.debug("Sending %s %s", request.method, request.url)
@@ -1236,7 +1274,7 @@ class HTTPSession(Singleton, ABC):
 
     def _local_send(
         self,
-        request: HTTPRequest,
+        request: PreparedRequest,
     ) -> HTTPResponse:
         config = request.send_config_or_default
         wait_cfg = config.wait if config.wait is not None else self.waiting
@@ -1279,7 +1317,7 @@ class HTTPSession(Singleton, ABC):
 
     def _wire_send(
         self,
-        request: HTTPRequest,
+        request: PreparedRequest,
         wait_cfg: WaitingConfig,
     ) -> HTTPResponse:
         """Single wire-level send.
@@ -1301,7 +1339,7 @@ class HTTPSession(Singleton, ABC):
     def _fetch_paginated_page(
         self,
         *,
-        request: HTTPRequest,
+        request: PreparedRequest,
         page_num: int,
         body_seed: bytes | None,
         wait_cfg: WaitingConfig,
@@ -1331,7 +1369,7 @@ class HTTPSession(Singleton, ABC):
         self,
         *,
         result: HTTPResponse,
-        request: HTTPRequest,
+        request: PreparedRequest,
         current_page: int,
         total_pages: int,
         wait_cfg: WaitingConfig,
@@ -1417,7 +1455,7 @@ class HTTPSession(Singleton, ABC):
 
     def send_many(
         self,
-        requests: Iterator[HTTPRequest],
+        requests: Iterator[PreparedRequest],
         config: SendConfig | Mapping[str, Any] | None = None,
         *,
         wait: WaitingConfigArg = ...,
@@ -1431,7 +1469,7 @@ class HTTPSession(Singleton, ABC):
         max_in_flight: int | None = None,
         max_batch_ttl: float | None = None,
         **options,
-    ) -> Iterator[HTTPResponse]:
+    ) -> Iterator[Response]:
         """Stream responses for a batch of requests.
 
         Batch orchestration kwargs (``batch_size``, ``ordered``,
@@ -1440,7 +1478,7 @@ class HTTPSession(Singleton, ABC):
         that gets stamped on each request.
 
         Send-config kwargs default to ``...`` (Ellipsis).  When left
-        unset the per-request :attr:`HTTPRequest.send_config` is
+        unset the per-request :attr:`PreparedRequest.send_config` is
         preserved; an explicit value overrides that field on every
         request in the batch.
         """
@@ -1474,7 +1512,7 @@ class HTTPSession(Singleton, ABC):
         if lc is not None and lc.tabular is None:
             lc.cache_tabular(session=self)
 
-        def _stamp(reqs: Iterator[HTTPRequest]) -> Iterator[HTTPRequest]:
+        def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
             for r in reqs:
                 if r.send_config is None:
                     r.send_config = cfg
@@ -1510,7 +1548,7 @@ class HTTPSession(Singleton, ABC):
 
     def _send_batch(
         self,
-        reqs: list[HTTPRequest],
+        reqs: list[PreparedRequest],
         cfg: "SendConfig",
         *,
         ordered: bool = False,
@@ -1523,10 +1561,10 @@ class HTTPSession(Singleton, ABC):
 
     @staticmethod
     def _group_by_config(
-        batch: list[HTTPRequest],
-    ) -> dict["SendConfig", list[HTTPRequest]]:
+        batch: list[PreparedRequest],
+    ) -> dict["SendConfig", list[PreparedRequest]]:
         """Group requests by send config."""
-        groups: dict[SendConfig, list[HTTPRequest]] = {}
+        groups: dict[SendConfig, list[PreparedRequest]] = {}
         for r in batch:
             cfg = r.send_config_or_default
             groups.setdefault(cfg, []).append(r)
@@ -1534,11 +1572,11 @@ class HTTPSession(Singleton, ABC):
 
     def _fetch_misses(
         self,
-        misses: list[HTTPRequest],
+        misses: list[PreparedRequest],
         *,
         ordered: bool = False,
         max_in_flight: int | None = None,
-    ) -> Iterator[HTTPResponse]:
+    ) -> Iterator[Response]:
         """Send misses through the job pool — no caching, just wire calls."""
         pool = self.job_pool
         for result in pool.as_completed(
@@ -1600,9 +1638,9 @@ class HTTPSession(Singleton, ABC):
 
     def _send_many(
         self,
-        requests: Iterator[HTTPRequest],
+        requests: Iterator[PreparedRequest],
         **batch_kw: Any,
-    ) -> Iterator[HTTPResponse]:
+    ) -> Iterator[Response]:
         """Stream responses, flattening the per-chunk :class:`HTTPResponseBatch`.
 
         In Spark mode ``raise_error`` is applied at the driver-iteration
@@ -1613,7 +1651,7 @@ class HTTPSession(Singleton, ABC):
 
     def send_many_batches(
         self,
-        requests: Iterator[HTTPRequest],
+        requests: Iterator[PreparedRequest],
         *,
         wait: WaitingConfigArg = ...,
         raise_error: bool = ...,
@@ -1629,7 +1667,7 @@ class HTTPSession(Singleton, ABC):
         """Yield one :class:`HTTPResponseBatch` per processed chunk.
 
         Send-config kwargs default to ``...`` (Ellipsis).  When left
-        unset the per-request :attr:`HTTPRequest.send_config` is
+        unset the per-request :attr:`PreparedRequest.send_config` is
         preserved; an explicit value overrides that field on every
         request in the batch.
         """
@@ -1650,7 +1688,7 @@ class HTTPSession(Singleton, ABC):
         if overrides:
             cfg = SendConfig.from_(None, **overrides)
 
-            def _stamp(reqs: Iterator[HTTPRequest]) -> Iterator[HTTPRequest]:
+            def _stamp(reqs: Iterator[PreparedRequest]) -> Iterator[PreparedRequest]:
                 for r in reqs:
                     if r.send_config is None:
                         r.send_config = cfg
@@ -1679,7 +1717,7 @@ class HTTPSession(Singleton, ABC):
 
     def _send_many_batches(
         self,
-        requests: Iterator[HTTPRequest],
+        requests: Iterator[PreparedRequest],
         *,
         batch_size: int | None = None,
         max_batch_size: int | None = None,
@@ -1701,10 +1739,10 @@ class HTTPSession(Singleton, ABC):
         total_failed = 0
 
         def _batched(
-            it: Iterator[HTTPRequest],
+            it: Iterator[PreparedRequest],
             n: int,
             ttl_seconds: float | None,
-        ) -> Iterator[list[HTTPRequest]]:
+        ) -> Iterator[list[PreparedRequest]]:
             # When no TTL is set, fall back to the cheap islice path —
             # avoids the per-request monotonic() probe.
             iterator = iter(it)
@@ -1720,7 +1758,7 @@ class HTTPSession(Singleton, ABC):
             # when either the size cap or the wall-clock deadline is
             # reached. The deadline is reset per chunk so a slow
             # upstream gets a fresh window after each flush.
-            buf: list[HTTPRequest] = []
+            buf: list[PreparedRequest] = []
             deadline: float | None = None
             for item in iterator:
                 if not buf:
@@ -1784,7 +1822,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> HTTPResponse | HTTPRequest:
+    ) -> Response | PreparedRequest:
         return self.request(
             "GET",
             url,
@@ -1825,7 +1863,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> HTTPResponse | HTTPRequest:
+    ) -> Response | PreparedRequest:
         return self.request(
             "POST",
             url,
@@ -1867,7 +1905,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> HTTPResponse | HTTPRequest:
+    ) -> Response | PreparedRequest:
         return self.request(
             "PUT",
             url,
@@ -1909,7 +1947,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> HTTPResponse | HTTPRequest:
+    ) -> Response | PreparedRequest:
         return self.request(
             "PATCH",
             url,
@@ -1951,7 +1989,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> HTTPResponse | HTTPRequest:
+    ) -> Response | PreparedRequest:
         return self.request(
             "DELETE",
             url,
@@ -1992,7 +2030,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> HTTPResponse | HTTPRequest:
+    ) -> Response | PreparedRequest:
         return self.request(
             "HEAD",
             url,
@@ -2033,7 +2071,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> HTTPResponse | HTTPRequest:
+    ) -> Response | PreparedRequest:
         return self.request(
             "OPTIONS",
             url,
@@ -2076,7 +2114,7 @@ class HTTPSession(Singleton, ABC):
         local_cache: CacheConfig | Mapping[str, Any] | None = None,
         send: bool = True,
         **options,
-    ) -> HTTPResponse | HTTPRequest:
+    ) -> Response | PreparedRequest:
         # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
         # form-urlencoding for mappings/sequences), ``timeout=`` becomes
         # ``wait=``, and ``cookies=`` joins ``headers={'Cookie': ...}``.
@@ -2149,7 +2187,7 @@ class HTTPSession(Singleton, ABC):
         normalize: bool = True,
         send_config: SendConfig | None = None,
         **send_kwargs: Any,
-    ) -> HTTPRequest:
+    ) -> PreparedRequest:
         full_url: URL | str | None = url
 
         if self.base_url:
@@ -2171,7 +2209,7 @@ class HTTPSession(Singleton, ABC):
             ):
                 object.__setattr__(lc, "tabular", self.local_cache())
 
-        request = HTTPRequest.prepare(
+        request = PreparedRequest.prepare(
             method=method,
             url=full_url,
             headers=headers,
@@ -2183,5 +2221,3 @@ class HTTPSession(Singleton, ABC):
             session=self
         )
         return request
-
-

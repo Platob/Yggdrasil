@@ -34,7 +34,8 @@ from pathlib import Path
 import pytest
 
 from yggdrasil.enums import Mode
-from yggdrasil.io.send_config import CacheConfig, SendConfig
+from yggdrasil.http_.cache_config import CacheConfig
+from yggdrasil.http_.send_config import SendConfig
 from ._helpers import StubSession, make_request, make_response
 
 

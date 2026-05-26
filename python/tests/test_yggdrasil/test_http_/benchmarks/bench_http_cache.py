@@ -51,7 +51,7 @@ from yggdrasil.io.memory import Memory
 from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import CacheConfig
+from yggdrasil.http_.cache_config import CacheConfig
 
 # ---------------------------------------------------------------------------
 # Fixtures

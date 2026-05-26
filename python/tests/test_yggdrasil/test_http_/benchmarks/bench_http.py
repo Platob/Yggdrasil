@@ -40,7 +40,7 @@ from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import SendConfig
+from yggdrasil.http_.send_config import SendConfig
 
 
 # ---------------------------------------------------------------------------

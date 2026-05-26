@@ -25,7 +25,8 @@ from yggdrasil.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.http_.response import HTTPResponse
-    from yggdrasil.io.send_config import CacheConfig, SendConfig
+    from yggdrasil.http_.cache_config import CacheConfig
+    from yggdrasil.http_.send_config import SendConfig
     from yggdrasil.http_.session import HTTPSession
 
 
@@ -138,7 +139,8 @@ def _fold_cache_into_send_config(
     if local_cache_config is None and remote_cache_config is None:
         return send_config
     import dataclasses
-    from yggdrasil.io.send_config import CacheConfig as _CacheConfig, SendConfig as _SendConfig
+    from yggdrasil.http_.cache_config import CacheConfig as _CacheConfig
+    from yggdrasil.http_.send_config import SendConfig as _SendConfig
     lc = _CacheConfig.from_(local_cache_config) if local_cache_config is not None else None
     rc = _CacheConfig.from_(remote_cache_config) if remote_cache_config is not None else None
     if send_config is not None:
@@ -190,7 +192,7 @@ class HTTPRequest:
             else dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
         )
         self.buffer: Optional[Holder] = _coerce_request_buffer(buffer)
-        from yggdrasil.io.send_config import SendConfig as _SendConfig
+        from yggdrasil.http_.send_config import SendConfig as _SendConfig
         self.send_config: SendConfig | None = _SendConfig.from_(send_config, default=None)
         self._sender: UserInfo | None = (
             _coerce_userinfo(sender) if sender is not None else _default_sender()
@@ -222,7 +224,7 @@ class HTTPRequest:
         sc = self.send_config
         if sc is not None:
             return sc
-        from yggdrasil.io.send_config import SendConfig as _SendConfig
+        from yggdrasil.http_.send_config import SendConfig as _SendConfig
         return _SendConfig.default()
 
     @property
@@ -263,7 +265,7 @@ class HTTPRequest:
         # ``send_config`` is omitted when it's ``None`` or the default
         # singleton — no point shipping bytes that the receiver would
         # reconstruct identically via :attr:`send_config_or_default`.
-        from yggdrasil.io.send_config import SendConfig as _SC
+        from yggdrasil.http_.send_config import SendConfig as _SC
         state = {
             k: v for k, v in self.__dict__.items()
             if k not in self._TRANSIENT_STATE_ATTRS

@@ -17,7 +17,8 @@ from yggdrasil.data import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.request import PreparedRequest, REQUEST_SCHEMA
 from yggdrasil.io.response import RESPONSE_SCHEMA, Response
-from yggdrasil.io.send_config import SendConfig, CacheConfig, MATCH_KEY
+from yggdrasil.http_.cache_config import CacheConfig, MATCH_KEY
+from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.io.tabular import ArrowTabular
 from yggdrasil.arrow.tabular import ArrowTabular as Dataset
 from yggdrasil.io.tabular.base import Tabular

@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.io.send_config import CacheConfig, SendConfig
+from yggdrasil.http_.cache_config import CacheConfig
+from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.io.session import Session
 
 from ._helpers import StubSession, make_request, make_response

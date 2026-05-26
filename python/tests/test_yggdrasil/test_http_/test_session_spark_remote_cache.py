@@ -17,7 +17,7 @@ import pytest
 from yggdrasil.enums import Mode
 from yggdrasil.http_.session import HTTPSession
 from yggdrasil.io.response import RESPONSE_SCHEMA, Response
-from yggdrasil.io.send_config import CacheConfig
+from yggdrasil.http_.cache_config import CacheConfig
 from yggdrasil.io.session import Session
 from yggdrasil.io.tabular import Tabular
 
