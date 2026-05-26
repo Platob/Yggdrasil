@@ -253,24 +253,94 @@ class _ConfigBase:
         return dataclasses.replace(self, **self._check_mapping(overrides))
 
 
-@dataclass(frozen=True, slots=True)
 class CacheConfig(_ConfigBase):
     _FIELD_NAMES: ClassVar[frozenset[str]] = _CACHE_CONFIG_FIELDS
 
-    tabular: Optional[Holder] = field(default=None, hash=False, compare=False)
-    request_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
-    response_by: Optional[list[str]] = field(default=None, hash=False, compare=False)
-    mode: Mode = Mode.APPEND
-    anonymize: Literal["remove", "redact"] = "remove"
-    received_from: Optional[dt.datetime] = None
-    received_to: Optional[dt.datetime] = None
-    received_ttl: Optional[dt.timedelta] = None
-    wait: WaitingConfig = False
-    mirror_local_to_remote: bool = False
-    cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1)
-    _derived: Optional[dict] = field(
-        default=None, init=False, hash=False, compare=False, repr=False,
+    __slots__ = (
+        "tabular", "request_by", "response_by", "mode", "anonymize",
+        "received_from", "received_to", "received_ttl", "wait",
+        "mirror_local_to_remote", "cleanup_ttl", "_derived",
     )
+
+    __setattr__ = object.__setattr__
+    __delattr__ = object.__delattr__
+
+    def __init__(
+        self,
+        tabular: Optional[Holder] = None,
+        request_by: Optional[list[str]] = None,
+        response_by: Optional[list[str]] = None,
+        mode: Mode = Mode.APPEND,
+        anonymize: Literal["remove", "redact"] = "remove",
+        received_from: Optional[dt.datetime] = None,
+        received_to: Optional[dt.datetime] = None,
+        received_ttl: Optional[dt.timedelta] = None,
+        wait: WaitingConfig = False,
+        mirror_local_to_remote: bool = False,
+        cleanup_ttl: Optional[dt.timedelta] = dt.timedelta(days=1),
+    ):
+        self.mode = Mode.from_(mode, default=Mode.APPEND)
+        self.wait = WaitingConfig.from_(wait)
+        self.anonymize = anonymize
+        self.mirror_local_to_remote = mirror_local_to_remote
+        self.cleanup_ttl = cleanup_ttl
+        self._derived = None
+
+        self.request_by = _validate_request_by(request_by)
+        self.response_by = _validate_response_by(response_by)
+
+        self.received_from = _coerce_optional_datetime(received_from)
+        self.received_to = _coerce_optional_datetime(received_to)
+        self.received_ttl = received_ttl
+
+        if self.received_ttl:
+            if not self.received_to:
+                self.received_to = dt.datetime.now(dt.timezone.utc)
+            if not self.received_from:
+                self.received_from = self.received_to - self.received_ttl
+
+        if tabular is not None:
+            from yggdrasil.io.tabular import Tabular
+            self.tabular = Tabular.from_(tabular, as_folder=True)
+        else:
+            self.tabular = None
+
+    def __repr__(self):
+        parts = []
+        if self.tabular is not None:
+            parts.append(f"tabular={self.tabular!r}")
+        if self.mode != Mode.APPEND:
+            parts.append(f"mode={self.mode!r}")
+        if self.request_by and self.request_by != list(_DEFAULT_REQUEST_BY):
+            parts.append(f"request_by={self.request_by!r}")
+        if self.response_by:
+            parts.append(f"response_by={self.response_by!r}")
+        if self.received_from is not None:
+            parts.append(f"received_from={self.received_from!r}")
+        if self.received_to is not None:
+            parts.append(f"received_to={self.received_to!r}")
+        return f"CacheConfig({', '.join(parts)})"
+
+    def __eq__(self, other):
+        if not isinstance(other, CacheConfig):
+            return NotImplemented
+        return (
+            self.mode == other.mode
+            and self.anonymize == other.anonymize
+            and self.received_from == other.received_from
+            and self.received_to == other.received_to
+            and self.received_ttl == other.received_ttl
+            and self.wait == other.wait
+            and self.mirror_local_to_remote == other.mirror_local_to_remote
+            and self.cleanup_ttl == other.cleanup_ttl
+        )
+
+    def __hash__(self):
+        return hash((
+            self.mode, self.anonymize,
+            self.received_from, self.received_to, self.received_ttl,
+            self.wait, self.mirror_local_to_remote, self.cleanup_ttl,
+        ))
 
     @staticmethod
     def _check_mapping(values: MutableMapping[str, Any]):
@@ -317,30 +387,6 @@ class CacheConfig(_ConfigBase):
                 return False
         return True
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "mode", Mode.from_(self.mode, default=Mode.APPEND))
-        object.__setattr__(self, "wait", WaitingConfig.from_(self.wait))
-
-        object.__setattr__(self, "request_by", _validate_request_by(self.request_by))
-        object.__setattr__(self, "response_by", _validate_response_by(self.response_by))
-
-        object.__setattr__(self, "received_from", _coerce_optional_datetime(self.received_from))
-        object.__setattr__(self, "received_to", _coerce_optional_datetime(self.received_to))
-
-        if self.received_ttl:
-            if not self.received_to:
-                object.__setattr__(self, "received_to", dt.datetime.now(dt.timezone.utc))
-
-            if not self.received_from:
-                object.__setattr__(self, "received_from", self.received_to - self.received_ttl)
-
-        tab = self.tabular
-        if tab is not None:
-            from yggdrasil.io.tabular import Tabular
-            object.__setattr__(
-                self, "tabular", Tabular.from_(tab, as_folder=True),
-            )
-
     def __getstate__(self):
         return {
             "mode": self.mode,
@@ -357,32 +403,24 @@ class CacheConfig(_ConfigBase):
         }
 
     def __setstate__(self, state):
-        object.__setattr__(self, "mode", state["mode"])
-        object.__setattr__(self, "wait", state["wait"])
-        object.__setattr__(self, "request_by", state["request_by"])
-        object.__setattr__(self, "response_by", state["response_by"])
-        object.__setattr__(self, "received_from", state["received_from"])
-        object.__setattr__(self, "received_to", state["received_to"])
-        object.__setattr__(self, "received_ttl", state["received_ttl"])
-        # Legacy payloads stored a URL string under "tabular_url" or
-        # "path" instead of the live Holder.
+        self.mode = state["mode"]
+        self.wait = state["wait"]
+        self.request_by = state["request_by"]
+        self.response_by = state["response_by"]
+        self.received_from = state["received_from"]
+        self.received_to = state["received_to"]
+        self.received_ttl = state["received_ttl"]
         tabular = state.get("tabular")
         if tabular is None:
             tabular_url = state.get("tabular_url", state.get("path"))
             if tabular_url is not None:
                 from yggdrasil.io.nested.folder_path import FolderPath
                 tabular = FolderPath(path=Path.from_(tabular_url))
-        object.__setattr__(self, "tabular", tabular)
-        object.__setattr__(self, "anonymize", state.get("anonymize", "remove"))
-        object.__setattr__(
-            self, "mirror_local_to_remote",
-            state.get("mirror_local_to_remote", False),
-        )
-        object.__setattr__(
-            self, "cleanup_ttl",
-            state.get("cleanup_ttl", dt.timedelta(days=1)),
-        )
-        object.__setattr__(self, "_derived", None)
+        self.tabular = tabular
+        self.anonymize = state.get("anonymize", "remove")
+        self.mirror_local_to_remote = state.get("mirror_local_to_remote", False)
+        self.cleanup_ttl = state.get("cleanup_ttl", dt.timedelta(days=1))
+        self._derived = None
 
     @classmethod
     def from_(
@@ -451,7 +489,7 @@ class CacheConfig(_ConfigBase):
         cache = self._derived
         if cache is None:
             cache = {}
-            object.__setattr__(self, "_derived", cache)
+            self._derived = cache
         return cache
 
     @property
@@ -633,7 +671,7 @@ class CacheConfig(_ConfigBase):
         # ``compare=False, hash=False`` and excluded from
         # ``__getstate__``, so the mutation doesn't affect equality
         # or pickling.
-        object.__setattr__(self, "tabular", tabular)
+        self.tabular = tabular
         return tabular
 
     def request_values(
@@ -866,20 +904,21 @@ class CacheConfig(_ConfigBase):
             return clauses[0]
         return all_of(*clauses)
 
-    def copy(
-        self,
-        **overrides
-    ):
-        clean = {
-            k: v
-            for k, v in overrides.items()
-            if v is not ...
-        }
+    def merge(self, **overrides: Any):
+        unknown = set(overrides) - self._FIELD_NAMES
+        if unknown:
+            raise TypeError(
+                f"{type(self).__name__}.merge got unexpected field(s): {sorted(unknown)!r}"
+            )
+        return self.copy(**self._check_mapping(overrides))
 
+    def copy(self, **overrides):
+        clean = {k: v for k, v in overrides.items() if v is not ...}
         if not clean:
             return self
-
-        return dataclasses.replace(self, **overrides)
+        state = self.__getstate__()
+        state.update(clean)
+        return type(self)(**state)
 
 
 DEFAULT_CACHE_CONFIG = CacheConfig()
