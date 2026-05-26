@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Callable
 
 from yggdrasil.http_.session import HTTPSession
-from yggdrasil.io import URL
+from yggdrasil.url import URL
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
 from yggdrasil.io.request import PreparedRequest

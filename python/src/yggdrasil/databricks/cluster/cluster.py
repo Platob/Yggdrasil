@@ -46,12 +46,12 @@ from databricks.sdk.service.compute import (
     PythonPyPiLibrary,
     State,
 )
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
 from yggdrasil.io.headers import DEFAULT_HOSTNAME
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.url import URL, URLBased
 from yggdrasil.pyutils.equality import dicts_equal
 from yggdrasil.version import VersionInfo
 

@@ -38,12 +38,12 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Iterator, List, Tuple, Optional
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig
 from yggdrasil.io.base import IO
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats, TimeLike
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 __all__ = ["Path"]
 
@@ -111,7 +111,7 @@ class Path(IO, os.PathLike, ABC):
             # land on :class:`Memory`.
             scheme = url.scheme
             if scheme:
-                from yggdrasil.io.url import URLBased
+                from yggdrasil.url import URLBased
 
                 try:
                     target = URLBased.for_scheme(scheme)

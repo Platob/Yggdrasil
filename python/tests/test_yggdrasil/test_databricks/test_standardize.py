@@ -23,8 +23,8 @@ import datetime as dt
 
 import pytest
 
-from yggdrasil.data.enums.currency import Currency
-from yggdrasil.data.enums.units import (
+from yggdrasil.enums.currency import Currency
+from yggdrasil.enums.units import (
     EnergyUnit,
     PowerUnit,
     TemperatureUnit,

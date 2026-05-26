@@ -46,7 +46,7 @@ from yggdrasil.lazy_imports import mime_type_class, bytes_io_class
 
 if TYPE_CHECKING:
     from yggdrasil.io.bytes_io import BytesIO
-    from yggdrasil.data.enums.mime_type import MimeType
+    from yggdrasil.enums.mime_type import MimeType
 
 __all__ = [
     "Codec",
@@ -428,7 +428,7 @@ class _GzipCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.GZIP
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -456,7 +456,7 @@ class _ZstdCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.ZSTD
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -505,7 +505,7 @@ class _Lz4Codec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.LZ4
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -532,7 +532,7 @@ class _Bzip2Codec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.BZ2
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -559,7 +559,7 @@ class _XzCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.XZ
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -588,7 +588,7 @@ class _SnappyCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.SNAPPY
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -611,7 +611,7 @@ class _BrotliCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.BROTLI
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -637,7 +637,7 @@ class _ZlibCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.ZLIB
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -750,7 +750,7 @@ class _LzmaCodec(Codec):
 
     @property
     def mime_type(self) -> "MimeType":
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
         return MimeTypes.LZMA
 
     def compress_bytes(self, data: bytes) -> bytes:
@@ -795,7 +795,7 @@ del _c
 
 
 def _build_codec_by_mime() -> dict["MimeType", Codec]:
-    from yggdrasil.data.enums.mime_type import MimeType as _MimeType
+    from yggdrasil.enums.mime_type import MimeType as _MimeType
 
     out: dict[_MimeType, Codec] = {}
     for c in _ALL_CODECS:

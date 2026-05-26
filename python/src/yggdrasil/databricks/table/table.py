@@ -39,7 +39,7 @@ from databricks.sdk.service.catalog import (
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
-from yggdrasil.data.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
+from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema, Schema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
@@ -55,7 +55,7 @@ from yggdrasil.databricks.sql.sql_utils import (
 )
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.io import URL
+from yggdrasil.url import URL
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import Path
@@ -2785,7 +2785,7 @@ class Table(DatabricksPath):
         column order — selecting present columns as-is and substituting
         ``CAST(NULL AS <ddl>)`` for absent ones.
         """
-        from yggdrasil.data.enums.mode import Mode as _Mode
+        from yggdrasil.enums.mode import Mode as _Mode
 
         column_order: list[str] = []
         unified: dict[str, Any] = {}

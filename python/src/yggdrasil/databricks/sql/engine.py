@@ -62,7 +62,7 @@ from yggdrasil.databricks.warehouse import (
 )
 from yggdrasil.databricks.warehouse.wh_utils import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.spark.executor import SparkStatementExecutor
 from yggdrasil.spark.statement import SparkPreparedStatement, SparkStatementResult
 from .spark_executor import DatabricksSparkStatementExecutor

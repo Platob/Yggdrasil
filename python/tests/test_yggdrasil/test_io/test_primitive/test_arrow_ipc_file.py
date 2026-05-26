@@ -14,7 +14,7 @@ from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 class TestRegistration:
 
     def test_class_for_media_type(self) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         assert Holder.class_for_media_type(MimeTypes.ARROW_IPC) is ArrowIPCFile
 

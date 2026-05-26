@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import StatementResult
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 
 from .connection import MongoConnection
 from .executor import MongoExecutor

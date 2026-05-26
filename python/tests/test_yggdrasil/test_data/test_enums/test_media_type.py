@@ -1,4 +1,4 @@
-"""Behavior tests for :class:`yggdrasil.data.enums.media_type.MediaType`.
+"""Behavior tests for :class:`yggdrasil.enums.media_type.MediaType`.
 
 `MediaType` is the format + codec wrapper layer above `MimeType`.
 The two-stage sniff (outer magic identifies a wrapper, inner peek
@@ -17,9 +17,9 @@ import gzip
 import io
 
 
-from yggdrasil.data.enums.codec import Codecs
-from yggdrasil.data.enums.media_type import MediaType, MediaTypes
-from yggdrasil.data.enums.mime_type import MimeTypes
+from yggdrasil.enums.codec import Codecs
+from yggdrasil.enums.media_type import MediaType, MediaTypes
+from yggdrasil.enums.mime_type import MimeTypes
 
 
 class TestIdentity:

@@ -14,7 +14,7 @@ from databricks.sdk.service.jobs import (
 from yggdrasil.databricks.jobs import Job, JobTask
 from yggdrasil.databricks.jobs.task import DEFAULT_ENVIRONMENT_KEY
 from yggdrasil.databricks.tests import DatabricksTestCase
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 
 def _job_info_for(job_id, name="t"):

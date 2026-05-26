@@ -84,7 +84,7 @@ from yggdrasil.databricks.path import (
 from yggdrasil.databricks.volume.volumes import Volumes
 from yggdrasil.databricks.workspaces.service import Workspaces
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 
 # ---------------------------------------------------------------------------

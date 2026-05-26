@@ -62,7 +62,7 @@ from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 from yggdrasil.data.data_field import Field as _Field
-from yggdrasil.data.enums import MediaType, MimeType, Mode, ModeLike
+from yggdrasil.enums import MediaType, MimeType, Mode, ModeLike
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module

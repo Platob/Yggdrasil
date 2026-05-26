@@ -3,7 +3,7 @@
 :class:`Cluster` is the all-purpose / classic cluster handle;
 :class:`ServerlessCluster` carries serverless-specific lifecycle
 overrides. Both are URL-addressable through
-:class:`~yggdrasil.io.url.URLBased` (``dbks+cluster://`` and
+:class:`~yggdrasil.url.URLBased` (``dbks+cluster://`` and
 ``dbks+serverless-cluster://`` respectively).
 
 :class:`ClusterStatementExecutor` exposes a cluster as a backing for

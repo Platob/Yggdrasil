@@ -1,4 +1,4 @@
-"""Behavior tests for :class:`yggdrasil.data.enums.codec.Codec`.
+"""Behavior tests for :class:`yggdrasil.enums.codec.Codec`.
 
 The codec enum sits between MimeType and the byte path. Tests pin
 the practical surface every caller uses:
@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.codec import Codec, Codecs
-from yggdrasil.data.enums.mime_type import MimeTypes
+from yggdrasil.enums.codec import Codec, Codecs
+from yggdrasil.enums.mime_type import MimeTypes
 from yggdrasil.io.bytes_io import BytesIO
 
 

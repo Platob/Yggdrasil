@@ -32,7 +32,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.tabular import Tabular
-from yggdrasil.data.enums import MimeType, MimeTypes
+from yggdrasil.enums import MimeType, MimeTypes
 
 if TYPE_CHECKING:
     from confluent_kafka import Consumer, Producer

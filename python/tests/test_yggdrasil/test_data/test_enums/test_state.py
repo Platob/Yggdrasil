@@ -1,4 +1,4 @@
-"""Behavior tests for :class:`yggdrasil.data.enums.state.State`.
+"""Behavior tests for :class:`yggdrasil.enums.state.State`.
 
 ``State`` is the cross-backend execution-state enum: every async surface
 (Databricks warehouse / Spark / Mongo / Postgres statement results,
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums.state import State
 
 
 class TestCanonicalMembers:

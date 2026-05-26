@@ -56,9 +56,9 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.data.enums.mime_type import MimeType
+from yggdrasil.enums import MimeTypes, Mode
+from yggdrasil.enums.media_type import MediaType
+from yggdrasil.enums.mime_type import MimeType
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.holder import Holder
 from yggdrasil.io.memory import Memory

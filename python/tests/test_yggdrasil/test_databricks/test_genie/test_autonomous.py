@@ -19,7 +19,7 @@ from databricks.sdk.service.dashboards import (
     TextAttachment,
 )
 
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums.state import State
 from yggdrasil.databricks.genie import (
     AgentResponse,
     AgentResult,

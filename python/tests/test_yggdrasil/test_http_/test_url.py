@@ -1,4 +1,4 @@
-"""Tests for yggdrasil.io.url.URL."""
+"""Tests for yggdrasil.url.URL."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from pathlib import Path as _Path
 
 import pytest
 
-from yggdrasil.io.url import URL, resolve_memory_address
+from yggdrasil.url import URL, resolve_memory_address
 
 
 # ---------------------------------------------------------------------------

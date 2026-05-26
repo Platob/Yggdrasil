@@ -11,7 +11,7 @@ import datetime as dt
 
 import pytest
 
-from yggdrasil.data.enums.currency import Currency
+from yggdrasil.enums.currency import Currency
 from yggdrasil.fxrate import (
     FX_FRAME_COLUMNS,
     FX_FRAME_GEO_COLUMNS,

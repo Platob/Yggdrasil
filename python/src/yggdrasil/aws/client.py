@@ -66,7 +66,7 @@ from typing import (
 )
 
 from yggdrasil.dataclasses.singleton import Singleton
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from yggdrasil.lazy_imports import boto3_module, botocore_module
 
 from .config import (

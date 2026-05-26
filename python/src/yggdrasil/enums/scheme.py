@@ -4,7 +4,7 @@ Across Yggdrasil, anything addressable by a URL — a filesystem
 path (``file://``, ``s3://``, ``dbfs://``, ``dbfs+volume://``), an
 in-memory buffer (``mem://``), a Databricks workspace object
 (``dbfs+workspace://``), an HTTP endpoint (``http://`` / ``https://``)
-— exposes itself as a :class:`yggdrasil.io.url.URLBased` subclass.
+— exposes itself as a :class:`yggdrasil.url.URLBased` subclass.
 That base owns a single registry keyed by :class:`Scheme`, and
 ``URLBased.from_url(url)`` dispatches to the concrete subclass for
 ``url.scheme`` without the caller knowing which sub-package owns it.
@@ -39,7 +39,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from yggdrasil.io.url import URLBased
+    from yggdrasil.url import URLBased
 
 
 __all__ = ["Scheme"]

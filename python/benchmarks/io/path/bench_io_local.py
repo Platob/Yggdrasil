@@ -27,7 +27,7 @@ from typing import Callable
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.path.local_path import LocalPath
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile

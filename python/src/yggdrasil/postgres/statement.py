@@ -48,7 +48,7 @@ from yggdrasil.data.statement import (
 )
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.io.tabular.base import O
-from yggdrasil.data.enums import MimeType, State
+from yggdrasil.enums import MimeType, State
 
 if TYPE_CHECKING:
     from .connection import PostgresConnection

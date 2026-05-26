@@ -35,7 +35,7 @@ from yggdrasil.data.constants import (
     POSITION_KEY,
     TAG_PREFIX,
 )
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.parser import ParsedDataType
 from yggdrasil.exceptions import CastError
@@ -1392,7 +1392,7 @@ class Field(BaseChildrenFields):
         raw = md.get(MEDIA_TYPE_METADATA_KEY)
         if not raw:
             return None
-        from yggdrasil.data.enums.media_type import MediaType
+        from yggdrasil.enums.media_type import MediaType
         # ``raw.decode`` can raise ``UnicodeDecodeError`` on a
         # corrupted metadata byte payload; ``MediaType.from_`` with
         # ``default=None`` already short-circuits unknown mime
@@ -2171,7 +2171,7 @@ class Field(BaseChildrenFields):
         # Routes through ``URL.is_pathish`` (the cross-cutting check) so
         # ``Field.from_any`` doesn't have to know about every Path subtype.
         if isinstance(obj, (pathlib.PurePath, os.PathLike)):
-            from yggdrasil.io.url import URL
+            from yggdrasil.url import URL
 
             if URL.is_pathish(obj):
                 try:

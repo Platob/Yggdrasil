@@ -109,7 +109,7 @@ class RemotePath(Path):
         """Wire the page-buffer state alongside the standard :class:`Path` init.
 
         ``page_size`` accepts an int (bytes), a
-        :class:`~yggdrasil.data.enums.byteunit.ByteUnit` member, or a
+        :class:`~yggdrasil.enums.byteunit.ByteUnit` member, or a
         size string (``"4 MB"``). ``None`` disables paging and routes
         every read/write straight through to the subclass primitives.
         Omitting the kwarg uses :attr:`DEFAULT_BUFFER_SIZE`.
@@ -160,7 +160,7 @@ class RemotePath(Path):
                     f"(int / ByteUnit / size string / None), got {value!r}"
                 )
             return value if value > 0 else None
-        from yggdrasil.data.enums.byteunit import ByteUnit
+        from yggdrasil.enums.byteunit import ByteUnit
 
         try:
             n = ByteUnit.parse_size(value)

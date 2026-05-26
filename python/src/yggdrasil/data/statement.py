@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Iterable, It
 import pyarrow as pa
 
 from yggdrasil.data import Mode
-from yggdrasil.data.enums import MimeType, MimeTypes, State
+from yggdrasil.enums import MimeType, MimeTypes, State
 from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable

@@ -39,7 +39,7 @@ from typing import (
     Sequence,
 )
 
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums.state import State
 
 from .agent import GenieAgent
 
@@ -1660,7 +1660,7 @@ class AutonomousAgent(GenieAgent):
 
     def fetch_entsoe_zones(self) -> Any:
         """Fetch ENTSO-E bidding zones via the official EIC CSV."""
-        from yggdrasil.data.enums.geozone.entsoe import fetch_entsoe_bidding_zones
+        from yggdrasil.enums.geozone.entsoe import fetch_entsoe_bidding_zones
 
         session = self._get_http_session()
         zones = fetch_entsoe_bidding_zones(session=session)

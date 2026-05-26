@@ -30,7 +30,7 @@ import time
 from typing import Callable
 
 from yggdrasil.data import Field
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import (
     BooleanType,

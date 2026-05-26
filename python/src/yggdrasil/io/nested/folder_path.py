@@ -87,13 +87,13 @@ import pyarrow as pa
 
 from yggdrasil.data.constants import MEDIA_TYPE_METADATA_KEY
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.data.enums.media_type import MediaType, MediaTypes
+from yggdrasil.enums import MimeTypes, Mode
+from yggdrasil.enums.media_type import MediaType, MediaTypes
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.io.url import hive_cast_value, hive_encode, hive_split
+from yggdrasil.url import hive_cast_value, hive_encode, hive_split
 
 # Side-effect import: ensures every primitive leaf (parquet / csv /
 # arrow / ndjson / json / xlsx) has registered itself in the

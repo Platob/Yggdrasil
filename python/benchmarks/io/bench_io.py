@@ -30,7 +30,8 @@ import time
 from pathlib import PurePosixPath
 from typing import Callable
 
-from yggdrasil.io import URL, BytesIO
+from yggdrasil.io import BytesIO
+from yggdrasil.url import URL
 from yggdrasil.io.headers import Headers
 from yggdrasil.io.parameters import anonymize_parameters
 

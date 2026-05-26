@@ -55,9 +55,9 @@ from databricks.sdk.service.sql import (
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema
-from yggdrasil.data.enums import MimeType, MimeTypes, Mode
-from yggdrasil.data.enums.media_type import MediaTypes
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums import MimeType, MimeTypes, Mode
+from yggdrasil.enums.media_type import MediaTypes
+from yggdrasil.enums.state import State
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import (
     ExternalStatementData,
@@ -120,7 +120,7 @@ FAILED_STATES = {
 
 
 # Map the Databricks SDK ``StatementState`` to the unified
-# :class:`yggdrasil.data.enums.State`. ``CLOSED`` is "result already
+# :class:`yggdrasil.enums.State`. ``CLOSED`` is "result already
 # fetched / TTL elapsed" — terminal but not an error, so it buckets with
 # ``SUCCEEDED`` (matches the legacy ``done and not failed`` behavior).
 _SDK_TO_STATE: dict[StatementState, State] = {

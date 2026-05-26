@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlparse, urlunparse
 
 from yggdrasil.disposable import Disposable
-from yggdrasil.io import URL
+from yggdrasil.url import URL
 
 from yggdrasil.lazy_imports import has_pymongoarrow, pymongo_module
 

@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Optional
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from yggdrasil.data.enums.timezone import Timezone
+from yggdrasil.enums.timezone import Timezone
 from yggdrasil.data.types import (
     BooleanType,
     DateType,

@@ -1,4 +1,4 @@
-"""Behaviors of :class:`yggdrasil.data.enums.scheme.Scheme`.
+"""Behaviors of :class:`yggdrasil.enums.scheme.Scheme`.
 
 The enum centralizes the URL-scheme tokens every Yggdrasil
 :class:`URLBased` backend uses. Contract:
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.scheme import Scheme
+from yggdrasil.enums.scheme import Scheme
 
 
 class TestCanonicalMembers:

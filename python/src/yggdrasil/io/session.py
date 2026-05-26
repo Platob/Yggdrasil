@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
 
 from yggdrasil.concurrent.threading import JobPoolExecutor
 from yggdrasil.dataclasses.singleton import Singleton
-from .url import URL
+from yggdrasil.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.io.nested.folder_path import FolderPath

@@ -4,7 +4,7 @@ The contract under test:
 
 * The base class derives ``done`` / ``failed`` / ``started`` from a
   subclass-provided ``_compute_state`` so a single
-  :class:`yggdrasil.data.enums.State` mapping is the source of truth.
+  :class:`yggdrasil.enums.State` mapping is the source of truth.
 * The :meth:`state_snapshot` context manager pins ``state`` for the
   duration of the block so multiple state-derived predicate accesses
   share a single ``refresh_status`` call — the warehouse path's
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from yggdrasil.data.enums import State
+from yggdrasil.enums import State
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 
 

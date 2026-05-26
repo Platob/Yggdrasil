@@ -55,7 +55,7 @@ from typing import Callable, Iterable, Iterator
 import pyarrow as pa
 
 from yggdrasil.data.data_field import Field
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions

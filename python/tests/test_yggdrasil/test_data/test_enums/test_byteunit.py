@@ -1,4 +1,4 @@
-"""Behaviors of :class:`yggdrasil.data.enums.byteunit.ByteUnit`.
+"""Behaviors of :class:`yggdrasil.enums.byteunit.ByteUnit`.
 
 The enum is the canonical byte-size table for every memory /
 capacity / spill threshold in the codebase. The contract:
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.byteunit import ByteUnit
+from yggdrasil.enums.byteunit import ByteUnit
 
 
 class TestCanonicalMembers:
@@ -221,10 +221,10 @@ class TestFormat:
 
 
 class TestEnumExportedFromPackage:
-    """``ByteUnit`` is reachable from ``yggdrasil.data.enums``."""
+    """``ByteUnit`` is reachable from ``yggdrasil.enums``."""
 
     def test_top_level_import(self) -> None:
-        from yggdrasil.data.enums import ByteUnit as Top
+        from yggdrasil.enums import ByteUnit as Top
         assert Top is ByteUnit
 
 

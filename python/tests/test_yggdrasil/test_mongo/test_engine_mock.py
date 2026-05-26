@@ -16,7 +16,7 @@ import pytest
 pytest.importorskip("pymongo")
 pytest.importorskip("mongomock")
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.mongo import (
     MongoCommand,
     MongoCommandKind,

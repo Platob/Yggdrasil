@@ -50,7 +50,7 @@ import pyarrow as pa
 
 from yggdrasil.data import Schema as DataSchema
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.enums import MimeType, Mode
+from yggdrasil.enums import MimeType, Mode
 from yggdrasil.io.tabular.base import O, Tabular
 
 from yggdrasil.lazy_imports import has_pymongoarrow, pymongoarrow_api_module

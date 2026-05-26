@@ -12,8 +12,8 @@ import pyarrow as pa
 
 from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.data.data_field import field as schema_field
-from yggdrasil.data.enums import GZIP, Codec, MimeType
-from yggdrasil.data.enums import MediaType, MimeTypes
+from yggdrasil.enums import GZIP, Codec, MimeType
+from yggdrasil.enums import MediaType, MimeTypes
 from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
@@ -23,7 +23,7 @@ from .bytes_io import BytesIO
 from .headers import Headers
 from .holder import Holder
 from .memory import Memory
-from .url import URL, URL_STRUCT
+from yggdrasil.url import URL, URL_STRUCT
 
 if TYPE_CHECKING:
     from .response import Response
@@ -46,7 +46,7 @@ _REQUEST_SCHEMA_JSON_TAGS: dict[str, str] = {
 }
 
 
-# Nested URL struct — re-exported from :mod:`yggdrasil.io.url` so the
+# Nested URL struct — re-exported from :mod:`yggdrasil.url` so the
 # request schema and every downstream consumer share a single source
 # of truth for column ordering, types, and nullability flags. The
 # full string isn't kept here; ``private_url_hash`` covers exact

@@ -27,7 +27,7 @@ from unittest.mock import Mock
 from yggdrasil.aws.fs.path import S3Path
 from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.io.path.remote_path import RemotePath
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 
 # ---------------------------------------------------------------------------

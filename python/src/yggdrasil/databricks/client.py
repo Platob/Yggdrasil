@@ -27,8 +27,8 @@ from yggdrasil.dataclasses import (
     Singleton,
 )
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.data.enums import MimeTypes, Scheme
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.enums import MimeTypes, Scheme
+from yggdrasil.url import URL, URLBased
 from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:

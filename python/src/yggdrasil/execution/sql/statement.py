@@ -26,7 +26,7 @@ import pyarrow as pa
 from yggdrasil.execution.expr import Expression
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import PreparedStatement, StatementResult
-from yggdrasil.data.enums import MimeType, State
+from yggdrasil.enums import MimeType, State
 from yggdrasil.io.tabular import Tabular
 
 from .catalog import SqlContext, default_context

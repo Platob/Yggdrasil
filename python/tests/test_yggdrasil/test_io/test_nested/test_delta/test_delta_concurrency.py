@@ -25,7 +25,7 @@ import shutil
 from typing import Any
 
 from yggdrasil.data.data_field import Field
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.types.primitive import Int64Type
 from yggdrasil.io.nested.delta import (
     ConcurrentDeltaCommitError,

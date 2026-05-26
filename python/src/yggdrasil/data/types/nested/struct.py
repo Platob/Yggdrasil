@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 import pyarrow as pa
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
 from yggdrasil.data.types.nested._cast_json import (

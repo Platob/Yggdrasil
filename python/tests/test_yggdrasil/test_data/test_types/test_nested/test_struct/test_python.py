@@ -14,7 +14,7 @@ from yggdrasil.data import DataType, Field
 from yggdrasil.data.types import IntegerType
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested.struct import StructType
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 
 
 # ---------------------------------------------------------------------------

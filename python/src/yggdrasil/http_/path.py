@@ -22,11 +22,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Mode, Scheme
+from yggdrasil.enums import Mode, Scheme
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.path import RemotePath
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from yggdrasil.dataclasses import WaitingConfig
 
 if TYPE_CHECKING:
@@ -232,6 +232,6 @@ class HTTPPath(RemotePath):
 # the codebase where a single backend serves two scheme spellings, so
 # we slot the alias in directly rather than introducing a multi-scheme
 # registration mechanism nothing else needs.
-from yggdrasil.io.url import _URL_BASED_REGISTRY as _HTTP_SCHEMES
+from yggdrasil.url import _URL_BASED_REGISTRY as _HTTP_SCHEMES
 _HTTP_SCHEMES.setdefault(Scheme.HTTP, HTTPPath)
 del _HTTP_SCHEMES

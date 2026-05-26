@@ -17,9 +17,9 @@ import gzip
 import pyarrow as pa
 import pytest
 
-from yggdrasil.data.enums import MimeTypes
-from yggdrasil.data.enums.codec import Codecs
-from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.enums import MimeTypes
+from yggdrasil.enums.codec import Codecs
+from yggdrasil.enums.media_type import MediaType
 from yggdrasil.io.bytes_io import BytesIO
 from yggdrasil.io.memory import Memory
 from yggdrasil.io.path.local_path import LocalPath
@@ -163,7 +163,7 @@ class TestCsvGzipLocalPath:
     def test_append_into_compressed_does_full_rewrite(
         self, tmp_path, table,
     ) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.primitive.csv_file import CsvOptions
 
         target = LocalPath(str(tmp_path / "trades.csv.gz"))

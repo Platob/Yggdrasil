@@ -176,7 +176,7 @@ class FunctionRun:
         self.node_url = node_url
         self.function_id = function_id
         # Lazy import to avoid circular deps
-        from yggdrasil.data.enums.state import State
+        from yggdrasil.enums.state import State
         self._state: State = State.PENDING
         self._result: Any = None
         self._exception: Exception | None = None
@@ -268,7 +268,7 @@ class FunctionRun:
         if self._state.is_done:
             return  # already settled, skip network call
 
-        from yggdrasil.data.enums.state import State
+        from yggdrasil.enums.state import State
 
         try:
             resp = _get(f"{self.node_url}/api/run/{self.run_id}")
@@ -378,7 +378,7 @@ class FunctionHandle:
         Bypasses network registration and HTTP submission for lower latency
         when the function is already running on a ygg node.
         """
-        from yggdrasil.data.enums.state import State
+        from yggdrasil.enums.state import State
 
         run = FunctionRun.__new__(FunctionRun)
         run.run_id = 0

@@ -51,7 +51,7 @@ from typing import Any, Iterator
 import pyarrow as pa
 import pytest
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, SendConfig
 from yggdrasil.io.session import Session

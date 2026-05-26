@@ -18,7 +18,7 @@ class TestWriteSparkFrameForwardsSession:
     def test_spark_session_forwarded(self):
         """_write_spark_frame must pass options.spark_session to spark_insert."""
         from yggdrasil.data.options import CastOptions
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
 
         fake_spark = MagicMock(name="FakeSparkSession")
         fake_frame = MagicMock(name="FakeSparkDataFrame")
@@ -43,7 +43,7 @@ class TestWriteSparkFrameForwardsSession:
     def test_spark_session_none_when_absent(self):
         """_write_spark_frame passes None when options has no spark_session."""
         from yggdrasil.data.options import CastOptions
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
 
         opts = CastOptions(mode=Mode.APPEND)
 

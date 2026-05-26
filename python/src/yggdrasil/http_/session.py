@@ -46,7 +46,7 @@ from typing import (
 from urllib.parse import urlsplit, urlunsplit
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
-from yggdrasil.data.enums import MediaTypes
+from yggdrasil.enums import MediaTypes
 from yggdrasil.dataclasses.waiting import (
     DEFAULT_WAITING_CONFIG,
     WaitingConfig,
@@ -62,7 +62,7 @@ from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.io.send_config import CacheConfig, DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.io.session import Session
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from .exceptions import (
     LocationParseError,

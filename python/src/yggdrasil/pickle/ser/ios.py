@@ -245,9 +245,9 @@ def _decode_media_type(metadata: Mapping[bytes, bytes] | None):
     raw = metadata.get(_M_MT)
     if raw is None:
         return None
-    from yggdrasil.data.enums.codec import Codec
-    from yggdrasil.data.enums.media_type import MediaType
-    from yggdrasil.data.enums.mime_type import MimeType
+    from yggdrasil.enums.codec import Codec
+    from yggdrasil.enums.media_type import MediaType
+    from yggdrasil.enums.mime_type import MimeType
 
     text = raw.decode("utf-8")
     if "+" in text:

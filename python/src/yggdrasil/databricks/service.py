@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC
 from typing import Any, ClassVar, Optional, TYPE_CHECKING, TypeVar
 
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from .client import DatabricksClient
 

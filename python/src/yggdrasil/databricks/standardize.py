@@ -36,7 +36,7 @@ Public surface:
   ``(name, name_currency, name_eur, name_usd, name_chf)``
   triplet/quintuplet a curated/dash table should ship with.
 
-The unit-conversion math comes from :mod:`yggdrasil.data.enums.units`;
+The unit-conversion math comes from :mod:`yggdrasil.enums.units`;
 currency conversion from :class:`yggdrasil.fxrate.FxRate`. The
 schema-field builder routes through :func:`yggdrasil.data.field` so
 the resulting columns flow through the same DDL / Spark / Arrow
@@ -48,8 +48,8 @@ import datetime as _dt
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence, Union
 
-from yggdrasil.data.enums.currency import Currency
-from yggdrasil.data.enums.units import Unit, unit_family_for
+from yggdrasil.enums.currency import Currency
+from yggdrasil.enums.units import Unit, unit_family_for
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import polars as pl
@@ -776,7 +776,7 @@ def dash_dual_value_fields(
 
         from yggdrasil.data import Schema
         from yggdrasil.databricks.standardize import dash_dual_value_fields
-        from yggdrasil.data.enums.units import EnergyUnit
+        from yggdrasil.enums.units import EnergyUnit
 
         Schema.from_fields([
             *dash_dual_value_fields("price", target=Currency.EUR, currency=True),

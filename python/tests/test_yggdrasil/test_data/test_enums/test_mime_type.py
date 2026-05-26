@@ -1,4 +1,4 @@
-"""Behavior tests for :class:`yggdrasil.data.enums.mime_type.MimeType`.
+"""Behavior tests for :class:`yggdrasil.enums.mime_type.MimeType`.
 
 Covers the practical entry points that the rest of the library calls:
 
@@ -17,7 +17,7 @@ import io
 
 import pytest
 
-from yggdrasil.data.enums.mime_type import MimeType, MimeTypes
+from yggdrasil.enums.mime_type import MimeType, MimeTypes
 
 
 class TestRegistryConstants:

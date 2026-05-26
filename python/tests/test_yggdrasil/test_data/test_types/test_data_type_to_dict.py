@@ -85,7 +85,7 @@ class TestPrimitiveDictRoundTrip(unittest.TestCase):
         self.assertEqual(restored.unit, "us")
 
     def test_timestamp_naive_preserves_none_tz(self) -> None:
-        from yggdrasil.data.enums.timezone import Timezone
+        from yggdrasil.enums.timezone import Timezone
 
         restored = DataType.from_dict(TimestampType(tz=None, unit="us").to_dict())
 

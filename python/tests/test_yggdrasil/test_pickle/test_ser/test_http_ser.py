@@ -425,8 +425,8 @@ class TestResponseRoundTrip:
         """
         from yggdrasil.io.holder import Holder
         from yggdrasil.io.primitive import JSONFile
-        from yggdrasil.data.enums.media_type import MediaType
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.media_type import MediaType
+        from yggdrasil.enums.mime_type import MimeTypes
 
         req = _make_request()
         buf = BytesIO(b'{"x":1}', media_type=MediaType(MimeTypes.JSON))

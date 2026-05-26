@@ -23,7 +23,7 @@ a :class:`datetime`, epoch seconds, ``"now"`` / ``"utcnow"``, all
 parse uniformly. Naive datetimes are read as UTC.
 
 Geography enrichment routes through
-:class:`yggdrasil.data.enums.geozone.GeoZoneCatalog` — the same
+:class:`yggdrasil.enums.geozone.GeoZoneCatalog` — the same
 catalog every other yggdrasil module uses for country/region
 lookup. ``geo=True`` triggers a lazy one-time fetch of the country
 catalog (cached for the rest of the process), then joins per
@@ -47,15 +47,15 @@ from typing import (
 )
 
 from yggdrasil.data.cast import convert
-from yggdrasil.data.enums.currency import Currency
+from yggdrasil.enums.currency import Currency
 from yggdrasil.http_.session import HTTPSession
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from .backends import Backend, BackendError, DEFAULT_BACKENDS
 
 if TYPE_CHECKING:
     import polars as pl
-    from yggdrasil.data.enums.geozone import GeoZone, GeoZoneCatalog
+    from yggdrasil.enums.geozone import GeoZone, GeoZoneCatalog
 
 
 __all__ = [
@@ -259,7 +259,7 @@ def _currency_geo_catalog() -> "GeoZoneCatalog | None":
         if _GEO_CATALOG_FAILED:
             return None
         try:
-            from yggdrasil.data.enums.geozone import load_geozones
+            from yggdrasil.enums.geozone import load_geozones
             _GEO_CATALOG = load_geozones(include_countries=True)
         except Exception as exc:
             LOGGER.warning(
@@ -267,7 +267,7 @@ def _currency_geo_catalog() -> "GeoZoneCatalog | None":
                 "to the default catalog (sparse coverage).", exc,
             )
             try:
-                from yggdrasil.data.enums.geozone import load_geozones
+                from yggdrasil.enums.geozone import load_geozones
                 _GEO_CATALOG = load_geozones()
             except Exception:
                 _GEO_CATALOG_FAILED = True
@@ -426,7 +426,7 @@ class FxRate(HTTPSession):
                 every free public source publishes at.
             geo: When ``True``, splice in
                 ``source_country_iso / lat / lon`` + target equivalents
-                via :class:`yggdrasil.data.enums.geozone.GeoZoneCatalog`.
+                via :class:`yggdrasil.enums.geozone.GeoZoneCatalog`.
                 Triggers a one-time country-catalog fetch the first
                 time this argument is set in the process.
             lazy: Return a :class:`polars.LazyFrame` instead of an

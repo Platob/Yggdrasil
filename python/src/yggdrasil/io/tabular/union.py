@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Tuple
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.io.tabular.base import Tabular

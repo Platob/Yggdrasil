@@ -720,7 +720,7 @@ class TestMerge:
         assert merged.tz in {"UTC", "Europe/Paris"}
 
     def test_tz_unification_conflict_downcast_drops(self) -> None:
-        from yggdrasil.data.enums.timezone import Timezone
+        from yggdrasil.enums.timezone import Timezone
 
         merged = TimestampType(tz="UTC")._merge_with_same_id(
             TimestampType(tz="Europe/Paris"), downcast=True

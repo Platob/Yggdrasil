@@ -17,7 +17,7 @@ from yggdrasil.io.primitive.xlsx_file import XLSXFile
 class TestRegistration:
 
     def test_class_for_media_type(self) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         assert Holder.class_for_media_type(MimeTypes.XLSX) is XLSXFile
 

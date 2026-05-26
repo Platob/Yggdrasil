@@ -15,7 +15,7 @@ from decimal import Decimal
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import ClassVar, Generic, Mapping
 
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from yggdrasil.pickle.ser.serialized import Serialized, T
 from yggdrasil.pickle.ser.tags import Tags
 
