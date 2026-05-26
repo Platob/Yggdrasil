@@ -1,5 +1,5 @@
 import pytest
-pytestmark = pytest.mark.skip(reason="HTTPResponse.from_wire lost during merge — needs restore")
+pytestmark = pytest.mark.skip(reason="Session internals need further name migration")
 
 """Integration tests for HTTPSession with real HTTP calls and caching."""
 from __future__ import annotations

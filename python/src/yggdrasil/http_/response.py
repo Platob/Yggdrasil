@@ -1479,85 +1479,6 @@ class HTTPResponse(IO):  # IO inherits Tabular
 # instead of falling back to the generic polars path.
 # ---------------------------------------------------------------------------
 
-from yggdrasil.arrow import cast as _arrow_cast  # noqa: E402
-from yggdrasil.arrow.cast import cast_arrow_tabular  # noqa: E402
-from yggdrasil.data.cast.registry import _any_registry  # noqa: E402
-
-
-_original_any_to_arrow_table = _arrow_cast.any_to_arrow_table
-_original_any_to_arrow_record_batch = _arrow_cast.any_to_arrow_record_batch
-
-
-def _any_to_arrow_table_with_response(obj, options=None):
-    if isinstance(obj, Response):
-        return cast_arrow_tabular(obj.to_arrow_table(parse=False), options)
-    return _original_any_to_arrow_table(obj, options)
-
-
-def _any_to_arrow_record_batch_with_response(obj, options=None):
-    if isinstance(obj, Response):
-        return cast_arrow_tabular(obj.to_arrow_batch(parse=False), options)
-    return _original_any_to_arrow_record_batch(obj, options)
-
-
-_any_registry[pa.Table] = _any_to_arrow_table_with_response
-_any_registry[pa.RecordBatch] = _any_to_arrow_record_batch_with_response
-
-
-class _DecodingReader:
-    """Wraps a chunked source iterator and decodes gzip/deflate on the fly.
-
-    The :class:`MemoryStream` backing every :class:`HTTPResponse` body
-    binds this reader's ``.read`` callable as its source. Each pull
-    feeds the next decoded chunk into the stream — no separate buffer,
-    no second copy.
-    """
-
-    def __init__(self, raw_read, content_encoding: Optional[str]) -> None:
-        self._raw_read = raw_read
-        self._encoding = (content_encoding or "").lower()
-        self._decoder: Any = None
-        if self._encoding in ("gzip", "x-gzip"):
-            self._decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        elif self._encoding == "deflate":
-            self._decoder = zlib.decompressobj()
-
-    def read(self, amt: Optional[int] = None) -> bytes:
-        chunk = self._raw_read(amt) if amt is not None else self._raw_read()
-        if not chunk:
-            if self._decoder is not None:
-                tail = self._decoder.flush()
-                self._decoder = None
-                return tail
-            return b""
-        if self._decoder is not None:
-            return self._decoder.decompress(chunk)
-        return chunk
-
-    """HTTP-shaped :class:`Response` that IS an IO cursor over its buffer.
-
-    Single access point for every HTTP response in yggdrasil: the
-    high-level :class:`Response` / :class:`Tabular` surface (status,
-    headers, tags, request, parse / Arrow / pickle projections, the
-    cache pipeline) plus the
-    :class:`yggdrasil.io.holder.IO` cursor surface (``read(n)`` /
-    ``seek`` / ``tell`` / :func:`pa.input_stream` compatibility) on
-    one object. ``self.buffer`` is a
-    :class:`~yggdrasil.io.memory_stream.MemoryStream`: in the
-    network-fetched shape it lazily pulls decoded bytes from the
-    underlying socket through a :class:`_DecodingReader`; in the
-    parsed-from-record shape the source is the pre-collected bytes.
-
-    Connection-lifecycle methods (:meth:`release_conn` /
-    :meth:`drain_conn` / :attr:`status`) keep the urllib3-shaped
-    surface that warehouse-style streaming consumers depend on so
-    HTTPSession itself plays the role :class:`PoolManager` used to fill.
-
-    :class:`Response` runs without ``__slots__`` so this mix-in compiles
-    (slot-backed bases on both sides of MI raise "multiple bases have
-    instance lay-out conflict" :class:`TypeError`).
-    """
-
     # No URL-routable scheme — the response's URL is sourced from the
     # bound :class:`HTTPRequest`, not the class-level scheme
     # registry. Keeping it ``None`` also bypasses the
@@ -1867,3 +1788,66 @@ class _DecodingReader:
         )
 
 
+
+
+
+from yggdrasil.arrow import cast as _arrow_cast  # noqa: E402
+from yggdrasil.arrow.cast import cast_arrow_tabular  # noqa: E402
+from yggdrasil.data.cast.registry import _any_registry  # noqa: E402
+
+
+_original_any_to_arrow_table = _arrow_cast.any_to_arrow_table
+_original_any_to_arrow_record_batch = _arrow_cast.any_to_arrow_record_batch
+
+
+def _any_to_arrow_table_with_response(obj, options=None):
+    if isinstance(obj, Response):
+        return cast_arrow_tabular(obj.to_arrow_table(parse=False), options)
+    return _original_any_to_arrow_table(obj, options)
+
+
+def _any_to_arrow_record_batch_with_response(obj, options=None):
+    if isinstance(obj, Response):
+        return cast_arrow_tabular(obj.to_arrow_batch(parse=False), options)
+    return _original_any_to_arrow_record_batch(obj, options)
+
+
+_any_registry[pa.Table] = _any_to_arrow_table_with_response
+_any_registry[pa.RecordBatch] = _any_to_arrow_record_batch_with_response
+
+
+
+
+class _DecodingReader:
+    """Wraps a chunked source iterator and decodes gzip/deflate on the fly.
+
+    The :class:`MemoryStream` backing every :class:`HTTPResponse` body
+    binds this reader's ``.read`` callable as its source. Each pull
+    feeds the next decoded chunk into the stream — no separate buffer,
+    no second copy.
+    """
+
+    def __init__(self, raw_read, content_encoding: Optional[str]) -> None:
+        self._raw_read = raw_read
+        self._encoding = (content_encoding or "").lower()
+        self._decoder: Any = None
+        if self._encoding in ("gzip", "x-gzip"):
+            self._decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        elif self._encoding == "deflate":
+            self._decoder = zlib.decompressobj()
+
+    def read(self, amt: Optional[int] = None) -> bytes:
+        chunk = self._raw_read(amt) if amt is not None else self._raw_read()
+        if not chunk:
+            if self._decoder is not None:
+                tail = self._decoder.flush()
+                self._decoder = None
+                return tail
+            return b""
+        if self._decoder is not None:
+            return self._decoder.decompress(chunk)
+        return chunk
+
+
+
+Response = HTTPResponse
