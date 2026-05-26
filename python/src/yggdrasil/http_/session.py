@@ -1793,7 +1793,7 @@ class HTTPSession(Session):
                     ordered=ordered, max_in_flight=max_in_flight,
                 )
                 total_cache_hits += len(reqs) - len(batch.misses)
-                total_network += batch.counts.get("new", 0)
+                total_network += batch.new_tabular.count() if batch.new_tabular else 0
                 total_failed += batch.failed_count
                 total_ignored += batch.ignored_count
                 yield batch
