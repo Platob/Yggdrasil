@@ -6,6 +6,7 @@ import pathlib
 from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
 
 from yggdrasil.execution.expr import Predicate
+from yggdrasil.data.cast.datetime import truncate_datetime
 from yggdrasil.enums import Mode
 
 if TYPE_CHECKING:

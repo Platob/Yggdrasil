@@ -17,7 +17,7 @@ from yggdrasil.data import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.response import HTTPResponse
-from yggdrasil.http_.schemas import RESPONSE_SCHEMA
+from yggdrasil.http_.schemas import REQUEST_SCHEMA, RESPONSE_SCHEMA
 from yggdrasil.http_.cache_config import CacheConfig, MATCH_KEY
 from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.io.tabular import ArrowTabular
@@ -266,8 +266,8 @@ class HTTPResponseBatch(Tabular):
             err_df = result_df.where(
                 (F.col("status_code") < 200) | (F.col("status_code") >= 400)
             )
-            if len(err_table) > 0:
-                self.failed = err_table
+            if err_df.count() > 0:
+                self._failed = err_df
             write_data = ok_df
 
         self.new_tabular = result_df
