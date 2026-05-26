@@ -595,17 +595,40 @@ class TestSparkBatchHolders:
 
 class TestSparkHolderTypes:
 
-    def test_spark_batch_holders_are_tabular(self, base_url, spark):
-        from yggdrasil.io.tabular.base import Tabular
+    def test_spark_batch_new_tabular_is_spark_dataset(self, base_url, spark):
+        from yggdrasil.spark.tabular import SparkDataset
         session = HTTPSession(base_url=base_url)
         reqs = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_type_a")]
         for r in reqs:
             r.send_config = SendConfig()
         batches = list(session.send_many_batches(reqs, spark_session=spark))
-        for holder in batches[0]._holders():
-            assert isinstance(holder, Tabular)
+        tab = batches[0].new_tabular
+        assert tab is not None
+        assert isinstance(tab, SparkDataset)
 
-    def test_spark_batch_new_tabular_readable_as_arrow(self, base_url, spark):
+    def test_spark_batch_holders_are_spark_dataset(self, base_url, spark):
+        from yggdrasil.spark.tabular import SparkDataset
+        session = HTTPSession(base_url=base_url)
+        reqs = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_type_b")]
+        for r in reqs:
+            r.send_config = SendConfig()
+        batches = list(session.send_many_batches(reqs, spark_session=spark))
+        for holder in batches[0]._holders():
+            assert isinstance(holder, SparkDataset)
+
+    def test_spark_dataset_has_spark_frame(self, base_url, spark):
+        from pyspark.sql import DataFrame
+        from yggdrasil.spark.tabular import SparkDataset
+        session = HTTPSession(base_url=base_url)
+        reqs = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_type_frame")]
+        for r in reqs:
+            r.send_config = SendConfig()
+        batches = list(session.send_many_batches(reqs, spark_session=spark))
+        tab = batches[0].new_tabular
+        assert isinstance(tab, SparkDataset)
+        assert isinstance(tab.frame, DataFrame)
+
+    def test_spark_dataset_readable_as_arrow(self, base_url, spark):
         import pyarrow as pa
         session = HTTPSession(base_url=base_url)
         reqs = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_type_arrow")]
@@ -613,25 +636,25 @@ class TestSparkHolderTypes:
             r.send_config = SendConfig()
         batches = list(session.send_many_batches(reqs, spark_session=spark))
         tab = batches[0].new_tabular
-        assert tab is not None
         table = tab.read_arrow_table()
         assert isinstance(table, pa.Table)
         assert table.num_rows >= 1
 
-    def test_spark_cached_holder_is_tabular(self, base_url, spark, local_cache_dir):
-        from yggdrasil.io.tabular.base import Tabular
+    def test_spark_cached_data_persists_in_folder(self, base_url, spark, local_cache_dir):
         session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
 
-        reqs_warm = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_type_cached")]
-        for r in reqs_warm:
+        reqs = [HTTPRequest.prepare(method="GET", url=f"{base_url}/sp_type_cached")]
+        for r in reqs:
             r.send_config = SendConfig(local_cache=cache)
-        list(session.send_many(reqs_warm, spark_session=spark))
+        list(session.send_many(reqs, spark_session=spark))
 
-        table = _folder(local_cache_dir).read_arrow_table()
-        assert table.num_rows >= 1
+        import pyarrow as pa
+        batches = list(_folder(local_cache_dir).read_arrow_batches())
+        total = sum(b.num_rows for b in batches)
+        assert total >= 1
 
-    def test_spark_batch_read_produces_valid_arrow_schema(self, base_url, spark):
+    def test_spark_batch_schema_matches_response_schema(self, base_url, spark):
         from yggdrasil.http_.schemas import RESPONSE_SCHEMA
         session = HTTPSession(base_url=base_url)
         reqs = [

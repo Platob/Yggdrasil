@@ -21,7 +21,7 @@ from yggdrasil.http_.schemas import REQUEST_SCHEMA, RESPONSE_SCHEMA
 from yggdrasil.http_.cache_config import CacheConfig, MATCH_KEY
 from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.io.tabular import ArrowTabular
-from yggdrasil.arrow.tabular import ArrowTabular as Dataset
+from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.io.tabular.base import Tabular
 
 if TYPE_CHECKING:
@@ -69,7 +69,8 @@ def _to_tabular(data) -> "Tabular | None":
     if isinstance(data, Tabular):
         return data
     if hasattr(data, "toArrow") or hasattr(data, "toPandas"):
-        return Dataset(data)
+        from yggdrasil.spark.tabular import SparkDataset
+        return SparkDataset(data)
     return None
 
 
@@ -277,7 +278,7 @@ class HTTPResponseBatch(Tabular):
         self,
         misses: "list[HTTPRequest]",
         spark: "SparkSession",
-    ) -> "Dataset":
+    ) -> "Tabular":
         """Scatter misses to Spark workers via mapInArrow."""
         session = self._session
         cfg = self._send_config
@@ -433,7 +434,11 @@ class HTTPResponseBatch(Tabular):
 
     @property
     def is_spark(self) -> bool:
-        return any(isinstance(h, Dataset) for h in self._holders())
+        try:
+            from yggdrasil.spark.tabular import SparkDataset
+            return any(isinstance(h, SparkDataset) for h in self._holders())
+        except ImportError:
+            return False
 
     # ------------------------------------------------------------------
     # Tabular implementation
