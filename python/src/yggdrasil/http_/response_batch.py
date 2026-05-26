@@ -225,27 +225,33 @@ class HTTPResponseBatch(Tabular):
         ok_list: list[HTTPResponse] = []
         all_list: list[HTTPResponse] = []
         err_list: list[HTTPResponse] = []
+        ignored: list[HTTPResponse] = []
         for response in self._session._fetch_misses(
             misses, ordered=ordered, max_in_flight=max_in_flight,
         ):
             all_list.append(response)
             if response.ok:
                 ok_list.append(response)
-            else:
+            elif cfg.raise_error:
                 err_list.append(response)
+            else:
+                ignored.append(response)
         if err_list:
-            if cfg.raise_error:
-                self.failed = err_list
-            for r in err_list:
-                LOGGER.warning(
-                    "%s %s returned %d",
-                    r.request.method, r.request.url, r.status_code,
-                )
+            self.failed = err_list
+        for r in err_list:
+            LOGGER.warning(
+                "%s %s failed %d (%d bytes)",
+                r.request.method, r.request.url, r.status_code, r.body_size,
+            )
+        for r in ignored:
+            LOGGER.warning(
+                "%s %s ignored %d (%d bytes, raise_error=False)",
+                r.request.method, r.request.url, r.status_code, r.body_size,
+            )
 
         LOGGER.info(
-            "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-            len(ok_list), len(misses),
-            len(ok_list), len(err_list),
+            "Fetched %d miss(es): ok=%d, failed=%d, ignored=%d",
+            len(misses), len(ok_list), len(err_list), len(ignored),
         )
 
         if all_list:
