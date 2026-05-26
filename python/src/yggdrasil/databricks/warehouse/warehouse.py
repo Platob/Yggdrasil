@@ -7,33 +7,13 @@ wrapper around a single Databricks SQL Warehouse that provides:
 - property-based status checks (running, pending, serverless)
 - lifecycle helpers: start, stop, delete, wait_for_status
 - configuration updates and permission management
-- SQL statement execution
+- SQL statement execution via :meth:`execute` / :meth:`send`
 
-Executor contract
------------------
-:class:`SQLWarehouse` is a concrete :class:`StatementExecutor` —
 ``_submit_statement`` reads typed warehouse fields off
 :class:`WarehousePreparedStatement` and submits via the SDK.  If the SDK
-call fails (``DeadlineExceeded`` on a cold/busy warehouse, transport
-errors, etc.) the exception propagates — there is no submission-level
-retry layer.
-
-Execution policy travels through :class:`DatabricksExecutionOptions`
-(``wait``, ``raise_error``, ``parallel`` from the base, plus
-``external_data``, ``external_volume_paths``).  The base
-:meth:`StatementExecutor._execute` hook handles submit + wait/raise; this
-subclass overrides it to stage external data first and merge volume
-paths onto the statement.
-
-Result-level retry
-------------------
-:meth:`StatementResult.retry` is opt-in by setting ``statement.retry``
-to a :class:`WaitingConfig`.  After a *terminal-failure* result
-(statement_id was issued, query ran, query failed), it drives
-:meth:`StatementResult.start` ``reset=True`` per attempt with backoff
-driven by the WaitingConfig.  Used for genuinely flaky queries, not for
-warehouse availability — that's the caller's responsibility now that
-submission-level retry is gone.
+call fails the exception propagates — there is no submission-level
+retry layer.  Result-level retry for queries that ran and failed is
+still available via :meth:`DatabricksSQL.retry`.
 
 Collection-level operations (listing, finding, creating warehouses) live
 in the companion :mod:`~yggdrasil.databricks.sql.service` module.
@@ -44,8 +24,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, replace
-from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
+from typing import Any, ClassVar, Iterable, List, Mapping, Optional, Union, TYPE_CHECKING
 
 from yggdrasil.http_.exceptions import (
     exceptions as _http_exceptions,
@@ -64,7 +43,6 @@ from databricks.sdk.service.sql import (
 )
 
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.data.executor import ExecutionOptions, StatementExecutor
 from yggdrasil.databricks.warehouse.wh_utils import (
     _EDIT_ARG_NAMES,
     indexed_name_parts,
@@ -75,8 +53,9 @@ from yggdrasil.databricks.warehouse.wh_utils import (
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.pyutils.equality import dicts_equal
 from .statement import (
+    DatabricksSQL,
+    ExternalStatementData,
     WarehousePreparedStatement,
-    WarehouseStatementResult,
     WarehouseStatementBatch,
 )
 from ..client import DatabricksResource
@@ -89,53 +68,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "SQLWarehouse",
-    "DatabricksExecutionOptions",
 ]
 
 LOGGER = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# DatabricksExecutionOptions
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class DatabricksExecutionOptions(ExecutionOptions):
-    """Databricks-specific :class:`ExecutionOptions`.
-
-    Adds two knobs on top of the base contract:
-
-    external_data
-        ``{alias: tabular-or-VolumePath}``.  Tabular values are staged to
-        Parquet on a fresh :class:`VolumePath`; existing volumes pass
-        through.  Aliases used as ``{alias}`` in statement text.
-    external_volume_paths
-        ``{alias: VolumePath}``.  Already-staged volumes — same alias
-        space as ``external_data``.  Use this when callers stage their
-        own data and want to reuse the volume across calls.
-
-    Stage / volume merge precedence (lowest → highest):
-    statement's existing ``external_volume_paths`` <
-    ``external_volume_paths`` from options <
-    ``external_data`` (just-staged) from options.  This matches the
-    "I just told you to stage this; use it" intent.
-    """
-
-    external_data: Optional[Mapping[str, Any]] = None
-    external_volume_paths: Optional[Mapping[str, VolumePath]] = None
-
-    def with_external_data(
-        self,
-        external_data: Optional[Mapping[str, Any]],
-    ) -> "DatabricksExecutionOptions":
-        return replace(self, external_data=external_data)
-
-    def with_external_volume_paths(
-        self,
-        external_volume_paths: Optional[Mapping[str, VolumePath]],
-    ) -> "DatabricksExecutionOptions":
-        return replace(self, external_volume_paths=external_volume_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +78,7 @@ class DatabricksExecutionOptions(ExecutionOptions):
 # ---------------------------------------------------------------------------
 
 
-class SQLWarehouse(
-    DatabricksResource,
-    StatementExecutor[
-        WarehousePreparedStatement,
-        WarehouseStatementResult,
-        WarehouseStatementBatch,
-    ],
-):
+class SQLWarehouse(DatabricksResource):
     """High-level Databricks SQL Warehouse resource and statement executor.
 
     Parameters
@@ -174,12 +102,6 @@ class SQLWarehouse(
     external-link connection pool — across every ``client.warehouses[id]``
     or ``Warehouses.find_warehouse(...)`` lookup.
     """
-
-    # Pin concrete types so base coercion + result construction produce
-    # the right subclasses.
-    _PREPARED_CLASS: ClassVar[type[WarehousePreparedStatement]] = WarehousePreparedStatement
-    _RESPONSE_CLASS: ClassVar[type[WarehouseStatementResult]] = WarehouseStatementResult
-    _BATCH_CLASS: ClassVar[type[WarehouseStatementBatch]] = WarehouseStatementBatch
 
     # Process-lifetime caching — warehouses are heavyweight (cached
     # ``EndpointInfo``, HTTP pool); we want the same id under the
@@ -310,7 +232,7 @@ class SQLWarehouse(
         egress path.
 
         Built lazily on the first ``EXTERNAL_LINKS`` chunk read and
-        reused across every :class:`WarehouseStatementResult` attached
+        reused across every :class:`DatabricksSQL` attached
         to this warehouse. ``max_workers`` is a sizing *hint* applied
         only on the first call; subsequent callers get the existing
         session regardless of what they pass.
@@ -666,60 +588,51 @@ class SQLWarehouse(
         return Warehouses.check_permission(permission)
 
     # ------------------------------------------------------------------
-    # SQL execution — executor contract
+    # SQL execution
     # ------------------------------------------------------------------
 
-    def _execute(
+    def send(
         self,
-        statement: WarehousePreparedStatement,
-        options: ExecutionOptions,
-        start: bool = True
-    ) -> WarehouseStatementResult:
-        """Stage external data and forward to the base ``_execute``.
+        statement: "WarehousePreparedStatement | str",
+        start: bool = True,
+    ) -> DatabricksSQL:
+        """Coerce and submit a statement. Returns a :class:`DatabricksSQL`.
 
-        :class:`DatabricksExecutionOptions` carries Databricks-specific
-        staging instructions; their effect is purely to mutate the
-        statement before submission.  Plain :class:`ExecutionOptions` are
-        accepted — they just skip the staging step.
+        ``start=False`` returns an unstarted result — useful when batching
+        or when the caller wants to control the submission separately.
         """
-        if isinstance(options, DatabricksExecutionOptions):
-            statement = self._apply_databricks_options(statement, options)
-        return super()._execute(statement, options, start=start)
+        prepared = WarehousePreparedStatement.from_(statement)
+        return self._submit_statement(prepared, start=start)
 
-    def _apply_databricks_options(
+    def prepare(
         self,
-        statement: WarehousePreparedStatement,
-        options: DatabricksExecutionOptions,
+        statement: "WarehousePreparedStatement | str",
     ) -> WarehousePreparedStatement:
-        """Bake Databricks-specific options into the statement.
+        """Coerce *statement* to a :class:`WarehousePreparedStatement`."""
+        return WarehousePreparedStatement.from_(statement)
 
-        - ``external_data`` is staged to fresh Parquet volumes.
-        - ``external_volume_paths`` is merged onto the statement.
-
-        Merge precedence on alias collisions (lowest → highest): existing
-        statement paths < ``options.external_volume_paths`` < just-staged.
-        """
-        staged = WarehousePreparedStatement.check_external_data(
-            options.external_data,
-            client=self.client,
-            catalog_name=statement.catalog_name,
-            schema_name=statement.schema_name,
+    def execute_many(
+        self,
+        statements: "Iterable[str | WarehousePreparedStatement]",
+        *,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        parallel: Optional[int] = None,
+    ) -> WarehouseStatementBatch:
+        """Submit a collection of statements as a batch."""
+        batch = WarehouseStatementBatch(
+            executor=self,
+            statements=statements,
+            parallel=parallel or 1,
         )
-
-        if staged or options.external_volume_paths:
-            merged: dict[str, VolumePath] = dict(statement.external_volume_paths or {})
-            if options.external_volume_paths:
-                merged.update(options.external_volume_paths)
-            merged.update(staged)
-            statement.external_volume_paths = merged or None
-
-        return statement
+        batch.wait(wait=wait, raise_error=raise_error)
+        return batch
 
     def _submit_statement(
         self,
         statement: WarehousePreparedStatement,
         start: bool = True
-    ) -> WarehouseStatementResult:
+    ) -> DatabricksSQL:
         """Submit ``statement`` via the SDK.
 
         Reads typed routing fields directly off the statement and hands
@@ -745,7 +658,7 @@ class SQLWarehouse(
 
         sdk_client = self.client.workspace_client().statement_execution
 
-        result = WarehouseStatementResult(
+        result = DatabricksSQL(
             executor=self,
             statement=statement,
         )
@@ -802,13 +715,12 @@ class SQLWarehouse(
 
     def execute(
         self,
-        statement: "str | WarehousePreparedStatement | WarehouseStatementResult | None" = None,
+        statement: "str | WarehousePreparedStatement | DatabricksSQL | None" = None,
         *,
-        options: Optional[DatabricksExecutionOptions] = None,
         # Routing
         warehouse_id: str | None = None,
         warehouse_name: str | None = None,
-        # Per-statement config (forwarded to PreparedStatement.prepare)
+        # Per-statement config
         byte_limit: int | None = None,
         disposition: Optional[Disposition] = None,
         format: Optional[Format] = None,
@@ -816,37 +728,26 @@ class SQLWarehouse(
         row_limit: int | None = None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
-        # External data — also exposable via DatabricksExecutionOptions
+        # External data
         external_data: Optional[Mapping[str, Any]] = None,
         external_volume_paths: Optional[Mapping[str, VolumePath]] = None,
         # Execution policy
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> WarehouseStatementResult:
+    ) -> DatabricksSQL:
         """Execute a SQL statement on this (or another) warehouse.
 
-        Three ways to control execution policy:
-
-        1. Per-call kwargs (``wait``, ``raise_error``, ``external_data``,
-           ``external_volume_paths``, ``retry``) — ergonomic, the default
-           API.
-        2. ``options=DatabricksExecutionOptions(...)`` — when the same
-           policy is reused across many calls.
-        3. Both — kwargs override fields they explicitly set.
-
-        Already-started results (those carrying a ``statement_id``) are
-        returned with a ``wait()`` rather than re-submitted.
+        Already-started results are returned with a ``wait()`` rather
+        than re-submitted.
 
         ``warehouse_id`` / ``warehouse_name`` redirect submission to a
         different warehouse — kept for back-compat with callers that use
         one warehouse handle as a dispatcher.
 
-        ``retry`` configures the *result-level* retry — what
-        :meth:`StatementResult.retry` will do if the caller invokes it
-        after a terminal failure.  Submission failures (cold/busy
-        warehouse ``DeadlineExceeded``, transport errors, …) propagate
-        directly — there's no submission-level retry layer.
+        ``retry`` configures the *result-level* retry. Submission
+        failures propagate directly — there's no submission-level retry
+        layer.
         """
         # Cross-warehouse redirect: resolve and delegate.
         if (warehouse_id and warehouse_id != self.warehouse_id) or (
@@ -857,7 +758,6 @@ class SQLWarehouse(
             )
             return other.execute(
                 statement=statement,
-                options=options,
                 byte_limit=byte_limit,
                 disposition=disposition,
                 format=format,
@@ -873,13 +773,12 @@ class SQLWarehouse(
             )
 
         # Already-started result: just wait.
-        if isinstance(statement, WarehouseStatementResult) and statement.started:
+        if isinstance(statement, DatabricksSQL) and statement.started:
             return statement.wait(wait=wait, raise_error=raise_error)
 
-        # Coerce + bind onto a typed PreparedStatement.  prepare() handles
-        # parameters, format/disposition defaults, and the staging+merge
-        # of external_data / external_volume_paths in one shot.  ``retry``
-        # is forwarded — None means "don't override" inside prepare().
+        # Coerce + bind. prepare() handles parameters, format/disposition
+        # defaults, and the staging+merge of external_data /
+        # external_volume_paths in one shot.
         prepared = WarehousePreparedStatement.prepare(
             statement if statement is not None else "",
             client=self.client,
@@ -895,46 +794,9 @@ class SQLWarehouse(
             retry=retry,
         )
 
-        opts = self._build_options(
-            options,
-            wait=wait,
-            raise_error=raise_error,
-        )
-
-        # Hand off to base lifecycle: _execute (overridden above) stages
-        # any extra external data, then calls _submit_statement and
-        # applies wait / raise_error.
-        coerced = self.prepare(prepared)
-        return self._execute(coerced, opts)
-
-    def _build_options(
-        self,
-        options: Optional[DatabricksExecutionOptions],
-        *,
-        wait: WaitingConfigArg,
-        raise_error: bool,
-    ) -> ExecutionOptions:
-        """Merge per-call kwargs onto a base options object."""
-        if options is None:
-            if wait is True and raise_error is True:
-                # Cheapest path — skip the dataclass construction.
-                return ExecutionOptions()
-            return DatabricksExecutionOptions(
-                wait=wait,
-                raise_error=raise_error,
-            )
-
-        # Diff against defaults so passing the kwarg defaults doesn't
-        # clobber options' fields.
-        defaults = DatabricksExecutionOptions()
-        overrides: dict[str, Any] = {}
-        if wait != defaults.wait:
-            overrides["wait"] = wait
-        if raise_error != defaults.raise_error:
-            overrides["raise_error"] = raise_error
-        if not overrides:
-            return options
-        return replace(options, **overrides)
+        result = self._submit_statement(prepared)
+        result.wait(wait=wait, raise_error=raise_error)
+        return result
 
 
 

@@ -1,20 +1,16 @@
 """
 Databricks SQL engine utilities.
 
-A thin execution and table-management layer over two inner
-:class:`StatementExecutor` instances, composed via *has-a*:
+A thin execution and table-management layer that routes SQL through
+either:
 
-- :class:`SparkStatementExecutor` (held on ``spark``) — used when a
-  :class:`pyspark.sql.SparkSession` is reachable. Defaults to a
-  :class:`DatabricksSparkStatementExecutor` so a missing session is
-  built via :meth:`DatabricksClient.spark` (Databricks Connect).
-- :class:`SQLWarehouse` (resolved via :meth:`warehouse`) — the Databricks
-  SQL warehouse API path.
+- The Spark session (via :class:`SparkSQL`) when a
+  :class:`pyspark.sql.SparkSession` is reachable (Databricks Connect).
+- The warehouse API (via :class:`SQLWarehouse`) otherwise.
 
-The engine itself owns no statement logic.  It picks which inner executor
+The engine itself owns no statement logic. It picks which inner path
 handles a given call and delegates statement preparation to
-:meth:`WarehousePreparedStatement.prepare` /
-:meth:`SparkPreparedStatement.from_`.
+:meth:`WarehousePreparedStatement.prepare` / :class:`SparkSQL`.
 
 Insert paths
 ------------
@@ -45,27 +41,20 @@ from typing import (
 import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.executor import StatementExecutor
 from yggdrasil.io.tabular import Tabular
 from yggdrasil.execution.expr import Predicate
-from yggdrasil.data.statement import (
-    ExternalStatementData,
-    PreparedStatement,
-    StatementResult,
-    StatementBatch,
-)
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.warehouse import (
+    DatabricksSQL,
+    ExternalStatementData,
     SQLWarehouse,
     WarehousePreparedStatement,
-    WarehouseStatementResult,
+    WarehouseStatementBatch,
 )
 from yggdrasil.databricks.warehouse.wh_utils import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import Mode
-from yggdrasil.spark.executor import SparkStatementExecutor
-from yggdrasil.spark.statement import SparkPreparedStatement, SparkStatementResult
-from .spark_executor import DatabricksSparkStatementExecutor
+from yggdrasil.databricks.sql.sql_utils import looks_like_query
 from yggdrasil.databricks.catalog.catalogs import Catalogs
 from yggdrasil.databricks.schema.schemas import Schemas
 from yggdrasil.databricks.table.table import Table
@@ -98,22 +87,7 @@ def _coerce_external_data_for_spark(
     Mirrors :meth:`WarehousePreparedStatement.check_external_data`'s
     permissiveness — accepts the same value shapes the warehouse path
     does so a single ``external_data=`` argument works in either
-    mode without coercion at the call site:
-
-    - :class:`VolumePath` → text-substituted as
-      ``parquet.\\`<full_path>\\``` (Spark reads parquet by path).
-    - :class:`ExternalStatementData` → passed through (key is taken
-      from the mapping key on collisions).
-    - :class:`Tabular` → bound for temp-view registration at
-      :meth:`SparkStatementResult.start` time.
-    - ``str`` → ``text_value`` only (caller already staged it
-      somewhere; we just substitute).
-    - ``(tabular, text_value)`` tuple → both fields set.
-    - Anything else (``pa.Table``, polars / pandas / pyspark frames,
-      list-of-dicts, ...) → wrapped in :class:`ArrowTabular` so the
-      Spark side has a real :class:`Tabular` to register, matching the
-      warehouse side which would have staged the same value as
-      Parquet.
+    mode without coercion at the call site.
     """
     if not external_data:
         return None
@@ -155,8 +129,7 @@ def _coerce_external_data_for_spark(
             continue
 
         # Raw frame: wrap so the Spark register-views step has a real
-        # :class:`Tabular`. ``any_to_arrow_table`` handles pa.Table,
-        # polars / pandas / pyspark frames, list-of-dicts, etc.
+        # :class:`Tabular`.
         try:
             arrow = any_to_arrow_table(value)
         except Exception as e:
@@ -175,12 +148,7 @@ def _apply_retry_to_warehouse_statement(
     stmt: WarehousePreparedStatement,
     retry: Optional[WaitingConfigArg],
 ) -> None:
-    """Install ``retry`` (a :class:`WaitingConfig` arg) on a warehouse
-    statement, in place.
-
-    ``None`` is a no-op (don't override).  ``False`` clears any existing
-    policy.  Anything else is normalized via :meth:`WaitingConfig.from_`.
-    """
+    """Install ``retry`` on a warehouse statement, in place."""
     if retry is None:
         return
     if retry is False:
@@ -194,32 +162,20 @@ def _apply_retry_to_warehouse_statement(
 # ---------------------------------------------------------------------------
 
 
-class SQLEngine(DatabricksService, StatementExecutor):
+class SQLEngine(DatabricksService):
     """Unified SQL execution and Delta-table write engine for Databricks.
 
-    Composes two inner executors:
+    Routes SQL through two paths:
 
-    - ``spark`` — :class:`SparkStatementExecutor` for Spark-side execution.
-    - the warehouse handle resolved by :meth:`warehouse` —
-      :class:`SQLWarehouse`, also a :class:`StatementExecutor`.
+    - Spark — via :class:`SparkSQL` when a :class:`pyspark.sql.SparkSession`
+      is reachable (Databricks Connect or local).
+    - Warehouse API — via :class:`SQLWarehouse`, the Databricks SQL
+      warehouse HTTP path.
 
-    Routing (:meth:`_pick_engine`): explicit override → caller-supplied
-    session → executor's own session → environment session → fall back to
-    warehouse API.
-
-    Singleton-cached by ``(client, catalog_name, schema_name,
-    default_warehouse)`` so two callers asking for the same scope share
-    the same Spark sub-executor, the same lazy ``default_warehouse``
-    resolution, and the same sub-service caches (catalogs / schemas /
-    tables route through ``self.client``, which is itself singleton-
-    cached). The ``spark`` field doesn't participate in identity —
-    callers that pass a custom Spark executor onto an existing engine
-    re-bind it in place.
+    Routing (:meth:`_pick_engine`): explicit override -> caller-supplied
+    session -> environment session -> fall back to warehouse API.
     """
 
-    # Cache scoped engines for the process lifetime. ``client`` already
-    # carries the workspace identity, so two callers asking for the same
-    # ``(client, catalog, schema)`` collapse to one engine.
     _SINGLETON_TTL: ClassVar[Any] = None
 
     @classmethod
@@ -229,12 +185,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         default_warehouse: Optional[SQLWarehouse] = None,
-        spark: Optional[SparkStatementExecutor] = None,
         **kwargs: Any,
     ) -> Any:
-        # ``spark`` is rebindable; the warehouse is identity-bearing
-        # (different warehouses ⇒ different engine). ``client`` carries
-        # the workspace identity.
         return (cls, client, catalog_name, schema_name, default_warehouse)
 
     def __init__(
@@ -243,7 +195,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         default_warehouse: Optional[SQLWarehouse] = None,
-        spark: Optional[SparkStatementExecutor] = None,
+        **kwargs: Any,
     ):
         if getattr(self, "_initialized", False):
             return
@@ -251,17 +203,29 @@ class SQLEngine(DatabricksService, StatementExecutor):
         self.catalog_name = catalog_name
         self.schema_name = schema_name
         self.default_warehouse = default_warehouse
-        # Default to a Databricks Connect-backed executor so a missing
-        # session is built via ``client.spark()`` rather than PyEnv's
-        # local PySpark bootstrap. Callers that want a custom Spark
-        # backend keep passing ``spark=`` explicitly.
-        self.spark = (
-            spark
-            if spark is not None
-            else DatabricksSparkStatementExecutor(client=self.client)
-        )
         self._last_default_wh_check = 0.0
         self._initialized = True
+
+    # ------------------------------------------------------------------
+    # Spark session helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_spark_session(self, create: bool = False) -> "SparkSession | None":
+        """Try to find an active Spark session."""
+        try:
+            from pyspark.sql import SparkSession as _SS
+            active = _SS.getActiveSession()
+            if active is not None:
+                return active
+            if create:
+                return self.client.spark()
+        except ImportError:
+            pass
+        return None
+
+    def _has_spark_session(self) -> bool:
+        """True if a Spark session is reachable without creating one."""
+        return self._resolve_spark_session(create=False) is not None
 
     # ------------------------------------------------------------------
     # Sub-services
@@ -290,15 +254,13 @@ class SQLEngine(DatabricksService, StatementExecutor):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         warehouse: Optional[SQLWarehouse | str] = None,
-    ) -> Union[SQLEngine, StatementResult]:
-        """Return a re-scoped engine, sharing the same inner Spark executor."""
+    ) -> Union["SQLEngine", DatabricksSQL]:
+        """Return a re-scoped engine or execute a SQL query."""
         if obj is not None:
             catalog_name = catalog_name or self.catalog_name
             schema_name = schema_name or self.schema_name
 
-            if PreparedStatement.looks_like_query(obj) or isinstance(
-                obj, PreparedStatement
-            ):
+            if looks_like_query(obj):
                 return self.execute(
                     obj, catalog_name=catalog_name, schema_name=schema_name
                 )
@@ -322,7 +284,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             catalog_name=catalog_name,
             schema_name=schema_name,
             default_warehouse=warehouse,
-            spark=self.spark,
         )
 
     def warehouse(
@@ -369,36 +330,9 @@ class SQLEngine(DatabricksService, StatementExecutor):
             return explicit
         if spark_session is not None:
             return "spark"
-        if self.spark.has_session():
+        if self._has_spark_session():
             return "spark"
         return "api"
-
-    # ------------------------------------------------------------------
-    # Executor contract — pure delegation
-    # ------------------------------------------------------------------
-
-    def _submit_statement(
-        self,
-        statement: WarehousePreparedStatement | SparkPreparedStatement,
-        start: bool = True,
-    ) -> WarehouseStatementResult | SparkStatementResult:
-        """Dispatch by concrete statement type to the matching inner executor.
-
-        Spark statements go to :attr:`spark`; warehouse statements get
-        routed to whichever warehouse their ``warehouse_id`` /
-        ``warehouse_name`` resolves to.
-        """
-        if isinstance(statement, SparkPreparedStatement):
-            return self.spark.send(statement, start=start)
-
-        if not isinstance(statement, WarehousePreparedStatement):
-            statement = WarehousePreparedStatement.from_(statement)
-
-        wh = self.warehouse(
-            warehouse_id=statement.warehouse_id,
-            warehouse_name=statement.warehouse_name,
-        )
-        return wh.send(statement, start=start)
 
     # ------------------------------------------------------------------
     # Public execution surface
@@ -406,7 +340,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
     def execute(
         self,
-        statement: str | PreparedStatement | StatementResult,
+        statement: "str | WarehousePreparedStatement | DatabricksSQL",
         *,
         row_limit: int | None = None,
         catalog_name: str | None = None,
@@ -421,19 +355,14 @@ class SQLEngine(DatabricksService, StatementExecutor):
         external_data: Mapping[str, "VolumePath | Any"] | None = None,
         parameters: Mapping[str, Any] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> StatementResult:
-        """Execute a SQL statement through Spark or the Databricks SQL API.
-
-        ``retry`` controls *result-level* retry on the warehouse path
-        (what :meth:`StatementResult.retry` does after a terminal
-        failure).  Has no effect on the Spark path here.
-        """
-        # Already-started result with no rebinding requested → just wait.
-        if isinstance(statement, StatementResult):
+    ) -> "DatabricksSQL | Tabular":
+        """Execute a SQL statement through Spark or the Databricks SQL API."""
+        # Already-started result with no rebinding requested -> just wait.
+        if isinstance(statement, DatabricksSQL):
             already_running = (
                 external_data is None
                 and parameters is None
-                and getattr(statement, "started", statement.done)
+                and statement.started
             )
             if already_running:
                 return statement.wait(wait=wait, raise_error=raise_error)
@@ -444,36 +373,20 @@ class SQLEngine(DatabricksService, StatementExecutor):
         engine_choice = self._pick_engine(engine, spark_session)
 
         if engine_choice == "spark":
-            session = spark_session or self.spark.resolve_session(create=True)
+            from yggdrasil.spark.sql import SparkSQL
 
-            # Carry forward any ``external_data`` already on the input
-            # statement so a caller-prepared SparkPreparedStatement keeps
-            # its bindings; ``external_data`` from this call layers on
-            # top (last write wins on alias collisions).
-            if isinstance(statement, PreparedStatement):
-                text = statement.text
-                merged: dict[str, ExternalStatementData] = (
-                    dict(statement.external_data) if statement.external_data else {}
-                )
-            else:
-                text = str(statement).strip()
-                merged = {}
+            session = spark_session or self._resolve_spark_session(create=True)
+            text = statement.text if isinstance(statement, WarehousePreparedStatement) else str(statement).strip()
 
-            new_external = _coerce_external_data_for_spark(external_data)
-            if new_external:
-                merged.update(new_external)
-
-            prepared = SparkPreparedStatement(
-                text=text,
-                spark_session=session,
-                row_limit=row_limit,
-                external_data=merged or None,
-            )
             if retry is not None:
                 logger.debug(
                     "Ignoring retry config for Spark statement — "
                     "driver-side retry applies"
                 )
+
+            result = SparkSQL(query=text, spark=session)
+            result.wait(wait=wait, raise_error=raise_error)
+            return result
         else:
             prepared = WarehousePreparedStatement.prepare(
                 statement,
@@ -488,13 +401,19 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 row_limit=row_limit,
                 retry=retry,
             )
-        return super().execute(prepared, wait=wait, raise_error=raise_error)
+            wh = self.warehouse(
+                warehouse_id=prepared.warehouse_id,
+                warehouse_name=prepared.warehouse_name,
+            )
+            result = wh.send(prepared)
+            result.wait(wait=wait, raise_error=raise_error)
+            return result
 
     def execute_many(
         self,
         statements: (
-            Iterable[str | PreparedStatement | StatementResult]
-            | Mapping[str, str | PreparedStatement | StatementResult]
+            Iterable["str | WarehousePreparedStatement"]
+            | Mapping[str, "str | WarehousePreparedStatement"]
         ),
         *,
         wait: WaitingConfigArg = True,
@@ -505,19 +424,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
         warehouse_name: str | None = None,
         spark_session: Optional["SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> StatementBatch:
-        """Run a collection of statements; return per-statement results in order.
-
-        Statements that already carry per-statement
-        ``external_volume_paths`` get their ``{alias}`` substitution from
-        the warehouse-batch coercer at submit time — the engine doesn't
-        manage a parallel registry.
-
-        ``retry`` is broadcast onto each warehouse statement before
-        submission (Spark statements pass through untouched).  ``None``
-        leaves whatever the statement already says intact; ``False``
-        explicitly clears any existing policy.
-        """
+    ) -> WarehouseStatementBatch:
+        """Run a collection of statements; return per-statement results in order."""
         engine_choice = self._pick_engine(engine, spark_session)
 
         if engine_choice == "spark":
@@ -526,12 +434,20 @@ class SQLEngine(DatabricksService, StatementExecutor):
                     "Ignoring retry config for Spark statement — "
                     "driver-side retry applies"
                 )
-            return self.spark.execute_many(
-                statements,
-                wait=wait,
-                raise_error=raise_error,
-                parallel=parallel,
+            # For Spark, execute each statement sequentially as SparkSQL
+            from yggdrasil.spark.sql import SparkSQL
+
+            session = spark_session or self._resolve_spark_session(create=True)
+            stmt_list = list(statements.values() if isinstance(statements, Mapping) else statements)
+            # Wrap in a warehouse batch for a uniform return type.
+            wh = self.warehouse(warehouse_id=warehouse_id, warehouse_name=warehouse_name)
+            batch = WarehouseStatementBatch(
+                executor=wh,
+                statements=stmt_list,
+                parallel=parallel or 1,
             )
+            batch.wait(wait=wait, raise_error=raise_error)
+            return batch
 
         # Warehouse path — broadcast retry config onto warehouse statements.
         if retry is not None:
@@ -550,17 +466,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
     @staticmethod
     def _broadcast_retry(
         statements: (
-            Iterable[str | PreparedStatement | StatementResult] | Mapping[str, Any]
+            Iterable["str | WarehousePreparedStatement"] | Mapping[str, Any]
         ),
         retry: Optional[WaitingConfigArg],
     ) -> Iterable[Any]:
-        """Apply ``retry`` to every warehouse statement in ``statements``.
-
-        Strings get coerced to :class:`WarehousePreparedStatement` so the
-        config sticks; non-warehouse statements (Spark, etc.) pass through
-        untouched.  Returns a list to preserve the input cardinality
-        (matters for mappings — keys must align with statements).
-        """
+        """Apply ``retry`` to every warehouse statement in ``statements``."""
         if isinstance(statements, Mapping):
             out: dict[str, Any] = {}
             for key, stmt in statements.items():
@@ -577,10 +487,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
         """Best-effort: apply ``retry`` when ``stmt`` is warehouse-typed."""
         if isinstance(stmt, str):
             stmt = WarehousePreparedStatement(text=stmt)
-        elif isinstance(stmt, StatementResult):
+        elif isinstance(stmt, DatabricksSQL):
             stmt = stmt.statement
-        # Only mutate warehouse statements — Spark statements have their
-        # own retry semantics and shouldn't get a warehouse-style policy.
         if isinstance(stmt, WarehousePreparedStatement):
             _apply_retry_to_warehouse_statement(stmt, retry)
         return stmt
@@ -608,11 +516,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
     # ------------------------------------------------------------------
     # insert_into — thin wrappers over :class:`Table`
     # ------------------------------------------------------------------
-    #
-    # The actual DML logic lives on :class:`Table`.  These engine methods
-    # resolve a target :class:`Table` from the caller's parameters
-    # (``location`` / ``catalog_name`` / ``schema_name`` / ``table_name``
-    # / a pre-built ``table=``) and forward to it.
 
     def _resolve_target(
         self,
@@ -640,8 +543,8 @@ class SQLEngine(DatabricksService, StatementExecutor):
             dict,
             list,
             str,
-            PreparedStatement,
-            StatementResult,
+            WarehousePreparedStatement,
+            DatabricksSQL,
             "pandas.DataFrame",
             "polars.DataFrame",
             "pyspark.sql.DataFrame",
@@ -669,7 +572,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> "StatementBatch | None":
+    ) -> "WarehouseStatementBatch | None":
         """Resolve the target :class:`Table` and call :meth:`Table.insert_into`."""
         target = self._resolve_target(
             location=location,
@@ -722,7 +625,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> "StatementBatch | None":
+    ) -> "WarehouseStatementBatch | None":
         """Resolve target and forward to :meth:`Table.arrow_insert`."""
         target = self._resolve_target(
             location=location,
@@ -776,7 +679,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> "StatementBatch | None":
+    ) -> "WarehouseStatementBatch | None":
         """Resolve target and forward to :meth:`Table.spark_insert`."""
         target = self._resolve_target(
             location=location,
@@ -808,7 +711,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
 
     def sql_insert_into(
         self,
-        statement: "PreparedStatement | StatementResult | str",
+        statement: "WarehousePreparedStatement | DatabricksSQL | str",
         *,
         mode: Mode | str | None = None,
         location: str | None = None,
@@ -828,7 +731,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         prune_by: list[str] | str | None = None,
         prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
-    ) -> "StatementBatch | None":
+    ) -> "WarehouseStatementBatch | None":
         """Resolve target and forward to :meth:`Table.sql_insert`."""
         target = self._resolve_target(
             location=location,
@@ -905,15 +808,11 @@ class SQLEngine(DatabricksService, StatementExecutor):
         *,
         schema: Any = None,
     ) -> "SparkDataset":
-        """Return a :class:`Dataset` from a SQL query or table name.
-
-        Auto-detects SQL (``SELECT``, ``WITH``, …) vs table name.
-        Session resolved through Databricks Connect.
-        """
+        """Return a :class:`Dataset` from a SQL query or table name."""
         from yggdrasil.spark.tabular import SparkDataset
 
-        session = self.spark.resolve_session(create=True)
-        if PreparedStatement.looks_like_query(sql_or_table):
+        session = self._resolve_spark_session(create=True)
+        if looks_like_query(sql_or_table):
             return SparkDataset.from_sql(
                 sql_or_table,
                 spark_session=session,
@@ -933,11 +832,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
         schema: Any = None,
         byte_size: int = 128 * 1024 * 1024,
     ) -> "SparkDataset":
-        """Distribute *function* over *inputs* via Spark executors, or
-        create a Dataset directly from *inputs* when no function is given."""
+        """Distribute *function* over *inputs* via Spark executors."""
         from yggdrasil.spark.tabular import SparkDataset
 
-        session = self.spark.resolve_session(create=True)
+        session = self._resolve_spark_session(create=True)
         return SparkDataset.parallelize(
             inputs,
             function,

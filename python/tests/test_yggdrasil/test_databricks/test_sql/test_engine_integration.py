@@ -406,8 +406,8 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         ``text_value`` (here a ``VALUES`` clause) is substituted
         verbatim — no staging round-trip, no warehouse volume created.
         """
-        from yggdrasil.data.statement import ExternalStatementData
         from yggdrasil.databricks.warehouse.statement import (
+            ExternalStatementData,
             WarehousePreparedStatement,
         )
 

@@ -16,7 +16,7 @@ import unittest
 import pyarrow as pa
 
 from yggdrasil.enums import Scheme
-from yggdrasil.data.statement import ExternalStatementData
+from yggdrasil.databricks.warehouse.statement import ExternalStatementData
 from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.sql.engine import _coerce_external_data_for_spark
 from yggdrasil.io.tabular import ArrowTabular

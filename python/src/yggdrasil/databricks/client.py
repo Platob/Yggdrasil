@@ -1458,11 +1458,11 @@ class DatabricksClient(Singleton, URLBased):
         The result is a full :class:`Dataset` — call ``.map``,
         ``.filter``, ``.to_table``, ``.toArrow``, etc. on it.
         """
-        from yggdrasil.data.statement import PreparedStatement
+        from yggdrasil.databricks.sql.sql_utils import looks_like_query
         from yggdrasil.spark.tabular import SparkDataset
 
         session = self.spark()
-        if PreparedStatement.looks_like_query(sql_or_table):
+        if looks_like_query(sql_or_table):
             return SparkDataset.from_sql(sql_or_table, spark_session=session, schema=schema)
         return SparkDataset.from_table(sql_or_table, spark_session=session, schema=schema)
 

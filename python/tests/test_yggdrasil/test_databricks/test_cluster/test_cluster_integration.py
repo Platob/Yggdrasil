@@ -42,14 +42,9 @@ from databricks.sdk.errors import DatabricksError
 
 from yggdrasil.databricks.cluster import (
     Cluster,
-    ClusterPreparedStatement,
-    ClusterStatementExecutor,
-    ServerlessCluster,
-    ServerlessClusterStatementExecutor,
 )
 from yggdrasil.databricks.volume.volume import Volume
 from yggdrasil.url import URLBased
-from yggdrasil.spark.statement import SparkPreparedStatement
 
 from .. import DatabricksIntegrationCase
 
