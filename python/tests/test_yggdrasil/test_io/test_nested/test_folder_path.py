@@ -93,6 +93,41 @@ class TestRoundTrip:
         got = folder.read_arrow_table()
         assert got.column("id").to_pylist() == [1, 2, 3]
 
+    def test_read_with_column_projection(self, tmp_path) -> None:
+        folder = FolderPath(path=str(tmp_path))
+        table = pa.table({"id": [1, 2, 3], "v": [10, 20, 30], "name": ["a", "b", "c"]})
+        folder.write_arrow_table(table)
+
+        out = folder.read_arrow_table(columns=["id"])
+        assert out.column_names == ["id"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_read_with_column_projection_multiple(self, tmp_path) -> None:
+        folder = FolderPath(path=str(tmp_path))
+        table = pa.table({"id": [1, 2], "v": [10, 20], "name": ["a", "b"]})
+        folder.write_arrow_table(table)
+
+        out = folder.read_arrow_table(columns=["id", "name"])
+        assert out.column_names == ["id", "name"]
+        assert out.to_pylist() == [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+
+    def test_read_with_column_projection_partitioned(self, tmp_path) -> None:
+        schema = pa.schema([
+            pa.field("pk", pa.int64(), metadata={b"t:partition_by": b"True"}),
+            pa.field("id", pa.int64()),
+            pa.field("v", pa.int64()),
+        ])
+        folder = FolderPath(path=str(tmp_path))
+        batch = pa.record_batch(
+            [pa.array([1, 2], pa.int64()), pa.array([10, 20], pa.int64()), pa.array([100, 200], pa.int64())],
+            schema=schema,
+        )
+        folder.write_arrow_batches((batch,))
+
+        out = folder.read_arrow_table(columns=["id"])
+        assert out.column_names == ["id"]
+        assert sorted(out.column("id").to_pylist()) == [10, 20]
+
 
 class TestMediaTypeMetadata:
     """``FolderPath._persist_schema`` stamps ``Field.media_type``."""

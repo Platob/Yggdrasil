@@ -1356,13 +1356,13 @@ class CastOptions:
     # ------------------------------------------------------------------
 
     def apply_post_read_table(self, table: "pa.Table") -> "pa.Table":
-        """Run resample + dedup directly on a materialised :class:`pa.Table`.
+        """Run column projection + resample + dedup on a materialised :class:`pa.Table`.
 
         Same operations and same order as the streaming wraps —
-        resample first (its bucket collapse trims rows before the
+        column projection first (trim I/O cost before any compute),
+        resample second (its bucket collapse trims rows before the
         unique-tag walk), then dedup. Identity short-circuit when
-        neither pass is configured so the common case stays
-        zero-cost.
+        no pass is configured so the common case stays zero-cost.
 
         Pyarrow / polars / pandas read paths that already produce a
         Table funnel through this method instead of the iterator
@@ -1370,6 +1370,13 @@ class CastOptions:
         ``Table.take`` (per pass) instead of two ``Table.from_batches``
         + a ``Table.to_batches`` rebatch sandwich.
         """
+        columns = self.column_names
+        if columns:
+            available = table.column_names
+            select = [c for c in columns if c in available]
+            if select and len(select) < len(available):
+                table = table.select(select)
+
         resample = self.resample_on_read()
         unique = self.dedup_columns_on_read()
         if resample is None and not unique:
