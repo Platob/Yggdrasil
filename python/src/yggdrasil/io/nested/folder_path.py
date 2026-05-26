@@ -1430,7 +1430,12 @@ class FolderPath(IO[bytes, FolderOptions]):
                     f"{type(self).__name__} already contains tabular files; "
                     f"refusing to write under mode={options.mode!r}."
                 )
-            if action is Mode.OVERWRITE:
+            match_by = list(options.match_by_keys or ())
+            if action is Mode.OVERWRITE and match_by:
+                # match_by is set — treat as UPSERT per partition so
+                # only matched rows are replaced, not the entire tree.
+                pass
+            elif action is Mode.OVERWRITE:
                 # Drop every existing child (files **and** partition
                 # subtrees — see :meth:`_clear_tabular_children`) so
                 # the new write fully replaces the old layout. The
@@ -1452,11 +1457,14 @@ class FolderPath(IO[bytes, FolderOptions]):
             # via :meth:`_schema_for_arrow`. RESPONSE_SCHEMA has 28
             # columns; the rebuild-and-cast was ~150 us per child
             # write before, now ~5 us.
-            child_mode = (
-                Mode.APPEND if action is Mode.OVERWRITE or action in (
-                    Mode.IGNORE, Mode.ERROR_IF_EXISTS,
-                ) else options.mode
-            )
+            if action is Mode.OVERWRITE and match_by:
+                child_mode = Mode.UPSERT
+            elif action is Mode.OVERWRITE or action in (
+                Mode.IGNORE, Mode.ERROR_IF_EXISTS,
+            ):
+                child_mode = Mode.APPEND
+            else:
+                child_mode = options.mode
             child_options = dataclasses.replace(
                 options, mode=child_mode, checked_cast=True,
             )
