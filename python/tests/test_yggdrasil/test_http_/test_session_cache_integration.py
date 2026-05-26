@@ -493,10 +493,6 @@ class TestRemoteCacheSend:
         # Insert call carries the configured knobs.
         i = tab.inserts[0]
         assert i["mode"] == Mode.APPEND
-        # Pruning keys the MERGE on both the partition column and the
-        # exact row identity — both keys are int64 so the IN literal
-        # stays compact.
-        assert i["prune_keys"] == ("partition_key", "public_hash")
 
     def test_failure_response_not_persisted(self) -> None:
         tab = _FakeRemoteTabular()

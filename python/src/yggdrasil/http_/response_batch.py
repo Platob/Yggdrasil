@@ -56,16 +56,22 @@ class HTTPResponseBatch(Tabular):
 
     def __init__(
         self,
-        local: "Tabular | None" = None,
-        remote: "Tabular | None" = None,
+        local: "Tabular | list[Response] | None" = None,
+        remote: "Tabular | list[Response] | None" = None,
         new: "Tabular | list[Response] | SparkDataFrame | pa.Table | None" = None,
         *,
         misses: "list | None" = None,
         failed: "list | None" = None,
     ) -> None:
         super().__init__()
-        self.local: Optional[Tabular] = local
-        self.remote: Optional[Tabular] = remote
+        self.local: Optional[Tabular] = (
+            responses_to_tabular(local) if isinstance(local, list) and local
+            else None if isinstance(local, list) else local
+        )
+        self.remote: Optional[Tabular] = (
+            responses_to_tabular(remote) if isinstance(remote, list) and remote
+            else None if isinstance(remote, list) else remote
+        )
         if isinstance(new, list):
             self.new: Optional[Tabular] = responses_to_tabular(new) if new else None
         elif isinstance(new, pa.Table):

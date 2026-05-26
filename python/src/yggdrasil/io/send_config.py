@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import logging
 import pathlib
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from yggdrasil.io.holder import Holder
 from yggdrasil.io.path import Path
 from yggdrasil.io.request import REQUEST_ARROW_SCHEMA, PreparedRequest
 from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA
+
+LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -135,12 +138,16 @@ def _validate_response_by(
     return keys
 
 
+def _truncate_to_hour(value: dt.datetime) -> dt.datetime:
+    return value.replace(minute=0, second=0, microsecond=0)
+
+
 def _coerce_optional_datetime(value: Any) -> Optional[dt.datetime]:
     if value in (None, ""):
         return None
     if isinstance(value, dt.datetime):
-        return value
-    return any_to_datetime(value)
+        return _truncate_to_hour(value)
+    return _truncate_to_hour(any_to_datetime(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,6 +639,148 @@ class CacheConfig(_ConfigBase):
         # or pickling.
         self.tabular = tabular
         return tabular
+
+    # ------------------------------------------------------------------
+    # Cache read / write — unified surface for both session pipelines
+    # ------------------------------------------------------------------
+
+    def read_responses(
+        self,
+        requests: "Iterable[PreparedRequest]",
+        *,
+        spark_session: "Any" = None,
+        session: "Session | None" = None,
+    ) -> "tuple[list[Response], list[PreparedRequest]]":
+        """Read cache hits as :class:`Response` objects.
+
+        Returns ``(hits, misses)`` — hits matched by ``request_by`` /
+        ``response_by`` and filtered by ``received_from`` / ``received_to``.
+        """
+        from yggdrasil.io.response import Response
+
+        tab = self.read_responses_tabular(
+            requests, spark_session=spark_session, session=session,
+        )
+        request_list = list(requests) if not isinstance(requests, list) else requests
+        if tab is None:
+            return [], list(request_list)
+
+        request_tuple = self.request_tuple
+        lookup_keys = [request_tuple(r) for r in request_list]
+
+        result_map: dict[tuple, Response] = {}
+        for response in Response.from_arrow_tabular(tab.read_arrow_batches()):
+            req = response.request
+            if req is None:
+                continue
+            key = request_tuple(req)
+            existing = result_map.get(key)
+            if existing is None or response.received_at >= existing.received_at:
+                result_map[key] = response
+
+        hits: list[Response] = []
+        misses: list[PreparedRequest] = []
+        filter_response = self.filter_response
+        for req, key in zip(request_list, lookup_keys):
+            candidate = result_map.get(key)
+            if candidate is not None and filter_response(candidate, request=req):
+                hits.append(candidate)
+            else:
+                misses.append(req)
+
+        return hits, misses
+
+    def read_responses_tabular(
+        self,
+        requests: "Iterable[PreparedRequest]",
+        *,
+        spark_session: "Any" = None,
+        session: "Session | None" = None,
+    ) -> "Tabular | None":
+        """Read matching cache rows as a :class:`Tabular`.
+
+        Builds the batch lookup predicate from *requests* and reads
+        from :attr:`tabular` (or the default local cache folder).
+        """
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.io.response import RESPONSE_SCHEMA
+
+        holder = self.tabular or self.cache_tabular(session=session)
+        if holder is None:
+            return None
+
+        request_list = list(requests) if not isinstance(requests, list) else requests
+        predicate = self.make_batch_lookup_predicate(request_list)
+        opts = CastOptions(
+            predicate=predicate,
+            spark_session=spark_session,
+            target=RESPONSE_SCHEMA,
+        )
+        return holder.read_table(options=opts)
+
+    def write_responses(
+        self,
+        responses: "list[Response]",
+        *,
+        mode: "Mode | None" = None,
+        spark_session: "Any" = None,
+        session: "Session | None" = None,
+    ) -> None:
+        """Write :class:`Response` objects to the cache backend."""
+        if not responses:
+            return
+        import pyarrow as pa
+        from yggdrasil.io.response import Response
+
+        table = pa.Table.from_batches(
+            [Response.values_to_arrow_batch(responses)]
+        )
+        self.write_responses_tabular(
+            table, mode=mode,
+            spark_session=spark_session, session=session,
+        )
+
+    def write_responses_tabular(
+        self,
+        data: "Any",
+        *,
+        mode: "Mode | None" = None,
+        spark_session: "Any" = None,
+        session: "Session | None" = None,
+    ) -> None:
+        """Write Arrow / Spark response data to the cache backend."""
+        import pyarrow as pa
+        from yggdrasil.data.options import CastOptions
+
+        if data is None:
+            return
+
+        holder = self.tabular or self.cache_tabular(session=session)
+        if holder is None:
+            return
+
+        opts = CastOptions(
+            mode=mode if mode is not None else self.mode,
+            match_by=self.match_by_columns or None,
+            spark_session=spark_session,
+        )
+        try:
+            if not isinstance(data, (pa.RecordBatch, pa.Table)) and (
+                hasattr(data, "toArrow") or hasattr(data, "toPandas")
+            ):
+                holder.write_spark_frame(data, options=opts)
+            elif isinstance(data, pa.RecordBatch):
+                if data.num_rows > 0:
+                    holder.write_arrow_batches((data,), options=opts)
+            elif isinstance(data, pa.Table):
+                if data.num_rows > 0:
+                    holder.write_arrow_batches(data.to_batches(), options=opts)
+            else:
+                holder.write_arrow_batches(data, options=opts)
+        except Exception:
+            LOGGER.warning(
+                "Cache write failed for %r", holder, exc_info=True,
+            )
 
     def request_values(
         self,
