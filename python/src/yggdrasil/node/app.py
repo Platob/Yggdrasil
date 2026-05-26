@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, ORJSONResponse
 
 from .config import Settings, get_settings
 from .exceptions import register_exception_handlers
@@ -21,6 +21,7 @@ from .routers import (
     monitor_router,
     python_router,
     run_router,
+    trading_router,
 )
 from .services import (
     CallService,
@@ -36,6 +37,7 @@ from .services import (
     MonitorService,
     PythonExecService,
     RunService,
+    TradingService,
 )
 
 
@@ -48,6 +50,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url=settings.docs_url,
         redoc_url=settings.redoc_url,
         openapi_url=settings.openapi_url,
+        default_response_class=ORJSONResponse,
     )
 
     app.state.settings = settings
@@ -73,6 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         run_service=app.state.run_service,
     )
     app.state.filesystem_service = FilesystemService(settings)
+    app.state.trading_service = TradingService(settings)
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -118,6 +122,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(monitor_router, prefix=f"{prefix}/monitor")
     app.include_router(dag_router, prefix=f"{prefix}/dag")
     app.include_router(filesystem_router, prefix=f"{prefix}/fs")
+    app.include_router(trading_router, prefix=f"{prefix}/trading")
 
     return app
 

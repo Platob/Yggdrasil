@@ -11,6 +11,7 @@ from .messenger import MessengerService
 from .monitor import MonitorService
 from .python import PythonExecService
 from .run import RunService
+from .trading import TradingService
 
 __all__ = [
     "CallService",
@@ -26,4 +27,5 @@ __all__ = [
     "MonitorService",
     "PythonExecService",
     "RunService",
+    "TradingService",
 ]

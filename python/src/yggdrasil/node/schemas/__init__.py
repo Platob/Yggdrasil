@@ -59,6 +59,18 @@ from .filesystem import (
     FileMoveRequest,
     FileWriteRequest,
 )
+from .trading import (
+    AlertCreate,
+    AlertsResponse,
+    PortfolioPositionEntry,
+    PortfolioResponse,
+    PositionCreate,
+    PriceAlert,
+    PriceHistoryResponse,
+    PriceQuote,
+    PricesResponse,
+    TechnicalIndicators,
+)
 
 __all__ = [
     "StrictModel",
@@ -110,4 +122,14 @@ __all__ = [
     "FileInfo",
     "FileMoveRequest",
     "FileWriteRequest",
+    "AlertCreate",
+    "AlertsResponse",
+    "PortfolioPositionEntry",
+    "PortfolioResponse",
+    "PositionCreate",
+    "PriceAlert",
+    "PriceHistoryResponse",
+    "PriceQuote",
+    "PricesResponse",
+    "TechnicalIndicators",
 ]

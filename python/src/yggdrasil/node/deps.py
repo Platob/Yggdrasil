@@ -15,6 +15,7 @@ from .services.monitor import MonitorService
 from .services.python import PythonExecService
 from .services.filesystem import FilesystemService
 from .services.run import RunService
+from .services.trading import TradingService
 
 
 def get_env_service(request: Request) -> EnvService:
@@ -67,3 +68,7 @@ def get_filesystem_service(request: Request) -> FilesystemService:
 
 def get_monitor_service(request: Request) -> MonitorService:
     return request.app.state.monitor_service
+
+
+def get_trading_service(request: Request) -> TradingService:
+    return request.app.state.trading_service
