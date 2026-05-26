@@ -394,7 +394,7 @@ class Codec(abc.ABC):
         mt = mime_type_class().from_(obj, default=None)
         if mt is None:
             if default is ...:
-                raise ValueError(f"Cannot resolve Codec from non-codec MIME type {obj!r}")
+                raise ValueError(f"Cannot resolve Codec from {obj!r}")
             return default
         return cls.from_mime(mt, default=default)
 
@@ -792,6 +792,12 @@ for _c in _ALL_CODECS:
     _CODEC_BY_NAME[_c.name] = _c
     _CODEC_BY_NAME[_c.name.upper()] = _c
 del _c
+_CODEC_BY_NAME["x-gzip"] = GZIP
+_CODEC_BY_NAME["X-GZIP"] = GZIP
+_CODEC_BY_NAME["deflate"] = ZLIB
+_CODEC_BY_NAME["DEFLATE"] = ZLIB
+_CODEC_BY_NAME["x-deflate"] = ZLIB
+_CODEC_BY_NAME["X-DEFLATE"] = ZLIB
 
 
 def _build_codec_by_mime() -> dict["MimeType", Codec]:

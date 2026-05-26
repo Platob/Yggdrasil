@@ -46,6 +46,7 @@ import tempfile
 import time
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Optional, Union
 
+from yggdrasil.enums.codec import Codec
 from yggdrasil.io.io_stats import IOKind, IOStats
 
 from .holder import Holder, _resolve_pos
@@ -190,11 +191,7 @@ class MemoryStream(Holder):
         self._read_chunk: Optional[Callable[[int], Any]] = None
         self._bind_source(source)
         if content_encoding and self._read_chunk is not None:
-            from yggdrasil.enums.codec import Codec
-            enc = content_encoding.strip().lower()
-            if enc == "x-gzip":
-                enc = "gzip"
-            codec = Codec.from_(enc, default=None)
+            codec = Codec.from_(content_encoding, default=None)
             if codec is not None:
                 raw_read = self._read_chunk
                 wrapper = _ReadCallableAsFile(raw_read)

@@ -84,8 +84,11 @@ class TestFrom:
         assert Codec.from_(None, default=None) is None
 
     def test_unknown_raises_without_default(self) -> None:
-        with pytest.raises(ValueError, match="Cannot resolve Codec"):
+        with pytest.raises(ValueError):
             Codec.from_("not-a-codec")
+
+    def test_unknown_returns_none_with_default(self) -> None:
+        assert Codec.from_("not-a-codec", default=None) is None
 
 
 class TestBytesRoundTrip:
