@@ -158,6 +158,51 @@ class TestFolderPathTargetCast:
         assert out.schema.field("id").type == pa.int32()
 
 
+class TestBatchLevelTargetCast:
+    """Target cast applies per-batch via read_arrow_batches, not just table."""
+
+    def test_arrow_ipc_batches_cast_dtype(self):
+        holder = Memory()
+        ipc = ArrowIPCFile(holder=holder, mode="wb")
+        ipc.write_arrow_table(_source_table())
+        ipc = ArrowIPCFile(holder=holder, mode="rb")
+        target = schema(fields=[field("id", pa.int32()), field("price", pa.float32())])
+        batches = list(ipc.read_arrow_batches(target=target))
+        assert len(batches) >= 1
+        assert batches[0].schema.field("id").type == pa.int32()
+        assert batches[0].schema.field("price").type == pa.float32()
+
+    def test_parquet_batches_cast_dtype(self):
+        holder = Memory()
+        pq = ParquetFile(holder=holder, mode="wb")
+        pq.write_arrow_table(_source_table())
+        pq = ParquetFile(holder=holder, mode="rb")
+        target = schema(fields=[field("id", pa.int32()), field("price", pa.float32())])
+        batches = list(pq.read_arrow_batches(target=target))
+        assert len(batches) >= 1
+        assert batches[0].schema.field("id").type == pa.int32()
+        assert batches[0].schema.field("price").type == pa.float32()
+
+    def test_folder_batches_cast_dtype(self, tmp_path):
+        folder = FolderPath(path=str(tmp_path))
+        folder.write_arrow_table(_source_table())
+        target = schema(fields=[field("id", pa.int32()), field("name", pa.large_string())])
+        batches = list(folder.read_arrow_batches(target=target))
+        assert len(batches) >= 1
+        assert batches[0].schema.field("id").type == pa.int32()
+        assert batches[0].schema.field("name").type == pa.large_string()
+
+    def test_select_by_index(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string()), field("c", pa.float64())])
+        out = s.select(0, 2)
+        assert out.names == ["a", "c"]
+
+    def test_drop_by_index(self):
+        s = schema(fields=[field("a", pa.int64()), field("b", pa.string()), field("c", pa.float64())])
+        out = s.drop(1)
+        assert out.names == ["a", "c"]
+
+
 class TestFieldSelectDrop:
 
     def test_select_by_name(self):

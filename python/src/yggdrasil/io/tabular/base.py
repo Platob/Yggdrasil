@@ -1132,7 +1132,7 @@ class Tabular(ABC, Generic[O]):
     def _read_arrow_batches_resolved(
         self, options: O,
     ) -> Iterator[pa.RecordBatch]:
-        """Inner read entry — applies the post-read tagged-schema passes.
+        """Inner read entry — applies target cast + post-read passes.
 
         Every public read path (:meth:`read_arrow_batches`,
         :meth:`_read_arrow_table`, :meth:`_read_arrow_batch_reader`)
@@ -1140,6 +1140,9 @@ class Tabular(ABC, Generic[O]):
         fire exactly once regardless of which entry point the caller
         picks:
 
+        * :meth:`CastOptions.cast_arrow_tabular` — per-batch target
+          cast (column selection + type coercion). Applies first so
+          downstream passes see the projected/typed schema.
         * :meth:`CastOptions.resample_arrow_batches` — snap rows to
           the target's ``time_sampling`` grid (Field tag), aggregating
           finer-grained sources via
@@ -1155,6 +1158,9 @@ class Tabular(ABC, Generic[O]):
         no matching tag fires, so the common case stays zero-cost.
         """
         stream = self._read_arrow_batches(options)
+        cast = options.cast_arrow_tabular
+        if options.target is not None:
+            stream = (cast(batch) for batch in stream)
         stream = options.resample_arrow_batches(stream)
         stream = options.dedup_arrow_batches(stream)
         return stream
@@ -1188,11 +1194,7 @@ class Tabular(ABC, Generic[O]):
     def _read_arrow_table(self, options: O) -> pa.Table:
         # Pull the raw batches off the underlying reader and assemble
         # them into one :class:`pa.Table`, then cast + project + resample
-        # + dedup via the options pipeline. The iterator wraps
-        # (:meth:`_read_arrow_batches_resolved`) materialise + re-batch
-        # internally too; calling them here would
-        # ``Table.from_batches → group_by → to_batches → Table.from_batches``
-        # for a wasted round trip. Single-Table path bypasses that.
+        # + dedup via the options pipeline.
         batches = list(self._read_arrow_batches(options))
         if not batches:
             schema = (
