@@ -22,6 +22,11 @@ from ..services.network import NetworkService
 router = APIRouter(tags=["network"])
 
 
+@router.get("/ping")
+async def ping(request: Request) -> dict:
+    return {"pong": True, "node_id": request.app.state.settings.node_id}
+
+
 @router.get("", response_model=NodeMeta)
 async def get_self(
     service: NetworkService = Depends(get_network_service),

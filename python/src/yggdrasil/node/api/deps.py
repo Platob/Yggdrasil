@@ -8,7 +8,12 @@ from .services.network import NetworkService
 from .services.pyenv import PyEnvService
 from .services.pyfunc import PyFuncService
 from .services.pyfuncrun import PyFuncRunService
+from .services.fs import FsService
 from .services.replicate import ReplicateService
+
+
+def get_fs_service(request: Request) -> FsService:
+    return request.app.state.fs_service
 
 
 def get_pyenv_service(request: Request) -> PyEnvService:

@@ -1,4 +1,11 @@
 from .common import NodeRole, StrictModel
+from .fs import (
+    FsEntry,
+    FsListResponse,
+    FsMoveRequest,
+    FsReadResponse,
+    FsWriteRequest,
+)
 from .pyenv import (
     PyEnvCreate,
     PyEnvEntry,
@@ -50,6 +57,11 @@ from .network import (
 __all__ = [
     "StrictModel",
     "NodeRole",
+    "FsEntry",
+    "FsListResponse",
+    "FsReadResponse",
+    "FsWriteRequest",
+    "FsMoveRequest",
     "PyEnvCreate",
     "PyEnvUpdate",
     "PyEnvEntry",

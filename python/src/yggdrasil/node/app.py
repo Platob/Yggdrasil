@@ -11,6 +11,7 @@ from .api.routers import (
     backend_router as v2_backend_router,
     card_router as v2_card_router,
     dag_router as v2_dag_router,
+    fs_router as v2_fs_router,
     network_router as v2_network_router,
     pyenv_router as v2_pyenv_router,
     pyfunc_router as v2_pyfunc_router,
@@ -19,6 +20,7 @@ from .api.routers import (
 )
 from .api.services.backend import BackendService
 from .api.services.dag import DAGService as V2DagService
+from .api.services.fs import FsService
 from .api.services.network import NetworkService
 from .api.services.pyenv import PyEnvService
 from .api.services.pyfunc import PyFuncService
@@ -91,7 +93,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.filesystem_service = FilesystemService(settings)
 
-    # -- v2 API services (PyEnv / PyFunc / PyFuncRun) -----------------------
+    # -- v2 API services (PyEnv / PyFunc / PyFuncRun / Fs) -------------------
+    v2_fs = FsService(settings)
     pyenv = PyEnvService(settings)
     pyfunc = PyFuncService(settings)
     pyfuncrun = PyFuncRunService(settings, pyenv, pyfunc)
@@ -104,6 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     network = NetworkService(settings, backend)
     replicate = ReplicateService(settings, pyenv, pyfunc, v2_dag)
 
+    app.state.fs_service = v2_fs
     app.state.pyenv_service = pyenv
     app.state.pyfunc_service = pyfunc
     app.state.pyfuncrun_service = pyfuncrun
@@ -142,6 +146,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
+    @app.get(f"{settings.api_prefix}/ping")
+    async def ping():
+        return {"pong": True, "node_id": settings.node_id}
+
     prefix = settings.api_prefix
     app.include_router(env_router, prefix=f"{prefix}/env")
     app.include_router(cmd_router, prefix=f"{prefix}/cmd")
@@ -166,6 +174,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(v2_backend_router, prefix=f"{prefix}/v2/backend")
     app.include_router(v2_network_router, prefix=f"{prefix}/v2/network")
     app.include_router(v2_replicate_router, prefix=f"{prefix}/v2/replicate")
+    app.include_router(v2_fs_router, prefix=f"{prefix}/v2/fs")
 
     return app
 

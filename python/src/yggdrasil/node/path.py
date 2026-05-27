@@ -1,10 +1,8 @@
-"""NodePath ��� pathlib-like interface for node filesystem access.
+"""NodePath -- pathlib-like interface for node filesystem access.
 
-Provides a ``pathlib.Path``-like API that transparently works with
-local files or remote node filesystems via the ``/api/fs`` endpoints.
-
-Local access uses direct filesystem calls.  Remote access uses
-HTTP with streaming for large files.
+Uses ``npfs://host:port/path`` URLs. When the URL resolves to the local
+node (same host:port), operations go directly to the filesystem. When
+remote, operations use HTTP against the node's ``/api/v2/fs/*`` endpoints.
 
 Usage::
 
@@ -13,14 +11,13 @@ Usage::
     # Local node files (direct filesystem)
     p = NodePath("data/input.csv")
     content = p.read_text()
-    p.write_text("hello")
-    for child in p.iterdir():
-        print(child.name, child.is_dir())
 
     # Remote node files (via HTTP)
     remote = NodePath("data/input.csv", node_url="http://node-2:8100")
     content = remote.read_bytes()
-    remote.write_bytes(b"data")
+
+    # From npfs:// URL
+    p = NodePath.from_url("npfs://node-2:8100/data/input.csv")
 """
 from __future__ import annotations
 
@@ -32,37 +29,24 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Iterator
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
-def _is_local_url(url: str) -> bool:
-    """Check if a URL points to the local node.
-
-    Compares the host and port against known localhost addresses and the
-    configured YGG_NODE_PORT. When a "remote" URL actually points back to
-    this node, we can skip HTTP and use direct filesystem access instead.
-    """
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        port = parsed.port
-        # If no explicit port in URL, it's not targeting our node port
-        if port is None:
-            return False
-        local_port = int(os.environ.get("YGG_NODE_PORT", "8100"))
-        if port != local_port:
-            return False
-        return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
-    except (ValueError, TypeError):
+def _is_self(host: str, port: int) -> bool:
+    """True when host:port points back to this node."""
+    local_port = int(os.environ.get("YGG_NODE_PORT", "8100"))
+    if port != local_port:
         return False
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0", "")
 
 
 class NodePath:
     """Path-like object for node filesystem access.
 
-    When ``node_url`` is None, operates directly on the local filesystem
-    within the node's data directory.  When ``node_url`` is set, uses
-    HTTP calls to the remote node's ``/api/fs`` endpoints.
+    When ``node_url`` is None (or resolves to self), operates directly
+    on the local filesystem within the node's data directory.  When
+    ``node_url`` is set and remote, uses HTTP calls to the remote
+    node's ``/api/v2/fs`` endpoints.
 
     Supports ``npfs://`` protocol URLs::
 
@@ -81,10 +65,12 @@ class NodePath:
         _root: Path | None = None,
     ) -> None:
         self._path = PurePosixPath(path.lstrip("/"))
-        # Optimize: if node_url points to localhost, treat as local access
-        # to skip unnecessary HTTP round-trips.
-        if node_url and _is_local_url(node_url):
-            node_url = None
+        if node_url:
+            parsed = urlparse(node_url)
+            host = parsed.hostname or ""
+            port = parsed.port or 8100
+            if _is_self(host, port):
+                node_url = None
         self._node_url = node_url
         if _root is None and node_url is None:
             from .config import get_settings
@@ -92,83 +78,43 @@ class NodePath:
         else:
             self._root = _root
 
-    # ── NPFS Protocol URL support ────────────────────────────
+    # -- NPFS URL support -----------------------------------------------------
 
     @classmethod
-    def from_url(cls, url: str) -> "NodePath":
-        """Parse npfs://host:port/path URL.
+    def from_url(cls, url: str) -> NodePath:
+        """Parse ``npfs://host:port/path`` URL.
 
-        Supports:
-        - ``npfs://host:port/path`` — remote node
-        - ``npfs:///path`` — local node (triple slash)
-        - Plain paths (no scheme) — treated as local
+        - ``npfs://host:port/path`` -- remote node
+        - ``npfs:///path`` -- local node (triple slash)
+        - Plain paths (no scheme) -- treated as local
         """
         if url.startswith("npfs://"):
             parsed = urlparse(url)
             host = parsed.hostname or ""
             port = parsed.port or 8100
             path = parsed.path.lstrip("/")
-            if not host or _is_local_url(f"http://{host}:{port}"):
+            if not host or _is_self(host, port):
                 return cls(path)
             return cls(path, node_url=f"http://{host}:{port}")
         return cls(url)
 
     def to_url(self) -> str:
-        """Convert to npfs:// URL.
-
-        Local paths use triple-slash (``npfs:///path``).
-        Remote paths include host and port.
-        """
+        """Convert to ``npfs://`` URL."""
         if self.is_local:
             return f"npfs:///{self._path}"
         parsed = urlparse(self._node_url)
         return f"npfs://{parsed.hostname}:{parsed.port or 8100}/{self._path}"
 
     @classmethod
-    def from_(cls, value) -> "NodePath | None":
-        """Polymorphic constructor — accepts str, NodePath, None.
-
-        Returns None if value is None, passes through NodePath instances,
-        and parses strings as npfs:// URLs or plain paths.
-        """
+    def from_(cls, value) -> NodePath | None:
+        """Polymorphic constructor -- accepts str, NodePath, None."""
         if value is None:
             return None
         if isinstance(value, cls):
             return value
         return cls.from_url(str(value))
 
-    # ── Mirror support ───────────────────────────────────────
-
-    def _get_node_home(self) -> Path:
-        """Get the node home directory."""
-        from .config import get_settings
-        return get_settings().node_home
-
-    def mirror_local(self) -> "NodePath":
-        """Get the local mirror path for a remote resource.
-
-        Remote files are mirrored under .ygg/mirrors/{node_id}/.
-        Local paths return self unchanged.
-        """
-        if self.is_local:
-            return self
-        parsed = urlparse(self._node_url)
-        node_id = f"{parsed.hostname}_{parsed.port or 8100}"
-        mirror_root = self._get_node_home() / "mirrors" / node_id
-        return NodePath(str(self._path), _root=mirror_root)
-
-    def sync_from_remote(self) -> "NodePath":
-        """Download remote file to local mirror.
-
-        For local paths, returns self unchanged. For remote paths,
-        fetches the content and writes it to the local mirror location.
-        """
-        if self.is_local:
-            return self
-        local = self.mirror_local()
-        data = self.read_bytes()
-        local.write_bytes(data)
-        return local
+    # -- Properties -----------------------------------------------------------
 
     @property
     def is_local(self) -> bool:
@@ -180,11 +126,8 @@ class NodePath:
 
     @property
     def parent(self) -> NodePath:
-        return NodePath(
-            str(self._path.parent) if str(self._path) != "." else "",
-            node_url=self._node_url,
-            _root=self._root,
-        )
+        p = str(self._path.parent) if str(self._path) != "." else ""
+        return NodePath(p, node_url=self._node_url, _root=self._root)
 
     @property
     def suffix(self) -> str:
@@ -208,16 +151,23 @@ class NodePath:
         target = self._node_url or "local"
         return f"NodePath({str(self._path)!r}, node={target!r})"
 
-    # ── Local helpers ────────────────────────────────────────
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, NodePath):
+            return NotImplemented
+        return self._path == other._path and self._node_url == other._node_url
+
+    def __hash__(self) -> int:
+        return hash((str(self._path), self._node_url))
+
+    # -- Local path resolution ------------------------------------------------
 
     def _local_path(self) -> Path:
         resolved = (self._root / str(self._path)).resolve()
-        root_str = str(self._root.resolve())
-        if not str(resolved).startswith(root_str):
+        if not str(resolved).startswith(str(self._root.resolve())):
             raise PermissionError("Path traversal not allowed")
         return resolved
 
-    # ── Read operations ──────────────────────────────────────
+    # -- Read operations ------------------------------------------------------
 
     def exists(self) -> bool:
         if self.is_local:
@@ -240,7 +190,7 @@ class NodePath:
     def is_file(self) -> bool:
         if self.is_local:
             return self._local_path().is_file()
-        return not self.is_dir()
+        return self.exists() and not self.is_dir()
 
     def stat(self) -> dict:
         if self.is_local:
@@ -251,15 +201,16 @@ class NodePath:
                 "name": p.name,
                 "is_dir": p.is_dir(),
                 "size": s.st_size,
-                "modified_at": datetime.fromtimestamp(s.st_mtime, tz=timezone.utc).isoformat(),
-                "created_at": datetime.fromtimestamp(s.st_ctime, tz=timezone.utc).isoformat(),
+                "modified_at": datetime.fromtimestamp(
+                    s.st_mtime, tz=timezone.utc
+                ).isoformat(),
             }
-        return _get(f"{self._node_url}/api/fs/stat?path={_quote(str(self._path))}")
+        return _get(f"{self._node_url}/api/v2/fs/stat?path={_quote(str(self._path))}")
 
     def read_text(self, encoding: str = "utf-8") -> str:
         if self.is_local:
             return self._local_path().read_text(encoding=encoding)
-        resp = _get(f"{self._node_url}/api/fs/read?path={_quote(str(self._path))}")
+        resp = _get(f"{self._node_url}/api/v2/fs/read?path={_quote(str(self._path))}")
         content = resp.get("content", "")
         if resp.get("encoding") == "base64":
             return base64.b64decode(content).decode(encoding)
@@ -268,7 +219,7 @@ class NodePath:
     def read_bytes(self) -> bytes:
         if self.is_local:
             return self._local_path().read_bytes()
-        resp = _get(f"{self._node_url}/api/fs/read?path={_quote(str(self._path))}")
+        resp = _get(f"{self._node_url}/api/v2/fs/read?path={_quote(str(self._path))}")
         content = resp.get("content", "")
         if resp.get("encoding") == "base64":
             return base64.b64decode(content)
@@ -283,7 +234,7 @@ class NodePath:
                     _root=self._root,
                 )
             return
-        resp = _get(f"{self._node_url}/api/fs/ls?path={_quote(str(self._path))}")
+        resp = _get(f"{self._node_url}/api/v2/fs/ls?path={_quote(str(self._path))}")
         for entry in resp.get("entries", []):
             yield NodePath(
                 entry["path"],
@@ -291,7 +242,7 @@ class NodePath:
                 _root=self._root,
             )
 
-    # ── Write operations ─────────────────────────────────────
+    # -- Write operations -----------------------------------------------------
 
     def write_text(self, content: str, encoding: str = "utf-8") -> None:
         if self.is_local:
@@ -299,7 +250,7 @@ class NodePath:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding=encoding)
             return
-        _post(f"{self._node_url}/api/fs/write", {
+        _post(f"{self._node_url}/api/v2/fs/write", {
             "path": str(self._path),
             "content": content,
             "encoding": "utf-8",
@@ -312,7 +263,7 @@ class NodePath:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(data)
             return
-        _post(f"{self._node_url}/api/fs/write", {
+        _post(f"{self._node_url}/api/v2/fs/write", {
             "path": str(self._path),
             "content": base64.b64encode(data).decode(),
             "encoding": "base64",
@@ -323,7 +274,7 @@ class NodePath:
         if self.is_local:
             self._local_path().mkdir(parents=parents, exist_ok=exist_ok)
             return
-        _post(f"{self._node_url}/api/fs/mkdir?path={_quote(str(self._path))}", {})
+        _post(f"{self._node_url}/api/v2/fs/mkdir?path={_quote(str(self._path))}", {})
 
     def unlink(self, missing_ok: bool = False) -> None:
         if self.is_local:
@@ -336,7 +287,7 @@ class NodePath:
                 raise FileNotFoundError(str(self._path))
             return
         try:
-            _delete(f"{self._node_url}/api/fs/delete?path={_quote(str(self._path))}")
+            _delete(f"{self._node_url}/api/v2/fs/delete?path={_quote(str(self._path))}")
         except Exception:
             if not missing_ok:
                 raise
@@ -347,13 +298,13 @@ class NodePath:
             dst = (self._root / target.lstrip("/")).resolve()
             src.rename(dst)
             return NodePath(target, node_url=self._node_url, _root=self._root)
-        _post(f"{self._node_url}/api/fs/move", {
+        _post(f"{self._node_url}/api/v2/fs/move", {
             "source": str(self._path),
             "destination": target,
         })
         return NodePath(target, node_url=self._node_url, _root=self._root)
 
-    # ── Streaming ────────────────────────────────────────────
+    # -- Streaming ------------------------------------------------------------
 
     def stream_read(self, chunk_size: int = 65536) -> Iterator[bytes]:
         if self.is_local:
@@ -365,7 +316,7 @@ class NodePath:
                     yield chunk
             return
         req = urllib.request.Request(
-            f"{self._node_url}/api/fs/stream?path={_quote(str(self._path))}",
+            f"{self._node_url}/api/v2/fs/stream?path={_quote(str(self._path))}",
             headers={"Accept": "application/octet-stream"},
         )
         with urllib.request.urlopen(req, timeout=300) as resp:
@@ -375,7 +326,27 @@ class NodePath:
                     break
                 yield chunk
 
-    # ── Copy between nodes ───────────────────────────────────
+    def stream_write(self, data: Iterator[bytes]) -> None:
+        """Send streaming data to the remote upload endpoint."""
+        if self.is_local:
+            p = self._local_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "wb") as f:
+                for chunk in data:
+                    f.write(chunk)
+            return
+        # For remote, collect and POST as upload body
+        collected = b"".join(data)
+        req = urllib.request.Request(
+            f"{self._node_url}/api/v2/fs/upload?path={_quote(str(self._path))}",
+            data=collected,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300):
+            pass
+
+    # -- Cross-node copy ------------------------------------------------------
 
     def copy_to(self, target: NodePath) -> NodePath:
         """Copy this file/directory to another NodePath (possibly on a different node)."""
@@ -393,10 +364,9 @@ class NodePath:
         return target
 
 
-# ── HTTP helpers ─────────────────────────────────────────────
+# -- HTTP helpers -------------------------------------------------------------
 
 def _quote(s: str) -> str:
-    from urllib.parse import quote
     return quote(s, safe="")
 
 

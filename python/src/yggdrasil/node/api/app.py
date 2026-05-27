@@ -11,6 +11,7 @@ from .routers import (
     backend_router,
     card_router,
     dag_router,
+    fs_router,
     network_router,
     pyenv_router,
     pyfunc_router,
@@ -19,6 +20,7 @@ from .routers import (
 )
 from .services.backend import BackendService
 from .services.dag import DAGService
+from .services.fs import FsService
 from .services.network import NetworkService
 from .services.pyenv import PyEnvService
 from .services.pyfunc import PyFuncService
@@ -40,6 +42,9 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     # -- Services -----------------------------------------------------------
+    fs = FsService(settings)
+    app.state.fs_service = fs
+
     pyenv = PyEnvService(settings)
     pyfunc = PyFuncService(settings)
     pyfuncrun = PyFuncRunService(settings, pyenv, pyfunc)
@@ -85,6 +90,11 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
+    # -- Ping (fastest possible, no middleware deps) -------------------------
+    @app.get(f"{settings.api_prefix}/ping")
+    async def ping():
+        return {"pong": True, "node_id": settings.node_id}
+
     # -- Routers ------------------------------------------------------------
     prefix = f"{settings.api_prefix}/v2"
     app.include_router(card_router, prefix=f"{settings.api_prefix}/card")
@@ -95,6 +105,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(backend_router, prefix=f"{prefix}/backend")
     app.include_router(network_router, prefix=f"{prefix}/network")
     app.include_router(replicate_router, prefix=f"{prefix}/replicate")
+    app.include_router(fs_router, prefix=f"{prefix}/fs")
 
     return app
 

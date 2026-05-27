@@ -124,11 +124,6 @@ def _apply_node_env(args: argparse.Namespace) -> None:
     os.environ["YGG_NODE_ALLOW_REMOTE"] = "1"
 
 
-def _get_node_url() -> str:
-    from yggdrasil.node.daemon import get_node_url
-    return get_node_url()
-
-
 def _ensure_node_running() -> str:
     try:
         from yggdrasil.node.daemon import spawn_node
@@ -187,9 +182,10 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None):
 # ── handlers ─────────────────────────────────────────────────────
 
 def _node_start(args: argparse.Namespace) -> int:
-    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, yellow
     from yggdrasil.node.config import get_settings
     from yggdrasil.node.daemon import spawn_node
+    from yggdrasil.node.service import install_service, is_service_installed
 
     _apply_node_env(args)
     print_logo("YGGNODE")
@@ -205,6 +201,15 @@ def _node_start(args: argparse.Namespace) -> int:
     out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n")
     out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
     out(f"  {cyan('pid')}   {dim(str(pid))}\n")
+
+    if not is_service_installed(settings):
+        out(f"\n  {cyan('install')} registering boot service...\n")
+        ok, msg = install_service(settings, no_front=True)
+        if ok:
+            out(f"  {green('✓')} auto-start on boot enabled\n")
+        else:
+            out(f"  {yellow('skip')} boot service: {msg}\n")
+
     out(f"\n  {dim('Public access enabled. Stop with:')} {bold('ygg node stop')}\n")
     return 0
 
@@ -289,8 +294,9 @@ def _node_status(args: argparse.Namespace) -> int:
 def _node_create(args: argparse.Namespace) -> int:
     import os
     from pathlib import Path
-    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo
-    from yggdrasil.node.daemon import ensure_directories
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, yellow
+    from yggdrasil.node.daemon import ensure_directories, spawn_node
+    from yggdrasil.node.service import install_service
 
     print_logo("YGGNODE")
 
@@ -303,7 +309,6 @@ def _node_create(args: argparse.Namespace) -> int:
     settings = get_settings()
     ensure_directories(settings)
 
-    # Persist the node ID
     id_file = Path.home() / ".node" / ".ygg_node_id"
     id_file.parent.mkdir(parents=True, exist_ok=True)
     id_file.write_text(args.name)
@@ -313,12 +318,15 @@ def _node_create(args: argparse.Namespace) -> int:
     out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
 
     if args.start:
-        out(f"\n  {cyan('starting')}...\n")
-        from yggdrasil.node.daemon import spawn_node
         pid, port = spawn_node(settings, host="0.0.0.0")
         out(f"  {green('✓')} running on {bold(f'0.0.0.0:{port}')} (pid={pid})\n")
-
-    out(f"\n  Start with: {bold('ygg node start')}\n")
+        ok, msg = install_service(settings, no_front=True)
+        if ok:
+            out(f"  {green('✓')} boot service installed\n")
+        else:
+            out(f"  {yellow('skip')} boot service: {msg}\n")
+    else:
+        out(f"\n  Start with: {bold('ygg node start')}\n")
     return 0
 
 
