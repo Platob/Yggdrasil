@@ -9,6 +9,7 @@ from ..schemas.dag import (
     DAGResponse,
     DAGRunListResponse,
     DAGRunResponse,
+    DAGScheduleRequest,
 )
 from ..services.dag import DAGService
 
@@ -37,6 +38,16 @@ async def get_dag(
 ) -> DAGResponse:
     entry = await service.get(dag_id)
     return DAGResponse(dag=entry)
+
+
+@router.put("/{dag_id}", response_model=DAGResponse)
+async def update_dag(
+    dag_id: int,
+    req: DAGCreate,
+    service: DAGService = Depends(get_dag_service),
+) -> DAGResponse:
+    """Update a DAG by upserting with the same name."""
+    return await service.create(req)
 
 
 @router.delete("/{dag_id}", response_model=DAGResponse)
@@ -71,3 +82,22 @@ async def get_dag_run(
 ) -> DAGRunResponse:
     entry = await service.get_run(dag_id, run_id)
     return DAGRunResponse(run=entry)
+
+
+@router.post("/{dag_id}/schedule", response_model=DAGResponse)
+async def schedule_dag(
+    dag_id: int,
+    req: DAGScheduleRequest,
+    service: DAGService = Depends(get_dag_service),
+) -> DAGResponse:
+    """Schedule a DAG to run at intervals."""
+    return await service.schedule(dag_id, req.interval_seconds, req.max_runs)
+
+
+@router.delete("/{dag_id}/schedule", response_model=DAGResponse)
+async def unschedule_dag(
+    dag_id: int,
+    service: DAGService = Depends(get_dag_service),
+) -> DAGResponse:
+    """Stop a scheduled DAG."""
+    return await service.unschedule(dag_id)

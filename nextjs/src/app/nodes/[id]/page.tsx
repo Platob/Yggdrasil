@@ -4,8 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { ResourceBar } from "@/components/ResourceBar";
-import { getBackend, getEnvs, getFuncs, getRuns, getNodeCard } from "@/lib/api";
-import type { NodeBackend, NodeCard, PyEnvEntry, PyFuncEntry, PyFuncRunEntry } from "@/lib/types";
+import { getBackend, getEnvs, getFuncs, getRuns, getNodeCard, getDags, getDagRuns } from "@/lib/api";
+import type { NodeBackend, NodeCard, PyEnvEntry, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -88,23 +88,29 @@ export default function NodeDetailPage() {
   const [envs, setEnvs] = useState<PyEnvEntry[]>([]);
   const [funcs, setFuncs] = useState<PyFuncEntry[]>([]);
   const [runs, setRuns] = useState<PyFuncRunEntry[]>([]);
+  const [dagList, setDagList] = useState<DAGEntry[]>([]);
+  const [dagRuns, setDagRuns] = useState<Record<number, DAGRunEntry[]>>({});
+  const [expandedDagId, setExpandedDagId] = useState<number | null>(null);
+  const [loadingDagRuns, setLoadingDagRuns] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [backendRes, cardRes, envsRes, funcsRes, runsRes] = await Promise.allSettled([
+      const [backendRes, cardRes, envsRes, funcsRes, runsRes, dagsRes] = await Promise.allSettled([
         getBackend(),
         getNodeCard(),
         getEnvs(),
         getFuncs(),
         getRuns(),
+        getDags(),
       ]);
       if (backendRes.status === "fulfilled") setBackend(backendRes.value.backend);
       if (cardRes.status === "fulfilled") setCard(cardRes.value);
       if (envsRes.status === "fulfilled") setEnvs(envsRes.value.envs);
       if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
       if (runsRes.status === "fulfilled") setRuns(runsRes.value.runs);
+      if (dagsRes.status === "fulfilled") setDagList(dagsRes.value.dags);
 
       // Check if at least one call succeeded
       const anySuccess = [backendRes, cardRes].some((r) => r.status === "fulfilled");
@@ -438,6 +444,97 @@ export default function NodeDetailPage() {
                 </div>
               );
             })}
+          </div>
+        </div>
+      )}
+
+      {/* DAGs */}
+      {dagList.length > 0 && (
+        <div className="glass-card p-5 space-y-3">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="5" cy="6" r="3" />
+              <circle cx="19" cy="6" r="3" />
+              <circle cx="12" cy="18" r="3" />
+              <path d="M7.5 8l3 7M16.5 8l-3 7" />
+            </svg>
+            DAGs
+            <span className="ml-auto text-foreground-dim font-mono">{dagList.length}</span>
+          </h2>
+          <div className="space-y-2 max-h-96 overflow-y-auto">
+            {dagList.map((dag) => (
+              <div key={dag.id} className="rounded-lg bg-white/[0.02] border border-white/[0.04] overflow-hidden">
+                <button
+                  onClick={async () => {
+                    if (expandedDagId === dag.id) {
+                      setExpandedDagId(null);
+                      return;
+                    }
+                    setExpandedDagId(dag.id);
+                    if (!dagRuns[dag.id]) {
+                      setLoadingDagRuns(true);
+                      try {
+                        const res = await getDagRuns(dag.id);
+                        setDagRuns((prev) => ({ ...prev, [dag.id]: res.runs }));
+                      } catch {
+                        setDagRuns((prev) => ({ ...prev, [dag.id]: [] }));
+                      } finally {
+                        setLoadingDagRuns(false);
+                      }
+                    }
+                  }}
+                  className="w-full text-left px-3 py-2.5 hover:bg-white/[0.02] transition-colors"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-mono font-medium text-foreground">{dag.name}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] text-muted font-mono">{dag.steps.length} steps</span>
+                      <span className="text-[10px] text-muted font-mono">{dag.run_count} runs</span>
+                      {dag.schedule_active && (
+                        <span
+                          className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
+                          style={{ background: "rgba(103,232,249,0.1)", color: "var(--frost)" }}
+                        >
+                          Scheduled
+                        </span>
+                      )}
+                      <svg
+                        width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth="2"
+                        className={`transition-transform ${expandedDagId === dag.id ? "rotate-90" : ""}`}
+                      >
+                        <polyline points="9 18 15 12 9 6" />
+                      </svg>
+                    </div>
+                  </div>
+                  {dag.description && (
+                    <p className="text-[11px] text-muted mt-0.5">{dag.description}</p>
+                  )}
+                </button>
+                {expandedDagId === dag.id && (
+                  <div className="border-t border-white/[0.04] px-3 py-2">
+                    {loadingDagRuns ? (
+                      <div className="flex items-center gap-2 py-2">
+                        <div className="w-3 h-3 border-2 border-frost/30 border-t-frost rounded-full spin-slow" />
+                        <span className="text-[10px] text-muted font-mono">Loading runs...</span>
+                      </div>
+                    ) : (dagRuns[dag.id] || []).length === 0 ? (
+                      <p className="text-[10px] text-muted/60 italic py-2">No runs yet</p>
+                    ) : (
+                      <div className="space-y-1">
+                        {(dagRuns[dag.id] || []).slice(0, 5).map((run) => (
+                          <div key={run.id} className="flex items-center gap-3 py-1.5">
+                            <RunStatusBadge status={run.status} />
+                            <span className="text-[10px] font-mono text-foreground-dim">#{run.id}</span>
+                            <span className="text-[10px] font-mono text-muted ml-auto">{formatDuration(run.duration)}</span>
+                            <span className="text-[10px] font-mono text-muted">{timeAgo(run.started_at)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
         </div>
       )}

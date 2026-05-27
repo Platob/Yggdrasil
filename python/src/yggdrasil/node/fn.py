@@ -447,7 +447,11 @@ class FunctionHandle:
         return _DagChain([self, other])
 
     def _ensure_registered(self) -> None:
-        """Register/upsert the function on the target node."""
+        """Register/upsert the function on the target node.
+
+        When no explicit environment is set, auto-creates a matching PyEnv
+        with the function's inferred python_version and dependencies.
+        """
         if self._registered:
             return
 
@@ -469,6 +473,26 @@ class FunctionHandle:
 
         resp = _post(f"{url}/api/v2/pyfunc", data)
         self._function_id = resp["func"]["id"]
+
+        # Auto-create matching environment if none was explicitly set
+        if self._environment_id is None and self.dependencies:
+            try:
+                env_resp = _post(f"{url}/api/v2/pyenv", {
+                    "name": f"auto_{self.name}",
+                    "python_version": self.python_version,
+                    "dependencies": self.dependencies,
+                })
+                self._environment_id = env_resp["env"]["id"]
+                # Re-register function with the env_id
+                data["env_id"] = self._environment_id
+                _post(f"{url}/api/v2/pyfunc", data)
+                LOGGER.debug(
+                    "Auto-created env %r (id=%d) for function %r",
+                    f"auto_{self.name}", self._environment_id, self.name,
+                )
+            except Exception:
+                pass  # Non-fatal: function still works without dedicated env
+
         self._registered = True
         LOGGER.debug(
             "Registered function %r (id=%d) on %s",
@@ -558,7 +582,7 @@ class DagHandle:
         """
         self._ensure_registered()
         url = _local_url()
-        resp = _post(f"{url}/api/dag/{self._dag_id}/run", initial_args or {})
+        resp = _post(f"{url}/api/v2/dag/{self._dag_id}/run", initial_args or {})
         run = resp["run"]
         return FunctionRun(run["id"], url, self._dag_id)
 
@@ -571,7 +595,7 @@ class DagHandle:
         for h in self.handles:
             h._ensure_registered()
 
-        # Build DAG steps and edges
+        # Build DAG steps and edges using v2 schema field names
         steps: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
         for i, h in enumerate(self.handles):
@@ -580,8 +604,8 @@ class DagHandle:
             steps.append({
                 "id": step_id,
                 "ref": {
-                    "function_id": h._function_id,
-                    "environment_id": h._environment_id,
+                    "func_id": h._function_id,
+                    "env_id": h._environment_id,
                     "node_url": h._node_url,
                     "args": {},
                 },
@@ -602,7 +626,7 @@ class DagHandle:
             "edges": edges,
         }
         url = _local_url()
-        resp = _post(f"{url}/api/dag", data)
+        resp = _post(f"{url}/api/v2/dag", data)
         self._dag_id = resp["dag"]["id"]
         self._registered = True
         LOGGER.debug("Registered DAG %r (id=%d)", self.name, self._dag_id)

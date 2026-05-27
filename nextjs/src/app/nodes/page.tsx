@@ -11,6 +11,8 @@ import {
   getFuncs,
   getUsers,
   getAudit,
+  getDags,
+  getRuns,
   createBackendStream,
 } from "@/lib/api";
 import type {
@@ -21,6 +23,8 @@ import type {
   BackendStreamEvent,
   UserCard,
   AuditEntry,
+  DAGEntry,
+  PyFuncRunEntry,
 } from "@/lib/types";
 
 // ── Helper: convert NodeBackend to NodeMeta for the self card ──
@@ -136,6 +140,8 @@ export default function NodesPage() {
   const [peers, setPeers] = useState<NodeMeta[]>([]);
   const [envs, setEnvs] = useState<PyEnvEntry[]>([]);
   const [funcs, setFuncs] = useState<PyFuncEntry[]>([]);
+  const [dagList, setDagList] = useState<DAGEntry[]>([]);
+  const [activeRuns, setActiveRuns] = useState<PyFuncRunEntry[]>([]);
   const [users, setUsers] = useState<UserCard[]>([]);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [cpuHistory, setCpuHistory] = useState<number[]>([]);
@@ -147,11 +153,13 @@ export default function NodesPage() {
   // ── Initial data fetch ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
     try {
-      const [backendRes, peersRes, envsRes, funcsRes, usersRes, auditRes] = await Promise.allSettled([
+      const [backendRes, peersRes, envsRes, funcsRes, dagsRes, runsRes, usersRes, auditRes] = await Promise.allSettled([
         getBackend(),
         getPeers(),
         getEnvs(),
         getFuncs(),
+        getDags(),
+        getRuns(),
         getUsers(),
         getAudit(),
       ]);
@@ -167,6 +175,8 @@ export default function NodesPage() {
       if (peersRes.status === "fulfilled") setPeers(peersRes.value.peers);
       if (envsRes.status === "fulfilled") setEnvs(envsRes.value.envs);
       if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
+      if (dagsRes.status === "fulfilled") setDagList(dagsRes.value.dags);
+      if (runsRes.status === "fulfilled") setActiveRuns(runsRes.value.runs.filter((r) => r.status === "running"));
       if (usersRes.status === "fulfilled") setUsers(usersRes.value.users);
       if (auditRes.status === "fulfilled") setAuditEntries(auditRes.value.entries);
     } finally {
@@ -313,7 +323,76 @@ export default function NodesPage() {
             color={totalActiveRuns > 0 ? "var(--amber)" : "var(--muted)"}
             pulse={totalActiveRuns > 0}
           />
+          <KpiCard
+            label="DAGs"
+            value={String(dagList.length)}
+            color={dagList.length > 0 ? "var(--frost)" : "var(--muted)"}
+          />
         </div>
+
+        {/* Active Runs — task manager view */}
+        {activeRuns.length > 0 && (
+          <div className="glass-card p-5 space-y-3">
+            <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="5 3 19 12 5 21 5 3" />
+              </svg>
+              Running
+              <span className="relative flex h-2 w-2 ml-1">
+                <span className="absolute inline-flex h-full w-full rounded-full opacity-75" style={{ background: "var(--amber)", animation: "pulse-frost 1.5s ease-in-out infinite" }} />
+                <span className="relative inline-flex rounded-full h-2 w-2" style={{ background: "var(--amber)" }} />
+              </span>
+              <span className="ml-auto text-[10px] font-mono text-foreground-dim">
+                {activeRuns.length}
+              </span>
+            </h2>
+            <div className="space-y-2">
+              {activeRuns.slice(0, 8).map((run) => {
+                const funcName = funcs.find((f) => f.id === run.func_id)?.name ?? `func#${run.func_id}`;
+                const progress = run.progress != null ? run.progress : null;
+                return (
+                  <div key={run.id} className="px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04] space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="relative flex h-1.5 w-1.5">
+                          <span className="absolute inline-flex h-full w-full rounded-full opacity-75" style={{ background: "var(--amber)", animation: "pulse-frost 1.5s ease-in-out infinite" }} />
+                          <span className="relative inline-flex rounded-full h-1.5 w-1.5" style={{ background: "var(--amber)" }} />
+                        </span>
+                        <span className="text-xs font-mono font-medium text-foreground">{funcName}</span>
+                      </div>
+                      <span className="text-[10px] font-mono text-muted">#{run.id}</span>
+                    </div>
+                    <div className="h-1 rounded-full bg-white/[0.06] overflow-hidden">
+                      {progress != null ? (
+                        <div
+                          className="h-full rounded-full transition-all duration-500"
+                          style={{
+                            width: `${Math.min(100, Math.max(0, progress))}%`,
+                            background: "linear-gradient(90deg, var(--amber), var(--amber)cc)",
+                            boxShadow: "0 0 8px var(--amber-glow)",
+                          }}
+                        />
+                      ) : (
+                        <div
+                          className="h-full rounded-full"
+                          style={{
+                            width: "100%",
+                            background: "linear-gradient(90deg, transparent 0%, var(--amber) 50%, transparent 100%)",
+                            backgroundSize: "200% 100%",
+                            animation: "shimmer 1.5s ease-in-out infinite",
+                          }}
+                        />
+                      )}
+                    </div>
+                    {progress != null && (
+                      <p className="text-[10px] font-mono text-muted text-right">{progress.toFixed(0)}%</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Recent Activity */}
         {auditEntries.length > 0 && (

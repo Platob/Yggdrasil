@@ -108,13 +108,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     pyenv = PyEnvService(settings, audit=audit)
     pyfunc = PyFuncService(settings, audit=audit)
     pyfuncrun = PyFuncRunService(settings, pyenv, pyfunc)
-    v2_dag = V2DagService(settings, pyfuncrun)
     backend = BackendService(settings)
     backend.bind_run_counters(
         lambda: pyfuncrun.active_count,
         lambda: pyfuncrun.total_count,
     )
     network = NetworkService(settings, backend)
+    v2_dag = V2DagService(settings, pyfuncrun, network_service=network, backend_service=backend)
     replicate = ReplicateService(settings, pyenv, pyfunc, v2_dag)
     user_svc = UserService(settings)
     v2_messenger = V2MessengerService(settings)
