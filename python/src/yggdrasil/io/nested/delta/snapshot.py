@@ -6,23 +6,11 @@ A snapshot is the table-as-of-a-version:
 - :attr:`metadata`        — schema, partition columns, configuration.
 - :attr:`active_files`    — :class:`AddFile` for every file still alive.
 - :attr:`txns`            — last committed application txn map.
-- :attr:`domain_metadata` — last entry per domain (modern Delta extras).
+- :attr:`domain_metadata` — last entry per domain.
 
-Reduction is: walk the action stream, apply every ``protocol`` /
+Reduction: walk the action stream, apply every ``protocol`` /
 ``metaData`` / ``txn`` to the latest-wins slot, fold ``add`` into the
-active-file map, and fold ``remove`` to drop a path. The order
-:meth:`DeltaLog.replay` delivers actions in (checkpoint first,
-commits in version order, file order within each commit) is the
-spec's required reduction order — there is exactly one consistent
-state at any version.
-
-We don't try to be clever: the active map keeps :class:`AddFile`
-values keyed by ``path``, an ``add`` overwrites a same-path entry
-(recommit-with-new-DV is a real wire shape — Delta updates a DV by
-emitting a remove + add pair, but a same-path readd is also legal),
-and a ``remove`` deletes the entry outright. ``RemoveFile`` actions
-that name a path we never saw are silently dropped — the spec
-explicitly tolerates this for vacuum-tail interleaving.
+active-file map, fold ``remove`` to drop a path.
 """
 
 from __future__ import annotations
@@ -56,8 +44,6 @@ class Snapshot:
     table_root: "Path"
     protocol: Protocol = dataclasses.field(default_factory=Protocol)
     metadata: Optional[Metadata] = None
-    #: Active files keyed by their *table-relative* path. Insertion
-    #: order is preserved so a deterministic replay surface stays.
     active_files: "Dict[str, AddFile]" = dataclasses.field(default_factory=dict)
     txns: "Dict[str, int]" = dataclasses.field(default_factory=dict)
     domain_metadata: "Dict[str, DomainMetadata]" = dataclasses.field(
@@ -72,7 +58,6 @@ class Snapshot:
         *,
         segment: "Optional[LogSegment]" = None,
     ) -> "Snapshot":
-        """Build a snapshot. Pass *segment* to skip the resolution pass."""
         seg = segment or log.segment(version)
         snap = cls(version=seg.version, table_root=log.table_root)
         snap._apply(log.replay(seg))
@@ -108,7 +93,6 @@ class Snapshot:
             else:
                 self.domain_metadata[a.domain] = a
             return
-        # CommitInfo & unknown actions: ignored on purpose.
 
     # ==================================================================
     # Convenience accessors
@@ -128,7 +112,6 @@ class Snapshot:
 
     @property
     def has_deletion_vectors(self) -> bool:
-        """True iff at least one active file carries a DV descriptor."""
         for f in self.active_files.values():
             if f.deletion_vector is not None:
                 return True
@@ -136,6 +119,20 @@ class Snapshot:
 
     def num_active_files(self) -> int:
         return len(self.active_files)
+
+    @property
+    def num_rows_approx(self) -> int:
+        """Approximate row count from file stats (when available)."""
+        total = 0
+        for f in self.active_files.values():
+            if f.stats:
+                import json
+                try:
+                    s = json.loads(f.stats)
+                    total += s.get("numRecords", 0)
+                except Exception:
+                    pass
+        return total
 
     # ==================================================================
     # Pruning helpers
@@ -146,12 +143,6 @@ class Snapshot:
         *,
         prune_values: "Optional[Mapping[str, Iterable]]" = None,
     ) -> "Iterator[AddFile]":
-        """Yield active files whose partition values pass *prune_values*.
-
-        Empty / ``None`` prune dict → yield everything. Per-column
-        ``IN``-set semantics — same shape :class:`Folder` uses
-        for its prune knob, so callers compose without re-mapping.
-        """
         if not prune_values:
             yield from self.active_files.values()
             return
@@ -169,11 +160,6 @@ class Snapshot:
     # ==================================================================
 
     def resolve(self, file: AddFile) -> "Path":
-        """Build the absolute :class:`Path` for an :class:`AddFile`.
-
-        Delta paths are URL-quoted relative paths; :class:`Path`'s
-        joinpath handles the unquote when constructing the URL.
-        """
         return self.table_root / file.path
 
 
@@ -183,18 +169,12 @@ class Snapshot:
 
 
 def _to_str_set(values: "Iterable") -> "frozenset":
-    """Normalize a prune ``IN``-set to strings.
-
-    Delta stores partition values as strings on disk (``"42"`` for an
-    int partition column, ``""`` for null) — comparing the prune set
-    in string-space avoids a coerce-on-every-row overhead.
-    """
     out: list[str] = []
     for v in (
         values if not isinstance(values, (str, bytes, int, float, bool)) else (values,)
     ):
         if v is None:
-            out.append("")  # Hive default — Delta stores None as ""
+            out.append("")
         else:
             out.append(str(v))
     return frozenset(out)

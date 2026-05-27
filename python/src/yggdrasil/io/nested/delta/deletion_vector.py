@@ -1,48 +1,25 @@
 """Deletion-vector encode/decode + Arrow batch masking.
 
-A Delta deletion vector is a serialized roaring bitmap whose bits
-mark the **logical row indices** of a parquet file that have been
-deleted. The reader's job is to read the parquet file as usual, then
-mask out those rows before yielding the batch upstream. The writer's
-job is the mirror: take a set of row indices and emit a descriptor +
-sidecar bytes so a later read drops them.
+A Delta deletion vector is a serialised roaring bitmap whose bits mark
+the **logical row indices** of a parquet file that have been deleted.
 
 Three storage shapes
 --------------------
 
-- ``"i"`` (inline) — the bitmap bytes are Z85-encoded straight into
-  the descriptor's ``pathOrInlineDv``. No sidecar fetch.
-- ``"u"`` (UUID sidecar) — bitmap lives in
-  ``<table>/deletion_vector_<uuid>.bin`` (or, when V2 checkpoint
-  sidecars are involved, under a ``_delta_log/_sidecars/`` directory).
-  ``offset`` + ``sizeInBytes`` window into it; one sidecar can
-  multiplex many DVs.
-- ``"p"`` (absolute path) — rare, table-relative absolute path. We
-  resolve it relative to the table root.
+- ``"i"`` (inline) — Z85-encoded directly in the descriptor.
+- ``"u"`` (UUID sidecar) — ``<table>/deletion_vector_<uuid>.bin``.
+- ``"p"`` (absolute path) — table-relative path.
 
 Bitmap layout
 -------------
 
-For both inline and sidecar shapes, the on-disk envelope is:
+Two envelope shapes:
 
-::
+- Magic 0x01 prefix + 64-bit Roaring ("RoaringBitmapArray").
+- Magic 0x00 prefix + simple list of 64-bit row ids.
 
-    int32 size_in_bytes (big-endian)            ← sidecar only; inline skips this
-    bytes payload[size_in_bytes]                ← format identifier + bitmap data
-    int32 crc32 (big-endian, optional)
-
-The ``payload`` is itself either:
-
-- A magic-byte 0x01 prefix + portable Roaring bitmap (the spec's
-  "RoaringBitmapArray" — one entry per "high 32 bits" key, each
-  holding a portable Roaring bitmap covering the low-32-bit row ids).
-- A magic-byte 0x00 prefix + 64-bit big-endian count + 64-bit big-endian
-  row ids ("BitmapArray" simple format) — used for tiny DVs.
-
-Read path supports both. Write path emits the simple-list shape (the
-small-DV envelope), which is always legal regardless of the table's
-``deletionVectors`` writer feature — it's the format Spark's
-``DeletionVectorStore`` writes for any DV under ~16k rows.
+Read path supports both + bare portable Roaring (no magic).
+Write path emits Roaring for large DVs and simple-list for small ones.
 """
 
 from __future__ import annotations
@@ -74,14 +51,6 @@ __all__ = [
 # Z85 / base85 inline coding
 # ---------------------------------------------------------------------------
 
-# Spec: inline DVs use the "Z85" base85 alphabet (ZeroMQ flavour).
-# Python's stdlib ships :func:`base64.b85decode` (the RFC1924 alphabet)
-# and :func:`base64.a85decode` (Adobe). Z85 differs from RFC1924 by
-# alphabet shuffling, so we do a one-shot translation table on top of
-# :func:`base64.b85decode` / :func:`base64.b85encode`. The table is 1:1
-# — same character set, same padding rules — only the symbol-to-value
-# mapping is permuted.
-
 _Z85_ALPHABET = (
     "0123456789"
     "abcdefghijklmnopqrstuvwxyz"
@@ -105,12 +74,6 @@ _B85_TO_Z85 = bytes.maketrans(
 
 
 def _z85_decode(data: str) -> bytes:
-    """Decode a Z85-encoded string into raw bytes.
-
-    Pure-stdlib path: translate Z85 → b85 alphabet, then hand off to
-    :func:`base64.b85decode`. Z85 length is always a multiple of 5, so
-    no padding handling is needed.
-    """
     if not data:
         return b""
     encoded = data.encode("ascii").translate(_Z85_TO_B85)
@@ -118,73 +81,48 @@ def _z85_decode(data: str) -> bytes:
 
 
 def _z85_encode(data: bytes) -> str:
-    """Encode bytes into a Z85 string. Input must be a multiple of 4."""
     if not data:
         return ""
     if len(data) % 4 != 0:
-        # Pad with zeros and remember the count — the framing layer
-        # handles the trim. The simple-list / roaring envelopes we
-        # produce are always 4-byte aligned (magic + uint64 count +
-        # n*uint64 ids), so we never actually hit this branch.
         raise ValueError(
-            f"_z85_encode requires 4-byte aligned input; got len={len(data)}. "
-            f"DV envelopes are 4-byte aligned by construction — check the caller."
+            f"_z85_encode requires 4-byte aligned input; got len={len(data)}."
         )
     encoded = base64.b85encode(data).translate(_B85_TO_Z85)
     return encoded.decode("ascii")
 
 
 # ---------------------------------------------------------------------------
-# Roaring-bitmap decode — minimal portable subset
+# Roaring-bitmap decode
 # ---------------------------------------------------------------------------
 
-#: Magic prefix on the 64-bit "RoaringBitmapArray" envelope.
-_MAGIC_ROARING_64 = 1681511377  # 0x64426152 — "RaBd" little-endian
-
-#: Magic prefix in the simple-list envelope used for tiny DVs.
+_MAGIC_ROARING_64 = 1681511377  # 0x64426152
 _MAGIC_SIMPLE = 1681511376  # 0x64426150
 
 
 def _read_portable_roaring(buf: memoryview, pos: int) -> "tuple[Set[int], int]":
-    """Decode one *portable* Roaring bitmap starting at *pos*.
-
-    Returns ``(row_ids, new_pos)``. The portable layout is well-defined
-    and small — see the Roaring spec — so a hand-rolled parser is fine
-    here. We don't need rank/select operations, just the row-ids.
-    """
-    # Cookie + container count.
     cookie = struct.unpack_from("<I", buf, pos)[0]
     pos += 4
 
     if (cookie & 0xFFFF) == 0x3B30:
-        # Cookie carries the container count in its high 16 bits.
         n_containers = ((cookie >> 16) & 0xFFFF) + 1
         bitmap_of_runs_size = (n_containers + 7) // 8
         run_flag_bytes = bytes(buf[pos : pos + bitmap_of_runs_size])
         pos += bitmap_of_runs_size
         has_run_flag = True
     else:
-        # Cookie 0x3B31 + 4-byte container count.
         n_containers = struct.unpack_from("<I", buf, pos)[0]
         pos += 4
         run_flag_bytes = b""
         has_run_flag = False
 
-    # Container key + cardinality table.
     key_card: list[tuple[int, int]] = []
     for _ in range(n_containers):
         key, card_minus_one = struct.unpack_from("<HH", buf, pos)
         pos += 4
         key_card.append((key, card_minus_one + 1))
 
-    # Offset table is only present when the run-flag bitmap is absent
-    # *and* the container count is at least :data:`NO_OFFSET_THRESHOLD`
-    # (4) in the spec; for small bitmaps it can be skipped. The format
-    # always emits the offsets in modern bitmaps, but we don't actually
-    # need them — containers are laid out contiguously after the
-    # header, so we just skip the table when present.
-    if not has_run_flag or n_containers >= 4:
-        # Skip 4 bytes per container.
+    # Offset table: present when no-run cookie AND n >= 4
+    if not has_run_flag and n_containers >= 4:
         pos += 4 * n_containers
 
     out: Set[int] = set()
@@ -200,17 +138,14 @@ def _read_portable_roaring(buf: memoryview, pos: int) -> "tuple[Set[int], int]":
             for _ in range(n_runs):
                 start, length = struct.unpack_from("<HH", buf, pos)
                 pos += 4
-                # length is "additional values after start".
                 for v in range(start, start + length + 1):
                     out.add(high | v)
         elif card <= 4096:
-            # Array container: card * uint16 values.
             for _ in range(card):
                 v = struct.unpack_from("<H", buf, pos)[0]
                 pos += 2
                 out.add(high | v)
         else:
-            # Bitmap container: 8192 bytes, one bit per low-16 value.
             for word_idx in range(1024):
                 word = struct.unpack_from("<Q", buf, pos)[0]
                 pos += 8
@@ -227,18 +162,6 @@ def _read_portable_roaring(buf: memoryview, pos: int) -> "tuple[Set[int], int]":
 
 
 def _decode_payload(payload: bytes) -> Set[int]:
-    """Decode the inner ``payload`` of either DV envelope shape.
-
-    Layout:
-        [magic int32 (LE)] [body]
-
-    For the 64-bit Roaring envelope (``_MAGIC_ROARING_64``), the body is
-    a uint64 ``count_of_chunks`` followed by ``count_of_chunks`` records
-    of ``(uint32 high_key, portable_roaring_bitmap)``.
-
-    For the simple envelope (``_MAGIC_SIMPLE``), the body is a uint64
-    ``count`` followed by ``count`` × uint64 row ids.
-    """
     if len(payload) < 4:
         return set()
     mv = memoryview(payload)
@@ -262,61 +185,133 @@ def _decode_payload(payload: bytes) -> Set[int]:
             out.update(high | x for x in sub)
         return out
 
-    # Some Spark writers emit a bare portable-roaring bitmap (no magic).
-    # Probe by treating the first 4 bytes as a Roaring cookie; if the
-    # parse looks plausible (low 16 bits is 0x3B30 / 0x3B31) we accept.
     cookie = magic & 0xFFFF
     if cookie in (0x3B30, 0x3B31):
         sub, _ = _read_portable_roaring(mv, 0)
         return sub
 
-    # Unknown envelope — return empty rather than raise; the higher
-    # level treats DV decode failures as "no rows masked" so the read
-    # path still produces something usable.
     return set()
 
 
 # ---------------------------------------------------------------------------
-# Encode — simple-list envelope (the format we write)
+# Roaring-bitmap encode
 # ---------------------------------------------------------------------------
 
 
-def _encode_simple_payload(row_ids: Iterable[int]) -> bytes:
-    """Pack *row_ids* into the simple-list DV payload.
+def _encode_roaring_payload(row_ids: Iterable[int]) -> bytes:
+    """Encode row IDs into a 64-bit Roaring bitmap envelope.
 
-    Layout (all little-endian):
-        ``int32 magic = _MAGIC_SIMPLE``
-        ``uint64 count``
-        ``uint64 row_id`` × count   (sorted ascending)
-
-    The payload is the bytes a sidecar reader stores after the framing
-    int32-size prefix — :func:`write_uuid_deletion_vector` adds the
-    framing on the way to disk, :func:`encode_inline_deletion_vector`
-    leaves it off (inline DV bytes are the raw payload).
+    Produces the RoaringBitmapArray format (magic 0x64426152) that both
+    Spark and Delta readers understand.
     """
+    rows = sorted(set(int(r) for r in row_ids))
+    if not rows:
+        return struct.pack("<I", _MAGIC_SIMPLE) + struct.pack("<Q", 0)
+
+    # Group by high 32 bits
+    chunks: dict[int, list[int]] = {}
+    for r in rows:
+        hi = (r >> 32) & 0xFFFFFFFF
+        lo = r & 0xFFFFFFFF
+        chunks.setdefault(hi, []).append(lo)
+
+    buf = bytearray()
+    buf += struct.pack("<I", _MAGIC_ROARING_64)
+    buf += struct.pack("<Q", len(chunks))
+
+    for hi_key in sorted(chunks):
+        buf += struct.pack("<I", hi_key)
+        lo_values = sorted(chunks[hi_key])
+        buf += _encode_portable_roaring(lo_values)
+
+    return bytes(buf)
+
+
+def _encode_portable_roaring(values: list[int]) -> bytes:
+    """Encode a set of 32-bit values into a portable Roaring bitmap."""
+    containers: dict[int, list[int]] = {}
+    for v in values:
+        key = (v >> 16) & 0xFFFF
+        low = v & 0xFFFF
+        containers.setdefault(key, []).append(low)
+
+    n_containers = len(containers)
+    sorted_keys = sorted(containers)
+
+    # Use the NO-run cookie: 0x3B31 followed by 4-byte container count.
+    # The reader skips the offset table for this cookie when n < 4,
+    # or reads 4*n bytes of offsets when n >= 4.
+    buf = bytearray()
+    buf += struct.pack("<I", 0x3B31)
+    buf += struct.pack("<I", n_containers)
+
+    for key in sorted_keys:
+        card = len(containers[key])
+        buf += struct.pack("<HH", key, card - 1)
+
+    # Pre-build container data to know offsets
+    container_chunks: list[bytes] = []
+    for key in sorted_keys:
+        vals = sorted(containers[key])
+        card = len(vals)
+        chunk = bytearray()
+        if card <= 4096:
+            for v in vals:
+                chunk += struct.pack("<H", v)
+        else:
+            bitmap = [0] * 1024
+            for v in vals:
+                word_idx = v >> 6
+                bit = v & 63
+                bitmap[word_idx] |= (1 << bit)
+            for word in bitmap:
+                chunk += struct.pack("<Q", word)
+        container_chunks.append(bytes(chunk))
+
+    # Offset table: cumulative byte offsets into the container data region
+    if n_containers >= 4:
+        offset = 0
+        for chunk in container_chunks:
+            buf += struct.pack("<I", offset)
+            offset += len(chunk)
+
+    for chunk in container_chunks:
+        buf += chunk
+    return bytes(buf)
+
+
+# ---------------------------------------------------------------------------
+# Encode — choose between simple and roaring based on cardinality
+# ---------------------------------------------------------------------------
+
+_ROARING_THRESHOLD = 256
+
+
+def _encode_simple_payload(row_ids: Iterable[int]) -> bytes:
     rows = sorted(set(int(r) for r in row_ids))
     body = struct.pack("<I", _MAGIC_SIMPLE) + struct.pack("<Q", len(rows))
     body += b"".join(struct.pack("<Q", r) for r in rows)
     return body
 
 
+def _encode_dv_payload(row_ids: Iterable[int]) -> bytes:
+    """Pick the best encoding for the given row IDs."""
+    rows = sorted(set(int(r) for r in row_ids))
+    if len(rows) <= _ROARING_THRESHOLD:
+        return _encode_simple_payload(rows)
+    return _encode_roaring_payload(rows)
+
+
 def encode_inline_deletion_vector(
     row_ids: Iterable[int],
 ) -> DeletionVectorDescriptor:
-    """Build an inline (Z85-encoded) deletion-vector descriptor.
-
-    Use this only for tiny DVs — the encoded blob lives directly in the
-    log line, so a few hundred deleted rows is the practical ceiling
-    before the JSON commit gets unwieldy. Above that, switch to a
-    sidecar via :func:`write_uuid_deletion_vector`.
-    """
-    payload = _encode_simple_payload(row_ids)
+    payload = _encode_dv_payload(row_ids)
     encoded = _z85_encode(payload)
     return DeletionVectorDescriptor(
         storage_type="i",
         path_or_inline_dv=encoded,
         size_in_bytes=len(payload),
-        cardinality=_count_from_payload(payload),
+        cardinality=_count_rows(row_ids),
     )
 
 
@@ -325,18 +320,7 @@ def write_uuid_deletion_vector(
     *,
     table_root: "Path",
 ) -> DeletionVectorDescriptor:
-    """Emit a UUID-named sidecar holding the DV for *row_ids*.
-
-    Frame: ``int32 size + payload + int32 crc(=0)`` — the spec allows
-    a zero crc, and Spark readers don't verify it. ``offset=0`` and
-    ``sizeInBytes`` covers the inner payload only (post-frame).
-
-    Returns the descriptor a writer should embed in the matching
-    AddFile / RemoveFile action.
-    """
-    from yggdrasil.path.path import Path as _Path  # noqa: F401 — typing only.
-
-    payload = _encode_simple_payload(row_ids)
+    payload = _encode_dv_payload(row_ids)
     framed = struct.pack(">I", len(payload)) + payload + struct.pack(">I", 0)
 
     uid = _uuid.uuid4().hex
@@ -349,13 +333,18 @@ def write_uuid_deletion_vector(
         storage_type="u",
         path_or_inline_dv=uid,
         size_in_bytes=len(payload),
-        cardinality=_count_from_payload(payload),
+        cardinality=_count_rows(row_ids),
         offset=0,
     )
 
 
+def _count_rows(row_ids: Iterable[int]) -> int:
+    if isinstance(row_ids, (set, frozenset, list)):
+        return len(row_ids)
+    return len(set(row_ids))
+
+
 def _count_from_payload(payload: bytes) -> int:
-    """Cheap cardinality lookup — peek the count out of a simple envelope."""
     if len(payload) < 12:
         return 0
     magic = struct.unpack_from("<I", payload, 0)[0]
@@ -374,17 +363,9 @@ def _read_sidecar_window(
     offset: int,
     size: int,
 ) -> bytes:
-    """Read the framed sidecar payload at ``offset`` for ``size`` bytes.
-
-    The framing is: ``int32 size`` + ``payload[size]`` + ``int32 crc``.
-    Some writers emit the payload directly without the size+crc frame
-    (Databricks' ``offset`` already points past the size header). We
-    accept both: if the first 4 bytes look like a sane payload size,
-    we strip it; otherwise we treat the whole window as the payload.
-    """
     with sidecar.open("rb") as bio:
         bio.seek(offset)
-        raw = bio.read(size + 8)  # over-read to capture trailing crc
+        raw = bio.read(size + 8)
     if not raw:
         return b""
 
@@ -392,7 +373,6 @@ def _read_sidecar_window(
         framed_size = struct.unpack(">I", raw[:4])[0]
         if 0 < framed_size <= size:
             return bytes(raw[4 : 4 + framed_size])
-    # Fall back to "the window IS the payload."
     return bytes(raw[:size])
 
 
@@ -418,11 +398,17 @@ class DeletionVector:
         return row in self.deleted_rows
 
     def filter_indices(self, num_rows: int) -> List[int]:
-        """Return the keep-indices for a parquet of ``num_rows`` rows."""
         if not self.deleted_rows:
             return list(range(num_rows))
         deleted = self.deleted_rows
         return [i for i in range(num_rows) if i not in deleted]
+
+    def merge(self, other: "DeletionVector") -> "DeletionVector":
+        """Combine two DVs (union of deleted rows)."""
+        return DeletionVector(
+            descriptor=self.descriptor,
+            deleted_rows=self.deleted_rows | other.deleted_rows,
+        )
 
 
 def decode_deletion_vector(
@@ -431,30 +417,16 @@ def decode_deletion_vector(
     table_root: "Path | None" = None,
     sidecar_cache: "dict[str, bytes] | None" = None,
 ) -> Optional[DeletionVector]:
-    """Decode *descriptor* into a :class:`DeletionVector`.
-
-    ``table_root`` is required for ``"u"`` / ``"p"`` storage shapes —
-    inline DVs decode without any path I/O.
-
-    ``sidecar_cache`` (a caller-supplied dict) lets multiple DVs that
-    share a sidecar file collapse to one read. The :class:`Snapshot`
-    threads one cache through every DV decode for its read pass.
-    """
     if descriptor is None:
         return None
 
     storage = (descriptor.storage_type or "").lower()
 
     if storage == "i":
-        # Inline payload — Z85-encoded. The descriptor's
-        # ``size_in_bytes`` is the *unencoded* size; we decode the
-        # whole string and trust it.
         try:
             raw = _z85_decode(descriptor.path_or_inline_dv)
         except Exception:
             return DeletionVector(descriptor=descriptor)
-        # Inline payloads sometimes ship with the framing prefix and
-        # sometimes without. Strip a leading int32 size if it matches.
         if len(raw) >= 4:
             head = struct.unpack(">I", raw[:4])[0]
             if head + 4 <= len(raw):
@@ -497,13 +469,6 @@ def _resolve_dv_sidecar(
     descriptor: DeletionVectorDescriptor,
     table_root: "Path",
 ) -> "Path | None":
-    """Resolve a UUID / absolute-path DV descriptor to a real sidecar Path.
-
-    UUID storage stores the sidecar at ``<root>/deletion_vector_<uuid>.bin``.
-    A leading single-byte prefix on ``pathOrInlineDv`` (sometimes used
-    by Databricks to encode "where" the sidecar lives — root vs. log
-    sidecars dir) is stripped here.
-    """
     raw = descriptor.path_or_inline_dv or ""
     if not raw:
         return None
@@ -511,11 +476,8 @@ def _resolve_dv_sidecar(
     storage = (descriptor.storage_type or "").lower()
 
     if storage == "p":
-        # Absolute path, table-relative.
         return table_root / raw
 
-    # UUID — strip leading single-char prefix when present (anything
-    # that isn't a uuid hex char).
     uuid_str = raw
     if len(uuid_str) > 0 and not (
         uuid_str[0].isalnum() and uuid_str[0] not in "ghijklmnopqrstuvwxyz"
@@ -533,21 +495,11 @@ def mask_batch_with_dv(
 ) -> "pa.RecordBatch":
     """Drop deleted rows from a single Arrow record batch.
 
-    No-op when ``dv`` is None or empty. ``base_offset`` is the row
-    index of the batch's first row within its parquet file — non-zero
-    when a parquet is read in chunks and the DV's row ids are
-    file-relative.
-
-    Mask construction is vectorised through numpy: a boolean array
-    of size ``n`` (one row per batch position) gets ``False`` written
-    at every in-range deleted offset, and the inverted mask drives a
-    single ``RecordBatch.filter`` kernel — no per-row Python loop
-    even when the DV's deleted set is large.
-
-    Imported lazily to keep the cold module import cheap.
+    Vectorised through numpy for O(|deleted|) cost regardless of
+    batch size.
     """
     import numpy as np
-    import pyarrow as pa  # local — keeps the cold module import cheap.
+    import pyarrow as pa
     import pyarrow.compute as pc
 
     if dv is None or dv.is_empty():
@@ -557,10 +509,6 @@ def mask_batch_with_dv(
         return batch
 
     deleted = dv.deleted_rows
-    # Build the keep-mask vectorised. Materialise the deleted set
-    # into a numpy int64 array once (one Python-side hop, then C
-    # speed everywhere downstream), translate to batch-relative
-    # indices, and drop anything outside ``[0, n)``.
     if not deleted:
         return batch
     del_arr = np.fromiter(deleted, dtype=np.int64, count=len(deleted))
@@ -577,6 +525,5 @@ def mask_batch_with_dv(
     if not keep.any():
         return batch.slice(0, 0)
 
-    # One pyarrow.compute call masks every column in the batch.
     mask = pa.array(keep)
     return pc.filter(batch, mask)

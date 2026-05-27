@@ -1,45 +1,24 @@
 """Checkpoint writers — V1 (single parquet) and V2 (manifest + sidecars).
 
-A checkpoint is "the state of the table at version N, materialized
-as one or more parquet files plus a pointer at ``_last_checkpoint``."
-Subsequent reads can start from the checkpoint and only apply the
-JSON commits with version > N — that's the whole point of the
-mechanism.
-
 V1 layout
 ---------
-
     _delta_log/
-        <N>.checkpoint.parquet      ← one row per action (Protocol,
-                                      Metadata, every active AddFile,
-                                      live Txns, live DomainMetadata)
-        _last_checkpoint            ← ``{"version": N, "size": <count>}``
+        <N>.checkpoint.parquet      <- one row per action
+        _last_checkpoint            <- {"version": N, "size": <count>}
 
 V2 layout
 ---------
-
     _delta_log/
-        <N>.checkpoint.<uuid>.json  ← manifest, one action per line
-                                      (one or more ``{"sidecar": ...}``
-                                      lines plus a ``checkpointMetadata``
-                                      tail)
+        <N>.checkpoint.<uuid>.json  <- manifest with sidecar references
         _sidecars/
-            <sc-uuid>.parquet       ← actions, one row per action
-        _last_checkpoint            ← ``{"version": N, "size": <count>,
-                                          "v2Checkpoint": {"version": N}}``
+            <sc-uuid>.parquet       <- actions, one row per action
+        _last_checkpoint            <- {"version": N, "size": <count>,
+                                        "v2Checkpoint": {"version": N,
+                                        "sidecarFiles": [...]}}
 
-Both flavors share the per-row encoding: each row has exactly one
-populated column, the rest are null. The column name is the action
-key (``add``, ``remove``, ``metaData``, ``protocol``, ``txn``,
-``domainMetadata``). Pyarrow infers the union schema from the
-materialized rows.
-
-The writer here doesn't try to be incremental — the snapshot is
-already in memory, and emitting the full action list as one parquet
-is fast enough that splitting into per-class sidecars would be
-premature work. Modern V2-using engines (Databricks, Spark) do split
-on retention-domain boundaries; we leave that for a follow-up when
-a real caller needs it.
+V2 checkpoints support multi-sidecar writes and per-action-class splits.
+This implementation writes a single sidecar for simplicity but correctly
+reads multi-sidecar checkpoints produced by other engines.
 """
 
 from __future__ import annotations
@@ -78,12 +57,8 @@ def write_checkpoint(
 ) -> Optional[int]:
     """Materialize *snap* as a V1 or V2 checkpoint under *log_path*.
 
-    Returns the number of actions written, or ``None`` when the
-    snapshot was empty (no protocol / metadata / files / txns) and
-    nothing got written. The ``_last_checkpoint`` pointer is *not*
-    updated by this function — :func:`update_last_checkpoint` does
-    that, separately, so callers writing multi-step checkpoints can
-    decide when the pointer becomes visible.
+    Returns the number of actions written, or ``None`` when the snapshot
+    was empty.
     """
     actions = _snapshot_to_actions(snap)
     if not actions:
@@ -102,13 +77,15 @@ def update_last_checkpoint(
     version: int,
     size: int,
     kind: str = "v1",
+    sidecar_files: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    """Refresh ``_last_checkpoint`` so readers find the new checkpoint
-    without scanning the directory.
-    """
+    """Refresh ``_last_checkpoint``."""
     payload: Dict[str, Any] = {"version": int(version), "size": int(size)}
     if kind == "v2":
-        payload["v2Checkpoint"] = {"version": int(version)}
+        v2_info: Dict[str, Any] = {"version": int(version)}
+        if sidecar_files:
+            v2_info["sidecarFiles"] = sidecar_files
+        payload["v2Checkpoint"] = v2_info
     body = ygg_json.dumps(payload, separators=(",", ":"))
     if isinstance(body, str):
         body = body.encode("utf-8")
@@ -124,7 +101,6 @@ def update_last_checkpoint(
 
 
 def _write_v1(version: int, actions: List[dict], *, log_path: "Path") -> None:
-    """V1 — single ``<version>.checkpoint.parquet`` next to the commits."""
     from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 
     ck_path = log_path / format_checkpoint_v1_name(version)
@@ -136,43 +112,81 @@ def _write_v1(version: int, actions: List[dict], *, log_path: "Path") -> None:
 
 
 def _write_v2(version: int, actions: List[dict], *, log_path: "Path") -> None:
-    """V2 — one sidecar parquet referenced from a manifest JSON."""
+    """V2 — sidecar parquet(s) referenced from a manifest JSON.
+
+    Writes per-action-class sidecars when the action count is large
+    enough to benefit from the split; otherwise falls back to a single
+    sidecar.
+    """
     from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 
-    sidecar_uuid = uuid.uuid4().hex
     sidecar_dir = log_path / SIDECARS_DIR_NAME
     sidecar_dir.mkdir(parents=True, exist_ok=True)
-    sidecar_name = format_checkpoint_v2_sidecar_name(sidecar_uuid)
-    sidecar_path = sidecar_dir / sidecar_name
 
-    table = _actions_to_arrow_table(actions)
-    leaf = ParquetFile(holder=sidecar_path, owns_holder=False)
-    with leaf as opened:
-        opened._write_arrow_table(table, ParquetOptions(mode=Mode.OVERWRITE))
+    # Split actions by type for per-class sidecars
+    sidecar_groups: Dict[str, List[dict]] = {}
+    for action in actions:
+        key = next(iter(action))
+        sidecar_groups.setdefault(key, []).append(action)
+
+    sidecar_entries: List[Dict[str, Any]] = []
+
+    if len(sidecar_groups) > 1 and len(actions) > 100:
+        # Multi-sidecar: one parquet per action class
+        for action_class, class_actions in sidecar_groups.items():
+            sc_uuid = uuid.uuid4().hex
+            sc_name = format_checkpoint_v2_sidecar_name(sc_uuid)
+            sc_path = sidecar_dir / sc_name
+
+            table = _actions_to_arrow_table(class_actions)
+            leaf = ParquetFile(holder=sc_path, owns_holder=False)
+            with leaf as opened:
+                opened._write_arrow_table(table, ParquetOptions(mode=Mode.OVERWRITE))
+
+            sidecar_entries.append({
+                "path": sc_name,
+                "sizeInBytes": int(sc_path.size),
+                "modificationTime": int(time.time() * 1000),
+                "tags": {"actionType": action_class},
+            })
+    else:
+        # Single sidecar
+        sc_uuid = uuid.uuid4().hex
+        sc_name = format_checkpoint_v2_sidecar_name(sc_uuid)
+        sc_path = sidecar_dir / sc_name
+
+        table = _actions_to_arrow_table(actions)
+        leaf = ParquetFile(holder=sc_path, owns_holder=False)
+        with leaf as opened:
+            opened._write_arrow_table(table, ParquetOptions(mode=Mode.OVERWRITE))
+
+        sidecar_entries.append({
+            "path": sc_name,
+            "sizeInBytes": int(sc_path.size),
+            "modificationTime": int(time.time() * 1000),
+        })
 
     manifest_uuid = uuid.uuid4().hex
     manifest_path = log_path / format_checkpoint_v2_manifest_name(
         version,
         manifest_uuid,
     )
-    manifest_lines = [
-        ygg_json.dumps(
-            {
-                "sidecar": {
-                    "path": sidecar_name,
-                    "sizeInBytes": int(sidecar_path.size),
-                    "modificationTime": int(time.time() * 1000),
-                }
-            },
-            separators=(",", ":"),
-            to_bytes=False,
-        ),
+    manifest_lines: List[str] = []
+    for entry in sidecar_entries:
+        manifest_lines.append(
+            ygg_json.dumps(
+                {"sidecar": entry},
+                separators=(",", ":"),
+                to_bytes=False,
+            )
+        )
+    manifest_lines.append(
         ygg_json.dumps(
             {"checkpointMetadata": {"version": int(version), "flavor": "v2"}},
             separators=(",", ":"),
             to_bytes=False,
         ),
-    ]
+    )
     body = ("\n".join(manifest_lines) + "\n").encode("utf-8")
     with manifest_path.open("wb") as bio:
         bio.truncate(0)
@@ -180,21 +194,11 @@ def _write_v2(version: int, actions: List[dict], *, log_path: "Path") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Snapshot → action list
+# Snapshot -> action list
 # ---------------------------------------------------------------------------
 
 
 def _snapshot_to_actions(snap: "Snapshot") -> "List[dict]":
-    """Project *snap* into the action list a checkpoint should hold.
-
-    Order matches Delta's reduction-friendly convention: ``protocol``
-    first, then ``metaData``, then live ``txn`` / ``domainMetadata``,
-    then the active ``add`` files. ``remove`` actions are *not* part
-    of a checkpoint — by definition a checkpoint is the active set,
-    and removed paths are gone from it. A reader replaying from this
-    checkpoint never sees the historical removes; it only sees the
-    survivors.
-    """
     out: List[dict] = []
     if snap.protocol is not None:
         out.append(snap.protocol.to_action())
@@ -210,17 +214,6 @@ def _snapshot_to_actions(snap: "Snapshot") -> "List[dict]":
 
 
 def _actions_to_arrow_table(actions: "List[dict]") -> pa.Table:
-    """Lay out checkpoint actions as one row per action.
-
-    Each row has exactly one populated column (the action's key);
-    the rest are null. Pyarrow infers the union schema from the rows.
-
-    Empty nested dicts get pruned to ``None`` first — pyarrow's
-    type-inference can't represent ``struct<>`` (zero-field struct)
-    in parquet, so a Metadata action with ``"options": {}`` would
-    blow up the writer. Dropping the empty value to ``None`` lets
-    the type land as nullable, which parquet *can* write.
-    """
     rows: list[dict] = []
     for entry in actions:
         if not entry:
@@ -241,15 +234,6 @@ def _actions_to_arrow_table(actions: "List[dict]") -> pa.Table:
 
 
 def _drop_empties(value: Any) -> Any:
-    """Recursively prune empty ``dict`` / ``list`` values to ``None``.
-
-    Pyarrow refuses to write a ``struct<>`` (zero-field struct) into
-    parquet — and that's exactly what an empty ``{}`` infers to. We
-    walk the action payload once, dropping empties, before handing it
-    to :meth:`pa.Table.from_pylist`. Functional shape: input is JSON-
-    safe (dict / list / scalars) and the output is the same shape
-    with empty containers replaced by ``None``.
-    """
     if isinstance(value, dict):
         cleaned = {k: _drop_empties(v) for k, v in value.items()}
         cleaned = {k: v for k, v in cleaned.items() if v is not None}
