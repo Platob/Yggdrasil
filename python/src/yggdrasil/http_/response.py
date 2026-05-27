@@ -1646,7 +1646,13 @@ class HTTPResponse(IO):  # IO inherits Tabular
             response_headers[k] = f"{existing}, {v}" if existing is not None else v
 
         encoding = response_headers.get("Content-Encoding") if decode_content else None
-        buffer = MemoryStream(source=raw.read, content_encoding=encoding)
+        from yggdrasil.http_.stream import HTTPStream
+        buffer = HTTPStream(
+            source=raw.read,
+            content_encoding=encoding,
+            request=request,
+            session=session,
+        )
 
         pre_media = _media_type_from_headers(response_headers)
         if pre_media is not None and buffer.media_type is None:
