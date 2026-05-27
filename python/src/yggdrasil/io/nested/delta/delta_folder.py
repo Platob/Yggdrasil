@@ -1224,10 +1224,13 @@ def _is_stats_eligible(arrow_type: pa.DataType) -> bool:
 def _stats_value(val: Any) -> Any:
     """Coerce a stats value to a JSON-safe type."""
     import datetime
+    import decimal
     if isinstance(val, (datetime.date, datetime.datetime)):
         return val.isoformat()
     if isinstance(val, bytes):
         return val.hex()
+    if isinstance(val, decimal.Decimal):
+        return str(val)
     return val
 
 
