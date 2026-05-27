@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import atexit
 import datetime as dt
 import logging
+import os
 import pathlib
-from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
+import threading
+import time
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Mapping, MutableMapping, Optional
 
 from yggdrasil.data.cast import any_to_timedelta
 from yggdrasil.execution.expr import Predicate
@@ -16,6 +20,75 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_CACHE_ROOT: pathlib.Path = pathlib.Path.home() / ".cache" / "http" / "response"
+
+
+# ---------------------------------------------------------------------------
+# Local cache cleanup daemon — runs once per process
+# ---------------------------------------------------------------------------
+
+_CLEANUP_STARTED: bool = False
+_CLEANUP_LOCK: threading.Lock = threading.Lock()
+
+
+def _cleanup_local_cache(
+    root: pathlib.Path,
+    max_age: dt.timedelta = dt.timedelta(days=1),
+) -> None:
+    """Delete files older than *max_age* under *root*, then prune empty dirs."""
+    if not root.is_dir():
+        return
+    cutoff = time.time() - max_age.total_seconds()
+    removed_files = 0
+    removed_dirs = 0
+    for dirpath, dirnames, filenames in os.walk(str(root), topdown=False):
+        dp = pathlib.Path(dirpath)
+        for fname in filenames:
+            fp = dp / fname
+            try:
+                if fp.stat().st_mtime < cutoff:
+                    fp.unlink()
+                    removed_files += 1
+            except OSError:
+                pass
+        try:
+            if dp != root and not any(dp.iterdir()):
+                dp.rmdir()
+                removed_dirs += 1
+        except OSError:
+            pass
+    if removed_files or removed_dirs:
+        LOGGER.info(
+            "Cache cleanup: removed %d file(s) and %d empty dir(s) under %s",
+            removed_files, removed_dirs, root,
+        )
+
+
+def _start_cleanup_daemon(
+    root: pathlib.Path = _DEFAULT_CACHE_ROOT,
+    max_age: dt.timedelta = dt.timedelta(days=1),
+) -> None:
+    """Start the cleanup daemon if it hasn't been started yet.
+
+    Runs once immediately in a daemon thread, then exits. Called
+    lazily from :meth:`CacheConfig.cache_tabular` so the thread is
+    only spawned when the local cache is actually used.
+    """
+    global _CLEANUP_STARTED
+    if _CLEANUP_STARTED:
+        return
+    with _CLEANUP_LOCK:
+        if _CLEANUP_STARTED:
+            return
+        _CLEANUP_STARTED = True
+
+    def _run():
+        try:
+            _cleanup_local_cache(root, max_age)
+        except Exception:
+            LOGGER.debug("Cache cleanup failed", exc_info=True)
+
+    t = threading.Thread(target=_run, name="ygg-cache-cleanup", daemon=True)
+    t.start()
 
 
 MATCH_COLUMN: str = "request_public_hash"
@@ -375,6 +448,9 @@ class CacheConfig:
         if self.tabular is not None:
             return self.tabular
         from yggdrasil.path.folder import Folder
+
+        if self.cleanup_ttl is not None:
+            _start_cleanup_daemon(_DEFAULT_CACHE_ROOT, self.cleanup_ttl)
 
         tabular = Folder(path=self.local_cache_folder(session=session))
         # Stash the built folder back on the config so subsequent
