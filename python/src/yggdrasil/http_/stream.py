@@ -41,7 +41,7 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 _COMPRESS_THRESHOLD = 4 * 1024 * 1024   # 4 MiB
-_MAX_PICKLE_SIZE = 128 * 1024 * 1024    # 128 MiB
+_MAX_PICKLE_SIZE = 4 * 1024 * 1024      # 4 MiB
 
 
 class HTTPStream(MemoryStream):
