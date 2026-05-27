@@ -142,7 +142,7 @@ class TestCancel:
 
     def test_fires_cancel_when_running(self) -> None:
         r = _result_in_state(StatementState.RUNNING)
-        r.cancel(wait=True)
+        r.cancel(wait=False)
         r.executor.client.workspace_client.return_value\
             .statement_execution.cancel_execution.assert_called_once_with(
                 statement_id="stmt-1",
