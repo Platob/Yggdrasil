@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Globe } from "@/components/Globe";
+import { YggLogoIcon } from "@/components/YggLogo";
 import { getNodeCard } from "@/lib/api";
 import type { NodeCard } from "@/lib/types";
 
@@ -53,6 +54,9 @@ export default function WelcomePage() {
       <div className="absolute inset-0 z-20 flex flex-col items-center justify-center pointer-events-none">
         {/* Title */}
         <div className="text-center space-y-4 float">
+          <div className="flex justify-center mb-2">
+            <YggLogoIcon size={72} />
+          </div>
           <h1
             className="text-6xl md:text-7xl font-bold tracking-[0.3em] uppercase"
             style={{
