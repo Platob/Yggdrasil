@@ -496,12 +496,16 @@ class Session(Singleton, ABC):
 
     @property
     def job_pool(self) -> JobPoolExecutor:
-        if self._job_pool is None:
-            with self._lock:
-                if self._job_pool is None:
-                    self._job_pool = JobPoolExecutor(max_workers=self.pool_maxsize)
-                    LOGGER.debug("Created job pool with max_workers=%s", self.pool_maxsize)
-        return self._job_pool
+        pool = self._job_pool
+        if pool is None:
+            pool = JobPoolExecutor(max_workers=self.pool_maxsize)
+            if self._job_pool is None:
+                self._job_pool = pool
+                LOGGER.debug("Created job pool with max_workers=%s", self.pool_maxsize)
+            else:
+                pool.shutdown(wait=False)
+                pool = self._job_pool
+        return pool
 
     def local_cache(self) -> "Folder":
         """Return the session-scoped local cache folder, creating the directory on first access.
@@ -942,12 +946,20 @@ class HTTPSession(Session):
         port: int,
         connect_timeout: Optional[float],
     ) -> http.client.HTTPConnection:
-        """Pop an idle connection for *(scheme, host, port)* or build one."""
+        """Pop an idle connection for *(scheme, host, port)* or build one.
+
+        Lock-free: ``collections.deque.popleft`` is atomic under CPython's
+        GIL, so the hot path (pooled-connection reuse) never blocks.  A
+        concurrent ``_release_connection`` that appends to the same deque
+        races harmlessly — worst case we build one extra connection.
+        """
         key = (scheme, host, port)
-        with self._lock:
-            cached = self._connections.get(key)
-            if cached:
+        cached = self._connections.get(key)
+        if cached:
+            try:
                 return cached.popleft()
+            except IndexError:
+                pass
         return self._build_connection(scheme, host, port, connect_timeout)
 
     def _release_connection(
@@ -960,16 +972,23 @@ class HTTPSession(Session):
         Called by :meth:`HTTPResponse.release_conn` after a response is
         fully drained. Connections beyond ``pool_maxsize`` get closed
         instead of cached so a runaway caller can't leak sockets.
+
+        Lock-free: ``deque.append`` is GIL-atomic.  The ``len`` check
+        is a racy approximation — worst case the deque grows slightly
+        past ``pool_maxsize``, which is harmless (one extra idle socket
+        that gets reaped on the next overshoot or ``clear_connections``).
         """
-        with self._lock:
-            cached = self._connections.setdefault(key, collections.deque())
-            if len(cached) < self.pool_maxsize:
-                cached.append(conn)
-                return
-        try:
-            conn.close()
-        except Exception:
-            pass
+        cached = self._connections.get(key)
+        if cached is None:
+            cached = collections.deque()
+            self._connections[key] = cached
+        if len(cached) < self.pool_maxsize:
+            cached.append(conn)
+        else:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def clear_connections(self) -> None:
         """Close every cached idle connection.
@@ -978,9 +997,8 @@ class HTTPSession(Session):
         accumulated. Not called automatically; explicit cleanup is the
         caller's responsibility (or rely on process exit).
         """
-        with self._lock:
-            cached, self._connections = self._connections, {}
-        for queue in cached.values():
+        old, self._connections = self._connections, {}
+        for queue in old.values():
             while queue:
                 try:
                     queue.popleft().close()
