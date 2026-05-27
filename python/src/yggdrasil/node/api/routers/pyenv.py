@@ -1,15 +1,23 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Any
 
-from ..deps import get_pyenv_service
+from fastapi import APIRouter, Depends
+from pydantic import Field
+
+from ..deps import get_pyenv_service, get_pyfunc_service, get_pyfuncrun_service
+from ..schemas.common import StrictModel
 from ..schemas.pyenv import (
     PyEnvCreate,
     PyEnvListResponse,
     PyEnvResponse,
     PyEnvUpdate,
 )
+from ..schemas.pyfunc import PyFuncCreate
+from ..schemas.pyfuncrun import PyFuncRunCreate, PyFuncRunResponse
 from ..services.pyenv import PyEnvService
+from ..services.pyfunc import PyFuncService
+from ..services.pyfuncrun import PyFuncRunService
 
 router = APIRouter(tags=["pyenv"])
 
@@ -53,3 +61,40 @@ async def delete_env(
     service: PyEnvService = Depends(get_pyenv_service),
 ) -> PyEnvResponse:
     return await service.delete(env_id)
+
+
+class _EnvRunRequest(StrictModel):
+    """Run code directly in a specific environment."""
+    code: str
+    args: list[Any] = Field(default_factory=list)
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    timeout: float | None = None
+    max_memory_mb: int | None = None
+
+
+@router.post("/{env_id}/run", response_model=PyFuncRunResponse)
+async def run_in_env(
+    env_id: int,
+    req: _EnvRunRequest,
+    pyenv: PyEnvService = Depends(get_pyenv_service),
+    pyfunc: PyFuncService = Depends(get_pyfunc_service),
+    pyfuncrun: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> PyFuncRunResponse:
+    """Execute code in a specific environment. Creates a temporary PyFunc, runs it, returns the run."""
+    # Validate env exists
+    await pyenv.get(env_id)
+    # Create an ephemeral function for this code
+    import time
+    func_resp = await pyfunc.create(PyFuncCreate(
+        name=f"_env_run_{env_id}_{int(time.monotonic() * 1000)}",
+        code=req.code,
+    ))
+    create_req = PyFuncRunCreate(
+        func_id=func_resp.func.id,
+        env_id=env_id,
+        args=list(req.args),
+        kwargs=dict(req.kwargs),
+        timeout=req.timeout,
+        max_memory_mb=req.max_memory_mb,
+    )
+    return await pyfuncrun.create(create_req)

@@ -16,16 +16,6 @@ class PyFuncRunCreate(StrictModel):
     max_memory_mb: int | None = None
 
 
-class PyFuncRunSubmit(StrictModel):
-    """Submit a run by function name instead of ID."""
-    func_name: str
-    env_id: int | None = None
-    args: list[Any] = Field(default_factory=list)
-    kwargs: dict[str, Any] = Field(default_factory=dict)
-    timeout: float | None = None
-    max_memory_mb: int | None = None
-
-
 class PyFuncRunEntry(StrictModel):
     id: int
     func_id: int
