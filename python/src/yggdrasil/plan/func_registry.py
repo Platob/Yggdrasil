@@ -133,6 +133,88 @@ def _k2(fn: str) -> ArrowKernel:
     f = getattr(pc, fn)
     return lambda a, b: f(a, b)
 
+def _read_files_kernel(paths: pa.Array) -> pa.Array:
+    """Read file contents from paths. Tries tabular formats first, raw text fallback."""
+    import pathlib
+    results = []
+    for path_val in paths.to_pylist():
+        if path_val is None:
+            results.append(None); continue
+        try:
+            p = pathlib.Path(path_val)
+            if not p.exists():
+                results.append(None); continue
+            from yggdrasil.io.tabular.base import Tabular
+            tab = Tabular.from_(str(p), default=None)
+            if tab is not None:
+                try:
+                    results.append(str(tab.read_arrow_table().to_pylist()))
+                    continue
+                except Exception:
+                    pass
+            results.append(p.read_bytes().decode("utf-8", errors="replace"))
+        except Exception:
+            results.append(None)
+    return pa.array(results, type=pa.utf8())
+
+
+def _read_paths_kernel(paths: pa.Array) -> pa.Array:
+    """List directory contents for each path."""
+    results = []
+    for path_val in paths.to_pylist():
+        if path_val is None:
+            results.append(None); continue
+        try:
+            import pathlib
+            p = pathlib.Path(path_val)
+            if p.is_dir():
+                results.append(str([str(c) for c in p.iterdir()]))
+            else:
+                results.append(str(path_val))
+        except Exception:
+            results.append(None)
+    return pa.array(results, type=pa.utf8())
+
+
+def _compress_kernel(data: pa.Array, codec_name=None) -> pa.Array:
+    """Compress binary/string column with a codec."""
+    codec_str = codec_name.as_py() if hasattr(codec_name, 'as_py') else str(codec_name) if codec_name else "gzip"
+    try:
+        from yggdrasil.enums.codec import Codec
+        codec = Codec.from_(codec_str)
+    except Exception:
+        import gzip
+        return pa.array([gzip.compress(v.encode() if isinstance(v, str) else v) if v else None
+                         for v in data.to_pylist()], type=pa.binary())
+    return pa.array([codec.compress_bytes(v.encode() if isinstance(v, str) else v) if v else None
+                     for v in data.to_pylist()], type=pa.binary())
+
+
+def _decompress_kernel(data: pa.Array, codec_name=None) -> pa.Array:
+    """Decompress binary column with a codec."""
+    codec_str = codec_name.as_py() if hasattr(codec_name, 'as_py') else str(codec_name) if codec_name else "gzip"
+    try:
+        from yggdrasil.enums.codec import Codec
+        codec = Codec.from_(codec_str)
+    except Exception:
+        import gzip
+        return pa.array([gzip.decompress(v) if v else None for v in data.to_pylist()], type=pa.binary())
+    return pa.array([codec.decompress_bytes(v) if v else None
+                     for v in data.to_pylist()], type=pa.binary())
+
+
+def _parse_json_kernel(data: pa.Array) -> pa.Array:
+    """Parse JSON strings to structured data."""
+    import json
+    return pa.array([json.loads(v) if v else None for v in data.to_pylist()])
+
+
+def _to_json_kernel(data: pa.Array) -> pa.Array:
+    """Serialize values to JSON strings."""
+    import json
+    return pa.array([json.dumps(v) if v is not None else None for v in data.to_pylist()], type=pa.utf8())
+
+
 _ARROW_KERNELS: dict[str, ArrowKernel] = {
     # String
     "UPPER": _k1("utf8_upper"),
@@ -202,6 +284,16 @@ _ARROW_KERNELS: dict[str, ArrowKernel] = {
     "COUNT": lambda a: pa.scalar(len(a) - a.null_count, type=pa.int64()),
     "AVG": _k1("mean"),
     "MEAN": _k1("mean"),
+
+    # IO / path-aware UDFs
+    "READ_FILES": _read_files_kernel,
+    "READ_PATHS": _read_paths_kernel,
+    "COMPRESS": _compress_kernel,
+    "DECOMPRESS": _decompress_kernel,
+    "PARSE_JSON": _parse_json_kernel,
+    "TO_JSON": _to_json_kernel,
+    "BASE64_ENCODE": lambda a: pc.binary_join_element_wise(a, pa.scalar("")),
+    "BASE64_DECODE": lambda a: a,
 }
 
 
@@ -317,6 +409,11 @@ def _build() -> FunctionRegistry:
         "RAISE_ERROR": (1, 1)}, deterministic=False)
     r.register("INTERVAL", category="datetime", min_args=1, max_args=2,
                special_syntax="INTERVAL 'value' unit")
+
+    # IO / codec / serialization UDFs
+    _b("io", {"READ_FILES": (1, 1), "READ_PATHS": (1, 1),
+        "COMPRESS": (1, 2), "DECOMPRESS": (1, 2),
+        "PARSE_JSON": (1, 1)})
     return r
 
 

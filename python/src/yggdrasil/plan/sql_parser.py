@@ -437,19 +437,20 @@ class SQLQueryParser:
 
     def _parse_from_item(self) -> Any:
         if self.cur.kind == "lparen":
-            # Subquery or parenthesized from
             self._eat()
             if self._is_kw("SELECT", "WITH"):
                 sub = self._parse_statement()
                 self._expect_kind("rparen")
                 alias = self._parse_optional_alias()
                 return SubqueryRef(plan=sub, alias=alias or "_subquery")
-            # Parenthesized expression in FROM — re-parse
             inner = self._parse_from_clause()
             self._expect_kind("rparen")
-            alias = self._parse_optional_alias()
             return inner
-        # Table reference: [catalog.][schema.]table [alias]
+        # String literal as path/URL source: FROM '/path/to/file.parquet'
+        if self.cur.kind == "string":
+            path = self._eat().text
+            alias = self._parse_optional_alias()
+            return TableRef(name=path, alias=alias)
         return self._parse_table_ref()
 
     def _parse_table_ref(self) -> TableRef:

@@ -44,11 +44,30 @@ def _exec(node: PlanNode, tables: dict[str, "Tabular"]) -> "Tabular":
     raise NotImplementedError(f"Cannot execute {type(node).__name__}")
 
 
-def _resolve_from(item: Any, tables: dict[str, "Tabular"]) -> "Tabular":
+def _resolve_from(item: Any, tables: dict[str, "Tabular"], predicate: Any = None) -> "Tabular":
     if isinstance(item, TableRef):
-        if item.name in tables:
-            return tables[item.name]
-        raise ValueError(f"Table {item.name!r} not found. Available: {sorted(tables)}")
+        name = item.name
+        # Qualified names: try catalog.schema.table, schema.table, table
+        full = ".".join(filter(None, [item.catalog, item.schema, name]))
+        for key in (full, f"{item.schema}.{name}" if item.schema else None, name):
+            if key and key in tables:
+                result = tables[key]
+                # Push predicate into I/O-backed sources
+                if predicate is not None and not _is_in_memory(result):
+                    try:
+                        opts = result.check_options(None, overrides={"predicate": predicate})
+                        return result.read_arrow_tabular(opts)
+                    except Exception:
+                        pass
+                return result
+        # Auto-resolve URLs/paths as tabular sources
+        from yggdrasil.io.tabular.base import is_tabular_source, Tabular as _Tab
+        if is_tabular_source(name) or is_tabular_source(full):
+            resolved = _Tab.from_(full if is_tabular_source(full) else name, default=None)
+            if resolved is not None:
+                tables[name] = resolved
+                return resolved
+        raise ValueError(f"Table {name!r} not found. Available: {sorted(tables)}")
     if isinstance(item, SubqueryRef):
         return _exec(item.plan, tables)
     if isinstance(item, JoinClause):
@@ -56,6 +75,11 @@ def _resolve_from(item: Any, tables: dict[str, "Tabular"]) -> "Tabular":
     if isinstance(item, PlanNode):
         return _exec(item, tables)
     raise TypeError(f"Cannot resolve FROM item: {type(item).__name__}")
+
+
+def _is_in_memory(t: "Tabular") -> bool:
+    from yggdrasil.arrow.tabular import ArrowTabular
+    return isinstance(t, ArrowTabular)
 
 
 def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
@@ -67,8 +91,9 @@ def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
         for cte in node.ctes:
             tables[cte.name] = _exec(cte.plan, tables)
 
-    # FROM
-    result: "Tabular | None" = _resolve_from(node.from_clause, tables) if node.from_clause else None
+    # FROM — push predicate to source when no joins (enables partition pruning)
+    pushable_pred = node.where if (node.where and not isinstance(node.from_clause, JoinClause)) else None
+    result: "Tabular | None" = _resolve_from(node.from_clause, tables, predicate=pushable_pred) if node.from_clause else None
     if result is None:
         row = {}
         for p in (node.projections or []):
@@ -221,6 +246,24 @@ def _exec_join(jc: JoinClause, tables: dict[str, "Tabular"]) -> "Tabular":
                     left_keys.append(ln); right_keys.append(ln)
 
     if left_keys and right_keys:
+        # Auto-cast mismatched join key types
+        for lk, rk in zip(left_keys, right_keys):
+            lt, rt = left_table.schema.field(lk).type, right_table.schema.field(rk).type
+            if lt != rt:
+                try:
+                    target = pa.lib.unify_schemas([
+                        pa.schema([(lk, lt)]), pa.schema([(rk, rt)])
+                    ]).field(0).type
+                except Exception:
+                    target = pa.utf8()
+                if left_table.schema.field(lk).type != target:
+                    left_table = left_table.set_column(
+                        left_table.column_names.index(lk), lk,
+                        left_table.column(lk).cast(target))
+                if right_table.schema.field(rk).type != target:
+                    right_table = right_table.set_column(
+                        right_table.column_names.index(rk), rk,
+                        right_table.column(rk).cast(target))
         kw = {"keys": left_keys, "join_type": jc.join_type.arrow}
         if left_keys != right_keys:
             kw["right_keys"] = right_keys
