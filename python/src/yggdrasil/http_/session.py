@@ -1683,10 +1683,10 @@ class HTTPSession(Session):
         # rotated upstream. Only worth retrying when an auth handler
         # is actually bound — otherwise the second attempt would
         # carry the same headers and 403 again.
-        if result.status_code == 403 and (request.auth or self.auth) is not None:
+        if result.status_code in (401, 403) and (request.auth or self.auth) is not None:
             LOGGER.warning(
-                "Refreshing auth after 403 for %s %s — retrying once",
-                request.method, request.url,
+                "Refreshing auth after %d for %s %s — retrying once",
+                result.status_code, request.method, request.url,
             )
             _, refreshed = self.refresh_auth(request)  # force=True default
             if refreshed:
