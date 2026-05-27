@@ -9,9 +9,8 @@ the workspace's serverless / classic compute with the right auth, deps,
 and warehouse routing.
 
 This subclass plugs that in on the ``create=True`` branch and is the
-default ``SQLEngine.spark`` executor. The cluster-bound counterparts
-(:class:`ServerlessClusterStatementExecutor`,
-:class:`ClusterStatementExecutor`) keep their own ``cluster.client.spark()``
+default ``SQLEngine.spark`` executor. The cluster-bound
+:class:`ClusterStatementExecutor` keeps its own ``cluster.client.spark()``
 override since the cluster id participates in the session builder.
 """
 from __future__ import annotations

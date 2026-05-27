@@ -1,33 +1,22 @@
 """Delta transaction-log action types.
 
-Every line of a Delta JSON commit (``00000000000000000007.json``) is
-exactly one action — a dict with a single top-level key naming the
-action type. The same shapes appear inside parquet checkpoints, just
-expanded into typed columns.
+Every line of a Delta JSON commit is exactly one action — a dict with
+a single top-level key naming the action type. The same shapes appear
+inside parquet checkpoints, expanded into typed columns.
 
-We model the actions that drive replay (``protocol``, ``metaData``,
-``add``, ``remove``, ``txn``, ``commitInfo``) plus the
-``DeletionVectorDescriptor`` carried inside ``add`` / ``remove`` and
-the ``domainMetadata`` action used by modern writers for table-level
-state. ``cdc``, ``checkpointMetadata``, ``sidecar``, and the rest of
-the zoo we treat as opaque dicts — the snapshot ignores them but the
-log-level iterator exposes the raw payload so callers that need them
-(CDC consumers, audit tooling, sidecar-aware checkpoint readers) can
-pull them out themselves.
+Action types modelled here:
 
-Why dataclasses, not plain dicts
---------------------------------
+- ``protocol``        — reader/writer version + named features
+- ``metaData``        — schema, partition columns, configuration
+- ``add``             — parquet file added
+- ``remove``          — parquet file logically removed
+- ``txn``             — idempotent-write marker
+- ``domainMetadata``  — per-domain named blob
+- ``commitInfo``      — operational provenance (opaque to replay)
 
-The dicts come off the wire untyped (``json.loads`` → ``dict``). Wrapping
-them in named slots gives:
-
-- A single normalization site for the spec's quirks (string→int casts,
-  optional fields, the ``size_in_bytes`` vs ``sizeInBytes`` rename
-  between V1 and V2 checkpoints, ``deletionVector`` vs nullable
-  struct columns in the parquet checkpoint shape).
-- A ``from_payload`` round-trip that turns "raw JSON line" → typed
-  action and back, so the writer never hand-rolls JSON.
-- Cheap snapshot membership (``AddFile`` is hashable on ``path``).
+``cdc``, ``checkpointMetadata``, ``sidecar``, and the rest of the zoo
+are treated as opaque — the log iterator exposes the raw payload so
+callers that need them can pull them out themselves.
 """
 
 from __future__ import annotations
@@ -57,17 +46,11 @@ __all__ = [
 class DeltaAction:
     """Marker base for every Delta action dataclass.
 
-    Subclasses register themselves under their JSON key (``"add"``,
-    ``"remove"``, …) on the class-level :data:`ACTIONS` map. The
-    parser uses that map to dispatch one wire-line into the right
-    typed action.
+    Subclasses register themselves under their JSON key on the
+    class-level :data:`ACTIONS` map via :meth:`__init_subclass__`.
     """
 
-    #: JSON top-level key used in commit / checkpoint files.
     json_key: ClassVar[str] = ""
-
-    #: Populated by :meth:`__init_subclass__` — the action registry
-    #: that :func:`parse_action` consults.
     ACTIONS: ClassVar[Dict[str, type]] = {}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -80,7 +63,6 @@ class DeltaAction:
         raise NotImplementedError
 
     def to_action(self) -> Dict[str, Any]:
-        """Serialize to the ``{json_key: payload}`` shape used on disk."""
         raise NotImplementedError
 
 
@@ -93,21 +75,11 @@ class DeltaAction:
 class DeletionVectorDescriptor:
     """Pointer to a deletion-vector blob.
 
-    Three storage shapes the spec recognises:
+    Three storage shapes:
 
-    - ``storageType="i"`` — inline. The DV bytes are Z85-encoded
-      directly into ``pathOrInlineDv``. ``size_in_bytes`` is the
-      decoded size.
-    - ``storageType="u"`` — uuid-based. The DV lives in a sidecar file
-      whose name is ``deletion_vector_<uuid>.bin``; ``pathOrInlineDv``
-      is the relative-path UUID (with optional one-byte storage prefix
-      written by Spark for "where" the sidecar lives).
-    - ``storageType="p"`` — absolute path. The path string is treated
-      as table-relative.
-
-    ``offset`` and ``sizeInBytes`` window into the sidecar; multiple
-    AddFile entries can share one sidecar (one DV per file, one file
-    holding many DVs).
+    - ``"i"`` — inline (Z85-encoded bytes in ``pathOrInlineDv``).
+    - ``"u"`` — uuid-based sidecar (``deletion_vector_<uuid>.bin``).
+    - ``"p"`` — absolute path (table-relative).
     """
 
     storage_type: str
@@ -152,19 +124,13 @@ class DeletionVectorDescriptor:
 
 
 # ---------------------------------------------------------------------------
-# Protocol — minReaderVersion / minWriterVersion + reader/writer features
+# Protocol
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(slots=True)
 class Protocol(DeltaAction):
-    """Reader / writer version requirements + named features.
-
-    Reader/writer feature names ("deletionVectors", "v2Checkpoint",
-    "columnMapping", …) appear once Delta ratchets to versions ≥ 3 / 7
-    respectively; we don't enforce them at write time but surface them
-    on the snapshot so callers can decide.
-    """
+    """Reader / writer version requirements + named features."""
 
     json_key: ClassVar[str] = "protocol"
 
@@ -195,7 +161,7 @@ class Protocol(DeltaAction):
 
 
 # ---------------------------------------------------------------------------
-# Metadata — schema, partition columns, table-level configuration
+# Metadata
 # ---------------------------------------------------------------------------
 
 
@@ -210,8 +176,6 @@ class Metadata(DeltaAction):
     description: Optional[str] = None
     format_provider: str = "parquet"
     format_options: Dict[str, str] = dataclasses.field(default_factory=dict)
-    #: Spark-flavoured StructType JSON ("type":"struct","fields":[...])
-    #: — the canonical schema shape Delta uses on the wire.
     schema_string: str = ""
     partition_columns: List[str] = dataclasses.field(default_factory=list)
     configuration: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -257,23 +221,13 @@ class Metadata(DeltaAction):
 
 
 # ---------------------------------------------------------------------------
-# AddFile / RemoveFile — the file-set deltas the snapshot reduces over
+# AddFile / RemoveFile
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(slots=True)
 class AddFile(DeltaAction):
-    """A parquet data file added to the table at a given commit version.
-
-    ``path`` is table-relative; either a plain ``part-00000-...`` for
-    unpartitioned tables or ``col=val/.../part-00000-...`` for
-    partitioned ones. Hive-encoded URL-quoting in the partition
-    fragments is the spec's choice — :func:`urllib.parse.unquote` is
-    enough to round-trip values containing ``/`` or ``=``.
-
-    ``deletion_vector`` (when present) means "this file's logical
-    contents are the parquet rows minus the ones masked by this DV."
-    """
+    """A parquet data file added to the table at a given commit version."""
 
     json_key: ClassVar[str] = "add"
 
@@ -339,11 +293,7 @@ class AddFile(DeltaAction):
 
 @dataclasses.dataclass(slots=True)
 class RemoveFile(DeltaAction):
-    """A previously-added parquet file removed (logically) at this commit.
-
-    The actual bytes only get vacuumed once a retention window has
-    passed; replay treats the ``remove`` as authoritative immediately.
-    """
+    """A previously-added parquet file logically removed at this commit."""
 
     json_key: ClassVar[str] = "remove"
 
@@ -412,14 +362,13 @@ class RemoveFile(DeltaAction):
 
 
 # ---------------------------------------------------------------------------
-# Txn — idempotent-write marker
+# Txn
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(slots=True)
 class Txn(DeltaAction):
-    """Application-level idempotency record. Replay carries the latest
-    ``version`` per ``app_id`` so writers can dedupe retries."""
+    """Application-level idempotency record."""
 
     json_key: ClassVar[str] = "txn"
 
@@ -450,18 +399,13 @@ class Txn(DeltaAction):
 
 
 # ---------------------------------------------------------------------------
-# DomainMetadata — opaque, named per-domain configuration
+# DomainMetadata
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(slots=True)
 class DomainMetadata(DeltaAction):
-    """Named per-domain blob (``configuration``). Modern Delta uses this
-    for things like row-tracking high-water marks, retention overrides,
-    cluster-by clauses, and per-feature scratchpads. Replay surfaces
-    the latest entry per domain so callers can read them out without
-    re-walking the log.
-    """
+    """Named per-domain configuration blob."""
 
     json_key: ClassVar[str] = "domainMetadata"
 
@@ -487,16 +431,13 @@ class DomainMetadata(DeltaAction):
 
 
 # ---------------------------------------------------------------------------
-# CommitInfo — operational provenance, opaque to replay
+# CommitInfo
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(slots=True)
 class CommitInfo(DeltaAction):
-    """Free-form commit metadata. Replay ignores it; we keep the raw
-    payload around so a reader that wants engine / operation strings
-    can pull them out later.
-    """
+    """Free-form commit metadata. Opaque to replay."""
 
     json_key: ClassVar[str] = "commitInfo"
 
@@ -513,16 +454,11 @@ class CommitInfo(DeltaAction):
 def parse_action(line: Mapping[str, Any]) -> "DeltaAction | None":
     """Dispatch one JSON commit line to its typed action.
 
-    Returns ``None`` for action keys we don't model — the log iterator
-    surfaces those as raw dicts so callers that need them can keep
-    walking. Keeping unknown actions silent (rather than raising)
-    matches the spec's forward-compatibility guidance.
+    Returns ``None`` for unknown action keys — matches the spec's
+    forward-compatibility guidance.
     """
     if not line:
         return None
-    # The wire shape is always exactly one top-level key. ``next(iter())``
-    # is faster than ``list(line)[0]`` and avoids allocating the keys
-    # list for every commit line.
     try:
         key = next(iter(line))
     except StopIteration:

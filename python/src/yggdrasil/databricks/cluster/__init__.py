@@ -1,10 +1,6 @@
 """Databricks cluster resource + service.
 
-:class:`Cluster` is the all-purpose / classic cluster handle;
-:class:`ServerlessCluster` carries serverless-specific lifecycle
-overrides. Both are URL-addressable through
-:class:`~yggdrasil.url.URLBased` (``dbks+cluster://`` and
-``dbks+serverless-cluster://`` respectively).
+:class:`Cluster` is the cluster handle for all-purpose / classic compute.
 
 :class:`ClusterStatementExecutor` exposes a cluster as a backing for
 ``yggdrasil.data.executor.StatementExecutor`` — i.e. lets the cluster
@@ -13,8 +9,6 @@ cluster-driven SQL path.
 """
 
 from .cluster import Cluster
-from .serverless import ServerlessCluster
-from .serverless_executor import ServerlessClusterStatementExecutor
 from .service import Clusters, PYTHON_BY_DBR
 from .statement import ClusterPreparedStatement, ClusterStatementBatch, ClusterStatementResult
 from .statement_executor import ClusterStatementExecutor
@@ -27,6 +21,4 @@ __all__ = [
     "ClusterStatementExecutor",
     "ClusterStatementResult",
     "PYTHON_BY_DBR",
-    "ServerlessCluster",
-    "ServerlessClusterStatementExecutor",
 ]

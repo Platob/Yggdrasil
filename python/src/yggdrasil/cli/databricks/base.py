@@ -58,7 +58,7 @@ CLIENT_FLAGS: tuple[tuple[str, str, dict[str, Any]], ...] = (
     ("--workspace-id", "workspace_id", {"help": "Databricks workspace id"}),
     ("--cluster-id", "cluster_id", {"help": "Default cluster id for compute fallbacks"}),
     ("--serverless-compute-id", "serverless_compute_id",
-     {"help": "Serverless compute id (default 'auto' when neither cluster nor this is set)"}),
+     {"help": "Serverless compute id for Spark Connect serverless path"}),
     ("--azure-tenant-id", "azure_tenant_id", {"help": "Azure tenant id"}),
     ("--azure-client-id", "azure_client_id", {"help": "Azure client id"}),
     ("--azure-client-secret", "azure_client_secret", {"help": "Azure client secret"}),

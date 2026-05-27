@@ -1,6 +1,6 @@
 # yggdrasil.databricks.cluster
 
-All-purpose and serverless cluster lifecycle — find, start, stop, poll state, install libraries, and execute commands remotely.
+All-purpose cluster lifecycle — find, start, stop, poll state, install libraries, and execute commands remotely.
 
 ## One-liner
 
@@ -83,18 +83,6 @@ client  = DatabricksClient()
 cluster = client.compute.clusters.all_purpose_cluster(name="etl")
 
 result = cluster.execute_python("print('hello from the cluster')")
-print(result.stdout)
-```
-
-## Serverless clusters
-
-```python
-from yggdrasil.databricks.cluster import ServerlessCluster
-
-client   = DatabricksClient()
-sc = ServerlessCluster(client=client)
-
-result = sc.execute_python("import pyspark; print(pyspark.__version__)")
 print(result.stdout)
 ```
 
