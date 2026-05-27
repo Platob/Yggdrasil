@@ -1506,57 +1506,20 @@ class HTTPSession(Session):
         self,
         request: HTTPRequest,
         force: bool = True,
-    ) -> "tuple[Session, bool]":
+    ) -> bool:
         """Resolve the auth handler and stamp the Authorization header.
 
         Per-request ``request.auth`` wins over the session-wide
-        ``self.auth``. When a handler is bound, ``refresh_auth`` calls
-        its ``refresh(force=force)`` if it exposes one — MSAL-style
-        handlers use ``force`` to bypass the in-memory token cache
-        and mint a fresh credential — then reads its ``authorization``
-        property, writes the value to ``request.headers["Authorization"]``,
-        and (when the resolved handler is the session-wide one) keeps
-        ``self.headers["Authorization"]`` in sync so the session-level
-        view stays current too.
+        ``self.auth``. When a handler is bound, calls its
+        ``refresh(force=force)`` then reads ``authorization`` and
+        stamps both the request and (when session-wide) the session
+        headers.
 
-        Returns ``(self, refreshed)`` where ``refreshed`` is ``True``
-        when a handler ran and the header was stamped, ``False`` when
-        the silent no-op branch was taken (force=False + no handler).
-        Returning ``self`` lets the caller chain
-        (``session.refresh_auth(req)[0].send(req)``); the bool surfaces
-        whether the request now carries an Authorization header so a
-        retry loop can short-circuit when nothing changed.
+        Returns ``True`` when a handler ran and the header was stamped,
+        ``False`` when no handler is bound (or ``force=False`` no-op).
 
-        When **no** handler is bound:
-
-        - ``force=True`` (default) → raises
-          :class:`~yggdrasil.exceptions.AuthRequiredError`. The caller
-          explicitly asked to force-refresh credentials and there is
-          nothing to refresh — failing fast catches misconfigured
-          integrations at the right line instead of letting an
-          un-authenticated send go to the wire.
-        - ``force=False`` → returns ``(self, False)``. This is the
-          steady-state path used by
-          :meth:`prepare_request_before_send`: a request to a public
-          endpoint shouldn't fail just because the session doesn't
-          have a token to refresh.
-
-        Two regular call sites:
-
-        - :meth:`prepare_request_before_send` calls this with
-          ``force=False`` so steady-state requests reuse the cached
-          token (the handler's own ``is_expired`` / refresh-skew
-          logic still mints a new one when the cache is empty or
-          stale).
-        - The HTTP send path calls this with the default ``force=True``
-          after a 403, to mint a fresh token before the single retry —
-          some vendors (Salesforce, M365, …) return 403 instead of
-          401 when a previously-valid token has been silently rotated
-          upstream.
-
-        Subclasses with vendor-specific auth (HMAC signing, SigV4,
-        challenge-response) override this to do whatever their API
-        needs while keeping the same contract.
+        When no handler is bound and ``force=True``, raises
+        :class:`~yggdrasil.exceptions.AuthRequiredError`.
         """
         handler = request.auth or self.auth
         if handler is None:
@@ -1570,26 +1533,20 @@ class HTTPSession(Session):
                     "handler should be tolerated.",
                     request=request,
                 )
-            return self, False
+            return False
         refresh = getattr(handler, "refresh", None)
         if callable(refresh):
             try:
                 refresh(force=force)
             except TypeError:
-                # Handler's refresh() doesn't accept ``force`` — fall
-                # back to a no-arg call so legacy handlers still work.
                 refresh()
         authorization = handler.authorization
         if request.headers is None:
             request.headers = HTTPHeaders()
         request.headers["Authorization"] = authorization
-        # Mirror the refresh on the session-level header when the
-        # session-wide handler is what we just ran — a per-request
-        # override (request.auth) deliberately doesn't pollute the
-        # session view.
         if handler is self.auth:
             self.headers["Authorization"] = authorization
-        return self, True
+        return True
 
     def prepare_request_before_send(self, request: HTTPRequest) -> HTTPRequest:
         """Session-wide request hook fired once per outbound request.
@@ -1688,7 +1645,7 @@ class HTTPSession(Session):
                 "Refreshing auth after %d for %s %s — retrying once",
                 result.status_code, request.method, request.url,
             )
-            _, refreshed = self.refresh_auth(request)  # force=True default
+            refreshed = self.refresh_auth(request)  # force=True default
             if refreshed:
                 result = self._wire_send(request, wait_cfg)
 
