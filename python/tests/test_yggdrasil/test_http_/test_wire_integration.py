@@ -115,11 +115,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _session(base_url: str, **kw) -> HTTPSession:
-    kw.setdefault("cache", False)
-    return HTTPSession(base_url=base_url, **kw)
-
-
 @pytest.fixture(scope="module")
 def server():
     srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
@@ -146,7 +141,7 @@ def _reset():
 class TestConnectionPooling:
 
     def test_keep_alive_reuses_socket(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r1 = session.get("/json")
         r2 = session.get("/json")
         assert r1.status_code == 200
@@ -154,21 +149,21 @@ class TestConnectionPooling:
         assert r2.json()["n"] == r1.json()["n"] + 1
 
     def test_pool_survives_close_header(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r1 = session.get("/close-connection")
         assert r1.json()["close"] is True
         r2 = session.get("/json")
         assert r2.status_code == 200
 
     def test_many_sequential_reuse(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         for i in range(20):
             r = session.get("/json")
             assert r.status_code == 200
         assert _Handler.call_count == 20
 
     def test_clear_connections(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         session.get("/json")
         session.clear_connections()
         r = session.get("/json")
@@ -183,7 +178,7 @@ class TestConnectionPooling:
 class TestConcurrentDispatch:
 
     def test_send_many_parallel(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         reqs = [
             HTTPRequest.prepare("GET", f"{server}/json?i={i}")
             for i in range(20)
@@ -193,7 +188,7 @@ class TestConcurrentDispatch:
         assert all(r.status_code == 200 for r in resps)
 
     def test_send_many_mixed_status(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         reqs = [
             HTTPRequest.prepare("GET", f"{server}/json"),
             HTTPRequest.prepare("GET", f"{server}/status/204"),
@@ -210,7 +205,7 @@ class TestConcurrentDispatch:
         results = []
 
         def worker(i):
-            session = _session(server)
+            session = HTTPSession(base_url=server)
             r = session.get(f"/json?t={i}")
             return r.status_code
 
@@ -229,19 +224,19 @@ class TestConcurrentDispatch:
 class TestLargeBodies:
 
     def test_large_response(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.get("/large")
         data = r.json()
         assert len(data["data"]) == 100_000
 
     def test_large_post(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         payload = b"x" * 50_000
         r = session.post("/echo", data=payload)
         assert r.json()["echoed_size"] == 50_000
 
     def test_empty_body_204(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.get("/status/204")
         assert r.status_code == 204
 
@@ -254,13 +249,13 @@ class TestLargeBodies:
 class TestRedirectChains:
 
     def test_double_redirect(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.get("/redirect-chain")
         assert r.status_code == 200
         assert r.json()["n"] > 0
 
     def test_redirect_preserves_session(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.get("/redirect-chain")
         assert r.request is not None
 
@@ -273,23 +268,23 @@ class TestRedirectChains:
 class TestErrorStatuses:
 
     def test_500_raise_error_false(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.get("/status/500", raise_error=False)
         assert r.status_code == 500
         assert not r.ok
 
     def test_500_raises_by_default(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         with pytest.raises(Exception):
             session.get("/status/500")
 
     def test_503_raise_error_false(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.get("/status/503", raise_error=False)
         assert r.status_code == 503
 
     def test_404_raise_error_false(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.get("/nonexistent", raise_error=False)
         assert r.status_code == 404
 
@@ -311,14 +306,14 @@ class TestHeaderForwarding:
         assert data.get("x-custom") == "session-val" or data.get("X-Custom") == "session-val"
 
     def test_per_request_headers(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.get("/echo-headers", headers={"X-Per-Request": "yes"})
         data = r.json()
         found = data.get("x-per-request") or data.get("X-Per-Request")
         assert found == "yes"
 
     def test_head_returns_custom_header(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.head("/head")
         assert r.status_code == 200
         count = r.headers.get("X-Count") or r.headers.get("x-count")
@@ -333,14 +328,14 @@ class TestHeaderForwarding:
 class TestPost:
 
     def test_post_json(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.post("/echo", json={"key": "value"})
         data = r.json()
         assert data["echoed_size"] > 0
         assert "json" in (data.get("content_type") or "").lower()
 
     def test_post_raw_bytes(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r = session.post("/echo", data=b"raw-bytes-here")
         assert r.json()["echoed_size"] == 14
 
@@ -353,14 +348,14 @@ class TestPost:
 class TestArrowMetadata:
 
     def test_batch_multiple_responses(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         resps = [session.get("/json"), session.get("/json")]
         batch = HTTPResponse.values_to_arrow_batch(resps)
         assert batch.num_rows == 2
         assert all(s == 200 for s in batch.column("status_code").to_pylist())
 
     def test_response_hash_differs_by_body(self, server):
-        session = _session(server)
+        session = HTTPSession(base_url=server)
         r1 = session.get("/json")
         r2 = session.get("/json")
         assert r1.arrow_values["request_hash"] == r2.arrow_values["request_hash"]

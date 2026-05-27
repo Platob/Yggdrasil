@@ -41,6 +41,8 @@ def _cleanup_local_cache(
     removed_files = 0
     removed_dirs = 0
     for dirpath, dirnames, filenames in os.walk(str(root), topdown=False):
+        if "/.ygg/" in dirpath or dirpath.endswith("/.ygg"):
+            continue
         dp = pathlib.Path(dirpath)
         for fname in filenames:
             fp = dp / fname

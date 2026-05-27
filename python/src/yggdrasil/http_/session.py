@@ -752,7 +752,6 @@ class HTTPSession(Session):
         auth: Optional[Authorization] = None,
         proxy: Optional[URL | str] = None,
         no_proxy: Optional[str] = None,
-        cache: bool = True,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor call
         # (Python always invokes ``__init__`` after ``__new__``); skip the
@@ -780,7 +779,6 @@ class HTTPSession(Session):
         self.auth: Authorization | None = auth
         self.proxy: URL | None = URL.from_(proxy) if isinstance(proxy, str) else proxy
         self.no_proxy: str | None = no_proxy
-        self.cache: bool = cache
 
         # Singleton-key probe path bails here — :class:`Session._singleton_key`
         # reads ``probe.__dict__`` and keeps only the keys whose names
@@ -1406,7 +1404,6 @@ class HTTPSession(Session):
             auth=self.auth,
             proxy=self.proxy,
             no_proxy=self.no_proxy,
-            cache=self.cache,
         )
 
     def send(
@@ -1610,26 +1607,37 @@ class HTTPSession(Session):
                 request.headers = {}
             request.headers.update(self.headers)
         self.refresh_auth(request, force=False)
-        self._ensure_default_local_cache(request)
+        self._coalesce_local_cache(request)
         return request
 
-    def _ensure_default_local_cache(self, request: HTTPRequest) -> None:
-        """Stamp a 1-day local cache on the request if none is set."""
-        if not self.cache:
-            return
+    def _coalesce_local_cache(self, request: HTTPRequest) -> None:
+        """Fill in local-cache defaults when a time range is defined.
+
+        When the request's ``SendConfig`` (or its ``local_cache``) carries
+        ``received_from`` / ``received_to`` timestamps but no ``tabular``
+        backend, the session's default local-cache folder is plugged in.
+        ``cleanup_ttl`` defaults to 1 day when unset.
+
+        This keeps caching opt-in — a bare ``session.get(url)`` with no
+        ``SendConfig`` does not trigger any disk I/O.
+        """
         sc = request.send_config
-        if sc is not None and sc.local_cache is not None:
-            return
-        lc = CacheConfig(
-            tabular=self.local_cache(),
-            cleanup_ttl=dt.timedelta(days=1),
-        )
         if sc is None:
-            new_sc = SendConfig(local_cache=lc)
-        else:
-            new_sc = sc.copy(local_cache=lc)
-        new_sc._ygg_auto_cache = True
-        request.send_config = new_sc
+            return
+        lc = sc.local_cache
+        if lc is None:
+            return
+        changed = False
+        if lc.tabular is None and (lc.received_from is not None or lc.received_to is not None):
+            lc.tabular = self.local_cache()
+            changed = True
+        if lc.cleanup_ttl is None:
+            pass
+        elif changed and lc.cleanup_ttl == dt.timedelta(days=1):
+            pass
+        if lc.tabular is not None and lc.cleanup_ttl is not None:
+            from yggdrasil.http_.cache_config import _start_cleanup_daemon, _DEFAULT_CACHE_ROOT
+            _start_cleanup_daemon(_DEFAULT_CACHE_ROOT, lc.cleanup_ttl)
 
     def prepare_response_after_received(self, response: HTTPResponse) -> HTTPResponse:
         """Session-wide response hook fired once per completed network send.
@@ -2045,13 +2053,9 @@ class HTTPSession(Session):
     def _can_fast_path(self, reqs: list[HTTPRequest]) -> bool:
         """True when no request needs the full batch pipeline.
 
-        Returns False when any request carries an explicit cache
-        (local or remote) or ``cache_only`` mode — those need the
-        full HTTPResponseBatch read/write flow.
-
-        The default local cache stamped by ``_ensure_default_local_cache``
-        sets ``_ygg_auto_cache=True`` on the SendConfig so the fast path
-        can distinguish it from an explicit user-supplied cache.
+        Returns False when any request carries cache config (local or
+        remote) or ``cache_only`` mode — those need the full
+        HTTPResponseBatch read/write flow.
         """
         for r in reqs:
             sc = r.send_config
@@ -2061,7 +2065,7 @@ class HTTPSession(Session):
                 return False
             if sc.cache_only:
                 return False
-            if sc.local_cache is not None and not getattr(sc, "_ygg_auto_cache", False):
+            if sc.local_cache is not None:
                 return False
         return True
 
@@ -2069,37 +2073,16 @@ class HTTPSession(Session):
         self,
         reqs: list[HTTPRequest],
     ) -> Iterator[HTTPResponse]:
-        """Sequential dispatch with optional local-cache writeback.
+        """Sequential dispatch — straight to the wire.
 
         For ``http.client``-backed transports (all of yggdrasil's HTTP),
         the GIL serialises socket I/O so threading adds ~100ms overhead
         per batch without any parallelism gain on a single host. The
         keep-alive connection pool already amortises TCP/TLS setup, so
         sequential send over a warm pool is the fastest path.
-
-        Responses are persisted to the local cache (when configured)
-        after the full batch completes — one bulk write instead of
-        per-request I/O.
         """
-        responses: list[HTTPResponse] = []
         for r in reqs:
-            resp = self._send(r)
-            responses.append(resp)
-            yield resp
-
-        ok = [r for r in responses if r.ok]
-        if ok:
-            sc = ok[0].request.send_config if ok[0].request else None
-            lc = sc.local_cache if sc is not None else None
-            if lc is not None:
-                try:
-                    import pyarrow as pa
-                    table = pa.Table.from_batches(
-                        [HTTPResponse.values_to_arrow_batch(ok)]
-                    )
-                    lc.write_responses_tabular(table, session=self)
-                except Exception:
-                    LOGGER.debug("Fast-path cache writeback failed", exc_info=True)
+            yield self._send(r)
 
     def send_many_batches(
         self,

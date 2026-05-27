@@ -81,37 +81,32 @@ def base_url(server):
     return server
 
 
-def _session(base_url: str, **kw) -> HTTPSession:
-    kw.setdefault("cache", False)
-    return HTTPSession(base_url=base_url, **kw)
-
-
 class TestGet:
 
     def test_get_json(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/json")
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
 
     def test_get_text(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/text")
         assert resp.status_code == 200
         assert resp.text == "hello world"
 
     def test_get_empty(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/empty")
         assert resp.status_code == 204
 
     def test_get_404(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/nonexistent", raise_error=False)
         assert resp.status_code == 404
 
     def test_get_500(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/error", raise_error=False)
         assert resp.status_code == 500
         assert not resp.ok
@@ -120,7 +115,7 @@ class TestGet:
 class TestPost:
 
     def test_post_body(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.post("/echo", data=b'{"key": "value"}')
         assert resp.status_code == 200
         assert resp.json()["echoed"] == '{"key": "value"}'
@@ -129,23 +124,23 @@ class TestPost:
 class TestResponseProperties:
 
     def test_content_type(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/json")
         assert "application/json" in resp.headers.get("Content-Type", "")
 
     def test_ok_property(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         assert session.get("/json").ok
         assert not session.get("/error", raise_error=False).ok
 
     def test_raise_for_status(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/error", raise_error=False)
         with pytest.raises(Exception):
             resp.raise_for_status()
 
     def test_response_has_request(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/json")
         assert resp.request is not None
         assert resp.request.method == "GET"
@@ -154,12 +149,12 @@ class TestResponseProperties:
 class TestSessionSingleton:
 
     def test_same_base_url_same_instance(self, base_url):
-        a = _session(base_url)
-        b = _session(base_url)
+        a = HTTPSession(base_url=base_url)
+        b = HTTPSession(base_url=base_url)
         assert a is b
 
     def test_different_base_url_different_instance(self, base_url):
-        a = _session(base_url)
+        a = HTTPSession(base_url=base_url)
         b = HTTPSession(base_url="http://other.example.com")
         assert a is not b
 
@@ -209,7 +204,7 @@ def _folder(path) -> Folder:
 class TestLocalCache:
 
     def test_local_cache_hit_skips_network(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -228,7 +223,7 @@ class TestLocalCache:
         assert resp2.json()["n"] == n1
 
     def test_local_cache_different_urls_miss(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -246,7 +241,7 @@ class TestLocalCache:
         assert _Handler.call_count > n1
 
     def test_local_cache_different_methods_miss(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -266,7 +261,7 @@ class TestLocalCache:
 class TestRemoteCache:
 
     def test_remote_folder_cache_hit(self, base_url, remote_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(remote_cache_dir))
         cfg = SendConfig(remote_cache=cache)
 
@@ -285,7 +280,7 @@ class TestRemoteCache:
         assert resp2.json()["n"] == n1
 
     def test_remote_cache_miss_fetches_from_network(self, base_url, remote_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(remote_cache_dir))
         cfg = SendConfig(remote_cache=cache)
 
@@ -300,7 +295,7 @@ class TestRemoteCache:
 class TestDualCache:
 
     def test_local_and_remote_cache(self, base_url, local_cache_dir, remote_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cfg = SendConfig(
             local_cache=CacheConfig(tabular=_folder(local_cache_dir)),
             remote_cache=CacheConfig(tabular=_folder(remote_cache_dir)),
@@ -320,7 +315,7 @@ class TestDualCache:
         assert resp2.json()["n"] == n1
 
     def test_local_cache_populated_from_remote(self, base_url, local_cache_dir, remote_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         remote_cfg = SendConfig(
             remote_cache=CacheConfig(tabular=_folder(remote_cache_dir)),
         )
@@ -344,7 +339,7 @@ class TestDualCache:
 class TestSendMany:
 
     def test_send_many_multiple_requests(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         reqs = [
             HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
             HTTPRequest.prepare(method="GET", url=f"{base_url}/text"),
@@ -353,7 +348,7 @@ class TestSendMany:
         assert len(responses) >= 2
 
     def test_send_many_with_cache(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
 
         reqs = [
@@ -382,7 +377,7 @@ class TestSendMany:
 class TestCacheOnly:
 
     def test_cache_only_returns_404_on_miss(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache, cache_only=True, raise_error=False)
 
@@ -394,7 +389,7 @@ class TestCacheOnly:
         assert _Handler.call_count == 0
 
     def test_cache_only_returns_cached_on_hit(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
 
         session.send(
@@ -421,7 +416,7 @@ class TestCacheOnly:
 class TestCacheUpsert:
 
     def test_append_mode_keeps_old_entries(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         from yggdrasil.enums import Mode
         cache = CacheConfig(tabular=_folder(local_cache_dir), mode=Mode.APPEND)
         cfg = SendConfig(local_cache=cache)
@@ -434,7 +429,7 @@ class TestCacheUpsert:
         assert table.num_rows >= 2
 
     def test_overwrite_mode_writes(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         from yggdrasil.enums import Mode
         cache = CacheConfig(tabular=_folder(local_cache_dir), mode=Mode.OVERWRITE)
         cfg = SendConfig(local_cache=cache)
@@ -456,7 +451,7 @@ class TestCacheUpsert:
 class TestCacheKeyCorrectness:
 
     def test_post_with_different_body_misses(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -474,7 +469,7 @@ class TestCacheKeyCorrectness:
         assert n2 != n1
 
     def test_post_same_body_hits_cache(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -491,7 +486,7 @@ class TestCacheKeyCorrectness:
         assert resp2.json()["n"] == n1
 
     def test_different_query_params_different_cache_key(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         req_a = HTTPRequest.prepare(method="GET", url=f"{base_url}/json?page=1")
         req_b = HTTPRequest.prepare(method="GET", url=f"{base_url}/json?page=2")
         assert req_a.public_hash != req_b.public_hash
@@ -505,7 +500,7 @@ class TestCacheKeyCorrectness:
 class TestErrorCaching:
 
     def test_500_response_not_cached(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache, raise_error=False)
 
@@ -522,7 +517,7 @@ class TestErrorCaching:
         assert _Handler.call_count > n1
 
     def test_404_response_not_cached(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache, raise_error=False)
 
@@ -547,7 +542,7 @@ class TestErrorCaching:
 class TestCacheFidelity:
 
     def test_cached_response_preserves_status_code(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -556,7 +551,7 @@ class TestCacheFidelity:
         assert resp.status_code == 200
 
     def test_cached_response_preserves_body(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -565,7 +560,7 @@ class TestCacheFidelity:
         assert resp.text == "hello world"
 
     def test_cached_response_preserves_json(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -576,7 +571,7 @@ class TestCacheFidelity:
         assert isinstance(data["n"], int)
 
     def test_cached_response_preserves_content_type(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -585,7 +580,7 @@ class TestCacheFidelity:
         assert "application/json" in resp.headers.get("Content-Type", "")
 
     def test_cached_response_has_request(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -603,7 +598,7 @@ class TestCacheFidelity:
 class TestCacheAnonymization:
 
     def test_cached_response_strips_auth_header(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir), anonymize="remove")
         cfg = SendConfig(local_cache=cache)
 
@@ -627,14 +622,14 @@ class TestCacheAnonymization:
 class TestSendManyAdvanced:
 
     def test_send_many_returns_all(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         urls = [f"{base_url}/json", f"{base_url}/text", f"{base_url}/json"]
         reqs = [HTTPRequest.prepare(method="GET", url=u) for u in urls]
         responses = list(session.send_many(reqs))
         assert len(responses) >= len(urls)
 
     def test_send_many_cached_no_extra_calls(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
 
         urls = [f"{base_url}/json", f"{base_url}/text"]
@@ -651,7 +646,7 @@ class TestSendManyAdvanced:
         assert _Handler.call_count == n_after
 
     def test_send_many_mixed_hit_miss(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -677,7 +672,7 @@ class TestSendManyAdvanced:
 class TestResponseBatchMetadata:
 
     def test_arrow_batch_has_expected_columns(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         from yggdrasil.http_.response import HTTPResponse
         resp = session.get("/json")
         batch = HTTPResponse.values_to_arrow_batch([resp])
@@ -696,7 +691,7 @@ class TestResponseBatchMetadata:
         assert "request_hash" in names
 
     def test_hashes_stable_across_runs(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -721,13 +716,13 @@ class TestResponseBatchMetadata:
         assert rh1 == rh2
 
     def test_request_hash_matches_response_request_hash(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/json")
         resp_vals = resp.arrow_values
         assert resp_vals["request_hash"] == resp.request.hash
 
     def test_body_hash_consistent(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
@@ -750,29 +745,29 @@ class TestResponseBatchMetadata:
         assert bs1 > 0
 
     def test_status_code_in_arrow(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/json")
         assert resp.arrow_values["status_code"] == 200
 
     def test_error_status_in_arrow(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp = session.get("/error", raise_error=False)
         assert resp.arrow_values["status_code"] == 500
 
     def test_partition_key_stable(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp1 = session.get("/json")
         resp2 = session.get("/json")
         assert resp1.arrow_values["partition_key"] == resp2.arrow_values["partition_key"]
 
     def test_partition_key_differs_by_url(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         resp1 = session.get("/json")
         resp2 = session.get("/text")
         assert resp1.arrow_values["partition_key"] != resp2.arrow_values["partition_key"]
 
     def test_multi_response_batch_consistent(self, base_url):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         from yggdrasil.http_.response import HTTPResponse
         resps = [session.get("/json"), session.get("/text")]
         batch = HTTPResponse.values_to_arrow_batch(resps)
@@ -781,7 +776,7 @@ class TestResponseBatchMetadata:
         assert all(s == 200 for s in col_status)
 
     def test_cached_metadata_matches_fresh(self, base_url, local_cache_dir):
-        session = _session(base_url)
+        session = HTTPSession(base_url=base_url)
         cache = CacheConfig(tabular=_folder(local_cache_dir))
         cfg = SendConfig(local_cache=cache)
 
