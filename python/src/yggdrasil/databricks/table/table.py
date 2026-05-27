@@ -740,9 +740,17 @@ def _build_dml_statements(
                 f"TRUNCATE TABLE {target_location}",
                 f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}",
             ])
+        elif match_by:
+            statements.extend(_build_delete_insert_statements(
+                target_location=target_location,
+                source_sql=source_sql,
+                columns=columns,
+                match_by=match_by,
+                prune_predicates=prune_predicates,
+            ))
         else:
             statements.append(
-                f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
+                f"INSERT OVERWRITE {target_location} ({cols_quoted})\n{source_sql}"
             )
 
     elif match_by and not safe_merge:
@@ -3252,7 +3260,7 @@ class Table(DatabricksPath):
         target = self.create(
             data,
             mode=schema_mode,
-            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
+            or_replace=False,
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
@@ -3394,7 +3402,7 @@ class Table(DatabricksPath):
         target = self.create(
             data,
             mode=schema_mode,
-            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
+            or_replace=False,
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
@@ -3671,9 +3679,7 @@ class Table(DatabricksPath):
             f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS {quote_ident('raw_src')}"
         )
 
-        prune_predicates = _build_where_predicates(
-            None, where, target_alias="T",
-        )
+        prune_predicates = _build_where_predicates(where, target_alias="T")
         sql_texts = _build_dml_statements(
             target_location=target_location,
             source_sql=source_sql,

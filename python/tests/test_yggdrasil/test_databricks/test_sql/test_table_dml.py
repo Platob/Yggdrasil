@@ -252,7 +252,7 @@ class TestSafeMerge:
 class TestDMLDispatch:
     """Mode dispatch behavior that's independent of ``safe_merge``."""
 
-    def test_overwrite_emits_plain_insert(self) -> None:
+    def test_overwrite_emits_insert_overwrite(self) -> None:
         stmts = _build_dml_statements(
             target_location="cat.sch.t",
             source_sql="SELECT id FROM staging",
@@ -263,7 +263,7 @@ class TestDMLDispatch:
             prune_predicates=[],
         )
         assert len(stmts) == 1
-        assert _normalize_ws(stmts[0]).startswith("INSERT INTO cat.sch.t")
+        assert _normalize_ws(stmts[0]).startswith("INSERT OVERWRITE cat.sch.t")
         assert "DELETE" not in _normalize_ws(stmts[0])
         assert "NOT EXISTS" not in _normalize_ws(stmts[0])
 
