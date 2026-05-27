@@ -479,9 +479,9 @@ def _format_cookie_header(cookies: Any) -> str:
 # time to clear; both schedules are tight (we'd rather surface an error
 # fast than mask a real outage with a minute-long retry storm).
 # Server-supplied Retry-After always wins over these when present.
-_RETRY_TOTAL = 3
-_RETRY_CONNECT = 2
-_RETRY_READ = 2
+_RETRY_TOTAL = 4
+_RETRY_CONNECT = 3
+_RETRY_READ = 3
 
 # 5xx schedule: 0.5, 1, 2 (capped at backoff_max). Worst-case ~3.5s.
 _BACKOFF_5XX_FACTOR = 0.5
@@ -676,7 +676,7 @@ class HTTPSession(Session):
             connect=_RETRY_CONNECT,
             read=_RETRY_READ,
             status=_RETRY_TOTAL,
-            other=2,
+            other=4,
             status_forcelist=_RETRY_STATUSES,
             allowed_methods=None,  # retry every method, incl. POST/PATCH
             respect_retry_after_header=True,
