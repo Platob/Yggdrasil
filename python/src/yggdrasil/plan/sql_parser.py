@@ -25,12 +25,15 @@ from yggdrasil.execution.expr.backends.sql import (
     _tokenize,
 )
 from yggdrasil.execution.expr.nodes import (
+    Alias,
     Arithmetic,
     Between,
+    CaseWhen,
     Cast,
     Column,
     Comparison,
     Expression,
+    FunctionCall,
     InList,
     IsNull,
     Like,
@@ -38,6 +41,11 @@ from yggdrasil.execution.expr.nodes import (
     Logical,
     Not,
     Predicate,
+    SortOrder,
+    Star,
+    Subscript,
+    WindowFunction,
+    WindowSpec,
 )
 from yggdrasil.execution.expr.operators import ArithmeticOp, CompareOp, LogicalOp
 
@@ -374,20 +382,16 @@ class SQLQueryParser:
     # ---- SELECT list --------------------------------------------------
 
     def _parse_select_list(self) -> list[Expression]:
-        items: list[Expression] = []
-        while True:
-            items.append(self._parse_select_item())
-            if self.cur.kind == "comma":
-                self._eat()
-                continue
-            break
+        items = [self._parse_select_item()]
+        while self.cur.kind == "comma":
+            self._eat(); items.append(self._parse_select_item())
         return items
 
     def _parse_select_item(self) -> Expression:
         # Star
         if self.cur.kind == "op" and self.cur.text == "*":
             self._eat()
-            return self._make_star()
+            return Star()
         # qualifier.* or expression [AS alias]
         expr = self._parse_expr()
         # Check for table.*
@@ -395,11 +399,11 @@ class SQLQueryParser:
                 and self._peek(1).kind == "op" and self._peek(1).text == "*"):
             self._eat()  # dot
             self._eat()  # *
-            return self._make_star(qualifier=expr.name)
+            return Star(qualifier=expr.name)
         # AS alias
         alias = self._parse_optional_alias()
         if alias:
-            return self._make_alias(expr, alias)
+            return Alias(expr=expr, name=alias)
         return expr
 
     def _parse_optional_alias(self) -> str | None:
@@ -429,9 +433,7 @@ class SQLQueryParser:
         return left
 
     def _is_join_kw(self) -> bool:
-        if self._is_kw("JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"):
-            return True
-        return False
+        return self._is_kw("JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS")
 
     def _parse_from_item(self) -> Any:
         if self.cur.kind == "lparen":
@@ -514,13 +516,9 @@ class SQLQueryParser:
     # ---- ORDER BY -----------------------------------------------------
 
     def _parse_order_by_list(self) -> list[Any]:
-        items: list[Any] = []
-        while True:
-            items.append(self._parse_sort_order())
-            if self.cur.kind == "comma":
-                self._eat()
-                continue
-            break
+        items = [self._parse_sort_order()]
+        while self.cur.kind == "comma":
+            self._eat(); items.append(self._parse_sort_order())
         return items
 
     def _parse_sort_order(self) -> Any:
@@ -538,7 +536,7 @@ class SQLQueryParser:
                 nulls_first = False
             else:
                 raise self._error("expected FIRST or LAST after NULLS")
-        return self._make_sort_order(expr, ascending, nulls_first)
+        return SortOrder(expr=expr, ascending=ascending, nulls_first=nulls_first)
 
     # ---- INSERT -------------------------------------------------------
 
@@ -663,13 +661,9 @@ class SQLQueryParser:
         return self._parse_or()
 
     def _parse_expr_list(self) -> list[Expression]:
-        items: list[Expression] = []
-        while True:
-            items.append(self._parse_expr())
-            if self.cur.kind == "comma":
-                self._eat()
-                continue
-            break
+        items = [self._parse_or()]
+        while self.cur.kind == "comma":
+            self._eat(); items.append(self._parse_or())
         return items
 
     def _parse_or(self) -> Expression:
@@ -755,7 +749,7 @@ class SQLQueryParser:
             # Subquery IN — not fully supported, store as FunctionCall placeholder
             sub = self._parse_statement()
             self._expect_kind("rparen")
-            return self._make_function("IN_SUBQUERY", (target, Literal(value=str(sub))))
+            return FunctionCall(name="IN_SUBQUERY", args=(target, Literal(value=str(sub))))
         values: list[Any] = []
         has_null = False
         if self.cur.kind != "rparen":
@@ -812,7 +806,7 @@ class SQLQueryParser:
             self._eat()
             idx = self._parse_expr()
             self._expect_kind("rbracket")
-            expr = self._make_subscript(expr, idx)
+            expr = Subscript(expr=expr, index=idx)
         # Dot access: expr.field
         while self.cur.kind == "dot" and self._peek(1).kind in ("ident", "keyword"):
             if self._peek(1).kind == "op" and self._peek(1).text == "*":
@@ -823,7 +817,7 @@ class SQLQueryParser:
             if self.cur.kind == "lparen":
                 expr = self._parse_function_call_named(field_name, qualifier=expr)
             else:
-                expr = self._make_subscript(expr, Literal(value=field_name))
+                expr = Subscript(expr=expr, index=Literal(value=field_name))
         return expr
 
     def _parse_primary(self) -> Expression:
@@ -871,7 +865,7 @@ class SQLQueryParser:
                 if self.cur.kind == "lparen":
                     self._eat()
                     self._expect_kind("rparen")
-                return self._make_function(t.upper, ())
+                return FunctionCall(name=t.upper, args=())
             # Generic function call check
             if self._peek(1).kind == "lparen":
                 return self._parse_function_call()
@@ -883,7 +877,7 @@ class SQLQueryParser:
             return self._parse_column()
         if t.kind == "op" and t.text == "*":
             self._eat()
-            return self._make_star()
+            return Star()
         raise self._error("unexpected token")
 
     def _parse_column(self) -> Expression:
@@ -896,9 +890,10 @@ class SQLQueryParser:
             qualifier, name = name, second.text
         return Column(name=name, qualifier=qualifier)
 
-    def _parse_function_call(self) -> Expression:
-        name_tok = self._ident_or_kw()
-        return self._parse_function_call_named(name_tok.text)
+    def _parse_function_call(self, name: str | None = None) -> Expression:
+        if name is None:
+            name = self._ident_or_kw().text
+        return self._parse_function_call_named(name)
 
     def _parse_function_call_named(
         self, name: str, qualifier: Expression | None = None,
@@ -910,8 +905,8 @@ class SQLQueryParser:
         if self.cur.kind == "op" and self.cur.text == "*":
             self._eat()
             self._expect_kind("rparen")
-            fc = self._make_function(upper_name, (self._make_star(),))
-            return self._maybe_parse_over(fc)
+            fc = FunctionCall(name=upper_name, args=(Star(),))
+            return self._maybe_over(fc)
 
         # DISTINCT
         distinct = False
@@ -928,14 +923,11 @@ class SQLQueryParser:
                 break
         self._expect_kind("rparen")
 
-        fc = self._make_function(upper_name, tuple(args), distinct=distinct)
-        return self._maybe_parse_over(fc)
+        fc = FunctionCall(name=upper_name, args=tuple(args), distinct=distinct)
+        return self._maybe_over(fc)
 
-    def _maybe_parse_over(self, func: Expression) -> Expression:
-        if self._accept_kw("OVER"):
-            window = self._parse_window_spec()
-            return self._make_window_function(func, window)
-        return func
+    def _maybe_over(self, fc: Expression) -> Expression:
+        return WindowFunction(function=fc, window=self._parse_window_spec()) if self._accept_kw("OVER") else fc
 
     def _parse_window_spec(self) -> Any:
         self._expect_kind("lparen")
@@ -964,7 +956,7 @@ class SQLQueryParser:
                 frame_start = self._parse_frame_bound()
 
         self._expect_kind("rparen")
-        return self._make_window_spec(
+        return WindowSpec(
             partition_by=tuple(partition_by),
             order_by=tuple(order_by),
             frame_start=frame_start,
@@ -1053,7 +1045,7 @@ class SQLQueryParser:
         if self._accept_kw("ELSE"):
             else_expr = self._parse_expr()
         self._expect_kw("END")
-        return self._make_case_when(
+        return CaseWhen(
             branches=tuple(branches),
             else_expr=else_expr,
             operand=operand,
@@ -1064,7 +1056,7 @@ class SQLQueryParser:
         self._expect_kind("lparen")
         sub = self._parse_statement()
         self._expect_kind("rparen")
-        return self._make_function("EXISTS", (Literal(value=str(sub)),))
+        return FunctionCall(name="EXISTS", args=(Literal(value=str(sub)),))
 
     # ---- INTERVAL literal ------------------------------------------------
 
@@ -1096,9 +1088,8 @@ class SQLQueryParser:
                 f"expected interval unit (DAY, HOUR, MINUTE, SECOND, "
                 f"MONTH, YEAR, WEEK) after INTERVAL literal"
             )
-        return self._make_function(
-            "INTERVAL", (Literal(value=value_tok.text), Literal(value=unit)),
-        )
+        return FunctionCall(name="INTERVAL",
+            args=(Literal(value=value_tok.text), Literal(value=unit)))
 
     # ---- EXTRACT(field FROM expr) ----------------------------------------
 
@@ -1123,79 +1114,8 @@ class SQLQueryParser:
         self._expect_kw("FROM")
         source = self._parse_expr()
         self._expect_kind("rparen")
-        return self._make_function("EXTRACT", (Literal(value=field), source))
+        return FunctionCall(name="EXTRACT", args=(Literal(value=field), source))
 
-    # ==================================================================
-    # Factory methods — override in subclasses to use custom node types
-    # ==================================================================
-
-    def _make_star(self, qualifier: str | None = None) -> Expression:
-        try:
-            from yggdrasil.execution.expr.nodes import Star
-            return Star(qualifier=qualifier)
-        except ImportError:
-            return Column(name="*", qualifier=qualifier)
-
-    def _make_alias(self, expr: Expression, name: str) -> Expression:
-        try:
-            from yggdrasil.execution.expr.nodes import Alias
-            return Alias(expr=expr, name=name)
-        except (ImportError, AttributeError):
-            if isinstance(expr, Column):
-                return Column(name=expr.name, field=expr.field,
-                              alias=name, qualifier=expr.qualifier)
-            return expr
-
-    def _make_sort_order(
-        self, expr: Expression, ascending: bool, nulls_first: bool | None,
-    ) -> Any:
-        try:
-            from yggdrasil.execution.expr.nodes import SortOrder
-            return SortOrder(expr=expr, ascending=ascending, nulls_first=nulls_first)
-        except (ImportError, AttributeError):
-            return {"expr": expr, "ascending": ascending, "nulls_first": nulls_first}
-
-    def _make_function(
-        self, name: str, args: tuple, distinct: bool = False,
-    ) -> Expression:
-        try:
-            from yggdrasil.execution.expr.nodes import FunctionCall
-            return FunctionCall(name=name, args=args, distinct=distinct)
-        except (ImportError, AttributeError):
-            return Column(name=f"{name}({', '.join(str(a) for a in args)})")
-
-    def _make_window_function(self, function: Expression, window: Any) -> Expression:
-        try:
-            from yggdrasil.execution.expr.nodes import WindowFunction
-            return WindowFunction(function=function, window=window)
-        except (ImportError, AttributeError):
-            return function
-
-    def _make_window_spec(self, **kwargs: Any) -> Any:
-        try:
-            from yggdrasil.execution.expr.nodes import WindowSpec
-            return WindowSpec(**kwargs)
-        except (ImportError, AttributeError):
-            return kwargs
-
-    def _make_case_when(
-        self,
-        branches: tuple,
-        else_expr: Expression | None,
-        operand: Expression | None,
-    ) -> Expression:
-        try:
-            from yggdrasil.execution.expr.nodes import CaseWhen
-            return CaseWhen(branches=branches, else_expr=else_expr, operand=operand)
-        except (ImportError, AttributeError):
-            return Literal(value="CASE_WHEN")
-
-    def _make_subscript(self, expr: Expression, index: Expression) -> Expression:
-        try:
-            from yggdrasil.execution.expr.nodes import Subscript
-            return Subscript(expr=expr, index=index)
-        except (ImportError, AttributeError):
-            return expr
 
 
 # ---------------------------------------------------------------------------

@@ -26,8 +26,8 @@ _AGG_NAMES = frozenset(_AGG_MAP) | {"MEAN", "COLLECT_LIST", "COLLECT_SET",
                                      "STDDEV", "VARIANCE", "APPROX_COUNT_DISTINCT"}
 
 
-def execute_plan(node: PlanNode, tables: dict[str, "Tabular"] | None = None) -> "Tabular":
-    return _exec(node, dict(tables or {}))
+def execute_plan(node: PlanNode, tables: "dict[str, Tabular] | None" = None) -> "Tabular":
+    return _exec(node, dict(tables) if tables else {})
 
 
 def _exec(node: PlanNode, tables: dict[str, "Tabular"]) -> "Tabular":

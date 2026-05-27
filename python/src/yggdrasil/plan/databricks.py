@@ -137,7 +137,8 @@ class DatabricksSQLParser(SQLQueryParser):
         self._expect_kw("AS")
         type_name = self._parse_type_head()
         self._expect_kind("rparen")
-        return self._make_function("TRY_CAST", (inner, Literal(value=type_name)))
+        from yggdrasil.execution.expr.nodes import FunctionCall
+        return FunctionCall(name="TRY_CAST", args=(inner, Literal(value=type_name)))
 
 
 # Register Databricks parser for the DATABRICKS dialect

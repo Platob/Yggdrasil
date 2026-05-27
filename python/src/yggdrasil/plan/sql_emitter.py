@@ -35,22 +35,16 @@ if TYPE_CHECKING:
 
 
 def emit_sql(node: PlanNode, *, dialect: "Dialect | str | None" = None) -> str:
-    d = _resolve_dialect(dialect)
-    return _emit_node(node, d)
+    return _emit(node, _resolve_dialect(dialect))
 
 
-def _emit_node(node: PlanNode, d: Dialect) -> str:
-    if isinstance(node, SelectNode):
-        return _emit_select(node, d)
-    if isinstance(node, InsertNode):
-        return _emit_insert(node, d)
-    if isinstance(node, MergeNode):
-        return _emit_merge(node, d)
+def _emit(node: PlanNode, d: Dialect) -> str:
+    if isinstance(node, SelectNode): return _emit_select(node, d)
+    if isinstance(node, InsertNode): return _emit_insert(node, d)
+    if isinstance(node, MergeNode): return _emit_merge(node, d)
     if isinstance(node, ScanNode):
-        name = node.name or "?"
-        if node.alias:
-            return f"{_quote_ident(name, d)} {_quote_ident(node.alias, d)}"
-        return _quote_ident(name, d)
+        n = node.name or "?"
+        return f"{_quote_ident(n, d)} {_quote_ident(node.alias, d)}" if node.alias else _quote_ident(n, d)
     raise NotImplementedError(f"Cannot emit SQL for {type(node).__name__}")
 
 
@@ -61,7 +55,7 @@ def _emit_select(node: SelectNode, d: Dialect) -> str:
     if node.ctes:
         cte_parts = []
         for cte in node.ctes:
-            body = _emit_node(cte.plan, d)
+            body = _emit(cte.plan, d)
             cte_parts.append(f"{_quote_ident(cte.name, d)} AS ({body})")
         parts.append("WITH " + ", ".join(cte_parts))
 
@@ -113,7 +107,7 @@ def _emit_select(node: SelectNode, d: Dialect) -> str:
     # Set operations
     if node.set_ops:
         for sop in node.set_ops:
-            right_sql = _emit_node(sop.plan, d)
+            right_sql = _emit(sop.plan, d)
             sql = f"{sql} {sop.kind} {right_sql}"
 
     return sql
@@ -132,7 +126,7 @@ def _emit_from(item: Any, d: Dialect) -> str:
             return f"{name} {_quote_ident(item.alias, d)}"
         return name
     if isinstance(item, SubqueryRef):
-        inner = _emit_node(item.plan, d)
+        inner = _emit(item.plan, d)
         return f"({inner}) {_quote_ident(item.alias, d)}"
     if isinstance(item, JoinClause):
         left_sql = _emit_from(item.left, d)
@@ -141,7 +135,7 @@ def _emit_from(item: Any, d: Dialect) -> str:
         on_sql = f" ON {_emit_expr(item.on, d)}" if item.on else ""
         return f"{left_sql} {jt} {right_sql}{on_sql}"
     if isinstance(item, PlanNode):
-        return _emit_node(item, d)
+        return _emit(item, d)
     return str(item)
 
 
@@ -180,51 +174,26 @@ def _emit_expr(expr: Any, d: Dialect) -> str:
 
 def _emit_order(item: Any, d: Dialect) -> str:
     if isinstance(item, SortOrder):
-        s = _emit_expr(item.expr, d)
-        s += " ASC" if item.ascending else " DESC"
-        if item.nulls_first is True:
-            s += " NULLS FIRST"
-        elif item.nulls_first is False:
-            s += " NULLS LAST"
-        return s
-    if isinstance(item, dict):
-        s = _emit_expr(item["expr"], d)
-        s += " ASC" if item.get("ascending", True) else " DESC"
-        nf = item.get("nulls_first")
-        if nf is True:
-            s += " NULLS FIRST"
-        elif nf is False:
-            s += " NULLS LAST"
-        return s
-    return _emit_expr(item, d)
+        expr, asc, nf = item.expr, item.ascending, item.nulls_first
+    elif isinstance(item, dict):
+        expr, asc, nf = item["expr"], item.get("ascending", True), item.get("nulls_first")
+    else:
+        return _emit_expr(item, d)
+    s = _emit_expr(expr, d) + (" ASC" if asc else " DESC")
+    if nf is True: s += " NULLS FIRST"
+    elif nf is False: s += " NULLS LAST"
+    return s
 
 
 def _emit_window_spec(spec: Any, d: Dialect) -> str:
+    pb = spec.partition_by if isinstance(spec, WindowSpec) else spec.get("partition_by", ())
+    ob = spec.order_by if isinstance(spec, WindowSpec) else spec.get("order_by", ())
+    fs = spec.frame_start if isinstance(spec, WindowSpec) else spec.get("frame_start")
+    fe = spec.frame_end if isinstance(spec, WindowSpec) else spec.get("frame_end")
     parts: list[str] = []
-    if isinstance(spec, WindowSpec):
-        if spec.partition_by:
-            parts.append("PARTITION BY " + ", ".join(_emit_expr(e, d) for e in spec.partition_by))
-        if spec.order_by:
-            parts.append("ORDER BY " + ", ".join(_emit_order(o, d) for o in spec.order_by))
-        if spec.frame_start:
-            frame = f"ROWS {spec.frame_start}"
-            if spec.frame_end:
-                frame = f"ROWS BETWEEN {spec.frame_start} AND {spec.frame_end}"
-            parts.append(frame)
-    elif isinstance(spec, dict):
-        pb = spec.get("partition_by", ())
-        if pb:
-            parts.append("PARTITION BY " + ", ".join(_emit_expr(e, d) for e in pb))
-        ob = spec.get("order_by", ())
-        if ob:
-            parts.append("ORDER BY " + ", ".join(_emit_order(o, d) for o in ob))
-        fs = spec.get("frame_start")
-        fe = spec.get("frame_end")
-        if fs:
-            frame = f"ROWS {fs}"
-            if fe:
-                frame = f"ROWS BETWEEN {fs} AND {fe}"
-            parts.append(frame)
+    if pb: parts.append("PARTITION BY " + ", ".join(_emit_expr(e, d) for e in pb))
+    if ob: parts.append("ORDER BY " + ", ".join(_emit_order(o, d) for o in ob))
+    if fs: parts.append(f"ROWS BETWEEN {fs} AND {fe}" if fe else f"ROWS {fs}")
     return " ".join(parts)
 
 
@@ -234,7 +203,7 @@ def _emit_insert(node: InsertNode, d: Dialect) -> str:
     if node.columns:
         cols = " (" + ", ".join(_quote_ident(c, d) for c in node.columns) + ")"
     if node.source:
-        src = _emit_node(node.source, d)
+        src = _emit(node.source, d)
         return f"INSERT INTO {target}{cols} {src}"
     if node.values:
         rows = ", ".join(
@@ -249,34 +218,18 @@ def _emit_merge(node: MergeNode, d: Dialect) -> str:
     target = _emit_from(node.target, d) if node.target else "?"
     source = _emit_from(node.source, d) if node.source else "?"
     on_sql = _emit_expr(node.on, d) if node.on else "?"
+    def _action(a: dict) -> str:
+        if a["type"] == "DELETE": return "DELETE"
+        if a["type"] == "UPDATE":
+            return "UPDATE SET " + ", ".join(f"{_quote_ident(k, d)} = {_emit_expr(v, d)}" for k, v in a["set"].items())
+        if a["type"] == "INSERT":
+            cols = " (" + ", ".join(_quote_ident(c, d) for c in a["columns"]) + ")" if a.get("columns") else ""
+            return f"INSERT{cols} VALUES ({', '.join(_emit_expr(v, d) for v in a['values'])})"
+        return a["type"]
+
     parts = [f"MERGE INTO {target} USING {source} ON {on_sql}"]
-    if node.when_matched:
-        for wm in node.when_matched:
-            cond = f" AND {_emit_expr(wm['condition'], d)}" if wm.get("condition") else ""
-            action = _emit_merge_action(wm["action"], d)
-            parts.append(f"WHEN MATCHED{cond} THEN {action}")
-    if node.when_not_matched:
-        for wnm in node.when_not_matched:
-            cond = f" AND {_emit_expr(wnm['condition'], d)}" if wnm.get("condition") else ""
-            action = _emit_merge_action(wnm["action"], d)
-            parts.append(f"WHEN NOT MATCHED{cond} THEN {action}")
+    for label, clauses in [("WHEN MATCHED", node.when_matched), ("WHEN NOT MATCHED", node.when_not_matched)]:
+        for wc in (clauses or []):
+            cond = f" AND {_emit_expr(wc['condition'], d)}" if wc.get("condition") else ""
+            parts.append(f"{label}{cond} THEN {_action(wc['action'])}")
     return " ".join(parts)
-
-
-def _emit_merge_action(action: dict, d: Dialect) -> str:
-    atype = action["type"]
-    if atype == "DELETE":
-        return "DELETE"
-    if atype == "UPDATE":
-        assigns = ", ".join(
-            f"{_quote_ident(k, d)} = {_emit_expr(v, d)}"
-            for k, v in action["set"].items()
-        )
-        return f"UPDATE SET {assigns}"
-    if atype == "INSERT":
-        cols = ""
-        if action.get("columns"):
-            cols = " (" + ", ".join(_quote_ident(c, d) for c in action["columns"]) + ")"
-        vals = ", ".join(_emit_expr(v, d) for v in action["values"])
-        return f"INSERT{cols} VALUES ({vals})"
-    return atype
