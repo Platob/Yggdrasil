@@ -4,12 +4,13 @@ import datetime as dt
 import logging
 import shutil
 import subprocess
-from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 from threading import Lock
 
 from fastapi.concurrency import run_in_threadpool
+
+from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from ...config import Settings
 from ...exceptions import NotFoundError
@@ -28,7 +29,7 @@ LOGGER = logging.getLogger(__name__)
 class PyEnvService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._envs: OrderedDict[int, PyEnvEntry] = OrderedDict()
+        self._envs: ExpiringDict[int, PyEnvEntry] = ExpiringDict(default_ttl=None, max_size=settings.max_environments)
         self._lock = Lock()
         self._envs_root = settings.node_home / "envs"
         self._envs_root.mkdir(parents=True, exist_ok=True)
@@ -73,8 +74,7 @@ class PyEnvService:
             updated_at=now,
         )
         with self._lock:
-            self._envs[env_id] = entry
-            self._evict()
+            self._envs.set(env_id, entry)
 
         await self._run(
             self._build_env, env_id, req.python_version,
@@ -291,13 +291,6 @@ class PyEnvService:
 
     def _touch(self, env_id: int) -> None:
         self._update_entry(env_id, last_used_at=self._now())
-
-    def _evict(self) -> None:
-        while len(self._envs) > self.settings.max_environments:
-            evicted_id, _ = self._envs.popitem(last=False)
-            p = self._envs_root / str(evicted_id)
-            if p.exists():
-                shutil.rmtree(p, ignore_errors=True)
 
     @staticmethod
     def _now() -> str:

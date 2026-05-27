@@ -4,6 +4,7 @@ from .network import NetworkService
 from .pyenv import PyEnvService
 from .pyfunc import PyFuncService
 from .pyfuncrun import PyFuncRunService
+from .replicate import ReplicateService
 
 __all__ = [
     "BackendService",
@@ -12,4 +13,5 @@ __all__ = [
     "PyEnvService",
     "PyFuncService",
     "PyFuncRunService",
+    "ReplicateService",
 ]

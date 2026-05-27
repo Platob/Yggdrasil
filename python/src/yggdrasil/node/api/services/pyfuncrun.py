@@ -11,13 +11,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 from threading import Lock
 from typing import Any, AsyncIterator
 
 from fastapi.concurrency import run_in_threadpool
+
+from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from ...config import Settings
 from ...exceptions import NotFoundError
@@ -46,7 +47,7 @@ class PyFuncRunService:
         self.settings = settings
         self._pyenv = pyenv_service
         self._pyfunc = pyfunc_service
-        self._runs: OrderedDict[int, PyFuncRunEntry] = OrderedDict()
+        self._runs: ExpiringDict[int, PyFuncRunEntry] = ExpiringDict(default_ttl=None, max_size=settings.max_runs_history)
         self._lock = Lock()
 
     async def _pool(self, fn, /, *args, **kwargs):
@@ -76,8 +77,7 @@ class PyFuncRunService:
             node_id=self.settings.node_id,
         )
         with self._lock:
-            self._runs[run_id] = entry
-            self._evict()
+            self._runs.set(run_id, entry)
 
         effective_timeout = (
             req.timeout if req.timeout is not None
@@ -270,13 +270,9 @@ class PyFuncRunService:
             entry = self._runs.get(run_id)
             if entry is not None:
                 entry = entry.model_copy(update=updates)
-                self._runs[run_id] = entry
+                self._runs.set(run_id, entry)
                 return entry
         raise NotFoundError(f"PyFuncRun {run_id!r} not found")
-
-    def _evict(self) -> None:
-        while len(self._runs) > self.settings.max_runs_history:
-            self._runs.popitem(last=False)
 
     @staticmethod
     def _now() -> str:

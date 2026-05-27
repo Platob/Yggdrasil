@@ -9,11 +9,13 @@ from .config import Settings, get_settings
 from .exceptions import register_exception_handlers
 from .api.routers import (
     backend_router as v2_backend_router,
+    card_router as v2_card_router,
     dag_router as v2_dag_router,
     network_router as v2_network_router,
     pyenv_router as v2_pyenv_router,
     pyfunc_router as v2_pyfunc_router,
     pyfuncrun_router as v2_pyfuncrun_router,
+    replicate_router as v2_replicate_router,
 )
 from .api.services.backend import BackendService
 from .api.services.dag import DAGService as V2DagService
@@ -21,6 +23,7 @@ from .api.services.network import NetworkService
 from .api.services.pyenv import PyEnvService
 from .api.services.pyfunc import PyFuncService
 from .api.services.pyfuncrun import PyFuncRunService
+from .api.services.replicate import ReplicateService
 from .routers import (
     call_router,
     cmd_router,
@@ -99,6 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lambda: pyfuncrun.total_count,
     )
     network = NetworkService(settings, backend)
+    replicate = ReplicateService(settings, pyenv, pyfunc, v2_dag)
 
     app.state.pyenv_service = pyenv
     app.state.pyfunc_service = pyfunc
@@ -106,6 +110,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.v2_dag_service = v2_dag
     app.state.backend_service = backend
     app.state.network_service = network
+    app.state.replicate_service = replicate
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -153,12 +158,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(filesystem_router, prefix=f"{prefix}/fs")
 
     # -- v2 API routers (PyEnv / PyFunc / PyFuncRun / Backend / Network) ----
+    app.include_router(v2_card_router, prefix=f"{prefix}/card")
     app.include_router(v2_pyenv_router, prefix=f"{prefix}/v2/pyenv")
     app.include_router(v2_pyfunc_router, prefix=f"{prefix}/v2/pyfunc")
     app.include_router(v2_pyfuncrun_router, prefix=f"{prefix}/v2/pyfuncrun")
     app.include_router(v2_dag_router, prefix=f"{prefix}/v2/dag")
     app.include_router(v2_backend_router, prefix=f"{prefix}/v2/backend")
     app.include_router(v2_network_router, prefix=f"{prefix}/v2/network")
+    app.include_router(v2_replicate_router, prefix=f"{prefix}/v2/replicate")
 
     return app
 

@@ -8,6 +8,7 @@ from .services.network import NetworkService
 from .services.pyenv import PyEnvService
 from .services.pyfunc import PyFuncService
 from .services.pyfuncrun import PyFuncRunService
+from .services.replicate import ReplicateService
 
 
 def get_pyenv_service(request: Request) -> PyEnvService:
@@ -32,3 +33,7 @@ def get_backend_service(request: Request) -> BackendService:
 
 def get_network_service(request: Request) -> NetworkService:
     return request.app.state.network_service
+
+
+def get_replicate_service(request: Request) -> ReplicateService:
+    return request.app.state.replicate_service

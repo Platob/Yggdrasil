@@ -1,0 +1,355 @@
+"use client";
+
+import { useEffect, useState, useCallback, useRef } from "react";
+import { NodeCard } from "@/components/NodeCard";
+import {
+  getBackend,
+  getPeers,
+  getEnvs,
+  getFuncs,
+  createBackendStream,
+} from "@/lib/api";
+import type {
+  NodeBackend,
+  NodeMeta,
+  PyEnvEntry,
+  PyFuncEntry,
+  BackendStreamEvent,
+} from "@/lib/types";
+
+// ── Helper: convert NodeBackend to NodeMeta for the self card ──
+function backendToMeta(b: NodeBackend): NodeMeta {
+  return {
+    node_id: b.node_id,
+    host: b.hostname,
+    port: 8100,
+    role: b.role,
+    version: "",
+    lat: null,
+    lon: null,
+    cpu_percent: b.cpu_percent,
+    memory_percent:
+      b.memory_total_mb > 0
+        ? (b.memory_used_mb / b.memory_total_mb) * 100
+        : 0,
+    active_runs: b.active_runs,
+    gpu_count: b.gpus.length,
+  };
+}
+
+// ── Status badge for environments ────────────────────────────
+function EnvStatusBadge({ status }: { status: string }) {
+  const colors: Record<string, { bg: string; text: string }> = {
+    ready:   { bg: "rgba(52,211,153,0.1)",  text: "var(--emerald)" },
+    pending: { bg: "rgba(251,191,36,0.1)",  text: "var(--amber)" },
+    error:   { bg: "rgba(244,63,94,0.1)",   text: "var(--rose)" },
+  };
+  const c = colors[status] || colors.pending;
+  return (
+    <span
+      className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
+      style={{ background: c.bg, color: c.text }}
+    >
+      {status}
+    </span>
+  );
+}
+
+export default function NodesPage() {
+  const [backend, setBackend] = useState<NodeBackend | null>(null);
+  const [peers, setPeers] = useState<NodeMeta[]>([]);
+  const [envs, setEnvs] = useState<PyEnvEntry[]>([]);
+  const [funcs, setFuncs] = useState<PyFuncEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [sseConnected, setSseConnected] = useState(false);
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  // ── Initial data fetch ──────────────────────────────────────
+  const fetchAll = useCallback(async () => {
+    try {
+      const [backendRes, peersRes, envsRes, funcsRes] = await Promise.allSettled([
+        getBackend(),
+        getPeers(),
+        getEnvs(),
+        getFuncs(),
+      ]);
+      if (backendRes.status === "fulfilled") setBackend(backendRes.value.backend);
+      if (peersRes.status === "fulfilled") setPeers(peersRes.value.peers);
+      if (envsRes.status === "fulfilled") setEnvs(envsRes.value.envs);
+      if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+  }, [fetchAll]);
+
+  // ── SSE stream for real-time backend updates ────────────────
+  useEffect(() => {
+    const es = createBackendStream();
+    eventSourceRef.current = es;
+
+    es.onopen = () => setSseConnected(true);
+
+    es.onmessage = (event) => {
+      try {
+        const data: BackendStreamEvent = JSON.parse(event.data);
+        if (data.backend) {
+          setBackend(data.backend);
+        }
+      } catch {
+        // Silently ignore parse errors from SSE
+      }
+    };
+
+    es.onerror = () => {
+      setSseConnected(false);
+    };
+
+    return () => {
+      es.close();
+      eventSourceRef.current = null;
+    };
+  }, []);
+
+  // ── Build the combined node list ────────────────────────────
+  const selfNode: NodeMeta | null = backend ? backendToMeta(backend) : null;
+  const allNodes: { node: NodeMeta; isSelf: boolean }[] = [];
+  if (selfNode) {
+    allNodes.push({ node: selfNode, isSelf: true });
+  }
+  for (const peer of peers) {
+    allNodes.push({ node: peer, isSelf: false });
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <div className="text-center animate-in">
+          <div className="w-8 h-8 border-2 border-frost/30 border-t-frost rounded-full spin-slow mx-auto mb-4" />
+          <p className="text-sm text-muted font-mono">Connecting to Yggdrasil...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-screen">
+      {/* ── Main content ─────────────────────────────────────── */}
+      <div className="flex-1 overflow-y-auto p-6 space-y-6 animate-in">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-foreground">Nodes</h1>
+            <p className="text-sm text-muted mt-1">
+              {allNodes.length} node{allNodes.length !== 1 ? "s" : ""} in the mesh
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            {/* SSE status */}
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.06]">
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  sseConnected ? "status-online" : "status-offline"
+                }`}
+              />
+              <span className="text-[11px] font-mono text-muted">
+                {sseConnected ? "Live" : "Polling"}
+              </span>
+            </div>
+            {/* Refresh button */}
+            <button
+              onClick={fetchAll}
+              className="
+                px-3 py-1.5 rounded-lg text-xs font-medium
+                text-frost/70 hover:text-frost
+                bg-frost/5 hover:bg-frost/10
+                border border-frost/10 hover:border-frost/20
+                transition-all duration-150
+              "
+            >
+              <svg className="inline-block mr-1.5 -mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <polyline points="23 4 23 10 17 10" />
+                <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
+              </svg>
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        {/* Node grid */}
+        {allNodes.length === 0 ? (
+          <div className="text-center py-20">
+            <p className="text-muted text-sm">No nodes found. Is the backend running?</p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            {allNodes.map(({ node, isSelf }) => (
+              <NodeCard key={node.node_id} node={node} isSelf={isSelf} />
+            ))}
+          </div>
+        )}
+
+        {/* Backend details (when available) */}
+        {backend && (
+          <div className="glass-card p-5 space-y-3">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted">
+              Local Backend
+            </h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+              <InfoCell label="Hostname" value={backend.hostname} mono />
+              <InfoCell label="Platform" value={backend.platform} />
+              <InfoCell label="Python" value={backend.python_version} mono />
+              <InfoCell label="CPU Cores" value={String(backend.cpu_count)} />
+              <InfoCell
+                label="Memory"
+                value={`${(backend.memory_used_mb / 1024).toFixed(1)} / ${(backend.memory_total_mb / 1024).toFixed(1)} GB`}
+                mono
+              />
+              <InfoCell
+                label="Disk"
+                value={`${(backend.disk_used_mb / 1024).toFixed(1)} / ${(backend.disk_total_mb / 1024).toFixed(1)} GB`}
+                mono
+              />
+              <InfoCell label="Active Runs" value={String(backend.active_runs)} highlight />
+              <InfoCell label="Total Runs" value={String(backend.total_runs)} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Right sidebar: functions + environments ──────────── */}
+      <div className="w-72 border-l border-border shrink-0 overflow-y-auto bg-background-elevated/50">
+        <div className="p-4 space-y-6">
+          {/* Functions */}
+          <div>
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-muted mb-3 flex items-center gap-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+              </svg>
+              Functions
+              <span className="ml-auto text-[10px] font-mono text-foreground-dim">
+                {funcs.length}
+              </span>
+            </h3>
+            {funcs.length === 0 ? (
+              <p className="text-xs text-muted/60 italic">No functions registered</p>
+            ) : (
+              <div className="space-y-1.5">
+                {funcs.map((f) => (
+                  <div
+                    key={f.id}
+                    className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04] hover:bg-white/[0.04] hover:border-white/[0.08] transition-all"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono font-medium text-foreground truncate">
+                        {f.name}
+                      </span>
+                      <span className="text-[10px] text-muted font-mono ml-2 shrink-0">
+                        {f.run_count} runs
+                      </span>
+                    </div>
+                    {f.description && (
+                      <p className="text-[11px] text-muted mt-0.5 truncate">
+                        {f.description}
+                      </p>
+                    )}
+                    {f.dependencies.length > 0 && (
+                      <div className="flex flex-wrap gap-1 mt-1.5">
+                        {f.dependencies.slice(0, 3).map((dep) => (
+                          <span
+                            key={dep}
+                            className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-frost/5 text-frost/60"
+                          >
+                            {dep}
+                          </span>
+                        ))}
+                        {f.dependencies.length > 3 && (
+                          <span className="text-[9px] text-muted">
+                            +{f.dependencies.length - 3}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Environments */}
+          <div>
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-muted mb-3 flex items-center gap-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z" />
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+                <line x1="12" y1="22.08" x2="12" y2="12" />
+              </svg>
+              Environments
+              <span className="ml-auto text-[10px] font-mono text-foreground-dim">
+                {envs.length}
+              </span>
+            </h3>
+            {envs.length === 0 ? (
+              <p className="text-xs text-muted/60 italic">No environments created</p>
+            ) : (
+              <div className="space-y-1.5">
+                {envs.map((env) => (
+                  <div
+                    key={env.id}
+                    className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04] hover:bg-white/[0.04] hover:border-white/[0.08] transition-all"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono font-medium text-foreground truncate">
+                        {env.name}
+                      </span>
+                      <EnvStatusBadge status={env.status} />
+                    </div>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-[10px] text-muted font-mono">
+                        Python {env.python_version}
+                      </span>
+                      {env.dependencies.length > 0 && (
+                        <span className="text-[10px] text-muted">
+                          {env.dependencies.length} dep{env.dependencies.length !== 1 ? "s" : ""}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Small info cell component ────────────────────────────────
+function InfoCell({
+  label,
+  value,
+  mono,
+  highlight,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+  highlight?: boolean;
+}) {
+  return (
+    <div>
+      <span className="text-[10px] text-muted uppercase tracking-wider">{label}</span>
+      <p
+        className={`text-sm truncate mt-0.5 ${mono ? "font-mono text-xs" : ""} ${
+          highlight ? "text-frost" : "text-foreground"
+        }`}
+      >
+        {value}
+      </p>
+    </div>
+  );
+}

@@ -1,0 +1,165 @@
+@import "tailwindcss";
+
+/* ── Nordic dark theme tokens ──────────────────────────────── */
+:root {
+  --background: #050510;
+  --background-elevated: #0a0a1a;
+  --foreground: #e4e2df;
+  --foreground-dim: #9a9894;
+  --muted: #5a5856;
+  --border: #1a1a2e;
+  --border-accent: #2a2a42;
+  --card: #0c0c1e;
+  --card-hover: #12122a;
+  --sidebar-bg: #06060f;
+  --sidebar-border: #141428;
+  --frost: #67e8f9;
+  --frost-dim: #22d3ee;
+  --frost-glow: rgba(103, 232, 249, 0.15);
+  --emerald: #34d399;
+  --emerald-glow: rgba(52, 211, 153, 0.15);
+  --amber: #fbbf24;
+  --amber-glow: rgba(251, 191, 36, 0.15);
+  --rose: #f43f5e;
+  --rose-glow: rgba(244, 63, 94, 0.15);
+  --primary: #67e8f9;
+  --primary-dim: #22d3ee;
+  --primary-glow: rgba(103, 232, 249, 0.12);
+  --radius: 0.75rem;
+  --radius-sm: 0.5rem;
+  --radius-lg: 1rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-background-elevated: var(--background-elevated);
+  --color-foreground: var(--foreground);
+  --color-foreground-dim: var(--foreground-dim);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-border-accent: var(--border-accent);
+  --color-card: var(--card);
+  --color-card-hover: var(--card-hover);
+  --color-sidebar-bg: var(--sidebar-bg);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-frost: var(--frost);
+  --color-frost-dim: var(--frost-dim);
+  --color-frost-glow: var(--frost-glow);
+  --color-emerald: var(--emerald);
+  --color-emerald-glow: var(--emerald-glow);
+  --color-amber: var(--amber);
+  --color-amber-glow: var(--amber-glow);
+  --color-rose: var(--rose);
+  --color-rose-glow: var(--rose-glow);
+  --color-primary: var(--primary);
+  --color-primary-dim: var(--primary-dim);
+  --color-primary-glow: var(--primary-glow);
+}
+
+/* ── Base ──────────────────────────────────────────────────── */
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+::selection {
+  background: var(--frost);
+  color: #000;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-accent);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+/* ── Animations ───────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-in {
+  animation: fadeIn 0.5s ease-out;
+}
+
+@keyframes pulse-frost {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.pulse-frost {
+  animation: pulse-frost 2s ease-in-out infinite;
+}
+
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: 0 0 8px var(--frost-glow); }
+  50% { box-shadow: 0 0 24px var(--frost-glow), 0 0 48px var(--frost-glow); }
+}
+.glow-pulse {
+  animation: glow-pulse 3s ease-in-out infinite;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+.float {
+  animation: float 6s ease-in-out infinite;
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+.spin-slow {
+  animation: spin-slow 20s linear infinite;
+}
+
+/* ── Glassmorphism card ───────────────────────────────────── */
+.glass-card {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-lg);
+  transition: all 0.2s ease;
+}
+.glass-card:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* ── Status dots ──────────────────────────────────────────── */
+.status-online {
+  background: var(--emerald);
+  box-shadow: 0 0 8px var(--emerald-glow);
+}
+.status-offline {
+  background: var(--rose);
+  box-shadow: 0 0 8px var(--rose-glow);
+}
+.status-pending {
+  background: var(--amber);
+  box-shadow: 0 0 8px var(--amber-glow);
+  animation: pulse-frost 1.5s ease-in-out infinite;
+}
+
+/* ── Subtle noise texture overlay ─────────────────────────── */
+.noise-bg::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  opacity: 0.02;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  pointer-events: none;
+}

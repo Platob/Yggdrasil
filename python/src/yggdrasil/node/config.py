@@ -19,7 +19,7 @@ def _user_key() -> str:
 
 
 def _node_home() -> Path:
-    return Path.home() / ".ygg" / _user_key()
+    return Path.home() / ".node" / _default_node_id()
 
 
 def _default_node_id() -> str:

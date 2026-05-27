@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from collections import OrderedDict
 from threading import Lock
+
+from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from ...config import Settings
 from ...exceptions import NotFoundError
@@ -22,7 +23,7 @@ LOGGER = logging.getLogger(__name__)
 class PyFuncService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._funcs: OrderedDict[int, PyFuncEntry] = OrderedDict()
+        self._funcs: ExpiringDict[int, PyFuncEntry] = ExpiringDict(default_ttl=None, max_size=settings.max_functions)
         self._lock = Lock()
 
     # -- CRUD ---------------------------------------------------------------
@@ -62,8 +63,7 @@ class PyFuncService:
                 created_at=now,
                 updated_at=now,
             )
-            self._funcs[func_id] = entry
-            self._evict()
+            self._funcs.set(func_id, entry)
             return PyFuncResponse(func=entry)
 
     async def get(self, func_id: int) -> PyFuncEntry:
@@ -113,10 +113,6 @@ class PyFuncService:
                 )
 
     # -- internals ----------------------------------------------------------
-
-    def _evict(self) -> None:
-        while len(self._funcs) > self.settings.max_functions:
-            self._funcs.popitem(last=False)
 
     @staticmethod
     def _now() -> str:

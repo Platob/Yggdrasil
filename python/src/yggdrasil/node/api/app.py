@@ -9,11 +9,13 @@ from ..config import Settings, get_settings
 from ..exceptions import register_exception_handlers
 from .routers import (
     backend_router,
+    card_router,
     dag_router,
     network_router,
     pyenv_router,
     pyfunc_router,
     pyfuncrun_router,
+    replicate_router,
 )
 from .services.backend import BackendService
 from .services.dag import DAGService
@@ -21,6 +23,7 @@ from .services.network import NetworkService
 from .services.pyenv import PyEnvService
 from .services.pyfunc import PyFuncService
 from .services.pyfuncrun import PyFuncRunService
+from .services.replicate import ReplicateService
 
 
 def create_api(settings: Settings | None = None) -> FastAPI:
@@ -47,6 +50,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         lambda: pyfuncrun.total_count,
     )
     network = NetworkService(settings, backend)
+    replicate = ReplicateService(settings, pyenv, pyfunc, dag)
 
     app.state.pyenv_service = pyenv
     app.state.pyfunc_service = pyfunc
@@ -54,6 +58,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.state.dag_service = dag
     app.state.backend_service = backend
     app.state.network_service = network
+    app.state.replicate_service = replicate
 
     # -- Middleware ----------------------------------------------------------
 
@@ -82,12 +87,14 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     # -- Routers ------------------------------------------------------------
     prefix = f"{settings.api_prefix}/v2"
+    app.include_router(card_router, prefix=f"{settings.api_prefix}/card")
     app.include_router(pyenv_router, prefix=f"{prefix}/pyenv")
     app.include_router(pyfunc_router, prefix=f"{prefix}/pyfunc")
     app.include_router(pyfuncrun_router, prefix=f"{prefix}/pyfuncrun")
     app.include_router(dag_router, prefix=f"{prefix}/dag")
     app.include_router(backend_router, prefix=f"{prefix}/backend")
     app.include_router(network_router, prefix=f"{prefix}/network")
+    app.include_router(replicate_router, prefix=f"{prefix}/replicate")
 
     return app
 
