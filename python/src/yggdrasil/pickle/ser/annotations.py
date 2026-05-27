@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser.serialized import Serialized
 
 __all__ = [
@@ -22,7 +22,7 @@ def _serialize_nested(obj: object) -> bytes:
 
 
 def _deserialize_nested(blob: bytes) -> object:
-    return Serialized.read_from(BytesIO(blob), pos=0).as_python()
+    return Serialized.read_from(IO(blob), pos=0).as_python()
 
 
 def _safe_repr(obj: object) -> str:

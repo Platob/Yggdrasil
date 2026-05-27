@@ -46,11 +46,11 @@ from databricks.sdk.errors import PermissionDenied
 
 from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
-from yggdrasil.data.enums import Mode, ModeLike, Scheme
-from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.enums import Mode, ModeLike, Scheme
+from yggdrasil.enums.media_type import MediaType
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 from ..path import DatabricksPath
 
 if TYPE_CHECKING:
@@ -785,7 +785,7 @@ class VolumePath(DatabricksPath):
 
         else:
             # ``FilesExt.upload`` calls ``contents.seekable()`` — wrap
-            # raw bytes in a fresh ``BytesIO`` each attempt so retries
+            # raw bytes in a fresh ``IO`` each attempt so retries
             # always PUT the full body from offset zero.
             payload = bytes(content)
 
@@ -797,7 +797,22 @@ class VolumePath(DatabricksPath):
                 )
 
         self._call_ensuring_parents(_do_upload)
+        if size < 0 and hasattr(content, "seek"):
+            try:
+                content.seek(0, io.SEEK_END)
+                size = content.tell()
+            except Exception:
+                pass
+        committed = None
         if size >= 0:
+            if hasattr(content, "read"):
+                try:
+                    content.seek(0)
+                    committed = content.read()
+                except Exception:
+                    pass
+            else:
+                committed = bytes(content)
             self._persist_stat_cache(
                 IOStats(
                     size=size,
@@ -809,6 +824,10 @@ class VolumePath(DatabricksPath):
             logger.info("Uploaded volume file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded volume file %r (size=stream)", self)
+        if committed is not None:
+            self._cache_after_upload(committed, len(committed))
+        else:
+            self._buffered_size = None
         return size
 
     def _clear(self) -> None:

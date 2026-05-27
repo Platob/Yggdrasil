@@ -55,7 +55,7 @@ import pytest
 from databricks.sdk.errors import DatabricksError, NotFound, PermissionDenied
 
 from yggdrasil.data import Field
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.databricks.table.table import Table

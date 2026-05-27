@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.pickle import json as ygg_json
 
 from yggdrasil.io.nested.delta._names import (
@@ -64,7 +64,7 @@ from yggdrasil.io.nested.delta.protocol import Txn
 
 if TYPE_CHECKING:
     from yggdrasil.io.nested.delta.snapshot import Snapshot
-    from yggdrasil.io.path import Path
+    from yggdrasil.path import Path
 
 
 __all__ = ["write_checkpoint", "update_last_checkpoint"]

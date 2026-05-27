@@ -4,7 +4,7 @@ The contract under test:
 
 * The base class derives ``done`` / ``failed`` / ``started`` from a
   subclass-provided ``_compute_state`` so a single
-  :class:`yggdrasil.data.enums.State` mapping is the source of truth.
+  :class:`yggdrasil.enums.State` mapping is the source of truth.
 * The :meth:`state_snapshot` context manager pins ``state`` for the
   duration of the block so multiple state-derived predicate accesses
   share a single ``refresh_status`` call — the warehouse path's
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from yggdrasil.data.enums import State
+from yggdrasil.enums import State
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 
 
@@ -48,17 +48,16 @@ class _CountingResult(StatementResult[_StubStatement]):
     def refresh_status(self) -> None:
         return None
 
-    def start(self, reset: bool = False, **kwargs: Any) -> "_CountingResult":
+    def _start(self) -> None:
         self._state_value = State.SUCCEEDED
-        return self
 
-    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "_CountingResult":
+    def _cancel(self) -> None:
         self._state_value = State.CANCELED
-        return self
 
-    def _raise_for_status(self) -> None:
+    def _error_for_status(self):
         if self._state_value.is_failed:
-            raise RuntimeError("stub failed")
+            return RuntimeError("stub failed")
+        return None
 
     # Unused Tabular hooks.
     def _read_arrow_batches(self, options):  # pragma: no cover

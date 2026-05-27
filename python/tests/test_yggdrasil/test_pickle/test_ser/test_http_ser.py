@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io import IO
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.pickle.ser import dumps, loads
@@ -62,7 +62,7 @@ def _make_response(
 ) -> Response:
     req = request or _make_request()
     all_headers = {"Content-Type": "application/json", **(headers or {})}
-    buf = BytesIO(body, copy=False)
+    buf = IO(body, copy=False)
     return Response(
         request=req,
         status_code=status_code,
@@ -74,7 +74,7 @@ def _make_response(
 
 
 def _wire_roundtrip(ser: Serialized) -> Serialized:
-    buf = BytesIO()
+    buf = IO()
     ser.write_to(buf)
     return Serialized.read_from(buf, pos=0)
 
@@ -425,11 +425,11 @@ class TestResponseRoundTrip:
         """
         from yggdrasil.io.holder import Holder
         from yggdrasil.io.primitive import JSONFile
-        from yggdrasil.data.enums.media_type import MediaType
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.media_type import MediaType
+        from yggdrasil.enums.mime_type import MimeTypes
 
         req = _make_request()
-        buf = BytesIO(b'{"x":1}', media_type=MediaType(MimeTypes.JSON))
+        buf = IO(b'{"x":1}', media_type=MediaType(MimeTypes.JSON))
         assert isinstance(buf, JSONFile)
         orig = Response(
             request=req,

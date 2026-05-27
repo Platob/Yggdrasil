@@ -6,8 +6,8 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.memory import Memory
+from yggdrasil.path.local_path import LocalPath
 from yggdrasil.io.primitive.parquet_file import ParquetFile
 
 
@@ -23,9 +23,9 @@ class TestRegistration:
         )
 
     def test_path_dispatches_via_extension(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(path=str(tmp_path / "x.parquet"))
+        b = IO(path=str(tmp_path / "x.parquet"))
         assert isinstance(b, ParquetFile)
 
     def test_open_local_path_dispatches(self, tmp_path) -> None:
@@ -50,16 +50,16 @@ class TestMemoryRoundTrip:
         assert leaf2.read_arrow_table().equals(table)
 
     def test_dispatch_via_stamped_media(self, table) -> None:
-        from yggdrasil.data.enums import MediaType, MimeTypes
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.enums import MediaType, MimeTypes
+        from yggdrasil.io.base import IO
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
-        writer = BytesIO(holder=mem, owns_holder=False)
+        writer = IO(holder=mem, owns_holder=False)
         assert isinstance(writer, ParquetFile)
         writer.write_arrow_table(table)
 
-        reader = BytesIO(holder=mem, owns_holder=False)
+        reader = IO(holder=mem, owns_holder=False)
         assert reader.read_arrow_table().equals(table)
 
 
@@ -280,7 +280,7 @@ class TestPandasAppendUpsert(__import__(
 
     def test_append_pandas_frames(self) -> None:
         """APPEND concatenates rows; the named index round-trips through both writes."""
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.primitive.parquet_file import ParquetOptions
 
         df1 = self.df(
@@ -308,7 +308,7 @@ class TestPandasAppendUpsert(__import__(
         """After an APPEND, the on-disk schema still carries the index tag."""
         import pyarrow.parquet as pq
         from io import BytesIO
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.data.data_field import Field
         from yggdrasil.io.primitive.parquet_file import ParquetOptions
 
@@ -328,7 +328,7 @@ class TestPandasAppendUpsert(__import__(
 
     def test_upsert_pandas_frames_by_key(self) -> None:
         """UPSERT with match_by replaces existing rows; incoming wins."""
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.primitive.parquet_file import ParquetOptions
 
         df1 = self.df(
@@ -349,7 +349,7 @@ class TestPandasAppendUpsert(__import__(
 
     def test_append_round_trips_multi_index(self) -> None:
         """MultiIndex levels survive an APPEND — every level stays tagged."""
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.primitive.parquet_file import ParquetOptions
 
         idx1 = self.pd.MultiIndex.from_tuples(
@@ -379,7 +379,7 @@ class TestPandasAppendUpsert(__import__(
         """APPEND against an empty buffer collapses to OVERWRITE and tags as usual."""
         import pyarrow.parquet as pq
         from io import BytesIO
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.data.data_field import Field
         from yggdrasil.io.primitive.parquet_file import ParquetOptions
 
@@ -401,7 +401,7 @@ class TestPandasAppendUpsert(__import__(
 
     def test_upsert_round_trips_index_with_match_by(self) -> None:
         """UPSERT preserves the pandas index after merging with existing rows."""
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.primitive.parquet_file import ParquetOptions
 
         # Existing rows keyed by 'k'; the named index 'i' rides along

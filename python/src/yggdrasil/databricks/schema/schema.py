@@ -38,15 +38,15 @@ from databricks.sdk.service.catalog import (
     SecurableType,
 )
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.data.enums import MediaTypes, MimeType, MimeTypes, Scheme
+from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.databricks.path import DatabricksPath
-from yggdrasil.io import URL
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.url import URL
+from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.path import Path
-from yggdrasil.data.enums.mode import Mode, ModeLike
+from yggdrasil.path import Path
+from yggdrasil.enums.mode import Mode, ModeLike
 
 from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
 
@@ -301,12 +301,12 @@ class UCSchema(DatabricksPath, Singleton):
             f"Use ``create()`` / ``update()`` to mutate metadata."
         )
 
-    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
         raise NotImplementedError(
             f"{type(self).__name__} is a logical Unity Catalog resource."
         )
 
-    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
         raise NotImplementedError(
             f"{type(self).__name__} is a logical Unity Catalog resource."
         )

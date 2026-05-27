@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from yggdrasil.aws.config import AwsCredentials
 from yggdrasil.aws.provider import AwsCredentialsProvider
-from yggdrasil.data.enums import Mode, ModeLike
+from yggdrasil.enums import Mode, ModeLike
 
 if TYPE_CHECKING:
     from databricks.sdk.service.catalog import TableOperation, VolumeOperation

@@ -34,7 +34,7 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.data_field import Field
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.io.primitive.csv_file import CsvOptions
 
 

@@ -29,7 +29,6 @@ class _DummyResult(StatementResult):
 
     def __init__(self, statement, *, executor=None, **kwargs):
         super().__init__(statement, executor=executor, **kwargs)
-        self.started = False
         self._terminal = False
 
     def _compute_state(self):
@@ -39,16 +38,14 @@ class _DummyResult(StatementResult):
     def refresh_status(self):
         pass
 
-    def start(self, *, reset=False, wait=None, raise_error=False, **kwargs):
-        self.started = True
+    def _start(self):
         self._terminal = True
-        return self
 
-    def cancel(self):
+    def _cancel(self):
         pass
 
-    def _raise_for_status(self):
-        pass
+    def _error_for_status(self):
+        return None
 
     def _read_arrow_batches(self, options):
         return iter([pa.RecordBatch.from_pylist([])])
@@ -73,8 +70,9 @@ class _DummyExecutor(StatementExecutor):
 
 
 class TestExecutorInheritsSession:
-    def test_statement_executor_is_session_subclass(self):
-        assert issubclass(StatementExecutor, Session)
+    def test_statement_executor_is_singleton_subclass(self):
+        from yggdrasil.dataclasses.singleton import Singleton
+        assert issubclass(StatementExecutor, Singleton)
 
     def test_session_classvars_declared_on_base(self):
         """Session declares the prepared / response / batch slots so each

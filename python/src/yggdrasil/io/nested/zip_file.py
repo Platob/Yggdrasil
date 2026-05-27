@@ -1,9 +1,9 @@
 """Zip-archive Tabular leaf with lazy per-entry I/O.
 
-:class:`ZipFile` IS-A :class:`BytesIO` whose backing bytes are a zip
+:class:`ZipFile` IS-A :class:`IO` whose backing bytes are a zip
 archive. It exposes two surfaces:
 
-1. **Byte surface** — inherited from :class:`BytesIO`. Read / write /
+1. **Byte surface** — inherited from :class:`IO`. Read / write /
    seek the raw archive bytes (useful for "open zip, drive
    :mod:`zipfile` yourself" flows).
 2. **Children surface** — :meth:`iter_children` walks every entry as
@@ -14,7 +14,7 @@ archive. It exposes two surfaces:
 Lazy children
 -------------
 
-A :class:`ZipEntryFile` is a :class:`BytesIO` over a :class:`Memory`
+A :class:`ZipEntryFile` is an :class:`IO` over a :class:`Memory`
 holder, but the holder's payload starts empty and is materialized
 on first access through :meth:`ZipEntryFile._materialize`. The first
 ``read`` / ``size`` / ``seek_end`` / ``to_bytes`` / Tabular hook
@@ -56,12 +56,12 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.data.enums.mime_type import MimeType
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.enums import MimeTypes, Mode
+from yggdrasil.enums.media_type import MediaType
+from yggdrasil.enums.mime_type import MimeType
+from yggdrasil.io.holder import IO
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 
 
@@ -130,12 +130,12 @@ class ZipOptions(CastOptions):
 
 
 # ---------------------------------------------------------------------------
-# ZipEntryFile — lazy per-entry BytesIO
+# ZipEntryFile — lazy per-entry IO
 # ---------------------------------------------------------------------------
 
 
-class ZipEntryFile(BytesIO):
-    """:class:`BytesIO` over a single zip entry's uncompressed payload.
+class ZipEntryFile(IO):
+    """:class:`IO` over a single zip entry's uncompressed payload.
 
     The payload is fetched from the parent archive on first access
     and cached in the inner :class:`Memory` holder. Reading the
@@ -289,7 +289,7 @@ class ZipEntryFile(BytesIO):
 # ---------------------------------------------------------------------------
 
 
-class ZipFile(BytesIO):
+class ZipFile(IO):
     """:class:`Tabular` leaf for ``.zip`` archives."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.ZIP

@@ -499,7 +499,7 @@ class WorkspacePyPIRegistry:
            bare module directories the user wants on the cluster
            via ``addArtifacts``, not via pip.
         """
-        from yggdrasil.io.path._module_pack import build_module_archive
+        from yggdrasil.path._module_pack import build_module_archive
 
         if info.source is not None and info.source.is_file():
             suffix = info.source.suffix.lower()

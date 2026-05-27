@@ -123,7 +123,7 @@ class TestSidecarDecode(DeltaTestCase):
         # Frame: ``int32 size + payload + int32 crc``.
         framed = struct.pack(">I", len(payload)) + payload + struct.pack(">I", 0)
 
-        from yggdrasil.io.path import LocalPath
+        from yggdrasil.path import LocalPath
 
         uid = "deadbeefdeadbeefdeadbeefdeadbeef"
         sidecar = self.tmp_path / f"deletion_vector_{uid}.bin"

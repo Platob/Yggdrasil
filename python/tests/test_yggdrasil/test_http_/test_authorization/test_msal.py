@@ -1,4 +1,4 @@
-"""Unit tests for :class:`yggdrasil.io.authorization.msal.MSALAuth`.
+"""Unit tests for :class:`yggdrasil.http_.authorization.msal.MSALAuth`.
 
 Covers config resolution (constructor / env fallback), singleton-by-config
 caching through the :class:`ExpiringDict` cache, idempotent ``__init__``,
@@ -25,8 +25,8 @@ import pytest
 # whole module when the dep is missing instead of crashing collection.
 pytest.importorskip("msal")
 
-from yggdrasil.io.authorization import Authorization, MSALAuth
-from yggdrasil.io.authorization import msal as msal_module
+from yggdrasil.http_.authorization import Authorization, MSALAuth
+from yggdrasil.http_.authorization import msal as msal_module
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
 

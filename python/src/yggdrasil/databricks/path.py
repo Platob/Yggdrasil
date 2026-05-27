@@ -38,10 +38,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, ClassVar, Optional, Tuple
 
-from yggdrasil.data.enums import Scheme
-from yggdrasil.io.path import RemotePath
-from yggdrasil.io.path._retry import retry_sdk_call
-from yggdrasil.io.url import URL
+from yggdrasil.enums import Scheme
+from yggdrasil.path import RemotePath
+from yggdrasil.path._retry import retry_sdk_call
+from yggdrasil.url import URL
 from .resource import DatabricksResource
 from .service import DatabricksService
 
@@ -780,7 +780,7 @@ class DatabricksPath(DatabricksResource, RemotePath):
         return super().read_mv(size, offset, cursor=cursor)
 
     def _bread(self, n: int, pos: int, mode):  # pragma: no cover - thin shim
-        """Fallback whole-file read into a fresh :class:`BytesIO`.
+        """Fallback whole-file read into a fresh :class:`IO`.
 
         Aggressive path: ``n`` is forwarded straight to :meth:`_read_mv`,
         which handles ``n < 0`` as "read to EOF". The previous version
@@ -791,19 +791,19 @@ class DatabricksPath(DatabricksResource, RemotePath):
         call gives the same "missing → empty buffer" semantics without
         the precondition.
         """
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.holder import IO
 
         del mode
         if n == 0:
-            return BytesIO()
+            return IO()
         try:
             data = bytes(self._read_mv(n, pos))
         except FileNotFoundError:
             data = b""
-        return BytesIO(data)
+        return IO(data)
 
     def _bwrite(self, data, pos: int, mode) -> int:  # pragma: no cover
-        """Fallback whole-file write from a :class:`BytesIO`."""
+        """Fallback whole-file write from a :class:`IO`."""
         del mode
         if hasattr(data, "to_bytes"):
             payload = data.to_bytes()

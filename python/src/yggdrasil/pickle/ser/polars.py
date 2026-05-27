@@ -8,7 +8,7 @@ from typing import ClassVar, Generic, TypeVar
 from yggdrasil.lazy_imports import polars as pl
 import pyarrow as pa
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
 
@@ -472,7 +472,7 @@ class PolarsSerialized(Serialized[TPolars], Generic[TPolars]):
 
     @staticmethod
     def _deserialize_nested_payload(data: bytes) -> object:
-        nested = Serialized.read_from(BytesIO(data), pos=0)
+        nested = Serialized.read_from(IO(data), pos=0)
         return nested.as_python()
 
     @staticmethod

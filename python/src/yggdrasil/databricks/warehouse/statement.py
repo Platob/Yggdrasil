@@ -55,9 +55,9 @@ from databricks.sdk.service.sql import (
 
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema
-from yggdrasil.data.enums import MimeType, MimeTypes, Mode
-from yggdrasil.data.enums.media_type import MediaTypes
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums import MimeType, MimeTypes, Mode
+from yggdrasil.enums.media_type import MediaTypes
+from yggdrasil.enums.state import State
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.statement import (
     ExternalStatementData,
@@ -120,7 +120,7 @@ FAILED_STATES = {
 
 
 # Map the Databricks SDK ``StatementState`` to the unified
-# :class:`yggdrasil.data.enums.State`. ``CLOSED`` is "result already
+# :class:`yggdrasil.enums.State`. ``CLOSED`` is "result already
 # fetched / TTL elapsed" — terminal but not an error, so it buckets with
 # ``SUCCEEDED`` (matches the legacy ``done and not failed`` behavior).
 _SDK_TO_STATE: dict[StatementState, State] = {
@@ -705,7 +705,7 @@ class WarehouseStatementResult(StatementResult):
         if elapsed and elapsed > _RETRYABLE_ELAPSED_LIMIT:
             return False
 
-        error = self._compute_error()
+        error = self._error_for_status()
         if error is None:
             return False
 
@@ -750,6 +750,13 @@ class WarehouseStatementResult(StatementResult):
 
         if isinstance(self._response, StatementResponse):
             self.statement_id = response.statement_id
+            state = response.status.state if response.status else StatementState.PENDING
+
+            if state in DONE_STATES:
+                self.statement.clear_temporary_resources()
+                logger.info(
+                    "Statement %r finished in state %r", self, state,
+                )
 
         return self
 
@@ -761,73 +768,21 @@ class WarehouseStatementResult(StatementResult):
         raise_error: bool = False,
         **kwargs: Any,
     ) -> "WarehouseStatementResult":
-        """Submit the statement.  Idempotent on already-started results.
-
-        ``reset=True`` cancels the existing submission (when not already
-        terminal) and clears local state before resubmitting — this is
-        the path :meth:`StatementResult.retry` drives.
-
-        Caller kwargs override anything carried on ``self.statement`` for
-        this submission only — the underlying statement's hints stay put.
-        """
-        if self.started:
-            if not reset:
-                logger.debug(
-                    "Skipping start for statement %r — already started", self,
-                )
-                return self
-
-            logger.debug(
-                "Resetting statement %r before resubmit (iteration=%d)",
-                self, self.iteration,
-            )
-            self.cancel(wait=False)
-
+        if self.started and not reset:
+            return self
+        if reset:
             self.statement_id = None
             self._response = None
             self._unpersist_schema()
+        return super().start(reset=reset, wait=wait, raise_error=raise_error)
 
-        logger.debug("Submitting statement on %r", self.executor)
-        submitted = self.executor.send(self.statement)
-
-        self.statement = submitted.statement
-        self.set_api_response(submitted._response)
-        self.iteration = self.iteration + 1
-        logger.debug(
-            "Submitted statement %r (iteration=%d, state=%s)",
-            self, self.iteration,
-            submitted._response.status.state if submitted._response else None,
-        )
-
-        return self
-
-    def cancel(self, wait: WaitingConfigArg = False, **kwargs) -> "WarehouseStatementResult":
-        """Cancel the running statement.  No-op when not started or already terminal."""
-        if not self.started:
-            return self
-        # Use the cached SDK response directly here — we don't want to
-        # trigger ``state``'s refresh just to short-circuit on an already
-        # terminal statement, and the cached response is authoritative
-        # for this check.
-        if self._response is not None and self._response.status.state in DONE_STATES:
-            return self
-
-        wait = WaitingConfig.from_(wait)
-
-        if wait:
-            logger.debug("Cancelling statement %r", self)
-            try:
-                self.client.workspace_client().statement_execution.cancel_execution(
-                    statement_id=self.statement_id,
-                )
-            except Exception:
-                logger.exception("Failed to cancel statement %r", self.key)
-        else:
-            logger.debug("Cancelling statement %r (no-wait)", self)
-            Job.make(self.client.workspace_client().statement_execution.cancel_execution, statement_id=self.statement_id).fire_and_forget()
-
-        self._response = None
-        return self
+    def cancel(
+        self,
+        wait: WaitingConfigArg = False,
+        raise_error: bool = False,
+        **kwargs,
+    ) -> "WarehouseStatementResult":
+        return super().cancel(wait=wait, raise_error=raise_error)
 
     # ------------------------------------------------------------------
     # Display
@@ -895,11 +850,7 @@ class WarehouseStatementResult(StatementResult):
         response = statement_execution.get_statement(self.statement_id)
         new_state = response.status.state
 
-        if new_state in DONE_STATES:
-            logger.info(
-                "Statement %r finished in state %s", self, new_state,
-            )
-        elif cached_state != new_state:
+        if cached_state != new_state:
             logger.debug(
                 "Polled statement %r (state=%s, prev=%s)",
                 self, new_state, cached_state,
@@ -926,33 +877,31 @@ class WarehouseStatementResult(StatementResult):
         return self.status.state
 
     def _compute_state(self) -> State:
-        """Refresh and map the SDK state onto the unified :class:`State`.
-
-        Single source of truth for ``done`` / ``failed`` / ``started``
-        on the warehouse path; the base ``state`` property caches this
-        for the duration of any :meth:`state_snapshot` block so a code
-        path that checks several state-derived predicates only hits the
-        warehouse status endpoint once.
-        """
         return _SDK_TO_STATE.get(self.sdk_state, State.PENDING)
 
-    def _compute_error(self) -> Optional[SQLError]:
-        """Build a :class:`SQLError` from the SDK response, or ``None`` on success.
-
-        Only meaningful in terminal states — :meth:`SQLError.from_statement`
-        inspects ``status.error``, which the SDK only populates on FAILED
-        / CANCELED.  Called from both :attr:`retryable` (no-refresh, uses
-        cached state) and :meth:`_raise_for_status` (after ``wait()`` has
-        forced termination).
-        """
+    def _error_for_status(self) -> BaseException | None:
         if self.sdk_state not in FAILED_STATES:
             return None
         return SQLError.from_statement(self)
 
-    def _raise_for_status(self) -> None:
-        error = self._compute_error()
-        if error is not None:
-            raise error
+    def _start(self) -> None:
+        submitted = self.executor.send(self.statement)
+        self.statement = submitted.statement
+        self.set_api_response(submitted._response)
+        self.iteration = self.iteration + 1
+
+    def _cancel(self) -> None:
+        if not self.started:
+            return
+        if self._response is not None and self._response.status.state in DONE_STATES:
+            return
+        try:
+            self.client.workspace_client().statement_execution.cancel_execution(
+                statement_id=self.statement_id,
+            )
+        except Exception:
+            logger.exception("Failed to cancel statement %r", self.key)
+        self._response = None
 
     # ------------------------------------------------------------------
     # Manifest / schema

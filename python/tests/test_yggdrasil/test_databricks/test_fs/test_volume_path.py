@@ -357,7 +357,7 @@ class TestWrite:
 
         workspace.files.upload.side_effect = upload_side_effect
 
-        with patch("yggdrasil.io.path._retry.time.sleep"):
+        with patch("yggdrasil.path._retry.time.sleep"):
             VolumePath("/Volumes/c/s/v/x", service=service).write_bytes(
                 io.BytesIO(b"abcdef"),
             )

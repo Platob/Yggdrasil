@@ -43,8 +43,9 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Iterable, It
 import pyarrow as pa
 
 from yggdrasil.data import Mode
-from yggdrasil.data.enums import MimeType, MimeTypes, State
+from yggdrasil.enums import MimeType, MimeTypes, State
 from yggdrasil.data.schema import Schema
+from yggdrasil.dataclasses.awaitable import Awaitable
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular import Tabular, O
@@ -438,17 +439,16 @@ def _new_key(
 # ---------------------------------------------------------------------------
 
 
-class StatementResult(Tabular, Generic[PS]):
+class StatementResult(Tabular, Awaitable, Generic[PS]):
     """Backend-agnostic handle to a running or completed statement.
 
-    Subclasses fill in lifecycle hooks (``done``, ``failed``,
-    ``refresh_status``, ``start``, ``cancel``).  The base provides:
+    Inherits :class:`Tabular` (Arrow I/O) and :class:`Awaitable`
+    (start / wait / cancel lifecycle with retry).  Subclasses implement
+    the three Awaitable hooks:
 
-    - polling-based :meth:`wait` that drives those hooks
-    - cached schema collection
-    - generic ``persist`` / ``cached`` so synchronous backends (Spark,
-      in-memory) can stash a materialized result without a backend-specific
-      override
+    - :meth:`_poll` — refresh state from the backend
+    - :meth:`_start` — submit the statement
+    - :meth:`_error_for_status` — return the backend-specific error
     """
 
     _PREPARED_CLASS: ClassVar[type[PreparedStatement]] = PreparedStatement
@@ -477,230 +477,63 @@ class StatementResult(Tabular, Generic[PS]):
         super().__init__(**kwargs)
 
     # -------------------------------------------------------------------------
-    # Execution lifecycle contract
+    # Awaitable bridge
     # -------------------------------------------------------------------------
 
     @abstractmethod
     def _compute_state(self) -> State:
-        """Refresh from the backend and return the current unified :class:`State`.
+        ...
 
-        Subclass hook — every backend translates its own state
-        vocabulary (Databricks ``StatementState``, Spark's local
-        ``_started`` / ``_failure`` flags, pymongo command response,
-        ...) into the unified enum here. Called once per ``state``
-        access except inside a :meth:`state_snapshot` block, where the
-        first call's result is cached and re-used.
-        """
+    def _poll(self) -> None:
+        self._state = self._compute_state()
 
     @property
     def state(self) -> State:
-        """Current unified :class:`State`.
-
-        Reads the per-instance snapshot when a :meth:`state_snapshot`
-        block is active so multiple state-derived accesses
-        (``done``, ``failed``, ``started``) in the same block share a
-        single ``refresh_status`` call. Outside a snapshot, every
-        access goes through :meth:`_compute_state`.
-        """
         return self._compute_state()
 
     @property
     def done(self) -> bool:
-        """Whether the statement is in a terminal state."""
         return self.state.is_done
 
     @property
     def failed(self) -> bool:
-        """Whether the statement failed or was canceled."""
         return self.state.is_failed
 
     @abstractmethod
     def refresh_status(self) -> None:
-        """Refresh execution state from the backend."""
-
-    def retry(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "StatementResult":
-        state = self.state
-
-        if state.is_succeeded:
-            return self
-        if state.is_failed:
-            if self.retryable:
-                return self.start(
-                    reset=True,
-                    wait=wait,
-                    raise_error=raise_error,
-                    **kwargs,
-                )
-            self.raise_for_status()
-            # raise_for_status raised; this line is unreachable, but keep
-            # the explicit return for type-checker happiness.
-            return self
-
-        # Non-terminal state — caller explicitly asked to retry something
-        # still in flight.  This isn't a hot path (wait() guards against
-        # it), so the error is the right answer.
-        raise RuntimeError(f"{self!r} in current state {state!r} cannot be retried.")
-
-    @abstractmethod
-    def start(
-        self,
-        reset: bool = False,
-        *,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True,
-        **kwargs: Any,
-    ) -> "StatementResult":
-        """Submit the statement for execution.  Idempotent on already-started results."""
-
-    @abstractmethod
-    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "StatementResult":
-        """Request cancellation.  Idempotent / no-op when not started or already terminal."""
+        ...
 
     def raise_for_status(self) -> None:
-        """Raise an exception if the statement failed or was canceled.
-
-        Releases any per-statement scratch on failure (so the caller doesn't
-        leak temp volumes when handling the exception).  Auto-promotes
-        the underlying statement to ``retryable=True`` once if the
-        failure matches a known-transient pattern declared by the
-        subclass — the caller's :meth:`retry` will then pick it up.
-
-        The state checks live inside a :meth:`state_snapshot` block so
-        the ``failed`` / ``done`` reads here and inside
-        ``_auto_promote_transient_retry`` share a single backend
-        ``refresh_status`` call.
-        """
-        # Fast-path the steady-state success branch — every executor
-        # ``wait`` / ``execute`` hop pays this. One state read; no
-        # contextmanager allocation when the result is fine.
         state = self._compute_state()
         if not state.is_failed:
             return None
-
         try:
             self.statement.clear_temporary_resources()
         except Exception:
             logger.exception("clear_temporary_resources failed during raise_for_status; continuing.")
-        return self._raise_for_status()
-
-    @abstractmethod
-    def _raise_for_status(self) -> None:
-        """Subclass hook: raise the backend-specific failure."""
+        err = self._error_for_status()
+        if err is not None:
+            raise err
 
     def clear_temporary_resources(self) -> None:
-        """Sweep per-statement scratch — does NOT touch result-level state.
-
-        Subclasses with their own scratch (cached HTTP pools, intermediate
-        files, ...) override and call ``super()``.
-        """
         try:
             self.statement.clear_temporary_resources()
         except Exception:
             logger.exception("clear_temporary_resources failed during clear; continuing.")
 
     # -------------------------------------------------------------------------
-    # Retry
-    # -------------------------------------------------------------------------
-
-    @property
-    def retryable(self) -> bool:
-        """Whether another retry attempt is allowed.
-
-        Two gates: the statement must opt in by setting ``statement.retry``
-        to a :class:`WaitingConfig`, and we must not have exhausted
-        ``retry.total_try_count``.  The ``num_try`` counter records
-        *completed* attempts, so the original ``start()`` counts as
-        attempt 1.
-        """
-        return False
-
-    @property
-    def elapsed_timestamp(self) -> float:
-        """Time elapsed since the statement was started, in seconds."""
-        if not self.start_timestamp:
-            return 0.0
-        return time.time() - self.start_timestamp
-
-    # -------------------------------------------------------------------------
     # Convenience
     # -------------------------------------------------------------------------
 
     @property
+    def elapsed_timestamp(self) -> float:
+        if not self.start_timestamp:
+            return 0.0
+        return time.time() - self.start_timestamp
+
+    @property
     def text(self) -> str:
         return self.statement.text
-
-    # -------------------------------------------------------------------------
-    # Wait
-    # -------------------------------------------------------------------------
-
-    def wait(
-        self,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True,
-    ) -> "StatementResult":
-        """Poll until the statement reaches a terminal state.
-
-        ``wait=False`` returns immediately (still respects ``raise_error``
-        if the result is already failed).  Otherwise drives
-        :meth:`refresh_status` on a :class:`WaitingConfig` schedule until
-        ``done`` is true.
-
-        Auto-retry: when the result reaches a terminal *failed* state and
-        :attr:`retryable` is true, the wait sleeps with jittered backoff
-        and invokes :meth:`retry`, then resumes polling for the
-        resubmitted attempt.  Jitter decorrelates retry storms when many
-        results fail on a shared upstream conflict (e.g. concurrent
-        Delta appends).  The loop terminates when the statement
-        succeeds, fails non-retryably, or the subclass's
-        :attr:`retryable` flips to ``False`` (typically because the
-        iteration / elapsed budget is exhausted).
-        """
-        self.start(reset=False, wait=False, raise_error=False)
-        wait_cfg = WaitingConfig.from_(wait)
-
-        if not wait_cfg:
-            if raise_error:
-                self.raise_for_status()
-            return self
-
-        logger.debug(
-            "Waiting on %r (timeout=%s, iteration=%d)",
-            self, wait_cfg.timeout, self.iteration,
-        )
-        wait_start = time.time()
-
-        while True:
-            # Poll to terminal for the current submission.
-            start = time.time()
-            state = self.state
-            while not state.is_done:
-                wait_cfg.sleep(iteration=0, start=start, max_interval=5)
-                state = self._compute_state()
-
-            if state.is_failed and self.retryable:
-                logger.info(
-                    "%r failed but is retryable; resubmitting (iteration=%d).",
-                    self, self.iteration,
-                )
-                wait_cfg.jittered_sleep(iteration=self.iteration)
-                self.retry(wait=False, raise_error=False)
-                continue
-
-            break
-
-        logger.debug(
-            "Waited %.1fs on %r (state=%s, iteration=%d)",
-            time.time() - wait_start, self, state, self.iteration,
-        )
-
-        if raise_error:
-            self.raise_for_status()
-
-        # Only clear scratch on success.  ``raise_for_status`` already
-        # cleared on failure; double-clearing is idempotent but noisy.
-        if not state.is_failed:
-            self.clear_temporary_resources()
-        return self
 
 
 SR = TypeVar("SR", bound="StatementResult")
@@ -905,12 +738,19 @@ class StatementBatch(StatementResult[PS], Generic[PS, SR]):
     # Lifecycle
     # -------------------------------------------------------------------------
 
+    def _poll(self) -> None:
+        for result in self.results.values():
+            result._poll()
+
+    def _start(self) -> None:
+        for result in self.results.values():
+            result.start(wait=False, raise_error=False)
+
     def start(
         self,
         reset: bool = False,
         **kwargs: Any,
     ):
-        """Submit all statements in the batch."""
         parallel = self.parallel
         wait = parallel <= 1
 
@@ -1063,14 +903,11 @@ class StatementBatch(StatementResult[PS], Generic[PS, SR]):
         self.results[last_key].raise_for_status()
         return self
 
-    def _raise_for_status(self) -> None:
-        """:class:`StatementResult` abstract hook — delegate to the
-        batch-level :meth:`raise_for_status` which walks failed children
-        directly. The base :meth:`StatementResult.raise_for_status`
-        pathway is bypassed because :meth:`raise_for_status` is
-        overridden above; this method exists to satisfy the abstract
-        contract for callers that go through the base path."""
-        self.raise_for_status()
+    def _error_for_status(self) -> BaseException | None:
+        failed_results = [r for r in self.results.values() if r.failed]
+        if not failed_results:
+            return None
+        return failed_results[-1]._error_for_status()
 
     # -------------------------------------------------------------------------
     # Internals

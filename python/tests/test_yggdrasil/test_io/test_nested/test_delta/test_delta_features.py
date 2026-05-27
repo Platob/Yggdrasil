@@ -75,7 +75,7 @@ class TestInlineDVRoundTrip(DeltaTestCase):
 
 class TestSidecarDVRoundTrip(DeltaTestCase):
     def test_uuid_sidecar_round_trip(self) -> None:
-        from yggdrasil.io.path import LocalPath
+        from yggdrasil.path import LocalPath
 
         rows = list(range(0, 200, 3))  # 67 row indices
         root = LocalPath(str(self.tmp_path))

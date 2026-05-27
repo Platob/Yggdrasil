@@ -18,10 +18,6 @@ from yggdrasil.pickle.ser import dumps, loads
 # ``yggdrasil.spark.dependencies`` module so the scan logic can be
 # tested / imported in environments where ``pyspark`` is not installed
 # (which is the common path for the Spark Connect client).
-from yggdrasil.spark.dependencies import (
-    _function_top_modules as _function_top_modules,  # re-export
-    _stdlib_modules as _stdlib_modules,  # re-export
-)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -172,7 +168,7 @@ def _install_modules_on_executors(
     logged at INFO / WARNING and swallowed: best-effort
     installs shouldn't crash an otherwise valid transform.
     """
-    from yggdrasil.io.path._module_pack import (
+    from yggdrasil.path._module_pack import (
         build_module_archive,
         resolve_module_root,
     )

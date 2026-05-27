@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import io
 
-from yggdrasil.io import BytesIO
 from yggdrasil.io.base import IO
-from yggdrasil.data.enums.codec import GZIP
-from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.data.enums.mime_type import MimeTypes
+from yggdrasil.enums.codec import GZIP
+from yggdrasil.enums.media_type import MediaType
+from yggdrasil.enums.mime_type import MimeTypes
 from yggdrasil.pickle.ser.ios import IOSerialized
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
@@ -44,15 +43,16 @@ def test_io_read_from_seekable_stream_restores_position() -> None:
     assert out.getvalue() == b"abcdef"
 
 
-def _media_type_of(buf: BytesIO):
+def _media_type_of(buf: IO):
     """Read the buffer's media type via the public stat surface."""
-    return buf._parent.stat().media_type
+    parent = buf._parent if buf._parent is not None else buf
+    return parent.stat().media_type
 
 
 def test_ygg_bytesio_media_type_roundtrip() -> None:
     """Media type on yggdrasil BytesIO is preserved through serialization."""
     mt = MediaType(MimeTypes.JSON)
-    src = BytesIO(b'{"a":1}', media_type=mt)
+    src = IO(b'{"a":1}', media_type=mt)
 
     ser = Serialized.from_python_object(src)
     assert ser is not None
@@ -72,7 +72,7 @@ def test_ygg_bytesio_media_type_roundtrip() -> None:
 def test_ygg_bytesio_media_type_with_codec_roundtrip() -> None:
     """Media type with codec on yggdrasil BytesIO is preserved."""
     mt = MediaType(MimeTypes.PARQUET, codec=GZIP)
-    src = BytesIO(b"compressed-payload", media_type=mt)
+    src = IO(b"compressed-payload", media_type=mt)
 
     ser = Serialized.from_python_object(src)
     assert ser is not None
@@ -91,7 +91,7 @@ def test_ygg_bytesio_media_type_with_codec_roundtrip() -> None:
 
 def test_ygg_bytesio_no_media_type_no_metadata() -> None:
     """When no media_type is set, no 'mt' key should appear in metadata."""
-    src = BytesIO(b"plain bytes")
+    src = IO(b"plain bytes")
 
     ser = Serialized.from_python_object(src)
     assert ser is not None
@@ -112,7 +112,7 @@ def test_ygg_bytesio_media_type_promotes_subclass() -> None:
     """
     from yggdrasil.io.primitive import JSONFile
 
-    src = BytesIO(b'{"a":1}', media_type=MediaType(MimeTypes.JSON))
+    src = IO(b'{"a":1}', media_type=MediaType(MimeTypes.JSON))
     assert isinstance(src, JSONFile)
 
     ser = Serialized.from_python_object(src)

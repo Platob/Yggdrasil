@@ -31,7 +31,7 @@ from yggdrasil.io.tabular import Tabular
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.io.tabular.base import O
-from yggdrasil.data.enums import MimeType, MimeTypes, State
+from yggdrasil.enums import MimeType, MimeTypes, State
 
 if TYPE_CHECKING:
     from yggdrasil.spark.executor import SparkStatementExecutor
@@ -141,28 +141,17 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     # -------------------------------------------------------------------------
 
     def _compute_state(self) -> State:
-        """Map the local ``_started`` / ``_failure`` flags onto :class:`State`.
-
-        Spark SQL is synchronous from this side — :meth:`start` either
-        returns with ``_started=True`` and a persisted frame, or
-        ``_failure`` set. There's nothing remote to refresh, so the
-        mapping is purely local-state.
-        """
         if not self._started:
             return State.IDLE
         if self._failure is not None:
             return State.FAILED
         return State.SUCCEEDED
 
-    def _raise_for_status(self) -> None:
-        # Auto-promote happens in the base raise_for_status() before this
-        # hook fires; we just re-raise the captured exception.
-        if self._failure is not None:
-            raise self._failure
+    def _error_for_status(self) -> BaseException | None:
+        return self._failure
 
     def refresh_status(self) -> None:
-        """No-op — Spark execution is synchronous, no remote state to poll."""
-        return None
+        pass
 
     # -------------------------------------------------------------------------
     # Persisted DataFrame
@@ -194,10 +183,10 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
         (Spark caches lazily on the frame itself, not on this handle).
         """
         if data is not None:
-            from yggdrasil.io.tabular import Dataset
+            from yggdrasil.spark.tabular import SparkTabular
             from yggdrasil.spark.cast import any_to_spark_dataframe
 
-            self._persisted_data = Dataset(any_to_spark_dataframe(data))
+            self._persisted_data = SparkTabular(any_to_spark_dataframe(data))
         return self
 
     # -------------------------------------------------------------------------
@@ -257,49 +246,9 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
     # Submit / cancel
     # -------------------------------------------------------------------------
 
-    def start(
-        self,
-        reset: bool = False,
-        *,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True,
-        spark_session: Optional["SparkSession"] = None,
-        **kwargs: Any,
-    ) -> "SparkStatementResult":
-        """Run ``session.sql(text)`` and stash the resulting DataFrame.
-
-        Idempotent on already-started results: returns ``self`` without
-        re-running unless ``reset=True``, in which case the prior
-        DataFrame and failure state are cleared and the statement re-runs.
-        ``reset=True`` is the path :meth:`StatementResult.retry` drives.
-
-        ``wait`` is accepted for signature compatibility but is irrelevant —
-        Spark is already synchronous.
-        """
-        if self._started and not reset:
-            if raise_error:
-                self.raise_for_status()
-            return self
-
-        if reset:
-            # Clear prior submission state before re-running.  Note: we
-            # don't drop a *successful* DataFrame from a prior attempt
-            # because retry() only reaches here on failure (the loop
-            # short-circuits when done and not failed), but the
-            # invariant of reset=True is "as if start was never called".
-            self._failure = None
-            self._persisted_data = None
-            self._cached_schema = None
-            self._started = False
-
-        session = spark_session or self.statement.spark_session
+    def _start(self) -> None:
+        session = self.statement.spark_session
         if session is None:
-            # Give the bound executor first crack at materialising a
-            # session — subclasses like
-            # :class:`ServerlessClusterStatementExecutor` route
-            # through ``client.spark()`` here so the right Spark
-            # Connect endpoint (serverless / classic) is picked
-            # before the generic :meth:`PyEnv.spark_session` fallback.
             resolver = getattr(self.executor, "resolve_session", None)
             if resolver is not None:
                 session = resolver(self.statement, create=True)
@@ -318,18 +267,11 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
             if row_limit:
                 df = df.limit(row_limit)
             self.persist(data=df)
+            self._started = True
         except BaseException as exc:
             self._failure = exc
             self._started = True
-            # Drop any views we registered before the failure so a retry
-            # can re-register cleanly without leaking session-scoped state.
             self.clear_temporary_resources()
-            if raise_error:
-                raise
-            return self
-
-        self._started = True
-        return self
 
     # -------------------------------------------------------------------------
     # External-data temp views
@@ -419,13 +361,8 @@ class SparkStatementResult(StatementResult[SparkPreparedStatement]):
                     entry.text_value = None
         super().clear_temporary_resources()
 
-    def cancel(self, wait: WaitingConfigArg = None, raise_error: bool = False, **kwargs) -> "SparkStatementResult":
-        """No-op: Spark SQL is synchronous, there is nothing to cancel.
-
-        Cancelling a running Spark *job* needs the caller's
-        :class:`SparkContext` and is out of scope here.
-        """
-        return self
+    def _cancel(self) -> None:
+        pass
 
 
 # ---------------------------------------------------------------------------

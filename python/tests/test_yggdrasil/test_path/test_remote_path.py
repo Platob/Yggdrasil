@@ -1,0 +1,457 @@
+"""RemotePath tests using a stub backend backed by a plain dict."""
+from __future__ import annotations
+
+import time
+from typing import Any, ClassVar, Iterator
+from unittest.mock import patch
+
+import pyarrow as pa
+import pytest
+
+from yggdrasil.dataclasses import WaitingConfig
+from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.enums import Mode
+from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.path.remote_path import RemotePath
+from yggdrasil.url import URL
+
+
+# ---------------------------------------------------------------------------
+# Stub backend — dict-backed RemotePath for hermetic testing
+# ---------------------------------------------------------------------------
+
+
+class _StubRemotePath(RemotePath):
+    _STORAGE: ClassVar[dict[str, bytes]] = {}
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=300.0,
+        max_size=10_000,
+    )
+
+    # ``scheme`` is set after class body (below) so ``__init_subclass__``
+    # skips the Scheme enum coercion, yet ``IO.__new__`` sees a truthy
+    # value and treats the class as a storage leaf (not a cursor).
+
+    def __init__(
+        self,
+        data: Any = None,
+        *,
+        url: URL | None = None,
+        singleton_ttl: Any = ...,
+        **kwargs: Any,
+    ) -> None:
+        if url is None and isinstance(data, str):
+            url = URL(scheme="stub", host="store", path=data)
+        del singleton_ttl
+        super().__init__(url=url, singleton_ttl=False, **kwargs)
+
+    def full_path(self) -> str:
+        return f"stub://{self.url.host}{self.url.path}"
+
+    # -- backend primitives ------------------------------------------------
+
+    def _stat_uncached(self) -> IOStats:
+        key = self.url.path
+        if key in self._STORAGE:
+            return IOStats(
+                size=len(self._STORAGE[key]),
+                kind=IOKind.FILE,
+                mtime=time.time(),
+            )
+        # Check if any keys start with key + "/" for directory semantics.
+        prefix = key.rstrip("/") + "/"
+        if any(k.startswith(prefix) for k in self._STORAGE):
+            return IOStats(size=0, kind=IOKind.DIRECTORY, mtime=0.0)
+        return IOStats(size=0, kind=IOKind.MISSING, mtime=0.0)
+
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        key = self.url.path
+        data = self._STORAGE.get(key)
+        if data is None:
+            raise FileNotFoundError(key)
+        if n < 0:
+            return memoryview(data[pos:])
+        return memoryview(data[pos : pos + n])
+
+    def _upload(self, content: bytes) -> int:
+        key = self.url.path
+        self._STORAGE[key] = content
+        return len(content)
+
+    def _ls(
+        self,
+        recursive: bool = False,
+        *,
+        singleton_ttl: Any = False,
+    ) -> Iterator["_StubRemotePath"]:
+        prefix = self.url.path.rstrip("/") + "/"
+        seen: set[str] = set()
+        for k in sorted(self._STORAGE):
+            if not k.startswith(prefix):
+                continue
+            remainder = k[len(prefix):]
+            if not recursive:
+                top = remainder.split("/")[0]
+                if top in seen:
+                    continue
+                seen.add(top)
+                yield _StubRemotePath(prefix + top, singleton_ttl=False)
+            else:
+                yield _StubRemotePath(k, singleton_ttl=False)
+
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
+        pass
+
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
+        key = self.url.path
+        if key in self._STORAGE:
+            del self._STORAGE[key]
+        elif not missing_ok:
+            raise FileNotFoundError(key)
+
+    def _remove_dir(
+        self,
+        recursive: bool,
+        missing_ok: bool,
+        wait: WaitingConfig,
+    ) -> None:
+        prefix = self.url.path.rstrip("/") + "/"
+        to_delete = [k for k in self._STORAGE if k.startswith(prefix)]
+        if not to_delete and not missing_ok:
+            raise FileNotFoundError(self.url.path)
+        for k in to_delete:
+            del self._STORAGE[k]
+
+
+# Post-class scheme assignment: truthy so IO.__new__ treats it as a storage
+# leaf, but never passed through Scheme.from_() / __init_subclass__.
+_StubRemotePath.scheme = "stub"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_stub_state():
+    _StubRemotePath._STORAGE.clear()
+    _StubRemotePath._INSTANCES = ExpiringDict(
+        default_ttl=300.0,
+        max_size=10_000,
+    )
+    yield
+    _StubRemotePath._STORAGE.clear()
+    _StubRemotePath._INSTANCES = ExpiringDict(
+        default_ttl=300.0,
+        max_size=10_000,
+    )
+
+
+def _make(path: str = "/data.bin", **kwargs: Any) -> _StubRemotePath:
+    return _StubRemotePath(path, singleton_ttl=False, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# TestRemoteReadWrite
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteReadWrite:
+
+    def test_write_bytes_then_read_back(self) -> None:
+        p = _make("/rw/file.bin")
+        p.write_bytes(b"hello world")
+        assert bytes(p.read_mv(-1, 0)) == b"hello world"
+
+    def test_write_at_position_zero_then_read(self) -> None:
+        p = _make("/rw/pos0.bin")
+        p.write_mv(memoryview(b"ABCDE"), 0, overwrite=True)
+        assert bytes(p.read_mv(5, 0)) == b"ABCDE"
+
+    def test_size_matches_written_data(self) -> None:
+        p = _make("/rw/size.bin")
+        payload = b"x" * 128
+        p.write_bytes(payload)
+        assert p.size == 128
+
+    def test_overwrite_replaces_content(self) -> None:
+        p = _make("/rw/overwrite.bin")
+        p.write_bytes(b"first")
+        p.write_mv(memoryview(b"second"), 0, overwrite=True)
+        assert bytes(p.read_mv(-1, 0)) == b"second"
+
+    def test_read_missing_returns_empty(self) -> None:
+        p = _make("/rw/ghost.bin")
+        result = p._bread(10, 0, Mode.READ_ONLY)
+        assert bytes(result.to_bytes()) == b""
+
+    def test_write_then_stat_shows_correct_size(self) -> None:
+        p = _make("/rw/stat_size.bin")
+        p.write_bytes(b"0123456789")
+        p.invalidate_singleton()
+        stat = p._stat()
+        assert stat.size == 10
+        assert stat.kind == IOKind.FILE
+
+
+# ---------------------------------------------------------------------------
+# TestRemotePageBuffer
+# ---------------------------------------------------------------------------
+
+
+class TestRemotePageBuffer:
+
+    def test_page_cache_reduces_read_mv_calls(self) -> None:
+        p = _StubRemotePath("/page/cached.bin", singleton_ttl=False, page_size=64)
+        _StubRemotePath._STORAGE["/page/cached.bin"] = b"A" * 64
+        p._persist_stat_cache(IOStats(size=64, kind=IOKind.FILE, mtime=time.time()))
+
+        call_count = 0
+        original_read_mv = _StubRemotePath._read_mv
+
+        def counting_read(self_inner, n, pos):
+            nonlocal call_count
+            call_count += 1
+            return original_read_mv(self_inner, n, pos)
+
+        with patch.object(_StubRemotePath, "_read_mv", counting_read):
+            p.read_mv(10, 0)
+            first_count = call_count
+            p.read_mv(10, 0)
+            assert call_count == first_count, (
+                "Second read from same page should not call _read_mv again"
+            )
+
+    def test_dirty_page_flush_writes_to_storage(self) -> None:
+        p = _StubRemotePath("/page/dirty.bin", singleton_ttl=False, page_size=64)
+        _StubRemotePath._STORAGE["/page/dirty.bin"] = b"\x00" * 64
+        p._persist_stat_cache(IOStats(size=64, kind=IOKind.FILE, mtime=time.time()))
+
+        with p:
+            p.write_mv(memoryview(b"PATCHED"), 0)
+        assert _StubRemotePath._STORAGE["/page/dirty.bin"][:7] == b"PATCHED"
+
+    def test_multiple_reads_within_same_page_use_cache(self) -> None:
+        p = _StubRemotePath("/page/multi.bin", singleton_ttl=False, page_size=256)
+        content = bytes(range(256))
+        _StubRemotePath._STORAGE["/page/multi.bin"] = content
+        p._persist_stat_cache(IOStats(size=256, kind=IOKind.FILE, mtime=time.time()))
+
+        call_count = 0
+        original_read_mv = _StubRemotePath._read_mv
+
+        def counting_read(self_inner, n, pos):
+            nonlocal call_count
+            call_count += 1
+            return original_read_mv(self_inner, n, pos)
+
+        with patch.object(_StubRemotePath, "_read_mv", counting_read):
+            _ = p.read_mv(10, 0)
+            _ = p.read_mv(10, 50)
+            _ = p.read_mv(10, 100)
+        # All three reads fall within page 0 — only one backend fetch.
+        assert call_count == 1
+
+    def test_page_eviction_on_cache_pressure(self) -> None:
+        # Use a tiny page size so four distinct pages cover the 128-byte file.
+        p = _StubRemotePath("/page/evict.bin", singleton_ttl=False, page_size=32)
+        content = b"A" * 32 + b"B" * 32 + b"C" * 32 + b"D" * 32
+        _StubRemotePath._STORAGE["/page/evict.bin"] = content
+        p._persist_stat_cache(IOStats(size=128, kind=IOKind.FILE, mtime=time.time()))
+
+        # Force the pages dict to have a tiny max_size so pages get evicted.
+        p._pages = ExpiringDict(default_ttl=300.0, max_size=2)
+
+        _ = p.read_mv(10, 0)    # page 0
+        _ = p.read_mv(10, 32)   # page 1
+        _ = p.read_mv(10, 64)   # page 2
+        _ = p.read_mv(10, 96)   # page 3
+
+        # The live page count should not exceed max_size.
+        assert len(p._pages) <= 2
+
+
+# ---------------------------------------------------------------------------
+# TestRemoteTabular
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteTabular:
+
+    def _make_ipc(self, path: str = "/tab/data.ipc") -> Any:
+        p = _StubRemotePath(path, singleton_ttl=False, page_size=None)
+        return p.as_media("arrow")
+
+    def _make_parquet(self, path: str = "/tab/data.parquet") -> Any:
+        p = _StubRemotePath(path, singleton_ttl=False, page_size=None)
+        return p.as_media("parquet")
+
+    def test_write_table_arrow_then_read_back(self) -> None:
+        leaf = self._make_ipc()
+        table = pa.table({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+        leaf.write_arrow_table(table, mode=Mode.OVERWRITE)
+        result = leaf.read_arrow_table()
+        assert result.num_rows == 3
+        assert result.column("x").to_pylist() == [1, 2, 3]
+        assert result.column("y").to_pylist() == ["a", "b", "c"]
+
+    def test_write_parquet_read_arrow_roundtrip(self) -> None:
+        leaf = self._make_parquet()
+        table = pa.table({"id": [10, 20], "val": ["foo", "bar"]})
+        leaf.write_arrow_table(table, mode=Mode.OVERWRITE)
+        result = leaf.read_arrow_table()
+        assert result.num_rows == 2
+        assert result.column("id").to_pylist() == [10, 20]
+
+    def test_collect_schema_from_remote_file(self) -> None:
+        leaf = self._make_ipc("/tab/schema.ipc")
+        table = pa.table({
+            "a": pa.array([1, 2], type=pa.int64()),
+            "b": pa.array(["x", "y"], type=pa.utf8()),
+        })
+        leaf.write_arrow_table(table, mode=Mode.OVERWRITE)
+        schema = leaf.collect_schema()
+        assert "a" in schema
+        assert "b" in schema
+
+    def test_overwrite_replaces_table(self) -> None:
+        leaf = self._make_ipc("/tab/over.ipc")
+        leaf.write_arrow_table(pa.table({"v": [1, 2, 3]}), mode=Mode.OVERWRITE)
+        assert leaf.read_arrow_table().num_rows == 3
+        leaf.write_arrow_table(pa.table({"v": [99]}), mode=Mode.OVERWRITE)
+        result = leaf.read_arrow_table()
+        assert result.num_rows == 1
+        assert result.column("v").to_pylist() == [99]
+
+    def test_large_table_roundtrip(self) -> None:
+        leaf = self._make_ipc("/tab/large.ipc")
+        n = 1000
+        table = pa.table({
+            "id": list(range(n)),
+            "val": [f"row_{i}" for i in range(n)],
+        })
+        leaf.write_arrow_table(table, mode=Mode.OVERWRITE)
+        result = leaf.read_arrow_table()
+        assert result.num_rows == n
+        assert result.column("id").to_pylist()[-1] == n - 1
+
+
+# ---------------------------------------------------------------------------
+# TestRemoteStat
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteStat:
+
+    def test_stat_returns_iostats_with_size_and_mtime(self) -> None:
+        p = _make("/stat/probe.bin")
+        _StubRemotePath._STORAGE["/stat/probe.bin"] = b"twelve bytes"
+        stat = p._stat()
+        assert stat.size == 12
+        assert stat.kind == IOKind.FILE
+        assert stat.mtime > 0
+
+    def test_stat_cache_avoids_repeated_backend_calls(self) -> None:
+        p = _make("/stat/cached.bin")
+        _StubRemotePath._STORAGE["/stat/cached.bin"] = b"data"
+
+        call_count = 0
+        original_stat = _StubRemotePath._stat_uncached
+
+        def counting_stat(self_inner):
+            nonlocal call_count
+            call_count += 1
+            return original_stat(self_inner)
+
+        with patch.object(_StubRemotePath, "_stat_uncached", counting_stat):
+            _ = p._stat()
+            _ = p._stat()
+            _ = p._stat()
+        assert call_count == 1, "Stat cache should prevent repeated backend calls"
+
+    def test_invalidate_singleton_clears_stat_cache(self) -> None:
+        p = _make("/stat/inval.bin")
+        _StubRemotePath._STORAGE["/stat/inval.bin"] = b"hello"
+        _ = p._stat()
+        assert p._stat_cached is not None
+
+        p.invalidate_singleton()
+        assert p._stat_cached is None
+
+
+# ---------------------------------------------------------------------------
+# TestRemoteSingleton
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteSingleton:
+
+    def test_same_url_same_instance_within_ttl(self) -> None:
+        a = _StubRemotePath(
+            url=URL(scheme="stub", host="store", path="/single/a.bin"),
+            singleton_ttl=300,
+        )
+        b = _StubRemotePath(
+            url=URL(scheme="stub", host="store", path="/single/a.bin"),
+            singleton_ttl=300,
+        )
+        assert a is b
+
+    def test_different_url_different_instance(self) -> None:
+        a = _StubRemotePath(
+            url=URL(scheme="stub", host="store", path="/single/a.bin"),
+            singleton_ttl=300,
+        )
+        b = _StubRemotePath(
+            url=URL(scheme="stub", host="store", path="/single/b.bin"),
+            singleton_ttl=300,
+        )
+        assert a is not b
+
+    def test_expired_ttl_creates_new_instance(self) -> None:
+        a = _StubRemotePath(
+            url=URL(scheme="stub", host="store", path="/single/expire.bin"),
+            singleton_ttl=0.001,
+        )
+        # Let the TTL expire.
+        time.sleep(0.05)
+        b = _StubRemotePath(
+            url=URL(scheme="stub", host="store", path="/single/expire.bin"),
+            singleton_ttl=0.001,
+        )
+        assert a is not b
+
+
+# ---------------------------------------------------------------------------
+# TestRemoteDirectory
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteDirectory:
+
+    def test_mkdir_and_iterdir(self) -> None:
+        d = _make("/dir/parent")
+        d.mkdir()
+        # Plant two children in the storage.
+        _StubRemotePath._STORAGE["/dir/parent/one.txt"] = b"1"
+        _StubRemotePath._STORAGE["/dir/parent/two.txt"] = b"2"
+        children = sorted(c.name for c in d.iterdir())
+        assert children == ["one.txt", "two.txt"]
+
+    def test_remove_file_deletes(self) -> None:
+        p = _make("/dir/doomed.bin")
+        _StubRemotePath._STORAGE["/dir/doomed.bin"] = b"bye"
+        assert p.exists()
+        p.remove()
+        assert "/dir/doomed.bin" not in _StubRemotePath._STORAGE
+
+    def test_remove_dir_deletes_prefix(self) -> None:
+        _StubRemotePath._STORAGE["/dir/sub/a.txt"] = b"a"
+        _StubRemotePath._STORAGE["/dir/sub/b.txt"] = b"b"
+        _StubRemotePath._STORAGE["/dir/other.txt"] = b"keep"
+        d = _make("/dir/sub")
+        d.remove(recursive=True)
+        assert "/dir/sub/a.txt" not in _StubRemotePath._STORAGE
+        assert "/dir/sub/b.txt" not in _StubRemotePath._STORAGE
+        assert "/dir/other.txt" in _StubRemotePath._STORAGE

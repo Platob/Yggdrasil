@@ -65,22 +65,13 @@ Engines register their converters **on import** — pull them in once at startup
 
 | Module | Purpose | Page |
 |---|---|---|
-| `yggdrasil.mongo` | Arrow-native MongoDB backend — collections, BSON bridging, type inference | [mongo](modules/mongo/README.md) |
-| `yggdrasil.postgres` | Arrow-native PostgreSQL backend — catalog/schema/table hierarchy, ADBC fast path | [postgres](modules/postgres/README.md) |
 | `yggdrasil.aws` | `AWSClient` singleton, S3 filesystem, credential management | [aws](modules/aws/README.md) |
 | `yggdrasil.delta` | Delta Lake log reader (back-compat shim → `yggdrasil.io.nested.delta`) | [delta](modules/delta/README.md) |
-
-## Streaming
-
-| Module | Purpose | Page |
-|---|---|---|
-| `yggdrasil.kafka` | Kafka topic as `Tabular` — publish and consume via Arrow/Polars/pandas | [kafka](modules/kafka/README.md) |
 
 ## Domain utilities
 
 | Module | Purpose | Page |
 |---|---|---|
-| `yggdrasil.fxrate` | FX rate fetching with multi-source fallback, geo enrichment, Databricks Job factory | [fxrate](modules/fxrate/README.md) |
 | `yggdrasil.jwt` | Parsing-only JWT primitives (`JWTToken`, `JWTParseError`) | [jwt](modules/jwt/README.md) |
 
 ## Platform and utilities
@@ -91,7 +82,7 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.concurrent` | `Job`, `AsyncJob`, `ThreadJob`, `JobPoolExecutor` | [concurrent](modules/concurrent/README.md) |
 | `yggdrasil.environ` | Runtime import / install logic | [optional libs](modules/libs/README.md) |
 | `yggdrasil.fastapi` | FastAPI service powering the Power Query connector | [API Reference](api/index.md) |
-| `yggdrasil.blake3` / `yggdrasil.xxhash` | Optional hashing | — |
+| `yggdrasil.blake3` | Optional hashing | — |
 
 ## See also
 

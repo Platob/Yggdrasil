@@ -11,14 +11,10 @@ class TestIOKind:
         assert IOKind.MISSING == 0
         assert IOKind.FILE == 1
         assert IOKind.DIRECTORY == 2
+        assert IOKind.MEMORY == 3
 
     def test_members_present(self):
-        # Spot-check the full enum surface.
-        assert IOKind.SYMLINK is IOKind(IOKind.SYMLINK.value)
-        for name in (
-            "MISSING", "FILE", "DIRECTORY", "SYMLINK",
-            "SOCKET", "FIFO", "CHAR_DEVICE", "BLOCK_DEVICE",
-        ):
+        for name in ("MISSING", "FILE", "DIRECTORY", "MEMORY"):
             assert hasattr(IOKind, name)
 
 
@@ -89,7 +85,7 @@ class TestIOStatsWith:
         assert out.size == 5
 
     def test_with_clears_media_type_explicitly(self):
-        from yggdrasil.data.enums import MediaTypes
+        from yggdrasil.enums import MediaTypes
 
         s = IOStats(media_type=MediaTypes.JSON)
         s.with_(media_type=None, inplace=True)

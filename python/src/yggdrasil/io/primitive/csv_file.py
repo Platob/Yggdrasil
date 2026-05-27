@@ -1,4 +1,4 @@
-"""CSV Tabular leaf over the new :class:`BytesIO` substrate.
+"""CSV Tabular leaf over the new :class:`IO` substrate.
 
 CSV is a pure stream — no footer, no random access, no cheap
 schema. Schema collection reads the first batch; reads parse from
@@ -23,7 +23,7 @@ import pyarrow.csv as pa_csv
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
+from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
 from yggdrasil.pickle import json as yg_json

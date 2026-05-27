@@ -18,8 +18,8 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import (
     WaitingConfigArg,
 )
-from yggdrasil.io.headers import DEFAULT_HOSTNAME
-from yggdrasil.io.url import URL
+from yggdrasil.http_.headers import DEFAULT_HOSTNAME
+from yggdrasil.url import URL
 from yggdrasil.pickle.ser import Serialized, dumps
 
 if TYPE_CHECKING:

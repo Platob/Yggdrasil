@@ -22,8 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 from decimal import Decimal
-from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 from ..nodes import (
     Arithmetic,
@@ -42,28 +41,9 @@ from ..nodes import (
 from ..operators import ArithmeticOp, CompareOp, LogicalOp
 
 
+from yggdrasil.enums.dialect import Dialect
+
 __all__ = ["to_sql", "from_sql", "Dialect", "DEFAULT_DIALECT"]
-
-
-# ---------------------------------------------------------------------------
-# Dialect — identifier quoting + literal escapes
-# ---------------------------------------------------------------------------
-
-
-class Dialect(str, Enum):
-    """SQL dialects supported by :func:`to_sql`.
-
-    Differences are intentionally minimal — we render a portable
-    subset and only branch where the dialect's syntax is
-    incompatible (identifier quote chars, ``ILIKE`` availability).
-    Unsupported dialects fall back to ANSI-ish defaults.
-    """
-
-    ANSI = "ansi"
-    DATABRICKS = "databricks"
-    POSTGRES = "postgres"
-    SQLITE = "sqlite"
-    MYSQL = "mysql"
 
 
 DEFAULT_DIALECT: Dialect = Dialect.DATABRICKS
@@ -1010,9 +990,3 @@ def _resolve_cast_dtype_str(name: str) -> Any:
         return DataType.from_str(name)
     except Exception:
         return None
-
-
-# Iterable was used by the previous sqlglot wrapper; kept here so the
-# per-dialect override tables downstreams add later still resolve the
-# import.
-_ = Iterable

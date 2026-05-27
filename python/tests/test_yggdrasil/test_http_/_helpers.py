@@ -1,82 +1,76 @@
-"""Importable helpers for the rewritten yggdrasil.io tests."""
-
+"""Shared test doubles for the ``test_http_`` package."""
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any
+from collections import deque
+from typing import Any, MutableMapping, Optional
 
-from yggdrasil.http_ import HTTPSession
-from yggdrasil.io.request import PreparedRequest
-from yggdrasil.io.response import Response
-from yggdrasil.io.send_config import SendConfig
-
-
-EPOCH = dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
+from yggdrasil.http_.request import HTTPRequest
+from yggdrasil.http_.response import HTTPResponse
+from yggdrasil.http_.session import HTTPSession
+from yggdrasil.dataclasses import WaitingConfig
+from yggdrasil.path.memory import Memory
 
 
 def make_request(
-    url: str = "https://example.com/path",
+    url: str = "https://api.example.com/test",
     method: str = "GET",
-    *,
-    headers: dict[str, str] | None = None,
-    body: bytes | None = None,
-    tags: dict[str, str] | None = None,
-) -> PreparedRequest:
-    return PreparedRequest.prepare(
-        method=method,
-        url=url,
-        headers=headers,
-        body=body,
-        tags=tags,
-    )
+    headers: Optional[MutableMapping[str, str]] = None,
+) -> HTTPRequest:
+    return HTTPRequest.prepare(method, url, headers=dict(headers or {}))
 
 
 def make_response(
-    request: PreparedRequest | None = None,
     *,
+    request: Optional[HTTPRequest] = None,
     status_code: int = 200,
-    body: bytes = b'{"ok":true}',
-    content_type: str = "application/json",
-    headers: dict[str, str] | None = None,
-    received_at: dt.datetime | None = None,
-) -> Response:
-    base_headers = {"Content-Type": content_type}
+    body: bytes = b"",
+    headers: Optional[MutableMapping[str, str]] = None,
+) -> HTTPResponse:
+    if request is None:
+        request = make_request()
+    resp_headers: dict[str, str] = {"Content-Length": str(len(body))}
     if headers:
-        base_headers.update(headers)
-    return Response(
-        request=request or make_request(),
+        resp_headers.update(headers)
+    return HTTPResponse(
+        request=request,
         status_code=status_code,
-        headers=base_headers,
+        headers=resp_headers,
         tags={},
-        buffer=body,  # type: ignore[arg-type]
-        received_at=received_at if received_at is not None else EPOCH,
+        buffer=Memory(binary=body),
+        received_at=dt.datetime.now(dt.timezone.utc),
     )
 
 
 class StubSession(HTTPSession):
-    """Concrete HTTPSession double that returns canned responses.
+    """In-memory session that records sent requests and returns queued responses."""
 
-    Each call to ``send`` is recorded in ``calls`` so tests can assert
-    the network was — or was not — touched.
-    """
+    _INSTANCES: dict = {}
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        if getattr(self, "_initialized", False):
-            # Reset the per-test queue/calls so cached singletons
-            # (same ``base_url``) don't bleed state across tests.
-            self._queue = []
-            self.calls = []
-            return
-        super().__init__(*args, **kwargs)
-        self._queue: list[Response] = []
-        self.calls: list[PreparedRequest] = []
+    def __new__(cls, *args: Any, **kwargs: Any) -> "StubSession":
+        return object.__new__(cls)
 
-    def queue(self, *responses: Response) -> "StubSession":
-        self._queue.extend(responses)
-        return self
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        *,
+        auth: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(base_url=base_url, auth=auth, **kwargs)
+        self._initialized = True
+        self.calls: list[HTTPRequest] = []
+        self._queue: deque[HTTPResponse] = deque()
 
-    def _local_send(self, request: PreparedRequest) -> Response:
+    def queue(self, response: HTTPResponse) -> None:
+        self._queue.append(response)
+
+    def _wire_send(
+        self,
+        request: HTTPRequest,
+        wait_cfg: WaitingConfig,
+    ) -> HTTPResponse:
         self.calls.append(request)
         if self._queue:
-            return self._queue.pop(0)
+            return self._queue.popleft()
         return make_response(request=request)

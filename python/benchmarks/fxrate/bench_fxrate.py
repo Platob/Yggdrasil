@@ -27,7 +27,7 @@ import statistics
 import time
 from typing import Callable, Sequence
 
-from yggdrasil.data.enums.currency import Currency
+from yggdrasil.enums.currency import Currency
 from yggdrasil.fxrate import (
     BackendError,
     FxQuote,

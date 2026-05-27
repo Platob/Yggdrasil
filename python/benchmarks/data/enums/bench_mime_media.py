@@ -39,11 +39,11 @@ import statistics
 import time
 from typing import Callable
 
-from yggdrasil.data.enums.codec import GZIP, ZSTD
-from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.data.enums.mime_type import MimeType, MimeTypes
+from yggdrasil.enums.codec import GZIP, ZSTD
+from yggdrasil.enums.media_type import MediaType
+from yggdrasil.enums.mime_type import MimeType, MimeTypes
 from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 
 # ---------------------------------------------------------------------------

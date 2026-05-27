@@ -13,7 +13,7 @@ from yggdrasil.databricks.cluster.cluster import Cluster as _YGGCluster
 from yggdrasil.databricks.compute.command_execution import CommandExecution as _YGGCommandExecution
 from yggdrasil.databricks.compute.execution_context import ExecutionContext as _YGGExecutionContext
 from yggdrasil.databricks.cluster.service import Clusters as _YGGClusters
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
 
@@ -140,7 +140,7 @@ def _canonicalize_client_kwargs(kwargs: Mapping[str, object]) -> dict[str, objec
 
 
 def _nested_serialized_bytes(obj: object) -> bytes:
-    # ``write_to`` builds + returns its own ``BytesIO`` when called
+    # ``write_to`` builds + returns its own ``IO`` when called
     # without a sink, so an explicit ``with``-managed buffer +
     # ``seek(0); buf.read()`` was double-buffering through scratch and
     # then re-reading it — ``to_bytes()`` snapshots the underlying
@@ -149,10 +149,10 @@ def _nested_serialized_bytes(obj: object) -> bytes:
 
 
 def _load_nested_serialized(data: bytes) -> object:
-    # Closed-state ``BytesIO(data)`` reads route straight through the
+    # Closed-state ``IO(data)`` reads route straight through the
     # Memory holder; the previous ``with``-managed scratch transaction
     # was seeding a redundant copy of the whole payload.
-    return Serialized.read_from(BytesIO(data), pos=0).as_python()
+    return Serialized.read_from(IO(data), pos=0).as_python()
 
 
 def _extract_config_kwargs(config: Config) -> dict[str, object]:

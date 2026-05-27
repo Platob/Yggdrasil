@@ -17,12 +17,12 @@ import gzip
 import pyarrow as pa
 import pytest
 
-from yggdrasil.data.enums import MimeTypes
-from yggdrasil.data.enums.codec import Codecs
-from yggdrasil.data.enums.media_type import MediaType
-from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.enums import MimeTypes
+from yggdrasil.enums.codec import Codecs
+from yggdrasil.enums.media_type import MediaType
+from yggdrasil.io.base import IO
+from yggdrasil.path.memory import Memory
+from yggdrasil.path.local_path import LocalPath
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.primitive.csv_file import CSVFile
 from yggdrasil.io.primitive.json_file import JSONFile
@@ -163,7 +163,7 @@ class TestCsvGzipLocalPath:
     def test_append_into_compressed_does_full_rewrite(
         self, tmp_path, table,
     ) -> None:
-        from yggdrasil.data.enums import Mode
+        from yggdrasil.enums import Mode
         from yggdrasil.io.primitive.csv_file import CsvOptions
 
         target = LocalPath(str(tmp_path / "trades.csv.gz"))
@@ -232,7 +232,7 @@ class TestJsonGzipMemory:
         # Writing pre-compressed bytes via the raw BytesIO surface so
         # the test mirrors the HTTP response path (response body is
         # already gzip-framed; only the MediaType is stamped).
-        BytesIO(holder=mem, owns_holder=False).write_bytes(gzip.compress(body))
+        IO(holder=mem, owns_holder=False).write_bytes(gzip.compress(body))
         loaded = JSONFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2]
 
@@ -240,7 +240,7 @@ class TestJsonGzipMemory:
         # JSONFile also accepts NDJSON-shaped (newline-terminated) input.
         body = b'{"id":1,"name":"a"}\n{"id":2,"name":"b"}\n'
         mem = _seed_codec(Memory(), MimeTypes.JSON, Codecs.GZIP)
-        BytesIO(holder=mem, owns_holder=False).write_bytes(gzip.compress(body))
+        IO(holder=mem, owns_holder=False).write_bytes(gzip.compress(body))
         loaded = JSONFile(holder=mem, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2]
 

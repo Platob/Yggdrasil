@@ -1,4 +1,4 @@
-"""Behavior tests for :class:`yggdrasil.data.enums.codec.Codec`.
+"""Behavior tests for :class:`yggdrasil.enums.codec.Codec`.
 
 The codec enum sits between MimeType and the byte path. Tests pin
 the practical surface every caller uses:
@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.codec import Codec, Codecs
-from yggdrasil.data.enums.mime_type import MimeTypes
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.enums.codec import Codec, Codecs
+from yggdrasil.enums.mime_type import MimeTypes
+from yggdrasil.io.base import IO
 
 
 _PAYLOAD = (b"yggdrasil-codec-roundtrip-" + b"x" * 16) * 32
@@ -84,8 +84,11 @@ class TestFrom:
         assert Codec.from_(None, default=None) is None
 
     def test_unknown_raises_without_default(self) -> None:
-        with pytest.raises(ValueError, match="Cannot resolve Codec"):
+        with pytest.raises(ValueError):
             Codec.from_("not-a-codec")
+
+    def test_unknown_returns_none_with_default(self) -> None:
+        assert Codec.from_("not-a-codec", default=None) is None
 
 
 class TestBytesRoundTrip:
@@ -118,7 +121,7 @@ class TestStreamingRoundTrip:
     def test_round_trip_via_bytes_io(self, codec: Codec) -> None:
         if not _codec_available(codec):
             pytest.skip(f"{codec.name} backend not installed")
-        src = BytesIO(_PAYLOAD)
+        src = IO(_PAYLOAD)
         with src:
             compressed = codec.compress(src)
         with compressed:

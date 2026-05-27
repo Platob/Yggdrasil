@@ -9,22 +9,22 @@ openpyxl = pytest.importorskip("openpyxl")
 pytest.importorskip("fastexcel")
 
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.memory import Memory
+from yggdrasil.path.local_path import LocalPath
 from yggdrasil.io.primitive.xlsx_file import XLSXFile
 
 
 class TestRegistration:
 
     def test_class_for_media_type(self) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         assert Holder.class_for_media_type(MimeTypes.XLSX) is XLSXFile
 
     def test_path_dispatches_xlsx_ext(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(path=str(tmp_path / "x.xlsx"))
+        b = IO(path=str(tmp_path / "x.xlsx"))
         assert isinstance(b, XLSXFile)
 
 

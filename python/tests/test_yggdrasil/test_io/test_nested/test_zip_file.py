@@ -8,8 +8,8 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.memory import Memory
+from yggdrasil.path.local_path import LocalPath
 from yggdrasil.io.nested.zip_file import ZipFile, ZipEntryFile
 
 
@@ -19,9 +19,9 @@ class TestRegistration:
         assert Holder.class_for_media_type("application/zip") is ZipFile
 
     def test_path_dispatches_zip_ext(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(path=str(tmp_path / "x.zip"))
+        b = IO(path=str(tmp_path / "x.zip"))
         assert isinstance(b, ZipFile)
 
 

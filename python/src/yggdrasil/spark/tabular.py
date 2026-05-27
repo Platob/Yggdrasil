@@ -74,7 +74,7 @@ from typing import (
 )
 
 import pyarrow as pa
-from yggdrasil.data.enums import MimeType, Mode
+from yggdrasil.enums import MimeType, Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.spark.frame import spark_typed_cast

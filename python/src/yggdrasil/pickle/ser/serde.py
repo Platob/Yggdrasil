@@ -14,9 +14,9 @@ import base64
 import binascii
 import logging
 from pathlib import Path
-from typing import Any, IO, Mapping
+from typing import Any, IO as TypingIO, Mapping
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser._scratch import _ScratchBuf
 from yggdrasil.pickle.ser.constants import is_valid_magic, MAGIC_LENGTH, MAGIC
 from yggdrasil.pickle.ser.errors import (
@@ -56,7 +56,7 @@ def serialize(
 
 def _dump(
     obj: Any,
-    fp: IO[bytes],
+    fp: TypingIO[bytes],
     *,
     metadata: Mapping[bytes, bytes] | None = None,
     codec: int | None = None,
@@ -64,8 +64,8 @@ def _dump(
     dumped = Serialized.from_python_object(obj, metadata=metadata, codec=codec)
     fp.write(MAGIC)
     # Stream the wire frame straight into ``fp``: ``Header.write_to``
-    # accepts any IO[bytes] sink. Skips the intermediate
-    # ``BytesIO() -> to_bytes()`` materialization the previous shape
+    # accepts any TypingIO[bytes] sink. Skips the intermediate
+    # ``IO() -> to_bytes()`` materialization the previous shape
     # paid on every dump.
     dumped.write_to(buffer=fp)
 
@@ -100,7 +100,7 @@ def _dump_path(
 
 def dump(
     obj: Any,
-    fp: IO[bytes] | Path | str,
+    fp: TypingIO[bytes] | Path | str,
     *,
     metadata: Mapping[bytes, bytes] | None = None,
     codec: int | None = None,
@@ -154,7 +154,7 @@ def _load_buf(
     default: Any,
     fp_label: Any,
 ) -> Any:
-    """Read from *buffer* (a _ScratchBuf or yggdrasil BytesIO)."""
+    """Read from *buffer* (a _ScratchBuf or yggdrasil IO)."""
     mag = buffer.read(MAGIC_LENGTH)
     if not is_valid_magic(mag):
         if isinstance(fp_label, (str, Path)):
@@ -186,15 +186,15 @@ def _load_buf(
 
 
 def load(
-    fp: IO[bytes] | Path | str,
+    fp: TypingIO[bytes] | Path | str,
     *,
     unpickle: bool = True,
     clean_corrupted: bool = False,
     default: Any = None,
 ) -> Any:
     """Read a serialised payload from *fp* and optionally unpickle it."""
-    # yggdrasil BytesIO handles Path / str / file-like opening for us.
-    buffer = BytesIO(fp)
+    # yggdrasil IO handles Path / str / file-like opening for us.
+    buffer = IO(fp)
     return _load_buf(buffer, unpickle=unpickle, clean_corrupted=clean_corrupted,
                      default=default, fp_label=fp)
 
@@ -214,8 +214,8 @@ def loads(
                 f"Invalid base64-encoded string {label!r}"
             ) from e
 
-    # _ScratchBuf avoids the two-layer yggdrasil BytesIO wrapping that
-    # load(BytesIO(s)) previously paid (once in loads, once in load).
+    # _ScratchBuf avoids the two-layer yggdrasil IO wrapping that
+    # load(IO(s)) previously paid (once in loads, once in load).
     return _load_buf(_ScratchBuf(s), unpickle=unpickle, clean_corrupted=False,
                      default=None, fp_label=None)
 

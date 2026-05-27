@@ -8,22 +8,22 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.memory import Memory
+from yggdrasil.path.local_path import LocalPath
 from yggdrasil.io.primitive.ndjson_file import NDJSONFile
 
 
 class TestRegistration:
 
     def test_class_for_media_type(self) -> None:
-        from yggdrasil.data.enums import MimeTypes
+        from yggdrasil.enums import MimeTypes
 
         assert Holder.class_for_media_type(MimeTypes.NDJSON) is NDJSONFile
 
     def test_path_dispatches(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(path=str(tmp_path / "x.ndjson"))
+        b = IO(path=str(tmp_path / "x.ndjson"))
         assert isinstance(b, NDJSONFile)
 
 

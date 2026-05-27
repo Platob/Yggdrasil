@@ -10,7 +10,7 @@ and don't want the IPC serialization round-trip.
 Auto-spill via :class:`ArrowIPCFile`
 ------------------------------------
 
-Same shape as :class:`yggdrasil.io.buffer.bytes_io.BytesIO`: when the
+Same shape as :class:`yggdrasil.io.holder.IO`: when the
 in-memory footprint crosses ``spill_bytes`` (default 128 MiB), the
 holder spills the current in-memory tail to a fresh **part file**
 inside a per-holder spill *folder* under ``tempfile.gettempdir()``.
@@ -50,7 +50,7 @@ state is already on disk and there's nothing new to flush.
 Flip the spill threshold off with ``spill_bytes=0`` (or ``None``).
 Pass an explicit ``spill_path=`` to use a caller-owned folder;
 the caller's folder is left intact on :meth:`unpersist` /
-:meth:`_release` (mirrors the BytesIO "external spill path"
+:meth:`_release` (mirrors the IO "external spill path"
 branch — we still mint our own part files under it).
 
 What we ingest
@@ -91,7 +91,7 @@ from yggdrasil.data.options import CastOptions
 from yggdrasil.io import IOStats
 from yggdrasil.io.tabular import O
 from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.data.enums import MimeType, Mode
+from yggdrasil.enums import MimeType, Mode
 from yggdrasil.pickle.serde import ObjectSerde
 
 logger = logging.getLogger(__name__)
@@ -134,7 +134,7 @@ def _write_spill_part(
     codec / legacy-format options) instead of re-implementing the
     same :func:`pa.ipc.new_file` sequence inline.
     """
-    from yggdrasil.io.path.local_path import LocalPath
+    from yggdrasil.path.local_path import LocalPath
     from yggdrasil.io.primitive.arrow_ipc_file import (
         ArrowIPCFile,
         ArrowIPCOptions,
@@ -237,11 +237,15 @@ class ArrowTabular(Tabular[CastOptions]):
         # explicitly here.
         super().__init__(**kwargs)
         self._batches: list[pa.RecordBatch] = []
-        self._schema_cache: Optional[StructField] = None if schema is None else StructField.from_arrow(schema)
+        # Use ``...`` (Ellipsis) as the "not yet resolved" sentinel so
+        # the base Tabular.collect_schema sees it as unset and delegates
+        # to _collect_schema on first access.  ``None`` would short-
+        # circuit the base check (``is not ...``) and be returned as-is.
+        self._schema_cache: "StructField | Any" = ... if schema is None else StructField.from_arrow(schema)
 
         # Spill state. ``_spill_bytes_threshold == 0`` (or None) keeps
         # the holder permanently in-memory. ``_spill_ttl`` matches the
-        # BytesIO convention so the cross-process janitor reaps stale
+        # IO convention so the cross-process janitor reaps stale
         # spill state using the same window.
         self._spill_bytes_threshold: int = int(spill_bytes or 0)
         self._spill_ttl: int = int(spill_ttl)
@@ -271,17 +275,17 @@ class ArrowTabular(Tabular[CastOptions]):
         if spill_path is not None:
             # Caller-supplied spill folder — we mint our own part files
             # inside it but don't rmtree the folder on close (mirrors
-            # the BytesIO "external spill path" branch).
+            # the IO "external spill path" branch).
             spill_dir_path = pathlib.Path(str(spill_path))
             spill_dir_path.mkdir(parents=True, exist_ok=True)
             self._spill_dir = spill_dir_path
             self._owns_spill_dir = False
 
         if data is not None:
-            self._ingest(data)
+            self.write_table(data, mode=Mode.APPEND)
         for src in more:
             if src is not None:
-                self._ingest(src)
+                self.write_table(src, mode=Mode.APPEND)
 
         # Tabular leaves are stateless w.r.t. Disposable — there is
         # no separate acquire phase to wait for, so just leave the
@@ -308,7 +312,7 @@ class ArrowTabular(Tabular[CastOptions]):
         if options.target:
             return options.target
 
-        if self._schema_cache is None:
+        if self._schema_cache is ...:
             for batch in self.batches:
                 self._schema_cache = StructField.from_arrow_schema(batch.schema)
                 return self._schema_cache
@@ -407,7 +411,7 @@ class ArrowTabular(Tabular[CastOptions]):
         # holder is always Arrow-backed.
         if data is not None:
             self.unpersist()
-            self._ingest(data)
+            self.write_table(data, mode=Mode.APPEND)
         return self
 
     def _release(self) -> None:
@@ -416,7 +420,7 @@ class ArrowTabular(Tabular[CastOptions]):
         :class:`Disposable` calls this from ``close()`` — mmaps are
         closed first so the OS releases the page mappings before the
         folder is removed. Owned-folder-only: a caller-supplied
-        ``spill_path`` is left intact (mirrors the BytesIO external-
+        ``spill_path`` is left intact (mirrors the IO external-
         spill convention).
         """
         super()._release()
@@ -536,8 +540,6 @@ class ArrowTabular(Tabular[CastOptions]):
     def _append_batch(self, batch: pa.RecordBatch) -> None:
         """Append *batch* to the in-memory tail and update the byte counter."""
         self._batches.append(batch)
-        if self._schema is None:
-            self._schema = batch.schema
         # ``nbytes`` is the contiguous buffer size — matches what we
         # spend on the IPC file plus a small framing overhead. Close
         # enough for the threshold check.
@@ -736,100 +738,3 @@ class ArrowTabular(Tabular[CastOptions]):
             f"valid: AUTO, OVERWRITE, TRUNCATE, APPEND, IGNORE, ERROR_IF_EXISTS."
         )
 
-    def _ingest(self, source: ArrowSource) -> None:
-        if source is None:
-            return
-
-        # Arrow-native shapes first — these are the hot paths and skip
-        # the module-name sniff entirely.
-        if isinstance(source, pa.RecordBatch):
-            self._append_batch(source)
-            self._maybe_spill()
-            return
-        if isinstance(source, pa.Table):
-            if self._schema is None:
-                self._schema = source.schema
-            for batch in source.to_batches():
-                self._append_batch(batch)
-            self._maybe_spill()
-            return
-        if isinstance(source, pa.RecordBatchReader):
-            # ``read_all`` decodes the whole reader inside the C++
-            # runtime — no per-batch Python hop, and the resulting
-            # table shares chunking with the upstream batches.
-            self._ingest(source.read_all())
-            return
-        if isinstance(source, pa.ChunkedArray):
-            raise TypeError(
-                f"ArrowTabular can't ingest a bare pa.ChunkedArray "
-                f"({source.type!r}); wrap it in a pa.Table with a "
-                "column name first: pa.table({'col': chunked})."
-            )
-
-        # Another Tabular — drain it as an Arrow batch stream. Covers
-        # ParquetFile, ArrowIPCFile, LazyTabular, another ArrowTabular,
-        # etc. without each backend re-implementing a dispatch branch.
-        if isinstance(source, Tabular):
-            for batch in source.read_arrow_batches():
-                self._append_batch(batch)
-            self._maybe_spill()
-            return
-
-        # Engine-frame namespaces — sniffed via the canonical
-        # :class:`ObjectSerde` helper so the dispatch table stays
-        # consistent with the rest of the IO layer.
-        namespace, _ = ObjectSerde.module_and_name(source)
-        root = namespace.split(".", 1)[0] if namespace else ""
-        if root == "polars":
-            import polars as pl
-
-            # LazyFrame collects here; the in-memory holder is the
-            # wrong tool for streaming-laziness anyway. Reach for
-            # ``scan_polars_frame`` on a different IO if you want
-            # that.
-            if isinstance(source, pl.LazyFrame):
-                source = source.collect()
-            self._ingest(source.to_arrow())
-            return
-        if root == "pandas":
-            self._ingest(pa.Table.from_pandas(source))
-            return
-        if root == "pyspark":
-            to_arrow = getattr(source, "toArrow", None)
-            if to_arrow is not None:
-                self._ingest(to_arrow())
-                return
-            self._ingest(pa.Table.from_pandas(source.toPandas()))
-            return
-
-        # Pure-Python row-list / column-dict shapes.
-        if isinstance(source, list) and source and all(
-            isinstance(r, dict) for r in source
-        ):
-            self._ingest(pa.Table.from_pylist(source))
-            return
-        if (
-            isinstance(source, dict) and source
-            and all(isinstance(v, (list, tuple)) for v in source.values())
-        ):
-            self._ingest(pa.Table.from_pydict({
-                k: list(v) for k, v in source.items()
-            }))
-            return
-
-        # Iterable fallback — recurse so a caller can pass a
-        # generator of Tables / batches and have it streamed in.
-        try:
-            iterator = iter(source)
-        except TypeError as exc:
-            raise TypeError(
-                f"ArrowTabular can't ingest "
-                f"{type(source).__module__}.{type(source).__name__}: "
-                f"{source!r}. Accepted: pyarrow Table / RecordBatch / "
-                "RecordBatchReader, another Tabular, polars "
-                "DataFrame/LazyFrame, pandas DataFrame, pyspark DataFrame, "
-                "list[dict], dict[str, list], or an iterable of any of "
-                "those."
-            ) from exc
-        for inner in iterator:
-            self._ingest(inner)

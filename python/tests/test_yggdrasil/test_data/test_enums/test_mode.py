@@ -1,4 +1,4 @@
-"""Behavior tests for :class:`yggdrasil.data.enums.mode.Mode`.
+"""Behavior tests for :class:`yggdrasil.enums.mode.Mode`.
 
 `Mode` is the cross-engine save-disposition enum: every sink (Path,
 SQL writer, Spark/Delta writer) takes a ``Mode | str`` and routes
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.mode import Mode, STR_MAPPING
+from yggdrasil.enums.mode import Mode, STR_MAPPING
 
 
 class TestCanonicalMembers:

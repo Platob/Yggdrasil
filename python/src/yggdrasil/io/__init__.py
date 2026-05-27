@@ -10,30 +10,32 @@ from __future__ import annotations
 # ``yggdrasil.io``), ``data_field`` is still mid-flight, so eagerly
 # loading Holder here closes a circular import.
 #
-# Buffer (BytesIO / BufferLike) is lazy for the same reason: pulling it
-# would trigger the buffer/primitive/tabular chain.
-from .url import URL
+# IO is lazy for the same reason: pulling it would trigger the
+# buffer/primitive/tabular chain.
 from .io_stats import IOStats
 
 
 _LAZY_DATA_NAMES = {"Holder", "Memory", "MemoryStream"}
-_LAZY_BUFFER_NAMES = {"BytesIO", "BufferLike"}
+_LAZY_IO_NAMES = {"IO"}
 
 
 def __getattr__(name: str):
+    if name == "URL":
+        from yggdrasil.url import URL as value
+
+        globals()["URL"] = value
+        return value
     if name in _LAZY_DATA_NAMES:
         if name == "Holder":
             from .holder import Holder as value
         elif name == "Memory":
-            from .memory import Memory as value
+            from yggdrasil.path.memory import Memory as value
         else:
-            from .memory_stream import MemoryStream as value
+            from yggdrasil.path.memory_stream import MemoryStream as value
         globals()[name] = value
         return value
-    if name in _LAZY_BUFFER_NAMES:
-        from . import bytes_io as _buffer
-
-        value = getattr(_buffer, name)
+    if name in _LAZY_IO_NAMES:
+        from .base import IO as value
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -43,6 +45,6 @@ def __dir__():
     return sorted(
         set(globals())
         | _LAZY_DATA_NAMES
-        | _LAZY_BUFFER_NAMES
+        | _LAZY_IO_NAMES
         | {"URL", "IOStats"}
     )

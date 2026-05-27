@@ -1,4 +1,4 @@
-"""DeltaFolder — :class:`FolderPath` over a Delta Lake table.
+"""DeltaFolder — :class:`Folder` over a Delta Lake table.
 
 The leaf orchestrates four subsystems documented in this package:
 
@@ -14,7 +14,7 @@ The leaf orchestrates four subsystems documented in this package:
 - :mod:`yggdrasil.io.nested.delta.checkpoint` writes V1 and V2
   checkpoints and updates ``_last_checkpoint``.
 
-What changes vs :class:`FolderPath`
+What changes vs :class:`Folder`
 ---------------------------------
 
 - **Children** come from the snapshot, not :func:`Path.iterdir`. We
@@ -22,8 +22,8 @@ What changes vs :class:`FolderPath`
   is that the log is authoritative, and listing the root on a remote
   store is the most expensive metadata round trip there is.
 - **Reads** push partition pruning into the snapshot itself
-  (``options.prune_values``) and pass the row-level
-  ``options.predicate`` through to the leaf parquet's reader. DVs
+  (via ``options.predicate``) and pass the row-level
+  predicate through to the leaf parquet's reader. DVs
   attached to an :class:`AddFile` decode lazily and mask rows on the
   way out.
 - **Writes** mint a parquet under ``<root>/`` (or under
@@ -53,7 +53,7 @@ table moved underneath them.
 Engine bridges
 --------------
 
-:class:`DeltaFolder` inherits :class:`FolderPath` -> :class:`Tabular`, so
+:class:`DeltaFolder` inherits :class:`Folder` -> :class:`Tabular`, so
 ``read_polars_frame`` / ``read_pandas_frame`` / ``read_spark_frame``
 work without any per-engine plumbing here. The Arrow batch stream
 :meth:`_read_arrow_batches` produces routes through
@@ -74,8 +74,8 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, L
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import MimeTypes, Mode
-from yggdrasil.io.nested.folder_path import FolderPath, FolderOptions
+from yggdrasil.enums import MimeTypes, Mode
+from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 from yggdrasil.pickle import json as ygg_json
 
@@ -200,8 +200,8 @@ class DeltaOptions(FolderOptions):
 # ---------------------------------------------------------------------------
 
 
-class DeltaFolder(FolderPath):
-    """:class:`FolderPath` over a Delta Lake table at a :class:`Path`."""
+class DeltaFolder(Folder):
+    """:class:`Folder` over a Delta Lake table at a :class:`Path`."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.DELTA_FOLDER
 
@@ -301,12 +301,9 @@ class DeltaFolder(FolderPath):
 
         1. Resolve snapshot at ``options.version`` (HEAD by default).
         2. Filter active files via partition pruning before any
-           parquet open. The accepted-value sets come from
-           ``options.prune_values`` directly *and* from
-           :func:`extract_partition_filters` walking
-           ``options.predicate`` for the partition columns — so a
-           caller who passes only a ``Predicate`` still gets file-
-           level skipping for free.
+           parquet open. :func:`extract_partition_filters` walks
+           ``options.predicate`` for the partition columns so the
+           caller gets file-level skipping for free.
         3. Read each parquet through :class:`ParquetFile` so codec /
            memory-map / native pushdown all work as usual.
         4. Mask rows with the file's :class:`DeletionVector` when one
@@ -330,8 +327,8 @@ class DeltaFolder(FolderPath):
         # reference the same DV sidecar collapse to one window read.
         sidecar_cache: dict[str, bytes] = {}
 
-        prune = _merge_prune_with_predicate(
-            options.prune_values, options.predicate, partition_columns,
+        prune = _extract_partition_prune_values(
+            options.predicate, partition_columns,
         )
         for add in snap.prune_files(prune_values=prune):
             try:
@@ -458,7 +455,7 @@ class DeltaFolder(FolderPath):
     def _resolve_action(self, mode: Mode) -> Mode:
         """Pick the disposition for a write call.
 
-        Overrides :meth:`FolderPath._resolve_action` to keep
+        Overrides :meth:`Folder._resolve_action` to keep
         :data:`Mode.UPSERT` / :data:`Mode.MERGE` as distinct actions —
         the parent collapses both to ``APPEND`` because plain folders
         don't have row-level identity, but Delta does (via
@@ -694,7 +691,7 @@ class DeltaFolder(FolderPath):
         # invariant across retries (we don't re-evaluate the predicate
         # against a different snapshot — we evaluate it against the
         # incoming rows, which don't change).
-        incoming_keys = FolderPath._collect_keys_from_batches(materialized, match_by)
+        incoming_keys = Folder._collect_keys_from_batches(materialized, match_by)
 
         # Each retry attempt may produce a different rewrite set if a
         # concurrent writer landed an add/remove in between. Track the
@@ -1488,13 +1485,13 @@ class DeltaFolder(FolderPath):
         return write_uuid_deletion_vector(deleted_rows, table_root=self.path)
 
     # ==================================================================
-    # FolderPath surface — children = active files
+    # Folder surface — children = active files
     # ==================================================================
 
     def iter_children(self) -> "Iterator":
         """Yield one :class:`ParquetFile` per active file in the snapshot.
 
-        Override of :meth:`FolderPath.iter_children`: we never list the
+        Override of :meth:`Folder.iter_children`: we never list the
         physical folder. The snapshot is the source of truth.
         """
         snap = self.snapshot()
@@ -1659,50 +1656,30 @@ def _arrow_row_filter_for(
     return _filter
 
 
-def _merge_prune_with_predicate(
-    explicit: "Optional[dict]",
+def _extract_partition_prune_values(
     predicate: "Predicate",
     partition_columns: "List[str]",
 ) -> "Optional[dict]":
-    """Combine caller-supplied ``prune_values`` with predicate-extracted hints.
+    """Extract partition-level prune values from a predicate.
 
-    The result is what :meth:`Snapshot.prune_files` consumes — a
+    The result is what :meth:`Snapshot.prune_files` consumes -- a
     ``Mapping[str, Iterable]`` of accepted values per partition
     column, or ``None`` when nothing constrains the file set.
-    Sources are AND'd: a file matches iff its partition value lies
-    in *both* the explicit set (when given) and the predicate's
-    extracted set (when extractable).
 
-    Predicate extraction routes through
+    Extraction routes through
     :func:`yggdrasil.execution.expr.extract_partition_filters`,
     which over-approximates and only reports columns it can pin to
-    a finite set — comparisons, ``IN`` lists, ``IS NULL``, and their
+    a finite set -- comparisons, ``IN`` lists, ``IS NULL``, and their
     ``AND`` / ``OR`` composition. Ranges, ``NOT``, and arithmetic
-    return no constraint for those columns — the row-level filter
+    return no constraint for those columns -- the row-level filter
     still runs on every surviving file, so the soundness contract
     is preserved.
     """
     if predicate is None or not partition_columns:
-        return explicit
+        return None
     from yggdrasil.execution.expr import extract_partition_filters
 
-    derived = extract_partition_filters(predicate, partition_columns)
-    if not derived:
-        return explicit
-    if not explicit:
-        # ``prune_files`` accepts any ``Mapping[str, Iterable]`` —
-        # frozensets satisfy that contract directly.
-        return derived
-    # Intersect column-by-column. Columns constrained on only one
-    # side keep that side's set.
-    merged: dict = dict(explicit)
-    for col_name, derived_set in derived.items():
-        if col_name in merged:
-            existing = frozenset(merged[col_name])
-            merged[col_name] = existing & derived_set
-        else:
-            merged[col_name] = derived_set
-    return merged
+    return extract_partition_filters(predicate, partition_columns) or None
 
 
 def _split_batch(

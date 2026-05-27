@@ -21,45 +21,19 @@ import datetime
 import time
 import datetime as dt
 from dataclasses import dataclass
-from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from yggdrasil.data.cast import any_to_datetime
+from yggdrasil.enums.io_kind import IOKind
 
 if TYPE_CHECKING:
-    from yggdrasil.data.enums import MediaType
+    from yggdrasil.enums import MediaType
 
 
 __all__ = ["IOStats", "IOKind", "TimeLike"]
 
 
-# Anything ``any_to_datetime`` can normalise into a wall-clock instant.
 TimeLike = Union[dt.datetime, dt.date, dt.timedelta, str, float, int]
-
-
-class IOKind(IntEnum):
-    """What a backend reports a path/holder entry is.
-
-    Integer-backed so the value compares cheaply and round-trips
-    through binary protocols / cache keys without string overhead.
-
-    ``MISSING`` and ``MEMORY`` are deliberately distinct values so a
-    fresh :class:`Memory` holder's stat reports ``MEMORY`` and not
-    ``MISSING`` — an ``IntEnum`` aliases equal-valued members to the
-    first declared name, which previously collapsed ``MEMORY`` into
-    ``MISSING`` and silently broke ``stat().kind`` for every memory
-    holder.
-    """
-
-    MISSING = 0
-    FILE = 1
-    DIRECTORY = 2
-    SYMLINK = 3
-    SOCKET = 4
-    FIFO = 5
-    CHAR_DEVICE = 6
-    BLOCK_DEVICE = 7
-    MEMORY = 8
 
 
 @dataclass(slots=True, repr=False, eq=False)

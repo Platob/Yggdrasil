@@ -4,7 +4,6 @@ import io
 from dataclasses import dataclass
 from typing import ClassVar, Mapping
 
-from yggdrasil.io import BytesIO
 from yggdrasil.io.base import IO
 from yggdrasil.pickle.ser.serialized import Serialized
 from yggdrasil.pickle.ser.tags import Tags
@@ -234,20 +233,20 @@ def _decode_media_type(metadata: Mapping[bytes, bytes] | None):
     """Return the ``MediaType`` encoded in *metadata*, or ``None``.
 
     Returned to the caller (rather than mutated onto an existing buffer)
-    so it can be passed to ``BytesIO(data, media_type=...)``. That route
-    runs the registry dispatch in :meth:`BytesIO.__new__` and lands on
+    so it can be passed to ``IO(data, media_type=...)``. That route
+    runs the registry dispatch in :meth:`IO.__new__` and lands on
     the right registered leaf (ParquetFile, JSONFile, …); a post-hoc
     ``buf._stats.media_type = ...`` would leave the class as the opaque
-    ``BytesIO``.
+    ``IO``.
     """
     if not metadata:
         return None
     raw = metadata.get(_M_MT)
     if raw is None:
         return None
-    from yggdrasil.data.enums.codec import Codec
-    from yggdrasil.data.enums.media_type import MediaType
-    from yggdrasil.data.enums.mime_type import MimeType
+    from yggdrasil.enums.codec import Codec
+    from yggdrasil.enums.media_type import MediaType
+    from yggdrasil.enums.mime_type import MimeType
 
     text = raw.decode("utf-8")
     if "+" in text:
@@ -279,7 +278,7 @@ class IOSerialized(Serialized[object]):
     Base serializer for Python IO-like objects.
 
     Subclasses specialize common in-memory forms:
-    - binary streams -> BytesIO
+    - binary streams -> IO
     - text streams -> StringIO
     - exact buffers -> io.BytesIO / io.StringIO
     """
@@ -298,8 +297,8 @@ class IOSerialized(Serialized[object]):
 
         media_type = _decode_media_type(self.metadata)
         if media_type is not None:
-            return BytesIO(self.decode(), media_type=media_type)
-        return BytesIO(self.decode())
+            return IO(self.decode(), media_type=media_type)
+        return IO(self.decode())
 
     def as_python(self) -> object:
         return self.value
@@ -313,7 +312,7 @@ class IOSerialized(Serialized[object]):
         codec: int | None = None,
     ) -> Serialized[object] | None:
         # order matters: most specific first.
-        # yggdrasil BytesIO does NOT inherit ``io.IOBase`` (it's a
+        # yggdrasil IO does NOT inherit ``io.IOBase`` (it's a
         # Tabular under :mod:`yggdrasil.io.buffer`), so the stdlib
         # checks below would miss it. Match it first and route through
         # the binary path, which already preserves ``_media_type`` via
@@ -345,19 +344,19 @@ class BinaryIOSerialized(IOSerialized):
     """
     Generic binary IO serializer.
 
-    Decodes to yggdrasil BytesIO.
+    Decodes to yggdrasil IO.
     """
 
     TAG: ClassVar[int] = Tags.IO_BINARY
 
     @property
-    def value(self) -> BytesIO:
+    def value(self) -> IO:
         media_type = _decode_media_type(self.metadata)
         if media_type is not None:
-            return BytesIO(self.decode(), media_type=media_type)
-        return BytesIO(self.decode())
+            return IO(self.decode(), media_type=media_type)
+        return IO(self.decode())
 
-    def as_python(self) -> BytesIO:
+    def as_python(self) -> IO:
         return self.value
 
     @classmethod
@@ -438,7 +437,7 @@ class BytesBufferSerialized(BinaryIOSerialized):
     """
     Exact serializer for io.BytesIO.
 
-    Decodes back to io.BytesIO rather than yggdrasil BytesIO.
+    Decodes back to io.BytesIO rather than yggdrasil IO.
     """
 
     TAG: ClassVar[int] = Tags.IO_BYTES_BUFFER
@@ -530,7 +529,6 @@ class StringBufferSerialized(TextIOSerialized):
 
 for pytype, cls in (
     (IO, IOSerialized),
-    (BytesIO, IOSerialized),
     (io.IOBase, BinaryIOSerialized),
     (io.TextIOBase, TextIOSerialized),
     (io.BytesIO, BytesBufferSerialized),

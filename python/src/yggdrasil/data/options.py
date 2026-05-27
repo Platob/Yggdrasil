@@ -82,7 +82,7 @@ import pyarrow as pa
 
 from yggdrasil.dataclasses import WaitingConfig
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.data.enums import Mode
+from yggdrasil.enums import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.lazy_imports import field_class, schema_class
 
@@ -318,7 +318,6 @@ class CastOptions:
     byte_size: int | None = None
     row_limit: int | None = None
     use_threads: bool = True
-    recursive: bool = False
     match_by: list["Field"] | None = None
     unique_by: list["Field"] | None = None
     time_sample_by: list["Field"] | None = None
@@ -330,16 +329,11 @@ class CastOptions:
 
     # --- Upsert / merge shape -------------------------------------------
     update_column_names: list[str] | None = None
-    prune_by: "list[str] | str | None" = None
-    prune_values: Mapping[str, tuple[Any, ...]] | None = None
 
     # --- Trailing maintenance -------------------------------------------
     zorder_by: list[str] | None = None
     optimize_after_merge: bool = False
     vacuum_hours: int | None = None
-
-    # --- Engine knobs ----------------------------------------------------
-    spark_options: dict[str, Any] | None = None
 
     retry: WaitingConfigArg | None = None
     return_data: bool = False

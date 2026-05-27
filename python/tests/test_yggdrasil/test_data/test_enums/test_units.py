@@ -1,4 +1,4 @@
-"""Behaviors of :mod:`yggdrasil.data.enums.units`.
+"""Behaviors of :mod:`yggdrasil.enums.units`.
 
 Each unit family ships with the same surface: :meth:`Unit.from_`
 forgiving coercion, :meth:`Unit.convert` scalar conversion, the
@@ -15,7 +15,7 @@ import math
 
 import pytest
 
-from yggdrasil.data.enums.units import (
+from yggdrasil.enums.units import (
     EnergyUnit,
     LengthUnit,
     MassUnit,

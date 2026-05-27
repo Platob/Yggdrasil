@@ -2,9 +2,9 @@
 
 Each concrete subclass under this package implements one file format
 (Parquet, CSV, JSON, …). They all single-inherit from
-:class:`yggdrasil.io.buffer.bytes_io.BytesIO`; the marker
-``PrimitiveIO`` layer is gone — every concrete leaf is just a
-:class:`BytesIO` with format-specific ``_read_arrow_batches`` /
+:class:`yggdrasil.io.holder.IO`; the marker
+``PrimitiveIO`` layer is gone — every concrete leaf is just an
+:class:`IO` with format-specific ``_read_arrow_batches`` /
 ``_write_arrow_batches`` hooks and a registered
 ``default_media_type``.
 

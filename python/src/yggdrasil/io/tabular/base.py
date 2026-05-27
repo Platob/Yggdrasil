@@ -9,7 +9,7 @@ derived from those hooks.
 Implementers compose :class:`Tabular` with whatever concrete
 substrate they need:
 
-- :class:`yggdrasil.io.buffer.bytes_io.BytesIO` mixes Tabular with
+- :class:`yggdrasil.io.holder.IO` mixes Tabular with
   :class:`Disposable` and a :class:`Holder` cursor — the default
   byte-backed implementation.
 - A hypothetical :class:`SparkCatalogTabular` could mix Tabular with
@@ -62,10 +62,13 @@ from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 from yggdrasil.data.data_field import Field as _Field
-from yggdrasil.data.enums import MediaType, MimeType, Mode, ModeLike
+from yggdrasil.dataclasses.singleton import Singleton
+from yggdrasil.disposable import Disposable
+from yggdrasil.enums import MediaType, MimeType, Mode, ModeLike
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
+from yggdrasil.url.based import URLBased
 
 if TYPE_CHECKING:
     from yggdrasil.arrow.tabular import ArrowTabular
@@ -486,7 +489,10 @@ O = TypeVar("O", bound=CastOptions)
 _ChildT = TypeVar("_ChildT", bound="Tabular")
 
 
-class Tabular(ABC, Generic[O]):
+_TABULAR_FORMAT_REGISTRY: "dict[str, type[Tabular]]" = {}
+
+
+class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     """Pure interface — Arrow record-batch source/sink + engine fan-out.
 
     No state, no lifecycle, with the single exception of a
@@ -504,6 +510,26 @@ class Tabular(ABC, Generic[O]):
     :meth:`Holder.__init_subclass__` auto-registers it. Look up via
     :meth:`Holder.class_for_media_type` / :meth:`Holder.for_holder`.
     """
+
+    mime_type: "ClassVar[MimeType | None]" = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        mt = cls.__dict__.get("mime_type")
+        if mt is None:
+            return
+        key = mt.name if hasattr(mt, "name") else str(mt)
+        _TABULAR_FORMAT_REGISTRY[key] = cls
+
+    @classmethod
+    def class_for_media_type(cls, media_type: Any, *, default: Any = None) -> "type[Tabular] | None":
+        if media_type is None:
+            return default
+        mt = media_type if hasattr(media_type, "mime_type") else None
+        if mt is not None:
+            media_type = mt.mime_type
+        key = media_type.name if hasattr(media_type, "name") else str(media_type)
+        return _TABULAR_FORMAT_REGISTRY.get(key, default)
 
     def __init__(
         self,
@@ -525,6 +551,18 @@ class Tabular(ABC, Generic[O]):
         super().__init__()
         self.tabular_parent: "Tabular | None" = tabular_parent
         self._schema_cache: "Schema | Any" = ...
+        self._url: "URL | None" = None
+
+    def to_url(self) -> "URL":
+        if self._url is not None:
+            return self._url
+        from yggdrasil.url import URL
+        self._url = URL.from_memory_address(self)
+        return self._url
+
+    @property
+    def url(self) -> "URL":
+        return self.to_url()
 
     # ==================================================================
     # Parent / child linkage
@@ -554,18 +592,9 @@ class Tabular(ABC, Generic[O]):
 
     @property
     def static_values(self) -> "Mapping[str, Any]":
-        """Column → constant value across every row this Tabular yields.
-
-        Default: empty mapping. Subclasses with a cheap source of
-        invariants override — :class:`FolderPath` parses Hive
-        ``<col>=<val>/`` segments off its bound :attr:`path` URL,
-        a future Parquet-stats-based subclass would read
-        min==max column stats from the footer, a Delta leaf would
-        pull from its ``AddFile.partition_values``, etc. There is
-        no parent-chain inheritance built into the base — each
-        subclass decides what "constant across rows" means for its
-        backing store.
-        """
+        url = getattr(self, "url", None) or getattr(self, "_url", None)
+        if url is not None and hasattr(url, "static_values"):
+            return url.static_values
         return {}
 
     def matches_static(
@@ -667,10 +696,10 @@ class Tabular(ABC, Generic[O]):
           ``default=None``).
         * :class:`Tabular` — returned as-is. When *as_folder* is
           ``True`` and *obj* is a local :class:`Path`, wraps it in
-          a :class:`FolderPath`.
+          a :class:`Folder`.
         * ``str`` / :class:`os.PathLike` — coerced via
           :class:`Path.from_`. When *as_folder* is ``True``,
-          wraps in :class:`FolderPath`.
+          wraps in :class:`Folder`.
         * File-like objects — drained into :class:`Memory`;
           *media_type* required.
 
@@ -684,9 +713,9 @@ class Tabular(ABC, Generic[O]):
 
         if isinstance(obj, Tabular):
             if as_folder and isinstance(obj, Holder) and obj.is_local:
-                from yggdrasil.io.nested.folder_path import FolderPath
-                if not isinstance(obj, FolderPath):
-                    return FolderPath(path=obj)
+                from yggdrasil.path.folder import Folder
+                if not isinstance(obj, Folder):
+                    return Folder(path=obj)
             if media_type is not None and isinstance(obj, Holder):
                 return Holder.for_holder(obj, media_type=media_type, **kwargs)
             return obj
@@ -700,11 +729,11 @@ class Tabular(ABC, Generic[O]):
                     "pass a URL, a filesystem path, or a name with an "
                     "extension (e.g. 'data.parquet')."
                 )
-            from yggdrasil.io.path import Path as YggPath
+            from yggdrasil.path import Path as YggPath
             path = YggPath.from_(obj)
             if as_folder:
-                from yggdrasil.io.nested.folder_path import FolderPath
-                return FolderPath(path=path)
+                from yggdrasil.path.folder import Folder
+                return Folder(path=path)
             if media_type is not None:
                 return Holder.for_holder(path, media_type=media_type, **kwargs)
             return path
@@ -719,7 +748,7 @@ class Tabular(ABC, Generic[O]):
                     f"inputs ({type(obj).__name__}); no URL extension "
                     "to sniff the format."
                 )
-            from yggdrasil.io.memory import Memory
+            from yggdrasil.path.memory import Memory
             data = read()
             if isinstance(data, str):
                 data = data.encode()
@@ -806,7 +835,7 @@ class Tabular(ABC, Generic[O]):
 
         Default implementation is a no-op and returns ``0`` — single-file
         leaves (parquet, csv, arrow IPC, …) don't have a compaction
-        concept. Aggregator subclasses (:class:`FolderPath`) override
+        concept. Aggregator subclasses (:class:`Folder`) override
         this to walk their child leaves and bin-pack small part files
         into bundles near *byte_size*.
         Files already close to the target size are left alone so a
@@ -851,7 +880,7 @@ class Tabular(ABC, Generic[O]):
         The default implementation reads every batch, drops rows the
         predicate accepts, and rewrites the leaf with the survivors.
         Aggregator subclasses
-        (:class:`yggdrasil.io.nested.folder_path.FolderPath`) override
+        (:class:`yggdrasil.path.folder.Folder`) override
         to walk children, prune subtrees whose partition bounds make
         the predicate trivially false, and only rewrite the leaves
         that actually hold matched rows — so a delete on a hive-
@@ -908,63 +937,6 @@ class Tabular(ABC, Generic[O]):
             )
         self._write_arrow_batches(iter(survivors), options)
         return deleted
-
-    # ==================================================================
-    # Execution-plan entry point
-    # ==================================================================
-
-    def execute_plan(
-        self,
-        plan: "Any",
-        *,
-        options: "O | None" = None,
-        **kwargs: Any,
-    ) -> "Tabular":
-        """Apply an :class:`ExecutionPlan` to this Tabular.
-
-        The default returns a :class:`LazyTabular` wrapping ``self``
-        with the plan attached — execution stays lazy and routes
-        through whatever read hook the caller pulls (Arrow, polars
-        LazyFrame, …). An empty plan returns ``self`` unchanged so
-        callers can hand a possibly-empty plan in without an explicit
-        guard.
-
-        Subclasses with native plan execution (a SQL engine that can
-        push the whole plan to a remote, an in-engine LazyFrame
-        source, …) override to bypass the LazyTabular wrapper. The
-        contract is just: return a :class:`Tabular` whose reads
-        produce the same rows the wrapper would.
-        """
-        from yggdrasil.execution.plan import ExecutionPlan
-        from yggdrasil.io.tabular.lazy import LazyTabular
-
-        coerced = (
-            plan if isinstance(plan, ExecutionPlan)
-            else ExecutionPlan(tuple(plan)) if plan is not None
-            else ExecutionPlan.empty()
-        )
-        if coerced.is_empty():
-            return self
-        # ``options`` / ``**kwargs`` are accepted for forward-compat
-        # so subclasses can wire engine-specific knobs through;
-        # the default LazyTabular doesn't need them — its reads
-        # carry their own options.
-        del options, kwargs
-        return LazyTabular(self, plan=coerced)
-
-    def lazy(self) -> "Tabular":
-        """Return a :class:`LazyTabular` view with a ``SELECT *`` plan.
-
-        Entry point for the builder API — chain :meth:`select`,
-        :meth:`filter`, :meth:`group_by`, :meth:`apply` off the result
-        without each call paying the wrapping cost. The seeded plan is
-        a single :class:`Select` over ``"*"`` so the lazy frame still
-        round-trips every column when collected with no further ops.
-        """
-        from yggdrasil.execution.plan import ExecutionPlan, Select
-        from yggdrasil.io.tabular.lazy import LazyTabular
-
-        return LazyTabular(self, plan=ExecutionPlan((Select(("*",)),)))
 
     # ==================================================================
     # Abstract batch hooks — the two things every implementer overrides
@@ -1418,8 +1390,7 @@ class Tabular(ABC, Generic[O]):
           from both sides survives).
 
         Concrete subclasses override :meth:`_union` for in-place
-        mutation (Arrow batch append, Spark ``unionByName``).  The
-        base falls back to :class:`UnionTabular`.
+        mutation (Arrow batch append, Spark ``unionByName``).
 
         Accepts :class:`Tabular`, ``pa.RecordBatch``, ``pa.Table``,
         ``list[Response]``, or a Spark DataFrame.
@@ -1453,8 +1424,10 @@ class Tabular(ABC, Generic[O]):
 
     def _union(self, other: "Tabular", *, mode: Mode = Mode.IGNORE) -> "Tabular":
         """Engine-specific union hook.  Override in subclasses."""
-        from .union import UnionTabular
-        return UnionTabular([self, other])
+        raise NotImplementedError(
+            f"{type(self).__name__}._union is not implemented; "
+            f"use ArrowTabular or SparkTabular which override this."
+        )
 
     # ==================================================================
     # Polars

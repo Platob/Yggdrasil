@@ -19,10 +19,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.table.table import Table
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.url import URL, URLBased
 
 
 # ---------------------------------------------------------------------------

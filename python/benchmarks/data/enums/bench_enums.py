@@ -1,9 +1,9 @@
-"""Benchmark the :mod:`yggdrasil.data.enums` parser hot paths.
+"""Benchmark the :mod:`yggdrasil.enums` parser hot paths.
 
 Why this exists
 ---------------
 
-The enums under :mod:`yggdrasil.data.enums` (``ByteUnit``, ``Mode``,
+The enums under :mod:`yggdrasil.enums` (``ByteUnit``, ``Mode``,
 ``TimeUnit``, ``JoinType``, ``State``, ``Scheme``, ``NodeType``,
 ``Currency``, ``Timezone``, ``MimeType``, ``Codec``) are the canonical
 entry points for normalising fixed-vocabulary tokens at every API
@@ -37,7 +37,7 @@ import statistics
 import time
 from typing import Callable
 
-from yggdrasil.data.enums import (
+from yggdrasil.enums import (
     ByteUnit,
     JoinType,
     Mode,
@@ -46,10 +46,10 @@ from yggdrasil.data.enums import (
     State,
     TimeUnit,
 )
-from yggdrasil.data.enums.currency.currency import Currency
-from yggdrasil.data.enums.mime_type import MimeType, MimeTypes
-from yggdrasil.data.enums.codec import Codec
-from yggdrasil.data.enums.timezone import Timezone
+from yggdrasil.enums.currency.currency import Currency
+from yggdrasil.enums.mime_type import MimeType, MimeTypes
+from yggdrasil.enums.codec import Codec
+from yggdrasil.enums.timezone import Timezone
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +486,7 @@ def _mime_scenarios(repeat: int) -> list[dict]:
 
 def _codec_scenarios(repeat: int) -> list[dict]:
     results: list[dict] = []
-    from yggdrasil.data.enums.codec import GZIP
+    from yggdrasil.enums.codec import GZIP
 
     results.append(_time_one(
         "Codec.from_(instance) passthrough",

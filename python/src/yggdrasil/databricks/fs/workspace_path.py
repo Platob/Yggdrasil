@@ -15,10 +15,10 @@ import logging
 import time
 from typing import Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Scheme
-from yggdrasil.data.enums.media_type import MediaType
+from yggdrasil.enums import Scheme
+from yggdrasil.enums.media_type import MediaType
 from yggdrasil.io.io_stats import IOStats, IOKind
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from ..path import DatabricksPath
 from ..workspaces.service import Workspaces
@@ -402,7 +402,7 @@ class WorkspacePath(DatabricksPath):
 
             def _do_upload() -> None:
                 # Bytes-like input — ``WorkspaceExt.upload`` will
-                # build a fresh ``BytesIO`` per request, so no
+                # build a fresh ``IO`` per request, so no
                 # cursor state crosses retry attempts.
                 upload(path=api_path, content=content, format=fmt, overwrite=True)
 
@@ -437,7 +437,16 @@ class WorkspacePath(DatabricksPath):
                 if not _looks_like_not_found(del_exc):
                     raise
             self._call_ensuring_parents(_do_upload)
+        committed = None
         if size >= 0:
+            if hasattr(content, "read"):
+                try:
+                    content.seek(0)
+                    committed = content.read()
+                except Exception:
+                    pass
+            else:
+                committed = bytes(content)
             self._persist_stat_cache(
                 IOStats(
                     size=size,
@@ -449,6 +458,10 @@ class WorkspacePath(DatabricksPath):
             logger.info("Uploaded workspace file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded workspace file %r (size=stream)", self)
+        if committed is not None:
+            self._cache_after_upload(committed, len(committed))
+        else:
+            self._buffered_size = None
         return size
 
     # ==================================================================
@@ -478,7 +491,7 @@ class WorkspacePath(DatabricksPath):
         — the Workspace API detects the binary content type and
         stores the object as a workspace file (not a notebook).
         """
-        from yggdrasil.io.path._module_pack import (
+        from yggdrasil.path._module_pack import (
             build_module_archive,
             resolve_module_root,
         )

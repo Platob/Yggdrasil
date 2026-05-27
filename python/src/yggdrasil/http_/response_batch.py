@@ -15,10 +15,13 @@ import pyarrow as pa
 from yggdrasil.arrow.cast import rechunk_arrow_batches
 from yggdrasil.data import Mode
 from yggdrasil.environ import PyEnv
-from yggdrasil.io.request import PreparedRequest, REQUEST_SCHEMA
-from yggdrasil.io.response import RESPONSE_ARROW_SCHEMA, RESPONSE_SCHEMA, Response
-from yggdrasil.io.send_config import SendConfig, CacheConfig, MATCH_KEY
-from yggdrasil.io.tabular import ArrowTabular, Dataset
+from yggdrasil.http_.request import HTTPRequest
+from yggdrasil.http_.response import HTTPResponse
+from yggdrasil.http_.schemas import REQUEST_SCHEMA, RESPONSE_SCHEMA
+from yggdrasil.http_.cache_config import CacheConfig, MATCH_KEY
+from yggdrasil.http_.send_config import SendConfig
+from yggdrasil.io.tabular import ArrowTabular
+from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.io.tabular.base import Tabular
 
 if TYPE_CHECKING:
@@ -36,8 +39,8 @@ __all__ = [
 ]
 
 
-def _synthetic_not_found(request: "PreparedRequest") -> Response:
-    return Response(
+def _synthetic_not_found(request: "HTTPRequest") -> HTTPResponse:
+    return HTTPResponse(
         request=request,
         status_code=404,
         headers={"Content-Type": "application/json"},
@@ -47,10 +50,10 @@ def _synthetic_not_found(request: "PreparedRequest") -> Response:
     )
 
 
-def responses_to_tabular(responses: list[Response]) -> ArrowTabular:
+def responses_to_tabular(responses: list[HTTPResponse]) -> ArrowTabular:
     return ArrowTabular(
-        [Response.values_to_arrow_batch(responses)],
-        schema=RESPONSE_ARROW_SCHEMA,
+        [HTTPResponse.values_to_arrow_batch(responses)],
+        schema=RESPONSE_SCHEMA.to_arrow_schema(),
     )
 
 
@@ -66,7 +69,8 @@ def _to_tabular(data) -> "Tabular | None":
     if isinstance(data, Tabular):
         return data
     if hasattr(data, "toArrow") or hasattr(data, "toPandas"):
-        return Dataset(data)
+        from yggdrasil.spark.tabular import SparkDataset
+        return SparkDataset(data)
     return None
 
 
@@ -82,18 +86,19 @@ class HTTPResponseBatch(Tabular):
         "_send_config", "_requests", "_session",
         "_local_hashes", "_remote_hashes",
         "_local_tabular", "_remote_tabular", "_new_tabular", "_failed",
-        "_split_done", "_misses",
+        "_split_done", "_misses", "_ignored_count",
+        "_new_responses",
     )
 
     def __init__(
         self,
         send_config: "SendConfig",
-        requests: "list[PreparedRequest]",
-        new_responses: "list[Response] | None" = None,
+        requests: "list[HTTPRequest]",
+        new_responses: "list[HTTPResponse] | None" = None,
         new_responses_tabular: "Tabular | pa.Table | SparkDataFrame | None" = None,
         *,
-        misses: "list[PreparedRequest] | None" = None,
-        failed: "list[Response] | None" = None,
+        misses: "list[HTTPRequest] | None" = None,
+        failed: "list[HTTPResponse] | None" = None,
         session: "Any" = None,
     ) -> None:
         super().__init__()
@@ -106,8 +111,9 @@ class HTTPResponseBatch(Tabular):
         self._split_done = False
         self._session = session
 
+        self._new_responses: list[HTTPResponse] | None = new_responses
         if new_responses is not None:
-            self._new_tabular: Optional[Tabular] = responses_to_tabular(new_responses)
+            self._new_tabular: Optional[Tabular] = ...
         else:
             self._new_tabular = _to_tabular(new_responses_tabular)
 
@@ -115,6 +121,7 @@ class HTTPResponseBatch(Tabular):
         self._failed: Optional[Tabular] = (
             responses_to_tabular(failed) if failed else None
         )
+        self._ignored_count: int = 0
 
     def _ensure_split(self) -> None:
         if self._split_done:
@@ -142,8 +149,8 @@ class HTTPResponseBatch(Tabular):
         if tab is None:
             return None
         request_map = {r.match_value(MATCH_KEY): r for r in hit_reqs}
-        kept: list[Response] = []
-        for resp in Response.from_arrow_tabular(tab.read_arrow_batches()):
+        kept: list[HTTPResponse] = []
+        for resp in HTTPResponse.from_arrow_tabular(tab.read_arrow_batches()):
             req = request_map.get(
                 resp.match_value(MATCH_KEY) if hasattr(resp, "match_value") else None
             )
@@ -168,7 +175,7 @@ class HTTPResponseBatch(Tabular):
         for tab in (local_tab, remote_tab):
             if tab is None:
                 continue
-            for resp in Response.from_arrow_tabular(tab.read_arrow_batches()):
+            for resp in HTTPResponse.from_arrow_tabular(tab.read_arrow_batches()):
                 req = resp.request
                 if req is not None:
                     served.add(req.match_value(MATCH_KEY))
@@ -194,6 +201,10 @@ class HTTPResponseBatch(Tabular):
 
         if not misses or cfg.cache_only:
             if misses:
+                LOGGER.warning(
+                    "cache_only=True: %d request(s) not in cache, returning synthetic 404",
+                    len(misses),
+                )
                 self.new_tabular = [_synthetic_not_found(r) for r in misses]
             return self
 
@@ -207,16 +218,17 @@ class HTTPResponseBatch(Tabular):
 
     def _fetch_local(
         self,
-        misses: "list[PreparedRequest]",
+        misses: "list[HTTPRequest]",
         *,
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> None:
         """Fetch misses via the session's thread pool."""
         cfg = self._send_config
-        ok_list: list[Response] = []
-        all_list: list[Response] = []
-        err_list: list[Response] = []
+        ok_list: list[HTTPResponse] = []
+        all_list: list[HTTPResponse] = []
+        err_list: list[HTTPResponse] = []
+        ignored: list[HTTPResponse] = []
         for response in self._session._fetch_misses(
             misses, ordered=ordered, max_in_flight=max_in_flight,
         ):
@@ -225,28 +237,39 @@ class HTTPResponseBatch(Tabular):
                 ok_list.append(response)
             elif cfg.raise_error:
                 err_list.append(response)
+            else:
+                ignored.append(response)
         if err_list:
             self.failed = err_list
+        for r in err_list:
+            LOGGER.warning(
+                "%s %s failed %d (%d bytes)",
+                r.request.method, r.request.url, r.status_code, r.body_size,
+            )
+        for r in ignored:
+            LOGGER.warning(
+                "%s %s ignored %d (%d bytes, raise_error=False)",
+                r.request.method, r.request.url, r.status_code, r.body_size,
+            )
 
+        self._ignored_count = len(ignored)
         LOGGER.info(
-            "Fetched %d/%d miss(es) (ok=%d, failed=%d)",
-            len(ok_list) + len(err_list), len(misses),
-            len(ok_list), len(err_list),
+            "Fetched %d miss(es): ok=%d, failed=%d, ignored=%d",
+            len(misses), len(ok_list), len(err_list), len(ignored),
         )
 
         if all_list:
-            self.new_tabular = pa.Table.from_batches(
-                [Response.values_to_arrow_batch(all_list)]
-            )
+            self._new_responses = all_list
+            self._new_tabular = ...
         if ok_list:
             write_data = pa.Table.from_batches(
-                [Response.values_to_arrow_batch(ok_list)]
+                [HTTPResponse.values_to_arrow_batch(ok_list)]
             )
             cfg.write_responses_tabular(write_data, session=self._session)
 
     def _fetch_spark(
         self,
-        misses: "list[PreparedRequest]",
+        misses: "list[HTTPRequest]",
         spark: "SparkSession",
     ) -> None:
         """Fetch misses via Spark mapInArrow."""
@@ -263,8 +286,8 @@ class HTTPResponseBatch(Tabular):
             err_df = result_df.where(
                 (F.col("status_code") < 200) | (F.col("status_code") >= 400)
             )
-            if len(err_table) > 0:
-                self.failed = err_table
+            if err_df.count() > 0:
+                self._failed = err_df
             write_data = ok_df
 
         self.new_tabular = result_df
@@ -272,9 +295,9 @@ class HTTPResponseBatch(Tabular):
 
     def _spark_scatter(
         self,
-        misses: "list[PreparedRequest]",
+        misses: "list[HTTPRequest]",
         spark: "SparkSession",
-    ) -> "Dataset":
+    ) -> "Tabular":
         """Scatter misses to Spark workers via mapInArrow."""
         session = self._session
         cfg = self._send_config
@@ -287,7 +310,7 @@ class HTTPResponseBatch(Tabular):
             session.prepare_request_before_send(req)
 
         request_table = pa.Table.from_batches(
-            [PreparedRequest.values_to_arrow_batch(misses)]
+            [HTTPRequest.values_to_arrow_batch(misses)]
         )
 
         try:
@@ -340,7 +363,7 @@ class HTTPResponseBatch(Tabular):
                 sess = pickle.loads(session_bytes)
                 part_config = worker_config
             for batch in batches:
-                reqs = list(PreparedRequest.from_arrow(batch))
+                reqs = list(HTTPRequest.from_arrow(batch))
                 if not reqs:
                     continue
 
@@ -390,11 +413,21 @@ class HTTPResponseBatch(Tabular):
 
     @property
     def new_tabular(self) -> "Tabular | None":
+        if self._new_tabular is ...:
+            if self._new_responses:
+                self._new_tabular = responses_to_tabular(self._new_responses)
+            else:
+                self._new_tabular = None
         return self._new_tabular
 
     @new_tabular.setter
     def new_tabular(self, value) -> None:
+        self._new_responses = None
         self._new_tabular = _to_tabular(value)
+
+    @property
+    def new_responses(self) -> "list[HTTPResponse] | None":
+        return self._new_responses
 
     @property
     def failed(self) -> "Tabular | None":
@@ -410,6 +443,10 @@ class HTTPResponseBatch(Tabular):
     @property
     def failed_count(self) -> int:
         return self._failed.count() if self._failed is not None else 0
+
+    @property
+    def ignored_count(self) -> int:
+        return self._ignored_count
 
     @property
     def send_config(self) -> "SendConfig":
@@ -430,7 +467,11 @@ class HTTPResponseBatch(Tabular):
 
     @property
     def is_spark(self) -> bool:
-        return any(isinstance(h, Dataset) for h in self._holders())
+        try:
+            from yggdrasil.spark.tabular import SparkDataset
+            return any(isinstance(h, SparkDataset) for h in self._holders())
+        except ImportError:
+            return False
 
     # ------------------------------------------------------------------
     # Tabular implementation
@@ -488,14 +529,17 @@ class HTTPResponseBatch(Tabular):
     # Iteration
     # ------------------------------------------------------------------
 
-    def __iter__(self) -> Iterator[Response]:
+    def __iter__(self) -> Iterator[HTTPResponse]:
         return self.responses()
 
-    def responses(self) -> Iterator[Response]:
-        for holder in self._holders():
-            if holder is None:
-                continue
-            yield from Response.from_records(holder.read_records())
+    def responses(self) -> Iterator[HTTPResponse]:
+        for tab in (self.local_tabular, self.remote_tabular):
+            if tab is not None:
+                yield from HTTPResponse.from_records(tab.read_records())
+        if self._new_responses is not None:
+            yield from self._new_responses
+        elif self._new_tabular is not None and self._new_tabular is not ...:
+            yield from HTTPResponse.from_records(self._new_tabular.read_records())
 
     # ------------------------------------------------------------------
     # Merge
@@ -504,7 +548,12 @@ class HTTPResponseBatch(Tabular):
     def extend(self, other: "HTTPResponseBatch") -> "HTTPResponseBatch":
         self._local_tabular = _union(self.local_tabular, other.local_tabular)
         self._remote_tabular = _union(self.remote_tabular, other.remote_tabular)
-        self._new_tabular = _union(self._new_tabular, other._new_tabular)
+        if self._new_responses is not None and other._new_responses is not None:
+            self._new_responses = self._new_responses + other._new_responses
+            self._new_tabular = ...
+        else:
+            self._new_tabular = _union(self.new_tabular, other.new_tabular)
+            self._new_responses = None
         self._misses.extend(other._misses)
         self._local_hashes |= other._local_hashes
         self._remote_hashes |= other._remote_hashes

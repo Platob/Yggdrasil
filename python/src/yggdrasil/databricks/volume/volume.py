@@ -46,13 +46,13 @@ from databricks.sdk.service.catalog import (
 )
 
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.data.enums import Mode, ModeLike, Scheme
+from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 from yggdrasil.databricks.client import DatabricksResource
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
@@ -508,7 +508,7 @@ class Volume(DatabricksResource, Singleton):
         if self._storage_path is not None and not refresh:
             return self._storage_path
 
-        from yggdrasil.io.path import Path
+        from yggdrasil.path import Path
 
         raw = self.storage_location(refresh=refresh)
         scheme = URL.from_str(raw).scheme or ""

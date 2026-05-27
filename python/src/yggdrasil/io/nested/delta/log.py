@@ -41,7 +41,7 @@ from yggdrasil.io.nested.delta._names import (
 from yggdrasil.io.nested.delta.protocol import DeltaAction, parse_action
 
 if TYPE_CHECKING:
-    from yggdrasil.io.path import Path
+    from yggdrasil.path import Path
 
 
 __all__ = [

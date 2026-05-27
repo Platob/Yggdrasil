@@ -57,7 +57,7 @@ from yggdrasil.io.nested.delta.protocol import DeletionVectorDescriptor
 
 if TYPE_CHECKING:
     import pyarrow as pa
-    from yggdrasil.io.path import Path
+    from yggdrasil.path import Path
 
 
 __all__ = [
@@ -334,7 +334,7 @@ def write_uuid_deletion_vector(
     Returns the descriptor a writer should embed in the matching
     AddFile / RemoveFile action.
     """
-    from yggdrasil.io.path.path import Path as _Path  # noqa: F401 — typing only.
+    from yggdrasil.path.path import Path as _Path  # noqa: F401 — typing only.
 
     payload = _encode_simple_payload(row_ids)
     framed = struct.pack(">I", len(payload)) + payload + struct.pack(">I", 0)

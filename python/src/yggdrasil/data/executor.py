@@ -33,7 +33,7 @@ from typing import Any, ClassVar, Generic, Iterable, Mapping, Optional, TypeVar
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
-from yggdrasil.io.session import Session
+from yggdrasil.dataclasses.singleton import Singleton
 from .statement import (
     PreparedStatement,
     StatementBatch,
@@ -163,7 +163,7 @@ _DEFAULT_EXECUTION_OPTIONS = ExecutionOptions()
 # ---------------------------------------------------------------------------
 
 
-class StatementExecutor(Session, Disposable, Generic[PS, SR, SB]):
+class StatementExecutor(Singleton, Disposable, Generic[PS, SR, SB]):
     """Abstract base for backend-specific statement executors.
 
     A :class:`StatementExecutor` IS a :class:`Session` over a transport

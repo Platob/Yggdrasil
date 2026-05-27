@@ -1,5 +1,5 @@
 from .data_field import field, Field
-from .enums import *
+from yggdrasil.enums import *
 from .schema import *
 from .types import DataType, DataTypeId
 from .types.geo import (

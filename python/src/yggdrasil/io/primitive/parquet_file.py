@@ -1,6 +1,6 @@
-"""Parquet Tabular leaf over the new :class:`BytesIO` substrate.
+"""Parquet Tabular leaf over the new :class:`IO` substrate.
 
-:class:`ParquetFile` is a :class:`BytesIO` subclass that auto-registers
+:class:`ParquetFile` is an :class:`IO` subclass that auto-registers
 under :data:`MimeTypes.PARQUET`. The Parquet file format is
 footer-indexed: readers parse the metadata block at the end of the
 file once and use it to plan column reads. Writes buffer row groups
@@ -35,7 +35,7 @@ from yggdrasil.arrow.ops import upsert_arrow_batches
 from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import MimeTypes, Mode
+from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
 from yggdrasil.pickle import json as ygg_json

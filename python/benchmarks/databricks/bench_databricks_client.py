@@ -73,7 +73,7 @@ from yggdrasil.databricks.client import (
     DatabricksClient,
     is_checked_tmp_path,
 )
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 
 # ---------------------------------------------------------------------------

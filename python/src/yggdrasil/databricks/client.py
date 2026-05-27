@@ -26,14 +26,13 @@ from yggdrasil.dataclasses import (
     ExpiringDict,
     Singleton,
 )
-from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.data.enums import MimeTypes, Scheme
-from yggdrasil.io.url import URL, URLBased
+from yggdrasil.io.holder import IO
+from yggdrasil.enums import MimeTypes, Scheme
+from yggdrasil.url import URL, URLBased
 from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:
     from .iam import IAM
-    from .jobs.service import Jobs
     from .sql.engine import SQLEngine
     from .table.tables import Tables
     from .column.columns import Columns
@@ -45,7 +44,6 @@ if TYPE_CHECKING:
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
     from .path import DatabricksPath
-    from .genie import Genie
     from .ai import DatabricksAI
     from .tags.service import EntityTags
 
@@ -323,9 +321,7 @@ class DatabricksClient(Singleton, URLBased):
             "_catalogs",
             "_schemas",
             "_volumes",
-            "_genie",
             "_filesystem",
-            "_jobs",
         }
     )
 
@@ -1058,7 +1054,7 @@ class DatabricksClient(Singleton, URLBased):
             return self.account_id
 
         local_cache = self.local_config_folder / "workspaces_latest.parquet"
-        buff = BytesIO(local_cache, copy=False)
+        buff = IO(local_cache, copy=False)
         workspace_id = self.get_workspace_id()
 
         if local_cache.exists() and local_cache.stat().st_size > 0:
@@ -1682,30 +1678,6 @@ class DatabricksClient(Singleton, URLBased):
 
         cached = Volumes(client=self)
         self.__dict__["_volumes"] = cached
-        return cached
-
-    @property
-    def jobs(self) -> "Jobs":
-        """Collection-level Databricks Jobs service for this client."""
-        cached = self.__dict__.get("_jobs")
-        if cached is not None:
-            return cached
-        from .jobs.service import Jobs
-
-        cached = Jobs(client=self)
-        self.__dict__["_jobs"] = cached
-        return cached
-
-    @property
-    def genie(self) -> "Genie":
-        """Genie conversation and space management helper for this client."""
-        cached = self.__dict__.get("_genie")
-        if cached is not None:
-            return cached
-        from .genie import Genie
-
-        cached = Genie(client=self)
-        self.__dict__["_genie"] = cached
         return cached
 
     @property

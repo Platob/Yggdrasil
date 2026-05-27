@@ -3,7 +3,7 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from yggdrasil.data.enums.currency import Currency
+from yggdrasil.enums.currency import Currency
 
 
 def test_parse_aliases() -> None:

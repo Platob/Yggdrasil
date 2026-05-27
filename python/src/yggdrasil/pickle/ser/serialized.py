@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Generic, Mapping, Optional, TypeVar
 
-from yggdrasil.io import BytesIO
+from yggdrasil.io.holder import IO
 from yggdrasil.pickle.ser._scratch import _ScratchBuf
 from yggdrasil.pickle.ser.codec import (
     DEFAULT_CODEC,
@@ -35,7 +35,7 @@ _SERIALIZE_GUARD = threading.local()
 
 def _restore_serialized_from_wire(payload: bytes) -> "Serialized[object]":
     """Rebuild a ``Serialized`` instance from its wire-format bytes."""
-    return Serialized.read_from(BytesIO(payload), pos=0)
+    return Serialized.read_from(IO(payload), pos=0)
 
 
 def _guard_key(obj: object) -> tuple[int, type]:
@@ -53,7 +53,7 @@ def _get_guard_stack() -> set[tuple[int, type]]:
 @dataclass(frozen=True, slots=True)
 class Serialized(ABC, Generic[T]):
     head: Header
-    data: BytesIO
+    data: IO
 
     _cached_obj: Optional[T] = field(
         init=False,
@@ -66,7 +66,7 @@ class Serialized(ABC, Generic[T]):
     def __new__(
         cls,
         head: Header | None = None,
-        data: BytesIO | None = None,
+        data: IO | None = None,
     ):
         # ``pickle``/``copy`` may call ``__new__`` with no constructor args.
         # Keep zero-arg construction valid for dataclass instance restoration.
@@ -128,7 +128,7 @@ class Serialized(ABC, Generic[T]):
             object.__setattr__(self, "_cached_obj", cached)
         return cached
 
-    def write_to(self, buffer: "BytesIO | None" = None) -> BytesIO:
+    def write_to(self, buffer: "IO | None" = None) -> IO:
         # Hand the payload to ``Header.write_to`` as a memoryview so the
         # write streams straight from the data buffer's holder into the
         # output sink (zero-copy for Memory holders) — no intermediate
@@ -439,7 +439,7 @@ class Serialized(ABC, Generic[T]):
     @classmethod
     def read_from(
         cls,
-        buffer: BytesIO,
+        buffer: IO,
         *,
         pos: int | None = None,
     ) -> "Serialized[object]":

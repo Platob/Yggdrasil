@@ -9,7 +9,7 @@ from types import MappingProxyType
 import pytest
 
 import yggdrasil.pickle.ser.collections as m
-from yggdrasil.io import BytesIO
+from yggdrasil.io import IO
 
 
 def _roundtrip(obj):
@@ -19,35 +19,35 @@ def _roundtrip(obj):
 
 
 def test_read_u32():
-    buf = BytesIO((123).to_bytes(4, "big"))
+    buf = IO((123).to_bytes(4, "big"))
     assert m._read_u32(buf) == 123
 
 
 def test_read_u32_invalid_size():
-    buf = BytesIO(b"\x00")
+    buf = IO(b"\x00")
     with pytest.raises(ValueError):
         m._read_u32(buf)
 
 
 def test_read_u64():
-    buf = BytesIO((123456789).to_bytes(8, "big"))
+    buf = IO((123456789).to_bytes(8, "big"))
     assert m._read_u64(buf) == 123456789
 
 
 def test_read_u64_invalid_size():
-    buf = BytesIO(b"\x00")
+    buf = IO(b"\x00")
     with pytest.raises(ValueError):
         m._read_u64(buf)
 
 
 def test_write_count_small():
-    buf = BytesIO()
+    buf = IO()
     m._write_count(buf, 7, large=False)
     assert buf.getvalue() == (7).to_bytes(4, "big")
 
 
 def test_write_count_large():
-    buf = BytesIO()
+    buf = IO()
     m._write_count(buf, 7, large=True)
     assert buf.getvalue() == (7).to_bytes(8, "big")
 
@@ -65,7 +65,7 @@ def test_materialize_iterable():
 
 def test_build_collection_payload_and_iter_items():
     payload = m._build_collection_payload(iter([1, "x", True]), count=3, large=False)
-    buf = BytesIO(payload.getvalue())
+    buf = IO(payload.getvalue())
     count = m._read_u32(buf)
     assert count == 3
 
@@ -79,7 +79,7 @@ def test_build_mapping_payload_and_iter_entry_pairs():
         count=2,
         large=False,
     )
-    buf = BytesIO(payload.getvalue())
+    buf = IO(payload.getvalue())
     count = m._read_u32(buf)
     assert count == 2
 
@@ -270,7 +270,7 @@ def test_payload_buffer_codec_none():
 
 
 def test_large_collection_read_count():
-    buf = BytesIO((5).to_bytes(8, "big"))
+    buf = IO((5).to_bytes(8, "big"))
     obj = object.__new__(m.LargeCollectionSerialized)
     assert obj._read_count(buf) == 5
 
@@ -1031,63 +1031,63 @@ def _to_wire(obj) -> bytes:
 
 def test_read_from_returns_list_serialized_for_list_bytes():
     wire = _to_wire([1, 2, 3])
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert isinstance(loaded, m.ListSerialized)
 
 
 def test_read_from_list_of_none():
     """Regression: list[None] must deserialise as [None, …], not raise AttributeError."""
     wire = _to_wire([None, None, None])
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert loaded.as_python() == [None, None, None]
 
 
 def test_read_from_list_of_all_primitive_types():
     obj = [None, True, False, -1, 0, 255, 3.14, b"bytes", "str"]
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert loaded.as_python() == obj
 
 
 def test_read_from_tuple_of_mixed_types():
     obj = (None, True, 42, "hello", b"\xff")
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert loaded.as_python() == obj
 
 
 def test_read_from_dict_with_none_values():
     obj = {"a": None, "b": 1, "c": None}
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert loaded.as_python() == obj
 
 
 def test_read_from_nested_dict_with_list_of_none():
     obj = {"key": [None, None], "other": {"inner": None}}
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert loaded.as_python() == obj
 
 
 def test_read_from_list_of_dicts_with_none():
     obj = [{"a": None}, {}, {"b": [None, 1]}]
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert loaded.as_python() == obj
 
 
 def test_read_from_deeply_nested_with_none():
     obj = [[None, [None]], {"x": {"y": None}}]
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert loaded.as_python() == obj
 
 
 def test_read_from_mappingproxy_with_none_value():
     obj = MappingProxyType({"a": None, "b": 1})
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     result = loaded.as_python()
     assert isinstance(result, MappingProxyType)
     assert dict(result) == {"a": None, "b": 1}
@@ -1096,7 +1096,7 @@ def test_read_from_mappingproxy_with_none_value():
 def test_read_from_deque_with_none_and_list():
     obj = deque([None, [1, 2], None])
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert list(loaded.as_python()) == [None, [1, 2], None]
 
 
@@ -1107,7 +1107,7 @@ def test_read_from_generator_with_none_items():
         yield None
 
     wire = _to_wire(gen())
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert list(loaded.as_python()) == [None, 1, None]
 
 
@@ -1124,7 +1124,7 @@ def test_read_from_preserves_tag_for_each_collection_type():
     ]
     for obj, expected_tag in cases:
         wire = _to_wire(obj)
-        loaded = Serialized.read_from(BytesIO(wire), pos=0)
+        loaded = Serialized.read_from(IO(wire), pos=0)
         assert loaded.tag == expected_tag, (
             f"tag mismatch for {type(obj).__name__}: "
             f"got {loaded.tag}, expected {expected_tag}"
@@ -1135,7 +1135,7 @@ def test_read_from_large_list_bytes(monkeypatch):
     """Large-count variant of list loads correctly via read_from."""
     monkeypatch.setattr(m, "_is_large_count", lambda _: True)
     wire = _to_wire([None, 1, "x"])
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert isinstance(loaded, m.LargeListSerialized)
     assert loaded.as_python() == [None, 1, "x"]
 
@@ -1144,7 +1144,7 @@ def test_read_from_large_mapping_bytes(monkeypatch):
     """Large-count dict loads correctly via read_from."""
     monkeypatch.setattr(m, "_is_large_count", lambda _: True)
     wire = _to_wire({"a": None, "b": [1, 2]})
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     assert isinstance(loaded, m.LargeMappingSerialized)
     assert loaded.as_python() == {"a": None, "b": [1, 2]}
 
@@ -1420,7 +1420,7 @@ def test_none_and_bool_survive_load_roundtrip_with_correct_types():
     """
     obj = [None, True, False, None, True]
     wire = _to_wire(obj)
-    loaded = Serialized.read_from(BytesIO(wire), pos=0)
+    loaded = Serialized.read_from(IO(wire), pos=0)
     result = loaded.as_python()
 
     assert result == obj

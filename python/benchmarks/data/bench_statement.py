@@ -43,7 +43,7 @@ import statistics
 import time
 from typing import Any, Callable, Optional
 
-from yggdrasil.data.enums import State
+from yggdrasil.enums import State
 from yggdrasil.data.executor import ExecutionOptions, StatementExecutor
 from yggdrasil.data.statement import (
     ExternalStatementData,

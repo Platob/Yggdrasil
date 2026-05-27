@@ -1,13 +1,13 @@
-"""Arrow IPC file Tabular leaf over the new :class:`BytesIO` substrate.
+"""Arrow IPC file Tabular leaf over the new :class:`IO` substrate.
 
-:class:`ArrowIPCFile` is a :class:`BytesIO` subclass with
+:class:`ArrowIPCFile` is an :class:`IO` subclass with
 :attr:`mime_type` set to :data:`MimeTypes.ARROW_IPC`, which auto-
 registers it in the Tabular registry so :meth:`Tabular.for_holder`
 dispatches a holder with that media type to this class.
 
 Reads use :class:`pa.ipc.RecordBatchFileReader` directly against the
 underlying buffer through :meth:`view` (so the caller's cursor on the
-parent BytesIO is not disturbed). Writes use
+parent IO is not disturbed). Writes use
 :class:`pa.ipc.RecordBatchFileWriter`. The IPC file format has a
 single footer for every batch, so APPEND / UPSERT modes degrade into
 a read-modify-rewrite over the same buffer.
@@ -16,7 +16,7 @@ Why no :class:`pa.BufferReader` materialization
 -----------------------------------------------
 
 PyArrow accepts any ``IO[bytes]`` with ``read`` + ``seek`` for both
-the reader and the writer side, and the reworked :class:`BytesIO`
+the reader and the writer side, and the reworked :class:`IO`
 satisfies that protocol exactly. Wrapping in
 :class:`pa.BufferReader` would force a full bytes copy out of the
 holder; passing ``self`` (or ``self.view(pos=0)``) avoids that on the
@@ -35,7 +35,7 @@ from yggdrasil.arrow.cast import get_arrow_nbytes
 from yggdrasil.arrow.ops import upsert_arrow_batches
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.data.enums import ByteUnit, MimeTypes, Mode
+from yggdrasil.enums import ByteUnit, MimeTypes, Mode
 from yggdrasil.io.base import IO
 
 if TYPE_CHECKING:

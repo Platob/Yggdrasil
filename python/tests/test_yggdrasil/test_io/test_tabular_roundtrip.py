@@ -28,9 +28,9 @@ import zipfile
 
 import pytest
 
-from yggdrasil.io.bytes_io import BytesIO
-from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.io.base import IO
+from yggdrasil.path.memory import Memory
+from yggdrasil.path.local_path import LocalPath
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ class TestPandasIntoMemory:
     def test_to_csv_round_trip_via_memory_holder(self, df_pandas) -> None:
         pd = pytest.importorskip("pandas")
         mem = Memory()
-        b = BytesIO(holder=mem, owns_holder=False, mode="wb+")
+        b = IO(holder=mem, owns_holder=False, mode="wb+")
         with b:
             df_pandas.to_csv(b, index=False)
         loaded = pd.read_csv(io.BytesIO(mem.read_bytes()))

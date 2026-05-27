@@ -4,7 +4,7 @@ DBFS is the legacy cluster-attached filesystem. Reads chunk via
 ``dbfs.read`` (1 MiB max per call, base64-encoded payload); writes
 stream via ``dbfs.open(write=True)`` which the SDK chunk-uploads
 under the hood. The new design folds those calls into the
-:class:`Holder` byte primitives so :class:`BytesIO` over a DBFS
+:class:`Holder` byte primitives so :class:`IO` over a DBFS
 path Just Works.
 """
 
@@ -15,9 +15,9 @@ import logging
 import time
 from typing import Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from ..path import DatabricksPath
 from .service import DBFSService
@@ -343,11 +343,16 @@ class DBFSPath(DatabricksPath):
                         offset += _DBFS_CHUNK
 
         self._call(_do_upload)
-        # The upload just established the object's full size; seed
-        # the cache so the next ``size`` / ``exists`` lookup is local
-        # and any concurrent reader on the singleton path sees the
-        # post-write metadata without a fresh ``dbfs.get_status``.
+        committed = None
         if size >= 0:
+            if hasattr(content, "read"):
+                try:
+                    content.seek(0)
+                    committed = content.read()
+                except Exception:
+                    pass
+            else:
+                committed = bytes(content)
             self._persist_stat_cache(
                 IOStats(
                     size=size,
@@ -359,6 +364,10 @@ class DBFSPath(DatabricksPath):
             logger.info("Uploaded DBFS file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded DBFS file %r (size=stream)", self)
+        if committed is not None:
+            self._cache_after_upload(committed, len(committed))
+        else:
+            self._buffered_size = None
         return size
 
     def _clear(self) -> None:

@@ -1,4 +1,4 @@
-"""Unit tests for :class:`~yggdrasil.data.enums.timezone.Timezone`.
+"""Unit tests for :class:`~yggdrasil.enums.timezone.Timezone`.
 
 Coverage
 ────────
@@ -26,7 +26,7 @@ import pyarrow as pa
 import polars as pl
 import pytest
 
-from yggdrasil.data.enums.timezone import Timezone
+from yggdrasil.enums.timezone import Timezone
 
 
 # ===========================================================================

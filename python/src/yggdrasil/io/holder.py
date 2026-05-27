@@ -63,13 +63,13 @@ from typing import (
 
 import pyarrow as pa
 
-from yggdrasil.data.enums import MediaType, MimeType
-from yggdrasil.data.enums.mode import Mode, ModeLike
+from yggdrasil.enums import MediaType, MimeType
+from yggdrasil.enums.mode import Mode, ModeLike
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
 from .io_stats import IOStats
-from .url import URL, URLBased
+from yggdrasil.url import URL, URLBased
 
 if TYPE_CHECKING:
     pass
@@ -224,7 +224,7 @@ def _resolve_subclass(
         # :class:`Path` itself isn't instantiable, so a missing scheme
         # falls back to LocalPath — that's the only path-shaped backend
         # that's always available.
-        from .path.local_path import LocalPath
+        from yggdrasil.path.local_path import LocalPath
 
         url_obj = URL.from_(path)
         scheme_from_path = url_obj.scheme
@@ -239,7 +239,7 @@ def _resolve_subclass(
         return type(data)
 
     # binary, str, pathlib.Path, None, bytes-like — all default to memory
-    from .memory import Memory
+    from yggdrasil.path.memory import Memory
 
     return Memory
 
@@ -323,7 +323,7 @@ def _resolve_format_target(
     return IO.class_for_media_type(mt, default=None)
 
 
-class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
+class IO(Tabular[O], BinaryIO, Generic[T, O]):
     """Position-addressable byte holder + seekable cursor + tabular handle.
 
     Three layered shapes share the class:
@@ -389,7 +389,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
     #: ``MimeTypes.CSV``, ``MimeTypes.FOLDER``, …) to claim that mime
     #: in :data:`_HOLDER_FORMAT_REGISTRY`. ``None`` (the abstract
     #: default) opts out of registration — :class:`Holder` itself and
-    #: intermediate abstracts (:class:`IO`, :class:`BytesIO`,
+    #: intermediate abstracts (:class:`IO`,
     #: :class:`Memory`, :class:`LocalPath`, :class:`Path`) leave it
     #: unset so they don't shadow the real format leaves. Mirrors
     #: :attr:`scheme`.
@@ -443,7 +443,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         # Cursor / wrapping. ``_parent`` is the underlying byte holder
         # this one delegates to (``LocalPath`` underneath a
         # :class:`ParquetFile` cursor, :class:`Memory` underneath a
-        # :class:`BytesIO`, …). ``None`` on top-level storage leaves
+        # :class:`IO`, …). ``None`` on top-level storage leaves
         # (:class:`Memory`, :class:`LocalPath`, :class:`VolumePath`, …)
         # that own their bytes directly. ``_owns_parent`` decides
         # whether closing this Holder also closes the parent —
@@ -756,7 +756,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
                 **kwargs,
             )
             # When target isn't a subclass of cls (sideways routes
-            # like ``BytesIO(path="x.parquet")`` → :class:`ParquetFile`,
+            # like ``IO(path="x.parquet")`` → :class:`ParquetFile`,
             # which inherits :class:`IO` directly), Python won't
             # auto-invoke ``__init__`` on the returned instance —
             # do it ourselves so the instance is fully set up.
@@ -791,7 +791,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         # Pre-stamp the cursor's parent / ownership before ``__init__``
         # so the parent-probe (``try: self._parent``) sees the bound
         # holder instead of clobbering it. When *cls* is a cursor-only
-        # leaf (e.g. :class:`BytesIO`, :class:`ParquetFile`) and the
+        # leaf (e.g. :class:`IO`, :class:`ParquetFile`) and the
         # caller handed us a ``data`` / ``path`` / ``binary`` / ``url``
         # seed without an explicit ``holder=``, auto-build a storage
         # parent via abstract ``IO(...)`` scheme dispatch so the cursor
@@ -804,7 +804,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             instance._owns_parent = bool(owns_holder)
         elif isinstance(data, IO):
             # Cursor-over-IO: borrow the parent's storage rather than
-            # reconstructing one. ``BytesIO(other_bytes_io)`` shares the
+            # reconstructing one. ``IO(other_io)`` shares the
             # same byte substrate; the new cursor owns nothing of its
             # own beyond the position. ``_resolve_subclass(data=IO)``
             # would return ``type(data)`` and route us back into this
@@ -1072,7 +1072,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
           bytes — ``IO.from_(b"x")`` → :class:`Memory`,
           ``IO.from_("file://...")`` → :class:`LocalPath`.
         - **Cursor / format-leaf subclasses** (``cls`` has no
-          ``scheme`` — :class:`BytesIO`, :class:`ParquetFile`,
+          ``scheme`` — :class:`IO`, :class:`ParquetFile`,
           :class:`CSVFile`, …). The result is an owning cursor over
           a fresh storage parent built from *obj*.
 
@@ -1117,7 +1117,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         if isinstance(obj, (bytes, bytearray, memoryview)):
             if is_storage:
                 return cls(binary=obj, url=url, **kwargs)
-            from .memory import Memory
+            from yggdrasil.path.memory import Memory
 
             return cls(
                 holder=Memory(binary=obj),
@@ -1136,7 +1136,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             # to :class:`MemoryStream`.
             local_path = _local_path_for_handle(obj)
             if local_path is not None:
-                from yggdrasil.io.path.local_path import LocalPath
+                from yggdrasil.path.local_path import LocalPath
 
                 if is_storage:
                     return (
@@ -1151,7 +1151,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
                     url=url,
                     **kwargs,
                 )
-            from yggdrasil.io.memory_stream import MemoryStream
+            from yggdrasil.path.memory_stream import MemoryStream
 
             if is_storage:
                 return (
@@ -1295,7 +1295,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
         The returned class is a :class:`Tabular` subclass — typically a
         :class:`Holder` byte-backed leaf, occasionally a non-Holder
-        leaf (:class:`FolderPath`, :class:`DeltaFolder`). Returns *default*
+        leaf (:class:`Folder`, :class:`DeltaFolder`). Returns *default*
         on miss when supplied; otherwise raises :class:`KeyError` with
         the list of registered names.
         """
@@ -1314,7 +1314,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
         # Miss may just mean the leaf package hasn't been imported
         # yet — force the side-effect bootstrap once and retry. This
-        # is what catches nested leaves (ZipFile / FolderPath / DeltaFolder)
+        # is what catches nested leaves (ZipFile / Folder / DeltaFolder)
         # for callers that never touched ``yggdrasil.io.nested``.
         if not _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
             _bootstrap_holder_format_registry()
@@ -1837,7 +1837,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             self._media_type = None
             return
         try:
-            from yggdrasil.data.enums.media_type import MediaType
+            from yggdrasil.enums.media_type import MediaType
 
             mt = MediaType.from_(value, default=None)
         except Exception:
@@ -1846,7 +1846,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
 
     # ------------------------------------------------------------------
     # Per-open lifecycle — Path overrides; Memory and other always-live
-    # holders inherit no-ops so :class:`BytesIO` can call them blind.
+    # holders inherit no-ops so :class:`IO` can call them blind.
     # ------------------------------------------------------------------
 
     def acquire(self) -> "IO":
@@ -2187,7 +2187,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         return False
 
     # ------------------------------------------------------------------
-    # Cursorless I/O — the canonical surface :class:`BytesIO` consumes
+    # Cursorless I/O — the canonical surface :class:`IO` consumes
     # ------------------------------------------------------------------
 
     def pread(self, n: int, pos: int, *, cursor: bool = False) -> bytes:
@@ -2701,9 +2701,8 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         if batch_size <= 0:
             raise ValueError("write_stream batch_size must be > 0")
         from yggdrasil.io.base import IO as _IO
-        from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
 
-        io_src = src if isinstance(src, _IO) else _YggBytesIO.from_(src)
+        io_src = src if isinstance(src, _IO) else IO.from_(src)
         n = self._write_stream(
             io_src,
             offset=offset,
@@ -2854,7 +2853,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         ``CopyObject`` when ``self`` and *src* share an
         underlying bucket).
         """
-        from yggdrasil.io.path.path import Path
+        from yggdrasil.path.path import Path
 
         if (
             offset == 0
@@ -2879,9 +2878,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
                 offset,
                 overwrite=overwrite,
             )
-        from yggdrasil.io.bytes_io import BytesIO as _YggBytesIO
-
-        with _YggBytesIO(holder=src, mode="rb") as io_src:
+        with IO(holder=src, mode="rb") as io_src:
             return self._write_stream(
                 io_src,
                 offset=offset,
@@ -2938,7 +2935,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         ``sendfile``, local→remote chunked stream) override
         :meth:`_transfer_to`, not this method.
         """
-        from yggdrasil.io.path.path import Path
+        from yggdrasil.path.path import Path
 
         source = IO.from_(src)
         target = _join_dir_hint(self, source)
@@ -2996,7 +2993,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         reads to EOF, ``size>=0`` caps the byte count, ``offset``
         is the starting offset. Returns the resolved target.
         """
-        from yggdrasil.io.path.path import Path
+        from yggdrasil.path.path import Path
 
         if to is None:
             to = _default_download_target(self.url.name)
@@ -3057,7 +3054,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
     # Hashing — full-payload digests over the durable bytes.
     # ------------------------------------------------------------------
     #
-    # Lives on the holder rather than only on :class:`BytesIO` because
+    # Lives on the holder rather than only on :class:`IO` because
     # callers that only have a holder shouldn't have to open a cursor
     # just to compute a digest — the holder owns the bytes.
 
@@ -3591,7 +3588,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
         :class:`Tabular` leaf and returns ``read_pylist()``.
         """
         import json as _json
-        from yggdrasil.data.enums.mime_type import MimeTypes
+        from yggdrasil.enums.mime_type import MimeTypes
 
         mt = (
             MediaType.from_(media_type, default=None)
@@ -3673,7 +3670,7 @@ class IO(Singleton, URLBased, Tabular[O], Disposable, BinaryIO, Generic[T, O]):
             if inner is not None:
                 codec_obj = inner
             else:
-                from yggdrasil.data.enums.codec import Codec
+                from yggdrasil.enums.codec import Codec
 
                 codec_obj = Codec.from_(codec, default=None)
         if codec_obj is None:
@@ -3720,7 +3717,7 @@ def _join_dir_hint(
     :meth:`IO._transfer_filename` so :class:`Memory` / nameless IOs
     fall back to ``"download"``.
     """
-    from yggdrasil.io.path.path import Path
+    from yggdrasil.path.path import Path
 
     if isinstance(dst, Path) and _looks_like_directory(dst.url):
         return dst / src._transfer_filename()
@@ -3735,7 +3732,7 @@ def _default_download_target(name: str) -> "IO":
     … before the suffix until a free slot is found. The directory
     is created on demand; the file itself is not.
     """
-    from yggdrasil.io.path.local_path import LocalPath
+    from yggdrasil.path.local_path import LocalPath
 
     downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(downloads_dir, exist_ok=True)

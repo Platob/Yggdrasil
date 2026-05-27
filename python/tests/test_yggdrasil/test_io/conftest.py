@@ -19,6 +19,6 @@ pytest.importorskip("yggdrasil")
 # before yggdrasil.io.fs has finished loading. Importing the heavy
 # leaves here once, in dependency order, breaks the cycle for every
 # downstream test module.
-from yggdrasil.io.bytes_io import BytesIO  # noqa: E402,F401
-from yggdrasil.io.path import Path, LocalPath  # noqa: E402,F401
+from yggdrasil.io.base import IO  # noqa: E402,F401
+from yggdrasil.path import Path, LocalPath  # noqa: E402,F401
 from yggdrasil.io.tabular import Tabular  # noqa: E402,F401

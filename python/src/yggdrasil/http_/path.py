@@ -22,11 +22,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator
 
-from yggdrasil.data.enums import Mode, Scheme
-from yggdrasil.io.bytes_io import BytesIO
+from yggdrasil.enums import Mode, Scheme
+from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.io.path import RemotePath
-from yggdrasil.io.url import URL
+from yggdrasil.path import RemotePath
+from yggdrasil.url import URL
 from yggdrasil.dataclasses import WaitingConfig
 
 if TYPE_CHECKING:
@@ -152,7 +152,7 @@ class HTTPPath(RemotePath):
     # Read / write — GET / PUT
     # ==================================================================
 
-    def _bread(self, n: int, pos: int, mode: Mode) -> BytesIO:
+    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
         del mode  # HTTP is read-only on this hook; mode is informational
         from .request import HTTPRequest
 
@@ -163,9 +163,9 @@ class HTTPPath(RemotePath):
 
         req = HTTPRequest.prepare("GET", self.url, headers=headers or None)
         resp = self.session.send(req)
-        return BytesIO(resp.content, copy=False, media_type=resp.media_type)
+        return IO(resp.content, copy=False, media_type=resp.media_type)
 
-    def _bwrite(self, data: BytesIO, pos: int, mode: Mode) -> int:
+    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
         del pos, mode  # HTTP PUT is whole-resource; positional writes
                        # would require multipart support the server may
                        # not advertise. Whole-resource semantics match
@@ -232,6 +232,6 @@ class HTTPPath(RemotePath):
 # the codebase where a single backend serves two scheme spellings, so
 # we slot the alias in directly rather than introducing a multi-scheme
 # registration mechanism nothing else needs.
-from yggdrasil.io.url import _URL_BASED_REGISTRY as _HTTP_SCHEMES
+from yggdrasil.url import _URL_BASED_REGISTRY as _HTTP_SCHEMES
 _HTTP_SCHEMES.setdefault(Scheme.HTTP, HTTPPath)
 del _HTTP_SCHEMES

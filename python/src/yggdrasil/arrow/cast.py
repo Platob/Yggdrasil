@@ -139,17 +139,11 @@ def _project(table: pa.Table, options: CastOptions) -> pa.Table:
 
 
 def _is_arrow_dataset(obj: Any) -> bool:
-    """Return ``True`` if *obj* is a :class:`pyarrow.dataset.Dataset`.
-
-    Lazy-imports ``pyarrow.dataset`` so the base install (pyarrow only)
-    isn't paying for the dataset submodule unless something actually
-    feeds a Dataset into the cast pipeline.
-    """
     try:
         ds = pyarrow_dataset_module()
+        return isinstance(obj, ds.Dataset)
     except Exception:
         return False
-    return isinstance(obj, ds.SparkDataset)
 
 
 def _is_yggdrasil_tabular(obj: Any) -> bool:

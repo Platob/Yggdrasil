@@ -22,6 +22,9 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import pytest
+
+pytest.importorskip("pyspark")
 from yggdrasil.io.tabular import SparkTabular
 
 

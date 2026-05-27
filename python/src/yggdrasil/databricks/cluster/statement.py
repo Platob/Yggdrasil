@@ -35,7 +35,7 @@ import pyarrow.dataset as pds
 
 from databricks.sdk.service.compute import CommandStatus, Language
 
-from yggdrasil.data.enums.state import State
+from yggdrasil.enums.state import State
 from yggdrasil.data.statement import (
     PreparedStatement,
     StatementBatch,
@@ -211,6 +211,22 @@ class ClusterStatementResult(StatementResult):
             except Exception:
                 LOGGER.debug("Status refresh swallowed for %r", cmd, exc_info=True)
         return self
+
+    def _start(self) -> None:
+        self.start()
+
+    def _poll(self) -> None:
+        self.refresh_status()
+
+    def _error_for_status(self) -> BaseException | None:
+        cmd = self.command
+        if cmd is None:
+            return None
+        try:
+            cmd.raise_for_status()
+        except BaseException as exc:
+            return exc
+        return None
 
     def _compute_state(self) -> State:
         cmd = self.command

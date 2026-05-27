@@ -8,8 +8,8 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.io.holder import Holder
-from yggdrasil.io.memory import Memory
-from yggdrasil.io.path.local_path import LocalPath
+from yggdrasil.path.memory import Memory
+from yggdrasil.path.local_path import LocalPath
 from yggdrasil.io.primitive.json_file import JSONFile
 
 
@@ -20,9 +20,9 @@ class TestRegistration:
         assert Holder.class_for_media_type("json") is JSONFile
 
     def test_path_dispatches(self, tmp_path) -> None:
-        from yggdrasil.io.bytes_io import BytesIO
+        from yggdrasil.io.base import IO
 
-        b = BytesIO(path=str(tmp_path / "x.json"))
+        b = IO(path=str(tmp_path / "x.json"))
         assert isinstance(b, JSONFile)
 
 

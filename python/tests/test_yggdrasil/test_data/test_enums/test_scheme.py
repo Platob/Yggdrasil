@@ -1,4 +1,4 @@
-"""Behaviors of :class:`yggdrasil.data.enums.scheme.Scheme`.
+"""Behaviors of :class:`yggdrasil.enums.scheme.Scheme`.
 
 The enum centralizes the URL-scheme tokens every Yggdrasil
 :class:`URLBased` backend uses. Contract:
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.scheme import Scheme
+from yggdrasil.enums.scheme import Scheme
 
 
 class TestCanonicalMembers:
@@ -106,15 +106,15 @@ class TestFrom:
 class TestPathClass:
 
     def test_resolves_local_path(self) -> None:
-        from yggdrasil.io.path.local_path import LocalPath
+        from yggdrasil.path.local_path import LocalPath
         assert Scheme.FILE.path_class() is LocalPath
 
     def test_resolves_memory(self) -> None:
-        from yggdrasil.io.memory import Memory
+        from yggdrasil.path.memory import Memory
         assert Scheme.MEMORY.path_class() is Memory
 
     def test_resolve_shortcut_routes_through_from(self) -> None:
-        from yggdrasil.io.path.local_path import LocalPath
+        from yggdrasil.path.local_path import LocalPath
         # Alias goes through :meth:`from_` and out :meth:`path_class`.
         assert Scheme.resolve("local") is LocalPath
         assert Scheme.resolve("file://") is LocalPath

@@ -1,4 +1,4 @@
-"""Behaviors of :class:`yggdrasil.data.enums.timeunit.TimeUnit`.
+"""Behaviors of :class:`yggdrasil.enums.timeunit.TimeUnit`.
 
 The enum is the canonical token table for every temporal ``DataType``
 in the codebase (``DateType`` / ``TimeType`` / ``TimestampType`` /
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.data.enums.timeunit import TimeUnit
+from yggdrasil.enums.timeunit import TimeUnit
 
 
 class TestCanonicalMembers:

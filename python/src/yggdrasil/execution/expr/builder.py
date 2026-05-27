@@ -25,7 +25,7 @@ Projections (rename + cast-on-select) live on
 :class:`yggdrasil.data.data_field.Field` directly — there's no
 separate selector node. Build a Field with the desired output
 :attr:`name`, optional :attr:`alias` for the source-side label,
-and target :attr:`dtype`, then pass it to ``LazyTabular.select``
+and target :attr:`dtype`, then pass it to ``Tabular.select``
 or the SQL executor's ``statement.select`` list.
 """
 

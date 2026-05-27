@@ -1,30 +1,4 @@
-"""
-Databricks SQL engine utilities.
-
-A thin execution and table-management layer over two inner
-:class:`StatementExecutor` instances, composed via *has-a*:
-
-- :class:`SparkStatementExecutor` (held on ``spark``) — used when a
-  :class:`pyspark.sql.SparkSession` is reachable. Defaults to a
-  :class:`DatabricksSparkStatementExecutor` so a missing session is
-  built via :meth:`DatabricksClient.spark` (Databricks Connect).
-- :class:`SQLWarehouse` (resolved via :meth:`warehouse`) — the Databricks
-  SQL warehouse API path.
-
-The engine itself owns no statement logic.  It picks which inner executor
-handles a given call and delegates statement preparation to
-:meth:`WarehousePreparedStatement.prepare` /
-:meth:`SparkPreparedStatement.from_`.
-
-Insert paths
-------------
-The DML write logic (arrow / spark / sql) lives on :class:`Table`
-(see :mod:`yggdrasil.databricks.table.table`).  The engine's
-:meth:`insert_into` / :meth:`arrow_insert_into` /
-:meth:`spark_insert_into` / :meth:`sql_insert_into` resolve a target
-:class:`Table` from the caller's parameters and forward to the matching
-``Table`` method.
-"""
+"""Databricks SQL engine — Spark + warehouse dual-path execution."""
 
 from __future__ import annotations
 
@@ -62,8 +36,7 @@ from yggdrasil.databricks.warehouse import (
 )
 from yggdrasil.databricks.warehouse.wh_utils import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
-from yggdrasil.data.enums import Mode
-from yggdrasil.spark.executor import SparkStatementExecutor
+from yggdrasil.enums import Mode
 from yggdrasil.spark.statement import SparkPreparedStatement, SparkStatementResult
 from .spark_executor import DatabricksSparkStatementExecutor
 from yggdrasil.databricks.catalog.catalogs import Catalogs
@@ -229,7 +202,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         default_warehouse: Optional[SQLWarehouse] = None,
-        spark: Optional[SparkStatementExecutor] = None,
+        spark: Optional[DatabricksSparkStatementExecutor] = None,
         **kwargs: Any,
     ) -> Any:
         # ``spark`` is rebindable; the warehouse is identity-bearing
@@ -243,7 +216,7 @@ class SQLEngine(DatabricksService, StatementExecutor):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         default_warehouse: Optional[SQLWarehouse] = None,
-        spark: Optional[SparkStatementExecutor] = None,
+        spark: Optional[DatabricksSparkStatementExecutor] = None,
     ):
         if getattr(self, "_initialized", False):
             return
@@ -382,12 +355,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         statement: WarehousePreparedStatement | SparkPreparedStatement,
         start: bool = True,
     ) -> WarehouseStatementResult | SparkStatementResult:
-        """Dispatch by concrete statement type to the matching inner executor.
-
-        Spark statements go to :attr:`spark`; warehouse statements get
-        routed to whichever warehouse their ``warehouse_id`` /
-        ``warehouse_name`` resolves to.
-        """
         if isinstance(statement, SparkPreparedStatement):
             return self.spark.send(statement, start=start)
 
@@ -446,34 +413,16 @@ class SQLEngine(DatabricksService, StatementExecutor):
         if engine_choice == "spark":
             session = spark_session or self.spark.resolve_session(create=True)
 
-            # Carry forward any ``external_data`` already on the input
-            # statement so a caller-prepared SparkPreparedStatement keeps
-            # its bindings; ``external_data`` from this call layers on
-            # top (last write wins on alias collisions).
             if isinstance(statement, PreparedStatement):
                 text = statement.text
-                merged: dict[str, ExternalStatementData] = (
-                    dict(statement.external_data) if statement.external_data else {}
-                )
             else:
                 text = str(statement).strip()
-                merged = {}
-
-            new_external = _coerce_external_data_for_spark(external_data)
-            if new_external:
-                merged.update(new_external)
 
             prepared = SparkPreparedStatement(
                 text=text,
                 spark_session=session,
                 row_limit=row_limit,
-                external_data=merged or None,
             )
-            if retry is not None:
-                logger.debug(
-                    "Ignoring retry config for Spark statement — "
-                    "driver-side retry applies"
-                )
         else:
             prepared = WarehousePreparedStatement.prepare(
                 statement,
@@ -521,11 +470,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         engine_choice = self._pick_engine(engine, spark_session)
 
         if engine_choice == "spark":
-            if retry is not None:
-                logger.debug(
-                    "Ignoring retry config for Spark statement — "
-                    "driver-side retry applies"
-                )
             return self.spark.execute_many(
                 statements,
                 wait=wait,
@@ -666,8 +610,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         spark_options: Optional[Dict[str, Any]] = None,
         table: Optional[Table] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Resolve the target :class:`Table` and call :meth:`Table.insert_into`."""
@@ -694,8 +636,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             spark_session=spark_session,
             spark_options=spark_options,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             retry=retry,
         )
 
@@ -719,8 +659,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         vacuum_hours: int | None = None,
         table: Optional[Table] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.arrow_insert`."""
@@ -745,8 +683,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             retry=retry,
         )
 
@@ -772,8 +708,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         spark_options: Optional[Dict[str, Any]] = None,
         table: Optional[Table] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
@@ -800,8 +734,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             vacuum_hours=vacuum_hours,
             spark_options=spark_options,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             spark_session=spark_session,
             retry=retry,
         )
@@ -825,8 +757,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         table: Optional[Table] = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.sql_insert`."""
@@ -849,8 +779,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             vacuum_hours=vacuum_hours,
             spark_session=spark_session,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             retry=retry,
         )
 

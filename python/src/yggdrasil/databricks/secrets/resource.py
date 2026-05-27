@@ -12,7 +12,7 @@ from databricks.sdk.service.workspace import AclItem, AclPermission, GetSecretRe
 from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.dataclasses.singleton import Singleton
 
-from yggdrasil.io.url import URL
+from yggdrasil.url import URL
 
 from .service import Secrets
 from ..client import DatabricksResource
