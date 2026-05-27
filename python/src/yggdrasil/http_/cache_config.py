@@ -503,10 +503,23 @@ class CacheConfig:
         if holder is None:
             return
 
+        from yggdrasil.execution.expr import col as _col
+        partition_keys = None
+        try:
+            if isinstance(data, (pa.RecordBatch, pa.Table)):
+                partition_keys = data.column("partition_key").unique().to_pylist()
+            elif hasattr(data, "select"):
+                partition_keys = [
+                    r["partition_key"]
+                    for r in data.select("partition_key").distinct().collect()
+                ]
+        except Exception:
+            pass
+        predicate = _col("partition_key").is_in(partition_keys) if partition_keys else None
         opts = CastOptions(
             mode=mode if mode is not None else self.mode,
             match_by=[MATCH_COLUMN],
-            prune_by=["partition_key"],
+            predicate=predicate,
             spark_session=spark_session,
         )
         try:

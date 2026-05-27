@@ -331,7 +331,7 @@ class DeltaFolder(Folder):
         sidecar_cache: dict[str, bytes] = {}
 
         prune = _merge_prune_with_predicate(
-            options.prune_values, options.predicate, partition_columns,
+            None, options.predicate, partition_columns,
         )
         for add in snap.prune_files(prune_values=prune):
             try:

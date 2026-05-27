@@ -1433,13 +1433,7 @@ class Table(DatabricksPath):
             zorder_by=options.zorder_by,
             optimize_after_merge=options.optimize_after_merge,
             vacuum_hours=options.vacuum_hours,
-            # Write-side filter — the unified ``predicate`` survives
-            # the MERGE / UPDATE planning so callers can scope the
-            # destination rewrite. The same predicate is consulted by
-            # the read path; backends decide which scope applies.
             where=options.predicate,
-            prune_by=options.prune_by,
-            prune_values=options.prune_values,
             retry=options.retry,
             return_data=options.return_data,
             safe_merge=options.safe_merge,

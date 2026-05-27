@@ -976,11 +976,6 @@ class Folder(Path):
         """
         if options is None:
             return None
-        prune_values = options.prune_values
-        if prune_values:
-            forced = prune_values.get(column)
-            if forced is not None:
-                return frozenset(forced)
         predicate = options.predicate
         if predicate is None:
             return None
@@ -1403,14 +1398,11 @@ class Folder(Path):
         opts_cls = child.options_class()
         kwargs: "dict[str, Any]" = {
             "predicate": options.predicate,
-            "prune_values": options.prune_values,
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
             return opts_cls(**kwargs)
         except TypeError:
-            # The leaf options class doesn't know about one of our
-            # kwargs (e.g. an older subclass without ``prune_values``).
             # Drop the unknown bits and retry; the per-child predicate
             # still wins via row-level filtering after read.
             safe = {

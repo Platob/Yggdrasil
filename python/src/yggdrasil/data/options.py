@@ -330,8 +330,6 @@ class CastOptions:
 
     # --- Upsert / merge shape -------------------------------------------
     update_column_names: list[str] | None = None
-    prune_by: "list[str] | str | None" = None
-    prune_values: Mapping[str, tuple[Any, ...]] | None = None
 
     # --- Trailing maintenance -------------------------------------------
     zorder_by: list[str] | None = None
