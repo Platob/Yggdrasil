@@ -287,3 +287,36 @@ class TestProxySessionProperties:
             session = HTTPSession()
             assert session.proxy is None
             assert session.no_proxy is None
+
+
+# ---------------------------------------------------------------------------
+# Dead proxy fallback
+# ---------------------------------------------------------------------------
+
+
+class TestDeadProxyFallback:
+
+    def test_unreachable_proxy_marked_dead(self, origin_server):
+        session = HTTPSession(proxy="http://127.0.0.1:19999")
+        assert len(session._dead_proxies) == 0
+        resp = session.get(f"{origin_server}/direct")
+        data = resp.json()
+        assert data.get("origin") is True
+        assert len(session._dead_proxies) == 1
+
+    def test_second_request_skips_dead_proxy(self, origin_server):
+        session = HTTPSession(proxy="http://127.0.0.1:19998")
+        session.get(f"{origin_server}/first")
+        assert len(session._dead_proxies) == 1
+        resp = session.get(f"{origin_server}/second")
+        assert resp.json().get("origin") is True
+
+    def test_dead_proxy_not_pickled(self, origin_server):
+        import pickle
+        session = HTTPSession(proxy="http://127.0.0.1:19997")
+        session.get(f"{origin_server}/trigger-dead")
+        assert len(session._dead_proxies) >= 1
+        data = pickle.dumps(session)
+        HTTPSession._INSTANCES.clear()
+        restored = pickle.loads(data)
+        assert len(restored._dead_proxies) == 0

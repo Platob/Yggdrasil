@@ -773,6 +773,9 @@ class HTTPSession(Session):
         # existing TCP / TLS handshake instead of paying for a new one;
         # capped at ``pool_maxsize`` entries per host.
         self._connections: dict[tuple[str, str, int], "collections.deque[http.client.HTTPConnection]"] = {}
+        # Proxy hosts that failed to connect — remembered so subsequent
+        # requests fall back to direct without retrying a dead proxy.
+        self._dead_proxies: set[str] = set()
         # Retry policy is built once at init — same policy applies to
         # every wire send and the singleton key already pins
         # ``pool_maxsize`` / ``waiting`` / ``verify`` so two sessions
@@ -803,6 +806,7 @@ class HTTPSession(Session):
             return
         super().__setstate__(state)
         self._connections = {}
+        self._dead_proxies = set()
         self._retry = self._build_retry()
 
     # ------------------------------------------------------------------
@@ -838,7 +842,20 @@ class HTTPSession(Session):
         """Return the proxy URL for this request, or ``None`` to go direct."""
         if _should_bypass_proxy(host, self.no_proxy):
             return None
-        return _resolve_proxy_url(self.proxy, target_scheme=scheme)
+        proxy = _resolve_proxy_url(self.proxy, target_scheme=scheme)
+        if proxy is not None:
+            proxy_key = f"{proxy.host}:{proxy.port or 8080}"
+            if proxy_key in self._dead_proxies:
+                return None
+        return proxy
+
+    def _mark_proxy_dead(self, proxy: URL) -> None:
+        proxy_key = f"{proxy.host}:{proxy.port or 8080}"
+        self._dead_proxies.add(proxy_key)
+        LOGGER.warning(
+            "Proxy %s marked dead — falling back to direct connections",
+            proxy_key,
+        )
 
     def _build_connection(
         self,
@@ -872,45 +889,16 @@ class HTTPSession(Session):
             ssl_ctx: ssl.SSLContext = _make_ssl_context(self.verify)
 
             if proxy is not None:
-                proxy_host = proxy.host
-                proxy_port = proxy.port or (443 if proxy.scheme == "https" else 8080)
-                conn = http.client.HTTPSConnection(
-                    host, port=port, timeout=connect_timeout, context=ssl_ctx,
-                )
-                conn.set_tunnel(host, port, headers=self._proxy_auth_headers(proxy))
-                conn._real_host = proxy_host  # type: ignore[attr-defined]
-                conn._real_port = proxy_port  # type: ignore[attr-defined]
                 try:
-                    tunnel_conn = http.client.HTTPConnection(
-                        proxy_host, port=proxy_port, timeout=connect_timeout,
+                    return self._build_connect_tunnel(
+                        proxy, host, port, connect_timeout, ssl_ctx,
                     )
-                    tunnel_conn.connect()
-                    tunnel_headers = {"Host": f"{host}:{port}"}
-                    tunnel_headers.update(self._proxy_auth_headers(proxy))
-                    tunnel_conn.request("CONNECT", f"{host}:{port}", headers=tunnel_headers)
-                    tunnel_resp = tunnel_conn.getresponse()
-                    if tunnel_resp.status != 200:
-                        tunnel_conn.close()
-                        raise ProxyError(
-                            f"CONNECT tunnel to {host}:{port} via "
-                            f"{proxy_host}:{proxy_port} failed: "
-                            f"{tunnel_resp.status} {tunnel_resp.reason}"
-                        )
-                    # Upgrade the raw socket to TLS for the target host.
-                    raw_sock = tunnel_conn.sock
-                    conn = http.client.HTTPSConnection(
-                        host, port=port, timeout=connect_timeout, context=ssl_ctx,
+                except (ProxyError, OSError) as exc:
+                    LOGGER.warning(
+                        "Proxy %s:%s failed for %s:%s (%s) — falling back to direct",
+                        proxy.host, proxy.port, host, port, exc,
                     )
-                    conn.sock = ssl_ctx.wrap_socket(raw_sock, server_hostname=host)
-                    return conn
-                except ProxyError:
-                    raise
-                except Exception as exc:
-                    raise ProxyError(
-                        f"Failed to establish CONNECT tunnel to {host}:{port} "
-                        f"via {proxy_host}:{proxy_port}: {exc}",
-                        error=exc,
-                    ) from exc
+                    self._mark_proxy_dead(proxy)
 
             return http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
@@ -920,13 +908,65 @@ class HTTPSession(Session):
         if proxy is not None:
             proxy_host = proxy.host
             proxy_port = proxy.port or (443 if proxy.scheme == "https" else 8080)
-            conn = http.client.HTTPConnection(
-                proxy_host, port=proxy_port, timeout=connect_timeout,
-            )
-            conn._ygg_proxy = True  # type: ignore[attr-defined]
-            return conn
+            try:
+                conn = http.client.HTTPConnection(
+                    proxy_host, port=proxy_port, timeout=connect_timeout,
+                )
+                conn.connect()
+                conn._ygg_proxy = True  # type: ignore[attr-defined]
+                return conn
+            except OSError as exc:
+                LOGGER.warning(
+                    "Proxy %s:%s unreachable (%s) — falling back to direct",
+                    proxy_host, proxy_port, exc,
+                )
+                self._mark_proxy_dead(proxy)
 
         return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
+
+    def _build_connect_tunnel(
+        self,
+        proxy: URL,
+        host: str,
+        port: int,
+        connect_timeout: float,
+        ssl_ctx: ssl.SSLContext,
+    ) -> http.client.HTTPSConnection:
+        """Establish an HTTPS connection through an HTTP CONNECT tunnel."""
+        proxy_host = proxy.host
+        proxy_port = proxy.port or (443 if proxy.scheme == "https" else 8080)
+        tunnel_conn = http.client.HTTPConnection(
+            proxy_host, port=proxy_port, timeout=connect_timeout,
+        )
+        try:
+            tunnel_conn.connect()
+            if tunnel_conn.sock is None:
+                raise ProxyError(
+                    f"Connection to proxy {proxy_host}:{proxy_port} "
+                    f"succeeded but socket is None"
+                )
+            tunnel_headers = {"Host": f"{host}:{port}"}
+            tunnel_headers.update(self._proxy_auth_headers(proxy))
+            tunnel_conn.request("CONNECT", f"{host}:{port}", headers=tunnel_headers)
+            tunnel_resp = tunnel_conn.getresponse()
+            if tunnel_resp.status != 200:
+                raise ProxyError(
+                    f"CONNECT tunnel to {host}:{port} via "
+                    f"{proxy_host}:{proxy_port} failed: "
+                    f"{tunnel_resp.status} {tunnel_resp.reason}"
+                )
+            raw_sock = tunnel_conn.sock
+            conn = http.client.HTTPSConnection(
+                host, port=port, timeout=connect_timeout, context=ssl_ctx,
+            )
+            conn.sock = ssl_ctx.wrap_socket(raw_sock, server_hostname=host)
+            return conn
+        except Exception:
+            try:
+                tunnel_conn.close()
+            except Exception:
+                pass
+            raise
 
     @staticmethod
     def _proxy_auth_headers(proxy: URL) -> dict[str, str]:
