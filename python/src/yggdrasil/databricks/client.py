@@ -33,6 +33,7 @@ from yggdrasil.version import __version__ as ygg_version
 
 if TYPE_CHECKING:
     from .iam import IAM
+    from .job.service import Jobs, JobRuns
     from .sql.engine import SQLEngine
     from .table.tables import Tables
     from .column.columns import Columns
@@ -1568,6 +1569,28 @@ class DatabricksClient(Singleton, URLBased):
     @property
     def clusters(self):
         return self.compute.clusters
+
+    @property
+    def jobs(self) -> "Jobs":
+        cached = self.__dict__.get("_jobs")
+        if cached is not None:
+            return cached
+        from .job.service import Jobs
+
+        cached = Jobs(client=self)
+        self.__dict__["_jobs"] = cached
+        return cached
+
+    @property
+    def job_runs(self) -> "JobRuns":
+        cached = self.__dict__.get("_job_runs")
+        if cached is not None:
+            return cached
+        from .job.service import JobRuns
+
+        cached = JobRuns(client=self)
+        self.__dict__["_job_runs"] = cached
+        return cached
 
     @property
     def secrets(self) -> "Secrets":

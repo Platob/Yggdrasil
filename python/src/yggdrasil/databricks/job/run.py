@@ -1,0 +1,390 @@
+"""Databricks JobRun resource — individual run lifecycle.
+
+:class:`JobRun` implements :class:`~yggdrasil.dataclasses.awaitable.Awaitable`
+so callers can ``run.wait()`` / ``run.cancel()`` with the same backoff and
+timeout contract used by every other async surface in yggdrasil.
+
+:class:`JobTask` is a thin read-only wrapper around
+:class:`~databricks.sdk.service.jobs.RunTask` for inspecting per-task
+state within a run.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, ClassVar, Optional
+
+from databricks.sdk.service.jobs import (
+    Run as SDKRun,
+    RunLifeCycleState,
+    RunResultState,
+    RunState,
+    RunTask as SDKRunTask,
+    RepairRunResponse,
+)
+
+from yggdrasil.dataclasses.awaitable import Awaitable
+from yggdrasil.dataclasses.singleton import Singleton
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.enums.state import State
+from yggdrasil.url import URL
+
+from ..resource import DatabricksResource
+from .service import JobRuns
+
+__all__ = ["JobRun", "JobTask"]
+
+LOGGER = logging.getLogger(__name__)
+
+_LIFECYCLE_TO_STATE: dict[RunLifeCycleState, State] = {
+    RunLifeCycleState.PENDING: State.PENDING,
+    RunLifeCycleState.QUEUED: State.QUEUED,
+    RunLifeCycleState.RUNNING: State.RUNNING,
+    RunLifeCycleState.TERMINATING: State.RUNNING,
+    RunLifeCycleState.TERMINATED: State.SUCCEEDED,
+    RunLifeCycleState.SKIPPED: State.CANCELED,
+    RunLifeCycleState.INTERNAL_ERROR: State.FAILED,
+    RunLifeCycleState.BLOCKED: State.PENDING,
+    RunLifeCycleState.WAITING_FOR_RETRY: State.PENDING,
+}
+
+_RESULT_TO_STATE: dict[RunResultState, State] = {
+    RunResultState.SUCCESS: State.SUCCEEDED,
+    RunResultState.FAILED: State.FAILED,
+    RunResultState.CANCELED: State.CANCELED,
+    RunResultState.TIMEDOUT: State.EXPIRED,
+    RunResultState.SUCCESS_WITH_FAILURES: State.SUCCEEDED,
+    RunResultState.EXCLUDED: State.CANCELED,
+    RunResultState.DISABLED: State.CANCELED,
+    RunResultState.UPSTREAM_CANCELED: State.CANCELED,
+    RunResultState.UPSTREAM_FAILED: State.FAILED,
+    RunResultState.MAXIMUM_CONCURRENT_RUNS_REACHED: State.REJECTED,
+}
+
+_TERMINAL_LIFECYCLE: frozenset[RunLifeCycleState] = frozenset({
+    RunLifeCycleState.TERMINATED,
+    RunLifeCycleState.SKIPPED,
+    RunLifeCycleState.INTERNAL_ERROR,
+})
+
+
+def _resolve_state(run_state: RunState | None) -> State:
+    if run_state is None:
+        return State.IDLE
+
+    lcs = run_state.life_cycle_state
+    rs = run_state.result_state
+
+    if lcs in _TERMINAL_LIFECYCLE and rs is not None:
+        return _RESULT_TO_STATE.get(rs, State.FAILED)
+
+    if lcs is not None:
+        return _LIFECYCLE_TO_STATE.get(lcs, State.RUNNING)
+
+    return State.IDLE
+
+
+# ---------------------------------------------------------------------------
+# JobRun
+# ---------------------------------------------------------------------------
+
+
+class JobRun(Singleton, DatabricksResource, Awaitable):
+    """Individual Databricks job run — awaitable lifecycle handle.
+
+    Parameters
+    ----------
+    service:
+        Parent :class:`JobRuns` service.
+    run_id:
+        Databricks run id.
+    job_id:
+        Owning job id.
+    details:
+        Pre-fetched SDK :class:`~databricks.sdk.service.jobs.Run`.
+    """
+
+    _SINGLETON_TTL: ClassVar[Any] = None
+
+    @classmethod
+    def _singleton_key(
+        cls,
+        service: JobRuns | None = None,
+        run_id: int | None = None,
+        job_id: int | None = None,
+        **_kwargs: Any,
+    ) -> Any:
+        return (cls, service, run_id)
+
+    def __init__(
+        self,
+        service: JobRuns | None = None,
+        run_id: int | None = None,
+        job_id: int | None = None,
+        *,
+        details: SDKRun | None = None,
+        singleton_ttl: Any = ...,
+    ):
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+
+        if service is None:
+            service = JobRuns.current()
+
+        super().__init__(service=service)
+        self.service: JobRuns = service
+        self.run_id: int | None = run_id
+        self.job_id: int | None = job_id
+        self._details: SDKRun | None = details
+
+        if self._details is not None:
+            self.run_id = self._details.run_id
+            self.job_id = self._details.job_id
+            self._state = _resolve_state(self._details.state)
+
+        self._initialized = True
+
+    def __str__(self) -> str:
+        return f"JobRun({self.run_id}, state={self._state})"
+
+    def __hash__(self):
+        return hash((type(self), self.run_id))
+
+    def __eq__(self, other):
+        return isinstance(other, JobRun) and self.run_id == other.run_id
+
+    @property
+    def explore_url(self) -> URL:
+        if self.job_id and self.run_id:
+            return self.client.base_url.with_path(f"/jobs/{self.job_id}/runs/{self.run_id}")
+        return self.client.base_url.with_path(f"/jobs")
+
+    # ------------------------------------------------------------------ #
+    # Details
+    # ------------------------------------------------------------------ #
+
+    @property
+    def details(self) -> SDKRun | None:
+        if self._details is None and self.run_id is not None:
+            self.refresh()
+        return self._details
+
+    def refresh(self) -> "JobRun":
+        sdk = self.client.workspace_client().jobs
+        raw = sdk.get_run(run_id=self.run_id)
+        self._details = raw
+        self.job_id = raw.job_id
+        self._state = _resolve_state(raw.state)
+        return self
+
+    @property
+    def run_state(self) -> RunState | None:
+        d = self.details
+        return d.state if d else None
+
+    @property
+    def state_message(self) -> str | None:
+        rs = self.run_state
+        return rs.state_message if rs else None
+
+    @property
+    def result_state(self) -> RunResultState | None:
+        rs = self.run_state
+        return rs.result_state if rs else None
+
+    @property
+    def life_cycle_state(self) -> RunLifeCycleState | None:
+        rs = self.run_state
+        return rs.life_cycle_state if rs else None
+
+    # ------------------------------------------------------------------ #
+    # Duration / timing
+    # ------------------------------------------------------------------ #
+
+    @property
+    def start_time_ms(self) -> int | None:
+        d = self.details
+        return d.start_time if d else None
+
+    @property
+    def end_time_ms(self) -> int | None:
+        d = self.details
+        return d.end_time if d else None
+
+    @property
+    def duration_ms(self) -> int | None:
+        d = self.details
+        return d.execution_duration if d else None
+
+    @property
+    def duration_seconds(self) -> float | None:
+        ms = self.duration_ms
+        return ms / 1000.0 if ms is not None else None
+
+    # ------------------------------------------------------------------ #
+    # Tasks
+    # ------------------------------------------------------------------ #
+
+    @property
+    def tasks(self) -> list["JobTask"]:
+        d = self.details
+        raw_tasks = d.tasks if d else None
+        if not raw_tasks:
+            return []
+        return [JobTask(t) for t in raw_tasks]
+
+    # ------------------------------------------------------------------ #
+    # Output
+    # ------------------------------------------------------------------ #
+
+    def output(self) -> Any:
+        sdk = self.client.workspace_client().jobs
+        return sdk.get_run_output(run_id=self.run_id)
+
+    # ------------------------------------------------------------------ #
+    # Awaitable contract
+    # ------------------------------------------------------------------ #
+
+    def _poll(self) -> None:
+        self.refresh()
+
+    def _start(self) -> None:
+        pass
+
+    def _error_for_status(self) -> BaseException | None:
+        msg = self.state_message or f"Run {self.run_id} failed"
+        rs = self.result_state
+        if rs == RunResultState.CANCELED:
+            return RuntimeError(f"Run {self.run_id} was cancelled: {msg}")
+        if rs == RunResultState.TIMEDOUT:
+            return TimeoutError(f"Run {self.run_id} timed out: {msg}")
+        return RuntimeError(f"Run {self.run_id} failed ({rs}): {msg}")
+
+    def _cancel(self) -> None:
+        sdk = self.client.workspace_client().jobs
+        LOGGER.debug("Cancelling run %s", self.run_id)
+        sdk.cancel_run(run_id=self.run_id)
+        self._state = State.CANCELED
+
+    # ------------------------------------------------------------------ #
+    # Repair
+    # ------------------------------------------------------------------ #
+
+    def repair(
+        self,
+        *,
+        rerun_tasks: list[str] | None = None,
+        wait: WaitingConfigArg = False,
+        raise_error: bool = True,
+    ) -> "JobRun":
+        """Repair (rerun) failed tasks in this run.
+
+        Parameters
+        ----------
+        rerun_tasks:
+            Task keys to rerun.  ``None`` reruns all failed tasks.
+        wait:
+            Block until the repair finishes.
+        raise_error:
+            Raise on failure when waiting.
+        """
+        sdk = self.client.workspace_client().jobs
+
+        LOGGER.debug("Repairing run %s (tasks=%s)", self.run_id, rerun_tasks)
+        sdk.repair_run(
+            run_id=self.run_id,
+            rerun_tasks=rerun_tasks,
+        )
+        self._state = State.PENDING
+        self._details = None
+
+        LOGGER.info("Repair triggered for run %s", self.run_id)
+
+        if wait is not False:
+            self.wait(wait=wait, raise_error=raise_error)
+
+        return self
+
+
+# ---------------------------------------------------------------------------
+# JobTask
+# ---------------------------------------------------------------------------
+
+
+class JobTask:
+    """Read-only wrapper around a single task within a job run."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: SDKRunTask):
+        self._raw = raw
+
+    def __repr__(self) -> str:
+        return f"JobTask({self.task_key!r}, state={self.state})"
+
+    @property
+    def raw(self) -> SDKRunTask:
+        return self._raw
+
+    @property
+    def task_key(self) -> str:
+        return self._raw.task_key
+
+    @property
+    def run_id(self) -> int | None:
+        return self._raw.run_id
+
+    @property
+    def attempt_number(self) -> int | None:
+        return self._raw.attempt_number
+
+    @property
+    def run_state(self) -> RunState | None:
+        return self._raw.state
+
+    @property
+    def state(self) -> State:
+        return _resolve_state(self._raw.state)
+
+    @property
+    def state_message(self) -> str | None:
+        rs = self._raw.state
+        return rs.state_message if rs else None
+
+    @property
+    def start_time_ms(self) -> int | None:
+        return self._raw.start_time
+
+    @property
+    def end_time_ms(self) -> int | None:
+        return self._raw.end_time
+
+    @property
+    def duration_ms(self) -> int | None:
+        return self._raw.execution_duration
+
+    @property
+    def duration_seconds(self) -> float | None:
+        ms = self.duration_ms
+        return ms / 1000.0 if ms is not None else None
+
+    @property
+    def is_done(self) -> bool:
+        return self.state.is_done
+
+    @property
+    def is_succeeded(self) -> bool:
+        return self.state.is_succeeded
+
+    @property
+    def is_failed(self) -> bool:
+        return self.state.is_failed
+
+    @property
+    def description(self) -> str | None:
+        return self._raw.description
+
+    @property
+    def cluster_instance(self):
+        return self._raw.cluster_instance
