@@ -2012,7 +2012,7 @@ class Table(DatabricksPath):
         comment: str | None = None,
         properties: Optional[dict[str, str]] = None,
         table_type: TableType | None = None,
-        data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
+        data_source_format: DataSourceFormat | None = None,
         missing_ok: bool = True,
         wait: WaitingConfigArg = True,
         or_replace: bool = False,
@@ -2020,25 +2020,27 @@ class Table(DatabricksPath):
     ) -> "Table":
         mode = Mode.from_(mode, default=Mode.AUTO)
 
-        if mode == Mode.OVERWRITE:
-            or_replace = True
-
-        if or_replace:
-            if table_type != TableType.MANAGED:
-                or_replace = False
-                self.delete(wait=True, missing_ok=True, delete_staging=False)
-
-        if self.exists:
-            if mode == Mode.ERROR_IF_EXISTS:
-                raise ValueError(f"Table {self!r} already exists")
-            elif mode in (Mode.IGNORE, Mode.AUTO):
-                return self
-
-            schema = DataSchema.from_(definition)
-            return self.with_columns(schema.fields, mode=mode)
-
         if table_type is None:
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
+
+        if data_source_format is None:
+            data_source_format = DataSourceFormat.DELTA if table_type == TableType.MANAGED else DataSourceFormat.PARQUET
+
+        if self.exists:
+            data_source_format = self.infos.data_source_format
+
+            if mode == Mode.OVERWRITE and data_source_format == DataSourceFormat.DELTA:
+                pass
+            elif mode == Mode.OVERWRITE:
+                self.delete(wait=True, missing_ok=True)
+            else:
+                if mode == Mode.ERROR_IF_EXISTS:
+                    raise ValueError(f"Table {self!r} already exists")
+                elif mode in (Mode.IGNORE, Mode.AUTO):
+                    return self
+
+                schema = DataSchema.from_(definition)
+                return self.with_columns(schema.fields, mode=mode)
 
         if table_type == TableType.MANAGED:
             result = self.sql_create(
@@ -2046,7 +2048,7 @@ class Table(DatabricksPath):
                 comment=comment,
                 missing_ok=missing_ok,
                 properties=properties,
-                or_replace=or_replace,
+                or_replace=mode == Mode.OVERWRITE and table_type == TableType.MANAGED,
                 record_ygg_properties=record_ygg_properties,
             )
         else:
@@ -2117,9 +2119,6 @@ class Table(DatabricksPath):
         )
 
         table_definitions = column_definitions + constraint_clauses
-
-        if or_replace and missing_ok:
-            raise ValueError("Use either or_replace or missing_ok, not both.")
 
         if or_replace:
             create_kw = "CREATE OR REPLACE TABLE"
