@@ -40,7 +40,8 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
-_COMPRESS_THRESHOLD = 4 * 1024 * 1024  # 4 MiB
+_COMPRESS_THRESHOLD = 4 * 1024 * 1024   # 4 MiB
+_MAX_PICKLE_SIZE = 128 * 1024 * 1024    # 128 MiB
 
 
 class HTTPStream(MemoryStream):
@@ -68,15 +69,23 @@ class HTTPStream(MemoryStream):
 
     def __getstate__(self) -> dict:
         self._pull_to_eof()
-        body = bytes(self._buf)
+        body = bytes(self.read_mv(self.size, 0))
         compressed = None
         if len(body) > _COMPRESS_THRESHOLD:
             import zlib
             compressed = zlib.compress(body, level=1)
             if len(compressed) >= len(body):
                 compressed = None
+        payload = compressed if compressed is not None else body
+        if len(payload) > _MAX_PICKLE_SIZE:
+            raise OverflowError(
+                f"HTTPStream body too large to pickle: "
+                f"{len(payload)} bytes (compressed={compressed is not None}, "
+                f"limit={_MAX_PICKLE_SIZE}). "
+                f"Stream the response instead of serializing it."
+            )
         return {
-            "body": compressed if compressed is not None else body,
+            "body": payload,
             "compressed": compressed is not None,
             "size": self.size,
         }
