@@ -215,6 +215,62 @@ def _to_json_kernel(data: pa.Array) -> pa.Array:
     return pa.array([json.dumps(v) if v is not None else None for v in data.to_pylist()], type=pa.utf8())
 
 
+def _named_struct_kernel(*args) -> pa.StructArray:
+    """NAMED_STRUCT('field1', val1, 'field2', val2, ...) → struct array.
+    Alternating name/value pairs; names are scalars or strings."""
+    names, arrays = [], []
+    for i in range(0, len(args), 2):
+        name = args[i]
+        name = name.as_py() if hasattr(name, 'as_py') else str(name)
+        names.append(name)
+        arrays.append(args[i + 1] if isinstance(args[i + 1], pa.Array) else
+                      pa.array([args[i + 1]] * (len(arrays[0]) if arrays else 1)))
+    return pc.make_struct(*arrays, field_names=names)
+
+
+def _array_kernel(*cols) -> pa.Array:
+    """ARRAY(col1, col2, ...) → list array where each row is [val1, val2, ...].
+    Zips column values row-wise into list elements."""
+    if not cols:
+        return pa.array([[] for _ in range(0)])
+    lists = [c.to_pylist() if isinstance(c, (pa.Array, pa.ChunkedArray)) else [c] for c in cols]
+    n = len(lists[0])
+    return pa.array([[row[i] for row in lists] for i in range(n)])
+
+
+def _map_kernel(*args) -> pa.Array:
+    """MAP(k1, v1, k2, v2, ...) → map array from alternating key/value pairs."""
+    if len(args) < 2:
+        return pa.array([None])
+    pairs = []
+    for i in range(0, len(args), 2):
+        k = args[i]
+        v = args[i + 1] if i + 1 < len(args) else None
+        k = k.as_py() if hasattr(k, 'as_py') else k
+        if isinstance(v, (pa.Array, pa.ChunkedArray)):
+            pairs.append((str(k), v.to_pylist()))
+        else:
+            v_val = v.as_py() if hasattr(v, 'as_py') else v
+            pairs.append((str(k), [v_val]))
+    n = max(len(vs) for _, vs in pairs) if pairs else 0
+    rows = []
+    for i in range(n):
+        row = {k: vs[i] if i < len(vs) else None for k, vs in pairs}
+        rows.append(row)
+    return pa.array(rows)
+
+
+def _map_from_arrays_kernel(keys: pa.Array, values: pa.Array) -> pa.Array:
+    """MAP_FROM_ARRAYS(keys_list, values_list) → struct array (dict per row)."""
+    result = []
+    for ks, vs in zip(keys.to_pylist(), values.to_pylist()):
+        if ks is None or vs is None:
+            result.append(None)
+        else:
+            result.append(dict(zip(ks, vs)))
+    return pa.array(result)
+
+
 _ARROW_KERNELS: dict[str, ArrowKernel] = {
     # String
     "UPPER": _k1("utf8_upper"),
@@ -320,6 +376,26 @@ _ARROW_KERNELS: dict[str, ArrowKernel] = {
         v.encode() if isinstance(v, str) else v or b"").hexdigest() for v in a.to_pylist()], type=pa.utf8()),
     "SHA1": lambda a: pa.array([__import__("hashlib").sha1(
         v.encode() if isinstance(v, str) else v or b"").hexdigest() for v in a.to_pylist()], type=pa.utf8()),
+
+    # Nested type constructors
+    "STRUCT": lambda *cols: pc.make_struct(*cols, field_names=[f"c{i}" for i in range(len(cols))]),
+    "NAMED_STRUCT": _named_struct_kernel,
+    "ARRAY": _array_kernel,
+    "MAP": _map_kernel,
+    "MAP_FROM_ARRAYS": _map_from_arrays_kernel,
+    "MAP_KEYS": lambda a: pa.array([
+        list(r.keys()) if isinstance(r, dict) else [k for k, _ in (r or [])] if r else []
+        for r in a.to_pylist()]),
+    "MAP_VALUES": lambda a: pa.array([
+        list(r.values()) if isinstance(r, dict) else [v for _, v in (r or [])] if r else []
+        for r in a.to_pylist()]),
+
+    # Struct field access
+    "GET_FIELD": lambda a, name: pc.struct_field(a, name.as_py() if hasattr(name, 'as_py') else str(name)),
+
+    # List construction from scalar per row
+    "ARRAY_CONSTRUCT": _array_kernel,
+    "CREATE_MAP": _map_kernel,
 }
 
 
@@ -415,7 +491,8 @@ def _build() -> FunctionRegistry:
         "MAP_ZIP_WITH": (3, 3), "TRANSFORM_KEYS": (2, 2), "TRANSFORM_VALUES": (2, 2),
         "NAMED_STRUCT": (2, None), "STRUCT": (1, None), "ARRAY": (0, None),
         "MAP": (0, None), "CARDINALITY": (1, 1), "ARRAY_COMPACT": (1, 1),
-        "ARRAY_APPEND": (2, 2), "ARRAY_PREPEND": (2, 2), "ARRAY_INSERT": (3, 3)})
+        "ARRAY_APPEND": (2, 2), "ARRAY_PREPEND": (2, 2), "ARRAY_INSERT": (3, 3),
+        "GET_FIELD": (2, 2), "ARRAY_CONSTRUCT": (1, None), "CREATE_MAP": (2, None)})
 
     _b("generator", {"EXPLODE": (1, 1), "POSEXPLODE": (1, 1), "INLINE": (1, 1),
         "STACK": (2, None), "EXPLODE_OUTER": (1, 1), "POSEXPLODE_OUTER": (1, 1),

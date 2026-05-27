@@ -183,3 +183,129 @@ class TestSparkUDFRegistration:
         result = node.execute(tables={"t": ds})
         table = result.read_arrow_table()
         assert table.column("uname").to_pylist() == ["ALICE", "BOB"]
+
+
+# ---------------------------------------------------------------------------
+# Nested type constructors
+# ---------------------------------------------------------------------------
+
+class TestNestedConstructors:
+    def test_struct(self):
+        r = BUILTIN_REGISTRY.apply_arrow("STRUCT", pa.array([1, 2]), pa.array(["a", "b"]))
+        assert r.to_pylist() == [{"c0": 1, "c1": "a"}, {"c0": 2, "c1": "b"}]
+
+    def test_named_struct(self):
+        r = BUILTIN_REGISTRY.apply_arrow("NAMED_STRUCT",
+            "id", pa.array([1, 2]), "name", pa.array(["a", "b"]))
+        assert r.to_pylist() == [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+
+    def test_array_construct(self):
+        r = BUILTIN_REGISTRY.apply_arrow("ARRAY",
+            pa.array([1, 2]), pa.array([3, 4]), pa.array([5, 6]))
+        assert r.to_pylist() == [[1, 3, 5], [2, 4, 6]]
+
+    def test_map_construct(self):
+        r = BUILTIN_REGISTRY.apply_arrow("MAP",
+            "x", pa.array([1, 2]), "y", pa.array([3, 4]))
+        assert r.to_pylist() == [{"x": 1, "y": 3}, {"x": 2, "y": 4}]
+
+    def test_map_from_arrays(self):
+        r = BUILTIN_REGISTRY.apply_arrow("MAP_FROM_ARRAYS",
+            pa.array([["a", "b"]], type=pa.list_(pa.utf8())),
+            pa.array([[1, 2]], type=pa.list_(pa.int64())))
+        vals = r.to_pylist()
+        assert vals[0]["a"] == 1 and vals[0]["b"] == 2
+
+    def test_map_keys(self):
+        m = pa.array([[("a", 1), ("b", 2)]], type=pa.map_(pa.utf8(), pa.int64()))
+        r = BUILTIN_REGISTRY.apply_arrow("MAP_KEYS", m)
+        assert r.to_pylist() == [["a", "b"]]
+
+    def test_map_values(self):
+        m = pa.array([[("a", 1), ("b", 2)]], type=pa.map_(pa.utf8(), pa.int64()))
+        r = BUILTIN_REGISTRY.apply_arrow("MAP_VALUES", m)
+        assert r.to_pylist() == [[1, 2]]
+
+    def test_get_field(self):
+        s = pc.make_struct(pa.array([10, 20]), pa.array(["x", "y"]),
+                           field_names=["id", "name"])
+        r = BUILTIN_REGISTRY.apply_arrow("GET_FIELD", s, "name")
+        assert r.to_pylist() == ["x", "y"]
+
+
+# ---------------------------------------------------------------------------
+# Explode / posexplode table-level operations
+# ---------------------------------------------------------------------------
+
+class TestExplodeTable:
+    def test_explode(self):
+        from yggdrasil.plan.func_registry import explode_table
+        t = pa.table({"id": [1, 2], "vals": [[10, 20], [30, 40, 50]]})
+        r = explode_table(t, "vals")
+        assert r.num_rows == 5
+        assert r.column("id").to_pylist() == [1, 1, 2, 2, 2]
+        assert r.column("vals").to_pylist() == [10, 20, 30, 40, 50]
+
+    def test_explode_with_rename(self):
+        from yggdrasil.plan.func_registry import explode_table
+        t = pa.table({"id": [1, 2], "items": [[10, 20], [30]]})
+        r = explode_table(t, "items", out_col="item")
+        assert "item" in r.column_names
+        assert "items" not in r.column_names
+        assert r.column("item").to_pylist() == [10, 20, 30]
+
+    def test_posexplode(self):
+        from yggdrasil.plan.func_registry import posexplode_table
+        t = pa.table({"id": [1, 2], "vals": [[10, 20], [30]]})
+        r = posexplode_table(t, "vals", out_col="val")
+        assert r.num_rows == 3
+        assert r.column("pos").to_pylist() == [0, 1, 0]
+        assert r.column("val").to_pylist() == [10, 20, 30]
+
+    def test_explode_preserves_columns(self):
+        from yggdrasil.plan.func_registry import explode_table
+        t = pa.table({"id": [1, 2], "name": ["a", "b"], "vals": [[10, 20], [30]]})
+        r = explode_table(t, "vals")
+        assert set(r.column_names) == {"id", "name", "vals"}
+        assert r.column("name").to_pylist() == ["a", "a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# Collection operations
+# ---------------------------------------------------------------------------
+
+class TestCollectionOps:
+    def test_size(self):
+        assert BUILTIN_REGISTRY.apply_arrow("SIZE", pa.array([[1, 2], [3]])).to_pylist() == [2, 1]
+
+    def test_flatten(self):
+        assert BUILTIN_REGISTRY.apply_arrow("FLATTEN", pa.array([[1, 2], [3, 4]])).to_pylist() == [1, 2, 3, 4]
+
+    def test_sort_array(self):
+        assert BUILTIN_REGISTRY.apply_arrow("SORT_ARRAY", pa.array([[3, 1, 2]])).to_pylist() == [[1, 2, 3]]
+
+    def test_array_distinct(self):
+        r = BUILTIN_REGISTRY.apply_arrow("ARRAY_DISTINCT", pa.array([[1, 2, 2, 3]]))
+        assert set(r.to_pylist()[0]) == {1, 2, 3}
+
+    def test_array_contains(self):
+        assert BUILTIN_REGISTRY.apply_arrow("ARRAY_CONTAINS", pa.array([[1, 2, 3]]), 2).to_pylist() == [True]
+        assert BUILTIN_REGISTRY.apply_arrow("ARRAY_CONTAINS", pa.array([[1, 2, 3]]), 5).to_pylist() == [False]
+
+    def test_array_min_max(self):
+        assert BUILTIN_REGISTRY.apply_arrow("ARRAY_MIN", pa.array([[3, 1, 2]])).to_pylist() == [1]
+        assert BUILTIN_REGISTRY.apply_arrow("ARRAY_MAX", pa.array([[3, 1, 2]])).to_pylist() == [3]
+
+    def test_string_cast(self):
+        assert BUILTIN_REGISTRY.apply_arrow("STRING", pa.array([1, 2, 3])).to_pylist() == ["1", "2", "3"]
+
+    def test_bigint_cast(self):
+        assert BUILTIN_REGISTRY.apply_arrow("BIGINT", pa.array(["1", "2"])).to_pylist() == [1, 2]
+
+    def test_md5(self):
+        r = BUILTIN_REGISTRY.apply_arrow("MD5", pa.array(["hello"]))
+        assert r.to_pylist()[0] == "5d41402abc4b2a76b9719d911017c592"
+
+    def test_total_kerneled(self):
+        count = sum(1 for m in BUILTIN_REGISTRY._functions.values() if m.kernel)
+        assert count >= 85
