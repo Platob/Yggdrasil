@@ -687,3 +687,445 @@ class TestPlanNodeFromSQL:
             dialect="databricks",
         )
         assert isinstance(node, SelectNode)
+
+
+# ---------------------------------------------------------------------------
+# Parser errors
+# ---------------------------------------------------------------------------
+
+class TestParserErrors:
+    def test_unterminated_string(self):
+        with pytest.raises(ValueError):
+            parse_sql("SELECT 'unclosed FROM t")
+
+    def test_empty_select_list(self):
+        with pytest.raises(ValueError):
+            parse_sql("SELECT , FROM t")
+
+    def test_missing_from_table(self):
+        with pytest.raises(ValueError):
+            parse_sql("SELECT * FROM")  # missing table
+
+    def test_invalid_in_list_non_literal(self):
+        # IN with non-literal column references
+        with pytest.raises(ValueError):
+            parse_sql("SELECT * FROM t WHERE id IN (a, b)")
+
+
+# ---------------------------------------------------------------------------
+# Qualified columns
+# ---------------------------------------------------------------------------
+
+class TestQualifiedColumns:
+    def test_qualified_column_in_select(self):
+        node = parse_sql("SELECT u.id, u.name FROM users u")
+        assert len(node.projections) == 2
+        assert isinstance(node.projections[0], Column)
+        assert node.projections[0].qualifier == "u"
+        assert node.projections[0].name == "id"
+
+    def test_qualified_column_in_where(self):
+        node = parse_sql("SELECT * FROM t WHERE t.id > 10")
+        assert isinstance(node.where, Comparison)
+        left = node.where.left
+        assert isinstance(left, Column)
+        assert left.qualifier == "t"
+        assert left.name == "id"
+
+    def test_qualified_column_in_join_on(self):
+        node = parse_sql("SELECT * FROM a JOIN b ON a.id = b.ref_id")
+        assert isinstance(node.from_clause, JoinClause)
+        on = node.from_clause.on
+        assert isinstance(on, Comparison)
+        assert on.left.qualifier == "a"
+        assert on.right.qualifier == "b"
+
+
+# ---------------------------------------------------------------------------
+# Arithmetic expressions
+# ---------------------------------------------------------------------------
+
+class TestArithmeticExpressions:
+    def test_arithmetic_in_select(self):
+        node = parse_sql("SELECT a + b, c * 2, d - 1 FROM t")
+        assert len(node.projections) == 3
+        assert all(isinstance(p, Arithmetic) for p in node.projections)
+
+    def test_arithmetic_in_where(self):
+        node = parse_sql("SELECT * FROM t WHERE a + b > 100")
+        assert isinstance(node.where, Comparison)
+        assert isinstance(node.where.left, Arithmetic)
+
+    def test_operator_precedence(self):
+        node = parse_sql("SELECT a + b * c FROM t")
+        # b * c should bind tighter than +
+        p = node.projections[0]
+        assert isinstance(p, Arithmetic)
+        assert p.op.value == "+"
+        assert isinstance(p.right, Arithmetic)
+        assert p.right.op.value == "*"
+
+    def test_parenthesized_arithmetic(self):
+        node = parse_sql("SELECT (a + b) * c FROM t")
+        p = node.projections[0]
+        assert isinstance(p, Arithmetic)
+        assert p.op.value == "*"
+        assert isinstance(p.left, Arithmetic)
+        assert p.left.op.value == "+"
+
+    def test_modulo(self):
+        node = parse_sql("SELECT a % 10 FROM t")
+        p = node.projections[0]
+        assert isinstance(p, Arithmetic)
+        assert p.op.value == "%"
+
+    def test_negative_literal(self):
+        node = parse_sql("SELECT -5, -3.14 FROM t")
+        assert node.projections[0].value == -5
+        assert node.projections[1].value == -3.14
+
+
+# ---------------------------------------------------------------------------
+# Functions in WHERE / HAVING
+# ---------------------------------------------------------------------------
+
+class TestFunctionsInWhere:
+    def test_function_in_where(self):
+        node = parse_sql("SELECT * FROM t WHERE UPPER(name) = 'JOHN'", dialect="databricks")
+        assert isinstance(node.where, Comparison)
+        assert isinstance(node.where.left, FunctionCall)
+        assert node.where.left.name == "UPPER"
+
+    def test_function_in_having(self):
+        node = parse_sql(
+            "SELECT region FROM t GROUP BY region HAVING SUM(amount) > 100",
+            dialect="databricks",
+        )
+        assert isinstance(node.having, Comparison)
+        assert isinstance(node.having.left, FunctionCall)
+        assert node.having.left.name == "SUM"
+
+    def test_nested_functions_in_where(self):
+        node = parse_sql(
+            "SELECT * FROM t WHERE LENGTH(TRIM(name)) > 0",
+            dialect="databricks",
+        )
+        assert isinstance(node.where, Comparison)
+        assert isinstance(node.where.left, FunctionCall)
+        assert node.where.left.name == "LENGTH"
+        inner = node.where.left.args[0]
+        assert isinstance(inner, FunctionCall)
+        assert inner.name == "TRIM"
+
+
+# ---------------------------------------------------------------------------
+# GROUP BY expressions
+# ---------------------------------------------------------------------------
+
+class TestGroupByExpressions:
+    def test_group_by_function(self):
+        node = parse_sql(
+            "SELECT YEAR(dt), COUNT(*) FROM t GROUP BY YEAR(dt)",
+            dialect="databricks",
+        )
+        assert node.group_by is not None
+        assert isinstance(node.group_by[0], FunctionCall)
+
+    def test_group_by_arithmetic(self):
+        node = parse_sql("SELECT a / 10 AS bucket, COUNT(*) FROM t GROUP BY a / 10")
+        assert isinstance(node.group_by[0], Arithmetic)
+
+
+# ---------------------------------------------------------------------------
+# ILIKE
+# ---------------------------------------------------------------------------
+
+class TestILike:
+    def test_ilike(self):
+        node = parse_sql("SELECT * FROM t WHERE name ILIKE '%john%'")
+        assert isinstance(node.where, Like)
+        assert node.where.case_insensitive is True
+        assert node.where.pattern == "%john%"
+
+    def test_not_ilike(self):
+        node = parse_sql("SELECT * FROM t WHERE name NOT ILIKE '%test%'")
+        assert isinstance(node.where, Like)
+        assert node.where.negated is True
+        assert node.where.case_insensitive is True
+
+
+# ---------------------------------------------------------------------------
+# Nested subqueries
+# ---------------------------------------------------------------------------
+
+class TestNestedSubqueries:
+    def test_double_nested_subquery(self):
+        node = parse_sql(
+            "SELECT * FROM (SELECT * FROM (SELECT id FROM t) inner_q) outer_q"
+        )
+        assert isinstance(node.from_clause, SubqueryRef)
+        inner = node.from_clause.plan
+        assert isinstance(inner.from_clause, SubqueryRef)
+
+    def test_subquery_in_from_with_join(self):
+        node = parse_sql(
+            "SELECT * FROM (SELECT id, name FROM users) u "
+            "JOIN orders o ON u.id = o.id"
+        )
+        assert isinstance(node.from_clause, JoinClause)
+        assert isinstance(node.from_clause.left, SubqueryRef)
+
+
+# ---------------------------------------------------------------------------
+# Complex MERGE
+# ---------------------------------------------------------------------------
+
+class TestComplexMerge:
+    def test_merge_with_subquery_source(self):
+        node = parse_sql(
+            "MERGE INTO target t USING (SELECT * FROM source WHERE active = TRUE) s "
+            "ON t.id = s.id "
+            "WHEN MATCHED THEN UPDATE SET t.name = s.name"
+        )
+        assert isinstance(node, MergeNode)
+        assert isinstance(node.source, SubqueryRef)
+
+    def test_merge_with_delete(self):
+        node = parse_sql(
+            "MERGE INTO target USING source ON target.id = source.id "
+            "WHEN MATCHED AND source.deleted = TRUE THEN DELETE "
+            "WHEN MATCHED THEN UPDATE SET target.name = source.name "
+            "WHEN NOT MATCHED THEN INSERT (id, name) VALUES (source.id, source.name)"
+        )
+        assert len(node.when_matched) == 2
+        assert node.when_matched[0]["action"]["type"] == "DELETE"
+        assert node.when_matched[1]["action"]["type"] == "UPDATE"
+        assert len(node.when_not_matched) == 1
+
+
+# ---------------------------------------------------------------------------
+# Catalog.Schema.Table references
+# ---------------------------------------------------------------------------
+
+class TestCatalogSchemaTable:
+    def test_three_part_name(self):
+        node = parse_sql("SELECT * FROM catalog.schema.table")
+        ref = node.from_clause
+        assert ref.catalog == "catalog"
+        assert ref.schema == "schema"
+        assert ref.name == "table"
+
+    def test_two_part_name(self):
+        node = parse_sql("SELECT * FROM schema.table")
+        ref = node.from_clause
+        assert ref.schema == "schema"
+        assert ref.name == "table"
+
+
+# ---------------------------------------------------------------------------
+# Multiple LATERAL VIEWs
+# ---------------------------------------------------------------------------
+
+class TestMultipleLateralViews:
+    def test_two_lateral_views(self):
+        node = parse_sql(
+            "SELECT id, v1, v2 FROM t "
+            "LATERAL VIEW EXPLODE(arr1) t1 AS v1 "
+            "LATERAL VIEW EXPLODE(arr2) t2 AS v2",
+            dialect="databricks",
+        )
+        assert len(node.lateral_views) == 2
+        assert node.lateral_views[0].table_alias == "t1"
+        assert node.lateral_views[1].table_alias == "t2"
+
+
+# ---------------------------------------------------------------------------
+# Window edge cases
+# ---------------------------------------------------------------------------
+
+class TestWindowEdgeCases:
+    def test_window_partition_only(self):
+        node = parse_sql(
+            "SELECT SUM(val) OVER (PARTITION BY id) FROM t",
+            dialect="databricks",
+        )
+        wf = node.projections[0]
+        assert isinstance(wf, WindowFunction)
+        assert len(wf.window.partition_by) == 1
+        assert len(wf.window.order_by) == 0
+
+    def test_window_order_only(self):
+        node = parse_sql(
+            "SELECT ROW_NUMBER() OVER (ORDER BY id) FROM t",
+            dialect="databricks",
+        )
+        wf = node.projections[0]
+        assert len(wf.window.partition_by) == 0
+        assert len(wf.window.order_by) == 1
+
+    def test_window_n_preceding_following(self):
+        node = parse_sql(
+            "SELECT SUM(val) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING) FROM t",
+            dialect="databricks",
+        )
+        wf = node.projections[0]
+        assert wf.window.frame_start == "3 PRECEDING"
+        assert wf.window.frame_end == "1 FOLLOWING"
+
+
+# ---------------------------------------------------------------------------
+# CASE WHEN edge cases
+# ---------------------------------------------------------------------------
+
+class TestCaseWhenEdgeCases:
+    def test_case_no_else(self):
+        node = parse_sql(
+            "SELECT CASE WHEN a > 0 THEN 'pos' END FROM t"
+        )
+        cw = node.projections[0]
+        assert isinstance(cw, CaseWhen)
+        assert cw.else_expr is None
+
+    def test_case_many_branches(self):
+        node = parse_sql(
+            "SELECT CASE "
+            "WHEN a = 1 THEN 'one' "
+            "WHEN a = 2 THEN 'two' "
+            "WHEN a = 3 THEN 'three' "
+            "WHEN a = 4 THEN 'four' "
+            "ELSE 'other' END FROM t"
+        )
+        cw = node.projections[0]
+        assert len(cw.branches) == 4
+        assert cw.else_expr is not None
+
+    def test_case_in_where(self):
+        node = parse_sql(
+            "SELECT * FROM t WHERE CASE WHEN x > 0 THEN TRUE ELSE FALSE END"
+        )
+        assert isinstance(node.where, CaseWhen)
+
+
+# ---------------------------------------------------------------------------
+# ORDER BY edge cases
+# ---------------------------------------------------------------------------
+
+class TestOrderByEdgeCases:
+    def test_order_by_implicit_asc(self):
+        node = parse_sql("SELECT * FROM t ORDER BY a, b")
+        assert len(node.order_by) == 2
+        assert all(o.ascending is True for o in node.order_by)
+
+    def test_order_by_nulls_last(self):
+        node = parse_sql("SELECT * FROM t ORDER BY id DESC NULLS LAST")
+        assert node.order_by[0].ascending is False
+        assert node.order_by[0].nulls_first is False
+
+    def test_order_by_mixed(self):
+        node = parse_sql("SELECT * FROM t ORDER BY a ASC NULLS FIRST, b DESC NULLS LAST, c")
+        assert len(node.order_by) == 3
+        assert node.order_by[0].ascending is True
+        assert node.order_by[0].nulls_first is True
+        assert node.order_by[1].ascending is False
+        assert node.order_by[1].nulls_first is False
+        assert node.order_by[2].ascending is True
+        assert node.order_by[2].nulls_first is None
+
+
+# ---------------------------------------------------------------------------
+# JOIN edge cases
+# ---------------------------------------------------------------------------
+
+class TestJoinEdgeCases:
+    def test_implicit_inner_join(self):
+        node = parse_sql("SELECT * FROM a JOIN b ON a.id = b.id")
+        assert isinstance(node.from_clause, JoinClause)
+        assert node.from_clause.join_type.is_inner
+
+    def test_left_outer_explicit(self):
+        node = parse_sql("SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.id")
+        assert node.from_clause.join_type.name == "LEFT_OUTER"
+
+    def test_triple_join(self):
+        node = parse_sql(
+            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id"
+        )
+        outer = node.from_clause
+        assert isinstance(outer, JoinClause)
+        assert isinstance(outer.left, JoinClause)
+
+
+# ---------------------------------------------------------------------------
+# SQL comments
+# ---------------------------------------------------------------------------
+
+class TestComments:
+    def test_line_comment(self):
+        node = parse_sql("SELECT a -- this is a comment\n FROM t")
+        assert isinstance(node, SelectNode)
+        assert len(node.projections) == 1
+
+    def test_block_comment(self):
+        node = parse_sql("SELECT /* comment */ a FROM t")
+        assert isinstance(node, SelectNode)
+        assert len(node.projections) == 1
+
+    def test_comment_in_where(self):
+        node = parse_sql("SELECT * FROM t WHERE /* filter */ id > 10")
+        assert isinstance(node.where, Comparison)
+
+
+# ---------------------------------------------------------------------------
+# Databricks-specific functions
+# ---------------------------------------------------------------------------
+
+class TestDatabricksSpecificFunctions:
+    def test_explode(self):
+        node = parse_sql("SELECT EXPLODE(arr) FROM t", dialect="databricks")
+        fc = node.projections[0]
+        assert isinstance(fc, FunctionCall)
+        assert fc.name == "EXPLODE"
+
+    def test_collect_list(self):
+        node = parse_sql("SELECT COLLECT_LIST(name) FROM t GROUP BY region", dialect="databricks")
+        assert isinstance(node.projections[0], FunctionCall)
+        assert node.projections[0].name == "COLLECT_LIST"
+
+    def test_row_number_over(self):
+        node = parse_sql(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY region ORDER BY score DESC) rn FROM t",
+            dialect="databricks",
+        )
+        proj = node.projections[0]
+        assert isinstance(proj, Alias)
+        assert isinstance(proj.expr, WindowFunction)
+
+    def test_first_value(self):
+        node = parse_sql(
+            "SELECT FIRST_VALUE(name) OVER (PARTITION BY region ORDER BY score DESC) FROM t",
+            dialect="databricks",
+        )
+        assert isinstance(node.projections[0], WindowFunction)
+
+    def test_if_function(self):
+        node = parse_sql("SELECT IF(a > 0, 'pos', 'neg') FROM t", dialect="databricks")
+        assert isinstance(node.projections[0], FunctionCall)
+        assert node.projections[0].name == "IF"
+
+    def test_named_struct(self):
+        node = parse_sql("SELECT NAMED_STRUCT('a', 1, 'b', 2) FROM t", dialect="databricks")
+        assert isinstance(node.projections[0], FunctionCall)
+        assert node.projections[0].name == "NAMED_STRUCT"
+
+    def test_element_at(self):
+        node = parse_sql("SELECT ELEMENT_AT(arr, 1) FROM t", dialect="databricks")
+        assert isinstance(node.projections[0], FunctionCall)
+
+    def test_from_json(self):
+        node = parse_sql("SELECT FROM_JSON(json_col, 'struct<a:int,b:string>') FROM t", dialect="databricks")
+        assert isinstance(node.projections[0], FunctionCall)
+        assert node.projections[0].name == "FROM_JSON"
+
+    def test_approx_count_distinct(self):
+        node = parse_sql("SELECT APPROX_COUNT_DISTINCT(id) FROM t", dialect="databricks")
+        assert isinstance(node.projections[0], FunctionCall)
