@@ -37,7 +37,10 @@ from yggdrasil.io.nested.delta.protocol import (
     AddFile, CommitInfo, DeltaAction, DeletionVectorDescriptor,
     Metadata, Protocol, RemoveFile, Txn,
 )
-from yggdrasil.io.nested.delta.schema_codec import arrow_schema_to_spark_json, spark_json_to_arrow_schema
+from yggdrasil.io.nested.delta.schema_codec import (
+    arrow_schema_to_spark_json, spark_json_to_arrow_schema,
+    schema_to_spark_json, spark_json_to_schema,
+)
 from yggdrasil.io.nested.delta.snapshot import Snapshot
 
 if TYPE_CHECKING:
@@ -112,11 +115,11 @@ class DeltaFolder(Folder):
         return self._snapshot
 
     def _collect_schema(self, options: DeltaOptions):
-        from yggdrasil.data.schema import Schema
         snap = self.snapshot(options.version)
         if snap.metadata is None or not snap.schema_string:
+            from yggdrasil.data.schema import Schema
             return Schema.empty()
-        return Schema.from_arrow(spark_json_to_arrow_schema(snap.schema_string))
+        return spark_json_to_schema(snap.schema_string)
 
     # ==================================================================
     # Read
