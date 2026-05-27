@@ -40,6 +40,9 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+_COMPRESS_THRESHOLD = 4 * 1024 * 1024  # 4 MiB
+
+
 class HTTPStream(MemoryStream):
     """MemoryStream with HTTP range-request retry on transient failures."""
 
@@ -62,6 +65,29 @@ class HTTPStream(MemoryStream):
         self._session_ref = session
         self._max_retries = max_retries
         self._retry_count = 0
+
+    def __getstate__(self) -> dict:
+        self._pull_to_eof()
+        body = bytes(self._buf)
+        compressed = None
+        if len(body) > _COMPRESS_THRESHOLD:
+            import zlib
+            compressed = zlib.compress(body, level=1)
+            if len(compressed) >= len(body):
+                compressed = None
+        return {
+            "body": compressed if compressed is not None else body,
+            "compressed": compressed is not None,
+            "size": self.size,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        body = state["body"]
+        if state.get("compressed"):
+            import zlib
+            body = zlib.decompress(body)
+        self.__init__(source=body)
+        self._pull_to_eof()
 
     def _pull_one(self, want: int) -> int:
         try:
