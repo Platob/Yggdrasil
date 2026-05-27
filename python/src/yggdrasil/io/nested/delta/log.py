@@ -12,6 +12,25 @@ Reading a snapshot collapses to:
 1. Read ``_last_checkpoint`` to find the most recent checkpoint version.
 2. Load checkpoint actions (V1 or V2).
 3. Apply JSON commits with version > checkpoint version.
+
+Caching strategy
+----------------
+
+Remote backends (S3, DBFS, ABFS) charge per-request, so every saved
+round trip matters. The log caches:
+
+- **Directory listing** — one ``iterdir()`` per instance lifetime
+  (extended in-place when we know the exact name of a new commit).
+- **``_last_checkpoint``** — one read per instance lifetime.
+- **Commit JSON content** — ``ExpiringDict`` keyed by path string,
+  60 s TTL, capped at 1024 entries.  Commit files are small (typically
+  200-2000 bytes) and immutable once written, so caching them is
+  safe and high-value on repeated reads or checkpoint replays.
+- **V2 manifest content** — cached alongside commit JSON (same dict).
+
+Content larger than ``_CONTENT_CACHE_MAX_BYTES`` (1 MiB) is never
+cached to keep memory bounded — checkpoint parquets for large tables
+can be tens of megabytes.
 """
 
 from __future__ import annotations
@@ -19,12 +38,14 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Iterable, Iterator, List, Mapping, Optional, Tuple
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.pickle import json as ygg_json
 
 from yggdrasil.io.nested.delta._names import (
     LAST_CHECKPOINT_NAME,
     LOG_DIR_NAME,
     SIDECARS_DIR_NAME,
+    format_commit_name,
     version_from_log_name,
 )
 from yggdrasil.io.nested.delta.protocol import DeltaAction, parse_action
@@ -40,6 +61,21 @@ __all__ = [
 
 
 _VERSION_FMT = "{:020d}"
+
+_CONTENT_CACHE_TTL = 60.0
+_CONTENT_CACHE_MAX_SIZE = 1024
+_CONTENT_CACHE_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
+
+# Module-level content cache shared across DeltaLog instances on the
+# same table root. Keyed by the path's full_path() string so entries
+# are unique across tables. Commit JSON files are immutable once
+# written, so a 60 s TTL is conservative — the only risk is a stale
+# entry from a partially-written commit that another process later
+# overwrites, which the Delta spec forbids.
+_content_cache: ExpiringDict[str, bytes] = ExpiringDict(
+    default_ttl=_CONTENT_CACHE_TTL,
+    max_size=_CONTENT_CACHE_MAX_SIZE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +106,9 @@ class DeltaLog:
     """High-level reader for a Delta ``_delta_log`` directory.
 
     Caches the directory listing + ``_last_checkpoint`` per instance.
-    Call :meth:`invalidate` between writes.
+    Call :meth:`invalidate` between writes, or :meth:`extend_listing`
+    when you know the exact name of a newly committed file (cheaper
+    than a full re-list).
     """
 
     __slots__ = (
@@ -93,6 +131,20 @@ class DeltaLog:
     def invalidate(self) -> None:
         self._last_checkpoint = None
         self._listing = None
+
+    def extend_listing(self, *names: str) -> None:
+        """Cheaply extend the cached listing with known new file names.
+
+        After a successful commit, the writer knows the exact name of
+        the new JSON file. Appending it to the cached listing avoids a
+        full ``iterdir()`` round trip on the next snapshot resolution.
+        """
+        if self._listing is None:
+            return
+        current = set(self._listing)
+        added = [n for n in names if n not in current]
+        if added:
+            self._listing = tuple(sorted(current | set(added)))
 
     def _list_log_dir(self) -> "Tuple[str, ...]":
         if self._listing is not None:
@@ -121,8 +173,8 @@ class DeltaLog:
 
         ptr = self.log_path / LAST_CHECKPOINT_NAME
         try:
-            with ptr.open("rb") as bio:
-                payload = ygg_json.loads(bio.read())
+            raw = _read_small_file(ptr)
+            payload = ygg_json.loads(raw)
         except FileNotFoundError:
             self._last_checkpoint = {}
             return None
@@ -159,7 +211,6 @@ class DeltaLog:
 
         all_commits: list[tuple[int, str]] = []
         for name in listing:
-            # Exclude V2 checkpoint manifests (*.checkpoint.<uuid>.json)
             if (
                 name.endswith(".json")
                 and not name.startswith("_")
@@ -284,13 +335,12 @@ class DeltaLog:
     ) -> "Tuple[Path, ...]":
         manifest_path = self.log_path / manifest_name
         try:
-            with manifest_path.open("rb") as bio:
-                raw = bio.read().decode("utf-8")
+            raw = _read_small_file(manifest_path)
         except Exception:
             return ()
 
         sidecars: list[str] = []
-        for line in raw.splitlines():
+        for line in raw.decode("utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -335,8 +385,7 @@ class DeltaLog:
 
     def _iter_commit_raw(self, path: "Path") -> "Iterator[Mapping[str, object]]":
         try:
-            with path.open("rb") as bio:
-                blob = bio.read().decode("utf-8")
+            blob = _read_small_file(path).decode("utf-8")
         except FileNotFoundError:
             return
         for line in blob.splitlines():
@@ -369,10 +418,8 @@ class DeltaLog:
                 if local is not None:
                     table = pq.read_table(local)
                 else:
-                    with path.open("rb") as bio:
-                        blob = bio.read()
+                    blob = _read_file_uncached(path)
                     import io as _io
-
                     table = pq.read_table(_io.BytesIO(blob))
             except FileNotFoundError:
                 continue
@@ -388,6 +435,44 @@ class DeltaLog:
                         continue
                     yield {col: val}
                     break
+
+
+# ---------------------------------------------------------------------------
+# File read helpers with content caching
+# ---------------------------------------------------------------------------
+
+
+def _cache_key(path: "Path") -> str:
+    """Stable string key for the content cache."""
+    fn = getattr(path, "full_path", None)
+    if callable(fn):
+        return fn()
+    return str(path)
+
+
+def _read_small_file(path: "Path") -> bytes:
+    """Read a small file through the content cache.
+
+    Files larger than ``_CONTENT_CACHE_MAX_BYTES`` are read but not
+    cached. Commit JSON and ``_last_checkpoint`` files are typically
+    200-2000 bytes and benefit strongly from caching on remote stores.
+    """
+    key = _cache_key(path)
+    cached = _content_cache.get(key)
+    if cached is not None:
+        return cached
+
+    raw = _read_file_uncached(path)
+
+    if len(raw) <= _CONTENT_CACHE_MAX_BYTES:
+        _content_cache[key] = raw
+    return raw
+
+
+def _read_file_uncached(path: "Path") -> bytes:
+    """Read a file without caching."""
+    with path.open("rb") as bio:
+        return bio.read()
 
 
 def _local_str(path: "Path") -> "Optional[str]":

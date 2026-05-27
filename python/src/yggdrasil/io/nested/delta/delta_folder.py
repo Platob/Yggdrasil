@@ -584,7 +584,12 @@ class DeltaFolder(Folder):
                     time.sleep(delay)
                 continue
 
-            self.refresh()
+            # Successful commit — extend the listing cache with the new
+            # commit name instead of doing a full invalidate + re-list.
+            # The snapshot cache is cleared so the next read picks up
+            # the new version.
+            self._log.extend_listing(format_commit_name(next_version))
+            self._snapshot = None
 
             interval = int(options.checkpoint_interval or 0)
             if interval > 0 and (next_version + 1) % interval == 0:

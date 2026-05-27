@@ -356,6 +356,8 @@ class TestBidirectionalInterop(DeltaTestCase):
             mode="append",
         )
 
+        # External write requires refresh to pick up the new commit
+        d.refresh()
         out = d.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), [1, 2, 3, 4])
 
