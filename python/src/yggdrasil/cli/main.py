@@ -182,7 +182,7 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None):
 # ── handlers ─────────────────────────────────────────────────────
 
 def _node_start(args: argparse.Namespace) -> int:
-    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, yellow
+    from yggdrasil.cli.style import blue, bold, cyan, dim, green, magenta, orange, out, print_logo, yellow
     from yggdrasil.node.config import get_settings
     from yggdrasil.node.daemon import spawn_node
     from yggdrasil.node.service import install_service, is_service_installed
@@ -197,18 +197,18 @@ def _node_start(args: argparse.Namespace) -> int:
     pid, port = spawn_node(settings, host=host)
 
     out(f"  {green('✓')} node running\n")
-    out(f"  {cyan('node')}  {bold(settings.node_id)}\n")
-    out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n")
-    out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
-    out(f"  {cyan('pid')}   {dim(str(pid))}\n")
+    out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
+    out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
+    out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
+    out(f"  {cyan('pid')}     {dim(str(pid))}\n")
 
     if not is_service_installed(settings):
-        out(f"\n  {cyan('install')} registering boot service...\n")
+        out(f"\n  {magenta('install')} registering boot service...\n")
         ok, msg = install_service(settings, no_front=True)
         if ok:
             out(f"  {green('✓')} auto-start on boot enabled\n")
         else:
-            out(f"  {yellow('skip')} boot service: {msg}\n")
+            out(f"  {yellow('skip')} {dim(msg)}\n")
 
     out(f"\n  {dim('Public access enabled. Stop with:')} {bold('ygg node stop')}\n")
     return 0
@@ -216,18 +216,20 @@ def _node_start(args: argparse.Namespace) -> int:
 
 def _node_stop(args: argparse.Namespace) -> int:
     from yggdrasil.node.daemon import stop_node
-    from yggdrasil.cli.style import green, out, print_logo, red
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.cli.style import green, orange, out, print_logo, red
 
     print_logo("YGGNODE")
-    if stop_node():
-        out(f"  {green('node stopped.')}\n")
+    settings = get_settings()
+    if stop_node(settings):
+        out(f"  {green('✓')} {orange(settings.node_id)} stopped\n")
     else:
-        out(f"  {red('no running node found.')}\n")
+        out(f"  {red('✗')} no running node found\n")
     return 0
 
 
 def _node_serve(args: argparse.Namespace) -> int:
-    from yggdrasil.cli.style import bold, cyan, dim, out, print_logo
+    from yggdrasil.cli.style import blue, bold, cyan, dim, green, orange, out, print_logo
     from yggdrasil.node.config import _find_open_port, get_settings
     from yggdrasil.node.daemon import cleanup_old_logs, ensure_directories
 
@@ -241,10 +243,10 @@ def _node_serve(args: argparse.Namespace) -> int:
     port = args.port or _find_open_port(settings.port, settings.port + 100)
     host = args.host or settings.host
 
-    out(f"  {cyan('node')}  {bold(settings.node_id)}\n")
-    out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
-    out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n")
-    out(f"  {cyan('mode')}  {dim('public — remote access enabled')}\n")
+    out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
+    out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
+    out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
+    out(f"  {cyan('mode')}    {dim('public — remote access enabled')}\n")
 
     front_proc = None
     if not args.no_front:
@@ -265,25 +267,25 @@ def _node_status(args: argparse.Namespace) -> int:
     from yggdrasil.node.config import get_settings
     from yggdrasil.node.daemon import _is_node_running, ensure_directories
     from yggdrasil.node.service import service_status
-    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, red, yellow
+    from yggdrasil.cli.style import blue, bold, cyan, dim, green, magenta, orange, out, print_logo, red, yellow
 
     print_logo("YGGNODE")
     settings = get_settings()
     ensure_directories(settings)
     running, pid, port = _is_node_running(settings)
 
-    out(f"  {cyan('node')}    {bold(settings.node_id)}\n")
-    out(f"  {cyan('home')}    {dim(str(settings.node_home))}\n")
+    out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
+    out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
     if running:
-        out(f"  {cyan('status')}  {green('running')} {dim(f'(pid={pid}, port={port})')}\n")
-        out(f"  {cyan('url')}     {bold(f'http://0.0.0.0:{port}')}\n")
+        out(f"  {cyan('status')}  {green('● running')} {dim(f'pid={pid}')}\n")
+        out(f"  {cyan('url')}     {green(f'http://0.0.0.0:{port}')}\n")
     else:
-        out(f"  {cyan('status')}  {red('stopped')}\n")
+        out(f"  {cyan('status')}  {red('● stopped')}\n")
         out(f"\n  Start with: {bold('ygg node start')}\n")
 
     svc = service_status(settings)
     if svc:
-        out(f"\n  {cyan('boot services:')}\n")
+        out(f"\n  {magenta('boot services:')}\n")
         for name, state in svc.items():
             color = green if state in ("active", "running") else (red if state == "not installed" else yellow)
             out(f"    {dim(name)}  {color(state)}\n")
@@ -294,7 +296,7 @@ def _node_status(args: argparse.Namespace) -> int:
 def _node_create(args: argparse.Namespace) -> int:
     import os
     from pathlib import Path
-    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, yellow
+    from yggdrasil.cli.style import blue, bold, cyan, dim, green, magenta, orange, out, print_logo, yellow
     from yggdrasil.node.daemon import ensure_directories, spawn_node
     from yggdrasil.node.service import install_service
 
@@ -314,17 +316,17 @@ def _node_create(args: argparse.Namespace) -> int:
     id_file.write_text(args.name)
 
     out(f"  {green('✓')} node created\n")
-    out(f"  {cyan('node')}  {bold(args.name)}\n")
-    out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
+    out(f"  {cyan('node')}    {orange(args.name)}\n")
+    out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
 
     if args.start:
         pid, port = spawn_node(settings, host="0.0.0.0")
-        out(f"  {green('✓')} running on {bold(f'0.0.0.0:{port}')} (pid={pid})\n")
+        out(f"  {green('✓')} running on {green(f'0.0.0.0:{port}')} {dim(f'pid={pid}')}\n")
         ok, msg = install_service(settings, no_front=True)
         if ok:
-            out(f"  {green('✓')} boot service installed\n")
+            out(f"  {green('✓')} {magenta('boot service')} installed\n")
         else:
-            out(f"  {yellow('skip')} boot service: {msg}\n")
+            out(f"  {yellow('skip')} {dim(msg)}\n")
     else:
         out(f"\n  Start with: {bold('ygg node start')}\n")
     return 0

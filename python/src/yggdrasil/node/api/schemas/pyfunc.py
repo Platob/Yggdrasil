@@ -35,6 +35,9 @@ class PyFuncEntry(StrictModel):
     created_at: str
     updated_at: str
     last_run_at: str | None = None
+    content_hash: str = ""
+    replicated_at: str | None = None
+    replicated_from: str | None = None
 
 
 class PyFuncResponse(StrictModel):

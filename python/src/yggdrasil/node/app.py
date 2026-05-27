@@ -12,11 +12,13 @@ from .api.routers import (
     card_router as v2_card_router,
     dag_router as v2_dag_router,
     fs_router as v2_fs_router,
+    messenger_router as v2_messenger_router,
     network_router as v2_network_router,
     pyenv_router as v2_pyenv_router,
     pyfunc_router as v2_pyfunc_router,
     pyfuncrun_router as v2_pyfuncrun_router,
     replicate_router as v2_replicate_router,
+    user_router as v2_user_router,
 )
 from .api.services.backend import BackendService
 from .api.services.dag import DAGService as V2DagService
@@ -25,7 +27,9 @@ from .api.services.network import NetworkService
 from .api.services.pyenv import PyEnvService
 from .api.services.pyfunc import PyFuncService
 from .api.services.pyfuncrun import PyFuncRunService
+from .api.services.messenger import MessengerService as V2MessengerService
 from .api.services.replicate import ReplicateService
+from .api.services.user import UserService
 from .routers import (
     call_router,
     cmd_router,
@@ -106,6 +110,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     network = NetworkService(settings, backend)
     replicate = ReplicateService(settings, pyenv, pyfunc, v2_dag)
+    user_svc = UserService(settings)
+    v2_messenger = V2MessengerService(settings)
 
     app.state.fs_service = v2_fs
     app.state.pyenv_service = pyenv
@@ -115,6 +121,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.backend_service = backend
     app.state.network_service = network
     app.state.replicate_service = replicate
+    app.state.user_service = user_svc
+    app.state.v2_messenger_service = v2_messenger
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -175,6 +183,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(v2_network_router, prefix=f"{prefix}/v2/network")
     app.include_router(v2_replicate_router, prefix=f"{prefix}/v2/replicate")
     app.include_router(v2_fs_router, prefix=f"{prefix}/v2/fs")
+    app.include_router(v2_user_router, prefix=f"{prefix}/v2/user")
+    app.include_router(v2_messenger_router, prefix=f"{prefix}/v2/messenger")
 
     return app
 

@@ -43,6 +43,9 @@ class DAGEntry(StrictModel):
     created_at: str
     updated_at: str
     run_count: int = 0
+    content_hash: str = ""
+    replicated_at: str | None = None
+    replicated_from: str | None = None
 
 
 class DAGResponse(StrictModel):

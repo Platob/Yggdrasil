@@ -53,6 +53,17 @@ from .network import (
     PeerRegisterRequest,
     PeerRegisterResponse,
 )
+from .user import (
+    UserCard,
+    UserListResponse,
+)
+from .messenger import (
+    ChannelInfo,
+    ChannelListResponse,
+    Message,
+    MessageListResponse,
+    MessageSend,
+)
 
 __all__ = [
     "StrictModel",
@@ -97,4 +108,11 @@ __all__ = [
     "PeerListResponse",
     "DispatchRequest",
     "DispatchResponse",
+    "UserCard",
+    "UserListResponse",
+    "ChannelInfo",
+    "ChannelListResponse",
+    "Message",
+    "MessageListResponse",
+    "MessageSend",
 ]

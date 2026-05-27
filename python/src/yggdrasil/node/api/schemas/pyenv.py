@@ -27,6 +27,9 @@ class PyEnvEntry(StrictModel):
     updated_at: str
     error: str | None = None
     last_used_at: str | None = None
+    content_hash: str = ""
+    replicated_at: str | None = None
+    replicated_from: str | None = None
 
 
 class PyEnvResponse(StrictModel):

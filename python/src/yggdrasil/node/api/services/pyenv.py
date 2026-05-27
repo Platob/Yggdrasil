@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -52,6 +53,10 @@ class PyEnvService:
             updates: dict = {"updated_at": now}
             if new_deps:
                 updates["dependencies"] = list(existing.dependencies) + new_deps
+            merged_deps = updates.get("dependencies", list(existing.dependencies))
+            updates["content_hash"] = hashlib.sha256(
+                (existing.name + existing.python_version + "".join(sorted(merged_deps))).encode()
+            ).hexdigest()
             updated = existing.model_copy(update=updates)
             with self._lock:
                 self._envs[existing.id] = updated
@@ -63,6 +68,9 @@ class PyEnvService:
 
         env_id = make_id(req.name)
         env_path = self._envs_root / str(env_id)
+        content_hash = hashlib.sha256(
+            (req.name + req.python_version + "".join(sorted(req.dependencies))).encode()
+        ).hexdigest()
         entry = PyEnvEntry(
             id=env_id,
             name=req.name,
@@ -72,6 +80,7 @@ class PyEnvService:
             status="creating",
             created_at=now,
             updated_at=now,
+            content_hash=content_hash,
         )
         with self._lock:
             self._envs.set(env_id, entry)

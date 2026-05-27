@@ -1,12 +1,15 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import Link from "next/link";
 import { NodeCard } from "@/components/NodeCard";
+import { ResourceBar } from "@/components/ResourceBar";
 import {
   getBackend,
   getPeers,
   getEnvs,
   getFuncs,
+  getUsers,
   createBackendStream,
 } from "@/lib/api";
 import type {
@@ -15,6 +18,7 @@ import type {
   PyEnvEntry,
   PyFuncEntry,
   BackendStreamEvent,
+  UserCard,
 } from "@/lib/types";
 
 // ── Helper: convert NodeBackend to NodeMeta for the self card ──
@@ -55,11 +59,25 @@ function EnvStatusBadge({ status }: { status: string }) {
   );
 }
 
+// ── KPI card ─────────────────────────────────────────────────
+function KpiCard({ label, value, sub, color }: { label: string; value: string; sub?: string; color?: string }) {
+  return (
+    <div className="glass-card p-4 flex-1 min-w-[140px]">
+      <span className="text-[10px] text-muted uppercase tracking-wider font-medium">{label}</span>
+      <p className="text-xl font-bold font-mono mt-1" style={{ color: color || "var(--foreground)" }}>
+        {value}
+      </p>
+      {sub && <p className="text-[11px] text-foreground-dim font-mono mt-0.5">{sub}</p>}
+    </div>
+  );
+}
+
 export default function NodesPage() {
   const [backend, setBackend] = useState<NodeBackend | null>(null);
   const [peers, setPeers] = useState<NodeMeta[]>([]);
   const [envs, setEnvs] = useState<PyEnvEntry[]>([]);
   const [funcs, setFuncs] = useState<PyFuncEntry[]>([]);
+  const [users, setUsers] = useState<UserCard[]>([]);
   const [loading, setLoading] = useState(true);
   const [sseConnected, setSseConnected] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -67,16 +85,18 @@ export default function NodesPage() {
   // ── Initial data fetch ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
     try {
-      const [backendRes, peersRes, envsRes, funcsRes] = await Promise.allSettled([
+      const [backendRes, peersRes, envsRes, funcsRes, usersRes] = await Promise.allSettled([
         getBackend(),
         getPeers(),
         getEnvs(),
         getFuncs(),
+        getUsers(),
       ]);
       if (backendRes.status === "fulfilled") setBackend(backendRes.value.backend);
       if (peersRes.status === "fulfilled") setPeers(peersRes.value.peers);
       if (envsRes.status === "fulfilled") setEnvs(envsRes.value.envs);
       if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
+      if (usersRes.status === "fulfilled") setUsers(usersRes.value.users);
     } finally {
       setLoading(false);
     }
@@ -123,6 +143,19 @@ export default function NodesPage() {
   for (const peer of peers) {
     allNodes.push({ node: peer, isSelf: false });
   }
+
+  // ── Aggregated KPIs ────────────────────────────────────────
+  const totalNodes = allNodes.length;
+  const totalCpuCores = (backend?.cpu_count ?? 0) + peers.reduce((sum, p) => sum + 0, 0);
+  // Weighted average CPU %: self backend has real data, peers have cpu_percent
+  const allCpuPercents = allNodes.map((n) => n.node.cpu_percent);
+  const clusterCpuPercent =
+    allCpuPercents.length > 0
+      ? allCpuPercents.reduce((a, b) => a + b, 0) / allCpuPercents.length
+      : 0;
+  const totalMemoryMb = (backend?.memory_total_mb ?? 0);
+  const totalGpus = (backend?.gpus.length ?? 0) + peers.reduce((sum, p) => sum + p.gpu_count, 0);
+  const totalActiveRuns = allNodes.reduce((sum, n) => sum + n.node.active_runs, 0);
 
   if (loading) {
     return (
@@ -179,6 +212,16 @@ export default function NodesPage() {
           </div>
         </div>
 
+        {/* Cluster KPIs */}
+        <div className="flex flex-wrap gap-3">
+          <KpiCard label="Total Nodes" value={String(totalNodes)} color="var(--frost)" />
+          <KpiCard label="CPU Cores" value={String(totalCpuCores)} sub={`${clusterCpuPercent.toFixed(1)}% avg`} />
+          <KpiCard label="Cluster CPU" value={`${clusterCpuPercent.toFixed(1)}%`} color={clusterCpuPercent > 80 ? "var(--rose)" : clusterCpuPercent > 50 ? "var(--amber)" : "var(--emerald)"} />
+          <KpiCard label="Total Memory" value={totalMemoryMb >= 1024 ? `${(totalMemoryMb / 1024).toFixed(1)} GB` : `${totalMemoryMb} MB`} />
+          <KpiCard label="GPUs" value={String(totalGpus)} color={totalGpus > 0 ? "var(--emerald)" : "var(--muted)"} />
+          <KpiCard label="Active Runs" value={String(totalActiveRuns)} color={totalActiveRuns > 0 ? "var(--amber)" : "var(--muted)"} />
+        </div>
+
         {/* Node grid */}
         {allNodes.length === 0 ? (
           <div className="text-center py-20">
@@ -187,7 +230,9 @@ export default function NodesPage() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {allNodes.map(({ node, isSelf }) => (
-              <NodeCard key={node.node_id} node={node} isSelf={isSelf} />
+              <Link key={node.node_id} href={`/nodes/${node.node_id}`} className="block">
+                <NodeCard node={node} isSelf={isSelf} />
+              </Link>
             ))}
           </div>
         )}
@@ -220,9 +265,48 @@ export default function NodesPage() {
         )}
       </div>
 
-      {/* ── Right sidebar: functions + environments ──────────── */}
+      {/* ── Right sidebar: functions + environments + users ──── */}
       <div className="w-72 border-l border-border shrink-0 overflow-y-auto bg-background-elevated/50">
         <div className="p-4 space-y-6">
+          {/* Users */}
+          <div>
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-muted mb-3 flex items-center gap-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4-4v2" />
+                <circle cx="9" cy="7" r="4" />
+                <path d="M23 21v-2a4 4 0 00-3-3.87" />
+                <path d="M16 3.13a4 4 0 010 7.75" />
+              </svg>
+              Users
+              <span className="ml-auto text-[10px] font-mono text-foreground-dim">
+                {users.length}
+              </span>
+            </h3>
+            {users.length === 0 ? (
+              <p className="text-xs text-muted/60 italic">No users connected</p>
+            ) : (
+              <div className="space-y-1.5">
+                {users.map((user) => (
+                  <div
+                    key={user.user_id}
+                    className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04] hover:bg-white/[0.04] hover:border-white/[0.08] transition-all"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className={`w-2 h-2 rounded-full shrink-0 ${user.online ? "status-online" : "status-offline"}`} />
+                      <span className="text-xs font-mono font-medium text-foreground truncate">
+                        {user.first_name || user.key}
+                      </span>
+                      <span className="text-[10px] text-muted ml-auto capitalize shrink-0">{user.role}</span>
+                    </div>
+                    {user.email && (
+                      <p className="text-[10px] text-muted mt-0.5 truncate pl-4">{user.email}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* Functions */}
           <div>
             <h3 className="text-[10px] font-bold uppercase tracking-widest text-muted mb-3 flex items-center gap-2">

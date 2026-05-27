@@ -10,10 +10,13 @@ const nextConfig: NextConfig = {
         source: "/api/v2/:path*",
         destination: `${BOT_API_URL}/api/v2/:path*`,
       },
-      // Proxy /api/card to the backend
       {
         source: "/api/card",
         destination: `${BOT_API_URL}/api/card`,
+      },
+      {
+        source: "/api/ping",
+        destination: `${BOT_API_URL}/api/ping`,
       },
     ];
   },

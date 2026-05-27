@@ -1,0 +1,347 @@
+"use client";
+
+import { useEffect, useState, useCallback } from "react";
+import { useParams } from "next/navigation";
+import Link from "next/link";
+import { ResourceBar } from "@/components/ResourceBar";
+import { getBackend, getEnvs, getFuncs, getNodeCard } from "@/lib/api";
+import type { NodeBackend, NodeCard, PyEnvEntry, PyFuncEntry } from "@/lib/types";
+
+function formatUptime(seconds: number): string {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function formatBytes(mb: number): string {
+  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+  return `${mb.toFixed(0)} MB`;
+}
+
+export default function NodeDetailPage() {
+  const params = useParams();
+  const nodeId = params.id as string;
+
+  const [backend, setBackend] = useState<NodeBackend | null>(null);
+  const [card, setCard] = useState<NodeCard | null>(null);
+  const [envs, setEnvs] = useState<PyEnvEntry[]>([]);
+  const [funcs, setFuncs] = useState<PyFuncEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+
+  const fetchAll = useCallback(async () => {
+    try {
+      const [backendRes, cardRes, envsRes, funcsRes] = await Promise.allSettled([
+        getBackend(),
+        getNodeCard(),
+        getEnvs(),
+        getFuncs(),
+      ]);
+      if (backendRes.status === "fulfilled") setBackend(backendRes.value.backend);
+      if (cardRes.status === "fulfilled") setCard(cardRes.value);
+      if (envsRes.status === "fulfilled") setEnvs(envsRes.value.envs);
+      if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
+
+      // Check if at least one call succeeded
+      const anySuccess = [backendRes, cardRes].some((r) => r.status === "fulfilled");
+      if (!anySuccess) setError(true);
+    } catch {
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+  }, [fetchAll]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <div className="text-center animate-in">
+          <div className="w-8 h-8 border-2 border-frost/30 border-t-frost rounded-full spin-slow mx-auto mb-4" />
+          <p className="text-sm text-muted font-mono">Loading node details...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || (!backend && !card)) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <div className="text-center animate-in space-y-4">
+          <div className="w-12 h-12 rounded-full bg-rose/10 flex items-center justify-center mx-auto">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--rose)" strokeWidth="2">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="15" y1="9" x2="9" y2="15" />
+              <line x1="9" y1="9" x2="15" y2="15" />
+            </svg>
+          </div>
+          <p className="text-sm text-muted">Backend unreachable</p>
+          <Link
+            href="/nodes"
+            className="inline-block text-xs text-frost hover:text-frost-dim transition-colors"
+          >
+            Back to Nodes
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  const memPercent = backend
+    ? (backend.memory_used_mb / backend.memory_total_mb) * 100
+    : 0;
+  const diskPercent = backend
+    ? (backend.disk_used_mb / backend.disk_total_mb) * 100
+    : 0;
+
+  return (
+    <div className="p-6 space-y-6 overflow-y-auto h-screen animate-in">
+      {/* Back link + header */}
+      <div className="flex items-center gap-4">
+        <Link
+          href="/nodes"
+          className="flex items-center gap-1.5 text-xs text-frost/70 hover:text-frost transition-colors"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+          Nodes
+        </Link>
+        <div className="flex items-center gap-3">
+          <span className="w-2.5 h-2.5 rounded-full status-online" />
+          <h1 className="text-xl font-bold font-mono text-foreground">{nodeId}</h1>
+        </div>
+      </div>
+
+      {/* Network info row */}
+      {card && (
+        <div className="glass-card p-5">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted mb-3">Network Info</h2>
+          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 text-sm">
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Role</span>
+              <p className="text-sm font-mono mt-0.5 capitalize text-frost">{card.role}</p>
+            </div>
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Version</span>
+              <p className="text-sm font-mono mt-0.5">v{card.version}</p>
+            </div>
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Uptime</span>
+              <p className="text-sm font-mono mt-0.5">{formatUptime(card.uptime_seconds)}</p>
+            </div>
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">URL</span>
+              <p className="text-sm font-mono mt-0.5 text-foreground-dim truncate">{card.url}</p>
+            </div>
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Platform</span>
+              <p className="text-sm font-mono mt-0.5">{card.platform}</p>
+            </div>
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Python</span>
+              <p className="text-sm font-mono mt-0.5">{card.python_version}</p>
+            </div>
+          </div>
+          {card.peers.length > 0 && (
+            <div className="mt-4 pt-3 border-t border-white/[0.04]">
+              <span className="text-[10px] text-muted uppercase tracking-wider">Connected Peers</span>
+              <div className="flex flex-wrap gap-2 mt-2">
+                {card.peers.map((p) => (
+                  <span key={p} className="text-[10px] font-mono px-2 py-1 rounded bg-white/[0.03] border border-white/[0.06] text-foreground-dim">
+                    {p}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Resource bars */}
+      {backend && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="glass-card p-5 space-y-4">
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-muted">CPU</h3>
+            <ResourceBar
+              label="Utilization"
+              value={backend.cpu_percent}
+              color="var(--frost)"
+              detail={`${backend.cpu_count} cores`}
+            />
+          </div>
+          <div className="glass-card p-5 space-y-4">
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-muted">Memory</h3>
+            <ResourceBar
+              label="Used"
+              value={memPercent}
+              color="var(--emerald)"
+              detail={`${formatBytes(backend.memory_used_mb)} / ${formatBytes(backend.memory_total_mb)}`}
+            />
+          </div>
+          <div className="glass-card p-5 space-y-4">
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-muted">Disk</h3>
+            <ResourceBar
+              label="Used"
+              value={diskPercent}
+              color="var(--amber)"
+              detail={`${formatBytes(backend.disk_used_mb)} / ${formatBytes(backend.disk_total_mb)}`}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* GPUs */}
+      {backend && backend.gpus.length > 0 && (
+        <div className="glass-card p-5 space-y-4">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted">GPUs</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {backend.gpus.map((gpu) => (
+              <div key={gpu.index} className="p-4 rounded-lg bg-white/[0.02] border border-white/[0.04] space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-mono font-medium text-foreground">{gpu.name}</span>
+                  <span className="text-[10px] text-muted">GPU {gpu.index}</span>
+                </div>
+                <ResourceBar
+                  label="Utilization"
+                  value={gpu.utilization_percent}
+                  color="var(--frost)"
+                />
+                <ResourceBar
+                  label="VRAM"
+                  value={(gpu.memory_used_mb / gpu.memory_total_mb) * 100}
+                  color="var(--emerald)"
+                  detail={`${formatBytes(gpu.memory_used_mb)} / ${formatBytes(gpu.memory_total_mb)}`}
+                />
+                <div className="flex items-center gap-2 text-[11px] text-muted">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z" />
+                  </svg>
+                  {gpu.temperature_c}C
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Functions and Environments */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Functions */}
+        <div className="glass-card p-5 space-y-3">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+            </svg>
+            Functions
+            <span className="ml-auto text-foreground-dim font-mono">{funcs.length}</span>
+          </h2>
+          {funcs.length === 0 ? (
+            <p className="text-xs text-muted/60 italic py-4">No functions registered</p>
+          ) : (
+            <div className="space-y-2 max-h-72 overflow-y-auto">
+              {funcs.map((f) => (
+                <div
+                  key={f.id}
+                  className="px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04]"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-mono font-medium text-foreground">{f.name}</span>
+                    <span className="text-[10px] text-muted font-mono">{f.run_count} runs</span>
+                  </div>
+                  {f.description && (
+                    <p className="text-[11px] text-muted mt-0.5">{f.description}</p>
+                  )}
+                  {f.dependencies.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-1.5">
+                      {f.dependencies.map((dep) => (
+                        <span key={dep} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-frost/5 text-frost/60">
+                          {dep}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Environments */}
+        <div className="glass-card p-5 space-y-3">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z" />
+              <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+              <line x1="12" y1="22.08" x2="12" y2="12" />
+            </svg>
+            Environments
+            <span className="ml-auto text-foreground-dim font-mono">{envs.length}</span>
+          </h2>
+          {envs.length === 0 ? (
+            <p className="text-xs text-muted/60 italic py-4">No environments created</p>
+          ) : (
+            <div className="space-y-2 max-h-72 overflow-y-auto">
+              {envs.map((env) => (
+                <div
+                  key={env.id}
+                  className="px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04]"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-mono font-medium text-foreground">{env.name}</span>
+                    <span
+                      className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
+                      style={{
+                        background: env.status === "ready" ? "rgba(52,211,153,0.1)" : env.status === "error" ? "rgba(244,63,94,0.1)" : "rgba(251,191,36,0.1)",
+                        color: env.status === "ready" ? "var(--emerald)" : env.status === "error" ? "var(--rose)" : "var(--amber)",
+                      }}
+                    >
+                      {env.status}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-1 text-[10px] text-muted font-mono">
+                    <span>Python {env.python_version}</span>
+                    {env.dependencies.length > 0 && (
+                      <span>{env.dependencies.length} deps</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Run stats */}
+      {backend && (
+        <div className="glass-card p-5">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted mb-3">Run Statistics</h2>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Active</span>
+              <p className="text-lg font-mono font-bold mt-0.5 text-frost">{backend.active_runs}</p>
+            </div>
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Total</span>
+              <p className="text-lg font-mono font-bold mt-0.5">{backend.total_runs}</p>
+            </div>
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Network Sent</span>
+              <p className="text-lg font-mono font-bold mt-0.5 text-foreground-dim">{formatBytes(backend.network.bytes_sent / 1048576)}</p>
+            </div>
+            <div>
+              <span className="text-[10px] text-muted uppercase tracking-wider">Network Recv</span>
+              <p className="text-lg font-mono font-bold mt-0.5 text-foreground-dim">{formatBytes(backend.network.bytes_recv / 1048576)}</p>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

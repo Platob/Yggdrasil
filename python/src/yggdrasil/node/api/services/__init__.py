@@ -6,6 +6,8 @@ from .pyenv import PyEnvService
 from .pyfunc import PyFuncService
 from .pyfuncrun import PyFuncRunService
 from .replicate import ReplicateService
+from .user import UserService
+from .messenger import MessengerService as V2MessengerService
 
 __all__ = [
     "BackendService",
@@ -16,4 +18,6 @@ __all__ = [
     "PyFuncService",
     "PyFuncRunService",
     "ReplicateService",
+    "UserService",
+    "V2MessengerService",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
 from threading import Lock
 
@@ -47,11 +48,20 @@ class PyFuncService:
                     updates["dependencies"] = list(req.dependencies)
                 if req.env_id is not None:
                     updates["env_id"] = req.env_id
+                hash_code = updates.get("code", existing.code)
+                hash_name = existing.name
+                hash_deps = updates.get("dependencies", list(existing.dependencies))
+                updates["content_hash"] = hashlib.sha256(
+                    (hash_code + hash_name + "".join(sorted(hash_deps))).encode()
+                ).hexdigest()
                 updated = existing.model_copy(update=updates)
                 self._funcs[existing.id] = updated
                 return PyFuncResponse(func=updated)
 
             func_id = make_id(req.name)
+            content_hash = hashlib.sha256(
+                (req.code + req.name + "".join(sorted(req.dependencies))).encode()
+            ).hexdigest()
             entry = PyFuncEntry(
                 id=func_id,
                 name=req.name,
@@ -62,6 +72,7 @@ class PyFuncService:
                 env_id=req.env_id,
                 created_at=now,
                 updated_at=now,
+                content_hash=content_hash,
             )
             self._funcs.set(func_id, entry)
             return PyFuncResponse(func=entry)
@@ -90,6 +101,13 @@ class PyFuncService:
             val = getattr(req, field)
             if val is not None:
                 updates[field] = list(val) if field == "dependencies" else val
+
+        hash_code = updates.get("code", entry.code)
+        hash_name = updates.get("name", entry.name)
+        hash_deps = updates.get("dependencies", list(entry.dependencies))
+        updates["content_hash"] = hashlib.sha256(
+            (hash_code + hash_name + "".join(sorted(hash_deps))).encode()
+        ).hexdigest()
 
         updated = entry.model_copy(update=updates)
         with self._lock:

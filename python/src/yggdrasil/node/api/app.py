@@ -12,11 +12,13 @@ from .routers import (
     card_router,
     dag_router,
     fs_router,
+    messenger_router,
     network_router,
     pyenv_router,
     pyfunc_router,
     pyfuncrun_router,
     replicate_router,
+    user_router,
 )
 from .services.backend import BackendService
 from .services.dag import DAGService
@@ -25,7 +27,9 @@ from .services.network import NetworkService
 from .services.pyenv import PyEnvService
 from .services.pyfunc import PyFuncService
 from .services.pyfuncrun import PyFuncRunService
+from .services.messenger import MessengerService as V2MessengerService
 from .services.replicate import ReplicateService
+from .services.user import UserService
 
 
 def create_api(settings: Settings | None = None) -> FastAPI:
@@ -56,6 +60,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     )
     network = NetworkService(settings, backend)
     replicate = ReplicateService(settings, pyenv, pyfunc, dag)
+    user_svc = UserService(settings)
+    v2_messenger = V2MessengerService(settings)
 
     app.state.pyenv_service = pyenv
     app.state.pyfunc_service = pyfunc
@@ -64,6 +70,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.state.backend_service = backend
     app.state.network_service = network
     app.state.replicate_service = replicate
+    app.state.user_service = user_svc
+    app.state.v2_messenger_service = v2_messenger
 
     # -- Middleware ----------------------------------------------------------
 
@@ -106,6 +114,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(network_router, prefix=f"{prefix}/network")
     app.include_router(replicate_router, prefix=f"{prefix}/replicate")
     app.include_router(fs_router, prefix=f"{prefix}/fs")
+    app.include_router(user_router, prefix=f"{prefix}/user")
+    app.include_router(messenger_router, prefix=f"{prefix}/messenger")
 
     return app
 

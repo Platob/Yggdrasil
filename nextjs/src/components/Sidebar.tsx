@@ -20,11 +20,23 @@ const Icons = {
       <path d="M12 12v4" />
     </svg>
   ),
+  chat: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+    </svg>
+  ),
+  files: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+    </svg>
+  ),
 };
 
 const NAV_ITEMS = [
   { href: "/", label: "Home", icon: Icons.home, exact: true },
   { href: "/nodes", label: "Nodes", icon: Icons.nodes },
+  { href: "/chat", label: "Chat", icon: Icons.chat },
+  { href: "/files", label: "Files", icon: Icons.files },
 ];
 
 export function Sidebar() {

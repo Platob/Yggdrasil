@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json as json_mod
 import logging
 import time
 from collections import OrderedDict, deque
@@ -52,16 +54,29 @@ class DAGService:
                 (d for d in self._dags.values() if d.name == req.name), None
             )
             if existing:
+                content_hash = hashlib.sha256(
+                    (existing.name
+                     + json_mod.dumps([s.model_dump() for s in req.steps], sort_keys=True)
+                     + json_mod.dumps([e.model_dump() for e in req.edges], sort_keys=True)
+                     ).encode()
+                ).hexdigest()
                 updated = existing.model_copy(update={
                     "description": req.description,
                     "steps": req.steps,
                     "edges": req.edges,
                     "updated_at": now,
+                    "content_hash": content_hash,
                 })
                 self._dags[existing.id] = updated
                 return DAGResponse(dag=updated)
 
             dag_id = make_id(req.name)
+            content_hash = hashlib.sha256(
+                (req.name
+                 + json_mod.dumps([s.model_dump() for s in req.steps], sort_keys=True)
+                 + json_mod.dumps([e.model_dump() for e in req.edges], sort_keys=True)
+                 ).encode()
+            ).hexdigest()
             entry = DAGEntry(
                 id=dag_id,
                 name=req.name,
@@ -70,6 +85,7 @@ class DAGService:
                 edges=req.edges,
                 created_at=now,
                 updated_at=now,
+                content_hash=content_hash,
             )
             self._dags[dag_id] = entry
             self._evict_dags()

@@ -82,23 +82,28 @@ Core concepts — workstation as remote executor/driver:
 
 | Prefix | Description |
 |--------|-------------|
+| `/api/ping` | Fast health check (`{pong: true, node_id}`) |
+| `/api/card` | Full node identity card (hardware, geo, counts) |
 | `/api/v2/pyenv` | PyEnv CRUD (create, get, list, update, delete) |
 | `/api/v2/pyfunc` | PyFunc CRUD |
 | `/api/v2/pyfuncrun` | PyFuncRun CRUD + `/logs` SSE + `/result` Arrow IPC |
 | `/api/v2/dag` | DAG CRUD + `/{id}/run` execution |
 | `/api/v2/backend` | Node metrics snapshot + `/history` + `/stream` SSE |
-| `/api/v2/network` | Self info + `/register` + `/peers` + `/role` + `/dispatch` + `/arrow` |
+| `/api/v2/network` | Self info + `/register` + `/peers` + `/role` + `/dispatch` + `/arrow` + `/ping` |
+| `/api/v2/fs` | Filesystem CRUD (ls, stat, read, write, delete, move, mkdir, stream, upload) |
+| `/api/v2/user` | User identity (`/me`, list, register from peers) |
+| `/api/v2/messenger` | Chat channels + messages + SSE streaming |
+| `/api/v2/replicate` | Export/import/push/pull node assets between nodes |
 
-## Frontend Routes
+## Frontend Routes (nextjs/)
 
 | Route | Description |
 |-------|-------------|
-| `/` | 3D globe welcome |
-| `/bot` | Bot dashboard — node info, registry |
-| `/bot/chat` | Messaging chat interface |
-| `/bot/execute` | Direct Python/shell code execution |
-| `/bot/network` | 3D network visualization |
-| `/msg` | Messaging channels |
+| `/` | 3D globe welcome with node card |
+| `/nodes` | Cluster dashboard — KPI aggregation + node grid + functions/envs sidebar |
+| `/nodes/[id]` | Per-node detail — resources, assets, replicated items |
+| `/chat` | Real-time messenger — channels, messages, SSE live updates |
+| `/files` | Filesystem browser — lazy directory listing, file preview |
 
 ## Python Decorator Framework
 
