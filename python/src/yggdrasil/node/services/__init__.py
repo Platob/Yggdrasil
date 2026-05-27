@@ -1,3 +1,4 @@
+from .ai import AIService
 from .call import CallService
 from .cmd import CmdService
 from .dag import DagService
@@ -7,12 +8,14 @@ from .environment import EnvironmentService
 from .filesystem import FilesystemService
 from .function import FunctionService
 from .job import JobService
+from .market import MarketService
 from .messenger import MessengerService
 from .monitor import MonitorService
 from .python import PythonExecService
 from .run import RunService
 
 __all__ = [
+    "AIService",
     "CallService",
     "CmdService",
     "DagService",
@@ -22,6 +25,7 @@ __all__ = [
     "FilesystemService",
     "FunctionService",
     "JobService",
+    "MarketService",
     "MessengerService",
     "MonitorService",
     "PythonExecService",

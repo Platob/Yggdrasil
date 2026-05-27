@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from .config import Settings, get_settings
 from .exceptions import register_exception_handlers
 from .routers import (
+    ai_router,
     call_router,
     cmd_router,
     dag_router,
@@ -17,12 +18,14 @@ from .routers import (
     filesystem_router,
     function_router,
     job_router,
+    market_router,
     messenger_router,
     monitor_router,
     python_router,
     run_router,
 )
 from .services import (
+    AIService,
     CallService,
     CmdService,
     DagService,
@@ -32,6 +35,7 @@ from .services import (
     FilesystemService,
     FunctionService,
     JobService,
+    MarketService,
     MessengerService,
     MonitorService,
     PythonExecService,
@@ -73,6 +77,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         run_service=app.state.run_service,
     )
     app.state.filesystem_service = FilesystemService(settings)
+    app.state.market_service = MarketService(settings)
+    app.state.ai_service = AIService(settings)
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -118,6 +124,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(monitor_router, prefix=f"{prefix}/monitor")
     app.include_router(dag_router, prefix=f"{prefix}/dag")
     app.include_router(filesystem_router, prefix=f"{prefix}/fs")
+    app.include_router(market_router, prefix=f"{prefix}/market")
+    app.include_router(ai_router, prefix=f"{prefix}/ai")
 
     return app
 

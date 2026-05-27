@@ -98,6 +98,40 @@ export interface CachedDashboard {
   cachedAt: string;
 }
 
+// -- Monitor --
+export interface NetworkSnapshot {
+  bytes_sent: number;
+  bytes_recv: number;
+  packets_sent: number;
+  packets_recv: number;
+  timestamp: string;
+}
+
+export interface ProcessInfo {
+  pid: number;
+  name: string;
+  cpu_percent: number;
+  memory_mb: number;
+  status: string;
+}
+
+export interface ResourceSnapshot {
+  cpu_percent: number;
+  memory_percent: number;
+  memory_used_mb: number;
+  memory_total_mb: number;
+  disk_percent: number;
+  network: NetworkSnapshot;
+  processes: ProcessInfo[];
+  timestamp: string;
+}
+
+export interface MonitorResponse {
+  node_id: string;
+  snapshot: ResourceSnapshot;
+  history: ResourceSnapshot[];
+}
+
 // -- Filesystem --
 export interface FileInfo {
   path: string;
@@ -331,6 +365,10 @@ export const node = {
   listDagRuns: (id: number) => fetchJSON<{ runs: DagRunEntry[] }>(`${NODE_BASE}/dag/${id}/run`),
   getDagRun: (dagId: number, runId: number) => fetchJSON<{ run: DagRunEntry }>(`${NODE_BASE}/dag/${dagId}/run/${runId}`),
 
+  // Monitor
+  getMonitor: (limit = 60): Promise<MonitorResponse> =>
+    fetchJSON(`${NODE_BASE}/monitor?limit=${limit}`),
+
   // Filesystem
   listDir: (path?: string) => fetchJSON<{ path: string; entries: FileInfo[] }>(`${NODE_BASE}/fs/ls?path=${encodeURIComponent(path || "")}`),
   readFile: (path: string) => fetchJSON<{ path: string; content: string; encoding: string }>(`${NODE_BASE}/fs/read?path=${encodeURIComponent(path)}`),
@@ -341,6 +379,34 @@ export const node = {
   // Clone
   cloneFunction: (id: number, name?: string) => fetchJSON<{ function: FunctionEntry }>(`${NODE_BASE}/function/${id}/clone`, { method: "POST", body: JSON.stringify({ name }) }),
   cloneEnvironment: (id: number, name?: string) => fetchJSON<{ environment: EnvironmentEntry }>(`${NODE_BASE}/environment/${id}/clone`, { method: "POST", body: JSON.stringify({ name }) }),
+
+  // Market — FX rates + watchlist
+  getWatchlist: (): Promise<WatchlistResponse> =>
+    fetchJSON(`${NODE_BASE}/market/watchlist`),
+  addToWatchlist: (pair: string): Promise<WatchlistResponse> =>
+    fetchJSON(`${NODE_BASE}/market/watchlist`, { method: "POST", body: JSON.stringify({ pair }) }),
+  removeFromWatchlist: (pair: string): Promise<WatchlistResponse> =>
+    fetchJSON(`${NODE_BASE}/market/watchlist/${encodeURIComponent(pair)}`, { method: "DELETE" }),
+  getWatchlistRates: (): Promise<FxLatestResponse> =>
+    fetchJSON(`${NODE_BASE}/market/watchlist/rates`),
+  getFxLatest: (pairs: string): Promise<FxLatestResponse> =>
+    fetchJSON(`${NODE_BASE}/market/fx/latest?pairs=${encodeURIComponent(pairs)}`),
+  getFxHistory: (pair: string, days = 30): Promise<FxHistoryResponse> =>
+    fetchJSON(`${NODE_BASE}/market/fx/history?pair=${encodeURIComponent(pair)}&days=${days}`),
+  convertFx: (amount: number, source: string, target: string): Promise<FxConvertResponse> =>
+    fetchJSON(`${NODE_BASE}/market/fx/convert?amount=${amount}&source=${encodeURIComponent(source)}&target=${encodeURIComponent(target)}`),
+
+  // AI — code analysis + run insights
+  analyzeCode: (code: string, language = "python", functionName = ""): Promise<CodeAnalysisResponse> =>
+    fetchJSON(`${NODE_BASE}/ai/analyze`, {
+      method: "POST",
+      body: JSON.stringify({ code, language, function_name: functionName }),
+    }),
+  analyzeRun: (status: string, duration?: number | null, stdout?: string | null, stderr?: string | null, returncode?: number | null): Promise<RunAnalysisResponse> =>
+    fetchJSON(`${NODE_BASE}/ai/run/analyze`, {
+      method: "POST",
+      body: JSON.stringify({ status, duration, stdout, stderr, returncode }),
+    }),
 };
 
 // =============================================================================
@@ -359,6 +425,100 @@ export const api = {
   // Cached dashboard data (aggregated from bot)
   getCachedDashboard: (): Promise<CachedDashboard> => fetchJSON(`${API_BASE}/cache/dashboard`),
 };
+
+// =============================================================================
+// Market API types
+// =============================================================================
+
+export interface FxRateEntry {
+  source: string;
+  target: string;
+  pair: string;
+  value: number;
+  from_timestamp: string;
+  to_timestamp: string;
+  sampling: string;
+}
+
+export interface FxLatestResponse {
+  rates: FxRateEntry[];
+  cached: boolean;
+  fetched_at: string;
+}
+
+export interface FxHistoryPoint {
+  from_timestamp: string;
+  to_timestamp: string;
+  value: number;
+}
+
+export interface FxHistoryResponse {
+  source: string;
+  target: string;
+  pair: string;
+  sampling: string;
+  points: FxHistoryPoint[];
+}
+
+export interface FxConvertResponse {
+  source: string;
+  target: string;
+  amount: number;
+  result: number;
+  rate: number;
+  at: string | null;
+}
+
+export interface WatchlistEntry {
+  pair: string;
+  source: string;
+  target: string;
+}
+
+export interface WatchlistResponse {
+  pairs: WatchlistEntry[];
+}
+
+// =============================================================================
+// AI API types
+// =============================================================================
+
+export interface CodeIssue {
+  line: number;
+  col: number;
+  severity: "error" | "warning" | "info";
+  category: string;
+  message: string;
+  suggestion: string;
+}
+
+export interface CodeAnalysis {
+  language: string;
+  loc: number;
+  complexity: number;
+  imports: string[];
+  suggested_deps: string[];
+  issues: CodeIssue[];
+  has_main: boolean;
+  has_return: boolean;
+  summary: string;
+  score: number;
+}
+
+export interface CodeAnalysisResponse {
+  analysis: CodeAnalysis;
+}
+
+export interface RunInsight {
+  status: string;
+  duration_label: string;
+  interpretation: string;
+  suggestions: string[];
+}
+
+export interface RunAnalysisResponse {
+  insight: RunInsight;
+}
 
 // =============================================================================
 // Legacy exports (for backward compatibility during migration)

@@ -24,6 +24,7 @@ class FunctionService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._functions: OrderedDict[int, FunctionEntry] = OrderedDict()
+        self._by_name: dict[str, int] = {}  # name -> id secondary index for O(1) lookup
         self._lock = Lock()
 
     # -- CRUD ---------------------------------------------------------------
@@ -36,10 +37,9 @@ class FunctionService:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
 
         with self._lock:
-            # Check if name already exists
-            existing = next(
-                (f for f in self._functions.values() if f.name == req.name), None
-            )
+            # O(1) name lookup via secondary index
+            existing_id = self._by_name.get(req.name)
+            existing = self._functions.get(existing_id) if existing_id is not None else None
             if existing:
                 # Update in place
                 updates: dict = {"updated_at": now}
@@ -74,6 +74,7 @@ class FunctionService:
                     updated_at=now,
                 )
                 self._functions[func_id] = entry
+                self._by_name[req.name] = func_id
                 self._evict()
                 LOGGER.info("Upserted function %r (name=%r, mode=create)", func_id, req.name)
                 return FunctionResponse(function=entry)
@@ -117,6 +118,10 @@ class FunctionService:
         updated = entry.model_copy(update=updates)
         with self._lock:
             self._functions[func_id] = updated
+            # Keep the name index consistent when name changes
+            if req.name is not None and req.name != entry.name:
+                self._by_name.pop(entry.name, None)
+                self._by_name[req.name] = func_id
 
         LOGGER.info("Updated function %r", func_id)
         return FunctionResponse(function=updated)
@@ -124,6 +129,8 @@ class FunctionService:
     async def delete(self, func_id: int) -> FunctionResponse:
         with self._lock:
             entry = self._functions.pop(func_id, None)
+            if entry is not None:
+                self._by_name.pop(entry.name, None)
         if entry is None:
             raise NotFoundError(f"Function {func_id!r} not found")
         LOGGER.info("Deleted function %r", func_id)
@@ -155,6 +162,7 @@ class FunctionService:
 
         with self._lock:
             self._functions[clone_id] = cloned
+            self._by_name[clone_name] = clone_id
             self._evict()
 
         LOGGER.info("Cloned function %r -> %r (name=%r)", func_id, clone_id, clone_name)

@@ -15,6 +15,14 @@ class NetworkSnapshot(StrictModel):
     timestamp: str = ""
 
 
+class ProcessInfo(StrictModel):
+    pid: int
+    name: str
+    cpu_percent: float
+    memory_mb: float
+    status: str
+
+
 class ResourceSnapshot(StrictModel):
     cpu_percent: float = 0.0
     memory_percent: float = 0.0
@@ -22,6 +30,7 @@ class ResourceSnapshot(StrictModel):
     memory_total_mb: float = 0.0
     disk_percent: float = 0.0
     network: NetworkSnapshot = Field(default_factory=NetworkSnapshot)
+    processes: list["ProcessInfo"] = Field(default_factory=list)
     timestamp: str = ""
 
 

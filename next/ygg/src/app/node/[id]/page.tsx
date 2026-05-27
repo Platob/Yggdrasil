@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, use } from "react";
-import { node as api, type NodeInfo } from "@/lib/api";
+import { node as api, type NodeInfo, type MonitorResponse, type ProcessInfo as APIProcessInfo } from "@/lib/api";
 import { YggdrasilLogo } from "@/components/logo";
 import Link from "next/link";
 
@@ -25,29 +25,27 @@ interface ProcessInfo {
   status: string;
 }
 
-// ── Mock data generators (replace with real API calls) ───────
-function generateMockMetrics(): SystemMetrics {
+function metricsFromMonitor(m: MonitorResponse["snapshot"]): SystemMetrics {
   return {
-    cpu: Math.random() * 60 + 10,
-    ram: Math.random() * 40 + 30,
-    ramUsed: 8 + Math.random() * 6,
-    ramTotal: 32,
-    gpu: Math.random() * 50 + 5,
-    gpuMemUsed: 2 + Math.random() * 4,
-    gpuMemTotal: 12,
-    gpuName: "NVIDIA RTX 4090",
+    cpu: m.cpu_percent,
+    ram: m.memory_percent,
+    ramUsed: m.memory_used_mb / 1024,
+    ramTotal: m.memory_total_mb / 1024,
+    gpu: 0,
+    gpuMemUsed: 0,
+    gpuMemTotal: 0,
+    gpuName: "N/A",
   };
 }
 
-function generateMockProcesses(): ProcessInfo[] {
-  const names = ["python", "yggdrasil", "node", "chromium", "nvdriver", "postgres"];
-  return names.map((name, i) => ({
-    pid: 1000 + i * 123,
-    name,
-    cpu: Math.random() * 25,
-    ram: Math.random() * 500 + 50,
-    status: Math.random() > 0.1 ? "running" : "sleeping",
-  })).sort((a, b) => b.cpu - a.cpu);
+function procsFromMonitor(procs: APIProcessInfo[]): ProcessInfo[] {
+  return procs.map((p) => ({
+    pid: p.pid,
+    name: p.name,
+    cpu: p.cpu_percent,
+    ram: p.memory_mb,
+    status: p.status,
+  }));
 }
 
 // ── Time Plot Component ──────────────────────────────────────
@@ -284,16 +282,23 @@ export default function NodeDetailPage({ params }: { params: Promise<{ id: strin
   }, [id]);
 
   // Periodic metrics fetch — only for local nodes (live resource monitoring)
-  const fetchMetrics = useCallback(() => {
-    // TODO: Replace with real API call when bot is connected: bot.getSystemMetrics()
-    const m = generateMockMetrics();
-    setMetrics(m);
-    setCpuHistory((prev) => [...prev.slice(1), m.cpu]);
-    setRamHistory((prev) => [...prev.slice(1), m.ram]);
-    setGpuHistory((prev) => [...prev.slice(1), m.gpu]);
-
-    // TODO: Replace with real API call: bot.getProcesses()
-    setProcesses(generateMockProcesses());
+  const fetchMetrics = useCallback(async () => {
+    try {
+      const monData = await api.getMonitor(60);
+      const m = metricsFromMonitor(monData.snapshot);
+      setMetrics(m);
+      setCpuHistory((prev) => [...prev.slice(1), m.cpu]);
+      setRamHistory((prev) => [...prev.slice(1), m.ram]);
+      setGpuHistory((prev) => [...prev.slice(1), m.gpu]);
+      setProcesses(procsFromMonitor(monData.snapshot.processes || []));
+    } catch {
+      // Demo fallback when monitor unavailable
+      const m: SystemMetrics = { cpu: Math.random() * 60 + 10, ram: Math.random() * 40 + 30, ramUsed: 8 + Math.random() * 6, ramTotal: 32, gpu: 0, gpuMemUsed: 0, gpuMemTotal: 0, gpuName: "N/A" };
+      setMetrics(m);
+      setCpuHistory((prev) => [...prev.slice(1), m.cpu]);
+      setRamHistory((prev) => [...prev.slice(1), m.ram]);
+      setGpuHistory((prev) => [...prev.slice(1), 0]);
+    }
   }, []);
 
   useEffect(() => {

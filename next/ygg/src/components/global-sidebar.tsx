@@ -138,9 +138,11 @@ const SERVICES: ServiceSection[] = [
   {
     id: "trading",
     label: "Trading",
-    prefix: "/trading",
+    prefix: "/node/market",
     icon: Icon.chart,
-    items: [],
+    items: [
+      { href: "/node/market", label: "FX Rates", icon: Icon.chart, exact: true },
+    ],
   },
 ];
 

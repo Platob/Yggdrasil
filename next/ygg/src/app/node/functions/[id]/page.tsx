@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, use, useCallback } from "react";
-import { node as api, type FunctionEntry, type RunEntry, type EnvironmentEntry } from "@/lib/api";
+import { node as api, type FunctionEntry, type RunEntry, type EnvironmentEntry, type CodeAnalysis, type CodeIssue } from "@/lib/api";
 import { formatRelative, formatDuration } from "@/lib/time";
 import Link from "next/link";
 
@@ -152,6 +152,132 @@ function RunningLogs({ runId, onComplete }: { runId: number; onComplete: () => v
         {logs.length > 0 ? logs.join("\n") : "Waiting for output..."}
       </pre>
       <div ref={logsEndRef} />
+    </div>
+  );
+}
+
+// ── AI Analysis Panel ─────────────────────────────────────────
+function AIAnalysisPanel({ code, language }: { code: string; language: string }) {
+  const [analysis, setAnalysis] = useState<CodeAnalysis | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+
+  async function runAnalysis() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await api.analyzeCode(code, language);
+      setAnalysis(res.analysis);
+      setOpen(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const scoreColor = analysis
+    ? analysis.score >= 80 ? "var(--success)" : analysis.score >= 50 ? "var(--warning)" : "var(--destructive)"
+    : "var(--muted)";
+
+  const severityColor = (s: CodeIssue["severity"]) =>
+    s === "error" ? "var(--destructive)" : s === "warning" ? "var(--warning)" : "var(--muted)";
+
+  return (
+    <div className="nordic-card overflow-hidden">
+      <button
+        onClick={open ? () => setOpen(false) : runAnalysis}
+        className="w-full p-4 flex items-center justify-between hover:bg-card-hover transition-colors text-left"
+      >
+        <div className="flex items-center gap-2">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--primary)" }}>
+            <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+          <span className="text-sm font-medium text-foreground">AI Code Analysis</span>
+          {loading && <div className="w-3 h-3 border border-primary border-t-transparent rounded-full animate-spin" />}
+          {analysis && !loading && (
+            <span className="text-xs font-mono font-semibold px-1.5 py-0.5 rounded" style={{ color: scoreColor, background: `color-mix(in srgb, ${scoreColor} 15%, transparent)` }}>
+              Score {analysis.score}/100
+            </span>
+          )}
+        </div>
+        {!analysis && !loading && (
+          <span className="text-xs text-muted btn-ghost px-2 py-1 rounded">Analyze</span>
+        )}
+        {analysis && (
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+            className="text-muted transition-transform" style={{ transform: open ? "rotate(180deg)" : "rotate(0)" }}>
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        )}
+      </button>
+
+      {error && (
+        <div className="px-4 pb-3 text-xs text-destructive">{error}</div>
+      )}
+
+      {open && analysis && (
+        <div className="border-t border-border p-4 space-y-4">
+          {/* Summary */}
+          <p className="text-xs text-muted">{analysis.summary}</p>
+
+          {/* Metrics */}
+          <div className="grid grid-cols-3 gap-3">
+            {[
+              { label: "Lines", value: String(analysis.loc) },
+              { label: "Complexity", value: String(analysis.complexity) },
+              { label: "Imports", value: String(analysis.imports.length) },
+            ].map((m) => (
+              <div key={m.label} className="bg-border/20 rounded-lg p-2.5 text-center">
+                <p className="text-lg font-mono font-bold text-foreground">{m.value}</p>
+                <p className="text-[10px] text-muted uppercase tracking-wider">{m.label}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Suggested deps */}
+          {analysis.suggested_deps.length > 0 && (
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-muted mb-1.5">Third-party imports</p>
+              <div className="flex flex-wrap gap-1.5">
+                {analysis.suggested_deps.map((dep) => (
+                  <span key={dep} className="text-[11px] font-mono px-2 py-0.5 rounded bg-primary/10 text-primary border border-primary/20">{dep}</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Issues */}
+          {analysis.issues.length > 0 && (
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-muted mb-1.5">{analysis.issues.length} issue{analysis.issues.length !== 1 ? "s" : ""}</p>
+              <div className="space-y-1.5">
+                {analysis.issues.map((issue, i) => (
+                  <div key={i} className="flex items-start gap-2 text-xs p-2 rounded-lg bg-border/20">
+                    <span className="shrink-0 font-mono text-[10px]" style={{ color: severityColor(issue.severity) }}>
+                      L{issue.line} {issue.severity.toUpperCase()}
+                    </span>
+                    <div className="min-w-0">
+                      <p style={{ color: severityColor(issue.severity) }}>{issue.message}</p>
+                      {issue.suggestion && <p className="text-muted mt-0.5">{issue.suggestion}</p>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {analysis.issues.length === 0 && (
+            <p className="text-xs text-success flex items-center gap-1.5">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+              No issues found
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -308,6 +434,9 @@ export default function FunctionDetailPage({ params }: { params: Promise<{ id: s
         <h2 className="text-xs font-medium text-muted uppercase tracking-wider mb-2">Source Code</h2>
         <pre className="code-block p-4 overflow-x-auto whitespace-pre-wrap">{fn.code}</pre>
       </div>
+
+      {/* AI Analysis */}
+      <AIAnalysisPanel code={fn.code} language={fn.language} />
 
       {/* Streaming Logs for active run */}
       {streamingRunId && (

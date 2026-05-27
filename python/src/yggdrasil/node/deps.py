@@ -2,18 +2,20 @@ from __future__ import annotations
 
 from fastapi import Request
 
+from .services.ai import AIService
 from .services.call import CallService
 from .services.cmd import CmdService
 from .services.dag import DagService
 from .services.discovery import DiscoveryService
 from .services.env import EnvService
 from .services.environment import EnvironmentService
+from .services.filesystem import FilesystemService
 from .services.function import FunctionService
 from .services.job import JobService
+from .services.market import MarketService
 from .services.messenger import MessengerService
 from .services.monitor import MonitorService
 from .services.python import PythonExecService
-from .services.filesystem import FilesystemService
 from .services.run import RunService
 
 
@@ -67,3 +69,11 @@ def get_filesystem_service(request: Request) -> FilesystemService:
 
 def get_monitor_service(request: Request) -> MonitorService:
     return request.app.state.monitor_service
+
+
+def get_market_service(request: Request) -> MarketService:
+    return request.app.state.market_service
+
+
+def get_ai_service(request: Request) -> AIService:
+    return request.app.state.ai_service

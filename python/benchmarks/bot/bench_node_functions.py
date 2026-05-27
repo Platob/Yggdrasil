@@ -43,19 +43,36 @@ async def bench_function_crud(n: int = 100) -> None:
 
 
 async def bench_monitor_snapshot(n: int = 1000) -> None:
-    """Benchmark monitor snapshot collection."""
+    """Benchmark monitor snapshot collection.
+
+    Two paths:
+    - cached: debounce hit (< 0.5s since last collect) — just returns in-memory snapshot
+    - uncached: full psutil collection including process tracking
+    """
     from yggdrasil.node.services.monitor import MonitorService
 
     service = MonitorService(Settings(), history_size=n)
-    start = time.perf_counter()
 
+    # Seed first snapshot
+    service.snapshot()
+
+    # Cached path: do NOT reset _last_collect
+    start = time.perf_counter()
     for _ in range(n):
         service.snapshot()
-        service._last_collect = 0  # force re-collect
+    cached_elapsed = time.perf_counter() - start
 
-    elapsed = time.perf_counter() - start
-    print(f"\nMonitor snapshots (n={n}):")
-    print(f"  total: {elapsed:.4f}s ({n / elapsed:.0f} ops/s)")
+    # Uncached path: force re-collect each time
+    uncached_n = min(n, 20)
+    start = time.perf_counter()
+    for _ in range(uncached_n):
+        service.snapshot()
+        service._last_collect = 0
+    uncached_elapsed = time.perf_counter() - start
+
+    print(f"\nMonitor snapshots:")
+    print(f"  cached   (n={n}): {cached_elapsed:.4f}s ({n / cached_elapsed:.0f} ops/s)")
+    print(f"  uncached (n={uncached_n}): {uncached_elapsed:.4f}s ({uncached_n / uncached_elapsed:.0f} ops/s) [psutil full scan]")
 
 
 if __name__ == "__main__":

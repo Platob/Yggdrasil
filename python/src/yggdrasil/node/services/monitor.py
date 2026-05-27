@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from threading import Lock
 
 from ..config import Settings
-from ..schemas.monitor import NetworkSnapshot, ResourceSnapshot
+from ..schemas.monitor import NetworkSnapshot, ProcessInfo, ResourceSnapshot
 
 
 class MonitorService:
@@ -19,15 +19,15 @@ class MonitorService:
 
     def snapshot(self) -> ResourceSnapshot:
         now = time.monotonic()
-        if now - self._last_collect < 0.5:
-            with self._lock:
-                if self._history:
-                    return self._history[-1]
+        with self._lock:
+            if now - self._last_collect < 0.5 and self._history:
+                return self._history[-1]
+            # Claim the collect slot inside the lock to prevent concurrent collects.
+            self._last_collect = now
 
         snap = self._collect()
         with self._lock:
             self._history.append(snap)
-            self._last_collect = now
         return snap
 
     def history(self, limit: int = 60) -> list[ResourceSnapshot]:
@@ -48,6 +48,22 @@ class MonitorService:
         disk = psutil.disk_usage("/")
         net = psutil.net_io_counters()
 
+        # Collect top-5 processes by CPU usage
+        procs: list[ProcessInfo] = []
+        for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info', 'status']):
+            try:
+                info = p.info
+                procs.append(ProcessInfo(
+                    pid=info['pid'],
+                    name=info['name'] or '',
+                    cpu_percent=info['cpu_percent'] or 0.0,
+                    memory_mb=(info['memory_info'].rss / (1024 * 1024)) if info['memory_info'] else 0.0,
+                    status=info['status'] or '',
+                ))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        top_procs = sorted(procs, key=lambda x: x.cpu_percent, reverse=True)[:5]
+
         return ResourceSnapshot(
             cpu_percent=cpu,
             memory_percent=mem.percent,
@@ -61,5 +77,6 @@ class MonitorService:
                 packets_recv=net.packets_recv,
                 timestamp=ts,
             ),
+            processes=top_procs,
             timestamp=ts,
         )
