@@ -123,15 +123,9 @@ def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
         if rewritten is not None:
             result = result.filter(rewritten)
 
-    # Projection — use Tabular.select() (routes to Spark/Arrow natively)
-    if node.projections and not has_group:
-        cols = [
-            (p.expr if isinstance(p, Alias) else p).name
-            for p in node.projections
-            if isinstance(p.expr if isinstance(p, Alias) else p, Column)
-        ]
-        if cols and len(cols) == len(node.projections):
-            result = result.select(*cols)
+    # Projection — apply scalar functions via Arrow kernels, then select
+    if node.projections and not has_agg:
+        result = _apply_projections(result, node.projections)
 
     # DISTINCT
     if node.distinct:
@@ -319,6 +313,65 @@ def _rewrite_having(having: Any, result: "Tabular", agg_alias_map: dict) -> Any:
 
     rewritten = _rw(having)
     return None if any(isinstance(n, FunctionCall) for n in walk(rewritten)) else rewritten
+
+
+def _apply_projections(result: "Tabular", projections: list) -> "Tabular":
+    """Apply SELECT projections: columns pass through, FunctionCall nodes
+    execute via Arrow kernels from the function registry."""
+    from yggdrasil.arrow.tabular import ArrowTabular
+    from yggdrasil.execution.expr.nodes import Alias, Column, FunctionCall, Literal, Star
+    from .func_registry import BUILTIN_REGISTRY
+
+    if any(isinstance(p.expr if isinstance(p, Alias) else p, Star) for p in projections):
+        return result
+
+    # Fast path: all simple columns
+    simple_cols = []
+    has_func = False
+    for p in projections:
+        expr = p.expr if isinstance(p, Alias) else p
+        if isinstance(expr, Column):
+            simple_cols.append(expr.name)
+        elif isinstance(expr, FunctionCall):
+            has_func = True
+        else:
+            return result
+
+    if not has_func and simple_cols and len(simple_cols) == len(projections):
+        return result.select(*simple_cols)
+
+    # Slow path: materialize table and apply function kernels column by column
+    table = result.read_arrow_table()
+    out_arrays: list[pa.Array] = []
+    out_names: list[str] = []
+    for p in projections:
+        out_name = p.name if isinstance(p, Alias) else None
+        expr = p.expr if isinstance(p, Alias) else p
+
+        if isinstance(expr, Column):
+            out_names.append(out_name or expr.name)
+            out_arrays.append(table.column(expr.name))
+        elif isinstance(expr, FunctionCall):
+            args = []
+            for a in expr.args:
+                if isinstance(a, Column):
+                    args.append(table.column(a.name))
+                elif isinstance(a, Literal):
+                    args.append(a.value)
+                else:
+                    return result
+            arr = BUILTIN_REGISTRY.apply_arrow(expr.name, *args)
+            if arr is None:
+                return result
+            out_names.append(out_name or expr.name.lower())
+            out_arrays.append(arr)
+        elif isinstance(expr, Literal):
+            out_names.append(out_name or str(expr.value))
+            out_arrays.append(pa.array([expr.value] * table.num_rows))
+        else:
+            return result
+
+    return ArrowTabular(pa.table(dict(zip(out_names, out_arrays))))
 
 
 def _exec_insert(node: InsertNode, tables: dict[str, "Tabular"]) -> "Tabular":

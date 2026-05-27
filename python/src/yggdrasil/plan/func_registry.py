@@ -1,14 +1,33 @@
-"""SQL function registry — canonical catalog of known functions."""
+"""SQL function registry with Arrow-native UDF execution.
+
+:class:`FunctionRegistry` maps SQL function names to Arrow compute
+kernels.  Built-in functions (UPPER, LOWER, ABS, …) are pre-wired
+to ``pyarrow.compute`` kernels.  User-defined functions register a
+Python callable that operates on ``pa.Array`` arguments and returns
+a ``pa.Array``.
+
+The same kernels auto-register in Spark via ``spark.udf.register``
+when :meth:`FunctionRegistry.register_in_spark` is called, wrapping
+the Arrow callable in a ``pandas_udf`` so data stays columnar.
+"""
 
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+from typing import Any, Callable, TYPE_CHECKING
+
+import pyarrow as pa
+import pyarrow.compute as pc
+
+if TYPE_CHECKING:
+    pass
 
 __all__ = ["FunctionRegistry", "FunctionMeta", "BUILTIN_REGISTRY"]
 
+ArrowKernel = Callable[..., pa.Array]
 
-@dataclasses.dataclass(slots=True, frozen=True)
+
+@dataclasses.dataclass(slots=True)
 class FunctionMeta:
     name: str
     category: str
@@ -16,6 +35,7 @@ class FunctionMeta:
     max_args: int | None = None
     deterministic: bool = True
     special_syntax: str | None = None
+    kernel: ArrowKernel | None = None
 
 
 class FunctionRegistry:
@@ -26,12 +46,20 @@ class FunctionRegistry:
 
     def register(self, name: str, *, category: str = "udf", min_args: int = 0,
                  max_args: int | None = None, deterministic: bool = True,
-                 special_syntax: str | None = None) -> FunctionMeta:
+                 special_syntax: str | None = None,
+                 kernel: ArrowKernel | None = None) -> FunctionMeta:
         meta = FunctionMeta(name=(u := name.upper()), category=category,
                             min_args=min_args, max_args=max_args,
-                            deterministic=deterministic, special_syntax=special_syntax)
+                            deterministic=deterministic, special_syntax=special_syntax,
+                            kernel=kernel)
         self._functions[u] = meta
         return meta
+
+    def register_udf(self, name: str, kernel: ArrowKernel, *,
+                     min_args: int = 1, max_args: int | None = None) -> FunctionMeta:
+        """Register a user-defined Arrow-array function."""
+        return self.register(name, category="udf", min_args=min_args,
+                             max_args=max_args, kernel=kernel)
 
     def get(self, name: str) -> FunctionMeta | None: return self._functions.get(name.upper())
     def is_known(self, name: str) -> bool: return name.upper() in self._functions
@@ -39,16 +67,165 @@ class FunctionRegistry:
     def __contains__(self, name: str) -> bool: return self.is_known(name)
     def __len__(self) -> int: return len(self._functions)
 
+    def apply_arrow(self, name: str, *arrays: pa.Array) -> pa.Array | None:
+        """Execute function on Arrow arrays. Returns None if no kernel."""
+        meta = self._functions.get(name.upper())
+        if meta is None or meta.kernel is None:
+            return None
+        return meta.kernel(*arrays)
+
+    def apply_table(self, name: str, table: pa.Table,
+                    col_names: list[str]) -> pa.Array | None:
+        """Convenience: extract named columns and apply kernel."""
+        meta = self._functions.get(name.upper())
+        if meta is None or meta.kernel is None:
+            return None
+        arrays = [table.column(c) for c in col_names]
+        return meta.kernel(*arrays)
+
+    def register_in_spark(self, spark_session: Any) -> int:
+        """Register all kerneled functions as Spark SQL UDFs.
+
+        Uses ``pandas_udf`` so data stays columnar (Arrow-backed).
+        Returns the number of functions registered.
+        """
+        count = 0
+        for meta in self._functions.values():
+            if meta.kernel is None:
+                continue
+            try:
+                _register_spark_udf(spark_session, meta)
+                count += 1
+            except Exception:
+                pass
+        return count
+
     def copy(self) -> "FunctionRegistry":
         r = FunctionRegistry(); r._functions = dict(self._functions); return r
 
+
+def _register_spark_udf(spark: Any, meta: FunctionMeta) -> None:
+    from pyspark.sql.functions import pandas_udf
+    from pyspark.sql.types import StringType
+
+    kernel = meta.kernel
+
+    @pandas_udf(StringType())
+    def _udf(*cols):
+        arrays = [pa.array(c) for c in cols]
+        result = kernel(*arrays)
+        return result.to_pandas()
+
+    spark.udf.register(meta.name, _udf)
+
+
+# ---------------------------------------------------------------------------
+# Arrow compute kernel mappings for common SQL functions
+# ---------------------------------------------------------------------------
+
+def _k1(fn: str) -> ArrowKernel:
+    """Single-arg pyarrow.compute kernel."""
+    f = getattr(pc, fn)
+    return lambda a: f(a)
+
+def _k2(fn: str) -> ArrowKernel:
+    """Two-arg pyarrow.compute kernel."""
+    f = getattr(pc, fn)
+    return lambda a, b: f(a, b)
+
+_ARROW_KERNELS: dict[str, ArrowKernel] = {
+    # String
+    "UPPER": _k1("utf8_upper"),
+    "LOWER": _k1("utf8_lower"),
+    "LENGTH": _k1("utf8_length"),
+    "CHAR_LENGTH": _k1("utf8_length"),
+    "TRIM": _k1("utf8_trim_whitespace"),
+    "LTRIM": _k1("utf8_ltrim_whitespace"),
+    "RTRIM": _k1("utf8_rtrim_whitespace"),
+    "REVERSE": _k1("utf8_reverse"),
+    "ASCII": _k1("utf8_length"),
+    "INITCAP": _k1("utf8_capitalize"),
+    "REPLACE": lambda a, old, new: pc.utf8_replace_substring(a, pattern=old.as_py() if hasattr(old, 'as_py') else str(old), replacement=new.as_py() if hasattr(new, 'as_py') else str(new)),
+
+    # Math
+    "ABS": _k1("abs"),
+    "CEIL": _k1("ceil"),
+    "CEILING": _k1("ceil"),
+    "FLOOR": _k1("floor"),
+    "ROUND": lambda a, n=None: pc.round(a, ndigits=n.as_py() if n is not None and hasattr(n, 'as_py') else 0 if n is None else int(n)),
+    "SQRT": _k1("sqrt"),
+    "LN": _k1("ln"),
+    "LOG10": _k1("log10"),
+    "LOG2": _k1("log2"),
+    "EXP": _k1("exp"),
+    "SIGN": _k1("sign"),
+    "SIGNUM": _k1("sign"),
+    "SIN": _k1("sin"),
+    "COS": _k1("cos"),
+    "TAN": _k1("tan"),
+    "ASIN": _k1("asin"),
+    "ACOS": _k1("acos"),
+    "ATAN": _k1("atan"),
+    "ATAN2": _k2("atan2"),
+    "POWER": _k2("power"),
+    "POW": _k2("power"),
+
+    # Null handling
+    "COALESCE": lambda *arrays: _coalesce_arrow(*arrays),
+    "IFNULL": lambda a, b: pc.if_else(pc.is_null(a), b, a),
+    "NVL": lambda a, b: pc.if_else(pc.is_null(a), b, a),
+    "NULLIF": lambda a, b: pc.if_else(pc.equal(a, b), pa.scalar(None, type=a.type), a),
+
+    # Conditional
+    "IF": lambda cond, t, f: pc.if_else(cond, t, f),
+
+    # Type
+    "ISNULL": lambda a: pc.is_null(a),
+    "ISNOTNULL": lambda a: pc.invert(pc.is_null(a)),
+
+    # Date/time extraction
+    "YEAR": _k1("year"),
+    "MONTH": _k1("month"),
+    "DAY": _k1("day"),
+    "HOUR": _k1("hour"),
+    "MINUTE": _k1("minute"),
+    "SECOND": _k1("second"),
+    "DAYOFWEEK": _k1("day_of_week"),
+    "DAYOFYEAR": lambda a: pc.add(pc.day_of_year(a), 0),
+    "QUARTER": _k1("quarter"),
+    "WEEKOFYEAR": _k1("iso_calendar"),
+
+    # Aggregates (these work on arrays and return scalars)
+    "SUM": _k1("sum"),
+    "MIN": _k1("min"),
+    "MAX": _k1("max"),
+    "COUNT": lambda a: pa.scalar(len(a) - a.null_count, type=pa.int64()),
+    "AVG": _k1("mean"),
+    "MEAN": _k1("mean"),
+}
+
+
+def _coalesce_arrow(*arrays: pa.Array) -> pa.Array:
+    result = arrays[0]
+    for arr in arrays[1:]:
+        if isinstance(arr, pa.Scalar):
+            arr = pa.array([arr.as_py()] * len(result), type=result.type)
+        result = pc.if_else(pc.is_null(result), arr, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Build the registry
+# ---------------------------------------------------------------------------
 
 def _build() -> FunctionRegistry:
     r = FunctionRegistry()
 
     def _b(cat: str, fns: dict[str, tuple[int, int | None]], **kw: Any) -> None:
         for n, (mn, mx) in fns.items():
-            r.register(n, category=cat, min_args=mn, max_args=mx, **kw)
+            kernel = _ARROW_KERNELS.get(n)
+            r.register(n, category=cat, min_args=mn, max_args=mx,
+                       kernel=kernel, **kw)
 
     _b("aggregate", {"COUNT": (0, 1), "SUM": (1, 1), "AVG": (1, 1), "MIN": (1, 1),
         "MAX": (1, 1), "MEAN": (1, 1), "STDDEV": (1, 1), "STDDEV_POP": (1, 1),
@@ -125,26 +302,19 @@ def _build() -> FunctionRegistry:
     _b("generator", {"EXPLODE": (1, 1), "POSEXPLODE": (1, 1), "INLINE": (1, 1),
         "STACK": (2, None), "EXPLODE_OUTER": (1, 1), "POSEXPLODE_OUTER": (1, 1),
         "INLINE_OUTER": (1, 1)})
-
     _b("type", {"CAST": (1, 1), "TRY_CAST": (1, 2), "TYPEOF": (1, 1)})
-
     _b("json", {"FROM_JSON": (2, 3), "TO_JSON": (1, 2), "SCHEMA_OF_JSON": (1, 2),
         "GET_JSON_OBJECT": (2, 2), "JSON_TUPLE": (2, None), "JSON_ARRAY_LENGTH": (1, 1)})
-
     _b("higher_order", {"TRANSFORM": (2, 2), "FILTER": (2, 2), "AGGREGATE": (3, 4),
         "EXISTS": (2, 2), "FORALL": (2, 2), "ZIP_WITH": (3, 3), "REDUCE": (3, 4)})
-
     _b("hash", {"HASH": (1, None), "XXHASH64": (1, None), "MD5": (1, 1),
         "SHA1": (1, 1), "SHA": (1, 1), "SHA2": (2, 2), "CRC32": (1, 1)})
-
     _b("conditional", {"IF": (3, 3), "IIF": (3, 3)})
-
     _b("misc", {"UUID": (0, 0), "INPUT_FILE_NAME": (0, 0),
         "MONOTONICALLY_INCREASING_ID": (0, 0), "SPARK_PARTITION_ID": (0, 0),
         "CURRENT_USER": (0, 0), "CURRENT_CATALOG": (0, 0), "CURRENT_DATABASE": (0, 0),
         "CURRENT_SCHEMA": (0, 0), "VERSION": (0, 0), "ASSERT_TRUE": (1, 2),
         "RAISE_ERROR": (1, 1)}, deterministic=False)
-
     r.register("INTERVAL", category="datetime", min_args=1, max_args=2,
                special_syntax="INTERVAL 'value' unit")
     return r

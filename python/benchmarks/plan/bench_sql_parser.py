@@ -195,6 +195,46 @@ def bench_registry(repeat: int = 5) -> None:
               repeat=repeat, inner=50000)
 
 
+def bench_udf_execution(repeat: int = 5) -> None:
+    from yggdrasil.arrow.tabular import ArrowTabular
+    from yggdrasil.plan import parse_sql
+    from yggdrasil.plan.func_registry import BUILTIN_REGISTRY
+
+    print("\n=== UDF / Arrow Kernel Execution ===")
+
+    rows = 10_000
+    table = pa.table({
+        "name": [f"user_{i}" for i in range(rows)],
+        "score": [50.5 + (i * 7) % 51 for i in range(rows)],
+        "val": [float(i) for i in range(rows)],
+    })
+    source = ArrowTabular(table)
+    tables = {"t": source}
+
+    _time_one("UPPER(name) 10k rows",
+              lambda: parse_sql("SELECT UPPER(name) AS u FROM t").execute(tables=tables).read_arrow_table(),
+              repeat=repeat, inner=100)
+    _time_one("ABS(score) 10k rows",
+              lambda: parse_sql("SELECT ABS(score) AS a FROM t").execute(tables=tables).read_arrow_table(),
+              repeat=repeat, inner=100)
+    _time_one("SQRT(val) 10k rows",
+              lambda: parse_sql("SELECT SQRT(val) AS s FROM t").execute(tables=tables).read_arrow_table(),
+              repeat=repeat, inner=100)
+    _time_one("COALESCE(score, val) 10k",
+              lambda: parse_sql("SELECT COALESCE(score, val) AS c FROM t").execute(tables=tables).read_arrow_table(),
+              repeat=repeat, inner=100)
+    _time_one("id+UPPER+ABS 10k (3 cols)",
+              lambda: parse_sql("SELECT UPPER(name) AS u, ABS(score) AS a, SQRT(val) AS s FROM t").execute(tables=tables).read_arrow_table(),
+              repeat=repeat, inner=100)
+
+    _time_one("direct pc.utf8_upper 10k",
+              lambda: pc.utf8_upper(table.column("name")),
+              repeat=repeat, inner=500)
+    _time_one("registry.apply_arrow UPPER",
+              lambda: BUILTIN_REGISTRY.apply_arrow("UPPER", table.column("name")),
+              repeat=repeat, inner=500)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repeat", type=int, default=5)
@@ -206,6 +246,7 @@ def main() -> None:
     bench_folder_execution(r)
     bench_roundtrip(r)
     bench_registry(r)
+    bench_udf_execution(r)
 
 
 if __name__ == "__main__":
