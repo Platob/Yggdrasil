@@ -1157,6 +1157,163 @@ class DeltaFolder(Folder):
         return write_uuid_deletion_vector(deleted_rows, table_root=self.path)
 
     # ==================================================================
+    # Spark integration — mapInArrow over active files
+    # ==================================================================
+
+    def _read_spark_frame(self, options: DeltaOptions) -> "Any":
+        """Read via Spark: scatter active AddFiles to executors via mapInArrow.
+
+        Each executor receives a pickled (table_root_path, AddFile, schema_info)
+        tuple, reads its parquet file locally, applies DV masking and
+        partition stamping, then yields Arrow batches.  The driver never
+        collects the data — Spark executors read directly from storage.
+        """
+        import pickle
+
+        from yggdrasil.environ import PyEnv
+
+        spark = PyEnv.spark_session(
+            options.spark_session, create=True, import_error=True,
+        )
+
+        snap = self.snapshot(options.version)
+        if snap.metadata is None or not snap.active_files:
+            schema = self._collect_schema(options)
+            return spark.createDataFrame([], schema=schema.to_spark_schema())
+
+        target_schema = (
+            spark_json_to_arrow_schema(snap.schema_string)
+            if snap.schema_string
+            else None
+        )
+        if target_schema is None:
+            schema = self._collect_schema(options)
+            return spark.createDataFrame([], schema=schema.to_spark_schema())
+
+        spark_schema = self._collect_schema(options).to_spark_schema()
+        partition_columns = snap.partition_columns
+
+        prune = _extract_partition_prune_values(
+            options.predicate, partition_columns,
+        )
+        active_adds = list(snap.prune_files(prune_values=prune))
+        if not active_adds:
+            return spark.createDataFrame([], schema=spark_schema)
+
+        # Pickle each (path, AddFile) pair for executor-side reads.
+        # Path objects carry their service/auth connections through pickle.
+        blobs: list[bytes] = []
+        for add in active_adds:
+            payload = pickle.dumps((self.path, add, partition_columns, target_schema))
+            blobs.append(payload)
+
+        leaf_table = pa.table({"_pkl": pa.array(blobs, type=pa.binary())})
+        try:
+            parallelism = max(spark.sparkContext.defaultParallelism, 1)
+        except Exception:
+            parallelism = 4
+        n_parts = min(len(blobs), parallelism)
+        leaf_df = spark.createDataFrame(leaf_table).coalesce(n_parts)
+
+        def _read_delta_files(
+            batches: "Iterator[pa.RecordBatch]",
+        ) -> "Iterator[pa.RecordBatch]":
+            import pickle as _pkl
+
+            from yggdrasil.io.primitive.parquet_file import (
+                ParquetFile as _PF,
+                ParquetOptions as _PO,
+            )
+            from yggdrasil.io.nested.delta.deletion_vector import (
+                decode_deletion_vector as _decode_dv,
+                mask_batch_with_dv as _mask,
+            )
+            from yggdrasil.enums import Mode as _Mode
+
+            for batch in batches:
+                for blob in batch.column("_pkl").to_pylist():
+                    table_root, add, part_cols, t_schema = _pkl.loads(blob)
+                    file_path = table_root / add.path
+
+                    dv = _decode_dv(
+                        add.deletion_vector,
+                        table_root=table_root,
+                    )
+
+                    leaf = _PF(holder=file_path, owns_holder=False)
+                    leaf_opts = _PO(mode=_Mode.READ_ONLY)
+
+                    base_offset = 0
+                    with leaf as opened:
+                        for rb in opened._read_arrow_batches(leaf_opts):
+                            masked = _mask(rb, dv, base_offset=base_offset)
+                            base_offset += rb.num_rows
+                            if masked.num_rows == 0:
+                                continue
+                            # Re-attach partition columns
+                            existing = set(masked.schema.names)
+                            for col in part_cols:
+                                if col in existing:
+                                    continue
+                                raw = add.partition_values.get(col)
+                                import pyarrow as _pa
+                                arrow_type = _pa.string()
+                                target_field = None
+                                if t_schema is not None:
+                                    idx = t_schema.get_field_index(col)
+                                    if idx >= 0:
+                                        target_field = t_schema.field(idx)
+                                        arrow_type = target_field.type
+                                value = _coerce_partition(raw, arrow_type)
+                                arr = _pa.array(
+                                    [value] * masked.num_rows, type=arrow_type,
+                                )
+                                field = (
+                                    target_field
+                                    if target_field is not None
+                                    else _pa.field(col, arrow_type, nullable=True)
+                                )
+                                masked = masked.append_column(field, arr)
+                            yield masked
+
+        return leaf_df.mapInArrow(_read_delta_files, schema=spark_schema)
+
+    def _write_spark_frame(
+        self,
+        frame: "Any",
+        options: DeltaOptions,
+    ) -> None:
+        """Write a Spark DataFrame into the Delta table.
+
+        Collects the frame to Arrow on the driver and delegates to
+        the standard ``_write_arrow_batches`` commit path.  For large
+        frames, callers should pre-partition or repartition the
+        DataFrame before writing.
+        """
+        to_arrow = getattr(frame, "toArrow", None)
+        if callable(to_arrow):
+            try:
+                table = to_arrow()
+                self._write_arrow_batches(table.to_batches(), options)
+                return
+            except Exception:
+                pass
+
+        to_iter = getattr(frame, "toArrowBatchIterator", None)
+        if callable(to_iter):
+            try:
+                batches = list(to_iter())
+                self._write_arrow_batches(batches, options)
+                return
+            except Exception:
+                pass
+
+        self._write_arrow_batches(
+            pa.Table.from_pandas(frame.toPandas()).to_batches(),
+            options,
+        )
+
+    # ==================================================================
     # Folder surface — children = active files
     # ==================================================================
 
