@@ -1,6 +1,9 @@
 """Tests for :class:`yggdrasil.dataclasses.awaitable.Awaitable`."""
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from yggdrasil.dataclasses.awaitable import Awaitable
@@ -114,6 +117,30 @@ class _CustomErrorTask(Awaitable):
 
     def _error_for_status(self):
         return ValueError("custom error message")
+
+
+class _PausableTask(Awaitable):
+    """Task that stays RUNNING until externally marked done."""
+
+    def __init__(self):
+        self.poll_count = 0
+        self._done_event = threading.Event()
+
+    def _poll(self):
+        self.poll_count += 1
+        if self._done_event.is_set():
+            self._state = State.SUCCEEDED
+
+    def _start(self):
+        self._state = State.RUNNING
+        self.poll_count = 0
+        self._done_event.clear()
+
+    def _error_for_status(self):
+        return RuntimeError(f"task {self._state.name}")
+
+    def finish(self):
+        self._done_event.set()
 
 
 class TestAbstract:
@@ -489,6 +516,180 @@ class TestCancel:
         t._state = State.RUNNING
         t.cancel(wait=False)
         assert t.is_canceled
+
+
+class TestSleeper:
+
+    def test_sleeper_is_threading_event(self):
+        t = _InstantTask()
+        assert isinstance(t._sleeper, threading.Event)
+
+    def test_sleeper_set_by_default(self):
+        t = _InstantTask()
+        assert t._sleeper.is_set()
+
+    def test_not_paused_by_default(self):
+        t = _InstantTask()
+        assert not t.is_paused
+
+    def test_sleeper_per_instance(self):
+        a = _InstantTask()
+        b = _InstantTask()
+        assert a._sleeper is not b._sleeper
+
+
+class TestPause:
+
+    def test_pause_active_task(self):
+        t = _InstantTask()
+        t._state = State.RUNNING
+        t.pause()
+        assert t.is_paused
+
+    def test_pause_clears_sleeper(self):
+        t = _InstantTask()
+        t._state = State.RUNNING
+        t.pause()
+        assert not t._sleeper.is_set()
+
+    def test_pause_idle_is_noop(self):
+        t = _InstantTask()
+        t.pause()
+        assert not t.is_paused
+
+    def test_pause_done_is_noop(self):
+        t = _InstantTask()
+        t._state = State.SUCCEEDED
+        t.pause()
+        assert not t.is_paused
+
+    def test_pause_returns_self(self):
+        t = _InstantTask()
+        t._state = State.RUNNING
+        assert t.pause() is t
+
+    def test_pause_returns_self_when_noop(self):
+        t = _InstantTask()
+        assert t.pause() is t
+
+    def test_internal_pause_always_clears(self):
+        t = _InstantTask()
+        t._pause()
+        assert t.is_paused
+
+
+class TestResume:
+
+    def test_resume_paused_task(self):
+        t = _InstantTask()
+        t._state = State.RUNNING
+        t.pause()
+        assert t.is_paused
+        t.resume()
+        assert not t.is_paused
+
+    def test_resume_sets_sleeper(self):
+        t = _InstantTask()
+        t._pause()
+        t._resume()
+        assert t._sleeper.is_set()
+
+    def test_resume_not_paused_is_noop(self):
+        t = _InstantTask()
+        t._state = State.RUNNING
+        t.resume()
+        assert not t.is_paused
+
+    def test_resume_returns_self(self):
+        t = _InstantTask()
+        t._pause()
+        assert t.resume() is t
+
+    def test_resume_returns_self_when_noop(self):
+        t = _InstantTask()
+        assert t.resume() is t
+
+    def test_internal_resume_always_sets(self):
+        t = _InstantTask()
+        t._pause()
+        t._resume()
+        assert not t.is_paused
+
+
+class TestPauseResumeWait:
+
+    def test_pause_blocks_wait_loop(self):
+        t = _PausableTask()
+        t.start(wait=False)
+        initial_polls = t.poll_count
+        t.pause()
+        wc = WaitingConfig(timeout=0.15, interval=0.01, backoff=1.0, max_interval=0.01)
+        result = t.wait(wait=wc, raise_error=False)
+        assert result is t
+        assert t.poll_count - initial_polls <= 2
+
+    def test_resume_unblocks_wait_loop(self):
+        t = _PausableTask()
+        t.start(wait=False)
+        t.pause()
+
+        def resume_then_finish():
+            time.sleep(0.05)
+            t.resume()
+            time.sleep(0.05)
+            t.finish()
+
+        helper = threading.Thread(target=resume_then_finish)
+        helper.start()
+        wc = WaitingConfig(timeout=2, interval=0.01, backoff=1.0, max_interval=0.01)
+        t.wait(wait=wc)
+        helper.join(timeout=1)
+        assert t.is_succeeded
+
+    def test_cancel_unblocks_paused_wait(self):
+        t = _PausableTask()
+        t.start(wait=False)
+        t.pause()
+
+        def cancel_later():
+            time.sleep(0.05)
+            t.cancel(wait=False)
+
+        helper = threading.Thread(target=cancel_later)
+        helper.start()
+        wc = WaitingConfig(timeout=2, interval=0.01, backoff=1.0, max_interval=0.01)
+        t.wait(wait=wc, raise_error=False)
+        helper.join(timeout=1)
+        assert t.is_canceled
+        assert not t.is_paused
+
+    def test_pause_respects_timeout(self):
+        t = _PausableTask()
+        t.start(wait=False)
+        t.pause()
+        wc = WaitingConfig(timeout=0.1, interval=0.01, backoff=1.0, max_interval=0.01)
+        start = time.time()
+        with pytest.raises(TimeoutError):
+            t.wait(wait=wc)
+        elapsed = time.time() - start
+        assert elapsed < 1.0
+
+    def test_pause_resume_cycle(self):
+        t = _PausableTask()
+        t.start(wait=False)
+        assert not t.is_paused
+        t.pause()
+        assert t.is_paused
+        t.resume()
+        assert not t.is_paused
+        t.pause()
+        assert t.is_paused
+        t.resume()
+        assert not t.is_paused
+        t.finish()
+        wc = WaitingConfig(timeout=1, interval=0.01, backoff=1.0, max_interval=0.01)
+        t.wait(wait=wc)
+        assert t.is_succeeded
 
 
 class TestRepr:
