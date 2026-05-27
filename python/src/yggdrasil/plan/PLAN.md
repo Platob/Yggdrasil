@@ -321,34 +321,99 @@ BUILTIN_REGISTRY.register_udf("NORMALIZE",
     min_args=1, max_args=1)
 ```
 
-### Collection Operations
+### Nested Type Constructors
+
+```python
+# STRUCT — combine columns into a struct array
+BUILTIN_REGISTRY.apply_arrow("STRUCT", pa.array([1, 2]), pa.array(["a", "b"]))
+# → [{"c0": 1, "c1": "a"}, {"c0": 2, "c1": "b"}]
+
+# NAMED_STRUCT — with explicit field names
+BUILTIN_REGISTRY.apply_arrow("NAMED_STRUCT",
+    "id", pa.array([1, 2]), "name", pa.array(["alice", "bob"]))
+# → [{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]
+
+# ARRAY — zip columns into list arrays (one list per row)
+BUILTIN_REGISTRY.apply_arrow("ARRAY",
+    pa.array([1, 2]), pa.array([3, 4]), pa.array([5, 6]))
+# → [[1, 3, 5], [2, 4, 6]]
+
+# MAP — build map/dict per row from key-value pairs
+BUILTIN_REGISTRY.apply_arrow("MAP",
+    "x", pa.array([1, 2]), "y", pa.array([3, 4]))
+# → [{"x": 1, "y": 3}, {"x": 2, "y": 4}]
+
+# MAP_FROM_ARRAYS — zip key-list and value-list per row
+BUILTIN_REGISTRY.apply_arrow("MAP_FROM_ARRAYS",
+    pa.array([["a", "b"]]), pa.array([[1, 2]]))
+# → [{"a": 1, "b": 2}]
+
+# Struct/map field access
+import pyarrow.compute as pc
+struct = pc.make_struct(pa.array([1, 2]), field_names=["id"])
+BUILTIN_REGISTRY.apply_arrow("GET_FIELD", struct, "id")  # → [1, 2]
+
+# Map key/value extraction
+m = pa.array([[("a", 1), ("b", 2)]], type=pa.map_(pa.utf8(), pa.int64()))
+BUILTIN_REGISTRY.apply_arrow("MAP_KEYS", m)    # → [["a", "b"]]
+BUILTIN_REGISTRY.apply_arrow("MAP_VALUES", m)   # → [[1, 2]]
+```
+
+### Collection Operations (Explode, Array Functions)
 
 ```python
 from yggdrasil.plan.func_registry import explode_table, posexplode_table
 
-# Explode list columns
+# Explode — flatten list column, repeat scalar columns
 t = pa.table({"id": [1, 2], "vals": [[10, 20], [30, 40, 50]]})
 explode_table(t, "vals")
-# id | vals
+# id | vals      (Arrow-native: list_flatten + list_parent_indices)
 # 1  | 10
 # 1  | 20
 # 2  | 30
 # 2  | 40
 # 2  | 50
 
+# Explode with rename
+explode_table(t, "vals", out_col="value")  # renames column
+
+# Posexplode — adds position column
 posexplode_table(t, "vals", pos_col="pos", out_col="val")
 # id | val | pos
 # 1  | 10  | 0
 # 1  | 20  | 1
 # 2  | 30  | 0
-# ...
+# 2  | 40  | 1
+# 2  | 50  | 2
 
-# Array functions via registry
+# Array functions
 BUILTIN_REGISTRY.apply_arrow("SIZE", pa.array([[1,2,3],[4,5]]))        # → [3, 2]
 BUILTIN_REGISTRY.apply_arrow("FLATTEN", pa.array([[1,2],[3],[4,5]]))   # → [1,2,3,4,5]
 BUILTIN_REGISTRY.apply_arrow("SORT_ARRAY", pa.array([[3,1,2]]))       # → [[1,2,3]]
 BUILTIN_REGISTRY.apply_arrow("ARRAY_DISTINCT", pa.array([[1,2,2,3]])) # → [[1,2,3]]
 BUILTIN_REGISTRY.apply_arrow("ARRAY_CONTAINS", pa.array([[1,2,3]]), 2) # → [True]
+BUILTIN_REGISTRY.apply_arrow("ARRAY_MIN", pa.array([[3,1,2]]))        # → [1]
+BUILTIN_REGISTRY.apply_arrow("ARRAY_MAX", pa.array([[3,1,2]]))        # → [3]
+```
+
+### Type Casting
+
+```python
+BUILTIN_REGISTRY.apply_arrow("STRING", pa.array([1, 2, 3]))    # → ["1", "2", "3"]
+BUILTIN_REGISTRY.apply_arrow("BIGINT", pa.array(["1", "2"]))   # → [1, 2]
+BUILTIN_REGISTRY.apply_arrow("INT", pa.array([1.5, 2.7]))      # → [1, 2]
+BUILTIN_REGISTRY.apply_arrow("DOUBLE", pa.array([1, 2]))       # → [1.0, 2.0]
+BUILTIN_REGISTRY.apply_arrow("BOOLEAN", pa.array([1, 0, 1]))   # → [True, False, True]
+```
+
+### Hash Functions
+
+```python
+BUILTIN_REGISTRY.apply_arrow("MD5", pa.array(["hello"]))
+# → ["5d41402abc4b2a76b9719d911017c592"]
+
+BUILTIN_REGISTRY.apply_arrow("SHA1", pa.array(["hello"]))
+# → ["aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"]
 ```
 
 ### IO UDFs
