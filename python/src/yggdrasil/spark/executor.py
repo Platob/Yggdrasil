@@ -167,10 +167,9 @@ class SparkStatementExecutor(
 
         Plumbs a :class:`SparkSession` onto the statement up front via
         :meth:`resolve_session` so subclasses that build their session
-        lazily (e.g. :class:`ServerlessClusterStatementExecutor` going
-        through ``client.spark()``) get a chance to install their own
-        before :meth:`SparkStatementResult.start` falls back to
-        :meth:`PyEnv.spark_session`.
+        lazily (e.g. via ``client.spark()``) get a chance to install
+        their own before :meth:`SparkStatementResult.start` falls back
+        to :meth:`PyEnv.spark_session`.
         """
         if statement.spark_session is None:
             session = self.resolve_session(statement, create=False)

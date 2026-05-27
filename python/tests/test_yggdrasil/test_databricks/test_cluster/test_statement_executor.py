@@ -11,7 +11,6 @@ The tests below cover:
 - SELECT detection and rewrite (with ``output_path`` bound to the
   result's prepared statement);
 - non-SELECT pass-through;
-- ServerlessCluster refusal at construction;
 - default ``context_key`` keyed off the volume so all statements on
   the same volume share one REPL context (clusters cap at 145);
 - :class:`ClusterPreparedStatement.clear_temporary_resources`
@@ -28,7 +27,6 @@ from yggdrasil.databricks.cluster import (
     ClusterPreparedStatement,
     ClusterStatementExecutor,
     ClusterStatementResult,
-    ServerlessCluster,
 )
 from yggdrasil.databricks.tests import DatabricksTestCase
 
@@ -93,17 +91,6 @@ class TestConstruction(_ExecutorTestBase):
         # right compute page.
         self.assertEqual(self.executor.explore_url, self.cluster.explore_url)
 
-    def test_refuses_serverless_cluster(self):
-        # Serverless compute does not expose the REPL command-
-        # execution API the executor relies on. Wrapping a serverless
-        # handle must fail loudly at construction time.
-        sl = ServerlessCluster(service=self.clusters, cluster_id="sl-1")
-        with pytest.raises(TypeError) as exc:
-            ClusterStatementExecutor(sl, self.volume)
-        msg = str(exc.value)
-        self.assertIn("ServerlessCluster", msg)
-        # Error message should point the caller at the right channel.
-        self.assertIn("SQLWarehouse", msg)
 
 
 class TestSelectRewrite(_ExecutorTestBase):

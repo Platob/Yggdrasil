@@ -31,12 +31,6 @@ folder is bound to the statement so the batch's
 
 Safety / reliability guardrails baked in
 ----------------------------------------
-- **No serverless command-execution path.** Databricks serverless
-  compute exposes Spark Connect, not the REPL ``CommandExecution``
-  endpoint (per the serverless limitations doc:
-  https://docs.databricks.com/aws/en/compute/serverless/limitations).
-  Constructing this executor against a :class:`ServerlessCluster`
-  raises — the warehouse path is the right route for serverless SQL.
 - **Execution-context reuse.** Each cluster caps at 145 user REPL
   contexts before new notebooks fail to attach
   (https://kb.databricks.com/clusters/too-many-execution-contexts-are-open-right-now).

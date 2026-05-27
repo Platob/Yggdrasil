@@ -49,7 +49,7 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.databricks.volume` | Unity Catalog `Volume` — credentials, storage path, Arrow filesystem | [volume](modules/databricks/volume/README.md) |
 | `yggdrasil.databricks.warehouse` | `SQLWarehouse` lifecycle + `Warehouses` service | [warehouse](modules/databricks/warehouse/README.md) |
 | `yggdrasil.databricks.compute` | Cluster lifecycle + remote execution | [compute](modules/databricks/compute/README.md), [remote](modules/databricks/compute/remote/README.md) |
-| `yggdrasil.databricks.cluster` | `Cluster` + `ServerlessCluster`, execute Python remotely | [cluster](modules/databricks/cluster/README.md) |
+| `yggdrasil.databricks.cluster` | `Cluster`, execute Python remotely | [cluster](modules/databricks/cluster/README.md) |
 | `yggdrasil.databricks.ai` | Vector Search endpoints, indexes, similarity search | [ai](modules/databricks/ai/README.md) |
 | `yggdrasil.databricks.workspaces` | Workspace + path helpers | [workspaces](modules/databricks/workspaces/README.md) |
 | `yggdrasil.databricks.fs` | DBFS / Volume / Workspace files | [fs](modules/databricks/fs/README.md) |
