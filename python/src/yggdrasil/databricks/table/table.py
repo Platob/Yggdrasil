@@ -3260,7 +3260,7 @@ class Table(DatabricksPath):
         target = self.create(
             data,
             mode=schema_mode,
-            or_replace=False,
+            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
@@ -3402,7 +3402,7 @@ class Table(DatabricksPath):
         target = self.create(
             data,
             mode=schema_mode,
-            or_replace=False,
+            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
