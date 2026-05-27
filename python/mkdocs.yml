@@ -158,6 +158,7 @@ nav:
       - Casting: guides/casting.md
       - IO & HTTP: guides/io-http.md
       - Bot & Mesh: guides/bot.md
+      - Execution Plans & SQL: guides/plan.md
       - Databricks: guides/databricks.md
       - Development: guides/development.md
   - Module Walkthrough:

@@ -133,86 +133,47 @@ def _k2(fn: str) -> ArrowKernel:
     f = getattr(pc, fn)
     return lambda a, b: f(a, b)
 
-def _read_files_kernel(paths: pa.Array) -> pa.Array:
-    """Read file contents from paths. Tries tabular formats first, raw text fallback."""
+def _per_row(fn, data, dtype=pa.utf8()):
+    return pa.array([fn(v) if v is not None else None for v in data.to_pylist()], type=dtype)
+
+
+def _codec_op(data, codec_name, op):
+    cs = codec_name.as_py() if hasattr(codec_name, 'as_py') else str(codec_name) if codec_name else "gzip"
+    try:
+        from yggdrasil.enums.codec import Codec
+        c = Codec.from_(cs)
+        fn = c.compress_bytes if op == "c" else c.decompress_bytes
+    except Exception:
+        import gzip
+        fn = gzip.compress if op == "c" else gzip.decompress
+    return pa.array([fn(v.encode() if isinstance(v, str) else v) if v else None
+                     for v in data.to_pylist()], type=pa.binary())
+
+
+def _read_files(paths):
     import pathlib
-    results = []
-    for path_val in paths.to_pylist():
-        if path_val is None:
-            results.append(None); continue
+    def _one(p):
         try:
-            p = pathlib.Path(path_val)
-            if not p.exists():
-                results.append(None); continue
+            pp = pathlib.Path(p)
+            if not pp.exists(): return None
             from yggdrasil.io.tabular.base import Tabular
-            tab = Tabular.from_(str(p), default=None)
-            if tab is not None:
-                try:
-                    results.append(str(tab.read_arrow_table().to_pylist()))
-                    continue
-                except Exception:
-                    pass
-            results.append(p.read_bytes().decode("utf-8", errors="replace"))
-        except Exception:
-            results.append(None)
-    return pa.array(results, type=pa.utf8())
+            t = Tabular.from_(str(pp), default=None)
+            if t:
+                try: return str(t.read_arrow_table().to_pylist())
+                except Exception: pass
+            return pp.read_bytes().decode("utf-8", errors="replace")
+        except Exception: return None
+    return pa.array([_one(v) if v else None for v in paths.to_pylist()], type=pa.utf8())
 
 
-def _read_paths_kernel(paths: pa.Array) -> pa.Array:
-    """List directory contents for each path."""
-    results = []
-    for path_val in paths.to_pylist():
-        if path_val is None:
-            results.append(None); continue
+def _read_paths(paths):
+    import pathlib
+    def _one(p):
         try:
-            import pathlib
-            p = pathlib.Path(path_val)
-            if p.is_dir():
-                results.append(str([str(c) for c in p.iterdir()]))
-            else:
-                results.append(str(path_val))
-        except Exception:
-            results.append(None)
-    return pa.array(results, type=pa.utf8())
-
-
-def _compress_kernel(data: pa.Array, codec_name=None) -> pa.Array:
-    """Compress binary/string column with a codec."""
-    codec_str = codec_name.as_py() if hasattr(codec_name, 'as_py') else str(codec_name) if codec_name else "gzip"
-    try:
-        from yggdrasil.enums.codec import Codec
-        codec = Codec.from_(codec_str)
-    except Exception:
-        import gzip
-        return pa.array([gzip.compress(v.encode() if isinstance(v, str) else v) if v else None
-                         for v in data.to_pylist()], type=pa.binary())
-    return pa.array([codec.compress_bytes(v.encode() if isinstance(v, str) else v) if v else None
-                     for v in data.to_pylist()], type=pa.binary())
-
-
-def _decompress_kernel(data: pa.Array, codec_name=None) -> pa.Array:
-    """Decompress binary column with a codec."""
-    codec_str = codec_name.as_py() if hasattr(codec_name, 'as_py') else str(codec_name) if codec_name else "gzip"
-    try:
-        from yggdrasil.enums.codec import Codec
-        codec = Codec.from_(codec_str)
-    except Exception:
-        import gzip
-        return pa.array([gzip.decompress(v) if v else None for v in data.to_pylist()], type=pa.binary())
-    return pa.array([codec.decompress_bytes(v) if v else None
-                     for v in data.to_pylist()], type=pa.binary())
-
-
-def _parse_json_kernel(data: pa.Array) -> pa.Array:
-    """Parse JSON strings to structured data."""
-    import json
-    return pa.array([json.loads(v) if v else None for v in data.to_pylist()])
-
-
-def _to_json_kernel(data: pa.Array) -> pa.Array:
-    """Serialize values to JSON strings."""
-    import json
-    return pa.array([json.dumps(v) if v is not None else None for v in data.to_pylist()], type=pa.utf8())
+            pp = pathlib.Path(p)
+            return str([str(c) for c in pp.iterdir()]) if pp.is_dir() else str(p)
+        except Exception: return None
+    return pa.array([_one(v) if v else None for v in paths.to_pylist()], type=pa.utf8())
 
 
 def _named_struct_kernel(*args) -> pa.StructArray:
@@ -342,12 +303,12 @@ _ARROW_KERNELS: dict[str, ArrowKernel] = {
     "MEAN": _k1("mean"),
 
     # IO / path-aware UDFs
-    "READ_FILES": _read_files_kernel,
-    "READ_PATHS": _read_paths_kernel,
-    "COMPRESS": _compress_kernel,
-    "DECOMPRESS": _decompress_kernel,
-    "PARSE_JSON": _parse_json_kernel,
-    "TO_JSON": _to_json_kernel,
+    "READ_FILES": _read_files,
+    "READ_PATHS": _read_paths,
+    "COMPRESS": lambda d, c=None: _codec_op(d, c, "c"),
+    "DECOMPRESS": lambda d, c=None: _codec_op(d, c, "d"),
+    "PARSE_JSON": lambda d: pa.array([__import__("json").loads(v) if v else None for v in d.to_pylist()]),
+    "TO_JSON": lambda d: _per_row(lambda v: __import__("json").dumps(v), d),
 
     # Collection / list / struct operations
     "ARRAY_LENGTH": _k1("list_value_length"),
