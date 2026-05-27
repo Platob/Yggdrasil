@@ -950,38 +950,65 @@ class HTTPSession(Session):
         connect_timeout: float,
         ssl_ctx: ssl.SSLContext,
     ) -> http.client.HTTPSConnection:
-        """Establish an HTTPS connection through an HTTP CONNECT tunnel."""
+        """Establish an HTTPS connection through an HTTP CONNECT tunnel.
+
+        Opens a TCP socket to the proxy, sends ``CONNECT host:port``,
+        reads the status line, then upgrades the *same* socket to TLS
+        for the target host.  The proxy sees only opaque bytes after
+        the 200 handshake.
+        """
         proxy_host = proxy.host
         proxy_port = proxy.port or (443 if proxy.scheme == "https" else 8080)
-        tunnel_conn = http.client.HTTPConnection(
-            proxy_host, port=proxy_port, timeout=connect_timeout,
+
+        # Low-level socket connect — avoids http.client's response
+        # machinery which can detach/close the socket after getresponse().
+        raw_sock = socket.create_connection(
+            (proxy_host, proxy_port), timeout=connect_timeout,
         )
         try:
-            tunnel_conn.connect()
-            if tunnel_conn.sock is None:
-                raise ProxyError(
-                    f"Connection to proxy {proxy_host}:{proxy_port} "
-                    f"succeeded but socket is None"
-                )
-            tunnel_headers = {"Host": f"{host}:{port}"}
-            tunnel_headers.update(self._proxy_auth_headers(proxy))
-            tunnel_conn.request("CONNECT", f"{host}:{port}", headers=tunnel_headers)
-            tunnel_resp = tunnel_conn.getresponse()
-            if tunnel_resp.status != 200:
+            # Hand-roll the CONNECT request so we keep full control of
+            # the socket lifecycle.  No chunked encoding, no body.
+            connect_line = f"CONNECT {host}:{port} HTTP/1.1\r\n"
+            header_lines = f"Host: {host}:{port}\r\n"
+            for k, v in self._proxy_auth_headers(proxy).items():
+                header_lines += f"{k}: {v}\r\n"
+            raw_sock.sendall((connect_line + header_lines + "\r\n").encode())
+
+            # Read the status line + headers.  The proxy's 200 response
+            # to CONNECT has no body — after the blank line the socket
+            # is a raw tunnel.
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = raw_sock.recv(4096)
+                if not chunk:
+                    raise ProxyError(
+                        f"Proxy {proxy_host}:{proxy_port} closed connection "
+                        f"during CONNECT handshake"
+                    )
+                buf += chunk
+
+            status_line = buf.split(b"\r\n", 1)[0].decode(errors="replace")
+            # "HTTP/1.1 200 Connection established"
+            parts = status_line.split(None, 2)
+            status_code = int(parts[1]) if len(parts) >= 2 else 0
+            if status_code != 200:
+                reason = parts[2] if len(parts) >= 3 else "unknown"
                 raise ProxyError(
                     f"CONNECT tunnel to {host}:{port} via "
                     f"{proxy_host}:{proxy_port} failed: "
-                    f"{tunnel_resp.status} {tunnel_resp.reason}"
+                    f"{status_code} {reason}"
                 )
-            raw_sock = tunnel_conn.sock
+
+            # Upgrade to TLS on the now-transparent tunnel.
+            tls_sock = ssl_ctx.wrap_socket(raw_sock, server_hostname=host)
             conn = http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
             )
-            conn.sock = ssl_ctx.wrap_socket(raw_sock, server_hostname=host)
+            conn.sock = tls_sock
             return conn
         except Exception:
             try:
-                tunnel_conn.close()
+                raw_sock.close()
             except Exception:
                 pass
             raise
