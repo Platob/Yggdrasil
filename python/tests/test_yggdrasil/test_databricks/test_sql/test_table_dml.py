@@ -42,9 +42,8 @@ from yggdrasil.databricks.table.table import (
     _build_column_projection,
     _build_delete_insert_statements,
     _build_dml_statements,
-    _build_prune_predicate,
+    _build_where_predicates,
 )
-from yggdrasil.execution.expr import col as expr_col
 
 
 # ---------------------------------------------------------------------------
@@ -434,105 +433,29 @@ class TestDeleteInsertShape:
 
 
 # ---------------------------------------------------------------------------
-# _build_prune_predicate — combines per-column prune_values + user where
-# into a single target-aliased, simplified SQL clause.
+# _build_where_predicates — render a predicate as target-aliased SQL
 # ---------------------------------------------------------------------------
 
 
-class TestBuildPrunePredicate:
-    """The helper that feeds prune_predicates into the SQL builders.
+class TestBuildWherePredicates:
 
-    The combined predicate carries the cheap normalisation
-    :class:`InList` / :class:`Logical` apply in ``__post_init__``:
-    duplicate ``IN`` values dedupe and same-op ``Logical`` nesting
-    flattens before SQL emission. OR-of-EQ-on-same-column chains
-    stay as-is — the caller spells the ``IN`` clause explicitly via
-    ``col(...).is_in([...])`` when that's what they want.
-    """
+    def test_none_returns_empty_list(self) -> None:
+        assert _build_where_predicates(None, target_alias="T") == []
 
-    def test_empty_inputs_return_empty_list(self) -> None:
-        assert _build_prune_predicate(None, None, target_alias="T") == []
-        assert _build_prune_predicate({}, None, target_alias="T") == []
-
-    def test_single_column_renders_aliased_in_list(self) -> None:
-        out = _build_prune_predicate(
-            {"region": ("us", "eu")}, None, target_alias="T",
-        )
-        assert len(out) == 1
-        assert out[0] == "`T`.`region` IN ('us', 'eu')"
-
-    def test_duplicate_in_values_collapse_in_post_init(self) -> None:
-        # Real-world: caller assembled the values list by concatenating
-        # per-batch keys, didn't pre-uniqify. ``InList.__post_init__``
-        # drops the dup so the IN list emitted to the warehouse is
-        # minimal.
-        out = _build_prune_predicate(
-            {"region": ("us", "eu", "us", "uk", "eu")},
-            None, target_alias="T",
-        )
-        assert out == ["`T`.`region` IN ('us', 'eu', 'uk')"]
-
-    def test_multiple_columns_and_join_with_target_alias(self) -> None:
-        out = _build_prune_predicate(
-            {"region": ("us",), "date": ("2026-01-01",)},
-            None, target_alias="T",
-        )
-        # Two IN clauses, AND-joined, both target-aliased.
-        assert len(out) == 1
-        assert "`T`.`region` IN ('us')" in out[0]
-        assert "`T`.`date` IN ('2026-01-01')" in out[0]
-        assert " AND " in out[0]
-
-    def test_empty_value_iterable_skips_the_column(self) -> None:
-        # An empty list shouldn't produce ``IN ()`` — the column is
-        # simply not constrained.
-        out = _build_prune_predicate(
-            {"region": ("us",), "date": ()},
-            None, target_alias="T",
-        )
-        assert out == ["`T`.`region` IN ('us')"]
-
-    def test_where_alone_renders_aliased(self) -> None:
-        out = _build_prune_predicate(
-            None, (expr_col("region") == "us"), target_alias="T",
+    def test_simple_predicate_renders_aliased(self) -> None:
+        from yggdrasil.execution.expr import col as expr_col
+        out = _build_where_predicates(
+            expr_col("region") == "us", target_alias="T",
         )
         assert out == ["`T`.`region` = 'us'"]
 
-    def test_where_or_chain_collapses_to_in_list(self) -> None:
-        # ``Logical.__new__`` collapses OR-of-EQ-on-same-target into a
-        # single ``InList`` at construction time, so the three-way OR
-        # the user spelled with ``|`` lands as ``region IN (...)``
-        # before SQL emission ever sees it.
-        where = (
-            (expr_col("region") == "us")
-            | (expr_col("region") == "eu")
-            | (expr_col("region") == "uk")
-        )
-        out = _build_prune_predicate(None, where, target_alias="T")
-        assert out == ["`T`.`region` IN ('us', 'eu', 'uk')"]
-
-    def test_where_is_anded_with_prune_values(self) -> None:
-        out = _build_prune_predicate(
-            {"region": ("us",)},
-            (expr_col("date") > "2026-01-01"),
-            target_alias="T",
+    def test_in_list_renders_aliased(self) -> None:
+        from yggdrasil.execution.expr import col as expr_col
+        out = _build_where_predicates(
+            expr_col("partition_key").is_in([1, 2, 3]), target_alias="T",
         )
         assert len(out) == 1
-        # Both clauses present, AND-joined, target-aliased.
-        assert "`T`.`region` IN ('us')" in out[0]
-        assert "`T`.`date` > '2026-01-01'" in out[0]
-        assert " AND " in out[0]
-
-    def test_top_level_or_wrapped_in_parens_for_safe_and_concat(self) -> None:
-        # A single InList with includes_null=True renders as
-        # ``T.x IN (...) OR T.x IS NULL`` — the consumer concatenates
-        # this with ``" AND ".join(...)``, so wrapping it in parens
-        # is what keeps the precedence right.
-        where = expr_col("region").is_in(("us", "eu", None))
-        out = _build_prune_predicate(None, where, target_alias="T")
-        assert len(out) == 1
-        assert out[0].startswith("(") and out[0].endswith(")")
-        assert " OR " in out[0]
+        assert "`T`.`partition_key` IN (1, 2, 3)" in out[0]
 
 
 # ---------------------------------------------------------------------------

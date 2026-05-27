@@ -62,12 +62,7 @@ from yggdrasil.path import Path
 from yggdrasil.io.primitive import ParquetFile
 from yggdrasil.io.tabular import Tabular, O
 from yggdrasil.execution.expr import (
-    Expression,
-    InList,
-    Logical,
-    LogicalOp,
     Predicate,
-    col as expr_col,
 )
 from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 
@@ -310,55 +305,20 @@ def _build_match_condition(
     return " AND ".join(clauses)
 
 
-def _build_prune_predicate(
-    prune_values: Mapping[str, Iterable[Any]] | None,
+def _build_where_predicates(
     where: Predicate | None,
     *,
     target_alias: str,
 ) -> list[str]:
-    """Combine ``prune_values`` + ``where`` into a single target-side SQL clause.
+    """Render *where* as a target-aliased SQL clause for MERGE / DELETE.
 
-    Builds one AST: per-column ``InList`` from ``prune_values`` AND'd
-    with the user's ``where``, target-aliased. ``InList.__post_init__``
-    dedupes per-column values and ``Logical.__post_init__`` flattens
-    same-op nesting so the rendered SQL is already tight without an
-    explicit normalisation pass.
-
-    Return shape stays ``list[str]`` (0 or 1 elements) so the
-    downstream :func:`_build_dml_statements` / :func:`_build_merge_statement`
-    / :func:`_build_delete_insert_statements` / :func:`_build_anti_join_insert`
-    contract — *list of clauses AND'd together by the consumer* —
-    is unchanged. A top-level ``OR`` in the final SQL gets a paren
-    wrap so callers can splice it into an AND chain without
-    precedence bleed.
+    Returns a ``list[str]`` (0 or 1 elements) so the downstream DML
+    builders can splice it into an AND chain.
     """
-    parts: list[Expression] = []
-    if prune_values:
-        for column_name, vals in prune_values.items():
-            materialized = tuple(vals)
-            if not materialized:
-                continue
-            parts.append(expr_col(column_name).is_in(materialized))
-    if where is not None:
-        parts.append(where)
-    if not parts:
+    if where is None:
         return []
-    if len(parts) == 1:
-        combined: Expression = parts[0]
-    else:
-        combined = Logical(LogicalOp.AND, tuple(parts))
-    # Alias once over the combined tree — single walk instead of one
-    # per part.
-    aliased = _alias_columns(combined, target_alias)
+    aliased = _alias_columns(where, target_alias)
     sql = expr_to_sql(aliased, dialect=Dialect.DATABRICKS)
-    # Top-level OR (e.g. a single ``InList`` with ``includes_null=True``
-    # renders as ``T.x IN (...) OR T.x IS NULL``) needs parens before
-    # the consumer concatenates it with AND. A top-level AND is
-    # already what the consumer would build anyway, so no wrap.
-    if isinstance(aliased, Logical) and aliased.op is LogicalOp.OR:
-        sql = f"({sql})"
-    elif isinstance(aliased, InList) and aliased.includes_null:
-        sql = f"({sql})"
     return [sql]
 
 
@@ -436,32 +396,6 @@ def _alias_columns(expr, alias: str):
         )
     return expr
 
-
-def _collect_prune_values_polars(
-    buffer: ParquetFile,
-    prune_by: list[str],
-) -> dict[str, tuple[Any, ...]]:
-    df = buffer.scan_polars_frame().select(*prune_by).unique().collect()
-    return {col: tuple(df.get_column(col).to_list()) for col in prune_by}
-
-
-def _collect_prune_values_spark(
-    data_df: Any,
-    prune_by: list[str],
-) -> dict[str, tuple[Any, ...]]:
-    rows = data_df.select(*prune_by).distinct().collect()
-    return {col: tuple(row[col] for row in rows) for col in prune_by}
-
-
-def _resolve_prune_by(
-    prune_by: list[str] | str | None,
-    fallback_partition_fields: Iterable[Any],
-) -> Optional[list[str]]:
-    if prune_by == "auto":
-        return [f.name for f in fallback_partition_fields] or None
-    if prune_by:
-        return list(prune_by)
-    return None
 
 
 def _build_column_projection(
@@ -3142,8 +3076,6 @@ class Table(DatabricksPath):
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         spark_options: Optional[Dict[str, Any]] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3176,8 +3108,6 @@ class Table(DatabricksPath):
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             retry=retry,
             return_data=return_data,
             safe_merge=safe_merge,
@@ -3280,8 +3210,6 @@ class Table(DatabricksPath):
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3314,7 +3242,7 @@ class Table(DatabricksPath):
                 wait=wait, raise_error=raise_error,
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
-                where=where, prune_by=prune_by,
+                where=where,
                 retry=retry,
                 return_data=return_data,
             )
@@ -3332,21 +3260,16 @@ class Table(DatabricksPath):
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
-        prune_by = _resolve_prune_by(prune_by, existing_schema.partition_fields)
 
         wait = WaitingConfig.from_(wait)
         staging = self.insert_volume_path(target, temporary=bool(wait))
-
-        prune_values = prune_values or {}
         output_data: "Tabular | None" = None
         staging.volume.create()
         staging.write_table(data, cast_options, mode=Mode.OVERWRITE)
         if return_data:
             output_data = staging.read_arrow_table()
 
-        prune_predicates = _build_prune_predicate(
-            prune_values, where, target_alias="T",
-        )
+        prune_predicates = _build_where_predicates(where, target_alias="T")
 
         columns = list(existing_schema.field_names())
         # Plain column projection — the staged Parquet was already
@@ -3395,9 +3318,9 @@ class Table(DatabricksPath):
         prepared = _prepare_batch(sql_texts)
 
         logger.debug(
-            "Arrow insert into table %r (mode=%s, match_by=%s, prune_by=%s, "
+            "Arrow insert into table %r (mode=%s, match_by=%s, "
             "statements=%d, retry=%s)",
-            target_location, mode_enum.name, match_by, prune_by, len(prepared),
+            target_location, mode_enum.name, match_by, len(prepared),
             retry_active,
         )
 
@@ -3431,8 +3354,6 @@ class Table(DatabricksPath):
         vacuum_hours: int | None = None,
         spark_options: Optional[Dict[str, Any]] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
@@ -3460,7 +3381,7 @@ class Table(DatabricksPath):
                 wait=wait, raise_error=raise_error,
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
-                where=where, prune_by=prune_by,
+                where=where,
                 spark_session=spark_session,
                 retry=retry,
                 return_data=return_data,
@@ -3488,22 +3409,7 @@ class Table(DatabricksPath):
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
-        prune_by = _resolve_prune_by(prune_by, existing_schema.partition_fields)
-
-        prune_values = prune_values or {}
-        if prune_by:
-            # Cache before the distinct().collect() so the temp view backing
-            # the MERGE doesn't re-execute the source plan from scratch.
-            data_df = data_df.cache()
-            prune_values = _collect_prune_values_spark(data_df, prune_by)
-            logger.debug(
-                "Spark pruning %s -> %s",
-                prune_by, {k: len(v) for k, v in prune_values.items()},
-            )
-
-        prune_predicates = _build_prune_predicate(
-            prune_values, where, target_alias="T",
-        )
+        prune_predicates = _build_where_predicates(where, target_alias="T")
 
         # Spark fast path for keyed APPEND under ``safe_merge=True``
         # (see :func:`_spark_filter_existing_keys`). Catalyst's
@@ -3581,9 +3487,9 @@ class Table(DatabricksPath):
         prepared = _prepare_spark_batch(sql_texts)
 
         logger.debug(
-            "Inserting via Spark into table %r (mode=%s, match_by=%s, prune_by=%s, "
+            "Inserting via Spark into table %r (mode=%s, match_by=%s, "
             "statements=%d, retry=%s, anti_join=%s)",
-            target_location, mode_enum.name, match_by, prune_by, len(prepared),
+            target_location, mode_enum.name, match_by, len(prepared),
             retry_cfg is not None, anti_join_handled,
         )
 
@@ -3601,8 +3507,8 @@ class Table(DatabricksPath):
                 )
             logger.info(
                 "Inserted via Spark into table %r (mode=%s, match_by=%s, "
-                "prune_by=%s, statements=%d, anti_join=%s)",
-                target_location, mode_enum.name, match_by, prune_by, len(prepared),
+                "statements=%d, anti_join=%s)",
+                target_location, mode_enum.name, match_by, len(prepared),
                 anti_join_handled,
             )
         finally:
@@ -3610,11 +3516,7 @@ class Table(DatabricksPath):
                 session.catalog.dropTempView(view_name)
             except Exception:
                 logger.debug("Failed to drop temp view %r; continuing.", view_name, exc_info=True)
-            if prune_by and not return_data:
-                # Keep the cached source alive when the caller asked
-                # for it back — :class:`Dataset` is the consumer
-                # and unpersisting here would force a re-execution
-                # downstream.
+            if not return_data:
                 try:
                     data_df.unpersist()
                 except Exception:
@@ -3645,8 +3547,6 @@ class Table(DatabricksPath):
         vacuum_hours: int | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3675,7 +3575,7 @@ class Table(DatabricksPath):
             wait=wait, raise_error=raise_error,
             zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            where=where, prune_by=prune_by, prune_values=prune_values,
+            where=where,
             retry=retry,
         )
 
@@ -3727,8 +3627,6 @@ class Table(DatabricksPath):
         optimize_after_merge: bool,
         vacuum_hours: int | None,
         where: Predicate | None,
-        prune_by: list[str] | str | None,
-        prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Warehouse fallback for :meth:`sql_insert`."""
@@ -3774,15 +3672,9 @@ class Table(DatabricksPath):
             f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS {quote_ident('raw_src')}"
         )
 
-        prune_predicates = _build_prune_predicate(
+        prune_predicates = _build_where_predicates(
             None, where, target_alias="T",
         )
-        if prune_by:
-            logger.debug(
-                "prune_by %s ignored on warehouse-fallback sql_insert "
-                "(would require re-executing source query)", prune_by,
-            )
-
         sql_texts = _build_dml_statements(
             target_location=target_location,
             source_sql=source_sql,

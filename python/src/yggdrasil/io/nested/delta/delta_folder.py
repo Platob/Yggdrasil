@@ -22,8 +22,8 @@ What changes vs :class:`Folder`
   is that the log is authoritative, and listing the root on a remote
   store is the most expensive metadata round trip there is.
 - **Reads** push partition pruning into the snapshot itself
-  (``options.prune_values``) and pass the row-level
-  ``options.predicate`` through to the leaf parquet's reader. DVs
+  (via ``options.predicate``) and pass the row-level
+  predicate through to the leaf parquet's reader. DVs
   attached to an :class:`AddFile` decode lazily and mask rows on the
   way out.
 - **Writes** mint a parquet under ``<root>/`` (or under
@@ -301,12 +301,9 @@ class DeltaFolder(Folder):
 
         1. Resolve snapshot at ``options.version`` (HEAD by default).
         2. Filter active files via partition pruning before any
-           parquet open. The accepted-value sets come from
-           ``options.prune_values`` directly *and* from
-           :func:`extract_partition_filters` walking
-           ``options.predicate`` for the partition columns — so a
-           caller who passes only a ``Predicate`` still gets file-
-           level skipping for free.
+           parquet open. :func:`extract_partition_filters` walks
+           ``options.predicate`` for the partition columns so the
+           caller gets file-level skipping for free.
         3. Read each parquet through :class:`ParquetFile` so codec /
            memory-map / native pushdown all work as usual.
         4. Mask rows with the file's :class:`DeletionVector` when one
@@ -330,8 +327,8 @@ class DeltaFolder(Folder):
         # reference the same DV sidecar collapse to one window read.
         sidecar_cache: dict[str, bytes] = {}
 
-        prune = _merge_prune_with_predicate(
-            None, options.predicate, partition_columns,
+        prune = _extract_partition_prune_values(
+            options.predicate, partition_columns,
         )
         for add in snap.prune_files(prune_values=prune):
             try:
@@ -1659,50 +1656,30 @@ def _arrow_row_filter_for(
     return _filter
 
 
-def _merge_prune_with_predicate(
-    explicit: "Optional[dict]",
+def _extract_partition_prune_values(
     predicate: "Predicate",
     partition_columns: "List[str]",
 ) -> "Optional[dict]":
-    """Combine caller-supplied ``prune_values`` with predicate-extracted hints.
+    """Extract partition-level prune values from a predicate.
 
-    The result is what :meth:`Snapshot.prune_files` consumes — a
+    The result is what :meth:`Snapshot.prune_files` consumes -- a
     ``Mapping[str, Iterable]`` of accepted values per partition
     column, or ``None`` when nothing constrains the file set.
-    Sources are AND'd: a file matches iff its partition value lies
-    in *both* the explicit set (when given) and the predicate's
-    extracted set (when extractable).
 
-    Predicate extraction routes through
+    Extraction routes through
     :func:`yggdrasil.execution.expr.extract_partition_filters`,
     which over-approximates and only reports columns it can pin to
-    a finite set — comparisons, ``IN`` lists, ``IS NULL``, and their
+    a finite set -- comparisons, ``IN`` lists, ``IS NULL``, and their
     ``AND`` / ``OR`` composition. Ranges, ``NOT``, and arithmetic
-    return no constraint for those columns — the row-level filter
+    return no constraint for those columns -- the row-level filter
     still runs on every surviving file, so the soundness contract
     is preserved.
     """
     if predicate is None or not partition_columns:
-        return explicit
+        return None
     from yggdrasil.execution.expr import extract_partition_filters
 
-    derived = extract_partition_filters(predicate, partition_columns)
-    if not derived:
-        return explicit
-    if not explicit:
-        # ``prune_files`` accepts any ``Mapping[str, Iterable]`` —
-        # frozensets satisfy that contract directly.
-        return derived
-    # Intersect column-by-column. Columns constrained on only one
-    # side keep that side's set.
-    merged: dict = dict(explicit)
-    for col_name, derived_set in derived.items():
-        if col_name in merged:
-            existing = frozenset(merged[col_name])
-            merged[col_name] = existing & derived_set
-        else:
-            merged[col_name] = derived_set
-    return merged
+    return extract_partition_filters(predicate, partition_columns) or None
 
 
 def _split_batch(

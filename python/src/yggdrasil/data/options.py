@@ -318,7 +318,6 @@ class CastOptions:
     byte_size: int | None = None
     row_limit: int | None = None
     use_threads: bool = True
-    recursive: bool = False
     match_by: list["Field"] | None = None
     unique_by: list["Field"] | None = None
     time_sample_by: list["Field"] | None = None
@@ -335,9 +334,6 @@ class CastOptions:
     zorder_by: list[str] | None = None
     optimize_after_merge: bool = False
     vacuum_hours: int | None = None
-
-    # --- Engine knobs ----------------------------------------------------
-    spark_options: dict[str, Any] | None = None
 
     retry: WaitingConfigArg | None = None
     return_data: bool = False

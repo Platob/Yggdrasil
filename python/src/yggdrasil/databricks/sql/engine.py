@@ -610,8 +610,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         spark_options: Optional[Dict[str, Any]] = None,
         table: Optional[Table] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Resolve the target :class:`Table` and call :meth:`Table.insert_into`."""
@@ -638,8 +636,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             spark_session=spark_session,
             spark_options=spark_options,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             retry=retry,
         )
 
@@ -663,8 +659,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         vacuum_hours: int | None = None,
         table: Optional[Table] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: Mapping[str, list[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.arrow_insert`."""
@@ -689,8 +683,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             retry=retry,
         )
 
@@ -716,8 +708,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         spark_options: Optional[Dict[str, Any]] = None,
         table: Optional[Table] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any, ...]] | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
@@ -744,8 +734,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             vacuum_hours=vacuum_hours,
             spark_options=spark_options,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             spark_session=spark_session,
             retry=retry,
         )
@@ -769,8 +757,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
         table: Optional[Table] = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         where: Predicate | None = None,
-        prune_by: list[str] | str | None = None,
-        prune_values: dict[str, tuple[Any]] | None = None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Resolve target and forward to :meth:`Table.sql_insert`."""
@@ -793,8 +779,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             vacuum_hours=vacuum_hours,
             spark_session=spark_session,
             where=where,
-            prune_by=prune_by,
-            prune_values=prune_values,
             retry=retry,
         )
 
