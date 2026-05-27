@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -16,6 +17,16 @@ __all__ = ["Awaitable"]
 class Awaitable(ABC):
     _state: State = State.IDLE
     _attempts: int = 0
+
+    @property
+    def _sleeper(self) -> threading.Event:
+        try:
+            return self.__dict__["_sleeper"]
+        except KeyError:
+            evt = threading.Event()
+            evt.set()
+            self.__dict__["_sleeper"] = evt
+            return evt
 
     @property
     def state(self) -> State:
@@ -54,6 +65,10 @@ class Awaitable(ABC):
         return self._state.is_failed
 
     @property
+    def is_paused(self) -> bool:
+        return not self._sleeper.is_set()
+
+    @property
     def is_canceled(self) -> bool:
         return self._state.is_canceled
 
@@ -79,6 +94,25 @@ class Awaitable(ABC):
 
     def _cancel(self) -> None:
         self._state = State.CANCELED
+        self._sleeper.set()
+
+    def _pause(self) -> None:
+        self._sleeper.clear()
+
+    def pause(self) -> "Awaitable":
+        if not self.is_active:
+            return self
+        self._pause()
+        return self
+
+    def _resume(self) -> None:
+        self._sleeper.set()
+
+    def resume(self) -> "Awaitable":
+        if not self.is_paused:
+            return self
+        self._resume()
+        return self
 
     @property
     def error(self) -> BaseException | None:
@@ -132,6 +166,13 @@ class Awaitable(ABC):
         iteration = 0
         next_log_at = 120.0
         while True:
+            if not self._sleeper.is_set():
+                if wait.timeout > 0:
+                    remaining = wait.timeout - (time.time() - start)
+                    if remaining > 0:
+                        self._sleeper.wait(timeout=remaining)
+                else:
+                    self._sleeper.wait()
             self._poll()
             if not self.is_done and logger.isEnabledFor(logging.INFO):
                 elapsed = time.time() - start
