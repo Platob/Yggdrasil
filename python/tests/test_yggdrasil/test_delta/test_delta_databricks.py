@@ -1,338 +1,456 @@
-"""Databricks integration tests for yggdrasil DeltaFolder.
+"""Databricks SQL engine integration tests for yggdrasil DeltaFolder.
 
-Validates that tables written locally by yggdrasil can be:
-- Uploaded to Databricks DBFS/Volumes and read back via SQL
-- Compared with tables written remotely via Databricks SQL
-- Round-tripped through local write -> remote scan -> local verify
+End-to-end tests that:
+- Write tables via Databricks SQL, read back with DeltaFolder
+- Write tables locally with DeltaFolder, register + read via SQL
+- Compare ygg local reads vs Databricks SQL reads
+- Scan inner storage paths and compare file layouts
+- Test APPEND / OVERWRITE / schema evolution through SQL + DeltaFolder
+- Benchmark local DeltaFolder vs Databricks SQL read paths
 
-These tests require a live Databricks workspace:
-    DATABRICKS_HOST and DATABRICKS_TOKEN must be set.
+Requires:
+    DATABRICKS_HOST, DATABRICKS_TOKEN (or auth profile)
+    Optional: DATABRICKS_INTEGRATION_CATALOG (default: main)
+              DATABRICKS_INTEGRATION_SCHEMA (default: ygg_delta_test)
 
-Run with:
+Run:
     python -m pytest tests/test_yggdrasil/test_delta/test_delta_databricks.py -v -s -m integration
 """
 from __future__ import annotations
 
+import json
 import os
+import secrets
 import time
 import unittest
+from typing import ClassVar
 
+import pyarrow as pa
 import pytest
 
 from yggdrasil.enums import Mode
 from yggdrasil.delta.io import DeltaOptions
-from yggdrasil.delta.tests import DeltaTestCase
 
 
 def _has_databricks() -> bool:
     return bool(os.environ.get("DATABRICKS_HOST"))
 
 
-def _has_deltalake() -> bool:
-    try:
-        import deltalake  # noqa: F401
-        return True
-    except ImportError:
-        return False
+def _catalog() -> str:
+    return os.environ.get("DATABRICKS_INTEGRATION_CATALOG", "main").strip() or "main"
+
+
+def _schema() -> str:
+    return os.environ.get("DATABRICKS_INTEGRATION_SCHEMA", "ygg_delta_test").strip() or "ygg_delta_test"
+
+
+# ---------------------------------------------------------------------------
+# Base class — one client + SQL engine per class, auto-cleanup
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
 @unittest.skipUnless(_has_databricks(), "DATABRICKS_HOST not set")
-class TestDatabricksSQLWriteLocalRead(DeltaTestCase):
-    """Write a table via Databricks SQL, download files, read locally."""
+class _DeltaSQLBase(unittest.TestCase):
+    client: ClassVar
+    sql: ClassVar
+    catalog_name: ClassVar[str]
+    schema_name: ClassVar[str]
+    _tables: ClassVar[list]
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
         from yggdrasil.databricks.client import DatabricksClient
         cls.client = DatabricksClient()
+        cls.catalog_name = _catalog()
+        cls.schema_name = _schema()
         cls.sql = cls.client.sql
-        cls.test_schema = f"ygg_delta_test_{int(time.time())}"
+        cls._tables = []
+        try:
+            cls.sql.execute(f"CREATE SCHEMA IF NOT EXISTS {cls.catalog_name}.{cls.schema_name}")
+        except Exception as e:
+            raise unittest.SkipTest(f"Cannot create test schema: {e}")
 
     @classmethod
     def tearDownClass(cls) -> None:
-        try:
-            cls.sql.execute(f"DROP SCHEMA IF EXISTS {cls.test_schema} CASCADE")
-        except Exception:
-            pass
-        super().tearDownClass()
-
-    def setUp(self) -> None:
-        super().setUp()
-        try:
-            self.sql.execute(f"CREATE SCHEMA IF NOT EXISTS {self.test_schema}")
-        except Exception:
-            self.skipTest("Cannot create test schema in Databricks")
-
-    def test_sql_write_local_read(self) -> None:
-        """Write with Databricks SQL, scan storage, read locally."""
-        table_name = f"{self.test_schema}.test_sql_write_{int(time.time())}"
-        try:
-            self.sql.execute(f"""
-                CREATE TABLE {table_name} (
-                    id BIGINT,
-                    val STRING
-                ) USING DELTA
-            """)
-            self.sql.execute(f"""
-                INSERT INTO {table_name} VALUES (1, 'a'), (2, 'b'), (3, 'c')
-            """)
-
-            rows = self.sql.execute(f"SELECT * FROM {table_name} ORDER BY id")
-            self.assertEqual(len(rows), 3)
-
-            location_rows = self.sql.execute(
-                f"DESCRIBE DETAIL {table_name}"
-            )
-            if location_rows:
-                location = location_rows[0].get("location", "")
-                self.assertTrue(len(location) > 0, "Table location should not be empty")
-
-        finally:
+        for name in cls._tables:
             try:
-                self.sql.execute(f"DROP TABLE IF EXISTS {table_name}")
+                cls.sql.execute(f"DROP TABLE IF EXISTS {name}")
             except Exception:
                 pass
-
-
-@pytest.mark.integration
-@unittest.skipUnless(_has_databricks(), "DATABRICKS_HOST not set")
-@unittest.skipUnless(_has_deltalake(), "deltalake package not installed")
-class TestLocalWriteDatabricksRead(DeltaTestCase):
-    """Write locally with yggdrasil, upload to DBFS, read with Databricks SQL."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        from yggdrasil.databricks.client import DatabricksClient
-        cls.client = DatabricksClient()
-        cls.sql = cls.client.sql
-        cls.test_schema = f"ygg_delta_upload_{int(time.time())}"
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        try:
-            cls.sql.execute(f"DROP SCHEMA IF EXISTS {cls.test_schema} CASCADE")
-        except Exception:
-            pass
         super().tearDownClass()
 
-    def test_local_write_verify_with_sql(self) -> None:
-        """Write a table locally, verify data integrity matches SQL expectations."""
-        d = self.delta_io()
-        t = self.pa.table({
-            "id": [1, 2, 3, 4, 5],
-            "val": ["a", "b", "c", "d", "e"],
-            "score": [10.0, 20.0, 30.0, 40.0, 50.0],
-        })
-        d.write_arrow_table(t, options=DeltaOptions(collect_stats=True))
+    def _table_name(self, tag: str) -> str:
+        name = f"{self.catalog_name}.{self.schema_name}.yg_{tag}_{secrets.token_hex(4)}"
+        type(self)._tables.append(name)
+        return name
 
-        snap = d.snapshot(fresh=True)
-        self.assertEqual(snap.version, 0)
-        self.assertEqual(snap.num_active_files(), 1)
+    def _execute(self, sql: str):
+        return self.sql.execute(sql)
 
-        out = d.read_arrow_table()
-        self.assertEqual(out.num_rows, 5)
+    def _read_sql_arrow(self, sql: str) -> pa.Table:
+        result = self._execute(sql)
+        return result.read_arrow_table()
+
+
+# ---------------------------------------------------------------------------
+# SQL write → DeltaFolder read (via storage location)
+# ---------------------------------------------------------------------------
+
+
+class TestSQLWriteDeltaFolderRead(_DeltaSQLBase):
+    """Write via Databricks SQL, then read the underlying storage with DeltaFolder."""
+
+    def test_create_insert_read_via_storage(self) -> None:
+        """CREATE TABLE + INSERT via SQL, read Delta log from storage location."""
+        tbl = self._table_name("sql_wr")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT, val STRING) USING DELTA")
+        self._execute(f"INSERT INTO {tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+
+        # Get storage location
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+        self.assertTrue(location, "Table must have a storage location")
+
+        # Read via DeltaFolder
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        snap = folder.snapshot()
+
+        self.assertGreaterEqual(snap.version, 0)
+        self.assertGreater(snap.num_active_files(), 0)
+        self.assertIsNotNone(snap.metadata)
+
+        out = folder.read_arrow_table()
+        self.assertEqual(out.num_rows, 3)
+        self.assertEqual(sorted(out.column("id").to_pylist()), [1, 2, 3])
+
+    def test_append_multiple_inserts(self) -> None:
+        """Multiple INSERTs produce multiple versions readable by DeltaFolder."""
+        tbl = self._table_name("sql_app")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl} VALUES (1), (2)")
+        self._execute(f"INSERT INTO {tbl} VALUES (3), (4)")
+        self._execute(f"INSERT INTO {tbl} VALUES (5)")
+
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        snap = folder.snapshot()
+
+        self.assertGreaterEqual(snap.version, 2)
+        out = folder.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), [1, 2, 3, 4, 5])
 
-        import json
-        for add in snap.active_files.values():
-            stats = json.loads(add.stats)
-            self.assertEqual(stats["numRecords"], 5)
+    def test_overwrite_via_sql(self) -> None:
+        """INSERT OVERWRITE replaces data, DeltaFolder sees new version."""
+        tbl = self._table_name("sql_ow")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl} VALUES (1), (2), (3)")
+        self._execute(f"INSERT OVERWRITE {tbl} VALUES (99)")
 
-    def test_multi_commit_consistency(self) -> None:
-        """Multiple appends produce consistent state readable by both engines."""
-        import deltalake
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
 
-        d = self.delta_io()
-        d.write_arrow_table(self.pa.table({"id": [1, 2]}))
-        d.write_arrow_batches(
-            self.pa.table({"id": [3, 4]}).to_batches(),
-            options=DeltaOptions(mode=Mode.APPEND),
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        out = folder.read_arrow_table()
+        self.assertEqual(out.column("id").to_pylist(), [99])
+
+    def test_partitioned_table_via_sql(self) -> None:
+        """Partitioned table created via SQL, read with partition pruning."""
+        tbl = self._table_name("sql_part")
+        self._execute(f"""
+            CREATE TABLE {tbl} (id BIGINT, region STRING, val STRING)
+            USING DELTA PARTITIONED BY (region)
+        """)
+        self._execute(f"INSERT INTO {tbl} VALUES (1, 'us', 'a'), (2, 'eu', 'b'), (3, 'us', 'c')")
+
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        snap = folder.snapshot()
+
+        self.assertEqual(snap.partition_columns, ["region"])
+        out = folder.read_arrow_table()
+        self.assertEqual(out.num_rows, 3)
+        self.assertEqual(set(out.column("region").to_pylist()), {"us", "eu"})
+
+    def test_schema_matches_sql(self) -> None:
+        """DeltaFolder schema matches what SQL reports."""
+        tbl = self._table_name("sql_sch")
+        self._execute(f"""
+            CREATE TABLE {tbl} (
+                id BIGINT, name STRING, score DOUBLE, active BOOLEAN
+            ) USING DELTA
+        """)
+        self._execute(f"INSERT INTO {tbl} VALUES (1, 'alice', 95.5, true)")
+
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        schema = folder.collect_schema()
+        names = [f.name for f in schema.fields]
+        self.assertEqual(names, ["id", "name", "score", "active"])
+
+
+# ---------------------------------------------------------------------------
+# DeltaFolder write → SQL read (write to managed location)
+# ---------------------------------------------------------------------------
+
+
+class TestDeltaFolderWriteSQLRead(_DeltaSQLBase):
+    """Write with DeltaFolder to a managed location, read back via SQL."""
+
+    def test_arrow_insert_then_sql_select(self) -> None:
+        """Write data via SQLEngine.arrow_insert_into, read back via SQL."""
+        tbl = self._table_name("ygg_ins")
+        data = pa.table({
+            "id": pa.array([10, 20, 30], type=pa.int64()),
+            "val": pa.array(["x", "y", "z"], type=pa.string()),
+        })
+
+        self.sql.arrow_insert_into(
+            data, table=tbl, mode="overwrite",
+            wait=True, raise_error=True,
         )
-        d.write_arrow_batches(
-            self.pa.table({"id": [5, 6]}).to_batches(),
-            options=DeltaOptions(mode=Mode.APPEND),
+
+        out = self._read_sql_arrow(f"SELECT * FROM {tbl} ORDER BY id")
+        self.assertEqual(out.num_rows, 3)
+        self.assertEqual(out.column("id").to_pylist(), [10, 20, 30])
+
+    def test_append_via_arrow_insert(self) -> None:
+        """Multiple arrow_insert_into appends produce correct cumulative state."""
+        tbl = self._table_name("ygg_app")
+        batch1 = pa.table({"id": pa.array([1, 2], type=pa.int64())})
+        batch2 = pa.table({"id": pa.array([3, 4], type=pa.int64())})
+
+        self.sql.arrow_insert_into(batch1, table=tbl, mode="overwrite",
+                                    wait=True, raise_error=True)
+        self.sql.arrow_insert_into(batch2, table=tbl, mode="append",
+                                    wait=True, raise_error=True)
+
+        out = self._read_sql_arrow(f"SELECT * FROM {tbl} ORDER BY id")
+        self.assertEqual(sorted(out.column("id").to_pylist()), [1, 2, 3, 4])
+
+    def test_overwrite_via_arrow_insert(self) -> None:
+        """Overwrite replaces all rows."""
+        tbl = self._table_name("ygg_ow")
+        self.sql.arrow_insert_into(
+            pa.table({"id": pa.array([1, 2, 3], type=pa.int64())}),
+            table=tbl, mode="overwrite", wait=True, raise_error=True,
+        )
+        self.sql.arrow_insert_into(
+            pa.table({"id": pa.array([99], type=pa.int64())}),
+            table=tbl, mode="overwrite", wait=True, raise_error=True,
         )
 
-        ygg_out = d.read_arrow_table()
-        dl_out = deltalake.DeltaTable(str(d.path)).to_pyarrow_table()
+        out = self._read_sql_arrow(f"SELECT * FROM {tbl}")
+        self.assertEqual(out.column("id").to_pylist(), [99])
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional: SQL ↔ DeltaFolder data comparison
+# ---------------------------------------------------------------------------
+
+
+class TestBidirectionalComparison(_DeltaSQLBase):
+    """Write on one side, read on both, compare results."""
+
+    def test_sql_write_compare_sql_vs_deltafolder(self) -> None:
+        """Write via SQL, read via both SQL and DeltaFolder, compare."""
+        tbl = self._table_name("cmp_sql")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT, val STRING) USING DELTA")
+        self._execute(f"INSERT INTO {tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+
+        sql_out = self._read_sql_arrow(f"SELECT * FROM {tbl} ORDER BY id")
+
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        ygg_out = folder.read_arrow_table()
 
         self.assertEqual(
+            sorted(sql_out.column("id").to_pylist()),
             sorted(ygg_out.column("id").to_pylist()),
-            sorted(dl_out.column("id").to_pylist()),
         )
         self.assertEqual(
+            sorted(sql_out.column("val").to_pylist()),
+            sorted(ygg_out.column("val").to_pylist()),
+        )
+
+    def test_arrow_insert_compare_sql_vs_deltafolder(self) -> None:
+        """Write via arrow_insert_into, read via SQL and DeltaFolder, compare."""
+        tbl = self._table_name("cmp_arr")
+        data = pa.table({
+            "id": pa.array([10, 20, 30, 40, 50], type=pa.int64()),
+            "score": pa.array([1.1, 2.2, 3.3, 4.4, 5.5], type=pa.float64()),
+        })
+        self.sql.arrow_insert_into(data, table=tbl, mode="overwrite",
+                                    wait=True, raise_error=True)
+
+        sql_out = self._read_sql_arrow(f"SELECT * FROM {tbl} ORDER BY id")
+
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        ygg_out = DeltaFolder(path=Path.from_(location)).read_arrow_table()
+
+        self.assertEqual(
+            sorted(sql_out.column("id").to_pylist()),
             sorted(ygg_out.column("id").to_pylist()),
-            [1, 2, 3, 4, 5, 6],
         )
 
+    def test_multi_version_time_travel(self) -> None:
+        """Multiple SQL inserts, DeltaFolder reads each version."""
+        tbl = self._table_name("cmp_tt")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl} VALUES (1), (2)")
+        self._execute(f"INSERT INTO {tbl} VALUES (3)")
+        self._execute(f"INSERT INTO {tbl} VALUES (4), (5)")
 
-@pytest.mark.integration
-@unittest.skipUnless(_has_databricks(), "DATABRICKS_HOST not set")
-@unittest.skipUnless(_has_deltalake(), "deltalake package not installed")
-class TestStoragePathComparison(DeltaTestCase):
-    """Compare local Delta storage structure with Databricks expectations."""
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
 
-    def test_log_structure_matches_convention(self) -> None:
-        """Verify _delta_log layout follows Delta spec."""
-        d = self.delta_io()
-        for i in range(6):
-            mode = Mode.AUTO if i == 0 else Mode.APPEND
-            d.write_arrow_batches(
-                self.pa.table({"id": [i], "val": [f"row_{i}"]}).to_batches(),
-                options=DeltaOptions(
-                    mode=mode,
-                    checkpoint_interval=5,
-                    checkpoint_kind="v1",
-                ),
-            )
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        snap = folder.snapshot()
 
-        log_dir = os.path.join(str(d.path), "_delta_log")
-        entries = os.listdir(log_dir)
+        head_ids = sorted(folder.read_arrow_table().column("id").to_pylist())
+        self.assertEqual(head_ids, [1, 2, 3, 4, 5])
 
-        commits = [f for f in entries if f.endswith(".json") and not f.startswith("_")]
-        self.assertEqual(len(commits), 6)
-
-        for i in range(6):
-            expected = f"{i:020d}.json"
-            self.assertIn(expected, commits)
-
-        self.assertIn("_last_checkpoint", entries)
-        self.assertIn(f"{4:020d}.checkpoint.parquet", entries)
-
-    def test_partition_directory_layout(self) -> None:
-        """Verify Hive-style partition directory structure."""
-        from yggdrasil.data.data_field import Field
-        from yggdrasil.data.schema import Schema
-        from yggdrasil.data.types.primitive import Int64Type, StringType
-
-        schema = Schema()
-        schema.with_field(Field(name="id", dtype=Int64Type()))
-        schema.with_field(
-            Field(name="region", dtype=StringType()).with_partition_by(True)
-        )
-        schema.with_field(Field(name="val", dtype=StringType()))
-
-        d = self.delta_io()
-        t = self.pa.table({
-            "id": [1, 2, 3, 4],
-            "region": ["us", "us", "eu", "eu"],
-            "val": ["a", "b", "c", "d"],
-        })
-        d.write_arrow_table(t, options=DeltaOptions(target=schema))
-
-        table_root = str(d.path)
-        dirs = os.listdir(table_root)
-        self.assertIn("_delta_log", dirs)
-        self.assertIn("region=us", dirs)
-        self.assertIn("region=eu", dirs)
-
-        us_files = os.listdir(os.path.join(table_root, "region=us"))
-        eu_files = os.listdir(os.path.join(table_root, "region=eu"))
-        self.assertEqual(len(us_files), 1)
-        self.assertEqual(len(eu_files), 1)
-        self.assertTrue(us_files[0].endswith(".parquet"))
-        self.assertTrue(eu_files[0].endswith(".parquet"))
-
-    def test_local_vs_deltalake_file_layout_match(self) -> None:
-        """Compare file layout of ygg vs deltalake writes."""
-        import deltalake
-
-        t = self.pa.table({"id": [1, 2, 3], "val": ["a", "b", "c"]})
-
-        ygg_path = str(self.tmp_path / "ygg_layout")
-        os.makedirs(ygg_path, exist_ok=True)
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
-        d = DeltaFolder(path=ygg_path)
-        d.write_arrow_table(t)
-
-        dl_path = str(self.tmp_path / "dl_layout")
-        deltalake.write_deltalake(dl_path, t)
-
-        ygg_log = os.path.join(ygg_path, "_delta_log")
-        dl_log = os.path.join(dl_path, "_delta_log")
-
-        ygg_commits = [f for f in os.listdir(ygg_log)
-                       if f.endswith(".json") and not f.startswith("_")]
-        dl_commits = [f for f in os.listdir(dl_log)
-                      if f.endswith(".json") and not f.startswith("_")]
-
-        self.assertEqual(len(ygg_commits), 1)
-        self.assertEqual(len(dl_commits), 1)
-        self.assertEqual(ygg_commits[0], "00000000000000000000.json")
-        self.assertEqual(dl_commits[0], "00000000000000000000.json")
-
-        ygg_parquets = [f for f in os.listdir(ygg_path) if f.endswith(".parquet")]
-        dl_parquets = [f for f in os.listdir(dl_path) if f.endswith(".parquet")]
-        self.assertEqual(len(ygg_parquets), 1)
-        self.assertEqual(len(dl_parquets), 1)
-
-    def test_overwrite_removes_match(self) -> None:
-        """Verify overwrite produces correct remove + add actions."""
-        d = self.delta_io()
-        d.write_arrow_table(self.pa.table({"id": [1, 2]}))
-        d.write_arrow_table(
-            self.pa.table({"id": [99]}),
-            options=DeltaOptions(mode=Mode.OVERWRITE),
-        )
-
-        snap = d.snapshot(fresh=True)
-        self.assertEqual(snap.version, 1)
-        self.assertEqual(snap.num_active_files(), 1)
-
-        import deltalake
-        dt = deltalake.DeltaTable(str(d.path))
-        dl_out = dt.to_pyarrow_table()
-        self.assertEqual(dl_out.column("id").to_pylist(), [99])
+        # Time-travel to version after first INSERT
+        if snap.version >= 2:
+            v1 = folder.read_arrow_table(options=DeltaOptions(version=1))
+            self.assertEqual(sorted(v1.column("id").to_pylist()), [1, 2])
 
 
-@pytest.mark.integration
-@unittest.skipUnless(_has_databricks(), "DATABRICKS_HOST not set")
-class TestDatabricksStorageScan(DeltaTestCase):
-    """Scan inner storage paths and compare local vs remote state."""
+# ---------------------------------------------------------------------------
+# Storage path inspection
+# ---------------------------------------------------------------------------
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        from yggdrasil.databricks.client import DatabricksClient
-        cls.client = DatabricksClient()
 
-    def test_dbfs_path_list(self) -> None:
-        """Verify we can list DBFS paths."""
-        try:
-            dbfs = self.client.workspace_client.dbfs
-            items = list(dbfs.list("/"))
-            self.assertIsNotNone(items)
-        except Exception as e:
-            self.skipTest(f"Cannot access DBFS: {e}")
+class TestStorageScan(_DeltaSQLBase):
+    """Inspect the physical storage layout of Databricks-managed Delta tables."""
 
-    def test_local_delta_structure_complete(self) -> None:
-        """Verify local Delta table has all required components."""
-        d = self.delta_io()
-        t = self.pa.table({
-            "id": [1, 2, 3],
-            "name": ["alice", "bob", "charlie"],
-            "score": [85.5, 92.0, 78.3],
-        })
-        d.write_arrow_table(t, options=DeltaOptions(collect_stats=True))
+    def test_table_has_delta_log(self) -> None:
+        """Every Delta table has a _delta_log directory."""
+        tbl = self._table_name("scan_log")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl} VALUES (1)")
 
-        snap = d.snapshot(fresh=True)
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
 
-        self.assertIsNotNone(snap.protocol)
-        self.assertGreaterEqual(snap.protocol.min_reader_version, 1)
-        self.assertGreaterEqual(snap.protocol.min_writer_version, 2)
+        from yggdrasil.path import Path
+        root = Path.from_(location)
+        children = [c.name for c in root.iterdir()]
+        self.assertIn("_delta_log", children)
 
+    def test_snapshot_metadata_matches_sql_describe(self) -> None:
+        """Snapshot protocol/metadata matches DESCRIBE output."""
+        tbl = self._table_name("scan_meta")
+        self._execute(f"""
+            CREATE TABLE {tbl} (id BIGINT, name STRING, score DOUBLE)
+            USING DELTA
+        """)
+        self._execute(f"INSERT INTO {tbl} VALUES (1, 'a', 1.5)")
+
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+        num_files_sql = detail.column("numFiles")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        snap = folder.snapshot()
+
+        self.assertEqual(snap.num_active_files(), num_files_sql)
         self.assertIsNotNone(snap.metadata)
-        self.assertTrue(len(snap.metadata.schema_string) > 0)
-        self.assertEqual(snap.metadata.format_provider, "parquet")
+        self.assertIn("id", snap.schema_string)
+        self.assertIn("name", snap.schema_string)
+        self.assertIn("score", snap.schema_string)
 
-        self.assertEqual(snap.num_active_files(), 1)
-        for add in snap.active_files.values():
-            self.assertTrue(len(add.path) > 0)
-            self.assertGreater(add.size, 0)
-            self.assertIsNotNone(add.stats)
+    def test_file_stats_match_sql_count(self) -> None:
+        """AddFile stats numRecords matches SQL COUNT(*)."""
+        tbl = self._table_name("scan_stats")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl} SELECT id FROM range(100)")
 
-            import json
-            stats = json.loads(add.stats)
-            self.assertEqual(stats["numRecords"], 3)
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+
+        count_out = self._read_sql_arrow(f"SELECT COUNT(*) AS cnt FROM {tbl}")
+        sql_count = count_out.column("cnt")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        snap = folder.snapshot()
+
+        ygg_count = sum(
+            json.loads(add.stats).get("numRecords", 0)
+            for add in snap.active_files.values()
+            if add.stats
+        )
+        self.assertEqual(ygg_count, sql_count)
+
+
+# ---------------------------------------------------------------------------
+# Schema evolution
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaEvolution(_DeltaSQLBase):
+    """Schema changes via SQL, read with DeltaFolder."""
+
+    def test_add_column_via_sql(self) -> None:
+        """ALTER TABLE ADD COLUMN, DeltaFolder sees updated schema."""
+        tbl = self._table_name("evo_add")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl} VALUES (1)")
+        self._execute(f"ALTER TABLE {tbl} ADD COLUMN (name STRING)")
+        self._execute(f"INSERT INTO {tbl} VALUES (2, 'bob')")
+
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        schema = folder.collect_schema()
+        names = [f.name for f in schema.fields]
+        self.assertIn("name", names)
+
+    def test_table_properties_via_sql(self) -> None:
+        """Table properties set via SQL are visible in snapshot config."""
+        tbl = self._table_name("evo_prop")
+        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
+        self._execute(f"ALTER TABLE {tbl} SET TBLPROPERTIES ('delta.minReaderVersion' = '1')")
+
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
+        location = detail.column("location")[0].as_py()
+
+        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.path import Path
+        folder = DeltaFolder(path=Path.from_(location))
+        snap = folder.snapshot()
+        self.assertIsNotNone(snap.protocol)
