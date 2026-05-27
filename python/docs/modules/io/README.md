@@ -1,31 +1,16 @@
 # yggdrasil.io
 
-Yggdrasil IO and transport layer for buffers, URLs, request/response models, media detection, and HTTP execution.
+Yggdrasil IO and transport layer for URLs, request/response models, media detection, and HTTP execution.
 
 ## What this module gives you
 
-- `BytesIO` for spill-to-disk byte buffers with media/compression helpers
 - `URL` for immutable URL parsing and composition
 - `SendConfig` / `SendManyConfig` for request behavior and batching
 - `HTTPSession` (`yggdrasil.http_`) as the preferred HTTP client
 
 ---
 
-## 1) BytesIO quick example
-
-```python
-from yggdrasil.io import BytesIO
-
-with BytesIO() as buf:
-    buf.write(b"hello")
-    buf.seek(0)
-    print(buf.compression)
-    print(buf.media_type)
-```
-
----
-
-## 2) URL parsing/composition
+## 1) URL parsing/composition
 
 ```python
 from yggdrasil.io import URL
@@ -37,7 +22,7 @@ print(u.with_query_items({"q": 2, "lang": "en"}).to_string())
 
 ---
 
-## 3) Preferred HTTP client
+## 2) Preferred HTTP client
 
 ```python
 from yggdrasil.http_ import HTTPSession

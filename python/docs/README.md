@@ -1,6 +1,6 @@
 # Yggdrasil Python documentation
 
-Hands-on, copy-paste guide that walks from the smallest possible cast up through dataframe engines, HTTP, and Databricks workflows.
+Hands-on, copy-paste guide that walks from the smallest possible cast up through dataframe engines, HTTP, and Databricks.
 
 The published site lives at **https://platob.github.io/Yggdrasil/** and is built from the same files you see here.
 
@@ -110,15 +110,10 @@ reqs = [http.prepare_request("GET", "https://httpbin.org/get",
 responses = list(http.send_many(reqs, send_config=SendManyConfig(max_workers=3)))
 ```
 
-Buffers and URLs:
+URLs:
 
 ```python
-from yggdrasil.io import BytesIO, URL
-
-with BytesIO() as buf:
-    buf.write(b"hello")
-    buf.seek(0)
-    print(buf.compression, buf.media_type)
+from yggdrasil.io import URL
 
 print(URL.from_str("https://example.com/?q=1").host)
 ```

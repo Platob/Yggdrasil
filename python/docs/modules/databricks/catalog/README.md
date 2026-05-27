@@ -148,21 +148,6 @@ tables_svc = client.tables
 print(list(tables_svc.list_tables("main.sales")))
 ```
 
-## Async / staged insert (high-volume)
-
-For high-volume writes, `Table` exposes an async staged-insert path that uploads Parquet to a Volume, then issues a `COPY INTO`:
-
-```python
-from yggdrasil.databricks import DatabricksClient
-import pyarrow as pa
-
-client = DatabricksClient()
-table  = client.catalogs["main"]["raw"]["events"]
-
-# Stage + commit in one call (Arrow table)
-table.async_insert(arrow_table, wait=True)
-```
-
 ## Constraints
 
 ```python

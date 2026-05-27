@@ -19,9 +19,8 @@ The full literate nav is generated into `reference/SUMMARY.md` and rendered by `
 | `yggdrasil.pandas.cast` | `cast_pandas_dataframe` |
 | `yggdrasil.spark.cast` | `cast_spark_dataframe` |
 | `yggdrasil.http_` | `HTTPSession`, `PreparedRequest`, `Response` |
-| `yggdrasil.io` | `BytesIO`, `URL`, `SendConfig`, `SendManyConfig` |
+| `yggdrasil.io` | `URL`, `SendConfig`, `SendManyConfig` |
 | `yggdrasil.databricks` | `DatabricksClient` |
-| `yggdrasil.databricks.jobs` | `NotebookConfig` |
 | `yggdrasil.pyutils` | `retry`, `parallelize` |
 | `yggdrasil.concurrent` | `Job`, `JobPoolExecutor` |
 

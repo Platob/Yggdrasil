@@ -23,8 +23,6 @@ c = DatabricksClient(host="https://<workspace>", token="<token>")
 | `c.dbfs_path(...)` | DBFS / Volumes / Workspace files | `c.dbfs_path("dbfs:/tmp/a.txt")` |
 | `c.secrets` | Scope/secret CRUD | `c.secrets.create_secret("scope/key", "value")` |
 | `c.iam` | Users/groups (workspace or account) | `c.iam.users.current_user` |
-| `c.genie` | Conversational analytics | `c.genie.ask("<space-id>", "weekly revenue")` |
-| `c.compute` | Cluster lifecycle / runtime selection | `c.compute.clusters.all_purpose_cluster(name="etl")` |
 
 ## Authentication
 
@@ -168,23 +166,6 @@ def add(x: int, y: int) -> int:
     return x + y
 ```
 
-## Typed job widgets
-
-```python
-from dataclasses import dataclass
-from yggdrasil.databricks.jobs import NotebookConfig
-
-@dataclass
-class IngestConfig(NotebookConfig):
-    catalog: str = "main"
-    schema: str = "ingest"
-    table: str = "events"
-    dry_run: bool = True
-
-cfg = IngestConfig.from_environment()    # in a job run
-# cfg = IngestConfig.init_widgets()      # in a local notebook
-```
-
 ## IAM
 
 ```python
@@ -196,16 +177,6 @@ list(iam.users.list(limit=20))
 grp = iam.groups.create("data-engineering")
 list(iam.groups.list(name="data-engineering", limit=5))
 iam.groups.delete(grp)
-```
-
-## Genie
-
-```python
-genie = c.genie
-print(genie.ask("<space-id>", "Top 10 customers by revenue"))
-
-conv = genie.start_conversation("<space-id>")
-genie.create_message("<space-id>", conv.conversation_id, "Now split by region")
 ```
 
 ## Troubleshooting
@@ -223,6 +194,4 @@ genie.create_message("<space-id>", conv.conversation_id, "Now split by region")
 - [databricks/compute](../modules/databricks/compute/README.md), [remote](../modules/databricks/compute/remote/README.md)
 - [databricks/workspaces](../modules/databricks/workspaces/README.md), [fs](../modules/databricks/fs/README.md)
 - [databricks/secrets](../modules/databricks/secrets/README.md), [iam](../modules/databricks/iam/README.md)
-- [databricks/jobs](../modules/databricks/jobs/README.md)
-- [databricks/genie](../modules/databricks/genie/README.md)
 - [databricks/account](../modules/databricks/account/README.md)

@@ -11,7 +11,7 @@ Hand-written, copy-paste-friendly pages for the most-used surfaces. The auto-gen
 
 ## IO and HTTP
 
-- [io](io/README.md) — `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`.
+- [io](io/README.md) — `URL`, `SendConfig`/`SendManyConfig`.
 - [http_](http_/README.md) — `HTTPSession`, prepared requests, batch dispatch.
 
 ## Databricks
@@ -21,8 +21,7 @@ Hand-written, copy-paste-friendly pages for the most-used surfaces. The auto-gen
 - [databricks/compute](databricks/compute/README.md) and [compute/remote](databricks/compute/remote/README.md).
 - [databricks/workspaces](databricks/workspaces/README.md), [databricks/fs](databricks/fs/README.md).
 - [databricks/secrets](databricks/secrets/README.md), [databricks/iam](databricks/iam/README.md).
-- [databricks/jobs](databricks/jobs/README.md), [databricks/account](databricks/account/README.md).
-- [databricks/genie](databricks/genie/README.md).
+- [databricks/account](databricks/account/README.md).
 
 ## Utilities
 
