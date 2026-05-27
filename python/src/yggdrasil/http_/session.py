@@ -850,7 +850,18 @@ class HTTPSession(Session):
                 retries.sleep()
                 continue
             except ssl.SSLError as exc:
-                raise SSLError(str(exc)) from exc
+                msg = str(exc)
+                if "EOF" in msg or "UNEXPECTED_EOF" in msg or "Connection reset" in msg:
+                    url_str = current_request.url.to_string()
+                    wrapped = SSLError(msg)
+                    wrapped.__cause__ = exc
+                    retries = retries.increment(
+                        method=current_request.method, url=url_str,
+                        error=wrapped, _pool=self,
+                    )
+                    retries.sleep()
+                    continue
+                raise SSLError(msg) from exc
             except (OSError, http.client.HTTPException) as exc:
                 url_str = current_request.url.to_string()
                 wrapped = NewConnectionError(self, str(exc))
