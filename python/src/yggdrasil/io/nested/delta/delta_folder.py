@@ -359,6 +359,15 @@ class DeltaFolder(Folder):
         if is_initial:
             target_schema = materialized[0].schema if materialized else pa.schema([])
             partition_columns = list(self._infer_partition_columns(options))
+        elif action is Mode.OVERWRITE and materialized:
+            # OVERWRITE replaces the table contents and may change the
+            # schema. Use the incoming data's schema so the new metaData
+            # action reflects the actual columns on disk.
+            target_schema = materialized[0].schema
+            partition_columns = (
+                list(self._infer_partition_columns(options))
+                or initial_snap.partition_columns
+            )
         else:
             target_schema = (
                 spark_json_to_arrow_schema(initial_snap.schema_string)
@@ -385,6 +394,19 @@ class DeltaFolder(Folder):
                         options=options,
                         target_schema=target_schema,
                         partition_columns=partition_columns,
+                    )
+                )
+            elif action is Mode.OVERWRITE and materialized:
+                # OVERWRITE replaces the active set. Re-emit metaData
+                # with the incoming schema so the recorded schemaString
+                # matches what the new parquet files contain.
+                actions.append(
+                    Metadata(
+                        id=snap.metadata.id,
+                        schema_string=arrow_schema_to_spark_json(target_schema),
+                        partition_columns=partition_columns,
+                        configuration=dict(snap.metadata.configuration),
+                        created_time=snap.metadata.created_time,
                     )
                 )
             if action is Mode.OVERWRITE:
