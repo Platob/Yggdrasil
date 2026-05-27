@@ -8,9 +8,7 @@ SELECT-like queries.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
-
-import pyarrow as pa
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.enums import JoinType, Mode
@@ -252,10 +250,6 @@ class SelectPlan(ExecutionPlan[O]):
             result = ArrowTabular(table)
 
         return result
-
-    def execute_arrow_batches(self, source: "Tabular[O]",
-                               options: "O | None" = None) -> Iterator[pa.RecordBatch]:
-        yield from self.execute(source).read_arrow_batches(options)
 
     # -- Plan node conversion --------------------------------------------
 

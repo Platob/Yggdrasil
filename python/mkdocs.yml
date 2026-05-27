@@ -185,6 +185,8 @@ nav:
           - account: modules/databricks/account/README.md
       - Serialization:
           - pickle + json: modules/pickle/README.md
+      - Execution Plans:
+          - plan: modules/plan/README.md
       - Engines:
           - polars / pandas / spark: modules/engines/README.md
       - Databricks (extended):

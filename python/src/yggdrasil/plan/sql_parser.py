@@ -411,29 +411,20 @@ class SQLQueryParser:
             return self._ident_or_kw().text
         # Implicit alias: ident not followed by keyword that starts a clause
         if (self.cur.kind == "ident"
-                and not self._is_clause_start()):
+                and not self._is_kw(*self._CLAUSE_KW)):
             return self._eat().text
         return None
 
-    def _is_clause_start(self) -> bool:
-        return self._is_kw(
-            "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT",
-            "OFFSET", "UNION", "INTERSECT", "EXCEPT", "ON", "JOIN",
-            "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "LATERAL",
-            "WHEN", "THEN", "ELSE", "END", "AND", "OR",
-        )
-
-    # ---- FROM ---------------------------------------------------------
+    _CLAUSE_KW = frozenset({"FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT",
+        "OFFSET", "UNION", "INTERSECT", "EXCEPT", "ON", "JOIN", "INNER", "LEFT",
+        "RIGHT", "FULL", "CROSS", "LATERAL", "WHEN", "THEN", "ELSE", "END", "AND", "OR"})
+    _JOIN_KW = frozenset({"JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"})
 
     def _parse_from_clause(self) -> Any:
         left = self._parse_from_item()
-        # Joins
-        while self._is_join_kw():
+        while self._is_kw(*self._JOIN_KW):
             left = self._parse_join(left)
         return left
-
-    def _is_join_kw(self) -> bool:
-        return self._is_kw("JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS")
 
     def _parse_from_item(self) -> Any:
         if self.cur.kind == "lparen":
@@ -907,7 +898,7 @@ class SQLQueryParser:
             self._eat()
             self._expect_kind("rparen")
             fc = FunctionCall(name=upper_name, args=(Star(),))
-            return self._maybe_over(fc)
+            return (WindowFunction(function=fc, window=self._parse_window_spec()) if self._accept_kw("OVER") else fc)
 
         # DISTINCT
         distinct = False
@@ -925,10 +916,7 @@ class SQLQueryParser:
         self._expect_kind("rparen")
 
         fc = FunctionCall(name=upper_name, args=tuple(args), distinct=distinct)
-        return self._maybe_over(fc)
-
-    def _maybe_over(self, fc: Expression) -> Expression:
-        return WindowFunction(function=fc, window=self._parse_window_spec()) if self._accept_kw("OVER") else fc
+        return (WindowFunction(function=fc, window=self._parse_window_spec()) if self._accept_kw("OVER") else fc)
 
     def _parse_window_spec(self) -> Any:
         self._expect_kind("lparen")
