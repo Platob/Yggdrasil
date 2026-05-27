@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Any
 
-from ..deps import get_pyfunc_service
+from fastapi import APIRouter, Depends
+from pydantic import Field
+
+from ..deps import get_pyfunc_service, get_pyfuncrun_service
+from ..schemas.common import StrictModel
 from ..schemas.pyfunc import (
     PyFuncCreate,
     PyFuncListResponse,
     PyFuncResponse,
     PyFuncUpdate,
 )
+from ..schemas.pyfuncrun import PyFuncRunCreate, PyFuncRunResponse
 from ..services.pyfunc import PyFuncService
+from ..services.pyfuncrun import PyFuncRunService
 
 router = APIRouter(tags=["pyfunc"])
 
@@ -53,3 +59,30 @@ async def delete_func(
     service: PyFuncService = Depends(get_pyfunc_service),
 ) -> PyFuncResponse:
     return await service.delete(func_id)
+
+
+class _FuncRunRequest(StrictModel):
+    """Inline body for the convenience run endpoint."""
+    env_id: int | None = None
+    args: list[Any] = Field(default_factory=list)
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    timeout: float | None = None
+    max_memory_mb: int | None = None
+
+
+@router.post("/{func_id}/run", response_model=PyFuncRunResponse)
+async def run_func(
+    func_id: int,
+    req: _FuncRunRequest,
+    pyfuncrun: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> PyFuncRunResponse:
+    """Run a function directly by its ID. Creates a PyFuncRun and returns the result."""
+    create_req = PyFuncRunCreate(
+        func_id=func_id,
+        env_id=req.env_id,
+        args=list(req.args),
+        kwargs=dict(req.kwargs),
+        timeout=req.timeout,
+        max_memory_mb=req.max_memory_mb,
+    )
+    return await pyfuncrun.create(create_req)

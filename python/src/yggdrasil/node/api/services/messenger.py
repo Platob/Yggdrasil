@@ -25,6 +25,8 @@ class MessengerService:
         self.settings = settings
         self._channels: dict[str, list[Message]] = defaultdict(list)
         self._lock = Lock()
+        # Per-channel event that fires when a new message arrives, waking SSE streams
+        self._channel_events: dict[str, asyncio.Event] = defaultdict(asyncio.Event)
 
         # Auto-create the default channel
         self._channels["general"] = []
@@ -37,7 +39,7 @@ class MessengerService:
         content: str,
         node_id: str = "",
     ) -> Message:
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         msg_id = make_id(f"msg:{channel}:{now}")
         msg = Message(
             id=msg_id,
@@ -50,6 +52,8 @@ class MessengerService:
         )
         with self._lock:
             self._channels[channel].append(msg)
+        # Wake any SSE streams waiting for new messages on this channel
+        self._channel_events[channel].set()
         return msg
 
     def list_channels(self) -> ChannelListResponse:
@@ -71,11 +75,12 @@ class MessengerService:
         return MessageListResponse(channel=channel, messages=messages)
 
     async def stream_messages(self, channel: str) -> AsyncIterator[Message]:
-        """Yield new messages as they arrive, polling every 0.5s."""
+        """Yield new messages as they arrive. Wakes immediately on new messages via asyncio.Event."""
+        event = self._channel_events[channel]
         with self._lock:
             last_seen = len(self._channels[channel])
         while True:
-            await asyncio.sleep(0.5)
+            event.clear()
             with self._lock:
                 msgs = self._channels[channel]
                 current_len = len(msgs)
@@ -86,7 +91,10 @@ class MessengerService:
                     new_msgs = []
             for msg in new_msgs:
                 yield msg
+            if not new_msgs:
+                # Wait for a new message or timeout (keeps connection alive with heartbeats)
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=30.0)
+                except TimeoutError:
+                    pass
 
-    @staticmethod
-    def _now() -> str:
-        return dt.datetime.now(dt.timezone.utc).isoformat()

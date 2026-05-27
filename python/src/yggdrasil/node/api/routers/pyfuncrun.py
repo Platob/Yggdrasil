@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from fastapi import APIRouter, Depends, Response
 from fastapi.responses import StreamingResponse
@@ -9,12 +10,14 @@ from ...transport import (
     CONTENT_TYPE_ARROW_STREAM,
     serialize_result,
 )
-from ..deps import get_pyfuncrun_service
+from ..deps import get_pyfunc_service, get_pyfuncrun_service
 from ..schemas.pyfuncrun import (
     PyFuncRunCreate,
     PyFuncRunListResponse,
     PyFuncRunResponse,
+    PyFuncRunSubmit,
 )
+from ..services.pyfunc import PyFuncService
 from ..services.pyfuncrun import PyFuncRunService
 
 router = APIRouter(tags=["pyfuncrun"])
@@ -36,6 +39,25 @@ async def create_run(
     return await service.create(req)
 
 
+@router.post("/submit", response_model=PyFuncRunResponse)
+async def submit_run(
+    req: PyFuncRunSubmit,
+    pyfunc: PyFuncService = Depends(get_pyfunc_service),
+    service: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> PyFuncRunResponse:
+    """Submit a run by function name. Resolves the function, creates the run, returns immediately."""
+    func = await pyfunc.get_by_name(req.func_name)
+    create_req = PyFuncRunCreate(
+        func_id=func.id,
+        env_id=req.env_id,
+        args=list(req.args),
+        kwargs=dict(req.kwargs),
+        timeout=req.timeout,
+        max_memory_mb=req.max_memory_mb,
+    )
+    return await service.create(create_req)
+
+
 @router.get("/{run_id}", response_model=PyFuncRunResponse)
 async def get_run(
     run_id: int,
@@ -51,6 +73,17 @@ async def delete_run(
     service: PyFuncRunService = Depends(get_pyfuncrun_service),
 ) -> PyFuncRunResponse:
     return await service.delete(run_id)
+
+
+@router.get("/{run_id}/wait", response_model=PyFuncRunResponse)
+async def wait_run(
+    run_id: int,
+    timeout: float = 600.0,
+    service: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> PyFuncRunResponse:
+    """Block until run completes or timeout, then return final state."""
+    entry = await service.wait(run_id, timeout=timeout)
+    return PyFuncRunResponse(run=entry)
 
 
 @router.get("/{run_id}/logs")

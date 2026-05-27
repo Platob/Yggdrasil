@@ -25,7 +25,7 @@ class UserService:
 
         # Auto-register the local user on startup
         info = UserInfo.current()
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         user_id = make_id(info.key)
         card = UserCard(
             user_id=user_id,
@@ -48,7 +48,7 @@ class UserService:
         return self._self_card  # type: ignore[return-value]
 
     def register(self, card: UserCard) -> UserCard:
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         card = card.model_copy(update={"last_seen_at": now})
         with self._lock:
             self._users.set(card.user_id, card)
@@ -67,6 +67,3 @@ class UserService:
             raise NotFoundError(f"User {user_id!r} not found")
         return card
 
-    @staticmethod
-    def _now() -> str:
-        return dt.datetime.now(dt.timezone.utc).isoformat()

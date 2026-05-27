@@ -64,7 +64,7 @@ class PyFuncRunService:
             env_python = self._pyenv.get_python_path(env_id)
 
         run_id = make_id(f"{req.func_id}:{time.monotonic()}")
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
 
         entry = PyFuncRunEntry(
             id=run_id,
@@ -116,6 +116,17 @@ class PyFuncRunService:
             raise NotFoundError(f"PyFuncRun {run_id!r} not found")
         return PyFuncRunResponse(run=entry)
 
+    async def wait(self, run_id: int, *, timeout: float = 600.0, interval: float = 0.3) -> PyFuncRunEntry:
+        """Block until run completes or timeout. Returns final entry."""
+        t0 = time.monotonic()
+        while True:
+            entry = await self.get(run_id)
+            if entry.status not in ("pending", "running"):
+                return entry
+            if time.monotonic() - t0 > timeout:
+                raise TimeoutError(f"Run {run_id} timed out after {timeout}s")
+            await asyncio.sleep(interval)
+
     async def stream_logs(self, run_id: int) -> AsyncIterator[dict[str, Any]]:
         with self._lock:
             entry = self._runs.get(run_id)
@@ -129,7 +140,7 @@ class PyFuncRunService:
             if entry is None:
                 return
 
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         if entry.stdout:
             for line in entry.stdout.splitlines():
                 yield {"type": "stdout", "line": line, "timestamp": now}
@@ -259,7 +270,7 @@ class PyFuncRunService:
             return self._update_entry(
                 run_id,
                 status=status,
-                completed_at=self._now(),
+                completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
                 duration=duration,
                 returncode=proc.returncode,
                 stdout=stdout_text,
@@ -274,7 +285,7 @@ class PyFuncRunService:
             return self._update_entry(
                 run_id,
                 status="failed",
-                completed_at=self._now(),
+                completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
                 duration=round(time.monotonic() - t0, 3),
                 stderr=f"Timed out after {timeout:.0f}s",
                 progress=1.0,
@@ -284,7 +295,7 @@ class PyFuncRunService:
             return self._update_entry(
                 run_id,
                 status="failed",
-                completed_at=self._now(),
+                completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
                 duration=round(time.monotonic() - t0, 3),
                 stderr=str(exc),
                 progress=1.0,
@@ -304,7 +315,3 @@ class PyFuncRunService:
                 self._runs.set(run_id, entry)
                 return entry
         raise NotFoundError(f"PyFuncRun {run_id!r} not found")
-
-    @staticmethod
-    def _now() -> str:
-        return dt.datetime.now(dt.timezone.utc).isoformat()

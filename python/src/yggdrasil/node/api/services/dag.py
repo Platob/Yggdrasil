@@ -5,11 +5,13 @@ import hashlib
 import json as json_mod
 import logging
 import time
-from collections import OrderedDict, deque
+from collections import deque
 from threading import Lock
 from typing import Any
 
 import httpx
+
+from yggdrasil.dataclasses.expiring import ExpiringDict
 
 from ...config import Settings
 from ...exceptions import NotFoundError
@@ -41,14 +43,14 @@ class DAGService:
     ) -> None:
         self.settings = settings
         self._pyfuncrun = pyfuncrun_service
-        self._dags: OrderedDict[int, DAGEntry] = OrderedDict()
-        self._runs: OrderedDict[int, DAGRunEntry] = OrderedDict()
+        self._dags: ExpiringDict[int, DAGEntry] = ExpiringDict(default_ttl=None, max_size=_MAX_DAGS)
+        self._runs: ExpiringDict[int, DAGRunEntry] = ExpiringDict(default_ttl=None, max_size=_MAX_DAG_RUNS)
         self._lock = Lock()
 
     # -- CRUD ---------------------------------------------------------------
 
     async def create(self, req: DAGCreate) -> DAGResponse:
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         with self._lock:
             existing = next(
                 (d for d in self._dags.values() if d.name == req.name), None
@@ -87,8 +89,7 @@ class DAGService:
                 updated_at=now,
                 content_hash=content_hash,
             )
-            self._dags[dag_id] = entry
-            self._evict_dags()
+            self._dags.set(dag_id, entry)
             return DAGResponse(dag=entry)
 
     async def get(self, dag_id: int) -> DAGEntry:
@@ -116,7 +117,7 @@ class DAGService:
         dag = await self.get(dag_id)
 
         run_id = make_id(f"dagrun:{dag_id}:{time.monotonic()}")
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         t0 = time.monotonic()
 
         dag_run = DAGRunEntry(
@@ -127,8 +128,7 @@ class DAGService:
             node_id=self.settings.node_id,
         )
         with self._lock:
-            self._runs[run_id] = dag_run
-            self._evict_runs()
+            self._runs.set(run_id, dag_run)
 
         step_results: dict[str, Any] = {}
         status = "completed"
@@ -159,7 +159,7 @@ class DAGService:
         duration = round(time.monotonic() - t0, 3)
         dag_run = dag_run.model_copy(update={
             "status": status,
-            "completed_at": self._now(),
+            "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "duration": duration,
             "step_results": step_results,
         })
@@ -263,14 +263,3 @@ class DAGService:
                 return stdout.strip()
         return None
 
-    def _evict_dags(self) -> None:
-        while len(self._dags) > _MAX_DAGS:
-            self._dags.popitem(last=False)
-
-    def _evict_runs(self) -> None:
-        while len(self._runs) > _MAX_DAG_RUNS:
-            self._runs.popitem(last=False)
-
-    @staticmethod
-    def _now() -> str:
-        return dt.datetime.now(dt.timezone.utc).isoformat()

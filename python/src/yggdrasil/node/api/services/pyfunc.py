@@ -31,17 +31,17 @@ class PyFuncService:
     def __init__(self, settings: Settings, *, audit: AuditLog | None = None) -> None:
         self.settings = settings
         self._funcs: ExpiringDict[int, PyFuncEntry] = ExpiringDict(default_ttl=None, max_size=settings.max_functions)
+        self._name_to_id: dict[str, int] = {}
         self._lock = Lock()
         self._audit = audit
 
     # -- CRUD ---------------------------------------------------------------
 
     async def create(self, req: PyFuncCreate) -> PyFuncResponse:
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         with self._lock:
-            existing = next(
-                (f for f in self._funcs.values() if f.name == req.name), None
-            )
+            existing_id = self._name_to_id.get(req.name)
+            existing = self._funcs.get(existing_id) if existing_id is not None else None
             if existing:
                 updates: dict = {
                     "updated_at": now,
@@ -84,6 +84,7 @@ class PyFuncService:
                 content_hash=content_hash,
             )
             self._funcs.set(func_id, entry)
+            self._name_to_id[req.name] = func_id
             if self._audit is not None:
                 self._audit.log("create", "pyfunc", func_id, detail=f"name={req.name}")
             return PyFuncResponse(func=entry)
@@ -106,7 +107,7 @@ class PyFuncService:
         if entry is None:
             raise NotFoundError(f"PyFunc {func_id!r} not found")
 
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         updates: dict = {"updated_at": now}
         for field in ("name", "code", "description", "python_version", "dependencies", "env_id"):
             val = getattr(req, field)
@@ -123,11 +124,16 @@ class PyFuncService:
         updated = entry.model_copy(update=updates)
         with self._lock:
             self._funcs[func_id] = updated
+            if "name" in updates and updates["name"] != entry.name:
+                self._name_to_id.pop(entry.name, None)
+                self._name_to_id[updates["name"]] = func_id
         return PyFuncResponse(func=updated)
 
     async def delete(self, func_id: int) -> PyFuncResponse:
         with self._lock:
             entry = self._funcs.pop(func_id, None)
+            if entry is not None:
+                self._name_to_id.pop(entry.name, None)
         if entry is None:
             raise NotFoundError(f"PyFunc {func_id!r} not found")
         if self._audit is not None:
@@ -135,7 +141,7 @@ class PyFuncService:
         return PyFuncResponse(func=entry)
 
     def increment_run_count(self, func_id: int) -> None:
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         with self._lock:
             entry = self._funcs.get(func_id)
             if entry is not None:
@@ -168,6 +174,15 @@ class PyFuncService:
 
     # -- internals ----------------------------------------------------------
 
-    @staticmethod
-    def _now() -> str:
-        return dt.datetime.now(dt.timezone.utc).isoformat()
+    async def get_by_name(self, name: str) -> PyFuncEntry:
+        """Resolve a function by name. O(1) via name index."""
+        with self._lock:
+            func_id = self._name_to_id.get(name)
+            if func_id is not None:
+                entry = self._funcs.get(func_id)
+                if entry is not None:
+                    return entry
+        raise NotFoundError(
+            f"PyFunc with name {name!r} not found. "
+            f"Check spelling or create it first with POST /api/v2/pyfunc."
+        )

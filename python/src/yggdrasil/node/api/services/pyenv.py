@@ -36,6 +36,7 @@ class PyEnvService:
     def __init__(self, settings: Settings, *, audit: AuditLog | None = None) -> None:
         self.settings = settings
         self._envs: ExpiringDict[int, PyEnvEntry] = ExpiringDict(default_ttl=None, max_size=settings.max_environments)
+        self._name_to_id: dict[str, int] = {}
         self._lock = Lock()
         self._envs_root = settings.node_home / "envs"
         self._envs_root.mkdir(parents=True, exist_ok=True)
@@ -47,12 +48,11 @@ class PyEnvService:
     # -- CRUD ---------------------------------------------------------------
 
     async def create(self, req: PyEnvCreate) -> PyEnvResponse:
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
 
         with self._lock:
-            existing = next(
-                (e for e in self._envs.values() if e.name == req.name), None
-            )
+            existing_id = self._name_to_id.get(req.name)
+            existing = self._envs.get(existing_id) if existing_id is not None else None
 
         if existing:
             new_deps = [d for d in req.dependencies if d not in existing.dependencies]
@@ -92,6 +92,7 @@ class PyEnvService:
         )
         with self._lock:
             self._envs.set(env_id, entry)
+            self._name_to_id[req.name] = env_id
 
         await self._run(
             self._build_env, env_id, req.python_version,
@@ -121,7 +122,7 @@ class PyEnvService:
         if entry is None:
             raise NotFoundError(f"PyEnv {env_id!r} not found")
 
-        now = self._now()
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
         updates: dict = {"updated_at": now}
         if req.name is not None:
             updates["name"] = req.name
@@ -133,6 +134,9 @@ class PyEnvService:
         updated = entry.model_copy(update=updates)
         with self._lock:
             self._envs[env_id] = updated
+            if req.name is not None and req.name != entry.name:
+                self._name_to_id.pop(entry.name, None)
+                self._name_to_id[req.name] = env_id
 
         if req.dependencies is not None:
             await self._run(self._install_packages, env_id, list(req.dependencies))
@@ -143,6 +147,8 @@ class PyEnvService:
     async def delete(self, env_id: int) -> PyEnvResponse:
         with self._lock:
             entry = self._envs.pop(env_id, None)
+            if entry is not None:
+                self._name_to_id.pop(entry.name, None)
         if entry is None:
             raise NotFoundError(f"PyEnv {env_id!r} not found")
         env_path = self._envs_root / str(env_id)
@@ -228,7 +234,7 @@ class PyEnvService:
         uv = shutil.which("uv")
         try:
             self._pip_install(env_path, packages, uv=uv)
-            now = self._now()
+            now = dt.datetime.now(dt.timezone.utc).isoformat()
             with self._lock:
                 current = self._envs.get(env_id)
                 if current is not None:
@@ -250,15 +256,11 @@ class PyEnvService:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
     def _update_entry(self, env_id: int, **updates) -> None:
-        updates["updated_at"] = self._now()
+        updates["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         with self._lock:
             entry = self._envs.get(env_id)
             if entry is not None:
                 self._envs[env_id] = entry.model_copy(update=updates)
 
     def _touch(self, env_id: int) -> None:
-        self._update_entry(env_id, last_used_at=self._now())
-
-    @staticmethod
-    def _now() -> str:
-        return dt.datetime.now(dt.timezone.utc).isoformat()
+        self._update_entry(env_id, last_used_at=dt.datetime.now(dt.timezone.utc).isoformat())

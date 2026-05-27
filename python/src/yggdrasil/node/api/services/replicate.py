@@ -30,6 +30,7 @@ class ReplicateService:
         self._pyenv = pyenv
         self._pyfunc = pyfunc
         self._dag = dag
+        self._client = httpx.AsyncClient(timeout=120.0)
 
     async def export_snapshot(self) -> NodeSnapshot:
         envs = await self._pyenv.list()
@@ -51,24 +52,22 @@ class ReplicateService:
         )
         try:
             for env_data in snapshot.envs:
-                req = PyEnvCreate(
+                await self._pyenv.create(PyEnvCreate(
                     name=env_data["name"],
                     python_version=env_data.get("python_version", "3.11"),
                     dependencies=env_data.get("dependencies", []),
-                )
-                await self._pyenv.create(req)
+                ))
                 status.envs_synced += 1
 
             for func_data in snapshot.funcs:
-                req = PyFuncCreate(
+                await self._pyfunc.create(PyFuncCreate(
                     name=func_data["name"],
                     code=func_data["code"],
                     description=func_data.get("description", ""),
                     python_version=func_data.get("python_version"),
                     dependencies=func_data.get("dependencies", []),
                     env_id=None,
-                )
-                await self._pyfunc.create(req)
+                ))
                 status.funcs_synced += 1
 
             for dag_data in snapshot.dags:
@@ -111,14 +110,13 @@ class ReplicateService:
             snapshot.dags = []
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"{req.target_node_url}/api/v2/replicate/import",
-                    json=snapshot.model_dump(),
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return ReplicateStatus(**data)
+            resp = await self._client.post(
+                f"{req.target_node_url}/api/v2/replicate/import",
+                json=snapshot.model_dump(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return ReplicateStatus(**data)
         except Exception as exc:
             LOGGER.error("Replicate to %s failed: %s", req.target_node_url, exc)
             return ReplicateStatus(
@@ -131,14 +129,13 @@ class ReplicateService:
     async def replicate_from(self, source_node_url: str) -> ReplicateStatus:
         """Pull assets from a source node into this node."""
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.get(
-                    f"{source_node_url}/api/v2/replicate/export",
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                snapshot = NodeSnapshot(**data)
-                return await self.import_snapshot(snapshot)
+            resp = await self._client.get(
+                f"{source_node_url}/api/v2/replicate/export",
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            snapshot = NodeSnapshot(**data)
+            return await self.import_snapshot(snapshot)
         except Exception as exc:
             LOGGER.error("Replicate from %s failed: %s", source_node_url, exc)
             return ReplicateStatus(
