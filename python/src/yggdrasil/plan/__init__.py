@@ -16,13 +16,17 @@ Public surface:
 """
 
 from .execution_plan import ExecutionPlan, SelectPlan
+from .func_registry import BUILTIN_REGISTRY, FunctionMeta, FunctionRegistry
 from .lazy import LazyTabular
 from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
 from .ops import CTE, JoinOp, ResampleOp, SetOp, UnionOp
 
 __all__ = [
+    "BUILTIN_REGISTRY",
     "CTE",
     "ExecutionPlan",
+    "FunctionMeta",
+    "FunctionRegistry",
     "InsertNode",
     "JoinOp",
     "LazyTabular",

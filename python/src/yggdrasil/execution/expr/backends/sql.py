@@ -384,6 +384,16 @@ def _render_arithmetic(
 
 
 def _render_function_call(expr: FunctionCall, dialect: Dialect) -> str:
+    # INTERVAL 'value' unit — special syntax, not parenthesized
+    if expr.name == "INTERVAL" and len(expr.args) == 2:
+        val = _render(expr.args[0], dialect, parent_prec=0)
+        unit = expr.args[1].value if isinstance(expr.args[1], Literal) else _render(expr.args[1], dialect, parent_prec=0)
+        return f"INTERVAL {val} {unit}"
+    # EXTRACT(field FROM source) — special keyword syntax
+    if expr.name == "EXTRACT" and len(expr.args) == 2:
+        field = expr.args[0].value if isinstance(expr.args[0], Literal) else _render(expr.args[0], dialect, parent_prec=0)
+        source = _render(expr.args[1], dialect, parent_prec=0)
+        return f"EXTRACT({field} FROM {source})"
     args = ", ".join(_render(a, dialect, parent_prec=0) for a in expr.args)
     distinct = "DISTINCT " if expr.distinct else ""
     return f"{expr.name}({distinct}{args})"

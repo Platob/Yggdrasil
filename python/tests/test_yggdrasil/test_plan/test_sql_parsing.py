@@ -1129,3 +1129,72 @@ class TestDatabricksSpecificFunctions:
     def test_approx_count_distinct(self):
         node = parse_sql("SELECT APPROX_COUNT_DISTINCT(id) FROM t", dialect="databricks")
         assert isinstance(node.projections[0], FunctionCall)
+
+
+# ---------------------------------------------------------------------------
+# INTERVAL literals
+# ---------------------------------------------------------------------------
+
+class TestIntervalLiterals:
+    def test_interval_day(self):
+        node = parse_sql("SELECT ts + INTERVAL '1' DAY FROM t")
+        p = node.projections[0]
+        assert isinstance(p, Arithmetic)
+        assert isinstance(p.right, FunctionCall)
+        assert p.right.name == "INTERVAL"
+
+    def test_interval_hour(self):
+        node = parse_sql("SELECT ts + INTERVAL '2' HOUR FROM t")
+        p = node.projections[0]
+        assert isinstance(p.right, FunctionCall)
+
+    def test_interval_month(self):
+        node = parse_sql("SELECT ts - INTERVAL '3' MONTH FROM t")
+        p = node.projections[0]
+        assert isinstance(p, Arithmetic)
+
+    def test_interval_in_where(self):
+        node = parse_sql("SELECT * FROM t WHERE ts > CURRENT_TIMESTAMP() - INTERVAL '7' DAY")
+        assert node.where is not None
+
+
+# ---------------------------------------------------------------------------
+# EXTRACT function
+# ---------------------------------------------------------------------------
+
+class TestExtractFunction:
+    def test_extract_year(self):
+        node = parse_sql("SELECT EXTRACT(YEAR FROM ts) FROM t")
+        fc = node.projections[0]
+        assert isinstance(fc, FunctionCall)
+        assert fc.name == "EXTRACT"
+        assert len(fc.args) == 2
+
+    def test_extract_month(self):
+        node = parse_sql("SELECT EXTRACT(MONTH FROM ts) FROM t")
+        fc = node.projections[0]
+        assert fc.name == "EXTRACT"
+
+    def test_extract_day(self):
+        node = parse_sql("SELECT EXTRACT(DAY FROM ts) FROM t")
+        assert node.projections[0].name == "EXTRACT"
+
+    def test_extract_hour_minute_second(self):
+        for field in ("HOUR", "MINUTE", "SECOND"):
+            node = parse_sql(f"SELECT EXTRACT({field} FROM ts) FROM t")
+            assert node.projections[0].name == "EXTRACT"
+
+    def test_extract_in_where(self):
+        node = parse_sql("SELECT * FROM t WHERE EXTRACT(YEAR FROM ts) = 2024")
+        assert isinstance(node.where, Comparison)
+
+    def test_extract_roundtrip(self):
+        node = parse_sql("SELECT EXTRACT(YEAR FROM ts) FROM t")
+        sql = node.to_sql(dialect="databricks")
+        assert "EXTRACT" in sql
+        assert "FROM" in sql
+
+    def test_interval_roundtrip(self):
+        node = parse_sql("SELECT ts + INTERVAL '1' DAY FROM t")
+        sql = node.to_sql(dialect="databricks")
+        assert "INTERVAL" in sql

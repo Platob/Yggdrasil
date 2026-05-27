@@ -29,6 +29,7 @@ from __future__ import annotations
 from yggdrasil.enums.dialect import Dialect
 from yggdrasil.execution.expr.nodes import Expression, Literal
 
+from .func_registry import BUILTIN_REGISTRY
 from .sql_parser import SQLQueryParser, _DIALECT_PARSERS
 
 
@@ -122,9 +123,10 @@ class DatabricksSQLParser(SQLQueryParser):
         # IF(cond, true_val, false_val) — Databricks shorthand
         if t.kind == "ident" and t.upper == "IF" and self._peek(1).kind == "lparen":
             return self._parse_function_call()
-        # Databricks functions that might appear as ident (not keyword)
-        if (t.kind == "ident" and t.upper in _DATABRICKS_FUNCTIONS
-                and self._peek(1).kind == "lparen"):
+        # Databricks functions: check the static set AND the registry
+        if (t.kind == "ident" and self._peek(1).kind == "lparen"
+                and (t.upper in _DATABRICKS_FUNCTIONS
+                     or BUILTIN_REGISTRY.is_known(t.upper))):
             return self._parse_function_call()
         return super()._parse_primary()
 

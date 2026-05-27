@@ -20,6 +20,7 @@ from yggdrasil.execution.expr.nodes import (
     Column,
     Expression,
     FunctionCall,
+    Literal,
     SortOrder,
     Star,
     WindowFunction,
@@ -153,6 +154,16 @@ def _emit_expr(expr: Any, d: Dialect) -> str:
         inner = _emit_expr(expr.expr, d)
         return f"{inner} AS {_quote_ident(expr.name, d)}"
     if isinstance(expr, FunctionCall):
+        # INTERVAL 'value' unit — special syntax, not parenthesized
+        if expr.name == "INTERVAL" and len(expr.args) == 2:
+            val = _emit_expr(expr.args[0], d)
+            unit = expr.args[1].value if isinstance(expr.args[1], Literal) else _emit_expr(expr.args[1], d)
+            return f"INTERVAL {val} {unit}"
+        # EXTRACT(field FROM source) — special keyword syntax
+        if expr.name == "EXTRACT" and len(expr.args) == 2:
+            field = expr.args[0].value if isinstance(expr.args[0], Literal) else _emit_expr(expr.args[0], d)
+            source = _emit_expr(expr.args[1], d)
+            return f"EXTRACT({field} FROM {source})"
         args = ", ".join(_emit_expr(a, d) for a in expr.args)
         distinct = "DISTINCT " if expr.distinct else ""
         return f"{expr.name}({distinct}{args})"

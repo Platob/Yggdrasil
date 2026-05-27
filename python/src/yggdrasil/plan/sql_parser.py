@@ -81,6 +81,8 @@ _QUERY_RESERVED = frozenset({
     # Misc
     "EXISTS", "ANY", "NULLS", "FIRST", "LAST",
     "ARRAY", "MAP", "STRUCT",
+    # Interval / Extract
+    "INTERVAL", "EXTRACT",
 })
 
 _CMP_OPS = {"=": CompareOp.EQ, "==": CompareOp.EQ, "!=": CompareOp.NE,
@@ -860,6 +862,10 @@ class SQLQueryParser:
                     return self._parse_function_call()
                 self._eat()
                 return Column(name=t.text)
+            if t.upper == "INTERVAL":
+                return self._parse_interval()
+            if t.upper == "EXTRACT":
+                return self._parse_extract()
             if t.upper in ("CURRENT_DATE", "CURRENT_TIMESTAMP", "NOW"):
                 self._eat()
                 if self.cur.kind == "lparen":
@@ -1059,6 +1065,65 @@ class SQLQueryParser:
         sub = self._parse_statement()
         self._expect_kind("rparen")
         return self._make_function("EXISTS", (Literal(value=str(sub)),))
+
+    # ---- INTERVAL literal ------------------------------------------------
+
+    _INTERVAL_UNITS = frozenset({
+        "DAY", "DAYS", "HOUR", "HOURS", "MINUTE", "MINUTES",
+        "SECOND", "SECONDS", "MONTH", "MONTHS", "YEAR", "YEARS",
+        "WEEK", "WEEKS",
+    })
+
+    def _parse_interval(self) -> Expression:
+        """Parse ``INTERVAL 'value' unit`` → FunctionCall("INTERVAL", ...)."""
+        self._expect_kw("INTERVAL")
+        value_tok = self._expect_kind("string")
+        # Unit keyword — might be tokenized as ident or keyword
+        t = self.cur
+        if t.kind in ("ident", "keyword") and t.upper in self._INTERVAL_UNITS:
+            unit = self._eat().upper
+            # Normalize plural forms to singular
+            if unit.endswith("S") and unit not in ("HOURS",) and len(unit) > 3:
+                unit = unit.rstrip("S")
+            elif unit == "DAYS":
+                unit = "DAY"
+            elif unit == "HOURS":
+                unit = "HOUR"
+            elif unit == "WEEKS":
+                unit = "WEEK"
+        else:
+            raise self._error(
+                f"expected interval unit (DAY, HOUR, MINUTE, SECOND, "
+                f"MONTH, YEAR, WEEK) after INTERVAL literal"
+            )
+        return self._make_function(
+            "INTERVAL", (Literal(value=value_tok.text), Literal(value=unit)),
+        )
+
+    # ---- EXTRACT(field FROM expr) ----------------------------------------
+
+    _EXTRACT_FIELDS = frozenset({
+        "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+        "DOW", "DOY", "EPOCH", "QUARTER", "WEEK",
+    })
+
+    def _parse_extract(self) -> Expression:
+        """Parse ``EXTRACT(field FROM expr)`` → FunctionCall("EXTRACT", ...)."""
+        self._expect_kw("EXTRACT")
+        self._expect_kind("lparen")
+        # The field name — could be tokenized as ident or keyword
+        t = self.cur
+        if t.kind in ("ident", "keyword") and t.upper in self._EXTRACT_FIELDS:
+            field = self._eat().upper
+        else:
+            raise self._error(
+                f"expected EXTRACT field (YEAR, MONTH, DAY, HOUR, MINUTE, "
+                f"SECOND, DOW, DOY, EPOCH, QUARTER, WEEK)"
+            )
+        self._expect_kw("FROM")
+        source = self._parse_expr()
+        self._expect_kind("rparen")
+        return self._make_function("EXTRACT", (Literal(value=field), source))
 
     # ==================================================================
     # Factory methods — override in subclasses to use custom node types
