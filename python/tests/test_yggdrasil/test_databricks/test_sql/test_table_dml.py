@@ -676,3 +676,133 @@ class TestCastOptionsSafeMerge:
     def test_set_via_constructor(self) -> None:
         from yggdrasil.data.options import CastOptions
         assert CastOptions(safe_merge=True).safe_merge is True
+
+
+# ---------------------------------------------------------------------------
+# INSERT OVERWRITE integration — verify the full mode matrix
+# ---------------------------------------------------------------------------
+
+
+class TestInsertOverwriteIntegration:
+    """Pin every OVERWRITE × keys × safe_merge combination to the
+    expected SQL shape so regressions are caught immediately."""
+
+    def test_overwrite_no_keys_emits_insert_overwrite(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="c.s.t",
+            source_sql="SELECT * FROM src",
+            columns=["id", "val"],
+            mode=Mode.OVERWRITE,
+            match_by=None,
+            update_column_names=None,
+            prune_predicates=[],
+        )
+        assert len(stmts) == 1
+        sql = _normalize_ws(stmts[0])
+        assert sql.startswith("INSERT OVERWRITE c.s.t")
+        assert "INSERT INTO" not in sql
+        assert "CREATE OR REPLACE" not in sql
+        assert "TRUNCATE" not in sql
+
+    def test_overwrite_no_keys_includes_column_list(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="c.s.t",
+            source_sql="SELECT * FROM src",
+            columns=["id", "name", "ts"],
+            mode=Mode.OVERWRITE,
+            match_by=None,
+            update_column_names=None,
+            prune_predicates=[],
+        )
+        sql = _normalize_ws(stmts[0])
+        assert "(`id`, `name`, `ts`)" in sql
+
+    def test_overwrite_with_keys_emits_delete_insert(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="c.s.t",
+            source_sql="SELECT * FROM src",
+            columns=["id", "val"],
+            mode=Mode.OVERWRITE,
+            match_by=["id"],
+            update_column_names=None,
+            prune_predicates=[],
+        )
+        assert len(stmts) == 2
+        assert _normalize_ws(stmts[0]).startswith("DELETE FROM")
+        assert _normalize_ws(stmts[1]).startswith("INSERT INTO")
+
+    def test_overwrite_with_keys_delete_uses_match(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="c.s.t",
+            source_sql="SELECT * FROM src",
+            columns=["id", "val"],
+            mode=Mode.OVERWRITE,
+            match_by=["id"],
+            update_column_names=None,
+            prune_predicates=[],
+        )
+        delete_sql = _normalize_ws(stmts[0])
+        assert "T.`id` <=> S.`id`" in delete_sql
+
+    def test_overwrite_with_prune_predicates(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="c.s.t",
+            source_sql="SELECT * FROM src",
+            columns=["id", "val"],
+            mode=Mode.OVERWRITE,
+            match_by=["id"],
+            update_column_names=None,
+            prune_predicates=["`T`.`region` = 'eu'"],
+        )
+        delete_sql = _normalize_ws(stmts[0])
+        assert "`T`.`region` = 'eu'" in delete_sql
+
+    def test_overwrite_no_keys_with_maintenance(self) -> None:
+        stmts = _build_dml_statements(
+            target_location="c.s.t",
+            source_sql="SELECT * FROM src",
+            columns=["id"],
+            mode=Mode.OVERWRITE,
+            match_by=None,
+            update_column_names=None,
+            prune_predicates=[],
+            vacuum_hours=72,
+        )
+        assert any("INSERT OVERWRITE" in _normalize_ws(s) for s in stmts)
+        assert any("VACUUM" in _normalize_ws(s) for s in stmts)
+
+    def test_overwrite_not_confused_with_truncate(self) -> None:
+        ow = _build_dml_statements(
+            target_location="c.s.t",
+            source_sql="SELECT * FROM src",
+            columns=["id"],
+            mode=Mode.OVERWRITE,
+            match_by=None,
+            update_column_names=None,
+            prune_predicates=[],
+        )
+        tr = _build_dml_statements(
+            target_location="c.s.t",
+            source_sql="SELECT * FROM src",
+            columns=["id"],
+            mode=Mode.TRUNCATE,
+            match_by=None,
+            update_column_names=None,
+            prune_predicates=[],
+        )
+        assert "INSERT OVERWRITE" in _normalize_ws(ow[0])
+        assert "TRUNCATE TABLE" in _normalize_ws(tr[0])
+        assert "INSERT INTO" in _normalize_ws(tr[1])
+
+    def test_all_modes_produce_at_least_one_statement(self) -> None:
+        for mode in (Mode.OVERWRITE, Mode.TRUNCATE, Mode.APPEND, Mode.AUTO, Mode.UPSERT):
+            stmts = _build_dml_statements(
+                target_location="c.s.t",
+                source_sql="SELECT id FROM src",
+                columns=["id"],
+                mode=mode,
+                match_by=["id"] if mode in (Mode.UPSERT, Mode.MERGE) else None,
+                update_column_names=None,
+                prune_predicates=[],
+            )
+            assert len(stmts) >= 1, f"Mode {mode} produced no statements"

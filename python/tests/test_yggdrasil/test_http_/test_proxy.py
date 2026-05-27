@@ -332,3 +332,38 @@ class TestDeadProxyFallback:
             env2 = _ProxyEnv.current()
             assert env1 is env2
             assert env1.https.host == "env-proxy"
+
+    def test_dead_proxy_persists_across_clear_connections(self, origin_server):
+        session = HTTPSession(proxy="http://127.0.0.1:19995")
+        session.get(f"{origin_server}/first")
+        assert len(_DEAD_PROXIES) == 1
+        session.clear_connections()
+        resp = session.get(f"{origin_server}/after-clear")
+        assert resp.json().get("origin") is True
+        assert len(_DEAD_PROXIES) == 1
+
+    def test_dead_proxy_prevents_all_routing(self, origin_server):
+        from yggdrasil.http_.session import mark_proxy_dead, is_proxy_dead
+        proxy_url = URL.from_("http://127.0.0.1:19994")
+        mark_proxy_dead(proxy_url)
+        assert is_proxy_dead(proxy_url)
+        session = HTTPSession(proxy="http://127.0.0.1:19994")
+        resolved = session._resolve_proxy_for("http", URL.from_(origin_server).host)
+        assert resolved is None
+
+    def test_multiple_dead_proxies_tracked(self, origin_server):
+        s1 = HTTPSession(proxy="http://127.0.0.1:19993")
+        s1.get(f"{origin_server}/a")
+        s2 = HTTPSession(proxy="http://127.0.0.1:19992")
+        s2.get(f"{origin_server}/b")
+        assert len(_DEAD_PROXIES) >= 2
+        assert "127.0.0.1:19993" in _DEAD_PROXIES
+        assert "127.0.0.1:19992" in _DEAD_PROXIES
+
+    def test_dead_proxy_does_not_retry(self, origin_server):
+        session = HTTPSession(proxy="http://127.0.0.1:19991")
+        session.get(f"{origin_server}/trigger")
+        dead_before = len(_DEAD_PROXIES)
+        for _ in range(5):
+            session.get(f"{origin_server}/repeat")
+        assert len(_DEAD_PROXIES) == dead_before
