@@ -97,6 +97,7 @@ from .exceptions import (
     LocationValueError,
     MaxRetryError,
     NewConnectionError,
+    ProxyError,
     ReadTimeoutError,
     SSLError,
 )
@@ -113,6 +114,74 @@ __all__ = ["Session", "HTTPSession"]
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Proxy helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_proxy_url(
+    proxy: "URL | str | None",
+    target_scheme: str | None = None,
+) -> "URL | None":
+    """Resolve a proxy URL from the explicit argument or environment.
+
+    Lookup order (first non-empty wins):
+
+    1. ``proxy`` if not ``None``.
+    2. ``HTTPS_PROXY`` / ``https_proxy`` when *target_scheme* is ``"https"``.
+    3. ``HTTP_PROXY`` / ``http_proxy`` when *target_scheme* is ``"http"``.
+    4. ``ALL_PROXY`` / ``all_proxy`` as a catch-all.
+    """
+    if proxy is not None:
+        return URL.from_(proxy) if not isinstance(proxy, URL) else proxy
+
+    if target_scheme == "https":
+        env = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        if env:
+            return URL.from_(env)
+
+    if target_scheme == "http":
+        env = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        if env:
+            return URL.from_(env)
+
+    env = os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+    if env:
+        return URL.from_(env)
+
+    return None
+
+
+def _should_bypass_proxy(host: str, no_proxy: str | None = None) -> bool:
+    """Return ``True`` when *host* matches a ``no_proxy`` pattern.
+
+    Reads ``NO_PROXY`` / ``no_proxy`` from the environment when
+    *no_proxy* is ``None``.  The wildcard ``"*"`` bypasses everything.
+    Entries are comma-separated; leading dots match any subdomain
+    (``".example.com"`` matches ``"foo.example.com"``).
+    """
+    if no_proxy is None:
+        no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+
+    if not no_proxy:
+        return False
+
+    host = host.lower().strip(".")
+
+    for entry in no_proxy.split(","):
+        entry = entry.strip().lower().strip(".")
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        if host == entry:
+            return True
+        if host.endswith("." + entry):
+            return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +651,8 @@ class HTTPSession(Session):
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         auth: Optional[Authorization] = None,
+        proxy: Optional[URL | str] = None,
+        no_proxy: Optional[str] = None,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor call
         # (Python always invokes ``__init__`` after ``__new__``); skip the
@@ -603,6 +674,8 @@ class HTTPSession(Session):
         self.headers: HTTPHeaders = HTTPHeaders.from_(headers)
         self.waiting = waiting
         self.auth: Authorization | None = auth
+        self.proxy: URL | None = URL.from_(proxy) if isinstance(proxy, str) else proxy
+        self.no_proxy: str | None = no_proxy
 
         # Singleton-key probe path bails here — :class:`Session._singleton_key`
         # reads ``probe.__dict__`` and keeps only the keys whose names
@@ -690,6 +763,12 @@ class HTTPSession(Session):
             backoff_max=_BACKOFF_429_MAX,
         )
 
+    def _resolve_proxy_for(self, scheme: str, host: str) -> "URL | None":
+        """Return the proxy URL for this request, or ``None`` to go direct."""
+        if _should_bypass_proxy(host, self.no_proxy):
+            return None
+        return _resolve_proxy_url(self.proxy, target_scheme=scheme)
+
     def _build_connection(
         self,
         scheme: str,
@@ -697,23 +776,97 @@ class HTTPSession(Session):
         port: int,
         connect_timeout: Optional[float],
     ) -> http.client.HTTPConnection:
-        """Open a fresh :class:`http.client.HTTPConnection` to *(scheme, host, port)*.
+        """Open a fresh connection to *(scheme, host, port)*.
+
+        When a proxy is configured and the target host is not bypassed,
+        the connection routes through the proxy:
+
+        - **HTTPS targets** use an HTTP CONNECT tunnel — the TCP socket
+          connects to the proxy, sends ``CONNECT host:port``, then
+          upgrades to TLS so the proxy sees only opaque bytes.
+        - **HTTP targets** connect to the proxy directly; the caller
+          must send the absolute URL as the request path (handled by
+          :meth:`_send_once`).
 
         Honours ``self.verify``: when False the HTTPS context turns off
-        certificate verification and hostname checking, matching the
-        ``cert_reqs="CERT_NONE"`` shape urllib3 callers rely on (Databricks
-        external links, some private-link deployments).
+        certificate verification and hostname checking.
         """
+        proxy = self._resolve_proxy_for(scheme, host)
+
         if scheme == "https":
             if self.verify:
                 ssl_ctx: ssl.SSLContext = ssl.create_default_context()
             else:
                 ssl_ctx = ssl._create_unverified_context()  # type: ignore[attr-defined]
                 ssl_ctx.check_hostname = False
+
+            if proxy is not None:
+                proxy_host = proxy.host
+                proxy_port = proxy.port or (443 if proxy.scheme == "https" else 8080)
+                conn = http.client.HTTPSConnection(
+                    host, port=port, timeout=connect_timeout, context=ssl_ctx,
+                )
+                conn.set_tunnel(host, port, headers=self._proxy_auth_headers(proxy))
+                conn._real_host = proxy_host  # type: ignore[attr-defined]
+                conn._real_port = proxy_port  # type: ignore[attr-defined]
+                try:
+                    tunnel_conn = http.client.HTTPConnection(
+                        proxy_host, port=proxy_port, timeout=connect_timeout,
+                    )
+                    tunnel_conn.connect()
+                    tunnel_headers = {"Host": f"{host}:{port}"}
+                    tunnel_headers.update(self._proxy_auth_headers(proxy))
+                    tunnel_conn.request("CONNECT", f"{host}:{port}", headers=tunnel_headers)
+                    tunnel_resp = tunnel_conn.getresponse()
+                    if tunnel_resp.status != 200:
+                        tunnel_conn.close()
+                        raise ProxyError(
+                            f"CONNECT tunnel to {host}:{port} via "
+                            f"{proxy_host}:{proxy_port} failed: "
+                            f"{tunnel_resp.status} {tunnel_resp.reason}"
+                        )
+                    # Upgrade the raw socket to TLS for the target host.
+                    raw_sock = tunnel_conn.sock
+                    conn = http.client.HTTPSConnection(
+                        host, port=port, timeout=connect_timeout, context=ssl_ctx,
+                    )
+                    conn.sock = ssl_ctx.wrap_socket(raw_sock, server_hostname=host)
+                    return conn
+                except ProxyError:
+                    raise
+                except Exception as exc:
+                    raise ProxyError(
+                        f"Failed to establish CONNECT tunnel to {host}:{port} "
+                        f"via {proxy_host}:{proxy_port}: {exc}",
+                        error=exc,
+                    ) from exc
+
             return http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
             )
+
+        # Plain HTTP
+        if proxy is not None:
+            proxy_host = proxy.host
+            proxy_port = proxy.port or (443 if proxy.scheme == "https" else 8080)
+            conn = http.client.HTTPConnection(
+                proxy_host, port=proxy_port, timeout=connect_timeout,
+            )
+            conn._ygg_proxy = True  # type: ignore[attr-defined]
+            return conn
+
         return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
+
+    @staticmethod
+    def _proxy_auth_headers(proxy: URL) -> dict[str, str]:
+        """Build ``Proxy-Authorization`` from userinfo in the proxy URL."""
+        user = proxy.user
+        if not user:
+            return {}
+        import base64
+        password = proxy.password or ""
+        cred = base64.b64encode(f"{user}:{password}".encode()).decode()
+        return {"Proxy-Authorization": f"Basic {cred}"}
 
     def _get_connection(
         self,
@@ -945,6 +1098,15 @@ class HTTPSession(Session):
         key = (scheme, host, port)
         conn = self._get_connection(scheme, host, port, connect_timeout)
         from_pool = conn.sock is not None
+
+        # Plain HTTP through a proxy: send the absolute URL as the
+        # request-target so the proxy knows where to forward.
+        is_http_proxy = getattr(conn, "_ygg_proxy", False)
+        if is_http_proxy:
+            request_path = url.to_string()
+        else:
+            request_path = path
+
         try:
             # Establish the TCP+TLS connection with the connect timeout.
             # stdlib http.client only applies conn.timeout at connect() time,
@@ -961,10 +1123,14 @@ class HTTPSession(Session):
             send_headers.setdefault(
                 "Host", f"{host}:{port}" if port not in (80, 443) else host,
             )
+            if is_http_proxy:
+                proxy = self._resolve_proxy_for(scheme, host)
+                if proxy:
+                    send_headers.update(self._proxy_auth_headers(proxy))
             body = request.buffer.to_bytes() if request.buffer is not None else None
             if body is not None and "Content-Length" not in send_headers:
                 send_headers["Content-Length"] = str(len(body))
-            conn.request(request.method, path, body=body, headers=send_headers)
+            conn.request(request.method, request_path, body=body, headers=send_headers)
             raw = conn.getresponse()
         except socket.timeout as exc:
             try:
