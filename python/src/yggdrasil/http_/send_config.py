@@ -110,9 +110,13 @@ class SendConfig:
                     predicate=predicate, columns=[MATCH_COLUMN],
                 )
                 if table is None or table.num_rows == 0:
+                    LOGGER.debug("Cache probe: 0 hits in %r", holder)
                     return set()
-                return set(table.column(MATCH_COLUMN).to_pylist())
+                hits = set(table.column(MATCH_COLUMN).to_pylist())
+                LOGGER.debug("Cache probe: %d hit(s) in %r", len(hits), holder)
+                return hits
             except Exception:
+                LOGGER.warning("Cache probe failed for %r", holder, exc_info=True)
                 return set()
 
         if self.local_cache is not None:

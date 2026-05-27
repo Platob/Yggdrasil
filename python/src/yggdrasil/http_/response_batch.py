@@ -199,6 +199,11 @@ class HTTPResponseBatch(Tabular):
                 except Exception:
                     LOGGER.debug("Remote→local backfill failed", exc_info=True)
 
+        LOGGER.debug(
+            "Cache split: %d local hit(s), %d remote hit(s), %d miss(es)",
+            len(self._local_hashes), len(self._remote_hashes), len(misses),
+        )
+
         if not misses or cfg.cache_only:
             if misses:
                 LOGGER.warning(
