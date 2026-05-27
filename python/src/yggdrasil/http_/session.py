@@ -93,6 +93,7 @@ from yggdrasil.http_.send_config import DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.url import URL
 
 from .exceptions import (
+    InsecureRequestWarning,
     LocationParseError,
     LocationValueError,
     MaxRetryError,
@@ -182,6 +183,51 @@ def _should_bypass_proxy(host: str, no_proxy: str | None = None) -> bool:
             return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# SSL context helpers
+# ---------------------------------------------------------------------------
+
+# Accepted shapes for the ``verify`` parameter:
+#   True          — default CA bundle (ssl.create_default_context())
+#   False         — no verification (InsecureRequestWarning emitted)
+#   str / Path    — path to a custom CA bundle or directory
+VerifyArg = "bool | str | pathlib.Path"
+
+
+def _make_ssl_context(verify: "bool | str | pathlib.Path") -> ssl.SSLContext:
+    """Build an :class:`ssl.SSLContext` from a ``verify`` argument.
+
+    - ``True`` — system default CA bundle.
+    - ``False`` — no certificate verification, no hostname check.
+    - ``str`` / ``pathlib.Path`` — custom CA bundle file or directory.
+    """
+    if verify is False:
+        ctx = ssl._create_unverified_context()  # type: ignore[attr-defined]
+        ctx.check_hostname = False
+        return ctx
+
+    ctx = ssl.create_default_context()
+    if verify is not True:
+        ca_path = str(verify)
+        if os.path.isdir(ca_path):
+            ctx.load_verify_locations(capath=ca_path)
+        else:
+            ctx.load_verify_locations(cafile=ca_path)
+    return ctx
+
+
+def _warn_if_insecure(verify: "bool | str | pathlib.Path") -> None:
+    """Emit :class:`InsecureRequestWarning` when verification is off."""
+    if verify is False:
+        import warnings
+        warnings.warn(
+            "SSL certificate verification is disabled. "
+            "Connections to HTTPS endpoints will not validate the server's identity.",
+            InsecureRequestWarning,
+            stacklevel=3,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +691,7 @@ class HTTPSession(Session):
     def __init__(
         self,
         base_url: Optional[URL | str] = None,
-        verify: bool = True,
+        verify: "bool | str | pathlib.Path" = True,
         pool_maxsize: int = 10,
         headers: "HTTPHeaders | Mapping[str, str] | None" = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
@@ -664,13 +710,17 @@ class HTTPSession(Session):
                 f"auth must be an Authorization instance or None; got "
                 f"{type(auth).__name__}."
             )
+        # Normalise pathlib.Path → str so the singleton key is hashable.
+        if isinstance(verify, pathlib.Path):
+            verify = str(verify)
+        _warn_if_insecure(verify)
         # The pool caps idle sockets per host; 8 is plenty for our typical
         # workloads. Clamping here means the singleton key (built from
         # ``pool_maxsize``) collapses ``HTTPSession(pool_maxsize=20)`` and
         # ``HTTPSession()`` to one instance the way they always did.
         pool_maxsize = min(8, int(pool_maxsize)) if pool_maxsize else 8
         self.base_url = URL.from_(base_url) if base_url else None
-        self.verify = verify
+        self.verify: bool | str = verify
         self.headers: HTTPHeaders = HTTPHeaders.from_(headers)
         self.waiting = waiting
         self.auth: Authorization | None = auth
@@ -788,17 +838,16 @@ class HTTPSession(Session):
           must send the absolute URL as the request path (handled by
           :meth:`_send_once`).
 
-        Honours ``self.verify``: when False the HTTPS context turns off
-        certificate verification and hostname checking.
+        Honours ``self.verify``:
+
+        - ``True`` — system default CA bundle.
+        - ``False`` — no certificate verification.
+        - ``str`` — path to a custom CA bundle file or directory.
         """
         proxy = self._resolve_proxy_for(scheme, host)
 
         if scheme == "https":
-            if self.verify:
-                ssl_ctx: ssl.SSLContext = ssl.create_default_context()
-            else:
-                ssl_ctx = ssl._create_unverified_context()  # type: ignore[attr-defined]
-                ssl_ctx.check_hostname = False
+            ssl_ctx: ssl.SSLContext = _make_ssl_context(self.verify)
 
             if proxy is not None:
                 proxy_host = proxy.host
@@ -1212,6 +1261,28 @@ class HTTPSession(Session):
             )
 
         raise ValueError(f"Cannot build session from scheme: {parsed.scheme!r}")
+
+    def insecure(self) -> "HTTPSession":
+        """Return a session with SSL verification disabled.
+
+        If ``self`` already has ``verify=False``, returns ``self``.
+        Otherwise returns a new :class:`HTTPSession` with the same
+        ``base_url`` / ``headers`` / ``waiting`` / ``auth`` / ``proxy``
+        / ``no_proxy`` but ``verify=False``.
+
+        Emits :class:`InsecureRequestWarning` on first construction.
+        """
+        if self.verify is False:
+            return self
+        return type(self)(
+            base_url=self.base_url,
+            verify=False,
+            headers=self.headers,
+            waiting=self.waiting,
+            auth=self.auth,
+            proxy=self.proxy,
+            no_proxy=self.no_proxy,
+        )
 
     def send(
         self,
