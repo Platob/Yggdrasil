@@ -181,8 +181,8 @@ function NodeMarker({
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
+            args={[new Float32Array([...pos.toArray(), ...endPos.toArray()]), 3]}
             count={2}
-            array={new Float32Array([...pos.toArray(), ...endPos.toArray()])}
             itemSize={3}
           />
         </bufferGeometry>
