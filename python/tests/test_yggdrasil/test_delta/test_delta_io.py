@@ -193,10 +193,10 @@ class TestPredicatePartitionPruning(DeltaTestCase):
 
     def _files_read(self, options: DeltaOptions) -> int:
         """Count partition files surviving the prune (pre-parquet open)."""
-        from yggdrasil.io.nested.delta.delta_folder import _extract_partition_prune_values  # noqa: E501
+        from yggdrasil.io.nested.delta.delta_folder import _partition_prune_values  # noqa: E501
 
         snap = self.d.snapshot(fresh=False)
-        prune = _extract_partition_prune_values(
+        prune = _partition_prune_values(
             options.predicate, snap.partition_columns,
         )
         return sum(1 for _ in snap.prune_files(prune_values=prune))
