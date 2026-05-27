@@ -939,6 +939,7 @@ class DeltaFolder(Folder):
                         size=int(add.size),
                         modification_time=ts,
                         data_change=True,
+                        stats=add.stats,
                         deletion_vector=dv,
                     )
                 )

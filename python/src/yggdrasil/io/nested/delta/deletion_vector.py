@@ -95,8 +95,8 @@ def _z85_encode(data: bytes) -> str:
 # Roaring-bitmap decode
 # ---------------------------------------------------------------------------
 
-_MAGIC_ROARING_64 = 1681511377  # 0x64426152
-_MAGIC_SIMPLE = 1681511376  # 0x64426150
+_MAGIC_ROARING_64 = 1681511377  # 0x6439D3D1
+_MAGIC_SIMPLE = 1681511376  # 0x6439D3D0
 
 
 def _read_portable_roaring(buf: memoryview, pos: int) -> "tuple[Set[int], int]":
@@ -125,8 +125,10 @@ def _read_portable_roaring(buf: memoryview, pos: int) -> "tuple[Set[int], int]":
         pos += 4
         key_card.append((key, card_minus_one + 1))
 
-    # Offset table: present when no-run cookie AND n >= 4
-    if not has_run_flag and n_containers >= 4:
+    # Offset table: present for BOTH cookie types when n >= 4.
+    # Per the Roaring spec, the offset table is always emitted when
+    # the container count reaches 4, regardless of cookie kind.
+    if n_containers >= 4:
         pos += 4 * n_containers
 
     out: Set[int] = set()
@@ -273,12 +275,14 @@ def _encode_portable_roaring(values: list[int]) -> bytes:
                 chunk += struct.pack("<Q", word)
         container_chunks.append(bytes(chunk))
 
-    # Offset table: cumulative byte offsets into the container data region
+    # Offset table: absolute byte offsets from stream start, per Roaring spec.
+    # Header size = 4 (cookie) + 4 (count) + 4*n (key-card pairs) + 4*n (offsets)
     if n_containers >= 4:
-        offset = 0
+        header_size = 4 + 4 + 4 * n_containers + 4 * n_containers
+        cumulative = 0
         for chunk in container_chunks:
-            buf += struct.pack("<I", offset)
-            offset += len(chunk)
+            buf += struct.pack("<I", header_size + cumulative)
+            cumulative += len(chunk)
 
     for chunk in container_chunks:
         buf += chunk
@@ -346,7 +350,7 @@ def write_uuid_deletion_vector(
 
 
 def _count_rows(row_ids: Iterable[int]) -> int:
-    if isinstance(row_ids, (set, frozenset, list)):
+    if isinstance(row_ids, (set, frozenset)):
         return len(row_ids)
     return len(set(row_ids))
 
@@ -430,14 +434,12 @@ def decode_deletion_vector(
     storage = (descriptor.storage_type or "").lower()
 
     if storage == "i":
+        # Inline payloads are raw DV bytes (no int32 size + CRC framing).
+        # The Z85-decoded bytes are the payload directly.
         try:
             raw = _z85_decode(descriptor.path_or_inline_dv)
         except Exception:
             return DeletionVector(descriptor=descriptor)
-        if len(raw) >= 4:
-            head = struct.unpack(">I", raw[:4])[0]
-            if head + 4 <= len(raw):
-                raw = raw[4 : 4 + head]
         return DeletionVector(
             descriptor=descriptor,
             deleted_rows=_decode_payload(raw),

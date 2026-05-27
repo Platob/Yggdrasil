@@ -139,7 +139,11 @@ class DeltaLog:
     def latest_version(self) -> int:
         max_v = -1
         for name in self._list_log_dir():
-            if name.endswith(".json") and not name.startswith("_"):
+            if (
+                name.endswith(".json")
+                and not name.startswith("_")
+                and ".checkpoint." not in name
+            ):
                 v = version_from_log_name(name)
                 if v is not None and v > max_v:
                     max_v = v
@@ -155,7 +159,12 @@ class DeltaLog:
 
         all_commits: list[tuple[int, str]] = []
         for name in listing:
-            if name.endswith(".json") and not name.startswith("_"):
+            # Exclude V2 checkpoint manifests (*.checkpoint.<uuid>.json)
+            if (
+                name.endswith(".json")
+                and not name.startswith("_")
+                and ".checkpoint." not in name
+            ):
                 v = version_from_log_name(name)
                 if v is not None:
                     all_commits.append((v, name))
@@ -254,7 +263,12 @@ class DeltaLog:
             return tuple(self.log_path / n for n in v1_parts)
 
         if last_ck and last_ck.get("v2Checkpoint"):
-            sidecars = last_ck["v2Checkpoint"].get("sidecars") or []  # type: ignore[union-attr]
+            v2_ck = last_ck["v2Checkpoint"]
+            sidecars = (
+                v2_ck.get("sidecarFiles")  # type: ignore[union-attr]
+                or v2_ck.get("sidecars")  # type: ignore[union-attr]
+                or []
+            )
             if sidecars:
                 return tuple(
                     self.table_root / LOG_DIR_NAME / SIDECARS_DIR_NAME / s["path"]
