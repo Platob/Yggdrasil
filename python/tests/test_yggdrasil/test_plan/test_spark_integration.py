@@ -234,3 +234,147 @@ class TestDefaultParamExec:
         from yggdrasil.plan import parse_sql
         result = parse_sql("SELECT 1", default=None)
         assert isinstance(result, SelectNode)
+
+
+# ---------------------------------------------------------------------------
+# Real PySpark integration tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def spark():
+    try:
+        from pyspark.sql import SparkSession
+        session = (SparkSession.builder
+                   .master("local[1]")
+                   .appName("ygg_plan_test")
+                   .config("spark.ui.enabled", "false")
+                   .config("spark.driver.memory", "512m")
+                   .config("spark.sql.shuffle.partitions", "2")
+                   .getOrCreate())
+        yield session
+        session.stop()
+    except ImportError:
+        pytest.skip("pyspark not available")
+
+
+@pytest.fixture
+def spark_users(spark):
+    from yggdrasil.spark.tabular import SparkDataset
+    df = spark.createDataFrame(
+        [(1, "alice", "US", 90), (2, "bob", "EU", 80),
+         (3, "carol", "US", 95), (4, "dave", "EU", 70),
+         (5, "eve", "US", 85)],
+        ["id", "name", "region", "score"],
+    )
+    return SparkDataset(frame=df)
+
+
+@pytest.fixture
+def spark_orders(spark):
+    from yggdrasil.spark.tabular import SparkDataset
+    df = spark.createDataFrame(
+        [(1, 101, 10.0), (2, 102, 20.0), (1, 103, 15.0), (3, 104, 30.0)],
+        ["id", "order_id", "amount"],
+    )
+    return SparkDataset(frame=df)
+
+
+class TestRealSparkExecution:
+    def test_spark_filter(self, spark_users):
+        node = parse_sql("SELECT * FROM users WHERE score > 80")
+        result = node.execute(tables={"users": spark_users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 3
+        assert all(s > 80 for s in table.column("score").to_pylist())
+
+    def test_spark_select(self, spark_users):
+        node = parse_sql("SELECT id, name FROM users")
+        result = node.execute(tables={"users": spark_users})
+        table = result.read_arrow_table()
+        assert set(table.column_names) == {"id", "name"}
+
+    def test_spark_order_limit(self, spark_users):
+        node = parse_sql("SELECT * FROM users ORDER BY score DESC LIMIT 3")
+        result = node.execute(tables={"users": spark_users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 3
+        scores = table.column("score").to_pylist()
+        assert scores == sorted(scores, reverse=True)
+
+    def test_spark_distinct(self, spark_users):
+        node = parse_sql("SELECT DISTINCT region FROM users")
+        result = node.execute(tables={"users": spark_users})
+        regions = set(result.read_arrow_table().column("region").to_pylist())
+        assert regions == {"US", "EU"}
+
+    def test_spark_join(self, spark_users, spark_orders):
+        node = parse_sql(
+            "SELECT users.name, orders.amount "
+            "FROM users INNER JOIN orders ON users.id = orders.id"
+        )
+        result = node.execute(tables={"users": spark_users, "orders": spark_orders})
+        table = result.read_arrow_table()
+        assert table.num_rows > 0
+        assert "name" in table.column_names
+
+    def test_spark_cte(self, spark_users):
+        node = parse_sql(
+            "WITH high AS (SELECT * FROM users WHERE score >= 85) "
+            "SELECT * FROM high"
+        )
+        result = node.execute(tables={"users": spark_users})
+        table = result.read_arrow_table()
+        assert all(s >= 85 for s in table.column("score").to_pylist())
+
+    def test_spark_preserves_frame(self, spark_users):
+        """SparkDataset stays as SparkDataset through filter/select."""
+        from yggdrasil.spark.tabular import SparkDataset
+        filtered = spark_users.filter("score > 80")
+        assert isinstance(filtered, SparkDataset)
+        assert filtered._native_spark_frame() is not None
+
+    def test_spark_lazy(self, spark_users):
+        lazy = spark_users.lazy()
+        lazy.filter("score > 80").select("id", "name").limit(2)
+        result = lazy.read_arrow_table()
+        assert result.num_rows <= 2
+        assert set(result.column_names) == {"id", "name"}
+
+
+# ---------------------------------------------------------------------------
+# row_limit pushdown via CastOptions
+# ---------------------------------------------------------------------------
+
+class TestRowLimitPushdown:
+    def test_arrow_row_limit(self):
+        from yggdrasil.data.options import CastOptions
+        source = ArrowTabular(pa.table({"id": list(range(100))}))
+        table = source.read_arrow_table(CastOptions(row_limit=10))
+        assert table.num_rows == 10
+
+    def test_arrow_row_limit_batches(self):
+        from yggdrasil.data.options import CastOptions
+        source = ArrowTabular(pa.table({"id": list(range(100))}))
+        batches = list(source.read_arrow_batches(CastOptions(row_limit=5)))
+        total = sum(b.num_rows for b in batches)
+        assert total == 5
+
+    def test_arrow_row_limit_larger_than_data(self):
+        from yggdrasil.data.options import CastOptions
+        source = ArrowTabular(pa.table({"id": [1, 2, 3]}))
+        table = source.read_arrow_table(CastOptions(row_limit=100))
+        assert table.num_rows == 3
+
+    def test_spark_row_limit(self, spark):
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.spark.tabular import SparkDataset
+        df = spark.createDataFrame([(i,) for i in range(100)], ["id"])
+        ds = SparkDataset(frame=df)
+        table = ds.read_arrow_table(CastOptions(row_limit=10))
+        assert table.num_rows == 10
+
+    def test_row_limit_none_reads_all(self):
+        from yggdrasil.data.options import CastOptions
+        source = ArrowTabular(pa.table({"id": list(range(50))}))
+        table = source.read_arrow_table(CastOptions(row_limit=None))
+        assert table.num_rows == 50
