@@ -219,4 +219,5 @@ __marimo__/
 /python/data.qqq
 /python/\*/
 .next/
+node_modules/
 .claude/worktrees/
