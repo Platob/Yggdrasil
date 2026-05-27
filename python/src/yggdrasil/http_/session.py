@@ -55,6 +55,7 @@ import os
 import pathlib
 import socket
 import ssl
+import sys
 import threading
 import time
 from abc import ABC
@@ -248,9 +249,16 @@ def _floor_connect_timeout(timeout: Optional[float]) -> float:
 def _make_ssl_context(verify: "bool | str | pathlib.Path") -> ssl.SSLContext:
     """Build an :class:`ssl.SSLContext` from a ``verify`` argument.
 
-    - ``True`` — system default CA bundle.
+    - ``True`` — system default CA bundle + Windows system store.
     - ``False`` — no certificate verification, no hostname check.
     - ``str`` / ``pathlib.Path`` — custom CA bundle file or directory.
+
+    On Windows, ``ssl.create_default_context()`` only loads Python's
+    bundled ``certifi`` CAs — corporate proxy/PKI certificates in the
+    Windows certificate store are invisible. This function loads the
+    Windows ``"ROOT"`` and ``"CA"`` stores into the context so those
+    certificates are trusted without requiring ``python-certifi-win32``
+    or ``pip-system-certs``.
     """
     if verify is False:
         ctx = ssl._create_unverified_context()  # type: ignore[attr-defined]
@@ -264,7 +272,30 @@ def _make_ssl_context(verify: "bool | str | pathlib.Path") -> ssl.SSLContext:
             ctx.load_verify_locations(capath=ca_path)
         else:
             ctx.load_verify_locations(cafile=ca_path)
+    _load_windows_system_certs(ctx)
     return ctx
+
+
+def _load_windows_system_certs(ctx: ssl.SSLContext) -> None:
+    """Load Windows system certificate stores into *ctx*.
+
+    No-op on non-Windows platforms. Loads ``"ROOT"`` and ``"CA"``
+    stores so corporate/proxy CAs trusted by the OS are also trusted
+    by Python — removes the need for ``python-certifi-win32``.
+    """
+    if sys.platform != "win32":
+        return
+    for store_name in ("ROOT", "CA"):
+        try:
+            certs = ssl.enum_certificates(store_name)  # type: ignore[attr-defined]
+            for cert_data, encoding, trust in certs:
+                if encoding == "x509_asn" and trust is True:
+                    try:
+                        ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert_data))
+                    except ssl.SSLError:
+                        pass
+        except (AttributeError, OSError):
+            pass
 
 
 def _warn_if_insecure(verify: "bool | str | pathlib.Path") -> None:
