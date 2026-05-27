@@ -292,8 +292,34 @@ _ARROW_KERNELS: dict[str, ArrowKernel] = {
     "DECOMPRESS": _decompress_kernel,
     "PARSE_JSON": _parse_json_kernel,
     "TO_JSON": _to_json_kernel,
-    "BASE64_ENCODE": lambda a: pc.binary_join_element_wise(a, pa.scalar("")),
-    "BASE64_DECODE": lambda a: a,
+
+    # Collection / list / struct operations
+    "ARRAY_LENGTH": _k1("list_value_length"),
+    "SIZE": _k1("list_value_length"),
+    "FLATTEN": _k1("list_flatten"),
+    "ARRAY_FLATTEN": _k1("list_flatten"),
+    "SORT_ARRAY": lambda a: pa.array([sorted(v) if v else None for v in a.to_pylist()]),
+    "ARRAY_SORT": lambda a: pa.array([sorted(v) if v else None for v in a.to_pylist()]),
+    "ARRAY_DISTINCT": lambda a: pa.array([list(set(v)) if v else None for v in a.to_pylist()]),
+    "CARDINALITY": _k1("list_value_length"),
+    "ARRAY_MIN": lambda a: pa.array([min(v) if v else None for v in a.to_pylist()]),
+    "ARRAY_MAX": lambda a: pa.array([max(v) if v else None for v in a.to_pylist()]),
+    "ARRAY_CONTAINS": lambda a, v: pa.array([
+        (v.as_py() if hasattr(v, 'as_py') else v) in (row or []) for row in a.to_pylist()]),
+
+    # Type conversion / casting
+    "STRING": lambda a: a.cast(pa.utf8()),
+    "INT": lambda a: a.cast(pa.int32()),
+    "BIGINT": lambda a: a.cast(pa.int64()),
+    "DOUBLE": lambda a: a.cast(pa.float64()),
+    "FLOAT": lambda a: a.cast(pa.float32()),
+    "BOOLEAN": lambda a: a.cast(pa.bool_()),
+
+    # Hash
+    "MD5": lambda a: pa.array([__import__("hashlib").md5(
+        v.encode() if isinstance(v, str) else v or b"").hexdigest() for v in a.to_pylist()], type=pa.utf8()),
+    "SHA1": lambda a: pa.array([__import__("hashlib").sha1(
+        v.encode() if isinstance(v, str) else v or b"").hexdigest() for v in a.to_pylist()], type=pa.utf8()),
 }
 
 
@@ -394,7 +420,9 @@ def _build() -> FunctionRegistry:
     _b("generator", {"EXPLODE": (1, 1), "POSEXPLODE": (1, 1), "INLINE": (1, 1),
         "STACK": (2, None), "EXPLODE_OUTER": (1, 1), "POSEXPLODE_OUTER": (1, 1),
         "INLINE_OUTER": (1, 1)})
-    _b("type", {"CAST": (1, 1), "TRY_CAST": (1, 2), "TYPEOF": (1, 1)})
+    _b("type", {"CAST": (1, 1), "TRY_CAST": (1, 2), "TYPEOF": (1, 1),
+        "STRING": (1, 1), "INT": (1, 1), "BIGINT": (1, 1),
+        "DOUBLE": (1, 1), "FLOAT": (1, 1), "BOOLEAN": (1, 1)})
     _b("json", {"FROM_JSON": (2, 3), "TO_JSON": (1, 2), "SCHEMA_OF_JSON": (1, 2),
         "GET_JSON_OBJECT": (2, 2), "JSON_TUPLE": (2, None), "JSON_ARRAY_LENGTH": (1, 1)})
     _b("higher_order", {"TRANSFORM": (2, 2), "FILTER": (2, 2), "AGGREGATE": (3, 4),
@@ -415,6 +443,45 @@ def _build() -> FunctionRegistry:
         "COMPRESS": (1, 2), "DECOMPRESS": (1, 2),
         "PARSE_JSON": (1, 1)})
     return r
+
+
+def explode_table(table: pa.Table, list_col: str, out_col: str | None = None) -> pa.Table:
+    """Explode a list column — equivalent to SQL LATERAL VIEW EXPLODE.
+
+    Each row with a list of N elements produces N rows; scalar columns
+    are repeated.  Uses Arrow-native ``list_flatten`` + ``list_parent_indices``
+    for zero-copy where possible.
+    """
+    vals = table.column(list_col)
+    flat = pc.list_flatten(vals)
+    parent_idx = pc.list_parent_indices(vals)
+    cols = {}
+    for name in table.column_names:
+        if name == list_col:
+            cols[out_col or name] = flat
+        else:
+            cols[name] = table.column(name).take(parent_idx)
+    return pa.table(cols)
+
+
+def posexplode_table(table: pa.Table, list_col: str,
+                     pos_col: str = "pos", out_col: str | None = None) -> pa.Table:
+    """Explode with position — equivalent to POSEXPLODE."""
+    vals = table.column(list_col)
+    flat = pc.list_flatten(vals)
+    parent_idx = pc.list_parent_indices(vals)
+    lengths = pc.list_value_length(vals).to_pylist()
+    positions = []
+    for length in lengths:
+        positions.extend(range(length or 0))
+    cols = {}
+    for name in table.column_names:
+        if name == list_col:
+            cols[out_col or name] = flat
+        else:
+            cols[name] = table.column(name).take(parent_idx)
+    cols[pos_col] = pa.array(positions, type=pa.int32())
+    return pa.table(cols)
 
 
 BUILTIN_REGISTRY: FunctionRegistry = _build()
