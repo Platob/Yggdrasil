@@ -750,6 +750,13 @@ class WarehouseStatementResult(StatementResult):
 
         if isinstance(self._response, StatementResponse):
             self.statement_id = response.statement_id
+            state = response.status.state if response.status else StatementState.PENDING
+
+            if state in DONE_STATES:
+                self.statement.clear_temporary_resources()
+                logger.info(
+                    "Statement %r finished in state %r", self, state,
+                )
 
         return self
 
@@ -843,11 +850,7 @@ class WarehouseStatementResult(StatementResult):
         response = statement_execution.get_statement(self.statement_id)
         new_state = response.status.state
 
-        if new_state in DONE_STATES:
-            logger.info(
-                "Statement %r finished in state %s", self, new_state,
-            )
-        elif cached_state != new_state:
+        if cached_state != new_state:
             logger.debug(
                 "Polled statement %r (state=%s, prev=%s)",
                 self, new_state, cached_state,
