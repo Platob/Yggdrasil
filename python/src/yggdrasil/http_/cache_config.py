@@ -506,6 +506,7 @@ class CacheConfig:
         opts = CastOptions(
             mode=mode if mode is not None else self.mode,
             match_by=[MATCH_COLUMN],
+            prune_by=["partition_key"],
             spark_session=spark_session,
         )
         try:
