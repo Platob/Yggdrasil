@@ -87,6 +87,7 @@ class HTTPResponseBatch(Tabular):
         "_local_hashes", "_remote_hashes",
         "_local_tabular", "_remote_tabular", "_new_tabular", "_failed",
         "_split_done", "_misses", "_ignored_count",
+        "_new_responses",
     )
 
     def __init__(
@@ -110,8 +111,9 @@ class HTTPResponseBatch(Tabular):
         self._split_done = False
         self._session = session
 
+        self._new_responses: list[HTTPResponse] | None = new_responses
         if new_responses is not None:
-            self._new_tabular: Optional[Tabular] = responses_to_tabular(new_responses)
+            self._new_tabular: Optional[Tabular] = ...
         else:
             self._new_tabular = _to_tabular(new_responses_tabular)
 
@@ -257,9 +259,8 @@ class HTTPResponseBatch(Tabular):
         )
 
         if all_list:
-            self.new_tabular = pa.Table.from_batches(
-                [HTTPResponse.values_to_arrow_batch(all_list)]
-            )
+            self._new_responses = all_list
+            self._new_tabular = ...
         if ok_list:
             write_data = pa.Table.from_batches(
                 [HTTPResponse.values_to_arrow_batch(ok_list)]
@@ -412,11 +413,21 @@ class HTTPResponseBatch(Tabular):
 
     @property
     def new_tabular(self) -> "Tabular | None":
+        if self._new_tabular is ...:
+            if self._new_responses:
+                self._new_tabular = responses_to_tabular(self._new_responses)
+            else:
+                self._new_tabular = None
         return self._new_tabular
 
     @new_tabular.setter
     def new_tabular(self, value) -> None:
+        self._new_responses = None
         self._new_tabular = _to_tabular(value)
+
+    @property
+    def new_responses(self) -> "list[HTTPResponse] | None":
+        return self._new_responses
 
     @property
     def failed(self) -> "Tabular | None":
@@ -522,10 +533,13 @@ class HTTPResponseBatch(Tabular):
         return self.responses()
 
     def responses(self) -> Iterator[HTTPResponse]:
-        for holder in self._holders():
-            if holder is None:
-                continue
-            yield from HTTPResponse.from_records(holder.read_records())
+        for tab in (self.local_tabular, self.remote_tabular):
+            if tab is not None:
+                yield from HTTPResponse.from_records(tab.read_records())
+        if self._new_responses is not None:
+            yield from self._new_responses
+        elif self._new_tabular is not None and self._new_tabular is not ...:
+            yield from HTTPResponse.from_records(self._new_tabular.read_records())
 
     # ------------------------------------------------------------------
     # Merge
@@ -534,7 +548,12 @@ class HTTPResponseBatch(Tabular):
     def extend(self, other: "HTTPResponseBatch") -> "HTTPResponseBatch":
         self._local_tabular = _union(self.local_tabular, other.local_tabular)
         self._remote_tabular = _union(self.remote_tabular, other.remote_tabular)
-        self._new_tabular = _union(self._new_tabular, other._new_tabular)
+        if self._new_responses is not None and other._new_responses is not None:
+            self._new_responses = self._new_responses + other._new_responses
+            self._new_tabular = ...
+        else:
+            self._new_tabular = _union(self.new_tabular, other.new_tabular)
+            self._new_responses = None
         self._misses.extend(other._misses)
         self._local_hashes |= other._local_hashes
         self._remote_hashes |= other._remote_hashes

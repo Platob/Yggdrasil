@@ -1683,6 +1683,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         if preload_content:
             buffer.read_mv(-1, 0)
             resp.release_conn()
+            resp.headers["Content-Length"] = str(buffer.size)
 
         return resp
 
