@@ -46,7 +46,7 @@ class SendConfig:
 
     __slots__ = (
         "raise_error", "wait", "remote_cache", "local_cache",
-        "cache_only", "spark_session",
+        "cache_only", "spark_session", "_ygg_auto_cache",
     )
 
     def __init__(
@@ -67,6 +67,7 @@ class SendConfig:
             self.spark_session = True
         else:
             self.spark_session = False
+        self._ygg_auto_cache = False
 
     def get_spark_session(self) -> "SparkSession | None":
         if not self.spark_session:
