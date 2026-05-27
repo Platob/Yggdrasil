@@ -1,6 +1,7 @@
 """Tests for :class:`yggdrasil.dataclasses.awaitable.Awaitable`."""
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
@@ -1051,6 +1052,160 @@ class TestConcurrentBatchPauseResume:
         batch.resume()
         assert not batch.is_paused
         assert all(not t.is_paused for t in tasks)
+
+
+# ── await / async tests ────────────────────────────────────────────────
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+class TestAwait:
+
+    def test_await_instant(self):
+        async def go():
+            t = _InstantTask()
+            t.start(wait=False)
+            result = await t
+            assert result is t
+            assert t.is_succeeded
+        _run(go())
+
+    def test_await_slow(self):
+        async def go():
+            t = _SlowTask(polls_until_done=3)
+            t.start(wait=False)
+            result = await t
+            assert result.is_succeeded
+        _run(go())
+
+    def test_await_raises_on_failure(self):
+        async def go():
+            t = _FailingTask()
+            t.start(wait=False)
+            with pytest.raises(RuntimeError):
+                await t
+        _run(go())
+
+    def test_await_does_not_block_loop(self):
+        async def go():
+            flag = []
+
+            async def set_flag():
+                flag.append(True)
+
+            t = _SlowTask(polls_until_done=2)
+            t.start(wait=False)
+
+            await asyncio.gather(t._async_wait(), set_flag())
+            assert flag
+            assert t.is_succeeded
+        _run(go())
+
+    def test_async_wait_timeout(self):
+        async def go():
+            t = _PausableTask()
+            t.start(wait=False)
+            wc = WaitingConfig(timeout=0.1, interval=0.01, backoff=1.0, max_interval=0.01)
+            with pytest.raises(TimeoutError):
+                await t._async_wait(wait=wc)
+        _run(go())
+
+    def test_async_wait_no_raise(self):
+        async def go():
+            t = _FailingTask()
+            t.start(wait=False)
+            wc = WaitingConfig(timeout=1, interval=0.01, backoff=1.0, max_interval=0.01)
+            result = await t._async_wait(wait=wc, raise_error=False)
+            assert result is t
+            assert t.is_failed
+        _run(go())
+
+    def test_await_pause_resume(self):
+        async def go():
+            t = _PausableTask()
+            t.start(wait=False)
+            t.pause()
+
+            async def resume_and_finish():
+                await asyncio.sleep(0.05)
+                t.resume()
+                await asyncio.sleep(0.02)
+                t.finish()
+
+            wc = WaitingConfig(timeout=2, interval=0.01, backoff=1.0, max_interval=0.01)
+            await asyncio.gather(t._async_wait(wait=wc), resume_and_finish())
+            assert t.is_succeeded
+        _run(go())
+
+    def test_await_batch_sequential(self):
+        async def go():
+            tasks = [_CountingTask(polls_to_done=1, name=f"t{i}") for i in range(3)]
+            batch = _TestBatch(tasks)
+            batch.start(wait=False)
+            result = await batch
+            assert result.is_succeeded
+            assert all(t.is_succeeded for t in tasks)
+        _run(go())
+
+    def test_await_batch_concurrent(self):
+        async def go():
+            tasks = [_CountingTask(polls_to_done=1, name=f"t{i}") for i in range(3)]
+            batch = _TestBatch(tasks, concurrency=3)
+            batch.start(wait=False)
+            wc = WaitingConfig(timeout=5, interval=0.01, backoff=1.0, max_interval=0.01)
+            result = await batch._async_wait(wait=wc)
+            assert result.is_succeeded
+            assert all(t.is_succeeded for t in tasks)
+        _run(go())
+
+    def test_await_retryable(self):
+        async def go():
+            t = _RetryableTask(fail_count=1)
+            t.start(wait=False)
+            wc = WaitingConfig(
+                timeout=5, interval=0.001, backoff=1.0,
+                max_interval=0.01, max_attempts=None,
+            )
+            result = await t._async_wait(wait=wc)
+            assert result.is_succeeded
+            assert t.attempts == 2
+        _run(go())
+
+
+class TestGetDelay:
+
+    def test_zero_interval(self):
+        wc = WaitingConfig(interval=0)
+        assert wc.get_delay(0) == 0.0
+
+    def test_basic_backoff(self):
+        wc = WaitingConfig(interval=1.0, backoff=2.0, max_interval=100.0)
+        assert wc.get_delay(0) == 1.0
+        assert wc.get_delay(1) == 2.0
+        assert wc.get_delay(2) == 4.0
+
+    def test_capped_by_max_interval(self):
+        wc = WaitingConfig(interval=1.0, backoff=2.0, max_interval=3.0)
+        assert wc.get_delay(0) == 1.0
+        assert wc.get_delay(5) == 3.0
+
+    def test_capped_by_remaining_timeout(self):
+        wc = WaitingConfig(interval=5.0, backoff=1.0, max_interval=10.0, timeout=1.0)
+        start = time.time()
+        delay = wc.get_delay(0, start=start)
+        assert delay <= 1.0
+
+    def test_expired_returns_zero(self):
+        wc = WaitingConfig(interval=1.0, backoff=1.0, max_interval=10.0, timeout=0.01)
+        start = time.time() - 1.0
+        assert wc.get_delay(0, start=start) == 0.0
+
+    def test_negative_iteration_raises(self):
+        wc = WaitingConfig()
+        with pytest.raises(ValueError):
+            wc.get_delay(-1)
 
 
 class TestRepr:

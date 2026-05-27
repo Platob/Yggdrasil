@@ -219,6 +219,29 @@ class WaitingConfig:
 
         return time.time() - start > self.timeout_total_seconds
 
+    def get_delay(
+        self,
+        iteration: int,
+        start: float | None = None,
+        max_interval: Optional[float] = None,
+    ) -> float:
+        if iteration < 0:
+            raise ValueError(f"iteration must be >= 0, got {iteration}")
+        if self.interval == 0:
+            return 0.0
+        sleep_s = self.interval * (self.backoff ** iteration)
+        cap = max_interval or self.max_interval
+        if cap > 0:
+            sleep_s = min(sleep_s, cap)
+        if sleep_s <= 0:
+            return 0.0
+        if start is not None and self.timeout > 0:
+            remaining = self.timeout - (time.time() - float(start))
+            if remaining <= 0:
+                return 0.0
+            sleep_s = min(sleep_s, remaining)
+        return sleep_s
+
     def sleep(
         self,
         iteration: int,

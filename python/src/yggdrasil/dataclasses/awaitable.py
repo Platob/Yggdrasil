@@ -266,6 +266,74 @@ class Awaitable(ABC):
                 wc.sleep(iteration, start)
                 iteration += 1
 
+    # ── async / await ────────────────────────────────────────────────────
+
+    def __await__(self):
+        return self._async_wait().__await__()
+
+    async def _async_wait(
+        self,
+        wait: WaitingConfig | None = None,
+        raise_error: bool = True,
+    ) -> "Awaitable":
+        import asyncio
+        if wait is None:
+            wait = WaitingConfig.from_(True)
+        start = time.time()
+        iteration = 0
+        next_log_at = 120.0
+        loop = asyncio.get_running_loop()
+        while True:
+            if not self._sleeper.is_set():
+                if wait.timeout > 0:
+                    remaining = wait.timeout - (time.time() - start)
+                    if remaining > 0:
+                        await loop.run_in_executor(
+                            None, self._sleeper.wait, remaining,
+                        )
+                else:
+                    await loop.run_in_executor(None, self._sleeper.wait)
+            self._poll()
+            if not self.is_done and logger.isEnabledFor(logging.INFO):
+                elapsed = time.time() - start
+                if elapsed >= next_log_at:
+                    logger.info(
+                        "%s still waiting after %.0fs (state=%s)",
+                        type(self).__name__, elapsed, self._state,
+                    )
+                    next_log_at = elapsed + 900.0
+            if self.is_done:
+                if self.is_failed and self.retryable and not wait.is_expired(start):
+                    if wait.max_attempts is not None and self._attempts >= wait.max_attempts:
+                        pass
+                    else:
+                        logger.warning(
+                            "%s retry %d: %s",
+                            type(self).__name__, self._attempts, self.error,
+                        )
+                        self.start(reset=True, wait=False)
+                        iteration = 0
+                        continue
+                if self.is_failed and raise_error:
+                    if wait.is_expired(start):
+                        raise TimeoutError(
+                            f"{type(self).__name__} timed out after {wait.timeout:.1f}s "
+                            f"(state={self._state})"
+                        )
+                    self.raise_for_status()
+                return self
+            if wait.is_expired(start):
+                if raise_error:
+                    raise TimeoutError(
+                        f"{type(self).__name__} timed out after {wait.timeout:.1f}s "
+                        f"(state={self._state})"
+                    )
+                return self
+            delay = wait.get_delay(iteration, start)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            iteration += 1
+
     def __repr__(self) -> str:
         return f"<{type(self).__name__} state={self._state}>"
 
