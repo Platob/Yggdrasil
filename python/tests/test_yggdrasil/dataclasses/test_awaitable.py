@@ -6,9 +6,12 @@ import time
 
 import pytest
 
-from yggdrasil.dataclasses.awaitable import Awaitable
+from yggdrasil.dataclasses.awaitable import Awaitable, AwaitableBatch
 from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.enums.state import State
+
+
+# ── Fixtures ────────────────────────────────────────────────────────────────
 
 
 class _InstantTask(Awaitable):
@@ -141,6 +144,53 @@ class _PausableTask(Awaitable):
 
     def finish(self):
         self._done_event.set()
+
+
+class _CountingTask(Awaitable):
+    """Task that succeeds after *polls_to_done* polls.  Records start order."""
+
+    started_order: list[_CountingTask] = []
+
+    def __init__(self, polls_to_done: int = 1, *, fail: bool = False, name: str = ""):
+        self._target = polls_to_done
+        self._fail = fail
+        self._polls = 0
+        self.name = name
+
+    def _poll(self):
+        self._polls += 1
+        if self._polls >= self._target:
+            self._state = State.FAILED if self._fail else State.SUCCEEDED
+
+    def _start(self):
+        self._state = State.RUNNING
+        self._polls = 0
+        _CountingTask.started_order.append(self)
+
+    def _error_for_status(self):
+        return RuntimeError(f"task {self.name} failed")
+
+    def __repr__(self):
+        return f"<_CountingTask {self.name!r} state={self._state}>"
+
+
+class _TestBatch(AwaitableBatch):
+    def __init__(self, tasks, concurrency=1):
+        self._tasks = list(tasks)
+        self._concurrency = concurrency
+
+    def awaitables(self):
+        return iter(self._tasks)
+
+    @property
+    def max_concurrency(self):
+        return self._concurrency
+
+
+_FAST_WC = WaitingConfig(timeout=5, interval=0.001, backoff=1.0, max_interval=0.01)
+
+
+# ── Awaitable base tests ───────────────────────────────────────────────────
 
 
 class TestAbstract:
@@ -577,6 +627,37 @@ class TestPause:
         t._pause()
         assert t.is_paused
 
+    def test_pause_wait_false_returns_immediately(self):
+        t = _PausableTask()
+        t.start(wait=False)
+        result = t.pause(wait=False)
+        assert result is t
+        assert t.is_paused
+
+    def test_pause_wait_blocks_until_done(self):
+        t = _PausableTask()
+        t.start(wait=False)
+
+        def resume_and_finish():
+            time.sleep(0.05)
+            t.resume()
+            time.sleep(0.02)
+            t.finish()
+
+        helper = threading.Thread(target=resume_and_finish)
+        helper.start()
+        wc = WaitingConfig(timeout=2, interval=0.01, backoff=1.0, max_interval=0.01)
+        t.pause(wait=wc)
+        helper.join(timeout=1)
+        assert t.is_succeeded
+
+    def test_pause_wait_respects_timeout(self):
+        t = _PausableTask()
+        t.start(wait=False)
+        wc = WaitingConfig(timeout=0.1, interval=0.01, backoff=1.0, max_interval=0.01)
+        with pytest.raises(TimeoutError):
+            t.pause(wait=wc)
+
 
 class TestResume:
 
@@ -690,6 +771,286 @@ class TestPauseResumeWait:
         wc = WaitingConfig(timeout=1, interval=0.01, backoff=1.0, max_interval=0.01)
         t.wait(wait=wc)
         assert t.is_succeeded
+
+
+# ── as_completed tests ─────────────────────────────────────────────────────
+
+
+class TestAsCompleted:
+
+    def test_empty(self):
+        result = list(Awaitable.as_completed([]))
+        assert result == []
+
+    def test_all_already_done(self):
+        tasks = [_InstantTask() for _ in range(3)]
+        for t in tasks:
+            t.start(wait=False)
+            t._poll()
+        result = list(Awaitable.as_completed(tasks, wait=_FAST_WC))
+        assert len(result) == 3
+        assert all(t.is_succeeded for t in result)
+
+    def test_yields_as_they_finish(self):
+        t1 = _SlowTask(polls_until_done=1)
+        t2 = _SlowTask(polls_until_done=5)
+        t3 = _SlowTask(polls_until_done=2)
+        for t in (t1, t2, t3):
+            t.start(wait=False)
+        result = list(Awaitable.as_completed([t1, t2, t3], wait=_FAST_WC))
+        assert len(result) == 3
+        assert result[0] is t1
+        assert result[1] is t3
+        assert result[2] is t2
+
+    def test_wait_false_only_yields_done(self):
+        t1 = _InstantTask()
+        t1.start(wait=False)
+        t1._poll()
+        t2 = _PausableTask()
+        t2.start(wait=False)
+        result = list(Awaitable.as_completed([t1, t2], wait=False))
+        assert result == [t1]
+
+    def test_timeout_stops_yielding(self):
+        tasks = [_PausableTask() for _ in range(3)]
+        for t in tasks:
+            t.start(wait=False)
+        tasks[0].finish()
+        wc = WaitingConfig(timeout=0.05, interval=0.001, backoff=1.0, max_interval=0.01)
+        result = list(Awaitable.as_completed(tasks, wait=wc))
+        assert len(result) == 1
+        assert result[0] is tasks[0]
+
+    def test_includes_failed(self):
+        t1 = _FailingTask()
+        t1.start(wait=False)
+        t1._poll()
+        result = list(Awaitable.as_completed([t1], wait=_FAST_WC))
+        assert len(result) == 1
+        assert result[0].is_failed
+
+
+# ── AwaitableBatch tests ──────────────────────────────────────────────────
+
+
+class TestAwaitableBatchAbstract:
+
+    def test_cannot_instantiate(self):
+        with pytest.raises(TypeError):
+            AwaitableBatch()
+
+    def test_abstract_awaitables(self):
+        assert "awaitables" in AwaitableBatch.__abstractmethods__
+
+    def test_default_max_concurrency(self):
+        batch = _TestBatch([])
+        assert batch.max_concurrency == 1
+
+
+class TestSequentialBatch:
+
+    def test_empty_batch_succeeds(self):
+        batch = _TestBatch([])
+        batch.start(wait=_FAST_WC)
+        assert batch.is_succeeded
+
+    def test_single_task(self):
+        task = _CountingTask(polls_to_done=2, name="a")
+        batch = _TestBatch([task])
+        batch.start(wait=_FAST_WC)
+        assert batch.is_succeeded
+        assert task.is_succeeded
+
+    def test_multiple_tasks_all_succeed(self):
+        tasks = [_CountingTask(polls_to_done=1, name=f"t{i}") for i in range(4)]
+        batch = _TestBatch(tasks)
+        batch.start(wait=_FAST_WC)
+        assert batch.is_succeeded
+        assert all(t.is_succeeded for t in tasks)
+
+    def test_sequential_order(self):
+        _CountingTask.started_order = []
+        tasks = [_CountingTask(polls_to_done=1, name=f"t{i}") for i in range(3)]
+        batch = _TestBatch(tasks)
+        batch.start(wait=_FAST_WC)
+        assert _CountingTask.started_order == tasks
+
+    def test_one_failure_marks_batch_failed(self):
+        t1 = _CountingTask(polls_to_done=1, name="ok1")
+        t2 = _CountingTask(polls_to_done=1, fail=True, name="bad")
+        t3 = _CountingTask(polls_to_done=1, name="ok2")
+        batch = _TestBatch([t1, t2, t3])
+        batch.start(wait=_FAST_WC, raise_error=False)
+        assert batch.is_failed
+        assert t1.is_succeeded
+        assert t2.is_failed
+        assert t3.is_succeeded
+
+    def test_error_for_status_single(self):
+        t = _CountingTask(polls_to_done=1, fail=True, name="bad")
+        batch = _TestBatch([t])
+        batch.start(wait=_FAST_WC, raise_error=False)
+        err = batch.error
+        assert isinstance(err, RuntimeError)
+        assert "bad" in str(err)
+
+    def test_error_for_status_multiple(self):
+        t1 = _CountingTask(polls_to_done=1, fail=True, name="bad1")
+        t2 = _CountingTask(polls_to_done=1, fail=True, name="bad2")
+        batch = _TestBatch([t1, t2])
+        batch.start(wait=_FAST_WC, raise_error=False)
+        err = batch.error
+        assert err is not None
+
+    def test_start_raises_on_failure(self):
+        t = _CountingTask(polls_to_done=1, fail=True, name="bad")
+        batch = _TestBatch([t])
+        with pytest.raises(RuntimeError):
+            batch.start(wait=_FAST_WC)
+
+    def test_returns_self(self):
+        batch = _TestBatch([_CountingTask(polls_to_done=1, name="a")])
+        assert batch.start(wait=_FAST_WC) is batch
+
+
+class TestSequentialBatchCancel:
+
+    def test_cancel_stops_batch(self):
+        tasks = [_PausableTask() for _ in range(3)]
+        batch = _TestBatch(tasks)
+        batch.start(wait=False)
+        batch.cancel(wait=False)
+        assert batch.is_canceled
+
+    def test_cancel_cancels_active_children(self):
+        t1 = _PausableTask()
+        t2 = _PausableTask()
+        batch = _TestBatch([t1, t2])
+        batch.start(wait=False)
+        assert t1.is_active
+        batch.cancel(wait=False)
+        assert t1.is_canceled
+
+
+class TestSequentialBatchPauseResume:
+
+    def test_pause_pauses_active_child(self):
+        t1 = _PausableTask()
+        batch = _TestBatch([t1])
+        batch.start(wait=False)
+        batch.pause()
+        assert batch.is_paused
+        assert t1.is_paused
+
+    def test_resume_resumes_children(self):
+        t1 = _PausableTask()
+        batch = _TestBatch([t1])
+        batch.start(wait=False)
+        batch.pause()
+        batch.resume()
+        assert not batch.is_paused
+        assert not t1.is_paused
+
+    def test_pause_resume_completes(self):
+        t1 = _CountingTask(polls_to_done=2, name="a")
+        batch = _TestBatch([t1])
+        batch.start(wait=False)
+        batch.pause()
+        assert batch.is_paused
+        batch.resume()
+        batch.wait(wait=_FAST_WC)
+        assert batch.is_succeeded
+
+
+class TestConcurrentBatch:
+
+    def test_empty_batch_succeeds(self):
+        batch = _TestBatch([], concurrency=4)
+        batch.start(wait=_FAST_WC)
+        assert batch.is_succeeded
+
+    def test_multiple_tasks_all_succeed(self):
+        tasks = [_CountingTask(polls_to_done=1, name=f"t{i}") for i in range(4)]
+        batch = _TestBatch(tasks, concurrency=4)
+        batch.start(wait=_FAST_WC)
+        assert batch.is_succeeded
+        assert all(t.is_succeeded for t in tasks)
+
+    def test_one_failure_marks_batch_failed(self):
+        t1 = _CountingTask(polls_to_done=1, name="ok")
+        t2 = _CountingTask(polls_to_done=1, fail=True, name="bad")
+        batch = _TestBatch([t1, t2], concurrency=2)
+        batch.start(wait=_FAST_WC, raise_error=False)
+        assert batch.is_failed
+        assert t1.is_succeeded
+        assert t2.is_failed
+
+    def test_concurrency_limits_parallelism(self):
+        barrier = threading.Barrier(3, timeout=1)
+        blocked = threading.Event()
+
+        class _BarrierTask(Awaitable):
+            def _poll(self):
+                if blocked.is_set():
+                    self._state = State.SUCCEEDED
+
+            def _start(self):
+                self._state = State.RUNNING
+                try:
+                    barrier.wait()
+                    blocked.set()
+                except threading.BrokenBarrierError:
+                    pass
+
+            def _error_for_status(self):
+                return RuntimeError("failed")
+
+        tasks = [_BarrierTask() for _ in range(3)]
+        batch = _TestBatch(tasks, concurrency=2)
+        batch.start(wait=False)
+        wc = WaitingConfig(timeout=0.3, interval=0.01, backoff=1.0, max_interval=0.01)
+        batch.wait(wait=wc, raise_error=False)
+        # With concurrency=2, only 2 threads start. Barrier needs 3, so it times out.
+        # At least one task should NOT have succeeded via the barrier.
+        barrier_succeeded = sum(1 for t in tasks if t.is_succeeded)
+        assert barrier_succeeded < 3
+
+    def test_cancel_concurrent(self):
+        tasks = [_PausableTask() for _ in range(3)]
+        batch = _TestBatch(tasks, concurrency=3)
+        batch.start(wait=False)
+        time.sleep(0.05)
+        batch.cancel(wait=False)
+        assert batch.is_canceled
+
+    def test_concurrent_start_raises_on_failure(self):
+        t = _CountingTask(polls_to_done=1, fail=True, name="bad")
+        batch = _TestBatch([t], concurrency=2)
+        with pytest.raises(RuntimeError):
+            batch.start(wait=_FAST_WC)
+
+
+class TestConcurrentBatchPauseResume:
+
+    def test_pause_pauses_children(self):
+        tasks = [_PausableTask() for _ in range(2)]
+        batch = _TestBatch(tasks, concurrency=2)
+        batch.start(wait=False)
+        time.sleep(0.05)
+        batch.pause()
+        assert batch.is_paused
+        assert all(t.is_paused for t in tasks)
+
+    def test_resume_resumes_children(self):
+        tasks = [_PausableTask() for _ in range(2)]
+        batch = _TestBatch(tasks, concurrency=2)
+        batch.start(wait=False)
+        time.sleep(0.05)
+        batch.pause()
+        batch.resume()
+        assert not batch.is_paused
+        assert all(not t.is_paused for t in tasks)
 
 
 class TestRepr:

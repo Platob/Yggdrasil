@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums.state import State
 
-__all__ = ["Awaitable"]
+__all__ = ["Awaitable", "AwaitableBatch"]
 
 
 class Awaitable(ABC):
@@ -99,10 +100,18 @@ class Awaitable(ABC):
     def _pause(self) -> None:
         self._sleeper.clear()
 
-    def pause(self) -> "Awaitable":
+    def pause(
+        self,
+        *,
+        wait: WaitingConfigArg = False,
+        raise_error: bool = True,
+    ) -> "Awaitable":
         if not self.is_active:
             return self
         self._pause()
+        if wait is not False:
+            wc = WaitingConfig.from_(wait)
+            self._wait(wc, raise_error=raise_error)
         return self
 
     def _resume(self) -> None:
@@ -225,5 +234,136 @@ class Awaitable(ABC):
             self._wait(wc, raise_error=raise_error)
         return self
 
+    @classmethod
+    def as_completed(
+        cls,
+        awaitables: Iterable["Awaitable"],
+        *,
+        wait: WaitingConfigArg = True,
+    ) -> Iterator["Awaitable"]:
+        if wait is False:
+            for a in awaitables:
+                a.wait(wait=False, raise_error=False)
+                if a.is_done:
+                    yield a
+            return
+        pending = list(awaitables)
+        wc = WaitingConfig.from_(wait)
+        start = time.time()
+        iteration = 0
+        while pending:
+            still_pending = []
+            for a in pending:
+                a.wait(wait=False, raise_error=False)
+                if a.is_done:
+                    yield a
+                else:
+                    still_pending.append(a)
+            pending = still_pending
+            if pending:
+                if wc.is_expired(start):
+                    return
+                wc.sleep(iteration, start)
+                iteration += 1
+
     def __repr__(self) -> str:
         return f"<{type(self).__name__} state={self._state}>"
+
+
+class AwaitableBatch(Awaitable):
+
+    @abstractmethod
+    def awaitables(self) -> Iterator[Awaitable]:
+        ...
+
+    @property
+    def max_concurrency(self) -> int:
+        return 1
+
+    def _error_for_status(self) -> BaseException | None:
+        children = getattr(self, "_children", ())
+        errors = [c.error for c in children if c.is_failed and c.error is not None]
+        if not errors:
+            return None
+        if len(errors) == 1:
+            return errors[0]
+        try:
+            return BaseExceptionGroup(
+                f"{type(self).__name__}: {len(errors)} failures", errors
+            )
+        except NameError:
+            return RuntimeError(
+                f"{type(self).__name__}: {len(errors)} failures"
+            )
+
+    def _start(self) -> None:
+        self._children: list[Awaitable] = list(self.awaitables())
+        if not self._children:
+            self._state = State.SUCCEEDED
+            return
+        self._state = State.RUNNING
+        concurrency = self.max_concurrency
+        if concurrency <= 1:
+            self._seq_index = 0
+            self._children[0].start(wait=False)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor = ThreadPoolExecutor(max_workers=concurrency)
+            for child in self._children:
+                self._executor.submit(child.start, raise_error=False)
+
+    def _poll(self) -> None:
+        if self.is_done:
+            return
+        concurrency = self.max_concurrency
+        if concurrency <= 1:
+            self._poll_sequential()
+        else:
+            self._poll_concurrent()
+
+    def _poll_sequential(self) -> None:
+        if self._seq_index >= len(self._children):
+            return
+        current = self._children[self._seq_index]
+        current.wait(wait=False, raise_error=False)
+        if current.is_done:
+            self._seq_index += 1
+            if self._seq_index < len(self._children):
+                self._children[self._seq_index].start(wait=False)
+            else:
+                self._resolve()
+
+    def _poll_concurrent(self) -> None:
+        if all(c.is_done for c in self._children):
+            self._resolve()
+
+    def _resolve(self) -> None:
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False)
+        if any(c.is_failed for c in self._children):
+            self._state = State.FAILED
+        else:
+            self._state = State.SUCCEEDED
+
+    def _cancel(self) -> None:
+        for child in getattr(self, "_children", ()):
+            if not child.is_done and not child.is_idle:
+                child.cancel(wait=False, raise_error=False)
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        self._state = State.CANCELED
+        self._sleeper.set()
+
+    def _pause(self) -> None:
+        for child in getattr(self, "_children", ()):
+            if child.is_active:
+                child.pause()
+        self._sleeper.clear()
+
+    def _resume(self) -> None:
+        for child in getattr(self, "_children", ()):
+            if child.is_paused:
+                child.resume()
+        self._sleeper.set()
