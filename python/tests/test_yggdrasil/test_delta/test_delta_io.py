@@ -155,15 +155,17 @@ class TestPartitionPruning(DeltaTestCase):
         )
 
     def test_prune_to_single_value(self) -> None:
+        from yggdrasil.execution.expr import col as expr_col
         out = self.d.read_arrow_table(
-            options=DeltaOptions(prune_values={"region": ("us",)}),
+            options=DeltaOptions(predicate=expr_col("region") == "us"),
         )
         self.assertEqual(out.num_rows, 2)
         self.assertEqual(set(out.column("region").to_pylist()), {"us"})
 
     def test_prune_unknown_value_returns_empty(self) -> None:
+        from yggdrasil.execution.expr import col as expr_col
         out = self.d.read_arrow_table(
-            options=DeltaOptions(prune_values={"region": ("antarctica",)}),
+            options=DeltaOptions(predicate=expr_col("region") == "antarctica"),
         )
         self.assertEqual(out.num_rows, 0)
 
@@ -191,11 +193,11 @@ class TestPredicatePartitionPruning(DeltaTestCase):
 
     def _files_read(self, options: DeltaOptions) -> int:
         """Count partition files surviving the prune (pre-parquet open)."""
-        from yggdrasil.io.nested.delta.delta_folder import _merge_prune_with_predicate
+        from yggdrasil.io.nested.delta.delta_folder import _extract_partition_prune_values  # noqa: E501
 
         snap = self.d.snapshot(fresh=False)
-        prune = _merge_prune_with_predicate(
-            options.prune_values, options.predicate, snap.partition_columns,
+        prune = _extract_partition_prune_values(
+            options.predicate, snap.partition_columns,
         )
         return sum(1 for _ in snap.prune_files(prune_values=prune))
 
@@ -237,18 +239,15 @@ class TestPredicatePartitionPruning(DeltaTestCase):
         self.assertEqual(out.num_rows, 1)
         self.assertEqual(out.column("id").to_pylist(), [2])
 
-    def test_predicate_intersects_with_explicit_prune_values(self) -> None:
-        # ``prune_values=us|eu`` AND ``predicate region == us`` →
-        # intersection is just ``us``.
+    def test_predicate_in_list_prunes_to_subset(self) -> None:
         from yggdrasil.execution.expr import col as expr_col
 
         opts = DeltaOptions(
-            prune_values={"region": ("us", "eu")},
-            predicate=(expr_col("region") == "us"),
+            predicate=expr_col("region").is_in(["us", "eu"]),
         )
-        self.assertEqual(self._files_read(opts), 1)
+        self.assertEqual(self._files_read(opts), 2)
         out = self.d.read_arrow_table(options=opts)
-        self.assertEqual(set(out.column("region").to_pylist()), {"us"})
+        self.assertEqual(set(out.column("region").to_pylist()), {"us", "eu"})
 
     def test_predicate_alone_with_unknown_value_returns_empty(self) -> None:
         from yggdrasil.execution.expr import col as expr_col

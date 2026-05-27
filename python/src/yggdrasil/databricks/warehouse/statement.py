@@ -705,7 +705,7 @@ class WarehouseStatementResult(StatementResult):
         if elapsed and elapsed > _RETRYABLE_ELAPSED_LIMIT:
             return False
 
-        error = self._compute_error()
+        error = self._error_for_status()
         if error is None:
             return False
 

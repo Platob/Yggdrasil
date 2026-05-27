@@ -212,6 +212,22 @@ class ClusterStatementResult(StatementResult):
                 LOGGER.debug("Status refresh swallowed for %r", cmd, exc_info=True)
         return self
 
+    def _start(self) -> None:
+        self.start()
+
+    def _poll(self) -> None:
+        self.refresh_status()
+
+    def _error_for_status(self) -> BaseException | None:
+        cmd = self.command
+        if cmd is None:
+            return None
+        try:
+            cmd.raise_for_status()
+        except BaseException as exc:
+            return exc
+        return None
+
     def _compute_state(self) -> State:
         cmd = self.command
         if cmd is None or not cmd.command_id:
