@@ -109,6 +109,7 @@ Repository = "https://github.com/Platob/Yggdrasil"
 Documentation = "https://platob.github.io/Yggdrasil/"
 
 [project.scripts]
+ygg = "yggdrasil.cli.main:main"
 
 # ── setuptools ────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]

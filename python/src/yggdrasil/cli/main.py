@@ -2,14 +2,16 @@
 
 Subcommands::
 
-    ygg node serve      Start node server + frontend (foreground)
+    ygg node start      Start node (background daemon, public by default)
+    ygg node stop       Stop the running node
+    ygg node serve      Start node + frontend (foreground)
+    ygg node status     Show running node status
+    ygg node create     Create a new named node
     ygg node front      Start frontend only (Next.js dev server)
-    ygg node install    Install node+frontend as boot service (systemd/launchd)
+    ygg node install    Install node as boot service (systemd/launchd)
     ygg node uninstall  Remove boot service (--purge to delete data)
     ygg node run        Call a @remote function
     ygg node chat       Open YGGCHAT terminal
-    ygg node status     Show running node status
-    ygg node stop       Stop the background node
     ygg databricks      YGGDBKS Databricks management CLI
 """
 from __future__ import annotations
@@ -19,41 +21,57 @@ import sys
 from typing import Sequence
 
 
-def _ensure_node_running() -> str:
-    try:
-        from yggdrasil.node.daemon import get_node_url, spawn_node
-        spawn_node()
-        return get_node_url()
-    except Exception:
-        return "http://127.0.0.1:8100"
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ygg",
-        description="Yggdrasil CLI — data tools, node execution, and Databricks utilities.",
+        description="Yggdrasil CLI — distributed node framework.",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
-    parser.add_argument("--no-node", action="store_true", help="Skip auto-spawning the background node.")
 
     sub = parser.add_subparsers(dest="command")
 
     # -- node --------------------------------------------------------------
-    node = sub.add_parser("node", help="Yggdrasil node server and remote execution.")
+    node = sub.add_parser("node", help="Yggdrasil node lifecycle and execution.")
     node_sub = node.add_subparsers(dest="node_action")
 
-    serve = node_sub.add_parser("serve", help="Start node server + frontend (foreground).")
-    serve.add_argument("--host", default=None, help="Bind host (default: 0.0.0.0).")
-    serve.add_argument("--port", type=int, default=None, help="Bind port (auto-scans if busy).")
+    # start (background daemon)
+    start = node_sub.add_parser("start", help="Start node as a background daemon (public by default).")
+    start.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0).")
+    start.add_argument("--port", type=int, default=None, help="Bind port (default: 8100, auto-scans if busy).")
+    start.add_argument("--name", default=None, help="Node ID override.")
+    start.set_defaults(handler=_node_start)
+
+    # stop
+    stop = node_sub.add_parser("stop", help="Stop the running node.")
+    stop.set_defaults(handler=_node_stop)
+
+    # serve (foreground)
+    serve = node_sub.add_parser("serve", help="Start node + frontend in foreground.")
+    serve.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0).")
+    serve.add_argument("--port", type=int, default=None, help="Bind port (default: 8100).")
     serve.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
     serve.add_argument("--no-front", action="store_true", default=False, help="Skip launching the frontend.")
+    serve.add_argument("--name", default=None, help="Node ID override.")
     serve.set_defaults(handler=_node_serve)
 
+    # status
+    status = node_sub.add_parser("status", help="Show node status.")
+    status.set_defaults(handler=_node_status)
+
+    # create
+    create = node_sub.add_parser("create", help="Create a new named node (initializes ~/.node/<name>/).")
+    create.add_argument("name", help="Node name/ID.")
+    create.add_argument("--start", action="store_true", default=False, help="Start the node after creation.")
+    create.add_argument("--port", type=int, default=None, help="Bind port.")
+    create.set_defaults(handler=_node_create)
+
+    # front
     front = node_sub.add_parser("front", help="Start frontend dev server only.")
     front.add_argument("--port", type=int, default=None, help="Frontend port (default: 3000).")
     front.add_argument("--node-port", type=int, default=None, help="Node API port to proxy to.")
     front.set_defaults(handler=_node_front)
 
+    # run
     run = node_sub.add_parser("run", help="Call a @remote function.")
     run.add_argument("func", help="Function key (e.g. 'mymodule:my_func').")
     run.add_argument("args", nargs="*", default=[], help="Positional arguments.")
@@ -63,27 +81,24 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--stream", action="store_true", default=False)
     run.set_defaults(handler=_node_run)
 
+    # chat
     chat = node_sub.add_parser("chat", help="Open YGGCHAT terminal.")
     chat.add_argument("--url", default=None, help="Node server URL (default: auto).")
     chat.add_argument("--user", default=None, help="Display name.")
     chat.add_argument("--channel", default="general", help="Initial channel.")
     chat.set_defaults(handler=_node_chat)
 
+    # install
     install = node_sub.add_parser("install", help="Install node as a boot service (systemd/launchd).")
     install.add_argument("--no-front", action="store_true", default=False, help="Skip frontend service.")
     install.add_argument("--port", type=int, default=None, help="Override node port.")
     install.add_argument("--front-port", type=int, default=None, help="Override frontend port.")
     install.set_defaults(handler=_node_install)
 
+    # uninstall
     uninstall = node_sub.add_parser("uninstall", help="Remove node boot service and stop.")
-    uninstall.add_argument("--purge", action="store_true", default=False, help="Also remove all data in ~/.ygg.")
+    uninstall.add_argument("--purge", action="store_true", default=False, help="Also remove all data in ~/.node/.")
     uninstall.set_defaults(handler=_node_uninstall)
-
-    status = node_sub.add_parser("status", help="Show node status.")
-    status.set_defaults(handler=_node_status)
-
-    stop = node_sub.add_parser("stop", help="Stop the node.")
-    stop.set_defaults(handler=_node_stop)
 
     # -- databricks --------------------------------------------------------
     dbks = sub.add_parser("databricks", help="YGGDBKS Databricks management.", add_help=False)
@@ -92,7 +107,38 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _start_frontend(settings, *, node_port: int, front_port: int | None = None) -> "subprocess.Popen | None":
+# ── helpers ──────────────────────────────────────────────────────
+
+def _apply_node_env(args: argparse.Namespace) -> None:
+    """Push CLI flags into env vars before settings are read."""
+    import os
+    name = getattr(args, "name", None)
+    if name:
+        os.environ["YGG_NODE_NODE_ID"] = name
+    host = getattr(args, "host", None)
+    if host:
+        os.environ["YGG_NODE_HOST"] = host
+    port = getattr(args, "port", None)
+    if port:
+        os.environ["YGG_NODE_PORT"] = str(port)
+    os.environ["YGG_NODE_ALLOW_REMOTE"] = "1"
+
+
+def _get_node_url() -> str:
+    from yggdrasil.node.daemon import get_node_url
+    return get_node_url()
+
+
+def _ensure_node_running() -> str:
+    try:
+        from yggdrasil.node.daemon import spawn_node
+        _, port = spawn_node()
+        return f"http://127.0.0.1:{port}"
+    except Exception:
+        return "http://127.0.0.1:8100"
+
+
+def _start_frontend(settings, *, node_port: int, front_port: int | None = None):
     import os
     import shutil
     import subprocess
@@ -134,23 +180,54 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None) 
     )
 
     from yggdrasil.cli.style import bold, cyan, out
-    out(f"  {cyan('front')} {bold(f'http://localhost:{port}')}\n")
+    out(f"  {cyan('front')} {bold(f'http://0.0.0.0:{port}')}\n")
     return proc
 
 
-def _node_serve(args: argparse.Namespace) -> int:
-    import os
-    from yggdrasil.cli.style import print_logo
+# ── handlers ─────────────────────────────────────────────────────
 
+def _node_start(args: argparse.Namespace) -> int:
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.node.daemon import spawn_node
+
+    _apply_node_env(args)
     print_logo("YGGNODE")
 
-    if args.host:
-        os.environ["YGG_NODE_HOST"] = args.host
-    if args.port:
-        os.environ["YGG_NODE_PORT"] = str(args.port)
+    settings = get_settings()
+    host = getattr(args, "host", "0.0.0.0")
 
+    out(f"  {cyan('starting')} node...\n")
+    pid, port = spawn_node(settings, host=host)
+
+    out(f"  {green('✓')} node running\n")
+    out(f"  {cyan('node')}  {bold(settings.node_id)}\n")
+    out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n")
+    out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
+    out(f"  {cyan('pid')}   {dim(str(pid))}\n")
+    out(f"\n  {dim('Public access enabled. Stop with:')} {bold('ygg node stop')}\n")
+    return 0
+
+
+def _node_stop(args: argparse.Namespace) -> int:
+    from yggdrasil.node.daemon import stop_node
+    from yggdrasil.cli.style import green, out, print_logo, red
+
+    print_logo("YGGNODE")
+    if stop_node():
+        out(f"  {green('node stopped.')}\n")
+    else:
+        out(f"  {red('no running node found.')}\n")
+    return 0
+
+
+def _node_serve(args: argparse.Namespace) -> int:
+    from yggdrasil.cli.style import bold, cyan, dim, out, print_logo
     from yggdrasil.node.config import _find_open_port, get_settings
     from yggdrasil.node.daemon import cleanup_old_logs, ensure_directories
+
+    _apply_node_env(args)
+    print_logo("YGGNODE")
 
     settings = get_settings()
     ensure_directories(settings)
@@ -159,10 +236,10 @@ def _node_serve(args: argparse.Namespace) -> int:
     port = args.port or _find_open_port(settings.port, settings.port + 100)
     host = args.host or settings.host
 
-    from yggdrasil.cli.style import bold, cyan, dim, out
     out(f"  {cyan('node')}  {bold(settings.node_id)}\n")
     out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
     out(f"  {cyan('bind')}  {bold(f'{host}:{port}')}\n")
+    out(f"  {cyan('mode')}  {dim('public — remote access enabled')}\n")
 
     front_proc = None
     if not args.no_front:
@@ -179,11 +256,76 @@ def _node_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _node_front(args: argparse.Namespace) -> int:
-    import signal
+def _node_status(args: argparse.Namespace) -> int:
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.node.daemon import _is_node_running, ensure_directories
+    from yggdrasil.node.service import service_status
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, red, yellow
+
+    print_logo("YGGNODE")
+    settings = get_settings()
+    ensure_directories(settings)
+    running, pid, port = _is_node_running(settings)
+
+    out(f"  {cyan('node')}    {bold(settings.node_id)}\n")
+    out(f"  {cyan('home')}    {dim(str(settings.node_home))}\n")
+    if running:
+        out(f"  {cyan('status')}  {green('running')} {dim(f'(pid={pid}, port={port})')}\n")
+        out(f"  {cyan('url')}     {bold(f'http://0.0.0.0:{port}')}\n")
+    else:
+        out(f"  {cyan('status')}  {red('stopped')}\n")
+        out(f"\n  Start with: {bold('ygg node start')}\n")
+
+    svc = service_status(settings)
+    if svc:
+        out(f"\n  {cyan('boot services:')}\n")
+        for name, state in svc.items():
+            color = green if state in ("active", "running") else (red if state == "not installed" else yellow)
+            out(f"    {dim(name)}  {color(state)}\n")
+
+    return 0
+
+
+def _node_create(args: argparse.Namespace) -> int:
+    import os
+    from pathlib import Path
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo
+    from yggdrasil.node.daemon import ensure_directories
+
+    print_logo("YGGNODE")
+
+    os.environ["YGG_NODE_NODE_ID"] = args.name
+    os.environ["YGG_NODE_ALLOW_REMOTE"] = "1"
+    if args.port:
+        os.environ["YGG_NODE_PORT"] = str(args.port)
 
     from yggdrasil.node.config import get_settings
-    from yggdrasil.cli.style import print_logo
+    settings = get_settings()
+    ensure_directories(settings)
+
+    # Persist the node ID
+    id_file = Path.home() / ".node" / ".ygg_node_id"
+    id_file.parent.mkdir(parents=True, exist_ok=True)
+    id_file.write_text(args.name)
+
+    out(f"  {green('✓')} node created\n")
+    out(f"  {cyan('node')}  {bold(args.name)}\n")
+    out(f"  {cyan('home')}  {dim(str(settings.node_home))}\n")
+
+    if args.start:
+        out(f"\n  {cyan('starting')}...\n")
+        from yggdrasil.node.daemon import spawn_node
+        pid, port = spawn_node(settings, host="0.0.0.0")
+        out(f"  {green('✓')} running on {bold(f'0.0.0.0:{port}')} (pid={pid})\n")
+
+    out(f"\n  Start with: {bold('ygg node start')}\n")
+    return 0
+
+
+def _node_front(args: argparse.Namespace) -> int:
+    import signal
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.cli.style import dim, out, print_logo
 
     print_logo("YGGNODE")
     settings = get_settings()
@@ -193,7 +335,6 @@ def _node_front(args: argparse.Namespace) -> int:
     if proc is None:
         return 1
 
-    from yggdrasil.cli.style import dim, out
     out(f"  {dim('Press Ctrl+C to stop.')}\n\n")
 
     try:
@@ -257,6 +398,7 @@ def _node_install(args: argparse.Namespace) -> int:
 
     print_logo("YGGNODE")
 
+    os.environ["YGG_NODE_ALLOW_REMOTE"] = "1"
     if args.port:
         os.environ["YGG_NODE_PORT"] = str(args.port)
     if args.front_port:
@@ -265,7 +407,7 @@ def _node_install(args: argparse.Namespace) -> int:
     settings = get_settings()
 
     out(f"  {cyan('install')} registering boot service...\n")
-    out(f"  {cyan('node')}    port {bold(str(settings.port))}\n")
+    out(f"  {cyan('node')}    {bold(settings.node_id)} on port {bold(str(settings.port))}\n")
     if not args.no_front:
         out(f"  {cyan('front')}   port {bold(str(settings.front_port))}\n")
     out(f"  {cyan('home')}    {dim(str(settings.node_home))}\n\n")
@@ -276,7 +418,7 @@ def _node_install(args: argparse.Namespace) -> int:
         out(f"  {green('✓')} {msg}\n\n")
         status = service_status(settings)
         for name, state in status.items():
-            color = green if state == "active" or state == "running" else yellow
+            color = green if state in ("active", "running") else yellow
             out(f"  {cyan(name)}  {color(state)}\n")
         out(f"\n  Node will start automatically on boot.\n")
         out(f"  Uninstall with: {bold('ygg node uninstall')}\n")
@@ -302,7 +444,6 @@ def _node_uninstall(args: argparse.Namespace) -> int:
 
     if ok:
         out(f"  {green('✓')} {msg}\n")
-        out(f"\n  Node service removed. Will no longer start on boot.\n")
         if args.purge:
             out(f"  {dim('All node data has been removed.')}\n")
     else:
@@ -311,53 +452,13 @@ def _node_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
-def _node_status(args: argparse.Namespace) -> int:
-    from yggdrasil.node.config import get_settings
-    from yggdrasil.node.daemon import _is_node_running, ensure_directories
-    from yggdrasil.node.service import service_status
-    from yggdrasil.cli.style import bold, cyan, dim, green, out, print_logo, red, yellow
-
-    print_logo("YGGNODE")
-    settings = get_settings()
-    ensure_directories(settings)
-    running, pid, port = _is_node_running(settings)
-
-    out(f"  {cyan('home')}    {dim(str(settings.node_home))}\n")
-    out(f"  {cyan('logs')}    {dim(str(settings.logs_root))}\n")
-    out(f"  {cyan('cache')}   {dim(str(settings.cache_root))}\n")
-    if running:
-        out(f"  {cyan('status')}  {green('running')} {dim(f'(pid={pid}, port={port})')}\n")
-        out(f"  {cyan('url')}     {bold(f'http://127.0.0.1:{port}')}\n")
-    else:
-        out(f"  {cyan('status')}  {red('stopped')}\n")
-
-    svc = service_status(settings)
-    if svc:
-        out(f"\n  {cyan('boot services:')}\n")
-        for name, state in svc.items():
-            color = green if state in ("active", "running") else (red if state == "not installed" else yellow)
-            out(f"    {dim(name)}  {color(state)}\n")
-
-    return 0
-
-
-def _node_stop(args: argparse.Namespace) -> int:
-    from yggdrasil.node.daemon import stop_node
-    from yggdrasil.cli.style import green, out, print_logo, red
-
-    print_logo("YGGNODE")
-    if stop_node():
-        out(f"  {green('node stopped.')}\n")
-    else:
-        out(f"  {red('no running node found.')}\n")
-    return 0
-
-
 def _databricks(args: argparse.Namespace) -> int:
     from yggdrasil.databricks.cli import main as dbks_main
     remaining = sys.argv[2:] if len(sys.argv) > 2 else []
     return dbks_main(remaining)
 
+
+# ── entry point ──────────────────────────────────────────────────
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
@@ -375,9 +476,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_logo("YGG")
         parser.print_help()
         return 0
-
-    if not getattr(args, "no_node", False) and args.command not in ("node",):
-        _ensure_node_running()
 
     handler = getattr(args, "handler", None)
     if handler is None:
