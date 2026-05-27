@@ -1608,10 +1608,10 @@ class HTTPSession(Session):
         """Session-wide request hook fired once per outbound request.
 
         Stamps the session reference, ``sent_at`` timestamp, merged
-        headers, and auth. When the request has no ``send_config``
-        (or its config has no ``local_cache``), a default 1-day local
-        cache is attached so every response is persisted to
-        ``~/.cache/http/<host>/`` automatically.
+        headers, and auth. When the request's ``local_cache`` has
+        ``received_from`` / ``received_to`` but no ``tabular``, fills
+        in the session's default local-cache folder. A bare
+        ``session.get(url)`` with no cache config does no disk I/O.
         """
         request.attach_session(self)
         request.sent_at = dt.datetime.now(dt.timezone.utc)
