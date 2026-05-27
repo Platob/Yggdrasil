@@ -32,6 +32,14 @@ Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 1. **User identity** — every request carries a user identity (sha256 hash of key+hostname). `UserService` auto-registers the local user and discovers peers.
 2. **Open by default** — all operations are allowed for all users. Permission checks are a middleware concern, not service logic. The `user_hash` is logged on every mutation for audit trail, but never blocks.
 3. **Audit log** — mutations (create, update, delete, replicate) log `(timestamp, user_hash, operation, asset_hash)`. Read-only operations are not logged.
+4. **Node acts as user** — the node operates with the current user's full permissions. It can read/write files, install packages, run arbitrary code. No sandboxing — the node IS the user's workstation.
+
+## Auto-configuration
+
+1. **Zero-config decorators** — `@function` infers name, code, dependencies, python version. `@function(auto_env=True)` also creates a matching PyEnv with the right Python version and deps.
+2. **Auto-env creation** — when a function is registered without an explicit environment, the system auto-creates one named `auto_{func_name}` with inferred deps.
+3. **Multi-python** — `uv venv --python 3.11/3.12/3.13` creates isolated envs. Code is replicable across nodes with different system Pythons.
+4. **Auto-install on start** — `ygg node start` auto-registers systemd/launchd boot services so the node survives reboots.
 
 ## Principles
 
