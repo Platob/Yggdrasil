@@ -2020,15 +2020,13 @@ class Table(DatabricksPath):
     ) -> "Table":
         mode = Mode.from_(mode, default=Mode.AUTO)
 
-        # ``or_replace=True`` — one-shot atomic replacement via
-        # ``CREATE OR REPLACE TABLE ... USING <format>``. Saves a round
-        # trip versus delete + recreate and removes the intermediate
-        # "table missing" window the warehouse used to see between the
-        # two calls. OR REPLACE is supported for managed Delta tables;
-        # external / explicit-storage paths fall through to the legacy
-        # drop + recreate (UC's tables.create API has no replace verb).
+        if mode == Mode.OVERWRITE:
+            or_replace = True
+
         if or_replace:
-            self.delete(wait=True, missing_ok=True, delete_staging=False)
+            if table_type != TableType.MANAGED:
+                or_replace = False
+                self.delete(wait=True, missing_ok=True, delete_staging=False)
 
         if self.exists:
             if mode == Mode.ERROR_IF_EXISTS:
@@ -2048,6 +2046,7 @@ class Table(DatabricksPath):
                 comment=comment,
                 missing_ok=missing_ok,
                 properties=properties,
+                or_replace=or_replace,
                 record_ygg_properties=record_ygg_properties,
             )
         else:
@@ -3256,11 +3255,12 @@ class Table(DatabricksPath):
             )
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
+        if mode_enum == Mode.OVERWRITE and not match_by:
+            schema_mode = Mode.OVERWRITE
 
         target = self.create(
             data,
             mode=schema_mode,
-            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
@@ -3398,11 +3398,12 @@ class Table(DatabricksPath):
         from yggdrasil.spark.statement import SparkPreparedStatement
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
+        if mode_enum == Mode.OVERWRITE and not match_by:
+            schema_mode = Mode.OVERWRITE
 
         target = self.create(
             data,
             mode=schema_mode,
-            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
