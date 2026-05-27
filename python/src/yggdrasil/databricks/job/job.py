@@ -23,7 +23,17 @@ from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.url import URL
 
 from ..resource import DatabricksResource
-from .service import Jobs, JobRuns, _check_permission, _check_task, _resolve_cluster_id, _set_cached_name
+from .service import (
+    Jobs,
+    JobRuns,
+    _check_permission,
+    _check_task,
+    _is_numeric,
+    _resolve_cluster_id,
+    _resolve_job_obj,
+    _resolve_run_obj,
+    _set_cached_name,
+)
 
 if TYPE_CHECKING:
     from ..cluster import Cluster
@@ -47,6 +57,12 @@ class Job(Singleton, DatabricksResource):
         Job display name.
     details:
         Pre-fetched SDK :class:`~databricks.sdk.service.jobs.Job`.
+
+    Positional construction accepts ``int``, ``str``, or ``Job``::
+
+        Job(service, 12345)          # by id
+        Job(service, "12345")        # numeric string → by id
+        Job(service, "my-etl-job")   # by name
     """
 
     _SINGLETON_TTL: ClassVar[Any] = None
@@ -55,16 +71,26 @@ class Job(Singleton, DatabricksResource):
     def _singleton_key(
         cls,
         service: Jobs | None = None,
-        job_id: int | None = None,
+        job_id: "int | str | None" = None,
         name: str | None = None,
         **_kwargs: Any,
     ) -> Any:
-        return (cls, service, job_id)
+        resolved_id, resolved_name = _resolve_job_obj(
+            None, job_id=None, name=None,
+        )
+        if job_id is not None:
+            if isinstance(job_id, str) and _is_numeric(job_id):
+                resolved_id = int(job_id)
+            elif isinstance(job_id, int):
+                resolved_id = job_id
+        if name is not None:
+            resolved_name = name
+        return (cls, service, resolved_id or resolved_name)
 
     def __init__(
         self,
         service: Jobs | None = None,
-        job_id: int | None = None,
+        job_id: "int | str | None" = None,
         name: str | None = None,
         *,
         details: SDKJob | None = None,
@@ -76,6 +102,14 @@ class Job(Singleton, DatabricksResource):
 
         if service is None:
             service = Jobs.current()
+
+        # Resolve positional obj-style: Job(svc, "12345") or Job(svc, "my-job")
+        if isinstance(job_id, str):
+            if _is_numeric(job_id):
+                job_id = int(job_id)
+            else:
+                name = name or job_id
+                job_id = None
 
         super().__init__(service=service)
         self.service: Jobs = service
@@ -89,7 +123,7 @@ class Job(Singleton, DatabricksResource):
                 self.name = self._details.settings.name
 
         if self.name and not self.job_id:
-            found = self.service.find(name=self.name, raise_error=True)
+            found = self.service.get(name=self.name)
             self.job_id = found.job_id
             self._details = found._details
 
@@ -236,6 +270,23 @@ class Job(Singleton, DatabricksResource):
             completed_only=completed_only,
             limit=limit,
         )
+
+    def get_run(
+        self,
+        obj: "JobRun | int | str | None" = None,
+        *,
+        run_id: int | None = None,
+        default: Any = ...,
+    ) -> Optional["JobRun"]:
+        """Retrieve a specific run of this job.
+
+        Parameters
+        ----------
+        obj:
+            Positional shortcut — ``JobRun`` (returned as-is), ``int``
+            (run id), or numeric ``str``.
+        """
+        return self.runs.get(obj, run_id=run_id, default=default)
 
     def latest_run(self) -> Optional["JobRun"]:
         return next(self.list_runs(limit=1), None)

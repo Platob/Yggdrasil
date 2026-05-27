@@ -62,6 +62,60 @@ def _get_cached_id(client: DatabricksClient, name: str) -> int | None:
     return bucket.get(name) if bucket else None
 
 
+def _is_numeric(value: str) -> bool:
+    return value.isdigit()
+
+
+def _resolve_job_obj(
+    obj: Any,
+    *,
+    job_id: int | None,
+    name: str | None,
+) -> tuple[int | None, str | None]:
+    """Resolve a positional ``obj`` into ``(job_id, name)``.
+
+    Accepts ``Job``, ``int`` (always id), or ``str`` (numeric → id,
+    otherwise → name).
+    """
+    if obj is None:
+        return job_id, name
+
+    from .job import Job
+
+    if isinstance(obj, Job):
+        return obj.job_id or job_id, obj.name or name
+    if isinstance(obj, int):
+        return obj, name
+    if isinstance(obj, str):
+        if _is_numeric(obj):
+            return int(obj), name
+        return job_id, obj
+    raise TypeError(f"obj must be Job | int | str, got {type(obj).__name__}")
+
+
+def _resolve_run_obj(
+    obj: Any,
+    *,
+    run_id: int | None,
+    job_id: int | None,
+) -> tuple[int | None, int | None]:
+    """Resolve a positional ``obj`` into ``(run_id, job_id)``."""
+    if obj is None:
+        return run_id, job_id
+
+    from .run import JobRun
+
+    if isinstance(obj, JobRun):
+        return obj.run_id or run_id, obj.job_id or job_id
+    if isinstance(obj, int):
+        return obj, job_id
+    if isinstance(obj, str):
+        if _is_numeric(obj):
+            return int(obj), job_id
+        raise ValueError(f"Run lookup by name is not supported; got {obj!r}")
+    raise TypeError(f"obj must be JobRun | int | str, got {type(obj).__name__}")
+
+
 def _check_task(
     task: Any,
     *,
@@ -117,15 +171,22 @@ class Jobs(DatabricksService):
 
     Listing, finding, creating, and updating jobs live here.
     Individual job lifecycle operations live on the :class:`Job` resource.
+
+    Getter methods accept a positional ``obj`` that can be a :class:`Job`,
+    an ``int`` (job id), or a ``str``.  Strings that are purely numeric
+    are treated as ids; everything else is treated as a job name::
+
+        jobs.get(12345)            # by id
+        jobs.get("12345")          # numeric string → by id
+        jobs.get("my-etl-job")     # by name
+        jobs["my-etl-job"]         # __getitem__ delegates to get
     """
 
     def __iter__(self) -> Iterator["Job"]:
         yield from self.list()
 
     def __getitem__(self, key: str | int) -> "Job":
-        if isinstance(key, int):
-            return self.get(key)
-        return self.find(name=key)
+        return self.get(key)
 
     # ------------------------------------------------------------------ #
     # List / Find / Get
@@ -145,7 +206,12 @@ class Jobs(DatabricksService):
         cap = limit if limit else float("inf")
 
         for raw in sdk.list(name=name, expand_tasks=expand_tasks):
-            job = Job(service=self, job_id=raw.job_id, name=raw.settings.name if raw.settings else None, details=raw)
+            job = Job(
+                service=self,
+                job_id=raw.job_id,
+                name=raw.settings.name if raw.settings else None,
+                details=raw,
+            )
             if raw.settings and raw.settings.name:
                 _set_cached_name(self.client, raw.settings.name, raw.job_id)
             yield job
@@ -153,49 +219,46 @@ class Jobs(DatabricksService):
             if cnt >= cap:
                 break
 
-    def get(self, job_id: int) -> "Job":
-        from .job import Job
-
-        sdk = self.client.workspace_client().jobs
-        raw = sdk.get(job_id=job_id)
-        name = raw.settings.name if raw.settings else None
-        if name:
-            _set_cached_name(self.client, name, raw.job_id)
-        return Job(service=self, job_id=raw.job_id, name=name, details=raw)
-
-    def find(
+    def get(
         self,
         obj: "Job | int | str | None" = None,
         *,
         job_id: int | None = None,
         name: str | None = None,
-        raise_error: bool = True,
+        default: Any = ...,
     ) -> Optional["Job"]:
+        """Resolve a job by id or name.
+
+        Parameters
+        ----------
+        obj:
+            Positional shortcut — ``Job`` (returned as-is), ``int``
+            (job id), or ``str`` (numeric → id, otherwise → name).
+        job_id:
+            Explicit job id.
+        name:
+            Explicit job name.
+        default:
+            Returned when the job is not found.  ``...`` (the default)
+            raises :class:`ResourceDoesNotExist`.
+        """
         from .job import Job
 
-        if obj is not None:
-            if isinstance(obj, Job):
-                return obj
-            if isinstance(obj, int):
-                job_id = job_id or obj
-            elif isinstance(obj, str):
-                name = name or obj
-            else:
-                raise TypeError(f"obj must be Job | int | str, got {type(obj).__name__}")
+        job_id, name = _resolve_job_obj(obj, job_id=job_id, name=name)
 
-        if job_id:
+        if job_id is not None:
             try:
-                return self.get(job_id)
+                return self._get_by_id(job_id)
             except ResourceDoesNotExist:
-                if raise_error:
-                    raise
-                return None
+                if default is not ...:
+                    return default
+                raise
 
-        if name:
+        if name is not None:
             cached_id = _get_cached_id(self.client, name)
             if cached_id is not None:
                 try:
-                    return self.get(cached_id)
+                    return self._get_by_id(cached_id)
                 except ResourceDoesNotExist:
                     pass
 
@@ -203,13 +266,23 @@ class Jobs(DatabricksService):
                 if job.name == name:
                     return job
 
-            if raise_error:
-                raise ResourceDoesNotExist(f"Cannot find job {name!r}")
-            return None
+            if default is not ...:
+                return default
+            raise ResourceDoesNotExist(f"Cannot find job {name!r}")
 
-        if raise_error:
-            raise ValueError("Either job_id or name must be provided")
-        return None
+        if default is not ...:
+            return default
+        raise ValueError("Either obj, job_id, or name must be provided")
+
+    def _get_by_id(self, job_id: int) -> "Job":
+        from .job import Job
+
+        sdk = self.client.workspace_client().jobs
+        raw = sdk.get(job_id=job_id)
+        job_name = raw.settings.name if raw.settings else None
+        if job_name:
+            _set_cached_name(self.client, job_name, raw.job_id)
+        return Job(service=self, job_id=raw.job_id, name=job_name, details=raw)
 
     # ------------------------------------------------------------------ #
     # Create / Update
@@ -294,17 +367,9 @@ class Jobs(DatabricksService):
         max_concurrent_runs: int | None = None,
         **settings_kwargs: Any,
     ) -> "Job":
-        if obj is not None:
-            from .job import Job
-            if isinstance(obj, Job):
-                job_id = obj.job_id
-                name = name or obj.name
-            elif isinstance(obj, int):
-                job_id = obj
-            elif isinstance(obj, str):
-                name = name or obj
+        resolved_id, resolved_name = _resolve_job_obj(obj, job_id=job_id, name=name)
 
-        existing = self.find(job_id=job_id, name=name, raise_error=False) if (job_id or name) else None
+        existing = self.get(job_id=resolved_id, name=resolved_name, default=None)
 
         if existing is not None:
             return existing.update(
@@ -317,11 +382,12 @@ class Jobs(DatabricksService):
                 **settings_kwargs,
             )
 
-        if not name:
+        final_name = resolved_name or name
+        if not final_name:
             raise ValueError("name is required to create a new job")
 
         return self.create(
-            name=name,
+            name=final_name,
             tasks=tasks,
             cluster=cluster,
             permissions=permissions,
@@ -331,6 +397,16 @@ class Jobs(DatabricksService):
             **settings_kwargs,
         )
 
+    def delete(
+        self,
+        obj: "Job | int | str | None" = None,
+        *,
+        job_id: int | None = None,
+        name: str | None = None,
+    ) -> None:
+        job = self.get(obj, job_id=job_id, name=name)
+        job.delete()
+
 
 # ---------------------------------------------------------------------------
 # JobRuns service
@@ -338,25 +414,54 @@ class Jobs(DatabricksService):
 
 
 class JobRuns(DatabricksService):
-    """Collection-level run management — listing and retrieving runs."""
+    """Collection-level run management — listing and retrieving runs.
+
+    Getter methods accept a positional ``obj`` that can be a
+    :class:`JobRun`, an ``int`` (run id), or a numeric ``str``::
+
+        job_runs.get(98765)        # by run id
+        job_runs.get("98765")      # numeric string → by run id
+    """
+
+    def __getitem__(self, key: int | str) -> "JobRun":
+        return self.get(key)
 
     def list(
         self,
+        obj: "Job | int | str | None" = None,
         *,
         job_id: int | None = None,
+        name: str | None = None,
         active_only: bool = False,
         completed_only: bool = False,
         expand_tasks: bool = False,
         limit: int | None = None,
     ) -> Iterator["JobRun"]:
+        """List runs, optionally scoped to a job.
+
+        Parameters
+        ----------
+        obj:
+            Positional shortcut for the owning job — ``Job``, ``int``
+            (job id), or ``str`` (numeric → job id, otherwise → job name
+            resolved via :meth:`Jobs.get`).
+        """
         from .run import JobRun
+
+        resolved_job_id, resolved_name = _resolve_job_obj(obj, job_id=job_id, name=name)
+
+        if resolved_name and not resolved_job_id:
+            from .job import Job
+            found = Jobs(client=self.client).get(name=resolved_name, default=None)
+            if found is not None:
+                resolved_job_id = found.job_id
 
         sdk = self.client.workspace_client().jobs
         cnt = 0
         cap = limit if limit else float("inf")
 
         for raw in sdk.list_runs(
-            job_id=job_id,
+            job_id=resolved_job_id,
             active_only=active_only,
             completed_only=completed_only,
             expand_tasks=expand_tasks,
@@ -367,9 +472,39 @@ class JobRuns(DatabricksService):
             if cnt >= cap:
                 break
 
-    def get(self, run_id: int) -> "JobRun":
+    def get(
+        self,
+        obj: "JobRun | int | str | None" = None,
+        *,
+        run_id: int | None = None,
+        default: Any = ...,
+    ) -> Optional["JobRun"]:
+        """Retrieve a single run by id.
+
+        Parameters
+        ----------
+        obj:
+            Positional shortcut — ``JobRun`` (returned as-is), ``int``
+            (run id), or numeric ``str``.
+        run_id:
+            Explicit run id.
+        default:
+            Returned when the run is not found.  ``...`` raises.
+        """
         from .run import JobRun
 
-        sdk = self.client.workspace_client().jobs
-        raw = sdk.get_run(run_id=run_id)
-        return JobRun(service=self, run_id=raw.run_id, job_id=raw.job_id, details=raw)
+        resolved_run_id, _ = _resolve_run_obj(obj, run_id=run_id, job_id=None)
+
+        if resolved_run_id is None:
+            if default is not ...:
+                return default
+            raise ValueError("Either obj or run_id must be provided")
+
+        try:
+            sdk = self.client.workspace_client().jobs
+            raw = sdk.get_run(run_id=resolved_run_id)
+            return JobRun(service=self, run_id=raw.run_id, job_id=raw.job_id, details=raw)
+        except ResourceDoesNotExist:
+            if default is not ...:
+                return default
+            raise

@@ -20,7 +20,6 @@ from databricks.sdk.service.jobs import (
     RunResultState,
     RunState,
     RunTask as SDKRunTask,
-    RepairRunResponse,
 )
 
 from yggdrasil.dataclasses.awaitable import Awaitable
@@ -30,7 +29,7 @@ from yggdrasil.enums.state import State
 from yggdrasil.url import URL
 
 from ..resource import DatabricksResource
-from .service import JobRuns
+from .service import JobRuns, _is_numeric, _resolve_run_obj
 
 __all__ = ["JobRun", "JobTask"]
 
@@ -97,11 +96,16 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
     service:
         Parent :class:`JobRuns` service.
     run_id:
-        Databricks run id.
+        Databricks run id.  Accepts ``int`` or numeric ``str``.
     job_id:
         Owning job id.
     details:
         Pre-fetched SDK :class:`~databricks.sdk.service.jobs.Run`.
+
+    Positional construction::
+
+        JobRun(service, 98765)       # by run id
+        JobRun(service, "98765")     # numeric string → by run id
     """
 
     _SINGLETON_TTL: ClassVar[Any] = None
@@ -110,17 +114,20 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
     def _singleton_key(
         cls,
         service: JobRuns | None = None,
-        run_id: int | None = None,
-        job_id: int | None = None,
+        run_id: "int | str | None" = None,
+        job_id: "int | str | None" = None,
         **_kwargs: Any,
     ) -> Any:
-        return (cls, service, run_id)
+        resolved = run_id
+        if isinstance(resolved, str) and _is_numeric(resolved):
+            resolved = int(resolved)
+        return (cls, service, resolved)
 
     def __init__(
         self,
         service: JobRuns | None = None,
-        run_id: int | None = None,
-        job_id: int | None = None,
+        run_id: "int | str | None" = None,
+        job_id: "int | str | None" = None,
         *,
         details: SDKRun | None = None,
         singleton_ttl: Any = ...,
@@ -131,6 +138,12 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
 
         if service is None:
             service = JobRuns.current()
+
+        # Coerce numeric strings
+        if isinstance(run_id, str) and _is_numeric(run_id):
+            run_id = int(run_id)
+        if isinstance(job_id, str) and _is_numeric(job_id):
+            job_id = int(job_id)
 
         super().__init__(service=service)
         self.service: JobRuns = service
@@ -158,7 +171,7 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
     def explore_url(self) -> URL:
         if self.job_id and self.run_id:
             return self.client.base_url.with_path(f"/jobs/{self.job_id}/runs/{self.run_id}")
-        return self.client.base_url.with_path(f"/jobs")
+        return self.client.base_url.with_path("/jobs")
 
     # ------------------------------------------------------------------ #
     # Details
@@ -169,6 +182,11 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
         if self._details is None and self.run_id is not None:
             self.refresh()
         return self._details
+
+    @property
+    def name(self) -> str | None:
+        d = self.details
+        return d.run_name if d else None
 
     def refresh(self) -> "JobRun":
         sdk = self.client.workspace_client().jobs
