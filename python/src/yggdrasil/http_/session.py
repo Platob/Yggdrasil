@@ -118,8 +118,61 @@ LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Proxy helpers
+# Proxy helpers — resolved once per process, shared across all sessions
 # ---------------------------------------------------------------------------
+
+# Dead proxies — process-wide set so one failure skips the proxy for
+# every session in the process, not just the one that hit the error.
+_DEAD_PROXIES: set[str] = set()
+
+
+def _proxy_key(proxy: "URL") -> str:
+    return f"{proxy.host}:{proxy.port or 8080}"
+
+
+def mark_proxy_dead(proxy: "URL") -> None:
+    """Mark *proxy* as unreachable for the rest of the process."""
+    key = _proxy_key(proxy)
+    _DEAD_PROXIES.add(key)
+    LOGGER.warning("Proxy %s marked dead — falling back to direct connections", key)
+
+
+def is_proxy_dead(proxy: "URL") -> bool:
+    return _proxy_key(proxy) in _DEAD_PROXIES
+
+
+def _read_env_proxy(name: str) -> "URL | None":
+    raw = os.environ.get(name) or os.environ.get(name.lower())
+    return URL.from_(raw) if raw else None
+
+
+class _ProxyEnv:
+    """Snapshot of proxy-related env vars, resolved once at first access."""
+
+    _instance: "Optional[_ProxyEnv]" = None
+
+    def __init__(self) -> None:
+        self.https: URL | None = _read_env_proxy("HTTPS_PROXY")
+        self.http: URL | None = _read_env_proxy("HTTP_PROXY")
+        self.all: URL | None = _read_env_proxy("ALL_PROXY")
+        self.no_proxy: str = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+
+    @classmethod
+    def current(cls) -> "_ProxyEnv":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._instance = None
+
+    def resolve(self, target_scheme: str | None = None) -> "URL | None":
+        if target_scheme == "https" and self.https:
+            return self.https
+        if target_scheme == "http" and self.http:
+            return self.http
+        return self.all
 
 
 def _resolve_proxy_url(
@@ -128,43 +181,22 @@ def _resolve_proxy_url(
 ) -> "URL | None":
     """Resolve a proxy URL from the explicit argument or environment.
 
-    Lookup order (first non-empty wins):
-
-    1. ``proxy`` if not ``None``.
-    2. ``HTTPS_PROXY`` / ``https_proxy`` when *target_scheme* is ``"https"``.
-    3. ``HTTP_PROXY`` / ``http_proxy`` when *target_scheme* is ``"http"``.
-    4. ``ALL_PROXY`` / ``all_proxy`` as a catch-all.
+    Env vars are read once per process via :class:`_ProxyEnv`.
     """
     if proxy is not None:
         return URL.from_(proxy) if not isinstance(proxy, URL) else proxy
-
-    if target_scheme == "https":
-        env = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        if env:
-            return URL.from_(env)
-
-    if target_scheme == "http":
-        env = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-        if env:
-            return URL.from_(env)
-
-    env = os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-    if env:
-        return URL.from_(env)
-
-    return None
+    return _ProxyEnv.current().resolve(target_scheme)
 
 
 def _should_bypass_proxy(host: str, no_proxy: str | None = None) -> bool:
     """Return ``True`` when *host* matches a ``no_proxy`` pattern.
 
-    Reads ``NO_PROXY`` / ``no_proxy`` from the environment when
-    *no_proxy* is ``None``.  The wildcard ``"*"`` bypasses everything.
-    Entries are comma-separated; leading dots match any subdomain
-    (``".example.com"`` matches ``"foo.example.com"``).
+    Uses the cached :class:`_ProxyEnv` when *no_proxy* is ``None``.
+    The wildcard ``"*"`` bypasses everything.  Entries are
+    comma-separated; leading dots match any subdomain.
     """
     if no_proxy is None:
-        no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+        no_proxy = _ProxyEnv.current().no_proxy
 
     if not no_proxy:
         return False
@@ -773,9 +805,6 @@ class HTTPSession(Session):
         # existing TCP / TLS handshake instead of paying for a new one;
         # capped at ``pool_maxsize`` entries per host.
         self._connections: dict[tuple[str, str, int], "collections.deque[http.client.HTTPConnection]"] = {}
-        # Proxy hosts that failed to connect — remembered so subsequent
-        # requests fall back to direct without retrying a dead proxy.
-        self._dead_proxies: set[str] = set()
         # Retry policy is built once at init — same policy applies to
         # every wire send and the singleton key already pins
         # ``pool_maxsize`` / ``waiting`` / ``verify`` so two sessions
@@ -806,7 +835,6 @@ class HTTPSession(Session):
             return
         super().__setstate__(state)
         self._connections = {}
-        self._dead_proxies = set()
         self._retry = self._build_retry()
 
     # ------------------------------------------------------------------
@@ -843,19 +871,9 @@ class HTTPSession(Session):
         if _should_bypass_proxy(host, self.no_proxy):
             return None
         proxy = _resolve_proxy_url(self.proxy, target_scheme=scheme)
-        if proxy is not None:
-            proxy_key = f"{proxy.host}:{proxy.port or 8080}"
-            if proxy_key in self._dead_proxies:
-                return None
+        if proxy is not None and is_proxy_dead(proxy):
+            return None
         return proxy
-
-    def _mark_proxy_dead(self, proxy: URL) -> None:
-        proxy_key = f"{proxy.host}:{proxy.port or 8080}"
-        self._dead_proxies.add(proxy_key)
-        LOGGER.warning(
-            "Proxy %s marked dead — falling back to direct connections",
-            proxy_key,
-        )
 
     def _build_connection(
         self,
@@ -898,7 +916,7 @@ class HTTPSession(Session):
                         "Proxy %s:%s failed for %s:%s (%s) — falling back to direct",
                         proxy.host, proxy.port, host, port, exc,
                     )
-                    self._mark_proxy_dead(proxy)
+                    mark_proxy_dead(proxy)
 
             return http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
@@ -920,7 +938,7 @@ class HTTPSession(Session):
                     "Proxy %s:%s unreachable (%s) — falling back to direct",
                     proxy_host, proxy_port, exc,
                 )
-                self._mark_proxy_dead(proxy)
+                mark_proxy_dead(proxy)
 
         return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
 

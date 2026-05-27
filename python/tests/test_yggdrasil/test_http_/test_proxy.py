@@ -22,6 +22,8 @@ import pytest
 
 from yggdrasil.http_.session import (
     HTTPSession,
+    _DEAD_PROXIES,
+    _ProxyEnv,
     _resolve_proxy_url,
     _should_bypass_proxy,
 )
@@ -205,10 +207,14 @@ def origin_server():
 
 
 @pytest.fixture(autouse=True)
-def _fresh_singletons():
+def _fresh_state():
     HTTPSession._INSTANCES.clear()
+    _DEAD_PROXIES.clear()
+    _ProxyEnv.reset()
     yield
     HTTPSession._INSTANCES.clear()
+    _DEAD_PROXIES.clear()
+    _ProxyEnv.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -298,25 +304,31 @@ class TestDeadProxyFallback:
 
     def test_unreachable_proxy_marked_dead(self, origin_server):
         session = HTTPSession(proxy="http://127.0.0.1:19999")
-        assert len(session._dead_proxies) == 0
+        assert len(_DEAD_PROXIES) == 0
         resp = session.get(f"{origin_server}/direct")
         data = resp.json()
         assert data.get("origin") is True
-        assert len(session._dead_proxies) == 1
+        assert len(_DEAD_PROXIES) == 1
 
     def test_second_request_skips_dead_proxy(self, origin_server):
         session = HTTPSession(proxy="http://127.0.0.1:19998")
         session.get(f"{origin_server}/first")
-        assert len(session._dead_proxies) == 1
+        assert len(_DEAD_PROXIES) == 1
         resp = session.get(f"{origin_server}/second")
         assert resp.json().get("origin") is True
 
-    def test_dead_proxy_not_pickled(self, origin_server):
-        import pickle
-        session = HTTPSession(proxy="http://127.0.0.1:19997")
-        session.get(f"{origin_server}/trigger-dead")
-        assert len(session._dead_proxies) >= 1
-        data = pickle.dumps(session)
-        HTTPSession._INSTANCES.clear()
-        restored = pickle.loads(data)
-        assert len(restored._dead_proxies) == 0
+    def test_dead_proxy_shared_across_sessions(self, origin_server):
+        s1 = HTTPSession(proxy="http://127.0.0.1:19996")
+        s1.get(f"{origin_server}/trigger")
+        assert len(_DEAD_PROXIES) == 1
+        s2 = HTTPSession(base_url=f"{origin_server}", proxy="http://127.0.0.1:19996")
+        resp = s2.get("/check")
+        assert resp.json().get("origin") is True
+
+    def test_env_resolved_once(self):
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://env-proxy:3128"}, clear=True):
+            _ProxyEnv.reset()
+            env1 = _ProxyEnv.current()
+            env2 = _ProxyEnv.current()
+            assert env1 is env2
+            assert env1.https.host == "env-proxy"
