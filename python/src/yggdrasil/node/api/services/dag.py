@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import json as json_mod
@@ -7,7 +8,7 @@ import logging
 import time
 from collections import deque
 from threading import Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -29,6 +30,10 @@ from ..schemas.dag import (
 from ..schemas.pyfuncrun import PyFuncRunCreate
 from .pyfuncrun import PyFuncRunService
 
+if TYPE_CHECKING:
+    from .backend import BackendService
+    from .network import NetworkService
+
 LOGGER = logging.getLogger(__name__)
 
 _MAX_DAGS = 128
@@ -40,12 +45,18 @@ class DAGService:
         self,
         settings: Settings,
         pyfuncrun_service: PyFuncRunService,
+        *,
+        network_service: NetworkService | None = None,
+        backend_service: BackendService | None = None,
     ) -> None:
         self.settings = settings
         self._pyfuncrun = pyfuncrun_service
+        self._network = network_service
+        self._backend = backend_service
         self._dags: ExpiringDict[int, DAGEntry] = ExpiringDict(default_ttl=None, max_size=_MAX_DAGS)
         self._runs: ExpiringDict[int, DAGRunEntry] = ExpiringDict(default_ttl=None, max_size=_MAX_DAG_RUNS)
         self._lock = Lock()
+        self._schedule_tasks: dict[int, asyncio.Task] = {}
 
     # -- CRUD ---------------------------------------------------------------
 
@@ -110,6 +121,59 @@ class DAGService:
         if entry is None:
             raise NotFoundError(f"DAG {dag_id!r} not found")
         return DAGResponse(dag=entry)
+
+    # -- scheduling ---------------------------------------------------------
+
+    async def schedule(self, dag_id: int, interval: float, max_runs: int | None = None) -> DAGResponse:
+        """Schedule periodic execution. Runs in background."""
+        dag = await self.get(dag_id)
+        dag = dag.model_copy(update={
+            "schedule_interval": interval,
+            "schedule_max_runs": max_runs,
+            "schedule_active": True,
+        })
+        with self._lock:
+            self._dags[dag_id] = dag
+        # Cancel any existing schedule task for this DAG
+        old_task = self._schedule_tasks.pop(dag_id, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        self._schedule_tasks[dag_id] = asyncio.create_task(self._run_schedule(dag_id))
+        LOGGER.info("Scheduled DAG %r every %.1fs (max_runs=%r)", dag_id, interval, max_runs)
+        return DAGResponse(dag=dag)
+
+    async def _run_schedule(self, dag_id: int) -> None:
+        runs = 0
+        while True:
+            with self._lock:
+                dag = self._dags.get(dag_id)
+            if dag is None or not dag.schedule_active:
+                break
+            if dag.schedule_max_runs is not None and runs >= dag.schedule_max_runs:
+                with self._lock:
+                    d = self._dags.get(dag_id)
+                    if d:
+                        self._dags[dag_id] = d.model_copy(update={"schedule_active": False})
+                LOGGER.info("DAG %r schedule completed after %d runs", dag_id, runs)
+                break
+            try:
+                await self.execute(dag_id)
+            except Exception as exc:
+                LOGGER.error("Scheduled DAG %r run failed: %s", dag_id, exc)
+            runs += 1
+            await asyncio.sleep(dag.schedule_interval or 60)
+
+    async def unschedule(self, dag_id: int) -> DAGResponse:
+        """Stop a scheduled DAG."""
+        dag = await self.get(dag_id)
+        dag = dag.model_copy(update={"schedule_active": False})
+        with self._lock:
+            self._dags[dag_id] = dag
+        task = self._schedule_tasks.pop(dag_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+        LOGGER.info("Unscheduled DAG %r", dag_id)
+        return DAGResponse(dag=dag)
 
     # -- execution ----------------------------------------------------------
 
@@ -214,6 +278,22 @@ class DAGService:
         return result
 
     async def _execute_local(self, step: DAGStep, args: dict[str, Any]) -> Any:
+        # Smart dispatch: if local node is overloaded, try a peer
+        if self._backend is not None and self._network is not None:
+            snap = self._backend.snapshot()
+            if snap.active_runs >= snap.cpu_count:
+                peers_resp = await self._network.get_peers()
+                if peers_resp.peers:
+                    target = min(peers_resp.peers, key=lambda p: (p.active_runs, p.cpu_percent))
+                    if target.active_runs < snap.active_runs:
+                        LOGGER.info(
+                            "Auto-dispatching step %r to peer %r (local_active=%d, peer_active=%d)",
+                            step.id, target.node_id, snap.active_runs, target.active_runs,
+                        )
+                        return await self._execute_remote_on(
+                            f"http://{target.host}:{target.port}", step, args,
+                        )
+
         req = PyFuncRunCreate(
             func_id=step.ref.func_id,
             env_id=step.ref.env_id,
@@ -228,16 +308,20 @@ class DAGService:
         if run.result is not None:
             return run.result
         if run.stdout:
-            import json
             try:
-                return json.loads(run.stdout.strip())
-            except (json.JSONDecodeError, ValueError):
+                return json_mod.loads(run.stdout.strip())
+            except (json_mod.JSONDecodeError, ValueError):
                 return run.stdout.strip()
         return None
 
     async def _execute_remote(self, step: DAGStep, args: dict[str, Any]) -> Any:
-        url = f"{step.ref.node_url}/api/v2/pyfuncrun"
-        async with httpx.AsyncClient(timeout=600.0) as client:
+        return await self._execute_remote_on(step.ref.node_url, step, args)
+
+    async def _execute_remote_on(self, base_url: str, step: DAGStep, args: dict[str, Any]) -> Any:
+        url = f"{base_url}/api/v2/pyfuncrun"
+        # Use the network service's shared client when available, fall back to one-shot
+        client = self._network._client if self._network is not None else None
+        if client is not None:
             resp = await client.post(url, json={
                 "func_id": step.ref.func_id,
                 "env_id": step.ref.env_id,
@@ -245,6 +329,15 @@ class DAGService:
             })
             resp.raise_for_status()
             data = resp.json()
+        else:
+            async with httpx.AsyncClient(timeout=600.0) as c:
+                resp = await c.post(url, json={
+                    "func_id": step.ref.func_id,
+                    "env_id": step.ref.env_id,
+                    "kwargs": args,
+                })
+                resp.raise_for_status()
+                data = resp.json()
 
         run_data = data.get("run", data)
         if run_data.get("status") == "failed":
@@ -256,10 +349,9 @@ class DAGService:
             return run_data["result"]
         stdout = run_data.get("stdout")
         if stdout:
-            import json
             try:
-                return json.loads(stdout.strip())
-            except (json.JSONDecodeError, ValueError):
+                return json_mod.loads(stdout.strip())
+            except (json_mod.JSONDecodeError, ValueError):
                 return stdout.strip()
         return None
 

@@ -20,6 +20,14 @@ const Icons = {
       <path d="M12 12v4" />
     </svg>
   ),
+  dags: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="5" cy="6" r="3" />
+      <circle cx="19" cy="6" r="3" />
+      <circle cx="12" cy="18" r="3" />
+      <path d="M7.5 8l3 7M16.5 8l-3 7" />
+    </svg>
+  ),
   chat: (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
@@ -35,6 +43,7 @@ const Icons = {
 const NAV_ITEMS = [
   { href: "/", label: "Home", icon: Icons.home, exact: true },
   { href: "/nodes", label: "Nodes", icon: Icons.nodes },
+  { href: "/dags", label: "DAGs", icon: Icons.dags },
   { href: "/chat", label: "Chat", icon: Icons.chat },
   { href: "/files", label: "Files", icon: Icons.files },
 ];

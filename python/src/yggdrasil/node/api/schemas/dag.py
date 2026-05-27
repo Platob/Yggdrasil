@@ -46,6 +46,14 @@ class DAGEntry(StrictModel):
     content_hash: str = ""
     replicated_at: str | None = None
     replicated_from: str | None = None
+    schedule_interval: float | None = None  # seconds between runs, None = no schedule
+    schedule_max_runs: int | None = None
+    schedule_active: bool = False
+
+
+class DAGScheduleRequest(StrictModel):
+    interval_seconds: float
+    max_runs: int | None = None
 
 
 class DAGResponse(StrictModel):
