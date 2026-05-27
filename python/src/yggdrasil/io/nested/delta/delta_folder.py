@@ -733,7 +733,8 @@ def _collect_stats(batches: "list[pa.RecordBatch]") -> "Optional[str]":
             col_nulls += col.null_count
             if col.null_count == len(col): continue
             try:
-                v_min, v_max = pc.min(col).as_py(), pc.max(col).as_py()
+                mm = pc.min_max(col)
+                v_min, v_max = mm["min"].as_py(), mm["max"].as_py()
                 if v_min is not None and (col_min is None or v_min < col_min): col_min = v_min
                 if v_max is not None and (col_max is None or v_max > col_max): col_max = v_max
             except Exception: continue

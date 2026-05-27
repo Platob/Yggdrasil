@@ -76,7 +76,8 @@ class TestRemoteCallCounts(DeltaTestCase):
         _content_cache.clear()
 
     def _folder(self, name: str = "t"):
-        return _s3_delta_folder(self.s3, self.bucket, f"test/{name}")
+        import time as _t
+        return _s3_delta_folder(self.s3, self.bucket, f"test/{name}_{_t.time_ns()}/")
 
     def test_initial_write_call_count(self) -> None:
         """Initial write: 1 list + 1 head (exists check) + 1 get (_last_ck) + 2 put (parquet + commit)."""
@@ -146,23 +147,23 @@ class TestRemoteCallCounts(DeltaTestCase):
 
     def test_fresh_instance_read_with_warm_content_cache(self) -> None:
         """New DeltaFolder on same table: listing cold, content warm."""
-        d = self._folder()
+        prefix = f"test/fresh_{time.time_ns()}/"
+        d = _s3_delta_folder(self.s3, self.bucket, prefix)
         d.write_arrow_table(pa.table({"id": list(range(5))}))
-        d.read_arrow_table()  # warm the content cache
+        d.read_arrow_table()
 
         self.counter.reset()
-        d2 = _s3_delta_folder(self.s3, self.bucket, "test/t")
+        d2 = _s3_delta_folder(self.s3, self.bucket, prefix)
         out = d2.read_arrow_table()
         print(f"\n--- Fresh instance, warm cache ({out.num_rows} rows) ---")
         self.counter.report("calls")
-        # Content cache hits save commit JSON reads; listing may or
-        # may not need a round trip depending on S3Path singleton cache.
         self.assertLessEqual(self.counter.total, 5)
 
     def test_checkpoint_reduces_commit_reads(self) -> None:
         """After checkpoint, reading a fresh instance should read the
         checkpoint + only the tail commits, not all historical commits."""
-        d = self._folder()
+        prefix = f"test/ck_{time.time_ns()}/"
+        d = _s3_delta_folder(self.s3, self.bucket, prefix)
         for i in range(11):
             mode = Mode.AUTO if i == 0 else Mode.APPEND
             d.write_arrow_batches(
@@ -174,12 +175,10 @@ class TestRemoteCallCounts(DeltaTestCase):
         _content_cache.clear()
 
         self.counter.reset()
-        d2 = _s3_delta_folder(self.s3, self.bucket, "test/t")
+        d2 = _s3_delta_folder(self.s3, self.bucket, prefix)
         out = d2.read_arrow_table()
         print(f"\n--- Post-checkpoint fresh read ({out.num_rows} rows) ---")
         self.counter.report("calls")
-        # Should read: 1 list, 1 _last_checkpoint, 1 checkpoint parquet,
-        # 1 tail commit (v10), 11 data parquets
         get_calls = self.counter.counts.get("get_object", 0)
         self.assertLessEqual(get_calls, 15,
             f"Expected ≤15 gets (checkpoint skips old commits), got {get_calls}")
