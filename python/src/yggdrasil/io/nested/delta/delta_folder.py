@@ -417,15 +417,14 @@ class DeltaFolder(Folder):
                     for sb in sub.to_batches():
                         buckets.setdefault(key, []).append(sb)
 
+        def _hq(v: Any) -> str:
+            return urllib.parse.quote(str(v), safe="") if v is not None else "__HIVE_DEFAULT_PARTITION__"
+
         for key, sub_batches in buckets.items():
             kv = dict(zip(partition_columns, key))
-
-            def _hive_quote(v: Any) -> str:
-                return urllib.parse.quote(str(v), safe="") if v is not None else "__HIVE_DEFAULT_PARTITION__"
-
             target_dir = self.path
             for col in partition_columns:
-                target_dir = target_dir / f"{col}={_hive_quote(kv[col])}"
+                target_dir = target_dir / f"{col}={_hq(kv[col])}"
             target_dir.mkdir(parents=True, exist_ok=True)
 
             stem = f"part-{int(time.time() * 1000)}-{os.urandom(8).hex()}.parquet"
@@ -449,7 +448,7 @@ class DeltaFolder(Folder):
             with ParquetFile(holder=file_path, owns_holder=False) as opened:
                 opened._write_arrow_batches(payload_batches, ParquetOptions(mode=Mode.OVERWRITE))
 
-            parts = [f"{col}={_hive_quote(kv[col])}" for col in partition_columns]
+            parts = [f"{col}={_hq(kv[col])}" for col in partition_columns]
             parts.append(stem)
             yield AddFile(
                 path="/".join(parts),
