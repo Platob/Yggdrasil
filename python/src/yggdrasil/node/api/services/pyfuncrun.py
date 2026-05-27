@@ -109,6 +109,23 @@ class PyFuncRunService:
             node_id=self.settings.node_id, runs=items,
         )
 
+    async def cancel(self, run_id: int) -> PyFuncRunEntry:
+        with self._lock:
+            entry = self._runs.get(run_id)
+        if entry is None:
+            raise NotFoundError(f"PyFuncRun {run_id!r} not found")
+        if entry.status not in ("pending", "running"):
+            raise NotFoundError(
+                f"PyFuncRun {run_id!r} is already {entry.status!r} — "
+                f"only pending/running runs can be cancelled"
+            )
+        return self._update_entry(
+            run_id,
+            status="cancelled",
+            completed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            progress=1.0,
+        )
+
     async def delete(self, run_id: int) -> PyFuncRunResponse:
         with self._lock:
             entry = self._runs.pop(run_id, None)

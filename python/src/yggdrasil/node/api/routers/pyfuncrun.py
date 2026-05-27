@@ -42,6 +42,16 @@ async def get_run(
     return PyFuncRunResponse(run=entry)
 
 
+@router.post("/{run_id}/cancel", response_model=PyFuncRunResponse)
+async def cancel_run(
+    run_id: int,
+    service: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> PyFuncRunResponse:
+    """Cancel a pending or running PyFuncRun. Returns the updated entry."""
+    entry = await service.cancel(run_id)
+    return PyFuncRunResponse(run=entry)
+
+
 @router.delete("/{run_id}", response_model=PyFuncRunResponse)
 async def delete_run(
     run_id: int,

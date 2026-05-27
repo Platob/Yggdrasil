@@ -20,6 +20,37 @@ async def get_backend(
     return BackendResponse(backend=snap)
 
 
+@router.get("/summary")
+async def get_summary(
+    service: BackendService = Depends(get_backend_service),
+) -> dict:
+    """Lightweight health check — CPU, memory, run counts only.
+
+    Skips GPU collection, network IO, and disk stats for minimal latency.
+    Designed for peer health polling where you just need the basics.
+    """
+    cpu_percent = 0.0
+    mem_total = 0.0
+    mem_used = 0.0
+    try:
+        import psutil
+        cpu_percent = psutil.cpu_percent(interval=0)
+        mem = psutil.virtual_memory()
+        mem_used = mem.used / (1024 * 1024)
+        mem_total = mem.total / (1024 * 1024)
+    except ImportError:
+        pass
+
+    memory_percent = round(mem_used / mem_total * 100, 1) if mem_total > 0 else 0.0
+    return {
+        "node_id": service.settings.node_id,
+        "cpu_percent": cpu_percent,
+        "memory_percent": memory_percent,
+        "active_runs": service._active_runs_fn(),
+        "total_runs": service._total_runs_fn(),
+    }
+
+
 @router.get("/history")
 async def get_history(
     limit: int = 60,

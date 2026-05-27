@@ -146,6 +146,17 @@ async def get_func_run(
     return PyFuncRunResponse(run=entry)
 
 
+@router.post("/{func_id}/runs/{run_id}/cancel", response_model=PyFuncRunResponse)
+async def cancel_func_run(
+    func_id: int,
+    run_id: int,
+    pyfuncrun: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> PyFuncRunResponse:
+    """Cancel a pending or running run under a function."""
+    entry = await pyfuncrun.cancel(run_id)
+    return PyFuncRunResponse(run=entry)
+
+
 @router.get("/{func_id}/runs/{run_id}/wait", response_model=PyFuncRunResponse)
 async def wait_func_run(
     func_id: int,

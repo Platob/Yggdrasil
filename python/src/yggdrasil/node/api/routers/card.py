@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import platform
 import sys
 
@@ -39,6 +40,14 @@ async def get_card(
     envs = await pyenv.list()
     funcs = await pyfunc.list()
 
+    env_count = len(envs.envs)
+    func_count = len(funcs.funcs)
+
+    # Fast identity fingerprint for change detection across peers
+    content_hash = hashlib.sha256(
+        f"{settings.node_id}:{settings.app_version}:{env_count}:{func_count}".encode()
+    ).hexdigest()
+
     return NodeCard(
         node_id=settings.node_id,
         host=settings.host,
@@ -58,9 +67,10 @@ async def get_card(
         gpu_count=len(snap.gpus),
         active_runs=pyfuncrun.active_count,
         total_runs=pyfuncrun.total_count,
-        env_count=len(envs.envs),
-        func_count=len(funcs.funcs),
+        env_count=env_count,
+        func_count=func_count,
         uptime_seconds=snap.uptime_seconds,
         node_home=str(settings.node_home),
         peers=[p.node_id for p in peers_resp.peers],
+        content_hash=content_hash,
     )

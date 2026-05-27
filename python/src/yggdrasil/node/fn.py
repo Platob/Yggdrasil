@@ -190,13 +190,13 @@ class FunctionRun:
         environment_id: int | None = None,
         node_url: str | None = None,
     ) -> "FunctionRun":
-        """Submit a run to the node API."""
+        """Submit a run to the v2 node API."""
         url = node_url or _local_url()
-        data: dict[str, Any] = {"function_id": function_id, "args": args}
+        data: dict[str, Any] = {"func_id": function_id, "args": list(args.values()), "kwargs": {}}
         if environment_id is not None:
-            data["environment_id"] = environment_id
-        # POST /api/function/{id}/run
-        resp = _post(f"{url}/api/function/{function_id}/run", data)
+            data["env_id"] = environment_id
+        # POST /api/v2/pyfunc/{id}/run
+        resp = _post(f"{url}/api/v2/pyfunc/{function_id}/run", data)
         run = resp["run"]
         return cls(run["id"], url, function_id)
 
@@ -271,7 +271,7 @@ class FunctionRun:
         from yggdrasil.enums.state import State
 
         try:
-            resp = _get(f"{self.node_url}/api/run/{self.run_id}")
+            resp = _get(f"{self.node_url}/api/v2/pyfuncrun/{self.run_id}")
         except Exception as exc:
             LOGGER.debug("Poll failed for run %d: %s", self.run_id, exc)
             return
@@ -460,16 +460,15 @@ class FunctionHandle:
         data: dict[str, Any] = {
             "name": self.name,
             "code": self.code,
-            "language": "python",
             "description": self.description,
             "python_version": self.python_version,
             "dependencies": self.dependencies,
         }
         if self._environment_id is not None:
-            data["environment_id"] = self._environment_id
+            data["env_id"] = self._environment_id
 
-        resp = _post(f"{url}/api/function", data)
-        self._function_id = resp["function"]["id"]
+        resp = _post(f"{url}/api/v2/pyfunc", data)
+        self._function_id = resp["func"]["id"]
         self._registered = True
         LOGGER.debug(
             "Registered function %r (id=%d) on %s",
@@ -478,10 +477,10 @@ class FunctionHandle:
 
     @staticmethod
     def _resolve_env_name(node_url: str, env_name: str) -> int | None:
-        """Resolve an environment name to its numeric ID."""
+        """Resolve an environment name to its numeric ID via v2 API."""
         try:
-            resp = _get(f"{node_url}/api/environment")
-            for env in resp.get("environments", []):
+            resp = _get(f"{node_url}/api/v2/pyenv")
+            for env in resp.get("envs", []):
                 if env.get("name") == env_name:
                     return env["id"]
         except Exception as exc:

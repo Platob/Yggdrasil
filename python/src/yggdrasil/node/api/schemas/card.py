@@ -29,3 +29,4 @@ class NodeCard(StrictModel):
     uptime_seconds: float = 0.0
     node_home: str = ""
     peers: list[str] = Field(default_factory=list)
+    content_hash: str = ""

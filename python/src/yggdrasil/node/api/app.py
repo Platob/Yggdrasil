@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -103,9 +105,12 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
     # -- Ping (fastest possible, no middleware deps) -------------------------
+    _ping_start = time.monotonic()
+    _ping_node_id = settings.node_id
+
     @app.get(f"{settings.api_prefix}/ping")
     async def ping():
-        return {"pong": True, "node_id": settings.node_id}
+        return {"pong": True, "node_id": _ping_node_id, "uptime": round(time.monotonic() - _ping_start, 1)}
 
     # -- Routers ------------------------------------------------------------
     prefix = f"{settings.api_prefix}/v2"
