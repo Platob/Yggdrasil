@@ -515,3 +515,271 @@ class TestComplexQueryExecution:
         table = result.read_arrow_table()
         cnts = table.column("cnt").to_pylist()
         assert cnts == sorted(cnts, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# HIGH priority gap: INSERT execution
+# ---------------------------------------------------------------------------
+
+class TestInsertExecution:
+    def test_insert_select(self, users):
+        target = ArrowTabular(pa.table({
+            "id": pa.array([], type=pa.int64()),
+            "name": pa.array([], type=pa.utf8()),
+            "region": pa.array([], type=pa.utf8()),
+            "score": pa.array([], type=pa.int64()),
+        }))
+        node = parse_sql("INSERT INTO target SELECT * FROM users")
+        node.execute(tables={"users": users, "target": target})
+        result = target.read_arrow_table()
+        assert result.num_rows == 5
+
+    def test_insert_values(self, users):
+        target = ArrowTabular(pa.table({
+            "id": pa.array([], type=pa.int64()),
+            "name": pa.array([], type=pa.utf8()),
+        }))
+        node = parse_sql("INSERT INTO target (id, name) VALUES (1, 'alice'), (2, 'bob')")
+        node.execute(tables={"target": target})
+        result = target.read_arrow_table()
+        assert result.num_rows == 2
+        assert result.column("id").to_pylist() == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# HIGH priority gap: aggregate without GROUP BY
+# ---------------------------------------------------------------------------
+
+class TestAggregateWithoutGroupBy:
+    def test_count_star_no_group_by(self, users):
+        node = parse_sql("SELECT COUNT(*) AS cnt FROM users")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 1
+        assert table.column("cnt").to_pylist() == [5]
+
+    def test_sum_no_group_by(self, users):
+        node = parse_sql("SELECT SUM(score) AS total FROM users")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.column("total").to_pylist() == [420]
+
+    def test_avg_no_group_by(self, users):
+        node = parse_sql("SELECT AVG(score) AS avg_score FROM users")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 1
+        avg = table.column("avg_score").to_pylist()[0]
+        assert abs(avg - 84.0) < 0.01
+
+    def test_min_max_no_group_by(self, users):
+        node = parse_sql("SELECT MIN(score) AS lo, MAX(score) AS hi FROM users")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.column("lo").to_pylist() == [70]
+        assert table.column("hi").to_pylist() == [95]
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM priority: HAVING with COUNT(*)
+# ---------------------------------------------------------------------------
+
+class TestHavingCountStar:
+    def test_having_count_star(self, users):
+        node = parse_sql(
+            "SELECT region, COUNT(*) AS cnt FROM users "
+            "GROUP BY region HAVING COUNT(*) > 2"
+        )
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        # US has 3 users (>2), EU has 2 (not >2)
+        assert table.num_rows == 1
+        assert table.column("region").to_pylist() == ["US"]
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM priority: Subquery IN
+# ---------------------------------------------------------------------------
+
+class TestSubqueryIn:
+    def test_in_subquery_parses(self):
+        node = parse_sql(
+            "SELECT * FROM t WHERE id IN (SELECT id FROM users)"
+        )
+        assert isinstance(node, SelectNode)
+        assert node.where is not None
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM priority: Expression node equality/hashing
+# ---------------------------------------------------------------------------
+
+class TestExpressionNodeEquality:
+    def test_function_call_equality(self):
+        from yggdrasil.execution.expr.nodes import FunctionCall, Column
+        fc1 = FunctionCall("COUNT", (Column(name="id"),), distinct=False)
+        fc2 = FunctionCall("COUNT", (Column(name="id"),), distinct=False)
+        assert fc1.equals(fc2)
+        assert hash(fc1) == hash(fc2)
+
+    def test_function_call_distinct_differs(self):
+        from yggdrasil.execution.expr.nodes import FunctionCall, Column
+        fc1 = FunctionCall("COUNT", (Column(name="id"),), distinct=True)
+        fc2 = FunctionCall("COUNT", (Column(name="id"),), distinct=False)
+        assert not fc1.equals(fc2)
+
+    def test_star_equality(self):
+        from yggdrasil.execution.expr.nodes import Star
+        assert Star().equals(Star())
+        assert Star(qualifier="t").equals(Star(qualifier="t"))
+        assert not Star().equals(Star(qualifier="t"))
+
+    def test_alias_equality(self):
+        from yggdrasil.execution.expr.nodes import Alias, Column
+        a1 = Alias(Column(name="x"), "y")
+        a2 = Alias(Column(name="x"), "y")
+        assert a1.equals(a2)
+        assert hash(a1) == hash(a2)
+
+    def test_subscript_equality(self):
+        from yggdrasil.execution.expr.nodes import Subscript, Column, Literal
+        s1 = Subscript(Column(name="arr"), Literal(0))
+        s2 = Subscript(Column(name="arr"), Literal(0))
+        assert s1.equals(s2)
+        assert hash(s1) == hash(s2)
+
+    def test_case_when_equality(self):
+        from yggdrasil.execution.expr.nodes import CaseWhen, Comparison, Column, Literal
+        from yggdrasil.execution.expr.operators import CompareOp
+        branch = (Comparison(Column(name="a"), CompareOp.GT, Literal(0)), Literal(1))
+        cw1 = CaseWhen(branches=(branch,), else_expr=Literal(0))
+        cw2 = CaseWhen(branches=(branch,), else_expr=Literal(0))
+        assert cw1.equals(cw2)
+
+    def test_sort_order_equality(self):
+        from yggdrasil.execution.expr.nodes import SortOrder, Column
+        so1 = SortOrder(Column(name="a"), ascending=False, nulls_first=True)
+        so2 = SortOrder(Column(name="a"), ascending=False, nulls_first=True)
+        assert so1.equals(so2)
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM priority: expression-level SQL round-trip for new nodes
+# ---------------------------------------------------------------------------
+
+class TestExpressionSQLRoundTrip:
+    def test_function_call_render(self):
+        from yggdrasil.execution.expr.backends.sql import to_sql
+        from yggdrasil.execution.expr.nodes import FunctionCall, Column
+        fc = FunctionCall("UPPER", (Column(name="name"),))
+        sql = to_sql(fc, dialect="databricks")
+        assert sql == "UPPER(`name`)"
+
+    def test_subscript_render(self):
+        from yggdrasil.execution.expr.backends.sql import to_sql
+        from yggdrasil.execution.expr.nodes import Subscript, Column, Literal
+        s = Subscript(Column(name="arr"), Literal(0))
+        sql = to_sql(s, dialect="databricks")
+        assert sql == "`arr`[0]"
+
+    def test_case_when_render(self):
+        from yggdrasil.execution.expr.backends.sql import to_sql, from_sql
+        expr = from_sql("CASE WHEN x > 0 THEN 1 ELSE 0 END")
+        sql = to_sql(expr, dialect="databricks")
+        assert "CASE" in sql
+        assert "WHEN" in sql
+        assert "ELSE" in sql
+        assert "END" in sql
+
+    def test_window_function_render(self):
+        from yggdrasil.execution.expr.backends.sql import to_sql, from_sql
+        expr = from_sql("ROW_NUMBER() OVER (PARTITION BY region ORDER BY id)")
+        sql = to_sql(expr, dialect="databricks")
+        assert "OVER" in sql
+        assert "PARTITION BY" in sql
+
+    def test_star_render(self):
+        from yggdrasil.execution.expr.backends.sql import to_sql
+        from yggdrasil.execution.expr.nodes import Star
+        assert to_sql(Star(), dialect="databricks") == "*"
+        assert ".*" in to_sql(Star(qualifier="t"), dialect="databricks")
+
+    def test_alias_render(self):
+        from yggdrasil.execution.expr.backends.sql import to_sql
+        from yggdrasil.execution.expr.nodes import Alias, Column
+        a = Alias(Column(name="x"), "y")
+        sql = to_sql(a, dialect="databricks")
+        assert "AS" in sql
+
+    def test_sort_order_render(self):
+        from yggdrasil.execution.expr.backends.sql import to_sql
+        from yggdrasil.execution.expr.nodes import SortOrder, Column
+        so = SortOrder(Column(name="a"), ascending=False, nulls_first=True)
+        sql = to_sql(so, dialect="databricks")
+        assert "DESC" in sql
+        assert "NULLS FIRST" in sql
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM priority: walk() traversal for new nodes
+# ---------------------------------------------------------------------------
+
+class TestWalkNewNodes:
+    def test_walk_function_call(self):
+        from yggdrasil.execution.expr import walk, free_columns
+        from yggdrasil.execution.expr.nodes import FunctionCall, Column
+        fc = FunctionCall("UPPER", (Column(name="name"),))
+        cols = free_columns(fc)
+        assert "name" in cols
+
+    def test_walk_subscript(self):
+        from yggdrasil.execution.expr import free_columns
+        from yggdrasil.execution.expr.nodes import Subscript, Column, Literal
+        s = Subscript(Column(name="arr"), Column(name="idx"))
+        cols = free_columns(s)
+        assert "arr" in cols
+        assert "idx" in cols
+
+    def test_walk_case_when(self):
+        from yggdrasil.execution.expr import free_columns
+        from yggdrasil.execution.expr.nodes import CaseWhen, Comparison, Column, Literal
+        from yggdrasil.execution.expr.operators import CompareOp
+        cw = CaseWhen(
+            branches=((Comparison(Column(name="a"), CompareOp.GT, Literal(0)), Column(name="b")),),
+            else_expr=Column(name="c"),
+        )
+        cols = free_columns(cw)
+        assert set(cols) == {"a", "b", "c"}
+
+    def test_walk_window_function(self):
+        from yggdrasil.execution.expr import free_columns
+        from yggdrasil.execution.expr.nodes import (
+            FunctionCall, WindowFunction, WindowSpec, SortOrder, Column,
+        )
+        wf = WindowFunction(
+            function=FunctionCall("ROW_NUMBER", ()),
+            window=WindowSpec(
+                partition_by=(Column(name="region"),),
+                order_by=(SortOrder(Column(name="id"), ascending=True),),
+            ),
+        )
+        cols = free_columns(wf)
+        assert "region" in cols
+        assert "id" in cols
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM priority: ExecutionPlan.from_sql for non-SELECT
+# ---------------------------------------------------------------------------
+
+class TestExecutionPlanFromSQLEdgeCases:
+    def test_from_sql_with_group_by(self):
+        plan = ExecutionPlan.from_sql(
+            "SELECT region, COUNT(*) FROM t GROUP BY region"
+        )
+        assert isinstance(plan, SelectPlan)
+
+    def test_from_sql_complex_expression_projections(self):
+        plan = ExecutionPlan.from_sql("SELECT a + b FROM t")
+        # Complex expressions don't map to _select columns
+        assert plan.columns is None

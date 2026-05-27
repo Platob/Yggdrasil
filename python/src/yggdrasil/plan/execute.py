@@ -94,16 +94,17 @@ class _Context:
             result = result.filter(node.where)
 
         # GROUP BY + aggregation
+        agg_alias_map: dict | None = None
         if node.group_by is not None:
-            result = self._exec_group_by(result, node)
+            result, agg_alias_map = self._exec_group_by(result, node)
         elif node.projections:
             has_agg = any(self._is_aggregate(p) for p in node.projections)
             if has_agg and not node.group_by:
-                result = self._exec_group_by(result, node)
+                result, agg_alias_map = self._exec_group_by(result, node)
 
         # HAVING — rewrite aggregate references to materialized column names
         if node.having is not None:
-            rewritten = self._rewrite_having(node.having, result)
+            rewritten = self._rewrite_having(node.having, result, agg_alias_map)
             if rewritten is not None:
                 result = result.filter(rewritten)
 
@@ -232,7 +233,9 @@ class _Context:
                     right_keys.append(l_name)
         return left_keys, right_keys
 
-    def _exec_group_by(self, result: "Tabular", node: SelectNode) -> "Tabular":
+    def _exec_group_by(
+        self, result: "Tabular", node: SelectNode,
+    ) -> "tuple[Tabular, dict | None]":
         from yggdrasil.arrow.tabular import ArrowTabular
         from yggdrasil.execution.expr.nodes import (
             Alias,
@@ -253,6 +256,7 @@ class _Context:
                     group_keys.append(g)
 
         agg_specs: list[tuple[str, str, str]] = []
+        agg_alias_map: dict[str, str] = {}
         output_names: list[str] = []
 
         for proj in (node.projections or []):
@@ -278,30 +282,54 @@ class _Context:
                         target_name = out_name or f"{func.lower()}_{col_name}"
                         agg_specs.append((col_name, agg_map[func], target_name))
                         output_names.append(target_name)
+                        agg_key = f"{func}:{col_name}"
+                        agg_alias_map[agg_key] = target_name
                         continue
             if isinstance(expr, Column):
                 output_names.append(out_name or expr.name)
 
-        if group_keys and agg_specs:
-            grouped = table.group_by(group_keys)
-            agg_calls = []
-            for col, func, name in agg_specs:
-                if col == "*" and func == "count":
-                    col = group_keys[0] if group_keys else table.column_names[0]
-                agg_calls.append((col, func))
-            result_table = grouped.aggregate(agg_calls)
+        if agg_specs:
+            resolved_agg: list[tuple[str, str]] = []
+            for col_name, func, name in agg_specs:
+                if col_name == "*" and func == "count":
+                    col_name = group_keys[0] if group_keys else table.column_names[0]
+                resolved_agg.append((col_name, func))
+
+            if group_keys:
+                result_table = table.group_by(group_keys).aggregate(resolved_agg)
+            else:
+                import pyarrow.compute as pc
+                row: dict[str, list] = {}
+                for (col_name, func), (_, _, out_name) in zip(resolved_agg, agg_specs):
+                    arr = table.column(col_name)
+                    if func == "count":
+                        row[out_name] = [len(arr) - arr.null_count]
+                    elif func == "sum":
+                        row[out_name] = [pc.sum(arr).as_py()]
+                    elif func == "mean":
+                        row[out_name] = [pc.mean(arr).as_py()]
+                    elif func == "min":
+                        row[out_name] = [pc.min(arr).as_py()]
+                    elif func == "max":
+                        row[out_name] = [pc.max(arr).as_py()]
+                    else:
+                        row[out_name] = [None]
+                return ArrowTabular(pa.table(row)), agg_alias_map or None
+
             rename_map = {}
-            for col, func, name in agg_specs:
-                src = f"{col}_{func}"
+            for col_name, func, name in agg_specs:
+                if col_name == "*" and func == "count":
+                    col_name = group_keys[0] if group_keys else table.column_names[0]
+                src = f"{col_name}_{func}"
                 if src in result_table.column_names and src != name:
                     rename_map[src] = name
             if rename_map:
                 result_table = result_table.rename_columns([
                     rename_map.get(c, c) for c in result_table.column_names
                 ])
-            return ArrowTabular(result_table)
+            return ArrowTabular(result_table), agg_alias_map or None
 
-        return result
+        return result, None
 
     def _exec_order_by(self, result: "Tabular", order_by: list) -> "Tabular":
         from yggdrasil.arrow.tabular import ArrowTabular
@@ -327,6 +355,9 @@ class _Context:
         return ArrowTabular(table)
 
     def _exec_insert(self, node: InsertNode) -> "Tabular":
+        from yggdrasil.arrow.tabular import ArrowTabular
+        from yggdrasil.execution.expr.nodes import Literal
+
         if node.target is None:
             raise ValueError("INSERT requires a target table")
         target_name = node.target.name
@@ -336,6 +367,18 @@ class _Context:
         if node.source:
             source_data = self.execute(node.source)
             target.write_table(source_data)
+        elif node.values:
+            columns = node.columns
+            if not columns:
+                columns = [f"col{i}" for i in range(len(node.values[0]))]
+            pydict: dict[str, list] = {c: [] for c in columns}
+            for row in node.values:
+                for i, c in enumerate(columns):
+                    val = row[i] if i < len(row) else None
+                    if isinstance(val, Literal):
+                        val = val.value
+                    pydict[c].append(val)
+            target.write_table(pa.table(pydict))
         return target
 
     def _resolve_projection_columns(
@@ -374,7 +417,10 @@ class _Context:
             return expr.value
         return None
 
-    def _rewrite_having(self, having: Any, result: "Tabular") -> Any:
+    def _rewrite_having(
+        self, having: Any, result: "Tabular",
+        agg_alias_map: dict | None = None,
+    ) -> Any:
         """Rewrite HAVING predicate: replace aggregate FunctionCalls with
         column references pointing to materialized aggregate column names."""
         from yggdrasil.execution.expr.nodes import (
@@ -382,21 +428,37 @@ class _Context:
         )
 
         col_names = set(result.read_arrow_table().column_names)
+        alias_map = agg_alias_map or {}
+        agg_pyarrow = {
+            "count": "count", "sum": "sum", "avg": "mean",
+            "min": "min", "max": "max", "mean": "mean",
+        }
 
         def _rewrite(expr: Any) -> Any:
             if isinstance(expr, FunctionCall):
-                agg_name = expr.name.lower()
+                func_upper = expr.name.upper()
+                func_lower = expr.name.lower()
+                pa_name = agg_pyarrow.get(func_lower, func_lower)
+                # Check alias map first (from the GROUP BY projection aliases)
                 if expr.args and isinstance(expr.args[0], Column):
-                    candidate = f"{expr.args[0].name}_{agg_name}"
+                    key = f"{func_upper}:{expr.args[0].name}"
+                    if key in alias_map and alias_map[key] in col_names:
+                        return Column(name=alias_map[key])
+                    candidate = f"{expr.args[0].name}_{pa_name}"
+                    if candidate in col_names:
+                        return Column(name=candidate)
                 elif expr.args and isinstance(expr.args[0], Star):
+                    # COUNT(*) → try alias map with wildcard keys
+                    for k, v in alias_map.items():
+                        if k.startswith(f"{func_upper}:") and v in col_names:
+                            return Column(name=v)
                     for cn in col_names:
-                        if cn.endswith(f"_{agg_name}"):
+                        if cn.endswith(f"_{pa_name}"):
                             return Column(name=cn)
-                    return expr
-                else:
-                    return expr
-                if candidate in col_names:
-                    return Column(name=candidate)
+                if not expr.args:
+                    for k, v in alias_map.items():
+                        if k.startswith(f"{func_upper}:") and v in col_names:
+                            return Column(name=v)
                 return expr
             if isinstance(expr, Comparison):
                 return Comparison(_rewrite(expr.left), expr.op, _rewrite(expr.right))
