@@ -176,6 +176,7 @@ nav:
           - sql: modules/databricks/sql/README.md
           - compute: modules/databricks/compute/README.md
           - compute.remote: modules/databricks/compute/remote/README.md
+          - job: modules/databricks/job/README.md
           - workspaces: modules/databricks/workspaces/README.md
           - fs: modules/databricks/fs/README.md
           - secrets: modules/databricks/secrets/README.md
@@ -192,14 +193,9 @@ nav:
           - cluster: modules/databricks/cluster/README.md
           - ai (Vector Search): modules/databricks/ai/README.md
       - Storage & Databases:
-          - mongo: modules/mongo/README.md
-          - postgres: modules/postgres/README.md
           - aws: modules/aws/README.md
           - delta: modules/delta/README.md
-      - Streaming:
-          - kafka: modules/kafka/README.md
       - Domain:
-          - fxrate: modules/fxrate/README.md
           - jwt: modules/jwt/README.md
           - exceptions: modules/exceptions/README.md
       - Utilities:
