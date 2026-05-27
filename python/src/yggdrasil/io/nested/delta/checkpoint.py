@@ -54,21 +54,22 @@ def write_checkpoint(
     *,
     log_path: "Path",
     kind: str = "v1",
-) -> Optional[int]:
+) -> "Optional[tuple[int, Optional[List[Dict[str, Any]]]]]":
     """Materialize *snap* as a V1 or V2 checkpoint under *log_path*.
 
-    Returns the number of actions written, or ``None`` when the snapshot
-    was empty.
+    Returns ``(action_count, sidecar_files)`` or ``None`` when the
+    snapshot was empty. ``sidecar_files`` is populated for V2 only.
     """
     actions = _snapshot_to_actions(snap)
     if not actions:
         return None
 
     if kind == "v2":
-        _write_v2(snap.version, actions, log_path=log_path)
+        sidecar_files = _write_v2(snap.version, actions, log_path=log_path)
+        return len(actions), sidecar_files
     else:
         _write_v1(snap.version, actions, log_path=log_path)
-    return len(actions)
+        return len(actions), None
 
 
 def update_last_checkpoint(
@@ -111,12 +112,12 @@ def _write_v1(version: int, actions: List[dict], *, log_path: "Path") -> None:
         opened._write_arrow_table(table, ParquetOptions(mode=Mode.OVERWRITE))
 
 
-def _write_v2(version: int, actions: List[dict], *, log_path: "Path") -> None:
+def _write_v2(
+    version: int, actions: List[dict], *, log_path: "Path",
+) -> List[Dict[str, Any]]:
     """V2 — sidecar parquet(s) referenced from a manifest JSON.
 
-    Writes per-action-class sidecars when the action count is large
-    enough to benefit from the split; otherwise falls back to a single
-    sidecar.
+    Returns the sidecar file entries for ``_last_checkpoint``.
     """
     from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
 
@@ -182,7 +183,7 @@ def _write_v2(version: int, actions: List[dict], *, log_path: "Path") -> None:
         )
     manifest_lines.append(
         ygg_json.dumps(
-            {"checkpointMetadata": {"version": int(version), "flavor": "v2"}},
+            {"checkpointMetadata": {"version": int(version)}},
             separators=(",", ":"),
             to_bytes=False,
         ),
@@ -191,6 +192,8 @@ def _write_v2(version: int, actions: List[dict], *, log_path: "Path") -> None:
     with manifest_path.open("wb") as bio:
         bio.truncate(0)
         bio.write_bytes(body)
+
+    return sidecar_entries
 
 
 # ---------------------------------------------------------------------------

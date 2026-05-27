@@ -297,8 +297,8 @@ class TestDeletionVectorBenchmark(DeltaTestCase, _BenchmarkMixin):
             _decode_payload,
         )
 
-        rows = list(range(0, 10000, 3))
-        print(f"\n--- DV encode/decode {len(rows)} rows ---")
+        rows = list(range(0, 50000, 3))
+        print(f"\n--- DV encode/decode {len(rows)} rows (Roaring) ---")
 
         def encode():
             return _encode_dv_payload(rows)

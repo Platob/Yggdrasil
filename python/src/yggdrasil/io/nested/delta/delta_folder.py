@@ -862,14 +862,16 @@ class DeltaFolder(Folder):
 
     def _write_checkpoint(self, version: int, *, kind: str = "v1") -> None:
         snap = self.snapshot(version, fresh=True)
-        size = write_checkpoint(snap, log_path=self._log.log_path, kind=kind)
-        if size is None:
+        result = write_checkpoint(snap, log_path=self._log.log_path, kind=kind)
+        if result is None:
             return
+        size, sidecar_files = result
         update_last_checkpoint(
             log_path=self._log.log_path,
             version=version,
             size=size,
             kind=kind,
+            sidecar_files=sidecar_files,
         )
 
     # ==================================================================

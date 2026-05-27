@@ -103,7 +103,11 @@ def _read_portable_roaring(buf: memoryview, pos: int) -> "tuple[Set[int], int]":
     cookie = struct.unpack_from("<I", buf, pos)[0]
     pos += 4
 
-    if (cookie & 0xFFFF) == 0x3B30:
+    # Portable Roaring cookies:
+    #   SERIAL_COOKIE = 12347 (0x303B) — has run containers
+    #   SERIAL_COOKIE_NO_RUNCONTAINER = 12346 (0x303A) — no runs
+    # Run-flag cookie: low 16 bits = 12347, high 16 = (n_containers - 1)
+    if (cookie & 0xFFFF) == 12347:  # SERIAL_COOKIE
         n_containers = ((cookie >> 16) & 0xFFFF) + 1
         bitmap_of_runs_size = (n_containers + 7) // 8
         run_flag_bytes = bytes(buf[pos : pos + bitmap_of_runs_size])
@@ -185,8 +189,9 @@ def _decode_payload(payload: bytes) -> Set[int]:
             out.update(high | x for x in sub)
         return out
 
-    cookie = magic & 0xFFFF
-    if cookie in (0x3B30, 0x3B31):
+    # Bare portable Roaring (no 64-bit envelope): check for standard cookies
+    cookie_low = magic & 0xFFFF
+    if cookie_low in (12346, 12347):  # SERIAL_COOKIE_NO_RUNCONTAINER, SERIAL_COOKIE
         sub, _ = _read_portable_roaring(mv, 0)
         return sub
 
@@ -238,11 +243,11 @@ def _encode_portable_roaring(values: list[int]) -> bytes:
     n_containers = len(containers)
     sorted_keys = sorted(containers)
 
-    # Use the NO-run cookie: 0x3B31 followed by 4-byte container count.
-    # The reader skips the offset table for this cookie when n < 4,
-    # or reads 4*n bytes of offsets when n >= 4.
+    # SERIAL_COOKIE_NO_RUNCONTAINER = 12346 (0x303A)
+    # Standard portable Roaring cookie for bitmaps without run containers.
+    # Followed by 4-byte container count. Offset table present when n >= 4.
     buf = bytearray()
-    buf += struct.pack("<I", 0x3B31)
+    buf += struct.pack("<I", 12346)
     buf += struct.pack("<I", n_containers)
 
     for key in sorted_keys:
@@ -284,7 +289,9 @@ def _encode_portable_roaring(values: list[int]) -> bytes:
 # Encode — choose between simple and roaring based on cardinality
 # ---------------------------------------------------------------------------
 
-_ROARING_THRESHOLD = 256
+# Delta spec guidance: simple-list for small DVs, Roaring above one
+# array container (4096 values). Matches Spark's DeletionVectorStore.
+_ROARING_THRESHOLD = 4096
 
 
 def _encode_simple_payload(row_ids: Iterable[int]) -> bytes:
