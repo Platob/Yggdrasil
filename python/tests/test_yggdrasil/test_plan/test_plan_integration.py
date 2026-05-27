@@ -177,3 +177,341 @@ class TestSelectPlanFromSQL:
         result = plan.execute(users)
         table = result.read_arrow_table()
         assert table.num_rows <= 2
+
+
+# ---------------------------------------------------------------------------
+# TestGroupByExecution — verify aggregation results
+# ---------------------------------------------------------------------------
+
+class TestGroupByExecution:
+    def test_count_star(self, users):
+        node = parse_sql("SELECT region, COUNT(*) AS cnt FROM users GROUP BY region")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 2
+        # Verify counts add up
+        cnts = table.column("cnt").to_pylist()
+        assert sum(cnts) == 5
+
+    def test_sum(self, users):
+        node = parse_sql("SELECT region, SUM(score) AS total FROM users GROUP BY region")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 2
+        # US: 90 + 95 + 85 = 270, EU: 80 + 70 = 150
+        for row in table.to_pylist():
+            if row["region"] == "US":
+                assert row["total"] == 270
+            else:
+                assert row["total"] == 150
+
+    def test_avg(self, users):
+        node = parse_sql("SELECT region, AVG(score) AS avg_score FROM users GROUP BY region")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 2
+
+    def test_min_max(self, users):
+        node = parse_sql("SELECT region, MIN(score) AS lo, MAX(score) AS hi FROM users GROUP BY region")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        for row in table.to_pylist():
+            if row["region"] == "US":
+                assert row["lo"] == 85
+                assert row["hi"] == 95
+            else:
+                assert row["lo"] == 70
+                assert row["hi"] == 80
+
+
+# ---------------------------------------------------------------------------
+# TestHavingExecution
+# ---------------------------------------------------------------------------
+
+class TestHavingExecution:
+    def test_having_filters_groups(self, users):
+        # Use the alias column name in HAVING so the arrow filter can resolve it;
+        # the engine evaluates HAVING as a post-aggregation filter on column names.
+        node = parse_sql(
+            "SELECT region, COUNT(*) AS cnt FROM users "
+            "GROUP BY region HAVING cnt > 2"
+        )
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        # US has 3 users (passes), EU has 2 (fails)
+        assert table.num_rows == 1
+        assert table.column("region").to_pylist() == ["US"]
+
+
+# ---------------------------------------------------------------------------
+# TestUnionExecution
+# ---------------------------------------------------------------------------
+
+class TestUnionExecution:
+    def test_union_all(self, users):
+        extra = ArrowTabular(pa.table({
+            "id": [10, 11],
+            "name": ["frank", "grace"],
+            "region": ["EU", "US"],
+            "score": [88, 92],
+        }))
+        node = parse_sql("SELECT * FROM users UNION ALL SELECT * FROM extra")
+        result = node.execute(tables={"users": users, "extra": extra})
+        table = result.read_arrow_table()
+        assert table.num_rows == 7  # 5 + 2
+
+
+# ---------------------------------------------------------------------------
+# TestOrderByExecution
+# ---------------------------------------------------------------------------
+
+class TestOrderByExecution:
+    def test_order_by_multiple_columns(self, users):
+        node = parse_sql("SELECT * FROM users ORDER BY region ASC, score DESC")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        rows = table.to_pylist()
+        # First EU rows (sorted by score DESC), then US rows (sorted by score DESC)
+        eu_rows = [r for r in rows if r["region"] == "EU"]
+        us_rows = [r for r in rows if r["region"] == "US"]
+        assert eu_rows[0]["score"] >= eu_rows[-1]["score"]
+        assert us_rows[0]["score"] >= us_rows[-1]["score"]
+        # EU comes before US (alphabetical ASC)
+        eu_idx = [i for i, r in enumerate(rows) if r["region"] == "EU"]
+        us_idx = [i for i, r in enumerate(rows) if r["region"] == "US"]
+        assert max(eu_idx) < min(us_idx)
+
+
+# ---------------------------------------------------------------------------
+# TestOffsetExecution
+# ---------------------------------------------------------------------------
+
+class TestOffsetExecution:
+    def test_limit_offset(self, users):
+        node = parse_sql("SELECT * FROM users ORDER BY id LIMIT 2 OFFSET 2")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 2
+        ids = table.column("id").to_pylist()
+        assert ids == [3, 4]  # skipped 1,2 and took 2
+
+
+# ---------------------------------------------------------------------------
+# TestDistinctExecution
+# ---------------------------------------------------------------------------
+
+class TestDistinctExecution:
+    def test_distinct_values(self, users):
+        node = parse_sql("SELECT DISTINCT region FROM users")
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        regions = table.column("region").to_pylist()
+        assert len(regions) == 2
+        assert set(regions) == {"US", "EU"}
+
+
+# ---------------------------------------------------------------------------
+# TestCTEExecution
+# ---------------------------------------------------------------------------
+
+class TestCTEExecution:
+    def test_cte_with_filter(self, users):
+        node = parse_sql(
+            "WITH high_scorers AS ("
+            "  SELECT * FROM users WHERE score >= 85"
+            ") "
+            "SELECT name, score FROM high_scorers"
+        )
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert all(s >= 85 for s in table.column("score").to_pylist())
+
+    def test_multiple_ctes(self, users, orders):
+        node = parse_sql(
+            "WITH us_users AS ("
+            "  SELECT * FROM users WHERE region = 'US'"
+            "), us_orders AS ("
+            "  SELECT * FROM orders WHERE id IN (1, 3, 5)"
+            ") "
+            "SELECT * FROM us_users"
+        )
+        result = node.execute(tables={"users": users, "orders": orders})
+        table = result.read_arrow_table()
+        assert all(r == "US" for r in table.column("region").to_pylist())
+
+
+# ---------------------------------------------------------------------------
+# TestSQLEmitterRoundTrips — parse -> emit -> parse -> verify structure matches
+# ---------------------------------------------------------------------------
+
+class TestSQLEmitterRoundTrips:
+    def _roundtrip(self, sql: str, dialect: str = "databricks"):
+        """Parse, emit, re-parse, verify key structures survive."""
+        node1 = parse_sql(sql, dialect=dialect)
+        emitted = node1.to_sql(dialect=dialect)
+        node2 = parse_sql(emitted, dialect=dialect)
+        return node1, node2, emitted
+
+    def test_roundtrip_select_where(self):
+        _, node2, sql = self._roundtrip("SELECT a, b FROM t WHERE id > 10")
+        assert len(node2.projections) == 2
+        assert node2.where is not None
+        assert isinstance(node2.from_clause, TableRef)
+
+    def test_roundtrip_group_by(self):
+        _, node2, _ = self._roundtrip(
+            "SELECT region, COUNT(*) FROM t GROUP BY region"
+        )
+        assert node2.group_by is not None
+
+    def test_roundtrip_order_by_desc(self):
+        _, node2, sql = self._roundtrip("SELECT * FROM t ORDER BY score DESC")
+        assert "DESC" in sql
+        assert node2.order_by is not None
+        assert node2.order_by[0].ascending is False
+
+    def test_roundtrip_distinct(self):
+        _, node2, sql = self._roundtrip("SELECT DISTINCT region FROM t")
+        assert "DISTINCT" in sql
+        assert node2.distinct is True
+
+    def test_roundtrip_join(self):
+        _, node2, sql = self._roundtrip(
+            "SELECT * FROM a INNER JOIN b ON a.id = b.id"
+        )
+        assert "JOIN" in sql
+        assert isinstance(node2.from_clause, JoinClause)
+
+    def test_roundtrip_having(self):
+        _, node2, sql = self._roundtrip(
+            "SELECT region, COUNT(*) FROM t GROUP BY region HAVING COUNT(*) > 5"
+        )
+        assert "HAVING" in sql
+        assert node2.having is not None
+
+    def test_roundtrip_cte(self):
+        _, node2, sql = self._roundtrip(
+            "WITH cte AS (SELECT a FROM t) SELECT * FROM cte"
+        )
+        assert "WITH" in sql
+        assert node2.ctes is not None
+
+    def test_roundtrip_union(self):
+        _, node2, sql = self._roundtrip(
+            "SELECT a FROM t1 UNION ALL SELECT a FROM t2"
+        )
+        assert "UNION ALL" in sql
+        assert node2.set_ops is not None
+
+    def test_roundtrip_lateral_view(self):
+        _, node2, sql = self._roundtrip(
+            "SELECT id, val FROM t LATERAL VIEW EXPLODE(arr) vals AS val",
+            dialect="databricks",
+        )
+        assert "LATERAL VIEW" in sql
+        assert node2.lateral_views is not None
+
+    def test_roundtrip_case_when(self):
+        _, node2, sql = self._roundtrip(
+            "SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END FROM t"
+        )
+        assert "CASE" in sql
+        assert "WHEN" in sql
+
+    def test_roundtrip_window_function(self):
+        _, node2, sql = self._roundtrip(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY region ORDER BY id) FROM t",
+            dialect="databricks",
+        )
+        assert "OVER" in sql
+        assert "PARTITION BY" in sql
+
+    def test_roundtrip_function_alias(self):
+        _, node2, sql = self._roundtrip(
+            "SELECT COUNT(*) AS total FROM t"
+        )
+        assert "AS" in sql
+
+    def test_roundtrip_insert(self):
+        _, _, sql = self._roundtrip(
+            "INSERT INTO target SELECT * FROM source"
+        )
+        assert "INSERT INTO" in sql
+
+    def test_roundtrip_limit_offset(self):
+        _, node2, sql = self._roundtrip("SELECT * FROM t LIMIT 10 OFFSET 5")
+        assert "LIMIT 10" in sql
+        assert "OFFSET 5" in sql
+        assert node2.limit == 10
+        assert node2.offset == 5
+
+
+# ---------------------------------------------------------------------------
+# TestSelectPlanNodeConversion
+# ---------------------------------------------------------------------------
+
+class TestSelectPlanNodeConversion:
+    def test_to_plan_node_select(self):
+        plan = SelectPlan()
+        plan.select("a", "b")
+        node = plan.to_plan_node()
+        assert isinstance(node, SelectNode)
+        # Should have Column projections
+        from yggdrasil.execution.expr.nodes import Column
+        assert any(isinstance(p, Column) and p.name == "a" for p in node.projections)
+
+    def test_to_plan_node_with_filter(self):
+        plan = SelectPlan()
+        plan.filter("x > 1")
+        node = plan.to_plan_node()
+        assert node.where is not None
+
+    def test_to_plan_node_with_limit(self):
+        plan = SelectPlan()
+        plan.limit(10)
+        node = plan.to_plan_node()
+        assert node.limit == 10
+
+    def test_to_sql_basic(self):
+        plan = SelectPlan()
+        plan.select("a", "b").filter("id > 5").limit(10)
+        sql = plan.to_sql(dialect="databricks")
+        assert "SELECT" in sql
+        assert "LIMIT 10" in sql
+
+
+# ---------------------------------------------------------------------------
+# TestComplexQueryExecution — end-to-end complex queries
+# ---------------------------------------------------------------------------
+
+class TestComplexQueryExecution:
+    def test_filter_and_order_and_limit(self, users):
+        node = parse_sql(
+            "SELECT id, name, score FROM users WHERE score >= 80 ORDER BY score DESC LIMIT 3"
+        )
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        assert table.num_rows == 3
+        scores = table.column("score").to_pylist()
+        assert scores == sorted(scores, reverse=True)
+        assert all(s >= 80 for s in scores)
+
+    def test_join_and_filter(self, users, orders):
+        node = parse_sql(
+            "SELECT users.name, orders.amount "
+            "FROM users INNER JOIN orders ON users.id = orders.id "
+            "WHERE orders.amount > 15"
+        )
+        result = node.execute(tables={"users": users, "orders": orders})
+        table = result.read_arrow_table()
+        assert all(a > 15 for a in table.column("amount").to_pylist())
+
+    def test_group_by_and_order(self, users):
+        node = parse_sql(
+            "SELECT region, COUNT(*) AS cnt FROM users "
+            "GROUP BY region ORDER BY cnt DESC"
+        )
+        result = node.execute(tables={"users": users})
+        table = result.read_arrow_table()
+        cnts = table.column("cnt").to_pylist()
+        assert cnts == sorted(cnts, reverse=True)
