@@ -20,6 +20,7 @@ from .api.routers import (
     replicate_router as v2_replicate_router,
     user_router as v2_user_router,
 )
+from .api.services.audit import AuditLog
 from .api.services.backend import BackendService
 from .api.services.dag import DAGService as V2DagService
 from .api.services.fs import FsService
@@ -98,9 +99,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.filesystem_service = FilesystemService(settings)
 
     # -- v2 API services (PyEnv / PyFunc / PyFuncRun / Fs) -------------------
+    audit = AuditLog()
+    app.state.audit = audit
+
     v2_fs = FsService(settings)
-    pyenv = PyEnvService(settings)
-    pyfunc = PyFuncService(settings)
+    pyenv = PyEnvService(settings, audit=audit)
+    pyfunc = PyFuncService(settings, audit=audit)
     pyfuncrun = PyFuncRunService(settings, pyenv, pyfunc)
     v2_dag = V2DagService(settings, pyfuncrun)
     backend = BackendService(settings)
@@ -185,6 +189,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(v2_fs_router, prefix=f"{prefix}/v2/fs")
     app.include_router(v2_user_router, prefix=f"{prefix}/v2/user")
     app.include_router(v2_messenger_router, prefix=f"{prefix}/v2/messenger")
+
+    @app.get(f"{prefix}/v2/audit")
+    async def get_audit(limit: int = 100):
+        return {"entries": audit.recent(limit=limit)}
 
     return app
 

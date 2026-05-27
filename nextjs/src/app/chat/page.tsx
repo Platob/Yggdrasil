@@ -199,12 +199,43 @@ export default function ChatPage() {
       {/* ── Channel sidebar ──────────────────────────────────── */}
       <div className="w-56 border-r border-border shrink-0 flex flex-col bg-background-elevated/50">
         <div className="p-4 border-b border-border">
-          <h2 className="text-xs font-bold uppercase tracking-widest text-muted flex items-center gap-2">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
-            </svg>
-            Channels
-          </h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-xs font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+              </svg>
+              Channels
+            </h2>
+            <button
+              onClick={() => setShowNewChannel(!showNewChannel)}
+              className="text-frost/60 hover:text-frost transition-colors"
+              title="Create channel"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+            </button>
+          </div>
+          {showNewChannel && (
+            <div className="mt-3 space-y-2">
+              <input
+                type="text"
+                value={newChannelName}
+                onChange={(e) => setNewChannelName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleCreateChannel(); }}
+                placeholder="channel-name"
+                className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-1.5 text-xs font-mono text-foreground placeholder-muted/50 outline-none focus:border-frost/30 transition-colors"
+              />
+              <button
+                onClick={handleCreateChannel}
+                disabled={!newChannelName.trim() || creatingChannel}
+                className="w-full px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-frost/10 text-frost border border-frost/20 hover:bg-frost/20 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+              >
+                {creatingChannel ? "Creating..." : "Create"}
+              </button>
+            </div>
+          )}
         </div>
         <div className="flex-1 overflow-y-auto py-2 px-2 space-y-0.5">
           {channels.length === 0 && !error ? (
@@ -228,11 +259,20 @@ export default function ChatPage() {
                 <div className="flex items-center gap-2">
                   <span className="text-muted">#</span>
                   <span className="font-medium truncate">{ch.name}</span>
+                  {ch.members.length > 0 && (
+                    <span className="ml-auto text-[10px] font-mono text-muted shrink-0 flex items-center gap-1">
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                        <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4-4v2" />
+                        <circle cx="9" cy="7" r="4" />
+                      </svg>
+                      {ch.members.length}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 mt-0.5 text-[10px] text-muted">
                   <span>{ch.message_count} msgs</span>
-                  {ch.members.length > 0 && (
-                    <span>{ch.members.length} members</span>
+                  {ch.last_message_at && (
+                    <span className="ml-auto">{timeAgo(ch.last_message_at)}</span>
                   )}
                 </div>
               </button>

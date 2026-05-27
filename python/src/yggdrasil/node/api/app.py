@@ -20,6 +20,7 @@ from .routers import (
     replicate_router,
     user_router,
 )
+from .services.audit import AuditLog
 from .services.backend import BackendService
 from .services.dag import DAGService
 from .services.fs import FsService
@@ -46,11 +47,14 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     # -- Services -----------------------------------------------------------
+    audit = AuditLog()
+    app.state.audit = audit
+
     fs = FsService(settings)
     app.state.fs_service = fs
 
-    pyenv = PyEnvService(settings)
-    pyfunc = PyFuncService(settings)
+    pyenv = PyEnvService(settings, audit=audit)
+    pyfunc = PyFuncService(settings, audit=audit)
     pyfuncrun = PyFuncRunService(settings, pyenv, pyfunc)
     dag = DAGService(settings, pyfuncrun)
     backend = BackendService(settings)
@@ -116,6 +120,10 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(fs_router, prefix=f"{prefix}/fs")
     app.include_router(user_router, prefix=f"{prefix}/user")
     app.include_router(messenger_router, prefix=f"{prefix}/messenger")
+
+    @app.get(f"{prefix}/audit")
+    async def get_audit(limit: int = 100):
+        return {"entries": audit.recent(limit=limit)}
 
     return app
 

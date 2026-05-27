@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { getFsListing } from "@/lib/api";
+import { getFsListing, getFsContent } from "@/lib/api";
 import type { FsEntry } from "@/lib/types";
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -86,6 +86,8 @@ export default function FilesPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [selectedFile, setSelectedFile] = useState<FsEntry | null>(null);
+  const [fileContent, setFileContent] = useState<string | null>(null);
+  const [loadingContent, setLoadingContent] = useState(false);
 
   const fetchListing = useCallback(async (path: string) => {
     setLoading(true);
