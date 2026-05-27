@@ -41,7 +41,10 @@ __all__ = [
 ]
 
 
-def parse_sql(sql: str, *, dialect=None):
-    """Parse a SQL query string into a :class:`PlanNode` tree."""
+def parse_sql(sql: str, *, dialect=None, default=...):
+    """Parse a SQL query string into a :class:`PlanNode` tree.
+
+    Returns *default* on parse failure when *default* is not ``...``.
+    """
     from .sql_parser import parse_sql as _parse
-    return _parse(sql, dialect=dialect)
+    return _parse(sql, dialect=dialect, default=default)

@@ -1207,13 +1207,24 @@ def parse_sql(
     *,
     dialect: "Dialect | str | None" = None,
     parser_class: type[SQLQueryParser] | None = None,
-) -> PlanNode:
-    """Parse a SQL query string into a :class:`PlanNode` tree."""
+    default: "Any" = ...,
+) -> "PlanNode | Any":
+    """Parse a SQL query string into a :class:`PlanNode` tree.
+
+    When *default* is ``...`` (the sentinel), parsing errors raise
+    :class:`ValueError`. When *default* is anything else, parsing
+    errors return *default* instead.
+    """
     resolved = _resolve_dialect(dialect)
     cls = parser_class
     if cls is None:
         cls = _get_parser_class(resolved)
-    return cls(sql, resolved).parse()
+    try:
+        return cls(sql, resolved).parse()
+    except (ValueError, NotImplementedError) as exc:
+        if default is not ...:
+            return default
+        raise
 
 
 def _get_parser_class(dialect: Dialect) -> type[SQLQueryParser]:

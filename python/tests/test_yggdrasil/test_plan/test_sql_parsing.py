@@ -1198,3 +1198,161 @@ class TestExtractFunction:
         node = parse_sql("SELECT ts + INTERVAL '1' DAY FROM t")
         sql = node.to_sql(dialect="databricks")
         assert "INTERVAL" in sql
+
+
+# ---------------------------------------------------------------------------
+# Default parameter — parse_sql(default=...)
+# ---------------------------------------------------------------------------
+
+class TestDefaultParameter:
+    def test_default_returns_none_on_bad_sql(self):
+        result = parse_sql("NOT VALID SQL AT ALL ???", default=None)
+        assert result is None
+
+    def test_default_returns_custom_on_bad_sql(self):
+        sentinel = object()
+        result = parse_sql("TOTAL GARBAGE", default=sentinel)
+        assert result is sentinel
+
+    def test_default_ellipsis_raises(self):
+        with pytest.raises(ValueError):
+            parse_sql("NOT VALID SQL", default=...)
+
+    def test_no_default_raises(self):
+        with pytest.raises(ValueError):
+            parse_sql("NOT VALID SQL")
+
+    def test_default_on_valid_sql_returns_node(self):
+        result = parse_sql("SELECT 1", default=None)
+        assert isinstance(result, SelectNode)
+
+    def test_plan_node_from_sql_default(self):
+        result = PlanNode.from_sql("GARBAGE", default=None)
+        assert result is None
+
+    def test_plan_node_from_sql_default_valid(self):
+        result = PlanNode.from_sql("SELECT 1", default=None)
+        assert isinstance(result, SelectNode)
+
+
+# ---------------------------------------------------------------------------
+# Timezone / CAST / type conversion patterns
+# ---------------------------------------------------------------------------
+
+class TestTimezoneAndCast:
+    def test_cast_timestamp(self):
+        node = parse_sql("SELECT CAST(s AS TIMESTAMP) FROM t")
+        c = node.projections[0]
+        assert isinstance(c, (Cast, FunctionCall))
+
+    def test_cast_timestamp_ntz(self):
+        node = parse_sql("SELECT CAST(s AS TIMESTAMP_NTZ) FROM t")
+        c = node.projections[0]
+        assert isinstance(c, (Cast, FunctionCall))
+
+    def test_cast_date(self):
+        node = parse_sql("SELECT CAST(s AS DATE) FROM t")
+        c = node.projections[0]
+        assert isinstance(c, (Cast, FunctionCall))
+
+    def test_timestamp_literal(self):
+        node = parse_sql("SELECT TIMESTAMP '2024-01-01 00:00:00' FROM t")
+        p = node.projections[0]
+        assert isinstance(p, Literal)
+
+    def test_date_literal(self):
+        node = parse_sql("SELECT DATE '2024-01-01' FROM t")
+        p = node.projections[0]
+        assert isinstance(p, Literal)
+
+    def test_cast_decimal(self):
+        node = parse_sql("SELECT CAST(price AS DECIMAL(10, 2)) FROM t")
+        c = node.projections[0]
+        assert isinstance(c, (Cast, FunctionCall))
+
+    def test_cast_bigint(self):
+        node = parse_sql("SELECT CAST(id AS BIGINT) FROM t")
+        c = node.projections[0]
+        assert isinstance(c, Cast)
+
+    def test_cast_string(self):
+        node = parse_sql("SELECT CAST(id AS STRING) FROM t")
+        c = node.projections[0]
+        assert isinstance(c, Cast)
+
+    def test_cast_boolean(self):
+        node = parse_sql("SELECT CAST(flag AS BOOLEAN) FROM t")
+        c = node.projections[0]
+        assert isinstance(c, Cast)
+
+    def test_to_timestamp_databricks(self):
+        node = parse_sql(
+            "SELECT TO_TIMESTAMP(s, 'yyyy-MM-dd HH:mm:ss') FROM t",
+            dialect="databricks",
+        )
+        fc = node.projections[0]
+        assert isinstance(fc, FunctionCall)
+        assert fc.name == "TO_TIMESTAMP"
+
+    def test_to_date_databricks(self):
+        node = parse_sql(
+            "SELECT TO_DATE(s, 'yyyy-MM-dd') FROM t",
+            dialect="databricks",
+        )
+        fc = node.projections[0]
+        assert fc.name == "TO_DATE"
+
+    def test_from_utc_timestamp(self):
+        node = parse_sql(
+            "SELECT FROM_UTC_TIMESTAMP(ts, 'America/New_York') FROM t",
+            dialect="databricks",
+        )
+        fc = node.projections[0]
+        assert fc.name == "FROM_UTC_TIMESTAMP"
+
+    def test_to_utc_timestamp(self):
+        node = parse_sql(
+            "SELECT TO_UTC_TIMESTAMP(ts, 'Europe/Paris') FROM t",
+            dialect="databricks",
+        )
+        fc = node.projections[0]
+        assert fc.name == "TO_UTC_TIMESTAMP"
+
+    def test_unix_timestamp(self):
+        node = parse_sql(
+            "SELECT UNIX_TIMESTAMP(ts) FROM t",
+            dialect="databricks",
+        )
+        fc = node.projections[0]
+        assert fc.name == "UNIX_TIMESTAMP"
+
+    def test_from_unixtime(self):
+        node = parse_sql(
+            "SELECT FROM_UNIXTIME(epoch, 'yyyy-MM-dd') FROM t",
+            dialect="databricks",
+        )
+        fc = node.projections[0]
+        assert fc.name == "FROM_UNIXTIME"
+
+    def test_timestamp_function_call_form(self):
+        node = parse_sql("SELECT TIMESTAMP('2024-01-01 00:00:00') FROM t")
+        p = node.projections[0]
+        assert isinstance(p, (Literal, Cast))
+
+    def test_date_function_call_form(self):
+        node = parse_sql("SELECT DATE('2024-01-01') FROM t")
+        p = node.projections[0]
+        assert isinstance(p, (Literal, Cast))
+
+    def test_cast_in_where(self):
+        node = parse_sql(
+            "SELECT * FROM t WHERE CAST(ts AS DATE) = DATE '2024-01-01'"
+        )
+        assert isinstance(node.where, Comparison)
+
+    def test_multiple_casts(self):
+        node = parse_sql(
+            "SELECT CAST(a AS INT), CAST(b AS STRING), CAST(c AS DOUBLE) FROM t"
+        )
+        assert len(node.projections) == 3
+        assert all(isinstance(p, Cast) for p in node.projections)

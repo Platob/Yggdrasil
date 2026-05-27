@@ -1,11 +1,31 @@
 """Execute a plan-node tree against concrete Tabular sources.
 
 Dispatches Spark-native operations when the source is a SparkDataset,
-otherwise falls back to Arrow.
+otherwise falls back to Arrow.  Three main optimizations over a naive
+execute:
+
+1. **Predicate pushdown** — when the source is a Folder / Parquet-
+   backed Tabular (anything that isn't already an in-memory
+   ArrowTabular or a SparkDataset), the WHERE predicate is pushed
+   into ``CastOptions.predicate`` so the format-level reader can
+   do partition pruning and row-group skipping at the I/O level
+   *before* materializing batches.
+
+2. **Spark-native execution** — ORDER BY, LIMIT, and DISTINCT
+   operate on the Spark DataFrame directly instead of collecting to
+   Arrow first.  GROUP BY and SET ops go through the full SQL
+   passthrough (``spark.sql(...)``).
+
+3. **Deferred materialization** — the Tabular API methods
+   (``.filter()``, ``.select()``, ``.unique()``) already route to
+   the correct engine (Spark vs Arrow).  The executor uses those
+   instead of calling ``read_arrow_table()`` eagerly wherever
+   possible.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
@@ -15,6 +35,49 @@ from .ops import JoinClause, LateralViewItem, SubqueryRef, TableRef
 
 if TYPE_CHECKING:
     from yggdrasil.io.tabular import Tabular
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_sort_keys(order_by: list) -> list[tuple[str, str]]:
+    """Extract ``[(col_name, "ascending"|"descending"), ...]`` from ORDER BY AST.
+
+    Handles both :class:`SortOrder` nodes and legacy dict shapes so the
+    caller doesn't have to branch.  Returns an empty list when none of
+    the items can be resolved to a column name — the caller treats that
+    as "no sort requested."
+    """
+    from yggdrasil.execution.expr.nodes import Column, SortOrder
+
+    keys: list[tuple[str, str]] = []
+    for item in order_by:
+        if isinstance(item, SortOrder):
+            if isinstance(item.expr, Column):
+                direction = "ascending" if item.ascending else "descending"
+                keys.append((item.expr.name, direction))
+        elif isinstance(item, dict):
+            expr = item.get("expr")
+            if isinstance(expr, Column):
+                direction = "ascending" if item.get("ascending", True) else "descending"
+                keys.append((expr.name, direction))
+    return keys
+
+
+def _column_names_from_tabular(result: "Tabular") -> list[str]:
+    """Get column names without forcing a full ``read_arrow_table()``.
+
+    Tries ``collect_schema().names`` first (which may read only the
+    first batch or a metadata sidecar) before falling back to
+    materializing the entire table.
+    """
+    try:
+        schema = result.collect_schema()
+        names = getattr(schema, "names", None)
+        if names is not None:
+            return list(names)
+    except Exception:
+        pass
+    return list(result.read_arrow_table().column_names)
 
 
 def execute_plan(
@@ -40,6 +103,28 @@ class _Context:
             return self._exec_insert(node)
         raise NotImplementedError(f"Cannot execute {type(node).__name__}")
 
+    # ------------------------------------------------------------------
+    # Helpers: engine detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_spark(result: "Tabular") -> bool:
+        """True when *result* natively wraps a Spark DataFrame."""
+        native = getattr(result, "_native_spark_frame", None)
+        if native is None:
+            return False
+        return native() is not None
+
+    @staticmethod
+    def _is_in_memory(result: "Tabular") -> bool:
+        """True when *result* is an ArrowTabular (already materialized)."""
+        from yggdrasil.arrow.tabular import ArrowTabular
+        return isinstance(result, ArrowTabular)
+
+    # ------------------------------------------------------------------
+    # Scan
+    # ------------------------------------------------------------------
+
     def _exec_scan(self, node: ScanNode) -> "Tabular":
         if node.tabular is not None:
             return node.tabular
@@ -49,6 +134,10 @@ class _Context:
         raise ValueError(
             f"Table {name!r} not found. Available: {sorted(self.tables)}"
         )
+
+    # ------------------------------------------------------------------
+    # SELECT — main dispatch
+    # ------------------------------------------------------------------
 
     def _exec_select(self, node: SelectNode) -> "Tabular":
         from yggdrasil.arrow.tabular import ArrowTabular
@@ -84,14 +173,13 @@ class _Context:
                 ))
             return ArrowTabular(pa.table({}))
 
-        # Spark SQL passthrough for complex plans
-        spark_frame = result._native_spark_frame() if hasattr(result, '_native_spark_frame') else None
-        if spark_frame is not None and self._can_spark_passthrough(node):
+        # Spark SQL passthrough for complex plans (GROUP BY, SET ops)
+        if self._is_spark(result) and self._can_spark_passthrough(node):
             return self._exec_spark_passthrough(node, result)
 
-        # WHERE
+        # WHERE — predicate pushdown + engine-native filter
         if node.where is not None:
-            result = result.filter(node.where)
+            result = self._apply_where(result, node)
 
         # GROUP BY + aggregation
         agg_alias_map: dict | None = None
@@ -108,32 +196,24 @@ class _Context:
             if rewritten is not None:
                 result = result.filter(rewritten)
 
-        # Projection (SELECT list) — only column selection for now
+        # Projection (SELECT list) — uses Tabular.select() which
+        # routes to SparkDataset._select() or Arrow natively
         if node.projections and not node.group_by:
             cols = self._resolve_projection_columns(node.projections, result)
             if cols:
                 result = result.select(*cols)
 
-        # DISTINCT
+        # DISTINCT — uses Tabular.unique() which routes natively
         if node.distinct:
-            table = result.read_arrow_table()
-            col_names = table.column_names
-            if col_names:
-                result = result.unique(col_names)
+            result = self._exec_distinct(result)
 
-        # ORDER BY
+        # ORDER BY — Spark-native or Arrow
         if node.order_by:
             result = self._exec_order_by(result, node.order_by)
 
-        # LIMIT
+        # LIMIT — Spark-native or Arrow
         if node.limit is not None:
-            table = result.read_arrow_table()
-            offset = node.offset or 0
-            if offset > 0:
-                table = table.slice(offset, node.limit)
-            elif table.num_rows > node.limit:
-                table = table.slice(0, node.limit)
-            result = ArrowTabular(table)
+            result = self._exec_limit(result, node.limit, node.offset)
 
         # Set operations
         if node.set_ops:
@@ -143,6 +223,10 @@ class _Context:
                 result = result.union(right, mode=Mode.IGNORE)
 
         return result
+
+    # ------------------------------------------------------------------
+    # FROM
+    # ------------------------------------------------------------------
 
     def _exec_from(self, item: Any) -> "Tabular":
         if isinstance(item, TableRef):
@@ -159,6 +243,69 @@ class _Context:
         if isinstance(item, PlanNode):
             return self.execute(item)
         raise TypeError(f"Cannot resolve FROM item: {type(item).__name__}")
+
+    # ------------------------------------------------------------------
+    # WHERE — predicate pushdown into CastOptions for I/O-level
+    # optimization (Folder partition pruning, Parquet row-group skip),
+    # then engine-native filter for row-level evaluation.
+    # ------------------------------------------------------------------
+
+    def _apply_where(self, result: "Tabular", node: SelectNode) -> "Tabular":
+        """Apply WHERE with I/O-level pushdown when beneficial.
+
+        Three paths, chosen by the source type:
+
+        * **SparkDataset** — ``Tabular.filter()`` compiles the
+          predicate to a PySpark Column and lets Catalyst plan the
+          physical filter (partition prune, predicate pushdown into
+          the scan, row-group skipping in Delta / Parquet).  No
+          extra work needed here.
+
+        * **ArrowTabular** (already in-memory) — ``Tabular.filter()``
+          runs the pyarrow C++ kernel directly on the held batches.
+          Pushing into CastOptions would just re-read the same
+          batches, so skip it.
+
+        * **Folder / Parquet / any other I/O-backed Tabular** — push
+          the predicate into ``CastOptions.predicate`` and read via
+          ``read_arrow_tabular(opts)``.  The Folder reader uses
+          ``_should_prune_by_predicate`` to skip entire partition
+          directories, and format readers (ParquetFile) use the
+          predicate for row-group pruning.  The result is a fully
+          materialized ArrowTabular with only the surviving rows.
+        """
+        from yggdrasil.execution.expr import Predicate
+
+        predicate = node.where
+        if predicate is None:
+            return result
+
+        # Spark and in-memory Arrow: use the engine-native filter path
+        # which already does the right thing (Catalyst / C++ kernel).
+        if self._is_spark(result) or self._is_in_memory(result):
+            return result.filter(predicate)
+
+        # I/O-backed source (Folder, single Parquet file, etc.): push
+        # the predicate into CastOptions so the reader can prune at
+        # the I/O level.  JoinClause results are always ArrowTabular
+        # (caught above), so this only fires on table-ref sources.
+        if isinstance(predicate, Predicate):
+            try:
+                opts = result.check_options(None, overrides={"predicate": predicate})
+                pushed = result.read_arrow_tabular(opts)
+                logger.debug(
+                    "Predicate pushdown read %d rows from %r",
+                    pushed.read_arrow_table().num_rows,
+                    type(result).__name__,
+                )
+                return pushed
+            except Exception:
+                # Pushdown failed (unsupported predicate shape, missing
+                # partition column, etc.) — fall through to the generic
+                # filter which materializes first, then filters.
+                pass
+
+        return result.filter(predicate)
 
     def _exec_join(self, jc: JoinClause) -> "Tabular":
         from yggdrasil.arrow.tabular import ArrowTabular
@@ -331,27 +478,122 @@ class _Context:
 
         return result, None
 
-    def _exec_order_by(self, result: "Tabular", order_by: list) -> "Tabular":
-        from yggdrasil.arrow.tabular import ArrowTabular
-        from yggdrasil.execution.expr.nodes import Column, SortOrder
-        import pyarrow.compute as pc
+    # ------------------------------------------------------------------
+    # DISTINCT — routes through Tabular.unique() which dispatches to
+    # SparkDataset._unique() (``dropDuplicates()``) or Arrow dedup.
+    # ------------------------------------------------------------------
 
-        table = result.read_arrow_table()
-        sort_keys = []
+    def _exec_distinct(self, result: "Tabular") -> "Tabular":
+        """Apply DISTINCT using the engine-native dedup path.
+
+        For Spark sources, ``Tabular.unique()`` compiles to
+        ``df.dropDuplicates()`` on the executors.  For Arrow, it
+        runs the pyarrow group-by dedup.  Both paths avoid a
+        premature ``read_arrow_table()`` call.
+        """
+        # Spark-native: use DataFrame.distinct() directly for best
+        # Catalyst optimization (it can push distinct into the scan).
+        spark_frame = result._native_spark_frame() if hasattr(result, "_native_spark_frame") else None
+        if spark_frame is not None:
+            from yggdrasil.spark.tabular import SparkDataset
+            return SparkDataset(frame=spark_frame.distinct())
+
+        # Non-Spark: get column names without full materialization
+        # when possible, then use Tabular.unique() which routes to
+        # the Arrow dedup kernel.
+        try:
+            schema = result.collect_schema()
+            col_names = schema.names if hasattr(schema, "names") else []
+        except Exception:
+            # Fallback: materialize to get column names
+            table = result.read_arrow_table()
+            col_names = table.column_names
+        if col_names:
+            return result.unique(col_names)
+        return result
+
+    # ------------------------------------------------------------------
+    # ORDER BY — Spark-native ``orderBy`` or Arrow ``sort_indices``.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_sort_keys(order_by: list) -> list[tuple[str, str]]:
+        from yggdrasil.execution.expr.nodes import Column, SortOrder
+        keys: list[tuple[str, str]] = []
         for item in order_by:
-            if isinstance(item, SortOrder):
-                if isinstance(item.expr, Column):
-                    order = "ascending" if item.ascending else "descending"
-                    sort_keys.append((item.expr.name, order))
+            if isinstance(item, SortOrder) and isinstance(item.expr, Column):
+                keys.append((item.expr.name, "ascending" if item.ascending else "descending"))
             elif isinstance(item, dict):
                 expr = item.get("expr")
                 if isinstance(expr, Column):
-                    order = "ascending" if item.get("ascending", True) else "descending"
-                    sort_keys.append((expr.name, order))
+                    keys.append((expr.name, "ascending" if item.get("ascending", True) else "descending"))
+        return keys
 
-        if sort_keys:
-            indices = pc.sort_indices(table, sort_keys=sort_keys)
-            table = table.take(indices)
+    def _exec_order_by(self, result: "Tabular", order_by: list) -> "Tabular":
+        from yggdrasil.execution.expr.nodes import Column, SortOrder
+
+        sort_keys = self._parse_sort_keys(order_by)
+        if not sort_keys:
+            return result
+
+        # Spark-native: compile sort columns to DataFrame.orderBy()
+        spark_frame = result._native_spark_frame() if hasattr(result, "_native_spark_frame") else None
+        if spark_frame is not None:
+            from yggdrasil.spark.tabular import SparkDataset
+            try:
+                from pyspark.sql.functions import col as spark_col, asc, desc
+                spark_order = []
+                for col_name, direction in sort_keys:
+                    if direction == "descending":
+                        spark_order.append(desc(col_name))
+                    else:
+                        spark_order.append(asc(col_name))
+                return SparkDataset(frame=spark_frame.orderBy(*spark_order))
+            except Exception:
+                # pyspark import may fail in test environments without
+                # Spark; fall through to Arrow.
+                pass
+
+        # Arrow path
+        from yggdrasil.arrow.tabular import ArrowTabular
+        import pyarrow.compute as pc
+
+        table = result.read_arrow_table()
+        indices = pc.sort_indices(table, sort_keys=sort_keys)
+        return ArrowTabular(table.take(indices))
+
+    # ------------------------------------------------------------------
+    # LIMIT / OFFSET — Spark-native ``limit`` or Arrow slice.
+    # ------------------------------------------------------------------
+
+    def _exec_limit(
+        self, result: "Tabular", limit: int, offset: int | None,
+    ) -> "Tabular":
+        """Apply LIMIT [OFFSET] using the engine-native path.
+
+        For Spark, ``DataFrame.limit()`` pushes the cap into the
+        physical plan so only *limit* rows are shuffled to the
+        driver.  Offset is handled via a ``monotonically_increasing_id``
+        window — uncommon enough that we fall back to Arrow for
+        offset > 0 on Spark (collecting limit+offset rows is cheap).
+        """
+        from yggdrasil.arrow.tabular import ArrowTabular
+        effective_offset = offset or 0
+
+        # Spark-native: use DataFrame.limit() — avoids collecting the
+        # entire frame to the driver just to slice.
+        spark_frame = result._native_spark_frame() if hasattr(result, "_native_spark_frame") else None
+        if spark_frame is not None and effective_offset == 0:
+            from yggdrasil.spark.tabular import SparkDataset
+            return SparkDataset(frame=spark_frame.limit(limit))
+
+        # Arrow path (also used for Spark + offset, since offset is rare
+        # and the frame is small after LIMIT).
+        table = result.read_arrow_table()
+        if effective_offset > 0:
+            table = table.slice(effective_offset, limit)
+        elif table.num_rows > limit:
+            table = table.slice(0, limit)
         return ArrowTabular(table)
 
     def _exec_insert(self, node: InsertNode) -> "Tabular":
@@ -427,7 +669,7 @@ class _Context:
             Column, Comparison, FunctionCall, Logical, Not, Star,
         )
 
-        col_names = set(result.read_arrow_table().column_names)
+        col_names = set(_column_names_from_tabular(result))
         alias_map = agg_alias_map or {}
         agg_pyarrow = {
             "count": "count", "sum": "sum", "avg": "mean",

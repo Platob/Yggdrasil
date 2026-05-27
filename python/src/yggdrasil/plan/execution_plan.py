@@ -78,11 +78,17 @@ class ExecutionPlan(ABC, Generic[O]):
         cls,
         sql: str,
         dialect: "Dialect | str | None" = None,
-    ) -> "ExecutionPlan":
-        """Parse a SQL query into a :class:`SelectPlan`."""
+        default: "Any" = ...,
+    ) -> "ExecutionPlan | Any":
+        """Parse a SQL query into a :class:`SelectPlan`.
+
+        Returns *default* on parse failure when *default* is not ``...``.
+        """
         from .sql_parser import parse_sql
         from .nodes import SelectNode
-        node = parse_sql(sql, dialect=dialect)
+        node = parse_sql(sql, dialect=dialect, default=default)
+        if default is not ... and not isinstance(node, SelectNode):
+            return default if node is default else SelectPlan()
         plan = SelectPlan()
         if isinstance(node, SelectNode):
             plan._apply_select_node(node)

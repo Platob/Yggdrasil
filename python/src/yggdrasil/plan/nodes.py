@@ -39,9 +39,12 @@ class PlanNode:
         cls,
         sql: str,
         dialect: "Dialect | str | None" = None,
-    ) -> "PlanNode":
+        default: "Any" = ...,
+    ) -> "PlanNode | Any":
+        """Parse SQL into a plan node. Returns *default* on failure
+        when *default* is not ``...``; raises otherwise."""
         from .sql_parser import parse_sql
-        return parse_sql(sql, dialect=dialect)
+        return parse_sql(sql, dialect=dialect, default=default)
 
     def to_sql(self, dialect: "Dialect | str | None" = None) -> str:
         from .sql_emitter import emit_sql
