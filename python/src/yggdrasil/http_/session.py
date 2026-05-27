@@ -1184,6 +1184,14 @@ class HTTPSession(Session):
                     )
                     retries.sleep()
                     continue
+                if "CERTIFICATE_VERIFY_FAILED" in msg:
+                    LOGGER.error(
+                        "SSL certificate verification failed for %s. "
+                        "Use HTTPSession(verify=False) to disable verification, "
+                        "HTTPSession(verify='/path/to/ca-bundle.crt') for a custom CA, "
+                        "or session.insecure() for a quick toggle: %s",
+                        current_request.url, msg,
+                    )
                 raise SSLError(msg) from exc
             except (OSError, http.client.HTTPException) as exc:
                 url_str = current_request.url.to_string()
