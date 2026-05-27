@@ -1530,6 +1530,7 @@ class HTTPSession(Session):
             if cfg.raise_error:
                 response.raise_for_status()
             return response
+        return None
 
     def _build_idle_response(
         self,
@@ -1554,7 +1555,7 @@ class HTTPSession(Session):
     def refresh_auth(
         self,
         request: HTTPRequest,
-        force: bool = True,
+        force: bool = False,
     ) -> bool:
         """Resolve the auth handler and stamp the Authorization header.
 

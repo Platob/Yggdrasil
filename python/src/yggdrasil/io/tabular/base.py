@@ -1134,12 +1134,6 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             n_batches += 1
             n_rows += batch.num_rows
             yield batch
-        logger.debug(
-            "%r read %d batches / %d rows",
-            self,
-            n_batches,
-            n_rows,
-        )
 
     def read_arrow_table(
         self, options: "O | None" = None, **kwargs: Any,
