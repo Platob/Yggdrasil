@@ -363,16 +363,6 @@ class DatabricksClient(Singleton, URLBased):
         if resolved["account_id"] and not resolved["host"]:
             resolved["host"] = "https://accounts.cloud.databricks.com"
 
-        # Default to serverless compute when the caller pinned no
-        # classic cluster and didn't already opt into a specific
-        # serverless pool. Setting it here (rather than inside
-        # ``_make_base_config``) bakes the choice into the field
-        # value AND the singleton cache key, so ``client.serverless_compute_id``
-        # reads ``"auto"`` immediately after construction and two
-        # bare clients collapse onto the same instance.
-        if not resolved["cluster_id"] and not resolved["serverless_compute_id"]:
-            resolved["serverless_compute_id"] = "auto"
-
         resolved["host"] = _normalize_host(resolved["host"])
         return resolved
 
@@ -1725,15 +1715,14 @@ class DatabricksClient(Singleton, URLBased):
 
     @property
     def is_serverless_compute(self) -> bool:
-        """True when this client targets serverless compute.
+        """True when this client explicitly targets serverless compute.
 
-        A bare client with no ``cluster_id`` lands on serverless
-        because :meth:`_resolve_init_kwargs` defaults
-        ``serverless_compute_id`` to ``"auto"`` at construction
-        time; setting ``cluster_id`` explicitly opts back into
-        the classic compute path.
+        Only returns ``True`` when ``serverless_compute_id`` was set
+        by the caller. A bare client with no ``cluster_id`` and no
+        ``serverless_compute_id`` is NOT serverless — it simply has
+        no compute target and will resolve one lazily when needed.
         """
-        return bool(self.serverless_compute_id) or not self.cluster_id
+        return bool(self.serverless_compute_id)
 
     def spark(
         self,

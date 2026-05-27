@@ -157,19 +157,6 @@ class ClusterStatementExecutor(DatabricksResource, StatementExecutor[
         if getattr(self, "_initialized", False):
             return
 
-        # Late import to avoid the cluster module pulling the
-        # serverless submodule at import time.
-        from .serverless import ServerlessCluster
-
-        if isinstance(cluster, ServerlessCluster):
-            raise TypeError(
-                f"{type(self).__name__} cannot wrap a ServerlessCluster: "
-                "serverless compute does not expose the REPL CommandExecution "
-                "API used by this executor (per Databricks serverless "
-                "limitations). Route serverless SQL through SQLWarehouse "
-                "instead."
-            )
-
         # DatabricksResource expects a ``service``; route through the
         # cluster's own service so callers downstream that walk
         # ``executor.service.client`` land on the right client.

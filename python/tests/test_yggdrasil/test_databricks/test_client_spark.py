@@ -31,8 +31,12 @@ from yggdrasil.databricks.registry import (
 
 @pytest.fixture
 def serverless_client():
-    """Default shape — no ``cluster_id`` → serverless compute."""
-    return DatabricksClient(host="https://ws.example.com", token="dapi-x")
+    """Explicit serverless compute."""
+    return DatabricksClient(
+        host="https://ws.example.com",
+        token="dapi-x",
+        serverless_compute_id="auto",
+    )
 
 
 @pytest.fixture
