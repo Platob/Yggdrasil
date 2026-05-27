@@ -324,6 +324,11 @@ class Clusters(DatabricksService):
         *,
         cluster_id: str | None = None,
         cluster_name: str | None = None,
+        single_user_name: str | None = None,
+        permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
+        libraries: Optional[list[Union[str, Library]]] = None,
+        wait: WaitingConfigArg = True,
+        **cluster_spec: Any,
     ):
         # Positional shortcut: accept a Cluster, an ID, or a name.
         if obj is not None:

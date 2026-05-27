@@ -740,9 +740,17 @@ def _build_dml_statements(
                 f"TRUNCATE TABLE {target_location}",
                 f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}",
             ])
+        elif match_by:
+            statements.extend(_build_delete_insert_statements(
+                target_location=target_location,
+                source_sql=source_sql,
+                columns=columns,
+                match_by=match_by,
+                prune_predicates=prune_predicates,
+            ))
         else:
             statements.append(
-                f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
+                f"INSERT OVERWRITE {target_location} ({cols_quoted})\n{source_sql}"
             )
 
     elif match_by and not safe_merge:
@@ -2004,7 +2012,7 @@ class Table(DatabricksPath):
         comment: str | None = None,
         properties: Optional[dict[str, str]] = None,
         table_type: TableType | None = None,
-        data_source_format: DataSourceFormat = DataSourceFormat.DELTA,
+        data_source_format: DataSourceFormat | None = None,
         missing_ok: bool = True,
         wait: WaitingConfigArg = True,
         or_replace: bool = False,
@@ -2012,27 +2020,27 @@ class Table(DatabricksPath):
     ) -> "Table":
         mode = Mode.from_(mode, default=Mode.AUTO)
 
-        # ``or_replace=True`` — one-shot atomic replacement via
-        # ``CREATE OR REPLACE TABLE ... USING <format>``. Saves a round
-        # trip versus delete + recreate and removes the intermediate
-        # "table missing" window the warehouse used to see between the
-        # two calls. OR REPLACE is supported for managed Delta tables;
-        # external / explicit-storage paths fall through to the legacy
-        # drop + recreate (UC's tables.create API has no replace verb).
-        if or_replace:
-            self.delete(wait=True, missing_ok=True, delete_staging=False)
-
-        if self.exists:
-            if mode == Mode.ERROR_IF_EXISTS:
-                raise ValueError(f"Table {self!r} already exists")
-            elif mode in (Mode.IGNORE, Mode.AUTO):
-                return self
-
-            schema = DataSchema.from_(definition)
-            return self.with_columns(schema.fields, mode=mode)
-
         if table_type is None:
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
+
+        if data_source_format is None:
+            data_source_format = DataSourceFormat.DELTA if table_type == TableType.MANAGED else DataSourceFormat.PARQUET
+
+        if self.exists:
+            data_source_format = self.infos.data_source_format
+
+            if mode == Mode.OVERWRITE and data_source_format == DataSourceFormat.DELTA:
+                pass
+            elif mode == Mode.OVERWRITE:
+                self.delete(wait=True, missing_ok=True)
+            else:
+                if mode == Mode.ERROR_IF_EXISTS:
+                    raise ValueError(f"Table {self!r} already exists")
+                elif mode in (Mode.IGNORE, Mode.AUTO):
+                    return self
+
+                schema = DataSchema.from_(definition)
+                return self.with_columns(schema.fields, mode=mode)
 
         if table_type == TableType.MANAGED:
             result = self.sql_create(
@@ -2040,6 +2048,7 @@ class Table(DatabricksPath):
                 comment=comment,
                 missing_ok=missing_ok,
                 properties=properties,
+                or_replace=mode == Mode.OVERWRITE and table_type == TableType.MANAGED,
                 record_ygg_properties=record_ygg_properties,
             )
         else:
@@ -2110,9 +2119,6 @@ class Table(DatabricksPath):
         )
 
         table_definitions = column_definitions + constraint_clauses
-
-        if or_replace and missing_ok:
-            raise ValueError("Use either or_replace or missing_ok, not both.")
 
         if or_replace:
             create_kw = "CREATE OR REPLACE TABLE"
@@ -3248,11 +3254,12 @@ class Table(DatabricksPath):
             )
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
+        if mode_enum == Mode.OVERWRITE and not match_by:
+            schema_mode = Mode.OVERWRITE
 
         target = self.create(
             data,
             mode=schema_mode,
-            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
@@ -3390,11 +3397,12 @@ class Table(DatabricksPath):
         from yggdrasil.spark.statement import SparkPreparedStatement
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
+        if mode_enum == Mode.OVERWRITE and not match_by:
+            schema_mode = Mode.OVERWRITE
 
         target = self.create(
             data,
             mode=schema_mode,
-            or_replace=(mode_enum == Mode.OVERWRITE and not match_by),
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
@@ -3671,9 +3679,7 @@ class Table(DatabricksPath):
             f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS {quote_ident('raw_src')}"
         )
 
-        prune_predicates = _build_where_predicates(
-            None, where, target_alias="T",
-        )
+        prune_predicates = _build_where_predicates(where, target_alias="T")
         sql_texts = _build_dml_statements(
             target_location=target_location,
             source_sql=source_sql,

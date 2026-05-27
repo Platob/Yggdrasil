@@ -172,8 +172,8 @@ class TestVolumeInfoTTL:
         v.read_info()
         assert workspace.volumes.read.call_count == 2
 
-    def test_default_ttl_is_five_minutes(self):
-        assert Volume.DEFAULT_INFO_TTL == 300.0
+    def test_default_ttl_is_thirty_minutes(self):
+        assert Volume.DEFAULT_INFO_TTL == 1800.0
 
     def test_seeded_info_skips_first_read(self, workspace, client):
         v = Volume(

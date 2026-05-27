@@ -7,6 +7,7 @@ This package gives you a **single entrypoint** (`DatabricksClient`) and service 
 - SQL execution and warehouse lifecycle
 - Unity Catalog navigation (catalog/schema/table/column)
 - Compute cluster management and remote execution contexts
+- Job orchestration and run management
 - DBFS / Volume / Workspace file operations
 - Secrets and IAM administration
 
@@ -121,6 +122,7 @@ with ExecutionContext(cluster=cluster) as ctx:
 | `client.warehouses` | Warehouse discovery/start/stop/update | `client.warehouses.find_default()` |
 | `client.catalogs` / `client.tables` | Unity Catalog hierarchy + table resources | `client.catalogs["main"]["default"]["orders"]` |
 | `client.compute` | Cluster lifecycle/version selection | `client.compute.clusters.all_purpose_cluster(name="etl")` |
+| `client.jobs` | Job CRUD, trigger runs, poll results | `client.jobs["my-etl"].run_and_wait()` |
 | `client.dbfs_path(...)` | DBFS/Volumes path operations | `client.dbfs_path("dbfs:/tmp/a.txt")` |
 | `client.secrets` | Scope/secret CRUD helpers | `client.secrets.create_secret("scope/key", "value")` |
 | `client.iam` | Users/groups in workspace/account scope | `client.iam.users.current_user` |
@@ -142,6 +144,7 @@ with ExecutionContext(cluster=cluster) as ctx:
 - [sql](sql/README.md)
 - [compute](compute/README.md)
 - [compute.remote](compute/remote/README.md)
+- [job](job/README.md)
 - [workspaces](workspaces/README.md)
 - [fs](fs/README.md)
 - [secrets](secrets/README.md)

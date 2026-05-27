@@ -199,6 +199,11 @@ class HTTPResponseBatch(Tabular):
                 except Exception:
                     LOGGER.debug("Remote→local backfill failed", exc_info=True)
 
+        LOGGER.debug(
+            "Cache split: %d local hit(s), %d remote hit(s), %d miss(es)",
+            len(self._local_hashes), len(self._remote_hashes), len(misses),
+        )
+
         if not misses or cfg.cache_only:
             if misses:
                 LOGGER.warning(
@@ -265,6 +270,14 @@ class HTTPResponseBatch(Tabular):
             write_data = pa.Table.from_batches(
                 [HTTPResponse.values_to_arrow_batch(ok_list)]
             )
+            if "received_at" in write_data.column_names:
+                import datetime as _dt
+                now_us = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1_000_000)
+                write_data = write_data.set_column(
+                    write_data.column_names.index("received_at"),
+                    "received_at",
+                    pa.array([now_us] * write_data.num_rows, type=pa.int64()),
+                )
             cfg.write_responses_tabular(write_data, session=self._session)
 
     def _fetch_spark(

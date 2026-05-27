@@ -46,12 +46,27 @@ def classic_client():
 
 @pytest.fixture
 def stubbed_workspace_config(monkeypatch):
-    """Skip the live SDK ``Config(...)`` call."""
+    """Skip the live SDK ``Config(...)`` call and cluster resolution."""
     monkeypatch.setattr(
         DatabricksClient,
         "workspace_config",
         property(lambda self: MagicMock(name="WorkspaceConfig")),
     )
+    monkeypatch.setattr(
+        DatabricksClient,
+        "workspace_client",
+        lambda self: MagicMock(name="WorkspaceClient"),
+    )
+
+    from yggdrasil.databricks.cluster.service import Clusters
+
+    def _stub_get_or_create(self_clusters, obj=None, **kwargs):
+        stub = MagicMock(name="Cluster")
+        cluster_id = obj if isinstance(obj, str) else kwargs.get("cluster_id", "stub-id")
+        stub.cluster_id = cluster_id
+        return stub
+
+    monkeypatch.setattr(Clusters, "get_or_create", _stub_get_or_create)
 
 
 @pytest.fixture

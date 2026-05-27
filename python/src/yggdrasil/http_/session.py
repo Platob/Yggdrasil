@@ -55,6 +55,7 @@ import os
 import pathlib
 import socket
 import ssl
+import sys
 import threading
 import time
 from abc import ABC
@@ -93,10 +94,12 @@ from yggdrasil.http_.send_config import DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.url import URL
 
 from .exceptions import (
+    InsecureRequestWarning,
     LocationParseError,
     LocationValueError,
     MaxRetryError,
     NewConnectionError,
+    ProxyError,
     ReadTimeoutError,
     SSLError,
 )
@@ -113,6 +116,198 @@ __all__ = ["Session", "HTTPSession"]
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Proxy helpers — resolved once per process, shared across all sessions
+# ---------------------------------------------------------------------------
+
+# Dead proxies — process-wide set so one failure skips the proxy for
+# every session in the process, not just the one that hit the error.
+_DEAD_PROXIES: set[str] = set()
+
+
+def _proxy_key(proxy: "URL") -> str:
+    return f"{proxy.host}:{proxy.port or 8080}"
+
+
+def mark_proxy_dead(proxy: "URL") -> None:
+    """Mark *proxy* as unreachable for the rest of the process."""
+    key = _proxy_key(proxy)
+    _DEAD_PROXIES.add(key)
+    LOGGER.warning("Proxy %s marked dead — falling back to direct connections", key)
+
+
+def is_proxy_dead(proxy: "URL") -> bool:
+    return _proxy_key(proxy) in _DEAD_PROXIES
+
+
+def _read_env_proxy(name: str) -> "URL | None":
+    raw = os.environ.get(name) or os.environ.get(name.lower())
+    return URL.from_(raw) if raw else None
+
+
+class _ProxyEnv:
+    """Snapshot of proxy-related env vars, resolved once at first access."""
+
+    _instance: "Optional[_ProxyEnv]" = None
+
+    def __init__(self) -> None:
+        self.https: URL | None = _read_env_proxy("HTTPS_PROXY")
+        self.http: URL | None = _read_env_proxy("HTTP_PROXY")
+        self.all: URL | None = _read_env_proxy("ALL_PROXY")
+        self.no_proxy: str = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+
+    @classmethod
+    def current(cls) -> "_ProxyEnv":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._instance = None
+
+    def resolve(self, target_scheme: str | None = None) -> "URL | None":
+        if target_scheme == "https" and self.https:
+            return self.https
+        if target_scheme == "http" and self.http:
+            return self.http
+        return self.all
+
+
+def _resolve_proxy_url(
+    proxy: "URL | str | None",
+    target_scheme: str | None = None,
+) -> "URL | None":
+    """Resolve a proxy URL from the explicit argument or environment.
+
+    Env vars are read once per process via :class:`_ProxyEnv`.
+    """
+    if proxy is not None:
+        return URL.from_(proxy) if not isinstance(proxy, URL) else proxy
+    return _ProxyEnv.current().resolve(target_scheme)
+
+
+def _should_bypass_proxy(host: str, no_proxy: str | None = None) -> bool:
+    """Return ``True`` when *host* matches a ``no_proxy`` pattern.
+
+    Uses the cached :class:`_ProxyEnv` when *no_proxy* is ``None``.
+    The wildcard ``"*"`` bypasses everything.  Entries are
+    comma-separated; leading dots match any subdomain.
+    """
+    if no_proxy is None:
+        no_proxy = _ProxyEnv.current().no_proxy
+
+    if not no_proxy:
+        return False
+
+    host = host.lower().strip(".")
+
+    for entry in no_proxy.split(","):
+        entry = entry.strip().lower().strip(".")
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        if host == entry:
+            return True
+        if host.endswith("." + entry):
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# SSL context helpers
+# ---------------------------------------------------------------------------
+
+# Accepted shapes for the ``verify`` parameter:
+#   True          — default CA bundle (ssl.create_default_context())
+#   False         — no verification (InsecureRequestWarning emitted)
+#   str / Path    — path to a custom CA bundle or directory
+VerifyArg = "bool | str | pathlib.Path"
+
+
+_DEFAULT_CONNECT_TIMEOUT: float = 30.0
+
+
+def _floor_connect_timeout(timeout: Optional[float]) -> float:
+    """Ensure a connect timeout is never ``None`` (infinite).
+
+    ``http.client.HTTPConnection(timeout=None)`` means "block until the
+    OS gives up" — which on some platforms is 2+ minutes and on others
+    is infinite.  This helper applies a floor so callers that forget to
+    set a timeout (``WaitingConfig(timeout=0)`` → ``Timeout(connect=None)``)
+    don't hang the process.
+    """
+    if timeout is None or timeout <= 0:
+        return _DEFAULT_CONNECT_TIMEOUT
+    return timeout
+
+
+def _make_ssl_context(verify: "bool | str | pathlib.Path") -> ssl.SSLContext:
+    """Build an :class:`ssl.SSLContext` from a ``verify`` argument.
+
+    - ``True`` — system default CA bundle + Windows system store.
+    - ``False`` — no certificate verification, no hostname check.
+    - ``str`` / ``pathlib.Path`` — custom CA bundle file or directory.
+
+    On Windows, ``ssl.create_default_context()`` only loads Python's
+    bundled ``certifi`` CAs — corporate proxy/PKI certificates in the
+    Windows certificate store are invisible. This function loads the
+    Windows ``"ROOT"`` and ``"CA"`` stores into the context so those
+    certificates are trusted without requiring ``python-certifi-win32``
+    or ``pip-system-certs``.
+    """
+    if verify is False:
+        ctx = ssl._create_unverified_context()  # type: ignore[attr-defined]
+        ctx.check_hostname = False
+        return ctx
+
+    ctx = ssl.create_default_context()
+    if verify is not True:
+        ca_path = str(verify)
+        if os.path.isdir(ca_path):
+            ctx.load_verify_locations(capath=ca_path)
+        else:
+            ctx.load_verify_locations(cafile=ca_path)
+    _load_windows_system_certs(ctx)
+    return ctx
+
+
+def _load_windows_system_certs(ctx: ssl.SSLContext) -> None:
+    """Load Windows system certificate stores into *ctx*.
+
+    No-op on non-Windows platforms. Loads ``"ROOT"`` and ``"CA"``
+    stores so corporate/proxy CAs trusted by the OS are also trusted
+    by Python — removes the need for ``python-certifi-win32``.
+    """
+    if sys.platform != "win32":
+        return
+    for store_name in ("ROOT", "CA"):
+        try:
+            certs = ssl.enum_certificates(store_name)  # type: ignore[attr-defined]
+            for cert_data, encoding, trust in certs:
+                if encoding == "x509_asn" and trust is True:
+                    try:
+                        ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert_data))
+                    except ssl.SSLError:
+                        pass
+        except (AttributeError, OSError):
+            pass
+
+
+def _warn_if_insecure(verify: "bool | str | pathlib.Path") -> None:
+    """Emit :class:`InsecureRequestWarning` when verification is off."""
+    if verify is False:
+        import warnings
+        warnings.warn(
+            "SSL certificate verification is disabled. "
+            "Connections to HTTPS endpoints will not validate the server's identity.",
+            InsecureRequestWarning,
+            stacklevel=3,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -364,12 +559,16 @@ class Session(Singleton, ABC):
 
     @property
     def job_pool(self) -> JobPoolExecutor:
-        if self._job_pool is None:
-            with self._lock:
-                if self._job_pool is None:
-                    self._job_pool = JobPoolExecutor(max_workers=self.pool_maxsize)
-                    LOGGER.debug("Created job pool with max_workers=%s", self.pool_maxsize)
-        return self._job_pool
+        pool = self._job_pool
+        if pool is None:
+            pool = JobPoolExecutor(max_workers=self.pool_maxsize)
+            if self._job_pool is None:
+                self._job_pool = pool
+                LOGGER.debug("Created job pool with max_workers=%s", self.pool_maxsize)
+            else:
+                pool.shutdown(wait=False)
+                pool = self._job_pool
+        return pool
 
     def local_cache(self) -> "Folder":
         """Return the session-scoped local cache folder, creating the directory on first access.
@@ -576,12 +775,14 @@ class HTTPSession(Session):
     def __init__(
         self,
         base_url: Optional[URL | str] = None,
-        verify: bool = True,
+        verify: "bool | str | pathlib.Path" = True,
         pool_maxsize: int = 10,
         headers: "HTTPHeaders | Mapping[str, str] | None" = None,
         waiting: WaitingConfig = DEFAULT_WAITING_CONFIG,
         *,
         auth: Optional[Authorization] = None,
+        proxy: Optional[URL | str] = None,
+        no_proxy: Optional[str] = None,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor call
         # (Python always invokes ``__init__`` after ``__new__``); skip the
@@ -593,16 +794,22 @@ class HTTPSession(Session):
                 f"auth must be an Authorization instance or None; got "
                 f"{type(auth).__name__}."
             )
+        # Normalise pathlib.Path → str so the singleton key is hashable.
+        if isinstance(verify, pathlib.Path):
+            verify = str(verify)
+        _warn_if_insecure(verify)
         # The pool caps idle sockets per host; 8 is plenty for our typical
         # workloads. Clamping here means the singleton key (built from
         # ``pool_maxsize``) collapses ``HTTPSession(pool_maxsize=20)`` and
         # ``HTTPSession()`` to one instance the way they always did.
         pool_maxsize = min(8, int(pool_maxsize)) if pool_maxsize else 8
         self.base_url = URL.from_(base_url) if base_url else None
-        self.verify = verify
+        self.verify: bool | str = verify
         self.headers: HTTPHeaders = HTTPHeaders.from_(headers)
         self.waiting = waiting
         self.auth: Authorization | None = auth
+        self.proxy: URL | None = URL.from_(proxy) if isinstance(proxy, str) else proxy
+        self.no_proxy: str | None = no_proxy
 
         # Singleton-key probe path bails here — :class:`Session._singleton_key`
         # reads ``probe.__dict__`` and keeps only the keys whose names
@@ -690,6 +897,15 @@ class HTTPSession(Session):
             backoff_max=_BACKOFF_429_MAX,
         )
 
+    def _resolve_proxy_for(self, scheme: str, host: str) -> "URL | None":
+        """Return the proxy URL for this request, or ``None`` to go direct."""
+        if _should_bypass_proxy(host, self.no_proxy):
+            return None
+        proxy = _resolve_proxy_url(self.proxy, target_scheme=scheme)
+        if proxy is not None and is_proxy_dead(proxy):
+            return None
+        return proxy
+
     def _build_connection(
         self,
         scheme: str,
@@ -697,23 +913,156 @@ class HTTPSession(Session):
         port: int,
         connect_timeout: Optional[float],
     ) -> http.client.HTTPConnection:
-        """Open a fresh :class:`http.client.HTTPConnection` to *(scheme, host, port)*.
+        """Open a fresh connection to *(scheme, host, port)*.
 
-        Honours ``self.verify``: when False the HTTPS context turns off
-        certificate verification and hostname checking, matching the
-        ``cert_reqs="CERT_NONE"`` shape urllib3 callers rely on (Databricks
-        external links, some private-link deployments).
+        When a proxy is configured and the target host is not bypassed,
+        the connection routes through the proxy:
+
+        - **HTTPS targets** use an HTTP CONNECT tunnel — the TCP socket
+          connects to the proxy, sends ``CONNECT host:port``, then
+          upgrades to TLS so the proxy sees only opaque bytes.
+        - **HTTP targets** connect to the proxy directly; the caller
+          must send the absolute URL as the request path (handled by
+          :meth:`_send_once`).
+
+        Honours ``self.verify``:
+
+        - ``True`` — system default CA bundle.
+        - ``False`` — no certificate verification.
+        - ``str`` — path to a custom CA bundle file or directory.
         """
+        connect_timeout = _floor_connect_timeout(connect_timeout)
+        proxy = self._resolve_proxy_for(scheme, host)
+
         if scheme == "https":
-            if self.verify:
-                ssl_ctx: ssl.SSLContext = ssl.create_default_context()
-            else:
-                ssl_ctx = ssl._create_unverified_context()  # type: ignore[attr-defined]
-                ssl_ctx.check_hostname = False
+            ssl_ctx: ssl.SSLContext = _make_ssl_context(self.verify)
+
+            if proxy is not None:
+                try:
+                    return self._build_connect_tunnel(
+                        proxy, host, port, connect_timeout, ssl_ctx,
+                    )
+                except (ProxyError, OSError) as exc:
+                    exc_msg = str(exc)
+                    if "CERTIFICATE_VERIFY_FAILED" in exc_msg:
+                        LOGGER.error(
+                            "SSL certificate verification failed for %s:%s "
+                            "(tunneled via proxy %s:%s). "
+                            "Use HTTPSession(verify=False) or session.insecure(): %s",
+                            host, port, proxy.host, proxy.port, exc_msg,
+                        )
+                    else:
+                        LOGGER.warning(
+                            "Proxy %s:%s failed for %s:%s (%s)",
+                            proxy.host, proxy.port, host, port, exc,
+                        )
+                    mark_proxy_dead(proxy)
+
             return http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
             )
+
+        # Plain HTTP
+        if proxy is not None:
+            proxy_host = proxy.host
+            proxy_port = proxy.port or (443 if proxy.scheme == "https" else 8080)
+            try:
+                conn = http.client.HTTPConnection(
+                    proxy_host, port=proxy_port, timeout=connect_timeout,
+                )
+                conn.connect()
+                conn._ygg_proxy = True  # type: ignore[attr-defined]
+                return conn
+            except OSError as exc:
+                LOGGER.warning(
+                    "Proxy %s:%s unreachable (%s) — falling back to direct",
+                    proxy_host, proxy_port, exc,
+                )
+                mark_proxy_dead(proxy)
+
         return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
+
+    def _build_connect_tunnel(
+        self,
+        proxy: URL,
+        host: str,
+        port: int,
+        connect_timeout: float,
+        ssl_ctx: ssl.SSLContext,
+    ) -> http.client.HTTPSConnection:
+        """Establish an HTTPS connection through an HTTP CONNECT tunnel.
+
+        Opens a TCP socket to the proxy, sends ``CONNECT host:port``,
+        reads the status line, then upgrades the *same* socket to TLS
+        for the target host.  The proxy sees only opaque bytes after
+        the 200 handshake.
+        """
+        proxy_host = proxy.host
+        proxy_port = proxy.port or (443 if proxy.scheme == "https" else 8080)
+
+        # Low-level socket connect — avoids http.client's response
+        # machinery which can detach/close the socket after getresponse().
+        raw_sock = socket.create_connection(
+            (proxy_host, proxy_port), timeout=connect_timeout,
+        )
+        try:
+            # Hand-roll the CONNECT request so we keep full control of
+            # the socket lifecycle.  No chunked encoding, no body.
+            connect_line = f"CONNECT {host}:{port} HTTP/1.1\r\n"
+            header_lines = f"Host: {host}:{port}\r\n"
+            for k, v in self._proxy_auth_headers(proxy).items():
+                header_lines += f"{k}: {v}\r\n"
+            raw_sock.sendall((connect_line + header_lines + "\r\n").encode())
+
+            # Read the status line + headers.  The proxy's 200 response
+            # to CONNECT has no body — after the blank line the socket
+            # is a raw tunnel.
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = raw_sock.recv(4096)
+                if not chunk:
+                    raise ProxyError(
+                        f"Proxy {proxy_host}:{proxy_port} closed connection "
+                        f"during CONNECT handshake"
+                    )
+                buf += chunk
+
+            status_line = buf.split(b"\r\n", 1)[0].decode(errors="replace")
+            # "HTTP/1.1 200 Connection established"
+            parts = status_line.split(None, 2)
+            status_code = int(parts[1]) if len(parts) >= 2 else 0
+            if status_code != 200:
+                reason = parts[2] if len(parts) >= 3 else "unknown"
+                raise ProxyError(
+                    f"CONNECT tunnel to {host}:{port} via "
+                    f"{proxy_host}:{proxy_port} failed: "
+                    f"{status_code} {reason}"
+                )
+
+            # Upgrade to TLS on the now-transparent tunnel.
+            tls_sock = ssl_ctx.wrap_socket(raw_sock, server_hostname=host)
+            conn = http.client.HTTPSConnection(
+                host, port=port, timeout=connect_timeout, context=ssl_ctx,
+            )
+            conn.sock = tls_sock
+            return conn
+        except Exception:
+            try:
+                raw_sock.close()
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def _proxy_auth_headers(proxy: URL) -> dict[str, str]:
+        """Build ``Proxy-Authorization`` from userinfo in the proxy URL."""
+        user = proxy.user
+        if not user:
+            return {}
+        import base64
+        password = proxy.password or ""
+        cred = base64.b64encode(f"{user}:{password}".encode()).decode()
+        return {"Proxy-Authorization": f"Basic {cred}"}
 
     def _get_connection(
         self,
@@ -722,12 +1071,20 @@ class HTTPSession(Session):
         port: int,
         connect_timeout: Optional[float],
     ) -> http.client.HTTPConnection:
-        """Pop an idle connection for *(scheme, host, port)* or build one."""
+        """Pop an idle connection for *(scheme, host, port)* or build one.
+
+        Lock-free: ``collections.deque.popleft`` is atomic under CPython's
+        GIL, so the hot path (pooled-connection reuse) never blocks.  A
+        concurrent ``_release_connection`` that appends to the same deque
+        races harmlessly — worst case we build one extra connection.
+        """
         key = (scheme, host, port)
-        with self._lock:
-            cached = self._connections.get(key)
-            if cached:
+        cached = self._connections.get(key)
+        if cached:
+            try:
                 return cached.popleft()
+            except IndexError:
+                pass
         return self._build_connection(scheme, host, port, connect_timeout)
 
     def _release_connection(
@@ -740,16 +1097,23 @@ class HTTPSession(Session):
         Called by :meth:`HTTPResponse.release_conn` after a response is
         fully drained. Connections beyond ``pool_maxsize`` get closed
         instead of cached so a runaway caller can't leak sockets.
+
+        Lock-free: ``deque.append`` is GIL-atomic.  The ``len`` check
+        is a racy approximation — worst case the deque grows slightly
+        past ``pool_maxsize``, which is harmless (one extra idle socket
+        that gets reaped on the next overshoot or ``clear_connections``).
         """
-        with self._lock:
-            cached = self._connections.setdefault(key, collections.deque())
-            if len(cached) < self.pool_maxsize:
-                cached.append(conn)
-                return
-        try:
-            conn.close()
-        except Exception:
-            pass
+        cached = self._connections.get(key)
+        if cached is None:
+            cached = collections.deque()
+            self._connections[key] = cached
+        if len(cached) < self.pool_maxsize:
+            cached.append(conn)
+        else:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def clear_connections(self) -> None:
         """Close every cached idle connection.
@@ -758,9 +1122,8 @@ class HTTPSession(Session):
         accumulated. Not called automatically; explicit cleanup is the
         caller's responsibility (or rely on process exit).
         """
-        with self._lock:
-            cached, self._connections = self._connections, {}
-        for queue in cached.values():
+        old, self._connections = self._connections, {}
+        for queue in old.values():
             while queue:
                 try:
                     queue.popleft().close()
@@ -861,6 +1224,15 @@ class HTTPSession(Session):
                     )
                     retries.sleep()
                     continue
+                if "CERTIFICATE_VERIFY_FAILED" in msg and self.verify is not False:
+                    LOGGER.warning(
+                        "SSL certificate verification failed for %s — "
+                        "retrying with verify=False: %s",
+                        current_request.url, msg,
+                    )
+                    self.verify = False
+                    self.clear_connections()
+                    continue
                 raise SSLError(msg) from exc
             except (OSError, http.client.HTTPException) as exc:
                 url_str = current_request.url.to_string()
@@ -942,9 +1314,19 @@ class HTTPSession(Session):
             path = f"{path}?{url.query}"
 
         connect_timeout, read_timeout = _resolve_timeout(timeout)
+        connect_timeout = _floor_connect_timeout(connect_timeout)
         key = (scheme, host, port)
         conn = self._get_connection(scheme, host, port, connect_timeout)
         from_pool = conn.sock is not None
+
+        # Plain HTTP through a proxy: send the absolute URL as the
+        # request-target so the proxy knows where to forward.
+        is_http_proxy = getattr(conn, "_ygg_proxy", False)
+        if is_http_proxy:
+            request_path = url.to_string()
+        else:
+            request_path = path
+
         try:
             # Establish the TCP+TLS connection with the connect timeout.
             # stdlib http.client only applies conn.timeout at connect() time,
@@ -961,10 +1343,14 @@ class HTTPSession(Session):
             send_headers.setdefault(
                 "Host", f"{host}:{port}" if port not in (80, 443) else host,
             )
+            if is_http_proxy:
+                proxy = self._resolve_proxy_for(scheme, host)
+                if proxy:
+                    send_headers.update(self._proxy_auth_headers(proxy))
             body = request.buffer.to_bytes() if request.buffer is not None else None
             if body is not None and "Content-Length" not in send_headers:
                 send_headers["Content-Length"] = str(len(body))
-            conn.request(request.method, path, body=body, headers=send_headers)
+            conn.request(request.method, request_path, body=body, headers=send_headers)
             raw = conn.getresponse()
         except socket.timeout as exc:
             try:
@@ -1047,6 +1433,28 @@ class HTTPSession(Session):
 
         raise ValueError(f"Cannot build session from scheme: {parsed.scheme!r}")
 
+    def insecure(self) -> "HTTPSession":
+        """Return a session with SSL verification disabled.
+
+        If ``self`` already has ``verify=False``, returns ``self``.
+        Otherwise returns a new :class:`HTTPSession` with the same
+        ``base_url`` / ``headers`` / ``waiting`` / ``auth`` / ``proxy``
+        / ``no_proxy`` but ``verify=False``.
+
+        Emits :class:`InsecureRequestWarning` on first construction.
+        """
+        if self.verify is False:
+            return self
+        return type(self)(
+            base_url=self.base_url,
+            verify=False,
+            headers=self.headers,
+            waiting=self.waiting,
+            auth=self.auth,
+            proxy=self.proxy,
+            no_proxy=self.no_proxy,
+        )
+
     def send(
         self,
         request: HTTPRequest,
@@ -1122,6 +1530,7 @@ class HTTPSession(Session):
             if cfg.raise_error:
                 response.raise_for_status()
             return response
+        return None
 
     def _build_idle_response(
         self,
@@ -1146,58 +1555,24 @@ class HTTPSession(Session):
     def refresh_auth(
         self,
         request: HTTPRequest,
-        force: bool = True,
-    ) -> "tuple[Session, bool]":
+        force: bool = False,
+    ) -> bool:
         """Resolve the auth handler and stamp the Authorization header.
 
-        Per-request ``request.auth`` wins over the session-wide
-        ``self.auth``. When a handler is bound, ``refresh_auth`` calls
-        its ``refresh(force=force)`` if it exposes one — MSAL-style
-        handlers use ``force`` to bypass the in-memory token cache
-        and mint a fresh credential — then reads its ``authorization``
-        property, writes the value to ``request.headers["Authorization"]``,
-        and (when the resolved handler is the session-wide one) keeps
-        ``self.headers["Authorization"]`` in sync so the session-level
-        view stays current too.
+        Called automatically by ``_local_send`` on 401/403 responses.
+        Per-request ``request.auth`` wins over session-wide ``self.auth``.
 
-        Returns ``(self, refreshed)`` where ``refreshed`` is ``True``
-        when a handler ran and the header was stamped, ``False`` when
-        the silent no-op branch was taken (force=False + no handler).
-        Returning ``self`` lets the caller chain
-        (``session.refresh_auth(req)[0].send(req)``); the bool surfaces
-        whether the request now carries an Authorization header so a
-        retry loop can short-circuit when nothing changed.
+        Returns ``True`` when a handler ran and the header was stamped,
+        ``False`` when no handler is bound and ``force=False``.
 
-        When **no** handler is bound:
+        Override this method in your session subclass to implement custom
+        auth flows (query-param tokens, API-key rotation, challenge-
+        response, etc.)::
 
-        - ``force=True`` (default) → raises
-          :class:`~yggdrasil.exceptions.AuthRequiredError`. The caller
-          explicitly asked to force-refresh credentials and there is
-          nothing to refresh — failing fast catches misconfigured
-          integrations at the right line instead of letting an
-          un-authenticated send go to the wire.
-        - ``force=False`` → returns ``(self, False)``. This is the
-          steady-state path used by
-          :meth:`prepare_request_before_send`: a request to a public
-          endpoint shouldn't fail just because the session doesn't
-          have a token to refresh.
-
-        Two regular call sites:
-
-        - :meth:`prepare_request_before_send` calls this with
-          ``force=False`` so steady-state requests reuse the cached
-          token (the handler's own ``is_expired`` / refresh-skew
-          logic still mints a new one when the cache is empty or
-          stale).
-        - The HTTP send path calls this with the default ``force=True``
-          after a 403, to mint a fresh token before the single retry —
-          some vendors (Salesforce, M365, …) return 403 instead of
-          401 when a previously-valid token has been silently rotated
-          upstream.
-
-        Subclasses with vendor-specific auth (HMAC signing, SigV4,
-        challenge-response) override this to do whatever their API
-        needs while keeping the same contract.
+            class MySession(HTTPSession):
+                def refresh_auth(self, request, force=True):
+                    request.headers["X-API-Key"] = self._rotate_key()
+                    return True
         """
         handler = request.auth or self.auth
         if handler is None:
@@ -1205,42 +1580,38 @@ class HTTPSession(Session):
                 from yggdrasil.exceptions import AuthRequiredError
                 raise AuthRequiredError(
                     f"refresh_auth(force=True) requested but no Authorization "
-                    f"handler is bound to the request or to {type(self).__name__}. "
-                    "Bind one via Session(auth=handler), request.auth=handler, "
-                    "or call refresh_auth(request, force=False) if a missing "
-                    "handler should be tolerated.",
+                    f"handler is bound to the request or to "
+                    f"{type(self).__name__!r}. "
+                    f"Either bind an auth handler via "
+                    f"{type(self).__name__}(auth=handler) or "
+                    f"request.auth=handler, or override "
+                    f"{type(self).__name__}.refresh_auth() to implement "
+                    f"custom auth refresh logic.",
                     request=request,
                 )
-            return self, False
+            return False
         refresh = getattr(handler, "refresh", None)
         if callable(refresh):
             try:
                 refresh(force=force)
             except TypeError:
-                # Handler's refresh() doesn't accept ``force`` — fall
-                # back to a no-arg call so legacy handlers still work.
                 refresh()
         authorization = handler.authorization
         if request.headers is None:
             request.headers = HTTPHeaders()
         request.headers["Authorization"] = authorization
-        # Mirror the refresh on the session-level header when the
-        # session-wide handler is what we just ran — a per-request
-        # override (request.auth) deliberately doesn't pollute the
-        # session view.
         if handler is self.auth:
             self.headers["Authorization"] = authorization
-        return self, True
+        return True
 
     def prepare_request_before_send(self, request: HTTPRequest) -> HTTPRequest:
         """Session-wide request hook fired once per outbound request.
 
-        Default returns *request* unchanged. Subclasses override to inject
-        session-level concerns — auth, signing, correlation IDs, mandatory
-        headers — that should apply to every request leaving this session.
-        Runs in :meth:`_send` just before :meth:`_local_send`, so cache hits
-        bypass it. Travels with the session into Spark workers via
-        ``__getstate__`` / ``__setstate__``.
+        Stamps the session reference, ``sent_at`` timestamp, merged
+        headers, and auth. When the request's ``local_cache`` has
+        ``received_from`` / ``received_to`` but no ``tabular``, fills
+        in the session's default local-cache folder. A bare
+        ``session.get(url)`` with no cache config does no disk I/O.
         """
         request.attach_session(self)
         request.sent_at = dt.datetime.now(dt.timezone.utc)
@@ -1248,12 +1619,38 @@ class HTTPSession(Session):
             if request.headers is None:
                 request.headers = {}
             request.headers.update(self.headers)
-        # Steady-state requests reuse the handler's cached token; the
-        # 403 retry path in HTTPSession._local_send re-calls
-        # ``refresh_auth`` with ``force=True`` to bypass that cache
-        # when the upstream rotated the credential.
         self.refresh_auth(request, force=False)
+        self._coalesce_local_cache(request)
         return request
+
+    def _coalesce_local_cache(self, request: HTTPRequest) -> None:
+        """Fill in local-cache defaults when a time range is defined.
+
+        When the request's ``SendConfig`` (or its ``local_cache``) carries
+        ``received_from`` / ``received_to`` timestamps but no ``tabular``
+        backend, the session's default local-cache folder is plugged in.
+        ``cleanup_ttl`` defaults to 1 day when unset.
+
+        This keeps caching opt-in — a bare ``session.get(url)`` with no
+        ``SendConfig`` does not trigger any disk I/O.
+        """
+        sc = request.send_config
+        if sc is None:
+            return
+        lc = sc.local_cache
+        if lc is None:
+            return
+        changed = False
+        if lc.tabular is None and (lc.received_from is not None or lc.received_to is not None):
+            lc.tabular = self.local_cache()
+            changed = True
+        if lc.cleanup_ttl is None:
+            pass
+        elif changed and lc.cleanup_ttl == dt.timedelta(days=1):
+            pass
+        if lc.tabular is not None and lc.cleanup_ttl is not None:
+            from yggdrasil.http_.cache_config import _start_cleanup_daemon, _DEFAULT_CACHE_ROOT
+            _start_cleanup_daemon(_DEFAULT_CACHE_ROOT, lc.cleanup_ttl)
 
     def prepare_response_after_received(self, response: HTTPResponse) -> HTTPResponse:
         """Session-wide response hook fired once per completed network send.
@@ -1292,21 +1689,17 @@ class HTTPSession(Session):
 
         result = self._wire_send(request, wait_cfg)
 
-        # 403 → refresh auth and retry once. The pool's status_forcelist
-        # covers 5xx / 429 transients; 403 is a deliberate auth signal
-        # some vendors (Salesforce, M365 SharePoint, …) emit instead
-        # of 401 when a previously-valid token has been silently
-        # rotated upstream. Only worth retrying when an auth handler
-        # is actually bound — otherwise the second attempt would
-        # carry the same headers and 403 again.
-        if result.status_code == 403 and (request.auth or self.auth) is not None:
+        if result.status_code in (401, 403):
             LOGGER.warning(
-                "Refreshing auth after 403 for %s %s — retrying once",
-                request.method, request.url,
+                "Refreshing auth after %d for %s %s — retrying once",
+                result.status_code, request.method, request.url,
             )
-            _, refreshed = self.refresh_auth(request)  # force=True default
-            if refreshed:
-                result = self._wire_send(request, wait_cfg)
+            try:
+                if self.refresh_auth(request, force=True):
+                    request = self.prepare_request_before_send(request)
+                    result = self._wire_send(request, wait_cfg)
+            except Exception:
+                LOGGER.debug("refresh_auth failed on %d retry", result.status_code, exc_info=True)
 
         x_current_page = result.headers.get("X-Current-Page")
         x_total_pages = result.headers.get("X-Last-Page")
@@ -1654,11 +2047,51 @@ class HTTPSession(Session):
     ) -> Iterator[HTTPResponse]:
         """Stream responses, flattening the per-chunk :class:`HTTPResponseBatch`.
 
-        In Spark mode ``raise_error`` is applied at the driver-iteration
-        boundary so a single failure doesn't poison a whole partition.
+        Fast path: when no cache is configured on any request, bypasses
+        the full HTTPResponseBatch pipeline (cache split, Arrow table
+        build, writeback) and dispatches directly through the thread
+        pool — ~10x faster for uncached workloads.
         """
-        for batch in self._send_many_batches(requests, **batch_kw):
+        reqs = list(requests)
+        if reqs and self._can_fast_path(reqs):
+            yield from self._send_many_fast(reqs)
+            return
+        for batch in self._send_many_batches(iter(reqs), **batch_kw):
             yield from batch.responses()
+
+    def _can_fast_path(self, reqs: list[HTTPRequest]) -> bool:
+        """True when no request needs the full batch pipeline.
+
+        Returns False when any request carries cache config (local or
+        remote) or ``cache_only`` mode — those need the full
+        HTTPResponseBatch read/write flow.
+        """
+        for r in reqs:
+            sc = r.send_config
+            if sc is None:
+                continue
+            if sc.remote_cache is not None:
+                return False
+            if sc.cache_only:
+                return False
+            if sc.local_cache is not None:
+                return False
+        return True
+
+    def _send_many_fast(
+        self,
+        reqs: list[HTTPRequest],
+    ) -> Iterator[HTTPResponse]:
+        """Sequential dispatch — straight to the wire.
+
+        For ``http.client``-backed transports (all of yggdrasil's HTTP),
+        the GIL serialises socket I/O so threading adds ~100ms overhead
+        per batch without any parallelism gain on a single host. The
+        keep-alive connection pool already amortises TCP/TLS setup, so
+        sequential send over a warm pool is the fastest path.
+        """
+        for r in reqs:
+            yield self._send(r)
 
     def send_many_batches(
         self,
@@ -1821,6 +2254,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         *,
         config: SendConfig | Mapping[str, Any] | None = None,
+        send_config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: IO | bytes | None = None,
@@ -1831,8 +2265,8 @@ class HTTPSession(Session):
         timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         normalize: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
         send: bool = True,
         **options,
     ) -> HTTPResponse | HTTPRequest:
@@ -1840,6 +2274,7 @@ class HTTPSession(Session):
             "GET",
             url,
             config=config,
+            send_config=send_config,
             params=params,
             headers=headers,
             body=body,
@@ -1861,6 +2296,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         *,
         config: SendConfig | Mapping[str, Any] | None = None,
+        send_config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: IO | bytes | None = None,
@@ -1872,8 +2308,8 @@ class HTTPSession(Session):
         timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         normalize: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
         send: bool = True,
         **options,
     ) -> HTTPResponse | HTTPRequest:
@@ -1881,6 +2317,7 @@ class HTTPSession(Session):
             "POST",
             url,
             config=config,
+            send_config=send_config,
             params=params,
             headers=headers,
             body=body,
@@ -1903,6 +2340,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         *,
         config: SendConfig | Mapping[str, Any] | None = None,
+        send_config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: IO | bytes | None = None,
@@ -1914,8 +2352,8 @@ class HTTPSession(Session):
         timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         normalize: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
         send: bool = True,
         **options,
     ) -> HTTPResponse | HTTPRequest:
@@ -1923,6 +2361,7 @@ class HTTPSession(Session):
             "PUT",
             url,
             config=config,
+            send_config=send_config,
             params=params,
             headers=headers,
             body=body,
@@ -1945,6 +2384,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         *,
         config: SendConfig | Mapping[str, Any] | None = None,
+        send_config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: IO | bytes | None = None,
@@ -1956,8 +2396,8 @@ class HTTPSession(Session):
         timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         normalize: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
         send: bool = True,
         **options,
     ) -> HTTPResponse | HTTPRequest:
@@ -1965,6 +2405,7 @@ class HTTPSession(Session):
             "PATCH",
             url,
             config=config,
+            send_config=send_config,
             params=params,
             headers=headers,
             body=body,
@@ -1987,6 +2428,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         *,
         config: SendConfig | Mapping[str, Any] | None = None,
+        send_config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: IO | bytes | None = None,
@@ -1998,8 +2440,8 @@ class HTTPSession(Session):
         timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         normalize: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
         send: bool = True,
         **options,
     ) -> HTTPResponse | HTTPRequest:
@@ -2007,6 +2449,7 @@ class HTTPSession(Session):
             "DELETE",
             url,
             config=config,
+            send_config=send_config,
             params=params,
             headers=headers,
             body=body,
@@ -2029,6 +2472,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         *,
         config: SendConfig | Mapping[str, Any] | None = None,
+        send_config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: IO | bytes | None = None,
@@ -2039,8 +2483,8 @@ class HTTPSession(Session):
         timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         normalize: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
         send: bool = True,
         **options,
     ) -> HTTPResponse | HTTPRequest:
@@ -2048,6 +2492,7 @@ class HTTPSession(Session):
             "HEAD",
             url,
             config=config,
+            send_config=send_config,
             params=params,
             headers=headers,
             body=body,
@@ -2069,6 +2514,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         *,
         config: SendConfig | Mapping[str, Any] | None = None,
+        send_config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: IO | bytes | None = None,
@@ -2080,8 +2526,8 @@ class HTTPSession(Session):
         timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         normalize: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
         send: bool = True,
         **options,
     ) -> HTTPResponse | HTTPRequest:
@@ -2089,6 +2535,7 @@ class HTTPSession(Session):
             "OPTIONS",
             url,
             config=config,
+            send_config=send_config,
             params=params,
             headers=headers,
             body=body,
@@ -2112,6 +2559,7 @@ class HTTPSession(Session):
         url: URL | str | None = None,
         *,
         config: SendConfig | Mapping[str, Any] | None = None,
+        send_config: SendConfig | Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         body: IO | bytes | None = None,
@@ -2123,11 +2571,15 @@ class HTTPSession(Session):
         timeout: WaitingConfigArg = None,
         raise_error: bool = True,
         normalize: bool = True,
-        remote_cache: CacheConfig | Mapping[str, Any] | None = None,
-        local_cache: CacheConfig | Mapping[str, Any] | None = None,
+        remote_cache: CacheConfig | Mapping[str, Any] | None = ...,
+        local_cache: CacheConfig | Mapping[str, Any] | None = ...,
         send: bool = True,
         **options,
     ) -> HTTPResponse | HTTPRequest:
+        if send_config is not None:
+            if config is not None:
+                raise ValueError("Pass only one of config= or send_config= (got both).")
+            config = send_config
         # ``requests``-style aliases: ``data=`` becomes ``body=`` (with
         # form-urlencoding for mappings/sequences), ``timeout=`` becomes
         # ``wait=``, and ``cookies=`` joins ``headers={'Cookie': ...}``.

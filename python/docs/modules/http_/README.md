@@ -104,7 +104,56 @@ print([r.status for r in responses])
 
 ---
 
-## 6) Response handling and conversions
+## 6) Proxy support
+
+```python
+from yggdrasil.http_ import HTTPSession
+
+# Explicit proxy
+http = HTTPSession(proxy="http://proxy.corp:8080")
+
+# Proxy with authentication
+http = HTTPSession(proxy="http://user:pass@proxy.corp:8080")
+
+# Bypass proxy for specific hosts
+http = HTTPSession(
+    proxy="http://proxy.corp:8080",
+    no_proxy="localhost,127.0.0.1,.internal.corp",
+)
+```
+
+When no explicit `proxy` is passed, the session reads the standard environment
+variables: `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`.
+
+HTTPS targets use an HTTP CONNECT tunnel — the proxy sees only opaque bytes.
+Plain HTTP targets send the absolute URL as the request path.
+
+## 7) SSL verification
+
+```python
+from yggdrasil.http_ import HTTPSession
+
+# Default: full certificate verification
+http = HTTPSession(verify=True)
+
+# Disable verification (emits InsecureRequestWarning)
+http = HTTPSession(verify=False)
+
+# Custom CA bundle
+http = HTTPSession(verify="/path/to/ca-bundle.crt")
+
+# Quick toggle from an existing session
+insecure = http.insecure()
+```
+
+Suppress the warning when verification is intentionally disabled:
+
+```python
+from yggdrasil.http_.exceptions import disable_warnings, InsecureRequestWarning
+disable_warnings(InsecureRequestWarning)
+```
+
+## 8) Response handling and conversions
 
 ```python
 from yggdrasil.http_ import HTTPSession
@@ -127,7 +176,7 @@ If your endpoint returns tabular JSON/Arrow-compatible payloads, you can project
 
 ---
 
-## 7) Practical recipe: resilient paged pull + normalization
+## 9) Practical recipe: resilient paged pull + normalization
 
 ```python
 from yggdrasil.http_ import HTTPSession

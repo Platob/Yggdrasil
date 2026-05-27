@@ -674,6 +674,9 @@ class WarehouseStatementResult(StatementResult):
         self.statement_id = statement_id
         self._response = _response
         super().__init__(statement=statement, executor=executor, **kwargs)
+        if self._response is not None and isinstance(self._response, StatementResponse):
+            sdk_state = self._response.status.state if self._response.status else StatementState.PENDING
+            self._state = _SDK_TO_STATE.get(sdk_state, State.PENDING)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -745,12 +748,13 @@ class WarehouseStatementResult(StatementResult):
         pass
 
     def set_api_response(self, response: StatementResponse) -> "WarehouseStatementResult":
-        """Test hook: stuff a fully-formed API response into the result."""
+        """Bind a fully-formed API response and sync Awaitable state."""
         self._response = response
 
         if isinstance(self._response, StatementResponse):
             self.statement_id = response.statement_id
             state = response.status.state if response.status else StatementState.PENDING
+            self._state = _SDK_TO_STATE.get(state, State.PENDING)
 
             if state in DONE_STATES:
                 self.statement.clear_temporary_resources()
