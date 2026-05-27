@@ -3157,7 +3157,7 @@ class Table(DatabricksPath):
                 service=self.service.volumes,
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
-                volume_name="tmp" # self.client.safe_tag_value(self.table_name, repl="_").lower()
+                volume_name=self.client.safe_tag_value(self.table_name, repl="_").lower()
             )
         return self._staging_volume
 
@@ -3264,7 +3264,6 @@ class Table(DatabricksPath):
         wait = WaitingConfig.from_(wait)
         staging = self.insert_volume_path(target, temporary=bool(wait))
         output_data: "Tabular | None" = None
-        staging.volume.create()
         staging.write_table(data, cast_options, mode=Mode.OVERWRITE)
         if return_data:
             output_data = staging.read_arrow_table()
