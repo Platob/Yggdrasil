@@ -196,6 +196,23 @@ def _should_bypass_proxy(host: str, no_proxy: str | None = None) -> bool:
 VerifyArg = "bool | str | pathlib.Path"
 
 
+_DEFAULT_CONNECT_TIMEOUT: float = 30.0
+
+
+def _floor_connect_timeout(timeout: Optional[float]) -> float:
+    """Ensure a connect timeout is never ``None`` (infinite).
+
+    ``http.client.HTTPConnection(timeout=None)`` means "block until the
+    OS gives up" — which on some platforms is 2+ minutes and on others
+    is infinite.  This helper applies a floor so callers that forget to
+    set a timeout (``WaitingConfig(timeout=0)`` → ``Timeout(connect=None)``)
+    don't hang the process.
+    """
+    if timeout is None or timeout <= 0:
+        return _DEFAULT_CONNECT_TIMEOUT
+    return timeout
+
+
 def _make_ssl_context(verify: "bool | str | pathlib.Path") -> ssl.SSLContext:
     """Build an :class:`ssl.SSLContext` from a ``verify`` argument.
 
@@ -844,6 +861,7 @@ class HTTPSession(Session):
         - ``False`` — no certificate verification.
         - ``str`` — path to a custom CA bundle file or directory.
         """
+        connect_timeout = _floor_connect_timeout(connect_timeout)
         proxy = self._resolve_proxy_for(scheme, host)
 
         if scheme == "https":
@@ -1144,6 +1162,7 @@ class HTTPSession(Session):
             path = f"{path}?{url.query}"
 
         connect_timeout, read_timeout = _resolve_timeout(timeout)
+        connect_timeout = _floor_connect_timeout(connect_timeout)
         key = (scheme, host, port)
         conn = self._get_connection(scheme, host, port, connect_timeout)
         from_pool = conn.sock is not None
