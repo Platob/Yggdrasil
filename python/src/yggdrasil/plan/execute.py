@@ -101,9 +101,11 @@ class _Context:
             if has_agg and not node.group_by:
                 result = self._exec_group_by(result, node)
 
-        # HAVING
+        # HAVING — rewrite aggregate references to materialized column names
         if node.having is not None:
-            result = result.filter(node.having)
+            rewritten = self._rewrite_having(node.having, result)
+            if rewritten is not None:
+                result = result.filter(rewritten)
 
         # Projection (SELECT list) — only column selection for now
         if node.projections and not node.group_by:
@@ -371,6 +373,49 @@ class _Context:
         if isinstance(expr, Literal):
             return expr.value
         return None
+
+    def _rewrite_having(self, having: Any, result: "Tabular") -> Any:
+        """Rewrite HAVING predicate: replace aggregate FunctionCalls with
+        column references pointing to materialized aggregate column names."""
+        from yggdrasil.execution.expr.nodes import (
+            Column, Comparison, FunctionCall, Logical, Not, Star,
+        )
+
+        col_names = set(result.read_arrow_table().column_names)
+
+        def _rewrite(expr: Any) -> Any:
+            if isinstance(expr, FunctionCall):
+                agg_name = expr.name.lower()
+                if expr.args and isinstance(expr.args[0], Column):
+                    candidate = f"{expr.args[0].name}_{agg_name}"
+                elif expr.args and isinstance(expr.args[0], Star):
+                    for cn in col_names:
+                        if cn.endswith(f"_{agg_name}"):
+                            return Column(name=cn)
+                    return expr
+                else:
+                    return expr
+                if candidate in col_names:
+                    return Column(name=candidate)
+                return expr
+            if isinstance(expr, Comparison):
+                return Comparison(_rewrite(expr.left), expr.op, _rewrite(expr.right))
+            if isinstance(expr, Logical):
+                return Logical(expr.op, tuple(_rewrite(o) for o in expr.operands))
+            if isinstance(expr, Not):
+                return Not(_rewrite(expr.operand))
+            return expr
+
+        rewritten = _rewrite(having)
+        has_func = False
+        from yggdrasil.execution.expr import walk
+        for node in walk(rewritten):
+            if isinstance(node, FunctionCall):
+                has_func = True
+                break
+        if has_func:
+            return None
+        return rewritten
 
     def _can_spark_passthrough(self, node: SelectNode) -> bool:
         return node.group_by is not None or bool(node.set_ops)

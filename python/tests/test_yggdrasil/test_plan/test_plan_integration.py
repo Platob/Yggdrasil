@@ -15,7 +15,7 @@ from yggdrasil.plan import (
     parse_sql,
 )
 from yggdrasil.plan.nodes import ScanNode
-from yggdrasil.plan.ops import TableRef
+from yggdrasil.plan.ops import JoinClause, TableRef
 
 
 # ---------------------------------------------------------------------------
