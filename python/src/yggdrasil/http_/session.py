@@ -1509,17 +1509,20 @@ class HTTPSession(Session):
     ) -> bool:
         """Resolve the auth handler and stamp the Authorization header.
 
-        Per-request ``request.auth`` wins over the session-wide
-        ``self.auth``. When a handler is bound, calls its
-        ``refresh(force=force)`` then reads ``authorization`` and
-        stamps both the request and (when session-wide) the session
-        headers.
+        Called automatically by ``_local_send`` on 401/403 responses.
+        Per-request ``request.auth`` wins over session-wide ``self.auth``.
 
         Returns ``True`` when a handler ran and the header was stamped,
-        ``False`` when no handler is bound (or ``force=False`` no-op).
+        ``False`` when no handler is bound and ``force=False``.
 
-        When no handler is bound and ``force=True``, raises
-        :class:`~yggdrasil.exceptions.AuthRequiredError`.
+        Override this method in your session subclass to implement custom
+        auth flows (query-param tokens, API-key rotation, challenge-
+        response, etc.)::
+
+            class MySession(HTTPSession):
+                def refresh_auth(self, request, force=True):
+                    request.headers["X-API-Key"] = self._rotate_key()
+                    return True
         """
         handler = request.auth or self.auth
         if handler is None:
@@ -1527,10 +1530,13 @@ class HTTPSession(Session):
                 from yggdrasil.exceptions import AuthRequiredError
                 raise AuthRequiredError(
                     f"refresh_auth(force=True) requested but no Authorization "
-                    f"handler is bound to the request or to {type(self).__name__}. "
-                    "Bind one via Session(auth=handler), request.auth=handler, "
-                    "or call refresh_auth(request, force=False) if a missing "
-                    "handler should be tolerated.",
+                    f"handler is bound to the request or to "
+                    f"{type(self).__name__!r}. "
+                    f"Either bind an auth handler via "
+                    f"{type(self).__name__}(auth=handler) or "
+                    f"request.auth=handler, or override "
+                    f"{type(self).__name__}.refresh_auth() to implement "
+                    f"custom auth refresh logic.",
                     request=request,
                 )
             return False
@@ -1633,14 +1639,17 @@ class HTTPSession(Session):
 
         result = self._wire_send(request, wait_cfg)
 
-        if result.status_code in (401, 403) and (request.auth or self.auth) is not None:
+        if result.status_code in (401, 403):
             LOGGER.warning(
                 "Refreshing auth after %d for %s %s — retrying once",
                 result.status_code, request.method, request.url,
             )
-            if self.refresh_auth(request, force=True):
-                request = self.prepare_request_before_send(request)
-                result = self._wire_send(request, wait_cfg)
+            try:
+                if self.refresh_auth(request, force=True):
+                    request = self.prepare_request_before_send(request)
+                    result = self._wire_send(request, wait_cfg)
+            except Exception:
+                LOGGER.debug("refresh_auth failed on %d retry", result.status_code, exc_info=True)
 
         x_current_page = result.headers.get("X-Current-Page")
         x_total_pages = result.headers.get("X-Last-Page")
