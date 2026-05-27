@@ -92,10 +92,10 @@ pip install ygg
   Scalar conversion, schema-aware tabular cast, engine bridges.
 
 - :material-web: **[IO & HTTP](guides/io-http.md)**
-  `BytesIO`, `URL`, `HTTPSession`, batch dispatch, response conversions.
+  `URL`, `HTTPSession`, batch dispatch, response conversions.
 
 - :material-database: **[Databricks](guides/databricks.md)**
-  SQL, Unity Catalog, Compute, DBFS/Volumes, Secrets, IAM, Genie.
+  SQL, Unity Catalog, Compute, DBFS/Volumes, Secrets, IAM.
 
 - :material-tools: **[Development](guides/development.md)**
   Tests, lint, docs, optional dependencies.

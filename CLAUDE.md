@@ -27,8 +27,9 @@ python/src/yggdrasil/
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
   databricks/           Databricks SDK integrations
-next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
-  src/lib/time.ts       Java-style time utilities (Instant, ZonedDateTime, Duration)
+src/                    Frontend (React 19, Next.js 16, Tailwind v4)
+  app/                  Next.js app router pages
+  components/           Shared React components (globe, sidebar, logo)
 ```
 
 ## Node API
@@ -48,22 +49,18 @@ next/ygg/               Frontend (React 19, Next.js 16, Tailwind v4)
 | `/api/job` | Job definitions + scheduled runs |
 | `/api/messenger` | Real-time messaging channels |
 | `/api/call` | @remote function registry + invocation |
+| `/api/env` | Environment variable get/set |
+| `/api/fs` | Filesystem operations (ls, read, write, mkdir, upload, streaming) |
 
 ## Frontend Routes
 
 | Route | Description |
 |-------|-------------|
 | `/` | 3D globe welcome |
-| `/node` | Network overview — all nodes, closest neighbors |
-| `/node/{id}` | Node detail — resource graphs, processes |
-| `/node/functions` | Functions CRUD — create, edit, run |
-| `/node/functions/{id}` | Function detail — code, runs, SSE logs |
-| `/node/environments` | Python venv management |
-| `/node/environments/{id}` | Environment detail — packages, status |
-| `/node/dags` | DAG definitions — function pipelines |
-| `/node/dags/{id}` | DAG detail — step flow, runs |
-| `/node/network` | 3D network visualization |
-| `/node/execute` | Direct code execution |
+| `/bot` | Bot dashboard — node info, registry |
+| `/bot/chat` | Messaging chat interface |
+| `/bot/execute` | Direct Python/shell code execution |
+| `/bot/network` | 3D network visualization |
 | `/msg` | Messaging channels |
 
 ## Python Decorator Framework
@@ -96,6 +93,9 @@ The `@function` decorator infers: name, source code, dependencies (AST), python 
 
 `ygg node serve` — node + frontend | `ygg node front` — frontend only
 `ygg node serve --no-front` — node only | `ygg node status/stop` — daemon
+`ygg node install/uninstall` — boot service (systemd/launchd)
+`ygg node run` — call a @remote function | `ygg node chat` — YGGCHAT terminal
+`ygg databricks` — Databricks management CLI
 
 ## Environment
 
@@ -103,4 +103,4 @@ The `@function` decorator infers: name, source code, dependencies (AST), python 
 |----------|---------|---------|
 | `YGG_NODE_PORT` | 8100 | Node port |
 | `YGG_NODE_FRONT_PORT` | 3000 | Frontend port |
-| `NODE_API_URL` | `http://127.0.0.1:8100` | Frontend → node proxy |
+| `BOT_API_URL` | `http://127.0.0.1:8100` | Frontend → node proxy |

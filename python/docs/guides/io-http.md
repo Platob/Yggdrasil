@@ -107,22 +107,6 @@ for r in responses:
 print(rows)
 ```
 
-## Buffers — `BytesIO`
-
-`yggdrasil.io.BytesIO` is a spill-to-disk byte buffer with media/compression detection:
-
-```python
-from yggdrasil.io import BytesIO
-
-with BytesIO() as buf:
-    buf.write(b"hello")
-    buf.seek(0)
-    print(buf.compression)
-    print(buf.media_type)
-```
-
-Buffer changes anywhere in the codebase must preserve spill-to-disk behavior, codec handling, cursor safety, and Arrow/Parquet/JSON/IPC compatibility.
-
 ## URL parsing and composition
 
 ```python

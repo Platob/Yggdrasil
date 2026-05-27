@@ -9,8 +9,6 @@ This package gives you a **single entrypoint** (`DatabricksClient`) and service 
 - Compute cluster management and remote execution contexts
 - DBFS / Volume / Workspace file operations
 - Secrets and IAM administration
-- Jobs parameter parsing and typed notebook config
-- Genie conversational analytics
 
 ---
 
@@ -32,7 +30,6 @@ One-line style works across services:
 - FS: `DatabricksClient().dbfs_path("dbfs:/tmp/demo.txt").write_text("ok")`
 - Secrets: `DatabricksClient().secrets.create_secret("scope/key", "value")`
 - IAM: `next(DatabricksClient().iam.users.list(limit=1), None)`
-- Genie: `DatabricksClient().genie.ask("<space-id>", "weekly revenue")`
 
 ---
 
@@ -127,8 +124,6 @@ with ExecutionContext(cluster=cluster) as ctx:
 | `client.dbfs_path(...)` | DBFS/Volumes path operations | `client.dbfs_path("dbfs:/tmp/a.txt")` |
 | `client.secrets` | Scope/secret CRUD helpers | `client.secrets.create_secret("scope/key", "value")` |
 | `client.iam` | Users/groups in workspace/account scope | `client.iam.users.current_user` |
-| `client.genie` | Conversational BI workflows | `client.genie.ask("<space-id>", "top customers")` |
-| `client.compute` | Cluster lifecycle / remote execution | `client.compute.clusters.all_purpose_cluster(name="etl")` |
 
 ---
 
@@ -151,7 +146,4 @@ with ExecutionContext(cluster=cluster) as ctx:
 - [fs](fs/README.md)
 - [secrets](secrets/README.md)
 - [iam](iam/README.md)
-- [genie](genie/README.md)
-- [jobs](jobs/README.md)
-- [workflow](workflow/README.md) — Prefect-style `@flow` / `@task` API
 - [account](account/README.md)

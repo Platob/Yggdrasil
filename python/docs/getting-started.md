@@ -145,15 +145,14 @@ Service shortcuts:
 | Compute | `DatabricksClient().compute.clusters.all_purpose_cluster(name="etl")` |
 | DBFS / Volume | `DatabricksClient().dbfs_path("/Volumes/main/...").write_text("ok")` |
 | Secrets | `DatabricksClient().secrets["scope/key"] = "value"` |
-| Genie | `DatabricksClient().genie.ask("<space-id>", "weekly revenue")` |
 
-See the [Databricks guide](guides/databricks.md) for full workflows.
+See the [Databricks guide](guides/databricks.md) for details.
 
 ## 9. Where next
 
 - [Architecture](guides/architecture.md) — the cast registry and dispatch order.
 - [Casting guide](guides/casting.md) — scalar, tabular, and engine-specific casting.
-- [IO & HTTP](guides/io-http.md) — buffers, URLs, sessions, batch dispatch.
-- [Databricks](guides/databricks.md) — SQL, compute, files, secrets, IAM, Genie.
+- [IO & HTTP](guides/io-http.md) — URLs, sessions, batch dispatch.
+- [Databricks](guides/databricks.md) — SQL, compute, files, secrets, IAM.
 - [Module walkthrough](modules.md) — curated index of focused module pages.
 - [API Reference](api/index.md) — generated from the `yggdrasil` source tree.

@@ -26,7 +26,7 @@ Engines register their converters **on import** — pull them in once at startup
 
 | Module | Purpose | Page |
 |---|---|---|
-| `yggdrasil.io` | `BytesIO`, `URL`, `SendConfig`/`SendManyConfig`, codecs, media types | [io](modules/io/README.md) |
+| `yggdrasil.io` | `URL`, `SendConfig`/`SendManyConfig`, codecs, media types | [io](modules/io/README.md) |
 | `yggdrasil.http_` | `HTTPSession` (preferred HTTP client) | [http_](modules/http_/README.md) |
 
 ## Serialization
@@ -44,7 +44,7 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.databricks.sql` | SQL execution engine + helpers | [databricks/sql](modules/databricks/sql/README.md) |
 | `yggdrasil.databricks.catalog` | Unity Catalog `Catalog` resource + `Catalogs` service | [catalog/schema/table/column](modules/databricks/catalog/README.md) |
 | `yggdrasil.databricks.schema` | Unity Catalog `Schema` resource + `Schemas` service | [catalog/schema/table/column](modules/databricks/catalog/README.md) |
-| `yggdrasil.databricks.table` | Unity Catalog `Table` resource + `Tables` service, `AsyncInsertJob` | [catalog/schema/table/column](modules/databricks/catalog/README.md) |
+| `yggdrasil.databricks.table` | Unity Catalog `Table` resource + `Tables` service | [catalog/schema/table/column](modules/databricks/catalog/README.md) |
 | `yggdrasil.databricks.column` | Unity Catalog `Column` resource + `Columns` service | [catalog/schema/table/column](modules/databricks/catalog/README.md) |
 | `yggdrasil.databricks.volume` | Unity Catalog `Volume` — credentials, storage path, Arrow filesystem | [volume](modules/databricks/volume/README.md) |
 | `yggdrasil.databricks.warehouse` | `SQLWarehouse` lifecycle + `Warehouses` service | [warehouse](modules/databricks/warehouse/README.md) |
@@ -55,10 +55,7 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.databricks.fs` | DBFS / Volume / Workspace files | [fs](modules/databricks/fs/README.md) |
 | `yggdrasil.databricks.secrets` | Scope/secret helpers | [secrets](modules/databricks/secrets/README.md) |
 | `yggdrasil.databricks.iam` | Users + groups (workspace/account) | [iam](modules/databricks/iam/README.md) |
-| `yggdrasil.databricks.jobs` | Typed `NotebookConfig` widgets | [jobs](modules/databricks/jobs/README.md) |
-| `yggdrasil.databricks.workflow` | Workflow service: jobs, tasks, schedules | [workflow](modules/databricks/workflow/README.md) |
 | `yggdrasil.databricks.account` | Account-level service | [account](modules/databricks/account/README.md) |
-| `yggdrasil.databricks.genie` | Conversational analytics | [genie](modules/databricks/genie/README.md) |
 | `yggdrasil.databricks.constraints` | Table constraints (PK, FK) | [catalog/schema/table/column](modules/databricks/catalog/README.md) |
 
 ## Storage and databases
@@ -81,8 +78,6 @@ Engines register their converters **on import** — pull them in once at startup
 | `yggdrasil.pyutils` | `retry`, `parallelize` | [pyutils](modules/pyutils/README.md) |
 | `yggdrasil.concurrent` | `Job`, `AsyncJob`, `ThreadJob`, `JobPoolExecutor` | [concurrent](modules/concurrent/README.md) |
 | `yggdrasil.environ` | Runtime import / install logic | [optional libs](modules/libs/README.md) |
-| `yggdrasil.fastapi` | FastAPI service powering the Power Query connector | [API Reference](api/index.md) |
-| `yggdrasil.blake3` | Optional hashing | — |
 
 ## See also
 
