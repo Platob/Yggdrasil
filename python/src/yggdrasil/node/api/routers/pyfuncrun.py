@@ -67,6 +67,21 @@ async def stream_logs(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+@router.get("/{run_id}/state")
+async def stream_state(
+    run_id: int,
+    service: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> StreamingResponse:
+    """SSE stream of the full run state (progress, status, etc.) until done."""
+    await service.get(run_id)
+
+    async def event_stream():
+        async for state in service.stream_state(run_id):
+            yield f"data: {json.dumps(state)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @router.get("/{run_id}/result")
 async def get_result_arrow(
     run_id: int,

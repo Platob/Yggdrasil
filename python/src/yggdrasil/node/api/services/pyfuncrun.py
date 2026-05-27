@@ -277,6 +277,8 @@ class PyFuncRunService:
                 completed_at=self._now(),
                 duration=round(time.monotonic() - t0, 3),
                 stderr=f"Timed out after {timeout:.0f}s",
+                progress=1.0,
+                log_lines=1,
             )
         except Exception as exc:
             return self._update_entry(
@@ -285,6 +287,8 @@ class PyFuncRunService:
                 completed_at=self._now(),
                 duration=round(time.monotonic() - t0, 3),
                 stderr=str(exc),
+                progress=1.0,
+                log_lines=1,
             )
         finally:
             if tmp is not None:

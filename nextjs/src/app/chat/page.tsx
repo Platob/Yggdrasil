@@ -46,6 +46,26 @@ function formatDate(ts: string): string {
   }
 }
 
+function timeAgo(ts: string | null): string {
+  if (!ts) return "";
+  try {
+    const now = Date.now();
+    const then = new Date(ts).getTime();
+    const diffMs = now - then;
+    if (diffMs < 0) return "just now";
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return `${diffSec}s ago`;
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    const diffDay = Math.floor(diffHr / 24);
+    return `${diffDay}d ago`;
+  } catch {
+    return "";
+  }
+}
+
 export default function ChatPage() {
   const [channels, setChannels] = useState<ChannelInfo[]>([]);
   const [activeChannel, setActiveChannel] = useState("general");
@@ -54,6 +74,9 @@ export default function ChatPage() {
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState(false);
+  const [showNewChannel, setShowNewChannel] = useState(false);
+  const [newChannelName, setNewChannelName] = useState("");
+  const [creatingChannel, setCreatingChannel] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
@@ -148,6 +171,26 @@ export default function ChatPage() {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  };
+
+  const handleCreateChannel = async () => {
+    const name = newChannelName.trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-_]/g, "");
+    if (!name || creatingChannel) return;
+    setCreatingChannel(true);
+    try {
+      // Send a system message to bootstrap the channel
+      await sendMessage(name, `Channel #${name} created`);
+      // Refresh channels list
+      const res = await getChannels();
+      setChannels(res.channels);
+      setActiveChannel(name);
+      setNewChannelName("");
+      setShowNewChannel(false);
+    } catch {
+      // Ignore — channel creation is best-effort
+    } finally {
+      setCreatingChannel(false);
     }
   };
 
