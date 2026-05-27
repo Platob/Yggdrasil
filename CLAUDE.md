@@ -2,6 +2,16 @@
 
 Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 
+## Coding Style
+
+1. **Inline over micro-functions** — prefer inlining logic directly where it's used. Don't extract one-liner helpers, don't create utility functions called from a single site, don't wrap stdlib calls in project-specific wrappers. A 15-line method is better than 5 three-line functions calling each other. Extract only when the same logic appears 3+ times or the extracted function has genuine standalone semantics (e.g. `make_id`, `serialize_result`).
+2. **Flat call stacks** — avoid deep delegation chains like `router → service → helper → sub-helper → util`. Routers call services. Services do the work. Two levels max for the common path.
+3. **No defensive wrappers** — don't wrap `json.loads` in a `safe_parse_json`, don't wrap `Path.mkdir` in an `ensure_dir`. Call stdlib directly. Handle errors at the boundary where they matter.
+4. **No premature abstraction** — three similar blocks of code is fine. A `BaseService` with one subclass is not. Don't create interfaces, registries, or plugin systems until the third concrete user exists.
+5. **Collocate related code** — keep schemas, service logic, and the router for one concept readable together. Jumping between 5 files to understand one endpoint is worse than a 200-line service file.
+6. **Delete dead code** — no commented-out blocks, no `# TODO: maybe later`, no unused imports. If it's not called, it doesn't exist.
+7. **Prefer data over code** — dicts and lists over class hierarchies. Pydantic models over hand-rolled validation. Enum values over if/elif chains.
+
 ## Principles
 
 1. **Exceptions** — derive from `YGGException`. API errors use `yggdrasil.exceptions.api`. No ad-hoc exception classes.
@@ -118,10 +128,12 @@ The `@function` decorator infers: name, source code, dependencies (AST), python 
 
 ## CLI
 
-`ygg node serve` — node + frontend | `ygg node front` — frontend only
-`ygg node serve --no-front` — node only | `ygg node status/stop` — daemon
-`ygg node install/uninstall` — boot service (systemd/launchd)
-`ygg node run` — call a @remote function | `ygg node chat` — YGGCHAT terminal
+`ygg node start` — background daemon (auto-installs boot service)
+`ygg node stop` — stop the daemon
+`ygg node create <name>` — create named node at `~/.node/<name>/`
+`ygg node serve` — foreground server + frontend
+`ygg node status` — show pid, port, boot service state
+`ygg node run <func>` — call a @remote function
 `ygg databricks` — Databricks management CLI
 
 ## Environment
