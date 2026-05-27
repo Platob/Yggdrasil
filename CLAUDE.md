@@ -17,12 +17,19 @@ Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 ```
 python/src/yggdrasil/
   node/                 Node server (FastAPI, default :8100)
-    routers/            HTTP handlers (function, environment, run, monitor, ...)
-    services/           Business logic + state
-    schemas/            Pydantic models
+    api/                v2 API — formalized PyEnv/PyFunc/PyFuncRun concepts
+      schemas/          Pydantic models (PyEnv, PyFunc, PyFuncRun, DAG, Backend, Network)
+      services/         Business logic (env mgmt, execution, metrics, peer mesh)
+      routers/          HTTP handlers mounted at /api/v2/*
+      app.py            Standalone v2 FastAPI app factory
+      deps.py           Dependency injection
+    routers/            v1 HTTP handlers (function, environment, run, monitor, ...)
+    services/           v1 Business logic + state
+    schemas/            v1 Pydantic models
     geo.py              IP geolocation
     ids.py              Int64 ID generation (xxhash)
     fn.py               @function decorator framework
+    transport.py        Arrow IPC + pickle serialization for inter-node comms
     path.py             NodePath — pathlib-like local/remote filesystem
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
@@ -51,6 +58,26 @@ src/                    Frontend (React 19, Next.js 16, Tailwind v4)
 | `/api/call` | @remote function registry + invocation |
 | `/api/env` | Environment variable get/set |
 | `/api/fs` | Filesystem operations (ls, read, write, mkdir, upload, streaming) |
+
+## Node v2 API (PyEnv / PyFunc / PyFuncRun)
+
+Core concepts — workstation as remote executor/driver:
+
+- **PyEnv** — Python environment (uv venv). Has `execute_pyfunc()` for inner dispatch.
+- **PyFunc** — Executable (code + deps + metadata). Upserted by name.
+- **PyFuncRun** — Execution = PyEnv + PyFunc + args/kwargs + metadata.
+- **DAG** — Composed of sub-PyFuncs with edges, cross-node orchestration.
+- **Backend** — Node metadata: CPU, RAM, GPU, disk, network metrics (SSE streaming).
+- **Network** — Peer mesh. Nodes swap roles (driver/executor/hybrid). Arrow IPC transport.
+
+| Prefix | Description |
+|--------|-------------|
+| `/api/v2/pyenv` | PyEnv CRUD (create, get, list, update, delete) |
+| `/api/v2/pyfunc` | PyFunc CRUD |
+| `/api/v2/pyfuncrun` | PyFuncRun CRUD + `/logs` SSE + `/result` Arrow IPC |
+| `/api/v2/dag` | DAG CRUD + `/{id}/run` execution |
+| `/api/v2/backend` | Node metrics snapshot + `/history` + `/stream` SSE |
+| `/api/v2/network` | Self info + `/register` + `/peers` + `/role` + `/dispatch` + `/arrow` |
 
 ## Frontend Routes
 

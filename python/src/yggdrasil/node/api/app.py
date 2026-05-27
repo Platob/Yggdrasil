@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+
+from ..config import Settings, get_settings
+from ..exceptions import register_exception_handlers
+from .routers import (
+    backend_router,
+    dag_router,
+    network_router,
+    pyenv_router,
+    pyfunc_router,
+    pyfuncrun_router,
+)
+from .services.backend import BackendService
+from .services.dag import DAGService
+from .services.network import NetworkService
+from .services.pyenv import PyEnvService
+from .services.pyfunc import PyFuncService
+from .services.pyfuncrun import PyFuncRunService
+
+
+def create_api(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+
+    app = FastAPI(
+        title=f"{settings.app_name}-v2",
+        version=settings.app_version,
+        docs_url="/v2/docs",
+        redoc_url="/v2/redoc",
+        openapi_url="/v2/openapi.json",
+    )
+
+    app.state.settings = settings
+
+    # -- Services -----------------------------------------------------------
+    pyenv = PyEnvService(settings)
+    pyfunc = PyFuncService(settings)
+    pyfuncrun = PyFuncRunService(settings, pyenv, pyfunc)
+    dag = DAGService(settings, pyfuncrun)
+    backend = BackendService(settings)
+    backend.bind_run_counters(
+        lambda: pyfuncrun.active_count,
+        lambda: pyfuncrun.total_count,
+    )
+    network = NetworkService(settings, backend)
+
+    app.state.pyenv_service = pyenv
+    app.state.pyfunc_service = pyfunc
+    app.state.pyfuncrun_service = pyfuncrun
+    app.state.dag_service = dag
+    app.state.backend_service = backend
+    app.state.network_service = network
+
+    # -- Middleware ----------------------------------------------------------
+
+    @app.middleware("http")
+    async def local_only_middleware(request: Request, call_next):
+        if settings.allow_remote:
+            return await call_next(request)
+        client_host = request.client.host if request.client else None
+        if client_host and client_host not in settings.local_clients:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Remote access disabled."},
+            )
+        return await call_next(request)
+
+    register_exception_handlers(app)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+
+    # -- Routers ------------------------------------------------------------
+    prefix = f"{settings.api_prefix}/v2"
+    app.include_router(pyenv_router, prefix=f"{prefix}/pyenv")
+    app.include_router(pyfunc_router, prefix=f"{prefix}/pyfunc")
+    app.include_router(pyfuncrun_router, prefix=f"{prefix}/pyfuncrun")
+    app.include_router(dag_router, prefix=f"{prefix}/dag")
+    app.include_router(backend_router, prefix=f"{prefix}/backend")
+    app.include_router(network_router, prefix=f"{prefix}/network")
+
+    return app
+
+
+api_app = create_api()
