@@ -158,6 +158,7 @@ nav:
       - Casting: guides/casting.md
       - IO & HTTP: guides/io-http.md
       - Bot & Mesh: guides/bot.md
+      - Execution Plans & SQL: guides/plan.md
       - Databricks: guides/databricks.md
       - Development: guides/development.md
   - Module Walkthrough:
@@ -184,6 +185,8 @@ nav:
           - account: modules/databricks/account/README.md
       - Serialization:
           - pickle + json: modules/pickle/README.md
+      - Execution Plans:
+          - plan: modules/plan/README.md
       - Engines:
           - polars / pandas / spark: modules/engines/README.md
       - Databricks (extended):

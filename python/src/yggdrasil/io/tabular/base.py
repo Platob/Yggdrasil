@@ -1125,15 +1125,41 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             stream = (cast(batch) for batch in stream)
         stream = resolved.resample_arrow_batches(stream)
         stream = resolved.dedup_arrow_batches(stream)
-        if not logger.isEnabledFor(logging.DEBUG):
+        row_limit = resolved.row_limit
+        if row_limit is not None and row_limit > 0:
+            yielded = 0
+            if not logger.isEnabledFor(logging.DEBUG):
+                for batch in stream:
+                    remaining = row_limit - yielded
+                    if remaining <= 0:
+                        return
+                    if batch.num_rows <= remaining:
+                        yielded += batch.num_rows
+                        yield batch
+                    else:
+                        yield batch.slice(0, remaining)
+                        return
+            else:
+                n_batches = 0
+                for batch in stream:
+                    remaining = row_limit - yielded
+                    if remaining <= 0:
+                        return
+                    if batch.num_rows > remaining:
+                        batch = batch.slice(0, remaining)
+                    yielded += batch.num_rows
+                    n_batches += 1
+                    yield batch
+        elif not logger.isEnabledFor(logging.DEBUG):
             yield from stream
             return
-        n_batches = 0
-        n_rows = 0
-        for batch in stream:
-            n_batches += 1
-            n_rows += batch.num_rows
-            yield batch
+        else:
+            n_batches = 0
+            n_rows = 0
+            for batch in stream:
+                n_batches += 1
+                n_rows += batch.num_rows
+                yield batch
 
     def read_arrow_table(
         self, options: "O | None" = None, **kwargs: Any,
@@ -1154,7 +1180,10 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             return schema.to_arrow_schema().empty_table()
         table = pa.Table.from_batches(batches)
         table = options.cast_arrow_table(table)
-        return options.apply_post_read_table(table)
+        table = options.apply_post_read_table(table)
+        if options.row_limit is not None and table.num_rows > options.row_limit:
+            table = table.slice(0, options.row_limit)
+        return table
 
     def read_arrow_batch_reader(
         self, options: "O | None" = None, **kwargs: Any,
@@ -2044,3 +2073,18 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     to_pydict = read_pydict
     to_record_iterator = read_record_iterator
     to_records = read_records
+
+    # ==================================================================
+    # Lazy execution plan
+    # ==================================================================
+
+    def lazy(self) -> "LazyTabular":
+        """Return a :class:`LazyTabular` wrapping this source.
+
+        Transformations on the returned object (``select``, ``filter``,
+        ``join``, …) accumulate in an :class:`ExecutionPlan` without
+        touching data.  Any ``read_*`` call materialises the plan.
+        """
+        from yggdrasil.plan.lazy import LazyTabular
+
+        return LazyTabular(self)

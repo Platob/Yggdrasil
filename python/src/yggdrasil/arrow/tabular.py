@@ -473,10 +473,15 @@ class ArrowTabular(Tabular[CastOptions]):
             and not getattr(options, "row_size", None)
             and not getattr(options, "byte_size", None)
         ):
-            # No cast or rechunk requested — hand back the cached table
-            # by reference (pyarrow tables are immutable; safe to share).
+            row_limit = getattr(options, "row_limit", None)
+            if row_limit is not None and table.num_rows > row_limit:
+                return table.slice(0, row_limit)
             return table
-        return options.cast_arrow_table(table)
+        casted = options.cast_arrow_table(table)
+        row_limit = getattr(options, "row_limit", None)
+        if row_limit is not None and casted.num_rows > row_limit:
+            casted = casted.slice(0, row_limit)
+        return casted
 
     def _materialize_table(self) -> "pa.Table | None":
         """Concatenate spilled parts + in-memory tail into one Table.

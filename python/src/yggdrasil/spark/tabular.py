@@ -394,7 +394,10 @@ class SparkDataset(Tabular[CastOptions]):
         # entirely inside Spark — ``groupBy + applyInArrow`` for the
         # partitioned resample, ``row_number() OVER (...)`` for dedup.
         frame = options.cast_spark_frame(self._frame)
-        return options.apply_post_read_spark_frame(frame)
+        frame = options.apply_post_read_spark_frame(frame)
+        if options.row_limit is not None:
+            frame = frame.limit(options.row_limit)
+        return frame
 
     def _read_spark_dataset(self, options: CastOptions) -> "SparkDataset":
         # Source already speaks Spark — skip the
@@ -462,7 +465,10 @@ class SparkDataset(Tabular[CastOptions]):
             return
         from yggdrasil.spark.cast import spark_dataframe_to_arrow
 
-        arrow_table = spark_dataframe_to_arrow(self._frame)
+        frame = self._frame
+        if options.row_limit is not None:
+            frame = frame.limit(options.row_limit)
+        arrow_table = spark_dataframe_to_arrow(frame)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Dataset collected %d rows from Spark frame",

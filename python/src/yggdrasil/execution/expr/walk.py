@@ -11,17 +11,24 @@ from __future__ import annotations
 from typing import Iterable
 
 from .nodes import (
+    Alias,
     Arithmetic,
     Between,
+    CaseWhen,
     Cast,
     Column,
     Comparison,
     Expression,
+    FunctionCall,
     InList,
     IsNull,
     Like,
     Logical,
     Not,
+    SortOrder,
+    Subscript,
+    WindowFunction,
+    WindowSpec,
 )
 
 
@@ -53,6 +60,32 @@ def walk(expr: Expression) -> "Iterable[Expression]":
         yield from walk(expr.target)
     elif isinstance(expr, Cast):
         yield from walk(expr.operand)
+    elif isinstance(expr, FunctionCall):
+        for arg in expr.args:
+            yield from walk(arg)
+    elif isinstance(expr, Alias):
+        yield from walk(expr.expr)
+    elif isinstance(expr, SortOrder):
+        yield from walk(expr.expr)
+    elif isinstance(expr, WindowSpec):
+        for p in expr.partition_by:
+            yield from walk(p)
+        for o in expr.order_by:
+            yield from walk(o)
+    elif isinstance(expr, WindowFunction):
+        yield from walk(expr.function)
+        yield from walk(expr.window)
+    elif isinstance(expr, CaseWhen):
+        if expr.operand is not None:
+            yield from walk(expr.operand)
+        for cond, val in expr.branches:
+            yield from walk(cond)
+            yield from walk(val)
+        if expr.else_expr is not None:
+            yield from walk(expr.else_expr)
+    elif isinstance(expr, Subscript):
+        yield from walk(expr.expr)
+        yield from walk(expr.index)
 
 
 def free_columns(expr: Expression) -> "tuple[str, ...]":

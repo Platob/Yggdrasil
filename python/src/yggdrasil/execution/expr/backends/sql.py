@@ -25,18 +25,26 @@ from decimal import Decimal
 from typing import Any
 
 from ..nodes import (
+    Alias,
     Arithmetic,
     Between,
+    CaseWhen,
     Cast,
     Column,
     Comparison,
     Expression,
+    FunctionCall,
     InList,
     IsNull,
     Like,
     Literal,
     Logical,
     Not,
+    SortOrder,
+    Star,
+    Subscript,
+    WindowFunction,
+    WindowSpec,
 )
 from ..operators import ArithmeticOp, CompareOp, LogicalOp
 
@@ -160,6 +168,29 @@ def _render(expr: Expression, dialect: Dialect, *, parent_prec: int) -> str:
         return _render_cast(expr, dialect)
     if isinstance(expr, Arithmetic):
         return _render_arithmetic(expr, dialect, parent_prec=parent_prec)
+    if isinstance(expr, FunctionCall):
+        return _render_function_call(expr, dialect)
+    if isinstance(expr, Star):
+        if expr.qualifier:
+            return f"{_quote_ident(expr.qualifier, dialect)}.*"
+        return "*"
+    if isinstance(expr, Alias):
+        inner = _render(expr.expr, dialect, parent_prec=0)
+        return f"{inner} AS {_quote_ident(expr.name, dialect)}"
+    if isinstance(expr, SortOrder):
+        return _render_sort_order(expr, dialect)
+    if isinstance(expr, WindowFunction):
+        fn = _render(expr.function, dialect, parent_prec=0)
+        win = _render_window_spec(expr.window, dialect)
+        return f"{fn} {win}"
+    if isinstance(expr, WindowSpec):
+        return _render_window_spec(expr, dialect)
+    if isinstance(expr, CaseWhen):
+        return _render_case_when(expr, dialect)
+    if isinstance(expr, Subscript):
+        base = _render(expr.expr, dialect, parent_prec=_PREC_LEAF)
+        idx = _render(expr.index, dialect, parent_prec=0)
+        return f"{base}[{idx}]"
 
     raise NotImplementedError(
         f"SQL backend does not implement node type {type(expr).__name__}."
@@ -348,6 +379,74 @@ def _render_arithmetic(
 
 
 # ---------------------------------------------------------------------------
+# FunctionCall / WindowSpec / SortOrder / CaseWhen rendering
+# ---------------------------------------------------------------------------
+
+
+def _render_function_call(expr: FunctionCall, dialect: Dialect) -> str:
+    # INTERVAL 'value' unit — special syntax, not parenthesized
+    if expr.name == "INTERVAL" and len(expr.args) == 2:
+        val = _render(expr.args[0], dialect, parent_prec=0)
+        unit = expr.args[1].value if isinstance(expr.args[1], Literal) else _render(expr.args[1], dialect, parent_prec=0)
+        return f"INTERVAL {val} {unit}"
+    # EXTRACT(field FROM source) — special keyword syntax
+    if expr.name == "EXTRACT" and len(expr.args) == 2:
+        field = expr.args[0].value if isinstance(expr.args[0], Literal) else _render(expr.args[0], dialect, parent_prec=0)
+        source = _render(expr.args[1], dialect, parent_prec=0)
+        return f"EXTRACT({field} FROM {source})"
+    args = ", ".join(_render(a, dialect, parent_prec=0) for a in expr.args)
+    distinct = "DISTINCT " if expr.distinct else ""
+    return f"{expr.name}({distinct}{args})"
+
+
+def _render_sort_order(expr: SortOrder, dialect: Dialect) -> str:
+    inner = _render(expr.expr, dialect, parent_prec=0)
+    direction = "ASC" if expr.ascending else "DESC"
+    parts = [inner, direction]
+    if expr.nulls_first is True:
+        parts.append("NULLS FIRST")
+    elif expr.nulls_first is False:
+        parts.append("NULLS LAST")
+    return " ".join(parts)
+
+
+def _render_window_spec(spec: WindowSpec, dialect: Dialect) -> str:
+    clauses: "list[str]" = []
+    if spec.partition_by:
+        parts = ", ".join(
+            _render(p, dialect, parent_prec=0) for p in spec.partition_by
+        )
+        clauses.append(f"PARTITION BY {parts}")
+    if spec.order_by:
+        parts = ", ".join(
+            _render(o, dialect, parent_prec=0) for o in spec.order_by
+        )
+        clauses.append(f"ORDER BY {parts}")
+    if spec.frame_start is not None:
+        if spec.frame_end is not None:
+            clauses.append(
+                f"ROWS BETWEEN {spec.frame_start} AND {spec.frame_end}"
+            )
+        else:
+            clauses.append(f"ROWS {spec.frame_start}")
+    return f"OVER ({' '.join(clauses)})"
+
+
+def _render_case_when(expr: CaseWhen, dialect: Dialect) -> str:
+    parts: "list[str]" = ["CASE"]
+    if expr.operand is not None:
+        parts.append(_render(expr.operand, dialect, parent_prec=0))
+    for cond, val in expr.branches:
+        c = _render(cond, dialect, parent_prec=0)
+        v = _render(val, dialect, parent_prec=0)
+        parts.append(f"WHEN {c} THEN {v}")
+    if expr.else_expr is not None:
+        parts.append(f"ELSE {_render(expr.else_expr, dialect, parent_prec=0)}")
+    parts.append("END")
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Tokenizer + recursive-descent predicate parser
 #
 # Hand-rolled to keep ``from_sql`` free of a third-party SQL parser
@@ -365,6 +464,26 @@ _RESERVED = frozenset({
     "LIKE", "ILIKE", "TRUE", "FALSE", "CAST", "AS",
     "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMPNTZ", "TIMESTAMP_NTZ",
     "TIMESTAMP_LTZ", "DATETIME", "DATE", "TIME", "TIMETZ",
+    # SELECT / clause keywords
+    "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER",
+    "ASC", "DESC", "NULLS", "FIRST", "LAST",
+    # CASE expression
+    "CASE", "WHEN", "THEN", "ELSE", "END",
+    # Window functions
+    "OVER", "PARTITION", "ROWS", "RANGE", "UNBOUNDED", "PRECEDING",
+    "FOLLOWING", "CURRENT", "ROW",
+    # Set / aggregate modifiers
+    "DISTINCT", "ALL", "UNION", "INTERSECT", "EXCEPT",
+    # Joins
+    "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "ON",
+    # CTE / lateral / misc
+    "WITH", "LATERAL", "VIEW", "EXPLODE",
+    # Pagination
+    "LIMIT", "OFFSET",
+    # Subquery operators
+    "EXISTS", "ANY",
+    # Complex-type constructors
+    "ARRAY", "MAP", "STRUCT",
 })
 
 
@@ -520,10 +639,11 @@ def _tokenize(sql: str, dialect: Dialect) -> "list[_Token]":
             tokens.append(_Token("op", c, c, i))
             i += 1
             continue
-        if c in "().,":
+        if c in "().,[]":
             kind = {
                 "(": "lparen", ")": "rparen",
                 ",": "comma", ".": "dot",
+                "[": "lbracket", "]": "rbracket",
             }[c]
             tokens.append(_Token(kind, c, c, i))
             i += 1
@@ -830,13 +950,17 @@ class _SqlParser:
             self._eat()
             expr = self._parse_or()
             self._expect_kind("rparen")
-            return expr
+            return self._parse_postfix(expr)
         if t.kind == "string":
             self._eat()
             return Literal(value=t.text)
         if t.kind == "number":
             self._eat()
             return Literal(value=_coerce_number(t.text))
+        # Bare * (for SELECT * or similar contexts)
+        if t.kind == "op" and t.text == "*":
+            self._eat()
+            return Star()
         if t.kind == "keyword":
             if t.upper == "NULL":
                 self._eat()
@@ -849,11 +973,20 @@ class _SqlParser:
                 return Literal(value=False)
             if t.upper == "CAST":
                 return self._parse_cast()
+            if t.upper == "CASE":
+                return self._parse_case_when()
             if t.upper in _CAST_TEMPORAL_PARSERS:
                 return self._parse_typed_temporal(t)
+            # Keywords that can also be function names (e.g. ARRAY(...))
+            if self._peek(1).kind == "lparen":
+                return self._parse_function_call()
             raise self._error(f"unexpected keyword {t.text!r}")
         if t.kind == "ident":
-            return self._parse_column()
+            # Check if next token is lparen -> function call
+            if self._peek(1).kind == "lparen":
+                return self._parse_function_call()
+            col = self._parse_column()
+            return self._parse_postfix(col)
         raise self._error("unexpected token")
 
     # ---- column / cast / typed-literal --------------------------------
@@ -903,6 +1036,155 @@ class _SqlParser:
         raise self._error(
             f"unexpected use of type keyword {head.text!r}"
         )
+
+    def _parse_function_call(self) -> Expression:
+        """Parse ``NAME(args)`` or ``NAME(DISTINCT args)`` optionally followed by OVER."""
+        name_tok = self._eat()  # ident or keyword token
+        name = name_tok.upper
+        self._expect_kind("lparen")
+
+        # Handle COUNT(*) or fn(*)
+        if self.cur.kind == "op" and self.cur.text == "*":
+            self._eat()
+            self._expect_kind("rparen")
+            fc = FunctionCall(name, (Star(),))
+            return self._parse_postfix(self._maybe_over(fc))
+
+        # Handle DISTINCT modifier
+        distinct = False
+        if self._accept_kw("DISTINCT") is not None:
+            distinct = True
+
+        args: "list[Expression]" = []
+        if self.cur.kind != "rparen":
+            while True:
+                args.append(self._parse_or())
+                if self.cur.kind == "comma":
+                    self._eat()
+                    continue
+                break
+        self._expect_kind("rparen")
+
+        fc = FunctionCall(name, tuple(args), distinct=distinct)
+        return self._parse_postfix(self._maybe_over(fc))
+
+    def _maybe_over(self, fc: Expression) -> Expression:
+        """If the next token is OVER, parse the window spec and wrap."""
+        if self._accept_kw("OVER") is not None:
+            window = self._parse_window_spec()
+            return WindowFunction(fc, window)
+        return fc
+
+    def _parse_window_spec(self) -> WindowSpec:
+        """Parse ``(PARTITION BY … ORDER BY … [ROWS|RANGE BETWEEN … AND …])``."""
+        self._expect_kind("lparen")
+        partition_by: "list[Expression]" = []
+        order_by: "list[SortOrder]" = []
+        frame_start: "str | None" = None
+        frame_end: "str | None" = None
+
+        # PARTITION BY
+        if self._accept_kw("PARTITION") is not None:
+            self._expect_kw("BY")
+            while True:
+                partition_by.append(self._parse_or())
+                if self.cur.kind == "comma":
+                    self._eat()
+                    continue
+                break
+
+        # ORDER BY
+        if self._accept_kw("ORDER") is not None:
+            self._expect_kw("BY")
+            while True:
+                expr = self._parse_or()
+                ascending = True
+                nulls_first: "bool | None" = None
+                if self._accept_kw("ASC") is not None:
+                    ascending = True
+                elif self._accept_kw("DESC") is not None:
+                    ascending = False
+                if self._accept_kw("NULLS") is not None:
+                    if self._accept_kw("FIRST") is not None:
+                        nulls_first = True
+                    elif self._accept_kw("LAST") is not None:
+                        nulls_first = False
+                    else:
+                        raise self._error("expected FIRST or LAST after NULLS")
+                order_by.append(SortOrder(expr, ascending=ascending, nulls_first=nulls_first))
+                if self.cur.kind == "comma":
+                    self._eat()
+                    continue
+                break
+
+        # ROWS or RANGE frame
+        if self._accept_kw("ROWS", "RANGE") is not None:
+            if self._accept_kw("BETWEEN") is not None:
+                frame_start = self._parse_frame_bound()
+                self._expect_kw("AND")
+                frame_end = self._parse_frame_bound()
+            else:
+                frame_start = self._parse_frame_bound()
+
+        self._expect_kind("rparen")
+        return WindowSpec(
+            partition_by=tuple(partition_by),
+            order_by=tuple(order_by),
+            frame_start=frame_start,
+            frame_end=frame_end,
+        )
+
+    def _parse_frame_bound(self) -> str:
+        """Parse a frame boundary: UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, N PRECEDING/FOLLOWING."""
+        if self._accept_kw("UNBOUNDED") is not None:
+            kw = self._expect_kw("PRECEDING", "FOLLOWING")
+            return f"UNBOUNDED {kw.upper}"
+        if self._accept_kw("CURRENT") is not None:
+            self._expect_kw("ROW")
+            return "CURRENT ROW"
+        # N PRECEDING / N FOLLOWING
+        if self.cur.kind == "number":
+            n_tok = self._eat()
+            kw = self._expect_kw("PRECEDING", "FOLLOWING")
+            return f"{n_tok.text} {kw.upper}"
+        raise self._error("expected frame bound (UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, or N PRECEDING/FOLLOWING)")
+
+    def _parse_case_when(self) -> Expression:
+        """Parse ``CASE [expr] WHEN … THEN … [ELSE …] END``."""
+        self._expect_kw("CASE")
+
+        # Simple form: CASE expr WHEN val THEN result …
+        # Searched form: CASE WHEN cond THEN result …
+        operand: "Expression | None" = None
+        if self.cur.kind != "keyword" or self.cur.upper != "WHEN":
+            operand = self._parse_or()
+
+        branches: "list[tuple[Expression, Expression]]" = []
+        while self._accept_kw("WHEN") is not None:
+            cond = self._parse_or()
+            self._expect_kw("THEN")
+            val = self._parse_or()
+            branches.append((cond, val))
+
+        else_expr: "Expression | None" = None
+        if self._accept_kw("ELSE") is not None:
+            else_expr = self._parse_or()
+
+        self._expect_kw("END")
+        return CaseWhen(
+            branches=tuple(branches),
+            else_expr=else_expr,
+            operand=operand,
+        )
+
+    def _parse_postfix(self, expr: Expression) -> Expression:
+        """Parse postfix operators: subscript ``[index]``."""
+        while self.cur.kind == "lbracket":
+            self._eat()
+            index = self._parse_or()
+            self._expect_kind("rbracket")
+            expr = Subscript(expr, index)
+        return expr
 
     def _parse_type_head(self) -> str:
         """Parse the type name after ``AS`` in a CAST.

@@ -23,6 +23,7 @@ __all__ = [
     "O",
     "Tabular",
     "ArrowTabular",
+    "LazyTabular",
     "SparkDataset",
     "SparkTabular",
     "is_tabular_source",
@@ -33,6 +34,9 @@ def __getattr__(name: str):
     if name == "ArrowTabular":
         from yggdrasil.arrow.tabular import ArrowTabular
         return ArrowTabular
+    if name == "LazyTabular":
+        from yggdrasil.plan.lazy import LazyTabular
+        return LazyTabular
     if name in ("SparkDataset", "SparkTabular"):
         from yggdrasil.spark.tabular import SparkDataset
         return SparkDataset
