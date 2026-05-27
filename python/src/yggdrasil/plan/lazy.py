@@ -1,9 +1,9 @@
 """:class:`LazyTabular` — a :class:`Tabular` that defers execution.
 
-Wraps a concrete source :class:`Tabular` and an :class:`ExecutionPlan`.
+Wraps a concrete source :class:`Tabular` and an :class:`SelectPlan`.
 Transformation methods (``select``, ``filter``, ``join``, …) mutate
 the plan instead of touching data.  Every ``read_*`` surface triggers
-:meth:`ExecutionPlan.execute`, materialising the result on demand.
+:meth:`SelectPlan.execute`, materialising the result on demand.
 
 Create via :meth:`Tabular.lazy`::
 
@@ -14,8 +14,8 @@ Create via :meth:`Tabular.lazy`::
 
 Or construct directly::
 
-    from yggdrasil.plan import LazyTabular, ExecutionPlan
-    plan = ExecutionPlan()
+    from yggdrasil.plan import LazyTabular, SelectPlan
+    plan = SelectPlan()
     plan.select("a").filter("x > 0")
     lazy = LazyTabular(source, plan)
 """
@@ -36,7 +36,7 @@ import pyarrow as pa
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.tabular.base import Tabular
 
-from .execution_plan import ExecutionPlan
+from .execution_plan import SelectPlan
 
 if TYPE_CHECKING:
     from yggdrasil.data.schema import Schema
@@ -52,12 +52,12 @@ class LazyTabular(Tabular[O], Generic[O]):
     def __init__(
         self,
         source: Tabular[O],
-        plan: ExecutionPlan[O] | None = None,
+        plan: SelectPlan[O] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._source: Tabular[O] = source
-        self._plan: ExecutionPlan[O] = plan if plan is not None else ExecutionPlan()
+        self._plan: SelectPlan[O] = plan if plan is not None else SelectPlan()
 
     # ------------------------------------------------------------------
     # Accessors
@@ -68,7 +68,7 @@ class LazyTabular(Tabular[O], Generic[O]):
         return self._source
 
     @property
-    def plan(self) -> ExecutionPlan[O]:
+    def plan(self) -> SelectPlan[O]:
         return self._plan
 
     @classmethod

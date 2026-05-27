@@ -72,6 +72,14 @@ __all__ = [
     "Like",
     "Cast",
     "Arithmetic",
+    "FunctionCall",
+    "Star",
+    "Alias",
+    "SortOrder",
+    "WindowSpec",
+    "WindowFunction",
+    "CaseWhen",
+    "Subscript",
     "ExpressionLike",
     "PredicateLike",
     "lit",
@@ -1884,6 +1892,177 @@ class Arithmetic(Expression):
         self.op = op
         self.left = left
         self.right = right
+
+
+# ---------------------------------------------------------------------------
+# Extended expression nodes — function calls, aliasing, ordering,
+# windowing, conditional (CASE), subscript.
+# ---------------------------------------------------------------------------
+
+
+class FunctionCall(Expression):
+    """Arbitrary function call — ``UPPER(col)``, ``COUNT(DISTINCT col)``, etc.
+
+    ``name`` is stored upper-cased so comparisons are case-insensitive.
+    ``args`` are the positional arguments as Expression nodes.
+    ``distinct`` renders ``DISTINCT`` inside the parentheses (aggregate
+    functions like ``COUNT(DISTINCT …)``).
+    """
+
+    __slots__ = ("name", "args", "distinct")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("name", "args", "distinct")
+
+    def __init__(
+        self,
+        name: str,
+        args: "tuple[Expression, ...]" = (),
+        distinct: bool = False,
+    ) -> None:
+        self.name = name.upper()
+        self.args = args if isinstance(args, tuple) else tuple(args)
+        self.distinct = distinct
+
+
+class Star(Expression):
+    """``SELECT *`` or ``COUNT(*)`` — a bare wildcard reference.
+
+    ``qualifier`` handles ``table.*`` style addressing:
+    ``Star(qualifier="t")`` renders as ``t.*``.
+    """
+
+    __slots__ = ("qualifier",)
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("qualifier",)
+
+    def __init__(self, qualifier: "str | None" = None) -> None:
+        self.qualifier = qualifier
+
+
+class Alias(Expression):
+    """``expr AS name`` — wraps any expression with a user-visible alias.
+
+    Used in SELECT lists, sub-expressions, and CTE column naming.
+    The inner ``expr`` carries the computation; ``name`` is the
+    output label.
+    """
+
+    __slots__ = ("expr", "name")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("expr", "name")
+
+    def __init__(self, expr: Expression, name: str) -> None:
+        self.expr = expr
+        self.name = name
+
+
+class SortOrder(Expression):
+    """``ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST]``.
+
+    ``ascending=True`` for ASC, ``False`` for DESC.
+    ``nulls_first=None`` leaves the null ordering to the engine
+    default; explicit ``True`` / ``False`` renders ``NULLS FIRST``
+    / ``NULLS LAST``.
+    """
+
+    __slots__ = ("expr", "ascending", "nulls_first")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("expr", "ascending", "nulls_first")
+
+    def __init__(
+        self,
+        expr: Expression,
+        ascending: bool = True,
+        nulls_first: "bool | None" = None,
+    ) -> None:
+        self.expr = expr
+        self.ascending = ascending
+        self.nulls_first = nulls_first
+
+
+class WindowSpec(Expression):
+    """``OVER (PARTITION BY … ORDER BY … ROWS BETWEEN … AND …)``.
+
+    ``partition_by`` and ``order_by`` are tuples of Expression /
+    SortOrder nodes respectively. ``frame_start`` / ``frame_end``
+    are raw SQL frame-boundary strings (``"UNBOUNDED PRECEDING"``,
+    ``"CURRENT ROW"``, ``"3 PRECEDING"``, etc.) — kept as strings
+    because the combinatorial space of frame specs is huge and
+    rarely manipulated programmatically.
+    """
+
+    __slots__ = ("partition_by", "order_by", "frame_start", "frame_end")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = (
+        "partition_by", "order_by", "frame_start", "frame_end",
+    )
+
+    def __init__(
+        self,
+        partition_by: "tuple[Expression, ...]" = (),
+        order_by: "tuple[SortOrder, ...]" = (),
+        frame_start: "str | None" = None,
+        frame_end: "str | None" = None,
+    ) -> None:
+        self.partition_by = partition_by if isinstance(partition_by, tuple) else tuple(partition_by)
+        self.order_by = order_by if isinstance(order_by, tuple) else tuple(order_by)
+        self.frame_start = frame_start
+        self.frame_end = frame_end
+
+
+class WindowFunction(Expression):
+    """``function OVER window_spec`` — a windowed aggregate or ranking call.
+
+    ``function`` is typically a :class:`FunctionCall` (e.g.
+    ``ROW_NUMBER()``, ``SUM(col)``). ``window`` carries the
+    ``OVER (…)`` specification.
+    """
+
+    __slots__ = ("function", "window")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("function", "window")
+
+    def __init__(self, function: Expression, window: WindowSpec) -> None:
+        self.function = function
+        self.window = window
+
+
+class CaseWhen(Expression):
+    """``CASE [operand] WHEN cond THEN val … [ELSE val] END``.
+
+    Two forms:
+
+    * **Searched** (``operand=None``): each branch condition is a
+      full boolean expression.
+    * **Simple** (``operand=expr``): each branch condition is
+      compared against ``operand`` with implicit equality.
+
+    ``branches`` is a tuple of ``(condition, result)`` pairs.
+    ``else_expr`` is the fallback value (``None`` ⇒ implicit
+    ``NULL``).
+    """
+
+    __slots__ = ("operand", "branches", "else_expr")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("operand", "branches", "else_expr")
+
+    def __init__(
+        self,
+        branches: "tuple[tuple[Expression, Expression], ...]",
+        else_expr: "Expression | None" = None,
+        operand: "Expression | None" = None,
+    ) -> None:
+        self.operand = operand
+        self.branches = branches if isinstance(branches, tuple) else tuple(branches)
+        self.else_expr = else_expr
+
+
+class Subscript(Expression):
+    """``expr[index]`` — array element access or map key lookup.
+
+    ``expr`` is the collection expression; ``index`` is the key /
+    offset expression. SQL renders as ``expr[index]``.
+    """
+
+    __slots__ = ("expr", "index")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("expr", "index")
+
+    def __init__(self, expr: Expression, index: Expression) -> None:
+        self.expr = expr
+        self.index = index
 
 
 # ---------------------------------------------------------------------------

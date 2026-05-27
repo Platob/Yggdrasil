@@ -7,7 +7,7 @@ import pytest
 
 from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.execution.expr import col
-from yggdrasil.plan import ExecutionPlan, LazyTabular
+from yggdrasil.plan import ExecutionPlan, LazyTabular, SelectPlan
 
 
 # ---------------------------------------------------------------------------
@@ -45,22 +45,22 @@ def dupes_table():
 
 class TestExecutionPlanIdentity:
     def test_empty_plan_is_identity(self):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         assert plan.is_identity
 
     def test_non_empty_plan_is_not_identity(self):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.select("a")
         assert not plan.is_identity
 
     def test_clear_resets_to_identity(self):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.select("a").filter("x > 1").limit(10)
         plan.clear()
         assert plan.is_identity
 
     def test_identity_plan_returns_source(self, users_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         result = plan.execute(users_table)
         assert result is users_table
 
@@ -71,33 +71,33 @@ class TestExecutionPlanIdentity:
 
 class TestExecutionPlanProjection:
     def test_select(self, users_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.select("id", "name")
         result = plan.execute(users_table).read_arrow_table()
         assert result.column_names == ["id", "name"]
         assert result.num_rows == 5
 
     def test_select_replaces(self):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.select("a", "b")
         assert plan.columns == ["a", "b"]
         plan.select("x")
         assert plan.columns == ["x"]
 
     def test_select_clears_drop(self):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.drop("a")
         plan.select("b", "c")
         assert plan._drop is None
 
     def test_drop(self, users_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.drop("region")
         result = plan.execute(users_table).read_arrow_table()
         assert result.column_names == ["id", "name"]
 
     def test_select_empty_raises(self):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         with pytest.raises(ValueError):
             plan.select()
 
@@ -108,26 +108,26 @@ class TestExecutionPlanProjection:
 
 class TestExecutionPlanFilter:
     def test_filter_sql_string(self, users_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.filter("id > 3")
         result = plan.execute(users_table).read_arrow_table()
         assert result.num_rows == 2
         assert result.column("id").to_pylist() == [4, 5]
 
     def test_filter_expression(self, users_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.filter(col("id") > 3)
         result = plan.execute(users_table).read_arrow_table()
         assert result.num_rows == 2
 
     def test_filter_and_accumulates(self, dupes_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.filter(col("id") > 1).filter(col("val") < 50)
         result = plan.execute(dupes_table).read_arrow_table()
         assert all(r["id"] > 1 and r["val"] < 50 for r in result.to_pylist())
 
     def test_clear_filter(self, users_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.filter("id > 100")
         plan.clear_filter()
         assert plan.predicate is None
@@ -141,34 +141,34 @@ class TestExecutionPlanFilter:
 
 class TestExecutionPlanJoin:
     def test_inner_join(self, users_table, scores_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.join(scores_table, on="id", how="inner")
         result = plan.execute(users_table).read_arrow_table()
         assert "score" in result.column_names
         assert result.num_rows == 3
 
     def test_left_join(self, users_table, scores_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.join(scores_table, on="id", how="left")
         result = plan.execute(users_table).read_arrow_table()
         assert result.num_rows == 5
 
     def test_join_with_lazy(self, users_table, scores_table):
         lazy_scores = scores_table.lazy().filter(col("score") > 70)
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.join(lazy_scores, on="id", how="inner")
         result = plan.execute(users_table).read_arrow_table()
         assert all(r["score"] > 70 for r in result.to_pylist())
 
     def test_join_then_filter(self, users_table, scores_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.join(scores_table, on="id", how="inner")
         plan.filter(col("score") > 85)
         result = plan.execute(users_table).read_arrow_table()
         assert all(r["score"] > 85 for r in result.to_pylist())
 
     def test_join_then_select(self, users_table, scores_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.join(scores_table, on="id", how="inner")
         plan.select("name", "score")
         result = plan.execute(users_table).read_arrow_table()
@@ -186,7 +186,7 @@ class TestExecutionPlanUnion:
             "name": ["frank", "grace"],
             "region": ["EU", "US"],
         }))
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.union(other)
         result = plan.execute(users_table).read_arrow_table()
         assert result.num_rows == 7
@@ -198,7 +198,7 @@ class TestExecutionPlanUnion:
 
 class TestExecutionPlanUnique:
     def test_unique(self, dupes_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.unique("id")
         result = plan.execute(dupes_table).read_arrow_table()
         ids = result.column("id").to_pylist()
@@ -211,13 +211,13 @@ class TestExecutionPlanUnique:
 
 class TestExecutionPlanLimit:
     def test_limit(self, users_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.limit(2)
         result = plan.execute(users_table).read_arrow_table()
         assert result.num_rows == 2
 
     def test_limit_none_removes(self, users_table):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.limit(2)
         plan.limit(None)
         result = plan.execute(users_table).read_arrow_table()
@@ -230,7 +230,7 @@ class TestExecutionPlanLimit:
 
 class TestExecutionPlanCopy:
     def test_copy_is_independent(self):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.select("a", "b").filter("x > 1")
         clone = plan.copy()
         clone.select("c")
@@ -244,10 +244,10 @@ class TestExecutionPlanCopy:
 
 class TestExecutionPlanRepr:
     def test_identity_repr(self):
-        assert "identity" in repr(ExecutionPlan())
+        assert "identity" in repr(SelectPlan())
 
     def test_non_empty_repr(self):
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.select("a").filter("x > 1").limit(10)
         r = repr(plan)
         assert "select=" in r

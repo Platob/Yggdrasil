@@ -1,11 +1,9 @@
 """Mutable execution plan that accumulates lazy transformations.
 
-An :class:`ExecutionPlan` collects column projections, pushdown
-predicates, joins, unions, dedup/resample/cast directives and a
-row limit — all without touching data.  :meth:`execute` materialises
-the plan against a concrete :class:`Tabular` source, pushing what it
-can into :class:`CastOptions` (predicate pushdown, column pruning)
-and applying the rest as post-read Tabular operations.
+:class:`ExecutionPlan` is the abstract base for all plan types.
+:class:`SelectPlan` is the concrete implementation for
+SELECT-like queries (column projection, filter, join, union,
+dedup, resample, cast, limit).
 
 The plan is **mutable**: every builder method mutates in-place and
 returns ``self`` for chaining.  Call :meth:`copy` to fork a plan
@@ -18,6 +16,7 @@ format-specific options survive through the pipeline.
 from __future__ import annotations
 
 import copy as _copy
+from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -34,6 +33,7 @@ from yggdrasil.enums import JoinType, Mode
 from .ops import JoinOp, ResampleOp, UnionOp
 
 if TYPE_CHECKING:
+    from yggdrasil.enums import Dialect
     from yggdrasil.execution.expr import Predicate, PredicateLike
     from yggdrasil.io.tabular import Tabular
 
@@ -60,21 +60,68 @@ def _coerce_sampling_seconds(value: Any) -> int:
     return _coerce(value)
 
 
-class ExecutionPlan(Generic[O]):
-    """Mutable, lazy execution plan for :class:`Tabular` transformations.
+class ExecutionPlan(ABC, Generic[O]):
+    """Abstract base for all execution plan types.
+
+    Concrete subclasses: :class:`SelectPlan`, and the SQL-level
+    plans in :mod:`yggdrasil.plan.nodes` (SelectNode, InsertNode,
+    MergeNode).
+
+    Provides :meth:`from_sql` / :meth:`to_sql` for SQL round-trip
+    and :meth:`execute` for materialisation against a Tabular source.
+    """
+
+    __slots__ = ()
+
+    @classmethod
+    def from_sql(
+        cls,
+        sql: str,
+        dialect: "Dialect | str | None" = None,
+    ) -> "ExecutionPlan":
+        """Parse a SQL query into a :class:`SelectPlan`."""
+        from .sql_parser import parse_sql
+        from .nodes import SelectNode
+        node = parse_sql(sql, dialect=dialect)
+        plan = SelectPlan()
+        if isinstance(node, SelectNode):
+            plan._apply_select_node(node)
+        return plan
+
+    def to_sql(self, dialect: "Dialect | str | None" = None) -> str:
+        """Emit this plan as a SQL query string."""
+        node = self.to_plan_node()
+        from .sql_emitter import emit_sql
+        return emit_sql(node, dialect=dialect)
+
+    def to_plan_node(self) -> "PlanNode":
+        """Convert this mutable plan to an immutable plan node tree."""
+        from .nodes import PlanNode
+        raise NotImplementedError(
+            f"{type(self).__name__}.to_plan_node is not implemented."
+        )
+
+    @abstractmethod
+    def execute(self, source: "Tabular[O]") -> "Tabular":
+        """Materialise the plan against *source*."""
+
+    @abstractmethod
+    def copy(self) -> "ExecutionPlan[O]":
+        """Return a deep copy."""
+
+
+class SelectPlan(ExecutionPlan[O]):
+    """Mutable SELECT-like plan: projection, filter, join, union,
+    dedup, resample, cast, limit.
 
     Builder methods mutate in-place and return ``self``::
 
-        plan = ExecutionPlan()
+        plan = SelectPlan()
         plan.select("a", "b").filter(col("a") > 10).limit(100)
 
     Call :meth:`execute` to materialise::
 
         result: Tabular = plan.execute(source_tabular)
-
-    Predicate and column projection are pushed into the source's
-    :class:`CastOptions` when possible, so format-level optimisations
-    (Parquet row-group pruning, column pruning) apply automatically.
     """
 
     __slots__ = (
@@ -456,4 +503,58 @@ class ExecutionPlan(Generic[O]):
         if self._limit is not None:
             parts.append(f"limit={self._limit}")
         body = ", ".join(parts) if parts else "identity"
-        return f"ExecutionPlan({body})"
+        return f"SelectPlan({body})"
+
+    # ------------------------------------------------------------------
+    # Plan node conversion
+    # ------------------------------------------------------------------
+
+    def to_plan_node(self) -> "PlanNode":
+        from .nodes import SelectNode
+        from yggdrasil.execution.expr.nodes import Column, Star
+
+        projections = []
+        if self._select:
+            projections = [Column(name=c) for c in self._select]
+        else:
+            projections = [Star()]
+
+        return SelectNode(
+            projections=projections,
+            where=self._predicate,
+            limit=self._limit,
+            distinct=bool(self._unique_by),
+        )
+
+    def _apply_select_node(self, node: "SelectNode") -> None:
+        """Populate this plan from a parsed SelectNode."""
+        from yggdrasil.execution.expr.nodes import Alias, Column, Star
+
+        if node.projections:
+            cols = []
+            all_columns = True
+            for p in node.projections:
+                if isinstance(p, Star):
+                    all_columns = False
+                    break
+                if isinstance(p, Column):
+                    cols.append(p.alias or p.name)
+                elif isinstance(p, Alias) and isinstance(p.expr, Column):
+                    cols.append(p.name)
+                else:
+                    all_columns = False
+                    break
+            if all_columns and cols:
+                self._select = cols
+
+        if node.where is not None:
+            from yggdrasil.execution.expr import Predicate
+            if isinstance(node.where, Predicate):
+                self._predicate = node.where
+
+        if node.limit is not None:
+            self._limit = node.limit
+
+        if node.distinct:
+            if self._select:
+                self._unique_by = list(self._select)

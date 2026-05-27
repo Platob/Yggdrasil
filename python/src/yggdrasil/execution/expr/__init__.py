@@ -46,13 +46,16 @@ directly.
 
 from .builder import all_of, any_of, col, neg
 from .nodes import (
+    Alias,
     Arithmetic,
     Between,
+    CaseWhen,
     Cast,
     Column,
     Comparison,
     Expression,
     ExpressionLike,
+    FunctionCall,
     InList,
     IsNull,
     Like,
@@ -61,6 +64,11 @@ from .nodes import (
     Not,
     Predicate,
     PredicateLike,
+    SortOrder,
+    Star,
+    Subscript,
+    WindowFunction,
+    WindowSpec,
     lit,
 )
 from .operators import ArithmeticOp, CompareOp, LogicalOp
@@ -68,15 +76,18 @@ from .partition import extract_partition_filters
 from .walk import free_columns, walk
 
 __all__ = [
+    "Alias",
     "Arithmetic",
     "ArithmeticOp",
     "Between",
+    "CaseWhen",
     "Cast",
     "Column",
     "Comparison",
     "CompareOp",
     "Expression",
     "ExpressionLike",
+    "FunctionCall",
     "InList",
     "IsNull",
     "Like",
@@ -86,6 +97,11 @@ __all__ = [
     "Not",
     "Predicate",
     "PredicateLike",
+    "SortOrder",
+    "Star",
+    "Subscript",
+    "WindowFunction",
+    "WindowSpec",
     "all_of",
     "any_of",
     "col",
