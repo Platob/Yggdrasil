@@ -143,6 +143,23 @@ class PyFuncRunService:
             "result_type": entry.result_type,
         }
 
+    async def stream_state(self, run_id: int) -> AsyncIterator[dict]:
+        """Yield the full run entry as a dict every 0.5s until the run is done."""
+        with self._lock:
+            entry = self._runs.get(run_id)
+        if entry is None:
+            raise NotFoundError(f"PyFuncRun {run_id!r} not found")
+
+        while True:
+            with self._lock:
+                entry = self._runs.get(run_id)
+            if entry is None:
+                return
+            yield entry.model_dump()
+            if entry.status not in ("pending", "running"):
+                return
+            await asyncio.sleep(0.5)
+
     @property
     def active_count(self) -> int:
         with self._lock:
@@ -231,16 +248,26 @@ class PyFuncRunService:
                 except (json.JSONDecodeError, OSError):
                     pass
 
+            stdout_text = proc.stdout or None
+            stderr_text = proc.stderr or None
+            total_lines = 0
+            if stdout_text:
+                total_lines += len(stdout_text.splitlines())
+            if stderr_text:
+                total_lines += len(stderr_text.splitlines())
+
             return self._update_entry(
                 run_id,
                 status=status,
                 completed_at=self._now(),
                 duration=duration,
                 returncode=proc.returncode,
-                stdout=proc.stdout or None,
-                stderr=proc.stderr or None,
+                stdout=stdout_text,
+                stderr=stderr_text,
                 result=result,
                 result_type=result_type,
+                progress=1.0,
+                log_lines=total_lines,
             )
 
         except subprocess.TimeoutExpired:

@@ -32,6 +32,8 @@ class PyFuncRunEntry(StrictModel):
     result: Any = None
     result_type: str | None = None
     node_id: str = ""
+    progress: float = 0.0
+    log_lines: int = 0
 
 
 class PyFuncRunResponse(StrictModel):

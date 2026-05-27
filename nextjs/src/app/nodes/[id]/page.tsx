@@ -4,8 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { ResourceBar } from "@/components/ResourceBar";
-import { getBackend, getEnvs, getFuncs, getNodeCard } from "@/lib/api";
-import type { NodeBackend, NodeCard, PyEnvEntry, PyFuncEntry } from "@/lib/types";
+import { getBackend, getEnvs, getFuncs, getRuns, getNodeCard } from "@/lib/api";
+import type { NodeBackend, NodeCard, PyEnvEntry, PyFuncEntry, PyFuncRunEntry } from "@/lib/types";
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -21,6 +21,64 @@ function formatBytes(mb: number): string {
   return `${mb.toFixed(0)} MB`;
 }
 
+// ── Run status badge ────────────────────────────────────────
+const RUN_STATUS_STYLES: Record<string, { bg: string; text: string }> = {
+  completed: { bg: "rgba(52,211,153,0.1)",  text: "var(--emerald)" },
+  success:   { bg: "rgba(52,211,153,0.1)",  text: "var(--emerald)" },
+  failed:    { bg: "rgba(244,63,94,0.1)",   text: "var(--rose)" },
+  error:     { bg: "rgba(244,63,94,0.1)",   text: "var(--rose)" },
+  running:   { bg: "rgba(251,191,36,0.1)",  text: "var(--amber)" },
+  pending:   { bg: "rgba(255,255,255,0.05)", text: "var(--muted)" },
+  queued:    { bg: "rgba(255,255,255,0.05)", text: "var(--muted)" },
+};
+
+function RunStatusBadge({ status }: { status: string }) {
+  const s = RUN_STATUS_STYLES[status] || RUN_STATUS_STYLES.pending;
+  return (
+    <span
+      className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded inline-flex items-center gap-1"
+      style={{ background: s.bg, color: s.text }}
+    >
+      {status === "running" && (
+        <span className="relative flex h-1.5 w-1.5">
+          <span className="absolute inline-flex h-full w-full rounded-full opacity-75" style={{ background: s.text, animation: "pulse-frost 1.5s ease-in-out infinite" }} />
+          <span className="relative inline-flex rounded-full h-1.5 w-1.5" style={{ background: s.text }} />
+        </span>
+      )}
+      {status}
+    </span>
+  );
+}
+
+function formatDuration(sec: number | null): string {
+  if (sec == null) return "--";
+  if (sec < 1) return `${(sec * 1000).toFixed(0)}ms`;
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}m ${s.toFixed(0)}s`;
+}
+
+function timeAgo(ts: string | null): string {
+  if (!ts) return "--";
+  try {
+    const now = Date.now();
+    const then = new Date(ts).getTime();
+    const diffMs = now - then;
+    if (diffMs < 0) return "just now";
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return `${diffSec}s ago`;
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    const diffDay = Math.floor(diffHr / 24);
+    return `${diffDay}d ago`;
+  } catch {
+    return "--";
+  }
+}
+
 export default function NodeDetailPage() {
   const params = useParams();
   const nodeId = params.id as string;
@@ -29,21 +87,24 @@ export default function NodeDetailPage() {
   const [card, setCard] = useState<NodeCard | null>(null);
   const [envs, setEnvs] = useState<PyEnvEntry[]>([]);
   const [funcs, setFuncs] = useState<PyFuncEntry[]>([]);
+  const [runs, setRuns] = useState<PyFuncRunEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [backendRes, cardRes, envsRes, funcsRes] = await Promise.allSettled([
+      const [backendRes, cardRes, envsRes, funcsRes, runsRes] = await Promise.allSettled([
         getBackend(),
         getNodeCard(),
         getEnvs(),
         getFuncs(),
+        getRuns(),
       ]);
       if (backendRes.status === "fulfilled") setBackend(backendRes.value.backend);
       if (cardRes.status === "fulfilled") setCard(cardRes.value);
       if (envsRes.status === "fulfilled") setEnvs(envsRes.value.envs);
       if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
+      if (runsRes.status === "fulfilled") setRuns(runsRes.value.runs);
 
       // Check if at least one call succeeded
       const anySuccess = [backendRes, cardRes].some((r) => r.status === "fulfilled");
@@ -317,6 +378,69 @@ export default function NodeDetailPage() {
           )}
         </div>
       </div>
+
+      {/* Recent Runs */}
+      {runs.length > 0 && (
+        <div className="glass-card p-5 space-y-3">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polygon points="5 3 19 12 5 21 5 3" />
+            </svg>
+            Recent Runs
+            <span className="ml-auto text-foreground-dim font-mono">{runs.length}</span>
+          </h2>
+          {/* Table header */}
+          <div className="grid grid-cols-[90px_1fr_90px_100px] gap-3 px-3 py-2 text-[10px] text-muted uppercase tracking-widest font-medium border-b border-white/[0.06]">
+            <span>Status</span>
+            <span>Function</span>
+            <span className="text-right">Duration</span>
+            <span className="text-right">Started</span>
+          </div>
+          <div className="space-y-0.5 max-h-72 overflow-y-auto">
+            {runs.slice(0, 20).map((run) => {
+              const funcName = funcs.find((f) => f.id === run.func_id)?.name ?? `func#${run.func_id}`;
+              const isRunning = run.status === "running";
+              const progress = run.progress != null ? run.progress : null;
+              return (
+                <div key={run.id} className="space-y-0">
+                  <div className="grid grid-cols-[90px_1fr_90px_100px] gap-3 items-center px-3 py-2 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors">
+                    <RunStatusBadge status={run.status} />
+                    <span className="text-xs font-mono text-foreground truncate">{funcName}</span>
+                    <span className="text-xs font-mono text-muted text-right">{formatDuration(run.duration)}</span>
+                    <span className="text-[11px] font-mono text-muted text-right">{timeAgo(run.started_at)}</span>
+                  </div>
+                  {isRunning && (
+                    <div className="mx-3 mb-1">
+                      <div className="h-1 rounded-full bg-white/[0.06] overflow-hidden">
+                        {progress != null ? (
+                          <div
+                            className="h-full rounded-full transition-all duration-500"
+                            style={{
+                              width: `${Math.min(100, Math.max(0, progress))}%`,
+                              background: "linear-gradient(90deg, var(--amber), var(--amber)cc)",
+                              boxShadow: "0 0 8px var(--amber-glow)",
+                            }}
+                          />
+                        ) : (
+                          <div
+                            className="h-full rounded-full"
+                            style={{
+                              width: "100%",
+                              background: "linear-gradient(90deg, transparent 0%, var(--amber) 50%, transparent 100%)",
+                              backgroundSize: "200% 100%",
+                              animation: "shimmer 1.5s ease-in-out infinite",
+                            }}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Run stats */}
       {backend && (

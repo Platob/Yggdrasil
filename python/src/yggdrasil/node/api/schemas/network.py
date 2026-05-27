@@ -45,9 +45,7 @@ class PeerListResponse(StrictModel):
 class DispatchRequest(StrictModel):
     func_id: int | None = None
     func_code: str | None = None
-    func_name: str = "dispatch"
     env_id: int | None = None
-    env_spec: dict[str, Any] | None = None
     args: list[Any] = Field(default_factory=list)
     kwargs: dict[str, Any] = Field(default_factory=dict)
     timeout: float | None = None

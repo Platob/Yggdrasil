@@ -10,6 +10,7 @@ import {
   getEnvs,
   getFuncs,
   getUsers,
+  getAudit,
   createBackendStream,
 } from "@/lib/api";
 import type {
@@ -19,6 +20,7 @@ import type {
   PyFuncEntry,
   BackendStreamEvent,
   UserCard,
+  AuditEntry,
 } from "@/lib/types";
 
 // ── Helper: convert NodeBackend to NodeMeta for the self card ──
@@ -59,15 +61,72 @@ function EnvStatusBadge({ status }: { status: string }) {
   );
 }
 
+// ── Relative time helper ─────────────────────────────────────
+function timeAgo(ts: string): string {
+  try {
+    const now = Date.now();
+    const then = new Date(ts).getTime();
+    const diffMs = now - then;
+    if (diffMs < 0) return "just now";
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return `${diffSec}s ago`;
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    const diffDay = Math.floor(diffHr / 24);
+    return `${diffDay}d ago`;
+  } catch {
+    return "";
+  }
+}
+
+// ── Mini sparkline (5-6 thin bars) ──────────────────────────
+function Sparkline({ values, color }: { values: number[]; color: string }) {
+  if (values.length === 0) return null;
+  const max = Math.max(...values, 1);
+  return (
+    <div className="flex items-end gap-[2px] h-4 mt-1">
+      {values.slice(-6).map((v, i) => (
+        <div
+          key={i}
+          className="w-[4px] rounded-sm transition-all duration-300"
+          style={{
+            height: `${Math.max(2, (v / max) * 16)}px`,
+            background: color,
+            opacity: 0.5 + (i / values.length) * 0.5,
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
 // ── KPI card ─────────────────────────────────────────────────
-function KpiCard({ label, value, sub, color }: { label: string; value: string; sub?: string; color?: string }) {
+function KpiCard({ label, value, sub, color, pulse, sparkValues }: {
+  label: string;
+  value: string;
+  sub?: string;
+  color?: string;
+  pulse?: boolean;
+  sparkValues?: number[];
+}) {
   return (
     <div className="glass-card p-4 flex-1 min-w-[140px]">
-      <span className="text-[10px] text-muted uppercase tracking-wider font-medium">{label}</span>
+      <div className="flex items-center gap-1.5">
+        <span className="text-[10px] text-muted uppercase tracking-wider font-medium">{label}</span>
+        {pulse && (
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full rounded-full opacity-75" style={{ background: color || "var(--amber)", animation: "pulse-frost 1.5s ease-in-out infinite" }} />
+            <span className="relative inline-flex rounded-full h-2 w-2" style={{ background: color || "var(--amber)" }} />
+          </span>
+        )}
+      </div>
       <p className="text-xl font-bold font-mono mt-1" style={{ color: color || "var(--foreground)" }}>
         {value}
       </p>
       {sub && <p className="text-[11px] text-foreground-dim font-mono mt-0.5">{sub}</p>}
+      {sparkValues && sparkValues.length > 1 && <Sparkline values={sparkValues} color={color || "var(--frost)"} />}
     </div>
   );
 }
@@ -78,6 +137,9 @@ export default function NodesPage() {
   const [envs, setEnvs] = useState<PyEnvEntry[]>([]);
   const [funcs, setFuncs] = useState<PyFuncEntry[]>([]);
   const [users, setUsers] = useState<UserCard[]>([]);
+  const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
+  const [cpuHistory, setCpuHistory] = useState<number[]>([]);
+  const [memHistory, setMemHistory] = useState<number[]>([]);
   const [loading, setLoading] = useState(true);
   const [sseConnected, setSseConnected] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -85,18 +147,28 @@ export default function NodesPage() {
   // ── Initial data fetch ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
     try {
-      const [backendRes, peersRes, envsRes, funcsRes, usersRes] = await Promise.allSettled([
+      const [backendRes, peersRes, envsRes, funcsRes, usersRes, auditRes] = await Promise.allSettled([
         getBackend(),
         getPeers(),
         getEnvs(),
         getFuncs(),
         getUsers(),
+        getAudit(),
       ]);
-      if (backendRes.status === "fulfilled") setBackend(backendRes.value.backend);
+      if (backendRes.status === "fulfilled") {
+        setBackend(backendRes.value.backend);
+        setCpuHistory((prev) => [...prev.slice(-5), backendRes.value.backend.cpu_percent]);
+        setMemHistory((prev) => {
+          const b = backendRes.value.backend;
+          const pct = b.memory_total_mb > 0 ? (b.memory_used_mb / b.memory_total_mb) * 100 : 0;
+          return [...prev.slice(-5), pct];
+        });
+      }
       if (peersRes.status === "fulfilled") setPeers(peersRes.value.peers);
       if (envsRes.status === "fulfilled") setEnvs(envsRes.value.envs);
       if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
       if (usersRes.status === "fulfilled") setUsers(usersRes.value.users);
+      if (auditRes.status === "fulfilled") setAuditEntries(auditRes.value.entries);
     } finally {
       setLoading(false);
     }
@@ -118,6 +190,12 @@ export default function NodesPage() {
         const data: BackendStreamEvent = JSON.parse(event.data);
         if (data.backend) {
           setBackend(data.backend);
+          setCpuHistory((prev) => [...prev.slice(-5), data.backend.cpu_percent]);
+          setMemHistory((prev) => {
+            const b = data.backend;
+            const pct = b.memory_total_mb > 0 ? (b.memory_used_mb / b.memory_total_mb) * 100 : 0;
+            return [...prev.slice(-5), pct];
+          });
         }
       } catch {
         // Silently ignore parse errors from SSE
@@ -216,11 +294,66 @@ export default function NodesPage() {
         <div className="flex flex-wrap gap-3">
           <KpiCard label="Total Nodes" value={String(totalNodes)} color="var(--frost)" />
           <KpiCard label="CPU Cores" value={String(totalCpuCores)} sub={`${clusterCpuPercent.toFixed(1)}% avg`} />
-          <KpiCard label="Cluster CPU" value={`${clusterCpuPercent.toFixed(1)}%`} color={clusterCpuPercent > 80 ? "var(--rose)" : clusterCpuPercent > 50 ? "var(--amber)" : "var(--emerald)"} />
-          <KpiCard label="Total Memory" value={totalMemoryMb >= 1024 ? `${(totalMemoryMb / 1024).toFixed(1)} GB` : `${totalMemoryMb} MB`} />
+          <KpiCard
+            label="Cluster CPU"
+            value={`${clusterCpuPercent.toFixed(1)}%`}
+            color={clusterCpuPercent > 80 ? "var(--rose)" : clusterCpuPercent > 50 ? "var(--amber)" : "var(--emerald)"}
+            sparkValues={cpuHistory}
+          />
+          <KpiCard
+            label="Total Memory"
+            value={totalMemoryMb >= 1024 ? `${(totalMemoryMb / 1024).toFixed(1)} GB` : `${totalMemoryMb} MB`}
+            sparkValues={memHistory}
+            color="var(--emerald)"
+          />
           <KpiCard label="GPUs" value={String(totalGpus)} color={totalGpus > 0 ? "var(--emerald)" : "var(--muted)"} />
-          <KpiCard label="Active Runs" value={String(totalActiveRuns)} color={totalActiveRuns > 0 ? "var(--amber)" : "var(--muted)"} />
+          <KpiCard
+            label="Active Runs"
+            value={String(totalActiveRuns)}
+            color={totalActiveRuns > 0 ? "var(--amber)" : "var(--muted)"}
+            pulse={totalActiveRuns > 0}
+          />
         </div>
+
+        {/* Recent Activity */}
+        {auditEntries.length > 0 && (
+          <div className="glass-card p-5 space-y-3">
+            <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <polyline points="12 6 12 12 16 14" />
+              </svg>
+              Recent Activity
+            </h2>
+            <div className="space-y-1">
+              {auditEntries.slice(0, 5).map((entry, i) => (
+                <div
+                  key={`${entry.asset_id}-${entry.timestamp}-${i}`}
+                  className="flex items-center gap-3 px-3 py-2 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors"
+                >
+                  <span className="text-[10px] font-mono text-muted shrink-0 w-14">
+                    {timeAgo(entry.timestamp)}
+                  </span>
+                  <span
+                    className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded shrink-0"
+                    style={{
+                      background: entry.operation === "create" ? "rgba(52,211,153,0.1)"
+                        : entry.operation === "delete" ? "rgba(244,63,94,0.1)"
+                        : "rgba(103,232,249,0.1)",
+                      color: entry.operation === "create" ? "var(--emerald)"
+                        : entry.operation === "delete" ? "var(--rose)"
+                        : "var(--frost)",
+                    }}
+                  >
+                    {entry.operation}
+                  </span>
+                  <span className="text-xs text-foreground-dim font-mono">{entry.asset_type}</span>
+                  <span className="text-xs text-muted truncate flex-1">{entry.detail}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Node grid */}
         {allNodes.length === 0 ? (

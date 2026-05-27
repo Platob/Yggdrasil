@@ -12,6 +12,27 @@ Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 6. **Delete dead code** — no commented-out blocks, no `# TODO: maybe later`, no unused imports. If it's not called, it doesn't exist.
 7. **Prefer data over code** — dicts and lists over class hierarchies. Pydantic models over hand-rolled validation. Enum values over if/elif chains.
 
+## Communication & Transport
+
+1. **Arrow IPC for tabular data** — all structured data between nodes uses `application/vnd.apache.arrow.stream`. Use `transport.serialize_result` / `deserialize_result` which auto-dispatches: Arrow for tables/dataframes, yggdrasil pickle for complex Python objects.
+2. **Stream everything** — SSE for logs, metrics, run state. Chunked HTTP for file transfer (64KB). Never buffer an entire large response in memory. Use `StreamingResponse` + async generators.
+3. **Lazy by default** — don't fetch what you don't need. Directory listings are lazy (click to expand). File contents only on demand. Peer metadata cached with TTL, refreshed on access. Cache small payloads (<4MB) in `ExpiringDict`, stream anything larger.
+4. **Connection pooling** — reuse `httpx.AsyncClient` per peer node instead of creating one per request. The `NetworkService` owns the pool.
+5. **Content-addressed assets** — every asset (PyFunc, PyEnv, DAG) has a `content_hash` (sha256 of defining content). Two assets with the same hash are identical regardless of which node created them. Use hash for fast replication diff: only replicate what changed.
+
+## Asset Design
+
+1. **Self-describing** — every asset carries all metadata to rebuild it anywhere: code, dependencies, python version, content hash. No external references that can't be resolved.
+2. **Cross-references by hash** — when a PyFuncRun references a PyFunc and PyEnv, it stores their content hashes. A receiving node can verify it has the right versions or request them.
+3. **Multi-Python via uv** — `PyEnv` specifies `python_version` (3.11, 3.12, 3.13). `uv venv --python X.Y` creates isolated envs. Code is replicable across nodes with different system Pythons because uv downloads the right interpreter.
+4. **Dependency inference** — `@function` decorator infers dependencies from AST import analysis. Explicitly listed deps override inference. Dependencies are part of the content hash.
+
+## Permissions
+
+1. **User identity** — every request carries a user identity (sha256 hash of key+hostname). `UserService` auto-registers the local user and discovers peers.
+2. **Open by default** — all operations are allowed for all users. Permission checks are a middleware concern, not service logic. The `user_hash` is logged on every mutation for audit trail, but never blocks.
+3. **Audit log** — mutations (create, update, delete, replicate) log `(timestamp, user_hash, operation, asset_hash)`. Read-only operations are not logged.
+
 ## Principles
 
 1. **Exceptions** — derive from `YGGException`. API errors use `yggdrasil.exceptions.api`. No ad-hoc exception classes.

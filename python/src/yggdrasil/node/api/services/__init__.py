@@ -1,3 +1,4 @@
+from .audit import AuditLog
 from .backend import BackendService
 from .dag import DAGService
 from .fs import FsService
@@ -10,6 +11,7 @@ from .user import UserService
 from .messenger import MessengerService as V2MessengerService
 
 __all__ = [
+    "AuditLog",
     "BackendService",
     "DAGService",
     "FsService",

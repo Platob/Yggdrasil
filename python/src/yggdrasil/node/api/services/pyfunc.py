@@ -4,6 +4,9 @@ import datetime as dt
 import hashlib
 import logging
 from threading import Lock
+from typing import TYPE_CHECKING
+
+import httpx
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
 
@@ -18,14 +21,18 @@ from ..schemas.pyfunc import (
     PyFuncUpdate,
 )
 
+if TYPE_CHECKING:
+    from .audit import AuditLog
+
 LOGGER = logging.getLogger(__name__)
 
 
 class PyFuncService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, audit: AuditLog | None = None) -> None:
         self.settings = settings
         self._funcs: ExpiringDict[int, PyFuncEntry] = ExpiringDict(default_ttl=None, max_size=settings.max_functions)
         self._lock = Lock()
+        self._audit = audit
 
     # -- CRUD ---------------------------------------------------------------
 
@@ -56,6 +63,8 @@ class PyFuncService:
                 ).hexdigest()
                 updated = existing.model_copy(update=updates)
                 self._funcs[existing.id] = updated
+                if self._audit is not None:
+                    self._audit.log("update", "pyfunc", existing.id, detail=f"name={req.name}")
                 return PyFuncResponse(func=updated)
 
             func_id = make_id(req.name)
@@ -75,6 +84,8 @@ class PyFuncService:
                 content_hash=content_hash,
             )
             self._funcs.set(func_id, entry)
+            if self._audit is not None:
+                self._audit.log("create", "pyfunc", func_id, detail=f"name={req.name}")
             return PyFuncResponse(func=entry)
 
     async def get(self, func_id: int) -> PyFuncEntry:
@@ -119,6 +130,8 @@ class PyFuncService:
             entry = self._funcs.pop(func_id, None)
         if entry is None:
             raise NotFoundError(f"PyFunc {func_id!r} not found")
+        if self._audit is not None:
+            self._audit.log("delete", "pyfunc", func_id, detail=f"name={entry.name}")
         return PyFuncResponse(func=entry)
 
     def increment_run_count(self, func_id: int) -> None:
@@ -129,6 +142,29 @@ class PyFuncService:
                 self._funcs[func_id] = entry.model_copy(
                     update={"run_count": entry.run_count + 1, "last_run_at": now}
                 )
+
+    # -- replication --------------------------------------------------------
+
+    async def replicate_to(self, func_id: int, target_url: str) -> dict:
+        """Replicate a PyFunc to a remote node by POSTing its data."""
+        entry = await self.get(func_id)
+        payload = {
+            "name": entry.name,
+            "code": entry.code,
+            "description": entry.description,
+            "python_version": entry.python_version,
+            "dependencies": list(entry.dependencies),
+        }
+        if entry.env_id is not None:
+            payload["env_id"] = entry.env_id
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{target_url.rstrip('/')}/api/v2/pyfunc",
+                json=payload,
+                headers={"X-YGG-Source-Node": self.settings.node_id},
+            )
+            resp.raise_for_status()
+            return resp.json()
 
     # -- internals ----------------------------------------------------------
 

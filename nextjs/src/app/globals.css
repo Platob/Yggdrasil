@@ -124,6 +124,11 @@ body {
   animation: spin-slow 20s linear infinite;
 }
 
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
 /* ── Glassmorphism card ───────────────────────────────────── */
 .glass-card {
   background: rgba(255, 255, 255, 0.03);
