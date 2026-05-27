@@ -91,6 +91,8 @@ _QUERY_RESERVED = frozenset({
     "ARRAY", "MAP", "STRUCT",
     # Interval / Extract
     "INTERVAL", "EXTRACT",
+    # Qualify
+    "QUALIFY",
 })
 
 _CMP_OPS = {"=": CompareOp.EQ, "==": CompareOp.EQ, "!=": CompareOp.NE,
@@ -361,6 +363,10 @@ class SQLQueryParser:
         if self._accept_kw("HAVING"):
             node.having = self._parse_expr()
 
+        # QUALIFY (Databricks window-function filter)
+        if self._accept_kw("QUALIFY"):
+            node.qualify = self._parse_expr()
+
         # ORDER BY
         if self._is_kw("ORDER"):
             self._eat()
@@ -415,8 +421,8 @@ class SQLQueryParser:
             return self._eat().text
         return None
 
-    _CLAUSE_KW = frozenset({"FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT",
-        "OFFSET", "UNION", "INTERSECT", "EXCEPT", "ON", "JOIN", "INNER", "LEFT",
+    _CLAUSE_KW = frozenset({"FROM", "WHERE", "GROUP", "HAVING", "QUALIFY", "ORDER", "LIMIT",
+        "OFFSET", "UNION", "INTERSECT", "EXCEPT", "ON", "USING", "JOIN", "INNER", "LEFT",
         "RIGHT", "FULL", "CROSS", "LATERAL", "WHEN", "THEN", "ELSE", "END", "AND", "OR"})
     _JOIN_KW = frozenset({"JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"})
 
@@ -465,6 +471,22 @@ class SQLQueryParser:
         on_pred = None
         if self._accept_kw("ON"):
             on_pred = self._parse_expr()
+        elif self._accept_kw("USING"):
+            self._expect_kind("lparen")
+            cols: list[str] = []
+            while self.cur.kind != "rparen":
+                cols.append(self._ident_or_kw().text)
+                if self.cur.kind == "comma":
+                    self._eat()
+            self._expect_kind("rparen")
+            # Convert USING(a, b) into ON left.a = right.a AND left.b = right.b
+            conditions = []
+            for c in cols:
+                conditions.append(Comparison(Column(name=c), CompareOp.EQ, Column(name=c)))
+            if len(conditions) == 1:
+                on_pred = conditions[0]
+            else:
+                on_pred = Logical(LogicalOp.AND, tuple(conditions))
         return JoinClause(left=left, right=right, join_type=jt, on=on_pred)
 
     def _parse_join_type(self) -> JoinType:
@@ -989,7 +1011,8 @@ class SQLQueryParser:
             inner = self._parse_or()
             self._expect_kind("rparen")
             return self._fold_cast(inner, head.upper)
-        raise self._error(f"unexpected use of type keyword {head.text!r}")
+        # Fall back to treating it as a column name (e.g., `date` as column)
+        return self._parse_column()
 
     def _parse_type_head(self) -> str:
         t = self.cur
@@ -1056,29 +1079,34 @@ class SQLQueryParser:
     })
 
     def _parse_interval(self) -> Expression:
-        """Parse ``INTERVAL 'value' unit`` → FunctionCall("INTERVAL", ...)."""
+        """Parse ``INTERVAL 'value' unit`` or ``INTERVAL N unit`` → FunctionCall("INTERVAL", ...)."""
         self._expect_kw("INTERVAL")
-        value_tok = self._expect_kind("string")
+        # Accept either string literal ('value') or numeric literal (N)
+        if self.cur.kind == "string":
+            value_text = self._eat().text
+        elif self.cur.kind == "number":
+            value_text = _coerce_number(self._eat().text)
+        else:
+            raise self._error("expected string or number after INTERVAL")
         # Unit keyword — might be tokenized as ident or keyword
         t = self.cur
         if t.kind in ("ident", "keyword") and t.upper in self._INTERVAL_UNITS:
             unit = self._eat().upper
-            # Normalize plural forms to singular
-            if unit.endswith("S") and unit not in ("HOURS",) and len(unit) > 3:
-                unit = unit.rstrip("S")
-            elif unit == "DAYS":
-                unit = "DAY"
-            elif unit == "HOURS":
-                unit = "HOUR"
-            elif unit == "WEEKS":
-                unit = "WEEK"
+            unit = self._normalize_interval_unit(unit)
         else:
             raise self._error(
                 f"expected interval unit (DAY, HOUR, MINUTE, SECOND, "
                 f"MONTH, YEAR, WEEK) after INTERVAL literal"
             )
         return FunctionCall(name="INTERVAL",
-            args=(Literal(value=value_tok.text), Literal(value=unit)))
+            args=(Literal(value=value_text), Literal(value=unit)))
+
+    @staticmethod
+    def _normalize_interval_unit(unit: str) -> str:
+        _PLURAL_MAP = {"DAYS": "DAY", "HOURS": "HOUR", "MINUTES": "MINUTE",
+                        "SECONDS": "SECOND", "MONTHS": "MONTH", "YEARS": "YEAR",
+                        "WEEKS": "WEEK"}
+        return _PLURAL_MAP.get(unit, unit)
 
     # ---- EXTRACT(field FROM expr) ----------------------------------------
 

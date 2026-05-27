@@ -90,6 +90,10 @@ def _emit_select(node: SelectNode, d: Dialect) -> str:
     if node.having is not None:
         parts.append("HAVING " + _emit_expr(node.having, d))
 
+    # QUALIFY
+    if node.qualify is not None:
+        parts.append("QUALIFY " + _emit_expr(node.qualify, d))
+
     # ORDER BY
     if node.order_by:
         parts.append("ORDER BY " + ", ".join(_emit_order(o, d) for o in node.order_by))

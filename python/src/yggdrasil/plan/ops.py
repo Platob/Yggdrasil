@@ -96,5 +96,18 @@ class SetOp:
     plan: Any   # forward ref to SelectPlan
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class GroupByOp:
+    """A pending GROUP BY operation."""
+    keys: list[str]
+    aggregations: dict[str, str]  # output_name -> "func(col)" or "func(*)"
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class OrderByOp:
+    """A pending ORDER BY operation."""
+    keys: list[tuple[str, bool]]  # (column, ascending)
+
+
 # Type alias for anything that can appear in a FROM clause
 FromItem = TableRef | SubqueryRef | JoinClause | LateralViewItem

@@ -410,7 +410,8 @@ def _build() -> FunctionRegistry:
         "MAKE_DATE": (3, 3), "MAKE_TIMESTAMP": (6, 7), "MAKE_INTERVAL": (0, 7),
         "DATE_PART": (2, 2), "DATEPART": (2, 2), "EXTRACT": (2, 2),
         "TIMESTAMP_SECONDS": (1, 1), "TIMESTAMP_MILLIS": (1, 1),
-        "TIMESTAMP_MICROS": (1, 1), "DATE_FROM_UNIX_DATE": (1, 1), "UNIX_DATE": (1, 1)})
+        "TIMESTAMP_MICROS": (1, 1), "DATE_FROM_UNIX_DATE": (1, 1), "UNIX_DATE": (1, 1),
+        "TIMESTAMPADD": (3, 3), "TIMESTAMPDIFF": (3, 3)})
 
     _b("string", {"CONCAT": (1, None), "CONCAT_WS": (2, None), "SUBSTRING": (2, 3),
         "SUBSTR": (2, 3), "TRIM": (1, 1), "LTRIM": (1, 2), "RTRIM": (1, 2),
