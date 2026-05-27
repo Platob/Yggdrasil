@@ -2044,3 +2044,18 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     to_pydict = read_pydict
     to_record_iterator = read_record_iterator
     to_records = read_records
+
+    # ==================================================================
+    # Lazy execution plan
+    # ==================================================================
+
+    def lazy(self) -> "LazyTabular":
+        """Return a :class:`LazyTabular` wrapping this source.
+
+        Transformations on the returned object (``select``, ``filter``,
+        ``join``, …) accumulate in an :class:`ExecutionPlan` without
+        touching data.  Any ``read_*`` call materialises the plan.
+        """
+        from yggdrasil.plan.lazy import LazyTabular
+
+        return LazyTabular(self)
