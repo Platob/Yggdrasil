@@ -1633,20 +1633,13 @@ class HTTPSession(Session):
 
         result = self._wire_send(request, wait_cfg)
 
-        # 403 → refresh auth and retry once. The pool's status_forcelist
-        # covers 5xx / 429 transients; 403 is a deliberate auth signal
-        # some vendors (Salesforce, M365 SharePoint, …) emit instead
-        # of 401 when a previously-valid token has been silently
-        # rotated upstream. Only worth retrying when an auth handler
-        # is actually bound — otherwise the second attempt would
-        # carry the same headers and 403 again.
         if result.status_code in (401, 403) and (request.auth or self.auth) is not None:
             LOGGER.warning(
                 "Refreshing auth after %d for %s %s — retrying once",
                 result.status_code, request.method, request.url,
             )
-            refreshed = self.refresh_auth(request)  # force=True default
-            if refreshed:
+            if self.refresh_auth(request, force=True):
+                request = self.prepare_request_before_send(request)
                 result = self._wire_send(request, wait_cfg)
 
         x_current_page = result.headers.get("X-Current-Page")

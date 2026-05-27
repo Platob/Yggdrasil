@@ -830,27 +830,6 @@ class HTTPResponse(IO):  # IO inherits Tabular
     def ok(self) -> bool:
         return 200 <= self.status_code < 400
 
-    def refresh_auth(self, force: bool = True) -> bool:
-        """Refresh the Authorization header on the bound request.
-
-        Delegates to :meth:`Session.refresh_auth` on the request's
-        attached session, which re-runs the handler's refresh
-        (force-minting a fresh token when ``force=True``) and
-        re-stamps ``request.headers["Authorization"]``.
-
-        Returns ``True`` when the handler ran and the header was
-        stamped, ``False`` when no handler is bound.
-        """
-        session = self.request.session
-        if session is None:
-            raise RuntimeError(
-                f"{type(self).__name__}.refresh_auth requires the bound "
-                f"request to carry an attached session — got "
-                f"{self.request!r} with session=None. Attach one via "
-                "request.attach_session(session) or call "
-                "session.refresh_auth(response.request, force=...) directly."
-            )
-        return session.refresh_auth(self.request, force=force)
 
     def raise_for_status(self) -> None:
         if not self.ok:
