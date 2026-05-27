@@ -29,6 +29,25 @@ function getFileExtension(name: string): string {
   return name.slice(idx + 1).toLowerCase();
 }
 
+const TEXT_VIEWABLE_EXTS = new Set([
+  "py", "ts", "tsx", "js", "jsx", "rs", "go", "c", "cpp", "h", "java", "rb",
+  "sh", "bash", "zsh", "toml", "yaml", "yml", "json", "xml", "html", "css",
+  "scss", "md", "txt", "rst", "cfg", "ini", "conf", "env", "log", "csv",
+  "sql", "graphql", "proto", "dockerfile", "makefile", "gitignore",
+]);
+
+// 4 MB threshold for inline viewing
+const MAX_VIEWABLE_SIZE = 4 * 1024 * 1024;
+
+function isTextViewable(entry: FsEntry): boolean {
+  if (entry.is_dir || entry.size > MAX_VIEWABLE_SIZE) return false;
+  const ext = getFileExtension(entry.name);
+  // Also handle extensionless files that are common text files
+  const lowerName = entry.name.toLowerCase();
+  return TEXT_VIEWABLE_EXTS.has(ext) ||
+    ["makefile", "dockerfile", "readme", "license", "changelog", ".gitignore", ".env"].includes(lowerName);
+}
+
 // Rough icon selection based on extension
 function FileIcon({ entry }: { entry: FsEntry }) {
   if (entry.is_dir) {
@@ -116,8 +135,25 @@ export default function FilesPage() {
 
   const navigateTo = (path: string) => {
     setSelectedFile(null);
+    setFileContent(null);
     setCurrentPath(path);
     fetchListing(path);
+  };
+
+  const openFile = async (entry: FsEntry) => {
+    setSelectedFile(entry);
+    setFileContent(null);
+    if (isTextViewable(entry)) {
+      setLoadingContent(true);
+      try {
+        const content = await getFsContent(entry.path);
+        setFileContent(content);
+      } catch {
+        setFileContent(null);
+      } finally {
+        setLoadingContent(false);
+      }
+    }
   };
 
   const navigateUp = () => {
@@ -138,7 +174,16 @@ export default function FilesPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Files</h1>
-          <p className="text-sm text-muted mt-1">Browse the node filesystem</p>
+          <p className="text-sm text-muted mt-1">
+            Browse the node filesystem
+            {!loading && entries.length > 0 && (
+              <span className="ml-2 text-foreground-dim font-mono">
+                {entries.length} item{entries.length !== 1 ? "s" : ""}
+                {" / "}
+                {formatSize(entries.reduce((sum, e) => sum + (e.is_dir ? 0 : e.size), 0))} total
+              </span>
+            )}
+          </p>
         </div>
         <button
           onClick={() => fetchListing(currentPath)}
@@ -250,7 +295,7 @@ export default function FilesPage() {
                   if (entry.is_dir) {
                     navigateTo(entry.path);
                   } else {
-                    setSelectedFile(entry);
+                    openFile(entry);
                   }
                 }}
                 className="
@@ -287,11 +332,11 @@ export default function FilesPage() {
           {/* Backdrop */}
           <div
             className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-            onClick={() => setSelectedFile(null)}
+            onClick={() => { setSelectedFile(null); setFileContent(null); }}
           />
           {/* Modal */}
-          <div className="relative glass-card p-6 max-w-lg w-full space-y-4 z-10">
-            <div className="flex items-start justify-between">
+          <div className={`relative glass-card p-6 w-full space-y-4 z-10 flex flex-col ${fileContent != null ? "max-w-3xl max-h-[85vh]" : "max-w-lg"}`}>
+            <div className="flex items-start justify-between shrink-0">
               <div className="flex items-center gap-3 min-w-0">
                 <FileIcon entry={selectedFile} />
                 <div className="min-w-0">
@@ -304,7 +349,7 @@ export default function FilesPage() {
                 </div>
               </div>
               <button
-                onClick={() => setSelectedFile(null)}
+                onClick={() => { setSelectedFile(null); setFileContent(null); }}
                 className="text-muted hover:text-foreground transition-colors shrink-0 ml-4"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -314,7 +359,7 @@ export default function FilesPage() {
               </button>
             </div>
 
-            <div className="grid grid-cols-2 gap-4 text-sm">
+            <div className="grid grid-cols-2 gap-4 text-sm shrink-0">
               <div>
                 <span className="text-[10px] text-muted uppercase tracking-wider">Size</span>
                 <p className="text-xs font-mono mt-0.5">{formatSize(selectedFile.size)}</p>
@@ -333,7 +378,28 @@ export default function FilesPage() {
               </div>
             </div>
 
-            <div className="flex items-center gap-3 pt-2 border-t border-white/[0.06]">
+            {/* Inline text viewer */}
+            {loadingContent && (
+              <div className="flex items-center gap-2 py-4 shrink-0">
+                <div className="w-4 h-4 border-2 border-frost/30 border-t-frost rounded-full spin-slow" />
+                <span className="text-xs text-muted font-mono">Loading file content...</span>
+              </div>
+            )}
+            {fileContent != null && (
+              <div className="flex-1 min-h-0 overflow-hidden rounded-lg border border-white/[0.06] bg-black/30">
+                <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/[0.06] bg-white/[0.02]">
+                  <span className="text-[10px] text-muted uppercase tracking-wider font-medium">Content</span>
+                  <span className="text-[10px] text-muted font-mono">
+                    {fileContent.split("\n").length} lines
+                  </span>
+                </div>
+                <pre className="overflow-auto p-4 text-xs font-mono text-foreground/80 leading-relaxed max-h-[50vh] whitespace-pre-wrap break-words">
+                  {fileContent}
+                </pre>
+              </div>
+            )}
+
+            <div className="flex items-center gap-3 pt-2 border-t border-white/[0.06] shrink-0">
               <a
                 href={`/api/v2/fs/read?path=${encodeURIComponent(selectedFile.path)}`}
                 target="_blank"
@@ -353,7 +419,7 @@ export default function FilesPage() {
                 Download
               </a>
               <button
-                onClick={() => setSelectedFile(null)}
+                onClick={() => { setSelectedFile(null); setFileContent(null); }}
                 className="px-4 py-2 rounded-lg text-xs font-medium text-muted hover:text-foreground transition-colors"
               >
                 Close

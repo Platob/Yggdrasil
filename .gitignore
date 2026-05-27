@@ -221,3 +221,4 @@ __marimo__/
 .next/
 node_modules/
 .claude/worktrees/
+tsconfig.tsbuildinfo
