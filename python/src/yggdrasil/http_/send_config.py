@@ -122,13 +122,31 @@ class SendConfig:
         if self.local_cache is not None:
             local_hashes = _probe(self.local_cache) & request_hash_set
             if local_hashes:
+                matched = [r for r in misses if r.match_value(MATCH_KEY) in local_hashes]
                 misses = [r for r in misses if r.match_value(MATCH_KEY) not in local_hashes]
+                if matched and LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        "Local cache hit: %s",
+                        ", ".join(f"{r.method} {r.url}" for r in matched),
+                    )
 
         if self.remote_cache is not None and misses:
             remaining = {r.match_value(MATCH_KEY) for r in misses}
             remote_hashes = _probe(self.remote_cache) & remaining
             if remote_hashes:
+                matched = [r for r in misses if r.match_value(MATCH_KEY) in remote_hashes]
                 misses = [r for r in misses if r.match_value(MATCH_KEY) not in remote_hashes]
+                if matched and LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        "Remote cache hit: %s",
+                        ", ".join(f"{r.method} {r.url}" for r in matched),
+                    )
+
+        if misses and LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "Cache miss: %s",
+                ", ".join(f"{r.method} {r.url}" for r in misses),
+            )
 
         return local_hashes, remote_hashes, misses
 
