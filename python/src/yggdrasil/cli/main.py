@@ -189,11 +189,12 @@ def _node_start(args: argparse.Namespace) -> int:
 
     _apply_node_env(args)
     print_logo("YGGNODE")
-
     settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
+
     host = getattr(args, "host", "0.0.0.0")
 
-    out(f"  {cyan('starting')} node...\n")
+    out(f"  starting node...\n")
     pid, port = spawn_node(settings, host=host)
 
     out(f"  {green('✓')} node running\n")
@@ -217,10 +218,11 @@ def _node_start(args: argparse.Namespace) -> int:
 def _node_stop(args: argparse.Namespace) -> int:
     from yggdrasil.node.daemon import stop_node
     from yggdrasil.node.config import get_settings
-    from yggdrasil.cli.style import green, orange, out, print_logo, red
+    from yggdrasil.cli.style import dim, green, orange, out, print_logo, red
 
     print_logo("YGGNODE")
     settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
     if stop_node(settings):
         out(f"  {green('✓')} {orange(settings.node_id)} stopped\n")
     else:
@@ -235,8 +237,8 @@ def _node_serve(args: argparse.Namespace) -> int:
 
     _apply_node_env(args)
     print_logo("YGGNODE")
-
     settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
     ensure_directories(settings)
     cleanup_old_logs(settings)
 
@@ -271,6 +273,7 @@ def _node_status(args: argparse.Namespace) -> int:
 
     print_logo("YGGNODE")
     settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
     ensure_directories(settings)
     running, pid, port = _is_node_running(settings)
 
@@ -309,6 +312,7 @@ def _node_create(args: argparse.Namespace) -> int:
 
     from yggdrasil.node.config import get_settings
     settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
     ensure_directories(settings)
 
     id_file = Path.home() / ".node" / ".ygg_node_id"

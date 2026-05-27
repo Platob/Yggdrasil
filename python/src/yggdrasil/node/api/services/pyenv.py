@@ -115,6 +115,11 @@ class PyEnvService:
         updates: dict = {"updated_at": now}
         if req.name is not None:
             updates["name"] = req.name
+        hash_name = updates.get("name", entry.name)
+        hash_deps = list(entry.dependencies)
+        updates["content_hash"] = hashlib.sha256(
+            (hash_name + entry.python_version + "".join(sorted(hash_deps))).encode()
+        ).hexdigest()
         updated = entry.model_copy(update=updates)
         with self._lock:
             self._envs[env_id] = updated
