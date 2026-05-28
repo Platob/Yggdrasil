@@ -21,9 +21,15 @@ router = APIRouter(tags=["pyfuncrun"])
 @router.get("", response_model=PyFuncRunListResponse)
 async def list_runs(
     func_id: int | None = None,
+    status: str | None = None,
     service: PyFuncRunService = Depends(get_pyfuncrun_service),
 ) -> PyFuncRunListResponse:
-    return await service.list(func_id=func_id)
+    """List runs. ``status`` can be a comma-separated list (e.g. ``running,pending``)."""
+    resp = await service.list(func_id=func_id)
+    if status:
+        wanted = {s.strip() for s in status.split(",") if s.strip()}
+        resp.runs = [r for r in resp.runs if r.status in wanted]
+    return resp
 
 
 @router.post("", response_model=PyFuncRunResponse)
