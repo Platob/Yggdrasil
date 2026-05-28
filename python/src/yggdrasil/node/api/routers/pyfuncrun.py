@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import json
+import orjson
 
 from fastapi import APIRouter, Depends, Response
 from fastapi.responses import StreamingResponse
+
+_SSE_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
 
 from ...transport import serialize_result
 from ..deps import get_pyfuncrun_service
@@ -119,9 +121,9 @@ async def stream_logs(
 
     async def event_stream():
         async for event in service.stream_logs(run_id):
-            yield f"data: {json.dumps(event)}\n\n"
+            yield b"data: " + orjson.dumps(event) + b"\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.get("/{run_id}/state")
@@ -134,9 +136,9 @@ async def stream_state(
 
     async def event_stream():
         async for state in service.stream_state(run_id):
-            yield f"data: {json.dumps(state)}\n\n"
+            yield b"data: " + orjson.dumps(state) + b"\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.get("/{run_id}/result")

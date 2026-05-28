@@ -218,11 +218,15 @@ async def tail_file(path: str, n: int = 100, service: FsService = Depends(get_fs
 @router.get("/watch")
 async def watch_file(path: str, service: FsService = Depends(get_fs_service)) -> StreamingResponse:
     """SSE tail -f. Streams each new line as ``data: {line}\\n\\n``."""
-    import json as _json
+    import orjson
     async def stream():
         async for line in service.watch_tail(path):
-            yield f"data: {_json.dumps({'line': line})}\n\n"
-    return StreamingResponse(stream(), media_type="text/event-stream")
+            yield b"data: " + orjson.dumps({"line": line}) + b"\n\n"
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 class _GrepRequest(StrictModel):

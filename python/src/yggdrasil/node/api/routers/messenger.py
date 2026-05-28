@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import json
+import orjson
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+
+_SSE_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
 
 from ..deps import get_messenger_service, get_user_service
 from ..schemas.messenger import (
@@ -60,7 +62,6 @@ async def stream_messages(
 
     async def event_stream():
         async for msg in service.stream_messages(channel):
-            payload = msg.model_dump()
-            yield f"data: {json.dumps(payload)}\n\n"
+            yield b"data: " + orjson.dumps(msg.model_dump()) + b"\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
