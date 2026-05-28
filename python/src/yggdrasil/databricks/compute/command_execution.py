@@ -558,7 +558,8 @@ class CommandExecution:
         if path is None:
             return
         try:
-            self.client.dbfs_path(path).remove()
+            from yggdrasil.databricks.path import DatabricksPath
+            DatabricksPath.from_(path, client=self.client).remove()
         except BaseException:  # noqa: BLE001 — cleanup must never raise
             try:
                 LOGGER.debug(
@@ -623,10 +624,12 @@ class CommandExecution:
             prefix = "DBXPATH:"
             if raw_result.startswith(prefix):
                 result_path = raw_result[len(prefix):]
+                from yggdrasil.databricks.path import DatabricksPath
+                result_obj = DatabricksPath.from_(result_path, client=self.client)
                 try:
-                    raw_result = self.client.dbfs_path(result_path).read_bytes().decode("ascii")
+                    raw_result = result_obj.read_bytes().decode("ascii")
                 finally:
-                    self.client.dbfs_path(result_path).remove()
+                    result_obj.remove()
 
             if (
                 (raw_result.startswith("[") and raw_result.endswith("]"))

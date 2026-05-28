@@ -1231,6 +1231,13 @@ class DatabricksClient(Singleton, URLBased):
     ):
         """Create a DatabricksPath in this workspace.
 
+        .. deprecated:: 0.8.31
+           Use :meth:`open` for byte IO
+           (``client.open("/Volumes/cat/sch/vol/x", "rb")``), or build
+           the path directly via
+           ``DatabricksPath.from_(parts, client=self)`` when you need
+           the resource itself.
+
         Args:
             parts: Path parts or string to parse.
             temporary: Temporary path
@@ -1238,6 +1245,14 @@ class DatabricksClient(Singleton, URLBased):
         Returns:
             A DatabricksPath instance.
         """
+        import warnings
+        warnings.warn(
+            "DatabricksClient.dbfs_path is deprecated; use "
+            "DatabricksClient.open(path, mode) for IO or "
+            "DatabricksPath.from_(path, client=...) for the path object.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         from .path import DatabricksPath
 
         return DatabricksPath.from_(
@@ -1254,8 +1269,8 @@ class DatabricksClient(Singleton, URLBased):
     ) -> "IO":
         """Open ``path`` against this workspace and return an :class:`IO` cursor.
 
-        Defaults to a :class:`DatabricksPath` resolved through
-        :meth:`dbfs_path` — strings like ``/Volumes/cat/sch/vol/x`` or
+        Defaults to a :class:`DatabricksPath` bound to this client —
+        strings like ``/Volumes/cat/sch/vol/x`` or
         ``dbfs+volume:///cat/sch/vol/x`` dispatch to the right concrete
         subclass (DBFS / Volumes / Workspace). A pre-built
         :class:`~yggdrasil.path.Path` is opened verbatim so callers can
@@ -1265,8 +1280,13 @@ class DatabricksClient(Singleton, URLBased):
         :meth:`Path.open` (which forwards to :meth:`IO.open`).
         """
         from yggdrasil.path import Path
+        from .path import DatabricksPath
 
-        target = path if isinstance(path, Path) else self.dbfs_path(path)
+        target = (
+            path
+            if isinstance(path, Path)
+            else DatabricksPath.from_(obj=path, client=self)
+        )
         return target.open(mode=mode, **kwargs)
 
     @staticmethod
@@ -1336,7 +1356,8 @@ class DatabricksClient(Singleton, URLBased):
             base_path=base_path,
         )
 
-        return self.dbfs_path(f"{base_path}/{temp_path}")
+        from .path import DatabricksPath
+        return DatabricksPath.from_(f"{base_path}/{temp_path}", client=self)
 
     def clean_tmp_folder(
         self,
@@ -1362,7 +1383,8 @@ class DatabricksClient(Singleton, URLBased):
             return self
 
         if wait.timeout:
-            base_path = self.dbfs_path(base_path)
+            from .path import DatabricksPath
+            base_path = DatabricksPath.from_(base_path, client=self)
 
             LOGGER.debug("Cleaning temp path %s", base_path)
 

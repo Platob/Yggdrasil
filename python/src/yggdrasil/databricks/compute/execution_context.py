@@ -873,9 +873,10 @@ _MAX_INLINE = 900000
 _raw = {payload_literal!r}
 if _raw.startswith(_DBXPATH_PREFIX):
     from yggdrasil.databricks.client import DatabricksClient as _DBC
+    from yggdrasil.databricks.path import DatabricksPath as _DBP
     _client = _DBC.current()
     _path = _raw[len(_DBXPATH_PREFIX):]
-    _raw = _client.dbfs_path(_path, temporary=True).read_bytes().decode("ascii")
+    _raw = _DBP.from_(_path, client=_client, temporary=True).read_bytes().decode("ascii")
 _f, _a, _k = loads(_raw)
 _r = dumps(_f(*_a, **_k), b64=True)
 if len(_r) > _MAX_INLINE:
