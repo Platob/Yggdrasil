@@ -102,7 +102,10 @@ def _local_mount_available() -> bool:
     Conjunction of "this process runs inside a Databricks runtime"
     (``DATABRICKS_RUNTIME_VERSION`` env var set) and "``/Volumes``
     actually exists on disk" (catches the rare runtime that disables
-    the mount or test environments that fake the env var).
+    the mount or test environments that fake the env var). The
+    result is logged once at INFO so an operator can see at a glance
+    whether VolumePath is short-circuiting through the kernel or
+    paying Files-API round trips.
     """
     global _LOCAL_MOUNT_PROBED, _LOCAL_MOUNT_AVAILABLE
     if _LOCAL_MOUNT_PROBED:
@@ -112,8 +115,20 @@ def _local_mount_available() -> bool:
         in_runtime = DatabricksClient.is_in_databricks_environment()
     except Exception:
         in_runtime = False
-    _LOCAL_MOUNT_AVAILABLE = bool(in_runtime) and os.path.isdir("/Volumes")
+    has_mount = bool(in_runtime) and os.path.isdir("/Volumes")
+    _LOCAL_MOUNT_AVAILABLE = has_mount
     _LOCAL_MOUNT_PROBED = True
+    if has_mount:
+        logger.info(
+            "VolumePath: /Volumes kernel mount detected — short-circuiting "
+            "stat/read/ls/upload/mkdir/remove off the Files API.",
+        )
+    else:
+        logger.debug(
+            "VolumePath: /Volumes kernel mount unavailable "
+            "(in_runtime=%s, /Volumes exists=%s) — routing through Files API.",
+            in_runtime, os.path.isdir("/Volumes"),
+        )
     return _LOCAL_MOUNT_AVAILABLE
 
 
@@ -211,16 +226,27 @@ class VolumePath(DatabricksPath):
             try:
                 st = os.stat(api_path)
             except FileNotFoundError:
+                logger.debug("stat via kernel mount: %r -> MISSING", api_path)
                 return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug(
+                    "stat via kernel mount: %r -> OSError %r, "
+                    "falling back to Files API", api_path, exc,
+                )
             else:
                 if _stat.S_ISDIR(st.st_mode):
+                    logger.debug(
+                        "stat via kernel mount: %r -> DIRECTORY", api_path,
+                    )
                     return IOStats(
                         kind=IOKind.DIRECTORY,
                         size=0,
                         mtime=st.st_mtime,
                     )
+                logger.debug(
+                    "stat via kernel mount: %r -> FILE size=%d",
+                    api_path, st.st_size,
+                )
                 return IOStats(
                     kind=IOKind.FILE,
                     size=int(st.st_size),
@@ -479,12 +505,16 @@ class VolumePath(DatabricksPath):
             try:
                 scan = os.scandir(scan_root)
             except FileNotFoundError:
+                logger.debug(
+                    "ls via kernel mount: %r -> not found", scan_root,
+                )
                 return
             except (NotADirectoryError, PermissionError) as exc:
                 logger.warning(
                     "Cannot scan volume directory %r: %r", self, exc,
                 )
                 return
+            yielded = 0
             with scan as it:
                 for entry in it:
                     # Build the child against the logical
@@ -513,11 +543,16 @@ class VolumePath(DatabricksPath):
                         )
                     except OSError:
                         is_directory = entry.is_dir(follow_symlinks=False)
+                    yielded += 1
                     yield child
                     if recursive and is_directory:
                         yield from child._ls(
                             recursive=True, singleton_ttl=singleton_ttl,
                         )
+            logger.debug(
+                "ls via kernel mount: %r -> %d entries (recursive=%s)",
+                scan_root, yielded, recursive,
+            )
             return
         files = self.client.workspace_client().files
         try:
@@ -680,7 +715,27 @@ class VolumePath(DatabricksPath):
     # ==================================================================
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
-        logger.debug("Creating volume directory %r", self)
+        logger.debug(
+            "Creating volume directory %r (parents=%s, exist_ok=%s)",
+            self, parents, exist_ok,
+        )
+        # Cluster fast path — mkdir on the kernel mount. The mount
+        # auto-materializes intermediate UC volume directories the
+        # same way the Files API does, so ``parents=True`` maps
+        # cleanly onto ``os.makedirs``.
+        if _local_mount_available():
+            api_path = self.api_path
+            try:
+                if parents:
+                    os.makedirs(api_path, exist_ok=exist_ok)
+                else:
+                    os.mkdir(api_path)
+            except FileExistsError:
+                if not exist_ok:
+                    raise
+            self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
+            logger.debug("mkdir via kernel mount: %r", api_path)
+            return
         try:
             self._call_ensuring_parents(
                 self.client.workspace_client().files.create_directory,
@@ -698,7 +753,20 @@ class VolumePath(DatabricksPath):
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
-        logger.info("Deleting volume file %r", self)
+        logger.debug(
+            "Deleting volume file %r (missing_ok=%s)", self, missing_ok,
+        )
+        if _local_mount_available():
+            try:
+                os.remove(self.api_path)
+                logger.debug("rm via kernel mount: %r", self.api_path)
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+            except IsADirectoryError:
+                raise
+            self.invalidate_singleton()
+            return
         try:
             self._call(self.client.workspace_client().files.delete, self.api_path)
         except Exception:
@@ -713,11 +781,32 @@ class VolumePath(DatabricksPath):
         wait: WaitingConfig,
         pool: "int | ThreadPoolExecutor | None" = None,
     ) -> None:
-        logger.info(
-            "Deleting volume directory %r (recursive=%s)",
-            self,
-            recursive,
+        logger.debug(
+            "Deleting volume directory %r (recursive=%s, missing_ok=%s)",
+            self, recursive, missing_ok,
         )
+        # Cluster fast path — ``shutil.rmtree`` for recursive,
+        # ``os.rmdir`` for the simple case. No thread pool needed
+        # because the kernel walks the tree at filesystem speed,
+        # and the Files-API per-leaf round trip the off-cluster
+        # path needs to fan out doesn't exist here.
+        if _local_mount_available():
+            import shutil
+            api_path = self.api_path
+            try:
+                if recursive:
+                    shutil.rmtree(api_path)
+                else:
+                    os.rmdir(api_path)
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+            self.invalidate_singleton()
+            logger.debug(
+                "rmdir via kernel mount: %r (recursive=%s)",
+                api_path, recursive,
+            )
+            return
         # ``files.delete_directory`` is non-recursive — its docstring is
         # explicit: "To delete a non-empty directory, first delete all
         # of its contents." Hitting it on a non-empty directory returns
@@ -798,16 +887,24 @@ class VolumePath(DatabricksPath):
         # Cluster fast path — read straight off the kernel mount,
         # honouring offset + length without downloading the rest.
         if _local_mount_available():
+            api_path = self.api_path
             try:
-                with open(self.api_path, "rb") as fh:
+                with open(api_path, "rb") as fh:
                     if pos:
                         fh.seek(pos)
                     data = fh.read() if n < 0 else fh.read(n)
             except FileNotFoundError as exc:
+                logger.debug(
+                    "read via kernel mount: %r -> NOT FOUND", api_path,
+                )
                 raise FileNotFoundError(self.full_path()) from exc
+            logger.debug(
+                "read via kernel mount: %r -> %d bytes (pos=%d, n=%s)",
+                api_path, len(data), pos, "EOF" if n < 0 else n,
+            )
             if not self._stat_cached:
                 try:
-                    st = os.stat(self.api_path)
+                    st = os.stat(api_path)
                     self._persist_stat_cache(
                         stats=IOStats(
                             size=int(st.st_size),
@@ -923,6 +1020,10 @@ class VolumePath(DatabricksPath):
         if _local_mount_available():
             parent = os.path.dirname(api_path)
             if parent and not os.path.isdir(parent):
+                logger.debug(
+                    "upload via kernel mount: auto-creating parent %r",
+                    parent,
+                )
                 os.makedirs(parent, exist_ok=True)
             if hasattr(content, "seek"):
                 try:
@@ -933,17 +1034,24 @@ class VolumePath(DatabricksPath):
                     content.seek(pos, io.SEEK_SET)
                 except Exception:
                     pos = 0
+                bytes_written = 0
                 with open(api_path, "wb") as fh:
                     while True:
                         chunk = content.read(1024 * 1024)
                         if not chunk:
                             break
                         fh.write(chunk)
+                        bytes_written += len(chunk)
+                if size == -1:
+                    size = bytes_written
             else:
                 payload = bytes(content)
                 size = len(payload)
                 with open(api_path, "wb") as fh:
                     fh.write(payload)
+            logger.debug(
+                "upload via kernel mount: %r -> %d bytes", api_path, size,
+            )
             self._persist_stat_cache(
                 IOStats(kind=IOKind.FILE, size=int(max(size, 0)),
                         mtime=time.time())

@@ -278,6 +278,136 @@ class TestUploadFastPath:
 # ===========================================================================
 
 
+# ===========================================================================
+# _mkdir / _remove_file / _remove_dir fast paths
+# ===========================================================================
+
+
+class TestMkdirFastPath:
+
+    def test_mkdir_creates_directory_on_mount(
+        self, fake_volume_root, service,
+    ):
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/newdir", service=service,
+        )
+        p._mkdir(parents=False, exist_ok=False)
+        assert (fake_volume_root / "newdir").is_dir()
+        service.client.workspace_client.assert_not_called()
+
+    def test_mkdir_parents_true_creates_intermediate_dirs(
+        self, fake_volume_root, service,
+    ):
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/deep/nested/path", service=service,
+        )
+        p._mkdir(parents=True, exist_ok=False)
+        assert (
+            fake_volume_root / "deep" / "nested" / "path"
+        ).is_dir()
+
+    def test_mkdir_exist_ok_silences_already_exists(
+        self, fake_volume_root, service,
+    ):
+        (fake_volume_root / "already").mkdir()
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/already", service=service,
+        )
+        # Should NOT raise.
+        p._mkdir(parents=False, exist_ok=True)
+
+    def test_mkdir_exist_ok_false_raises_on_collision(
+        self, fake_volume_root, service,
+    ):
+        (fake_volume_root / "already").mkdir()
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/already", service=service,
+        )
+        with pytest.raises(FileExistsError):
+            p._mkdir(parents=False, exist_ok=False)
+
+
+class TestRemoveFileFastPath:
+
+    def test_remove_file_unlinks_from_mount(
+        self, fake_volume_root, service,
+    ):
+        target = fake_volume_root / "f.bin"
+        target.write_bytes(b"x")
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/f.bin", service=service,
+        )
+        from yggdrasil.dataclasses import WaitingConfig
+        p._remove_file(missing_ok=False, wait=WaitingConfig.from_(True))
+        assert not target.exists()
+        service.client.workspace_client.assert_not_called()
+
+    def test_remove_file_missing_ok_swallows_not_found(
+        self, fake_volume_root, service,
+    ):
+        from yggdrasil.dataclasses import WaitingConfig
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/ghost.bin", service=service,
+        )
+        # Should NOT raise.
+        p._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
+
+    def test_remove_file_not_missing_ok_raises(
+        self, fake_volume_root, service,
+    ):
+        from yggdrasil.dataclasses import WaitingConfig
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/ghost.bin", service=service,
+        )
+        with pytest.raises(FileNotFoundError):
+            p._remove_file(
+                missing_ok=False, wait=WaitingConfig.from_(True),
+            )
+
+
+class TestRemoveDirFastPath:
+
+    def test_remove_empty_dir_via_rmdir(
+        self, fake_volume_root, service,
+    ):
+        (fake_volume_root / "empty").mkdir()
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/empty", service=service,
+        )
+        from yggdrasil.dataclasses import WaitingConfig
+        p._remove_dir(
+            recursive=False,
+            missing_ok=False,
+            wait=WaitingConfig.from_(True),
+        )
+        assert not (fake_volume_root / "empty").exists()
+        service.client.workspace_client.assert_not_called()
+
+    def test_remove_dir_recursive_wipes_subtree(
+        self, fake_volume_root, service,
+    ):
+        sub = fake_volume_root / "tree"
+        sub.mkdir()
+        (sub / "a.bin").write_bytes(b"A")
+        (sub / "inner").mkdir()
+        (sub / "inner" / "b.bin").write_bytes(b"B")
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/tree", service=service,
+        )
+        from yggdrasil.dataclasses import WaitingConfig
+        p._remove_dir(
+            recursive=True,
+            missing_ok=False,
+            wait=WaitingConfig.from_(True),
+        )
+        assert not sub.exists()
+
+
+# ===========================================================================
+# Off-cluster fallback
+# ===========================================================================
+
+
 class TestFilesApiPathStillUsedOffCluster:
     """When the local-mount probe returns False (the off-cluster
     case), every operation must still go through ``files.*`` — the
