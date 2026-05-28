@@ -304,6 +304,27 @@ def _build_match_condition(
     return " AND ".join(clauses)
 
 
+def _coalesce_predicate(
+    cast_options: "CastOptions | None",
+    predicate: "Predicate | None",
+) -> "CastOptions":
+    """Fold *predicate* into :attr:`CastOptions.predicate`.
+
+    Used at insert-method boundaries so callers can pass a top-level
+    ``predicate=`` kwarg without juggling :class:`CastOptions`
+    manually. When both the kwarg and ``cast_options.predicate`` carry
+    a value, they're combined with ``&`` (logical AND) so the
+    downstream SQL prune and source-row filter both see the merged
+    expression.
+    """
+    opts = CastOptions.check(options=cast_options)
+    if predicate is None:
+        return opts
+    if opts.predicate is None:
+        return opts.copy(predicate=predicate)
+    return opts.copy(predicate=opts.predicate & predicate)
+
+
 def _build_where_predicates(
     where: Predicate | None,
     *,
@@ -1399,7 +1420,7 @@ class Table(DatabricksPath):
             zorder_by=options.zorder_by,
             optimize_after_merge=options.optimize_after_merge,
             vacuum_hours=options.vacuum_hours,
-            where=options.predicate,
+            predicate=options.predicate,
             retry=options.retry,
             return_data=options.return_data,
             safe_merge=options.safe_merge,
@@ -3126,7 +3147,7 @@ class Table(DatabricksPath):
         vacuum_hours: int | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         spark_options: Optional[Dict[str, Any]] = None,
-        where: Predicate | None = None,
+        predicate: Predicate | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3149,6 +3170,9 @@ class Table(DatabricksPath):
         :class:`StatementResult` from :meth:`sql_insert` — for
         downstream chaining without re-querying the target.
         """
+        # Fold the top-level predicate into cast_options so the
+        # downstream backends read a single source of truth.
+        cast_options = _coalesce_predicate(cast_options, predicate)
         common = dict(
             mode=mode,
             match_by=match_by,
@@ -3158,7 +3182,6 @@ class Table(DatabricksPath):
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            where=where,
             retry=retry,
             return_data=return_data,
             safe_merge=safe_merge,
@@ -3260,7 +3283,7 @@ class Table(DatabricksPath):
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
-        where: Predicate | None = None,
+        predicate: Predicate | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3285,15 +3308,17 @@ class Table(DatabricksPath):
         """
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
+        cast_options = _coalesce_predicate(cast_options, predicate)
+
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert(
                 data,
                 mode=mode,
+                cast_options=cast_options,
                 match_by=match_by, update_column_names=update_column_names,
                 wait=wait, raise_error=raise_error,
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
-                where=where,
                 retry=retry,
                 return_data=return_data,
             )
@@ -3320,7 +3345,9 @@ class Table(DatabricksPath):
         if return_data:
             output_data = staging.read_arrow_table()
 
-        prune_predicates = _build_where_predicates(where, target_alias="T")
+        prune_predicates = _build_where_predicates(
+            cast_options.predicate, target_alias="T",
+        )
 
         columns = list(existing_schema.field_names())
         # Plain column projection — the staged Parquet was already
@@ -3397,7 +3424,7 @@ class Table(DatabricksPath):
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         spark_options: Optional[Dict[str, Any]] = None,
-        where: Predicate | None = None,
+        predicate: Predicate | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
@@ -3417,15 +3444,17 @@ class Table(DatabricksPath):
         the materialised source DataFrame — handy for chaining
         downstream transforms without re-querying the target.
         """
+        cast_options = _coalesce_predicate(cast_options, predicate)
+
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert(
                 data,
                 mode=mode,
+                cast_options=cast_options,
                 match_by=match_by, update_column_names=update_column_names,
                 wait=wait, raise_error=raise_error,
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
-                where=where,
                 spark_session=spark_session,
                 retry=retry,
                 return_data=return_data,
@@ -3454,7 +3483,9 @@ class Table(DatabricksPath):
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
-        prune_predicates = _build_where_predicates(where, target_alias="T")
+        prune_predicates = _build_where_predicates(
+            cast_options.predicate, target_alias="T",
+        )
 
         # Spark fast path for keyed APPEND under ``safe_merge=True``
         # (see :func:`_spark_filter_existing_keys`). Catalyst's
@@ -3591,7 +3622,7 @@ class Table(DatabricksPath):
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
-        where: Predicate | None = None,
+        predicate: Predicate | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3614,13 +3645,13 @@ class Table(DatabricksPath):
         cached one) so callers can stream the same rows the warehouse
         just inserted.
         """
+        cast_options = _coalesce_predicate(cast_options, predicate)
         common = dict(
             mode=mode,
             match_by=match_by, update_column_names=update_column_names,
             wait=wait, raise_error=raise_error,
             zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            where=where,
             retry=retry,
         )
 
@@ -3671,7 +3702,6 @@ class Table(DatabricksPath):
         zorder_by: Optional[list[str]],
         optimize_after_merge: bool,
         vacuum_hours: int | None,
-        where: Predicate | None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Warehouse fallback for :meth:`sql_insert`."""
@@ -3717,7 +3747,9 @@ class Table(DatabricksPath):
             f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS {quote_ident('raw_src')}"
         )
 
-        prune_predicates = _build_where_predicates(where, target_alias="T")
+        prune_predicates = _build_where_predicates(
+            cast_options.predicate, target_alias="T",
+        )
         sql_texts = _build_dml_statements(
             target_location=target_location,
             source_sql=source_sql,
@@ -3790,22 +3822,14 @@ class Table(DatabricksPath):
         return infos.storage_location
 
     def storage_location(self) -> str | None:
-        """Return the table's backing storage location as an addressable :class:`Path`.
+        """Return the raw storage-location URL string for this table, or
+        ``None`` when the table has no resolvable metadata.
 
-        ``operation`` accepts a :class:`TableOperation`, a :class:`Mode`,
-        a :class:`Mode`-like string (``"read"``, ``"overwrite"``,
-        ``"append"``, …), or ``None``.
-
-        Resolution:
-
-        - ``None`` (the default) picks ``READ`` for managed tables
-          (Unity Catalog only ever vends read creds for those) and
-          ``READ_WRITE`` for external tables.
-        - A :class:`TableOperation` is used as-is.
-        - A :class:`Mode` / string is mapped to ``READ`` for read-only
-          modes and ``READ_WRITE`` otherwise; managed tables still
-          collapse to ``READ`` because Unity Catalog will refuse
-          to vend write credentials for them.
+        For a Delta table this is the cloud-object root that contains
+        the parquet data files plus the ``_delta_log`` directory.
+        :meth:`storage_path` wraps the same URL in an
+        :class:`AWSClient`-backed Path so callers can ``iterdir()`` /
+        ``read_bytes()`` it directly.
         """
         infos = self.read_infos(default=None)
 
@@ -3814,13 +3838,18 @@ class Table(DatabricksPath):
 
         return infos.storage_location
 
-    def storage_path(self):
-        l = self.storage_location()
+    def storage_path(self) -> "Path | None":
+        """Return the table's backing storage as an addressable :class:`Path`.
 
-        if l is None:
+        For a Delta table, ``tbl.storage_path()`` yields a Path that
+        contains the parquet data files plus the ``_delta_log``
+        transaction directory — ``list(tbl.storage_path().iterdir())``
+        is the natural way to inspect the on-disk layout.
+        """
+        location = self.storage_location()
+        if location is None:
             return None
-
-        return self.aws().s3.path(l)
+        return self.aws().s3.path(location)
 
     def aws(
         self,

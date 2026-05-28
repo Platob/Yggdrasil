@@ -812,7 +812,7 @@ class TestTableStoragePathIntegration(_TableFixture):
         # Only AWS workspaces vend the read creds we need here — skip
         # cleanly on Azure / GCP rather than failing.
         try:
-            path = self.table.storage_location()
+            path = self.table.storage_path()
         except NotImplementedError as exc:
             raise unittest.SkipTest(
                 f"storage_location not implemented on this workspace: {exc}."

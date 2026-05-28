@@ -215,7 +215,7 @@ class TestDeltaStoragePathBenchmark(DatabricksIntegrationCase):
         # available (Azure / GCP on workspaces that don't implement
         # the AWS-style flow, or identities without the grant).
         try:
-            cls.storage_path = cls.table.storage_location()
+            cls.storage_path = cls.table.storage_path()
         except NotImplementedError as exc:
             cls._safe_drop_table()
             raise unittest.SkipTest(
@@ -282,6 +282,19 @@ class TestDeltaStoragePathBenchmark(DatabricksIntegrationCase):
     # ------------------------------------------------------------------
     # Tests — each asserts correctness *and* logs timings.
     # ------------------------------------------------------------------
+
+    def test_storage_path_exposes_delta_log(self) -> None:
+        """Every Delta table has a ``_delta_log`` directory.
+
+        Pins the contract that ``Table.storage_path()`` returns a
+        directory containing the transaction log alongside the
+        parquet data files. The test reaches for ``storage_path()``
+        (not ``storage_location()``) so the canonical name stays the
+        one tests + docs surface.
+        """
+        root = self.table.storage_path()
+        children = [c.name for c in root.iterdir()]
+        self.assertIn("_delta_log", children)
 
     def test_full_scan_round_trip(self) -> None:
         """Full table scan: SQL vs direct storage read return same rows."""
