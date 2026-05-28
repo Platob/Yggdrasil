@@ -176,25 +176,20 @@ class DeltaFolder(Folder):
                 with leaf as opened:
                     for batch in opened._read_arrow_batches(leaf_opts):
                         # Databricks DBR with row-tracking enabled
-                        # (auto-enabled on DV tables) stamps
+                        # (auto-on for DV tables) stamps internal
                         # ``_row-id-col-<uuid>`` /
                         # ``_row-commit-version-col-<uuid>`` columns
                         # onto AddFiles created post-feature-enable.
-                        # Drop anything that isn't part of the
-                        # table's logical schema so concurrent
-                        # AddFiles with mixed schemas concatenate
+                        # Drop anything not in the table's logical
+                        # schema so mixed-schema AddFiles concatenate
                         # cleanly via ``pa.Table.from_batches``.
-                        if target_field_names is not None:
-                            extra = [
+                        if (target_field_names is not None
+                                and not target_field_names.issuperset(
+                                    batch.schema.names)):
+                            batch = batch.select([
                                 n for n in batch.schema.names
-                                if n not in target_field_names
-                            ]
-                            if extra:
-                                keep = [
-                                    n for n in batch.schema.names
-                                    if n in target_field_names
-                                ]
-                                batch = batch.select(keep)
+                                if n in target_field_names
+                            ])
                         masked = mask_batch_with_dv(batch, dv, base_offset=base_offset)
                         base_offset += batch.num_rows
                         if masked.num_rows == 0:
