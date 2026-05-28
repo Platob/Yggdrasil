@@ -56,18 +56,19 @@ class AwsCredentialsProvider(ABC):
     # Per-(cls, key) singleton cache. Subclasses inherit the slot —
     # the ``(cls, key)`` tuple disambiguates AWSDatabricksVolumeCredentials
     # from AWSDatabricksTableCredentials against the same string key.
+    # No companion lock — ``dict.setdefault`` is GIL-atomic.
     _INSTANCES: ClassVar[dict[Tuple[type, str], "AwsCredentialsProvider"]] = {}
-    _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     def __new__(cls, key: str, *args, **kwargs) -> "AwsCredentialsProvider":
         cache_key = (cls, str(key))
-        with cls._INSTANCES_LOCK:
-            existing = cls._INSTANCES.get(cache_key)
-            if existing is not None:
-                return existing
-            instance = super().__new__(cls)
-            cls._INSTANCES[cache_key] = instance
-            return instance
+        existing = cls._INSTANCES.get(cache_key)
+        if existing is not None:
+            return existing
+        # ``dict.setdefault`` is GIL-atomic: under contention two
+        # threads may both allocate, but only the first writer's
+        # instance enters the cache and is returned everywhere.
+        instance = super().__new__(cls)
+        return cls._INSTANCES.setdefault(cache_key, instance)
 
     def __init__(self, key: str) -> None:
         # Singleton-cached instances are re-entered on every constructor

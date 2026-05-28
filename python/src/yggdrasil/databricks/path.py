@@ -38,9 +38,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, ClassVar, Optional, Tuple
 
+from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.enums import Scheme
 from yggdrasil.path import RemotePath
 from yggdrasil.path._retry import retry_sdk_call
+from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
 from .resource import DatabricksResource
 from .service import DatabricksService
@@ -291,12 +293,27 @@ class DatabricksPath(DatabricksResource, RemotePath):
     :class:`VolumePath`, ``/Workspace/...`` → :class:`WorkspacePath`,
     everything else → :class:`DBFSPath`).
 
-    Singleton identity caching, the 5-minute default TTL, and the
-    bounded ``_INSTANCES`` dict all come from :class:`RemotePath` —
-    see its docstring for the policy.
+    Singleton identity caching uses the 5-minute default TTL via a
+    PER-CLASS ``_INSTANCES`` cache so a hot ``DatabricksPath(...)``
+    race never contends on the same lock as a hot ``S3Path(...)`` /
+    ``HTTPPath(...)`` construction. Concrete subclasses
+    (:class:`DBFSPath`, :class:`VolumePath`, :class:`WorkspacePath`)
+    declare their own ``_INSTANCES`` on top, partitioning further so
+    a volumes-heavy workload doesn't slow down DBFS or workspace
+    listings.
     """
 
     scheme: ClassVar[Scheme] = Scheme.DBFS
+
+    # Per-class singleton cache for the DatabricksPath dispatcher
+    # itself. Concrete subclasses override with their OWN dict so
+    # each surface (DBFS / Volumes / Workspace) keeps independent
+    # storage. No companion lock — :class:`ExpiringDict.get_or_set`
+    # (called by :class:`Singleton.__new__`) is GIL-atomic.
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=_STAT_CACHE_TTL,
+        max_size=10_000,
+    )
 
     #: Canonical POSIX prefix for the legacy string shape
     #: (``/dbfs/``, ``/Workspace/``, ``/Volumes/``). Empty on the

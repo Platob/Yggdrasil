@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import unittest
 from typing import Any, ClassVar
-from threading import RLock
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.singleton import Singleton
@@ -23,7 +22,6 @@ class _CachingPath(Singleton):
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=300.0, max_size=64,
     )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     def __init__(self, key: str, *, singleton_ttl: Any = ...) -> None:
         del singleton_ttl

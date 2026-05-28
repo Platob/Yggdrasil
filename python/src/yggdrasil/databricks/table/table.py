@@ -934,8 +934,10 @@ class Table(DatabricksPath):
     volume slot are shared across views into the same UC resource.
     """
 
-    # Per-class singleton cache — keeps Table singletons separate
-    # from the rest of the project's :class:`Singleton` users.
+    # Per-class singleton cache — keeps Table singletons separated
+    # from :class:`UCCatalog`, :class:`UCSchema`, :class:`Volume`,
+    # and the rest of the project's :class:`Singleton` users. No
+    # companion lock — :class:`ExpiringDict.get_or_set` is GIL-atomic.
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
     # Cache every Table under the singleton convention; the cached
     # ``TableInfo`` / columns / staging-volume slot are worth keeping
@@ -1001,22 +1003,21 @@ class Table(DatabricksPath):
             schema_name=schema_name,
             table_name=table_name,
         )
-        with cls._INSTANCES_LOCK:
-            existing = cls._INSTANCES.get(key)
-            if existing is not None:
-                return existing
-            instance = _allocate()
+        ttl_arg = (
+            float(singleton_ttl)
+            if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+            else singleton_ttl
+        )
+
+        def _build() -> "Table":
+            inst = _allocate()
             try:
-                object.__setattr__(instance, "_singleton_key_", key)
+                object.__setattr__(inst, "_singleton_key_", key)
             except AttributeError:
                 pass
-            ttl_arg = (
-                float(singleton_ttl)
-                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
-                else singleton_ttl
-            )
-            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
-            return instance
+            return inst
+
+        return cls._INSTANCES.get_or_set(key, _build, ttl=ttl_arg)
 
     def _stat_uncached(self) -> IOStats:
         return IOStats(

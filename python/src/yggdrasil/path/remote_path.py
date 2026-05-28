@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import time
 from abc import abstractmethod
-from threading import RLock
 from typing import Any, ClassVar, Optional
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
@@ -80,18 +79,28 @@ class RemotePath(Path):
     # below a certain threshold) can pin their own default here.
     DEFAULT_BUFFER_SIZE: ClassVar["int | None"] = _DEFAULT_BUFFER_SIZE
 
-    # Activate the :class:`Singleton` cache for every concrete remote
-    # backend: 5-minute default TTL, bounded at 10 000 entries as
-    # defence-in-depth against accidental cardinality explosions.
-    # The default ``_singleton_key`` includes ``cls`` so S3Path /
-    # DatabricksPath / future Azure paths can share one ``_INSTANCES``
-    # dict without colliding.
+    # Activate the :class:`Singleton` cache: 5-minute default TTL,
+    # bounded at 10 000 entries as defence-in-depth against
+    # accidental cardinality explosions.
+    #
+    # Concrete subclasses (:class:`S3Path`, :class:`DatabricksPath`,
+    # :class:`HTTPPath`, …) override ``_INSTANCES`` with their OWN
+    # per-class dict so a hot ``__new__`` race on S3 doesn't
+    # serialize against a hot Databricks Volume construction.
+    # Sharing one cache across implementations was a pure
+    # contention-amplifier — the default ``_singleton_key`` already
+    # includes ``cls`` so collisions are impossible, partitioning by
+    # class only buys parallelism. The base-class instance below
+    # stays as a fallback for any caller that constructs
+    # :class:`RemotePath` directly or for a brand-new subclass that
+    # hasn't declared its own yet. No companion lock anywhere —
+    # :class:`ExpiringDict.get_or_set` (used by
+    # :class:`Singleton.__new__`) is GIL-atomic and cannot deadlock.
     _SINGLETON_TTL: ClassVar[Any] = _STAT_CACHE_TTL
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,
         max_size=10_000,
     )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     # ------------------------------------------------------------------
     # Inner buffered-page cache — reduces remote round trips for

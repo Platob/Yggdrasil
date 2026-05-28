@@ -72,8 +72,10 @@ class UCCatalog(DatabricksPath, Singleton):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_CATALOG
 
-    # Per-class singleton cache so this surface stays separate from
-    # the rest of the project's :class:`Singleton` users.
+    # Per-class singleton cache so this surface stays separated from
+    # :class:`UCSchema`, :class:`UCTable`, :class:`Volume`, and the
+    # rest of the project's :class:`Singleton` users. No companion
+    # lock — :class:`ExpiringDict.get_or_set` is GIL-atomic.
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
     # Cache every catalog under the singleton convention; the cached
     # ``CatalogInfo`` and tag state are worth keeping for the
@@ -134,22 +136,24 @@ class UCCatalog(DatabricksPath, Singleton):
             return _allocate()
 
         key = cls._singleton_key(service, catalog_name=catalog_name)
-        with cls._INSTANCES_LOCK:
-            existing = cls._INSTANCES.get(key)
-            if existing is not None:
-                return existing
-            instance = _allocate()
+        ttl_arg = (
+            float(singleton_ttl)
+            if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+            else singleton_ttl
+        )
+
+        # Lock-free atomic check-and-insert: under contention two
+        # threads may both allocate, but only the first writer's
+        # instance enters the cache and is returned to all callers.
+        def _build() -> "UCCatalog":
+            inst = _allocate()
             try:
-                object.__setattr__(instance, "_singleton_key_", key)
+                object.__setattr__(inst, "_singleton_key_", key)
             except AttributeError:
                 pass
-            ttl_arg = (
-                float(singleton_ttl)
-                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
-                else singleton_ttl
-            )
-            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
-            return instance
+            return inst
+
+        return cls._INSTANCES.get_or_set(key, _build, ttl=ttl_arg)
 
     def __init__(
         self,
