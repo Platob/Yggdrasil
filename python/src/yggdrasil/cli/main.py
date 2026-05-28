@@ -5,6 +5,8 @@ Subcommands::
     ygg node start      Start node (background daemon, public by default)
     ygg node stop       Stop the running node
     ygg node serve      Start node + frontend (foreground)
+    ygg node back       Start backend only (Uvicorn API, foreground)
+    ygg node front      Start frontend only (Next.js dev server, foreground)
     ygg node status     Show running node status
     ygg node watch      Live TTY dashboard — auto-refreshing node stats
     ygg node logs       Tail the node log file (-f to follow)
@@ -12,7 +14,6 @@ Subcommands::
     ygg node call       Run a function by name and print result
     ygg node health     Run health checks on the node
     ygg node create     Create a new named node
-    ygg node front      Start frontend only (Next.js dev server)
     ygg node install    Install node as boot service (systemd/launchd)
     ygg node uninstall  Remove boot service (--purge to delete data)
     ygg node run        Call a @remote function
@@ -99,6 +100,14 @@ def _build_parser() -> argparse.ArgumentParser:
     create.add_argument("--port", type=int, default=None, help="Bind port.")
     create.set_defaults(handler=_node_create)
 
+    # back
+    back = node_sub.add_parser("back", help="Start backend API only (foreground).")
+    back.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0).")
+    back.add_argument("--port", type=int, default=None, help="Bind port (default: 8100).")
+    back.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
+    back.add_argument("--name", default=None, help="Node ID override.")
+    back.set_defaults(handler=_node_back)
+
     # front
     front = node_sub.add_parser("front", help="Start frontend dev server only.")
     front.add_argument("--port", type=int, default=None, help="Frontend port (default: 3000).")
@@ -167,7 +176,7 @@ def _ensure_node_running() -> str:
         return "http://127.0.0.1:8100"
 
 
-def _start_frontend(settings, *, node_port: int, front_port: int | None = None):
+def _start_frontend(settings, *, node_port: int, front_port: int | None = None, quiet: bool = True):
     import os
     import shutil
     import subprocess
@@ -204,8 +213,8 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None):
         [npm, "run", "dev", "--", "--hostname", "0.0.0.0", "--port", str(port)],
         cwd=str(front_home),
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL if quiet else None,
+        stderr=subprocess.DEVNULL if quiet else None,
     )
 
     from yggdrasil.cli.style import bold, cyan, out
@@ -370,6 +379,31 @@ def _node_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _node_back(args: argparse.Namespace) -> int:
+    from yggdrasil.cli.style import blue, cyan, dim, green, orange, out, print_logo
+    from yggdrasil.node.config import _find_open_port, get_settings
+    from yggdrasil.node.daemon import cleanup_old_logs, ensure_directories
+
+    _apply_node_env(args)
+    print_logo("YGGNODE")
+    settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
+    ensure_directories(settings)
+    cleanup_old_logs(settings)
+
+    port = args.port or _find_open_port(settings.port, settings.port + 100)
+    host = args.host or settings.host
+
+    out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
+    out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
+    out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
+    out(f"  {cyan('mode')}    {dim('backend only')}\n\n")
+
+    import uvicorn
+    uvicorn.run("yggdrasil.node.app:app", host=host, port=port, reload=args.reload)
+    return 0
+
+
 def _node_front(args: argparse.Namespace) -> int:
     import signal
     from yggdrasil.node.config import get_settings
@@ -379,7 +413,7 @@ def _node_front(args: argparse.Namespace) -> int:
     settings = get_settings()
 
     node_port = args.node_port or settings.port
-    proc = _start_frontend(settings, node_port=node_port, front_port=args.port)
+    proc = _start_frontend(settings, node_port=node_port, front_port=args.port, quiet=False)
     if proc is None:
         return 1
 
