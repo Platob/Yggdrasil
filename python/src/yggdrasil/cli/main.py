@@ -6,6 +6,11 @@ Subcommands::
     ygg node stop       Stop the running node
     ygg node serve      Start node + frontend (foreground)
     ygg node status     Show running node status
+    ygg node watch      Live TTY dashboard — auto-refreshing node stats
+    ygg node logs       Tail the node log file (-f to follow)
+    ygg node ps         List active runs
+    ygg node call       Run a function by name and print result
+    ygg node health     Run health checks on the node
     ygg node create     Create a new named node
     ygg node front      Start frontend only (Next.js dev server)
     ygg node install    Install node as boot service (systemd/launchd)
@@ -57,6 +62,35 @@ def _build_parser() -> argparse.ArgumentParser:
     # status
     status = node_sub.add_parser("status", help="Show node status.")
     status.set_defaults(handler=_node_status)
+
+    # watch — live TTY dashboard
+    watch = node_sub.add_parser("watch", help="Live TTY dashboard — auto-refreshing node stats.")
+    watch.add_argument("--interval", type=float, default=1.0, help="Refresh interval in seconds.")
+    watch.add_argument("--url", default=None, help="Node URL (default: local).")
+    watch.set_defaults(handler=_node_watch)
+
+    # logs — tail the node log
+    logs = node_sub.add_parser("logs", help="Tail the node log file.")
+    logs.add_argument("--follow", "-f", action="store_true", help="Follow log output.")
+    logs.add_argument("--lines", "-n", type=int, default=50, help="Show last N lines.")
+    logs.set_defaults(handler=_node_logs)
+
+    # ps — list active runs
+    ps = node_sub.add_parser("ps", help="List active runs (like docker ps).")
+    ps.add_argument("--all", "-a", action="store_true", help="Show all runs, not just active.")
+    ps.set_defaults(handler=_node_ps)
+
+    # call — run a function by name
+    call = node_sub.add_parser("call", help="Run a function by name and print result.")
+    call.add_argument("name", help="Function name.")
+    call.add_argument("--arg", action="append", default=[], help="Positional arg (JSON-decoded).")
+    call.add_argument("--kwarg", action="append", default=[], metavar="KEY=VALUE", help="Keyword arg.")
+    call.add_argument("--wait", type=float, default=60.0, help="Wait for completion (seconds).")
+    call.set_defaults(handler=_node_call)
+
+    # health — quick health check
+    health_cmd = node_sub.add_parser("health", help="Run health checks on the node.")
+    health_cmd.set_defaults(handler=_node_health)
 
     # create
     create = node_sub.add_parser("create", help="Create a new named node (initializes ~/.node/<name>/).")
@@ -463,6 +497,280 @@ def _node_uninstall(args: argparse.Namespace) -> int:
     else:
         out(f"  {red('✗')} {msg}\n")
         return 1
+    return 0
+
+
+def _node_watch(args: argparse.Namespace) -> int:
+    """Live auto-refreshing TTY dashboard of node stats."""
+    import json
+    import time
+    import urllib.request
+    from yggdrasil.cli.style import blue, bold, cyan, dim, green, magenta, orange, out, red, yellow, _CSI, _RESET
+
+    url = args.url or _ensure_node_running()
+    interval = args.interval
+
+    def fetch(path):
+        try:
+            with urllib.request.urlopen(f"{url}{path}", timeout=3) as resp:
+                return json.loads(resp.read())
+        except Exception:
+            return None
+
+    def bar(pct, width=30):
+        filled = int(width * min(100, max(0, pct)) / 100)
+        color = "31" if pct > 90 else "33" if pct > 70 else "36"
+        return f"{_CSI}{color}m{'█' * filled}{_RESET}{dim('░' * (width - filled))}"
+
+    def format_uptime(seconds):
+        if seconds < 60: return f"{int(seconds)}s"
+        if seconds < 3600: return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+        if seconds < 86400: return f"{int(seconds // 3600)}h {int(seconds % 3600 // 60)}m"
+        return f"{int(seconds // 86400)}d {int(seconds % 86400 // 3600)}h"
+
+    # Clear screen and hide cursor
+    sys.stdout.write("\033[?25l\033[2J\033[H")
+    try:
+        while True:
+            stats = fetch("/api/v2/stats")
+            health = fetch("/api/v2/health")
+            metrics = fetch("/api/v2/metrics")
+            audit = fetch("/api/v2/audit?limit=5")
+
+            # Move to top, don't clear (less flicker)
+            sys.stdout.write("\033[H\033[J")
+
+            # Header
+            out(f"  {cyan('═' * 70)}\n")
+            if stats:
+                out(f"  {bold('YGGDRASIL NODE')}  {orange(stats.get('node_id', '?'))}  ")
+                out(f"{dim('uptime')} {green(format_uptime(stats.get('uptime', 0)))}  ")
+                if health:
+                    status = health.get('status', 'unknown')
+                    color_fn = green if status == 'healthy' else yellow if status == 'degraded' else red
+                    out(f"{dim('status')} {color_fn('● ' + status)}\n")
+                else:
+                    out("\n")
+            else:
+                out(f"  {red('● node unreachable')}  retrying...\n")
+            out(f"  {cyan('═' * 70)}\n\n")
+
+            if stats:
+                # Resources
+                cpu = stats.get('cpu_percent', 0)
+                mem = stats.get('memory_percent', 0)
+                out(f"  {cyan('CPU')}     {bar(cpu)}  {bold(f'{cpu:5.1f}%')}\n")
+                out(f"  {cyan('Memory')}  {bar(mem)}  {bold(f'{mem:5.1f}%')}\n")
+                out("\n")
+
+                # Counts
+                out(f"  {magenta('Assets')}\n")
+                out(f"    {dim('functions')}    {bold(str(stats.get('func_count', 0)))}\n")
+                out(f"    {dim('environments')} {bold(str(stats.get('env_count', 0)))}\n")
+                out(f"    {dim('DAGs')}         {bold(str(stats.get('dag_count', 0)))}  ")
+                if stats.get('scheduled_dags', 0):
+                    out(f"{green('●')} {stats['scheduled_dags']} scheduled")
+                out("\n\n")
+
+                # Runs
+                active = stats.get('active_runs', 0)
+                total = stats.get('total_runs', 0)
+                out(f"  {magenta('Execution')}\n")
+                active_color = yellow if active > 0 else dim
+                out(f"    {dim('active')}     {active_color(str(active))}\n")
+                out(f"    {dim('total')}      {bold(str(total))}\n\n")
+
+                # Network
+                out(f"  {magenta('Network')}\n")
+                out(f"    {dim('peers')}      {bold(str(stats.get('peer_count', 0)))}\n")
+                out(f"    {dim('GPUs')}       {bold(str(stats.get('gpu_count', 0)))}\n\n")
+
+            # Top functions
+            if metrics and metrics.get('top_by_runs'):
+                out(f"  {magenta('Top Functions')}\n")
+                for f in metrics['top_by_runs'][:5]:
+                    name = f['name'][:24].ljust(24)
+                    out(f"    {cyan(name)} {dim('runs')} {bold(str(f['runs']))}\n")
+                out("\n")
+
+            # Recent activity
+            if audit and audit.get('entries'):
+                out(f"  {magenta('Recent Activity')}\n")
+                for e in audit['entries'][-5:]:
+                    op = e.get('operation', '?')
+                    op_color = green if op == 'create' else red if op == 'delete' else cyan
+                    ts = e.get('timestamp', '')[11:19]  # HH:MM:SS
+                    out(f"    {dim(ts)}  {op_color(op.ljust(7))} {e.get('asset_type', '?')} {dim('#' + str(e.get('asset_id', '?'))[:10])}\n")
+
+            out(f"\n  {dim('refreshing every ' + str(interval) + 's — Ctrl+C to exit')}\n")
+            sys.stdout.flush()
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        # Show cursor again
+        sys.stdout.write("\033[?25h\n")
+    return 0
+
+
+def _node_logs(args: argparse.Namespace) -> int:
+    import datetime as dt
+    import time
+    from yggdrasil.cli.style import bold, cyan, dim, out, print_logo, red
+    from yggdrasil.node.config import get_settings
+
+    print_logo("YGGNODE")
+    settings = get_settings()
+    log_file = settings.logs_root / f"node-{dt.date.today().isoformat()}.log"
+
+    if not log_file.exists():
+        out(f"  {red('no log file found at')} {dim(str(log_file))}\n")
+        return 1
+
+    out(f"  {cyan('log')}  {dim(str(log_file))}\n\n")
+    with open(log_file) as f:
+        # Print last N lines
+        all_lines = f.readlines()
+        for line in all_lines[-args.lines:]:
+            out(line)
+
+        if args.follow:
+            out(f"\n  {dim('following — Ctrl+C to exit')}\n")
+            try:
+                while True:
+                    line = f.readline()
+                    if line:
+                        out(line)
+                    else:
+                        time.sleep(0.5)
+            except KeyboardInterrupt:
+                pass
+    return 0
+
+
+def _node_ps(args: argparse.Namespace) -> int:
+    import json
+    import urllib.request
+    from yggdrasil.cli.style import bold, cyan, dim, green, out, red, yellow
+
+    url = _ensure_node_running()
+    try:
+        with urllib.request.urlopen(f"{url}/api/v2/pyfuncrun", timeout=3) as resp:
+            data = json.loads(resp.read())
+    except Exception as exc:
+        out(f"  {red('error:')} {exc}\n")
+        return 1
+
+    runs = data.get("runs", [])
+    if not args.all:
+        runs = [r for r in runs if r.get("status") in ("pending", "running")]
+
+    if not runs:
+        out(f"  {dim('no')} {('active ' if not args.all else '')}{dim('runs')}\n")
+        return 0
+
+    out(f"  {bold('RUN ID'.ljust(22))} {bold('FUNC'.ljust(20))} {bold('STATUS'.ljust(11))} {bold('DURATION'.ljust(10))} {bold('STARTED')}\n")
+    out(f"  {dim('─' * 90)}\n")
+    for r in runs:
+        rid = str(r.get("id", ""))[:20].ljust(22)
+        fid = str(r.get("func_id", ""))[:18].ljust(20)
+        status = r.get("status", "?")
+        status_color = green if status == "completed" else red if status == "failed" else yellow if status == "running" else cyan
+        duration = r.get("duration")
+        dur_str = f"{duration:.2f}s" if duration else "-"
+        started = (r.get("started_at") or "")[:19]
+        out(f"  {dim(rid)} {dim(fid)} {status_color(status.ljust(11))} {dim(dur_str.ljust(10))} {dim(started)}\n")
+    return 0
+
+
+def _node_call(args: argparse.Namespace) -> int:
+    import json
+    import urllib.request
+    from yggdrasil.cli.style import bold, cyan, dim, green, magenta, out, red
+
+    url = _ensure_node_running()
+
+    # Parse args
+    call_args = []
+    for a in args.arg:
+        try:
+            call_args.append(json.loads(a))
+        except json.JSONDecodeError:
+            call_args.append(a)
+
+    call_kwargs = {}
+    for kv in args.kwarg:
+        if "=" not in kv:
+            out(f"  {red('error:')} --kwarg must be KEY=VALUE\n")
+            return 1
+        k, v = kv.split("=", 1)
+        try:
+            call_kwargs[k] = json.loads(v)
+        except json.JSONDecodeError:
+            call_kwargs[k] = v
+
+    payload = {"args": call_args, "kwargs": call_kwargs}
+    req = urllib.request.Request(
+        f"{url}/api/v2/pyfunc/by-name/{args.name}/run",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    out(f"  {cyan('calling')} {bold(args.name)}\n")
+    try:
+        with urllib.request.urlopen(req, timeout=args.wait + 10) as resp:
+            result = json.loads(resp.read())
+    except Exception as exc:
+        out(f"  {red('error:')} {exc}\n")
+        return 1
+
+    run = result.get("run", {})
+    status = run.get("status", "?")
+    status_color = green if status == "completed" else red
+    out(f"  {status_color('●')} {status}  {dim(str(run.get('duration', 0)) + 's')}\n")
+
+    if run.get("stdout"):
+        out(f"\n  {magenta('stdout:')}\n")
+        for line in run["stdout"].splitlines():
+            out(f"    {line}\n")
+    if run.get("stderr"):
+        out(f"\n  {magenta('stderr:')}\n")
+        for line in run["stderr"].splitlines():
+            out(f"    {dim(line)}\n")
+    if run.get("result") is not None:
+        out(f"\n  {magenta('result:')} {json.dumps(run['result'], indent=2)}\n")
+    return 0
+
+
+def _node_health(args: argparse.Namespace) -> int:
+    import json
+    import urllib.request
+    from yggdrasil.cli.style import bold, cyan, dim, green, magenta, out, print_logo, red, yellow
+
+    print_logo("YGGNODE")
+    url = _ensure_node_running()
+    try:
+        with urllib.request.urlopen(f"{url}/api/v2/health", timeout=5) as resp:
+            data = json.loads(resp.read())
+    except Exception as exc:
+        out(f"  {red('node unreachable:')} {exc}\n")
+        return 1
+
+    status = data.get("status", "unknown")
+    color_fn = green if status == "healthy" else yellow if status == "degraded" else red
+    out(f"  {cyan('overall')}   {color_fn('● ' + status)}\n")
+    out(f"  {cyan('node')}      {bold(data.get('node_id', '?'))}\n\n")
+
+    out(f"  {magenta('subsystems:')}\n")
+    for name, check in data.get("checks", {}).items():
+        check_status = check.get("status", "?")
+        check_color = green if check_status == "ok" else red
+        extra = []
+        if "cpu" in check: extra.append(f"cpu={check['cpu']:.1f}%")
+        if "count" in check: extra.append(f"count={check['count']}")
+        if "peers" in check: extra.append(f"peers={check['peers']}")
+        if "error" in check: extra.append(f"error={check['error']}")
+        out(f"    {check_color('●')} {dim(name.ljust(12))}  {check_color(check_status)}  {dim(' '.join(extra))}\n")
     return 0
 
 
