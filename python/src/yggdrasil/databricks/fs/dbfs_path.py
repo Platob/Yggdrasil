@@ -28,8 +28,10 @@ import stat as _stat
 import time
 from typing import Any, ClassVar, Iterator
 
+from databricks.sdk.errors import InvalidParameterValue
+
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
-from yggdrasil.enums import Scheme
+from yggdrasil.enums import Scheme, MediaTypes
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
@@ -465,8 +467,17 @@ class DBFSPath(DatabricksPath):
                     length=chunk_size,
                 )
             except Exception as exc:
+                if isinstance(exc, InvalidParameterValue):
+                    msg = str(exc)
+                    if "Found directory on path: " in msg:
+                        self._stat_cached = IOStats(
+                            kind=IOKind.DIRECTORY,
+                            media_type=MediaTypes.DIRECTORY,
+                        )
+
                 if _looks_like_not_found(exc):
                     raise FileNotFoundError(self.full_path()) from exc
+
                 raise
             data = getattr(resp, "data", None)
             if not data:

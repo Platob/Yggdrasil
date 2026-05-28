@@ -3789,10 +3789,7 @@ class Table(DatabricksPath):
 
         return infos.storage_location
 
-    def storage_location(
-        self,
-        operation: "TableOperation | ModeLike | None" = None,
-    ) -> "Path":
+    def storage_location(self) -> str | None:
         """Return the table's backing storage location as an addressable :class:`Path`.
 
         ``operation`` accepts a :class:`TableOperation`, a :class:`Mode`,
@@ -3810,8 +3807,20 @@ class Table(DatabricksPath):
           collapse to ``READ`` because Unity Catalog will refuse
           to vend write credentials for them.
         """
-        op = _resolve_table_operation(operation, self.infos.table_type)
-        return self.aws(operation=op).s3.path(self.infos.storage_location)
+        infos = self.read_infos(default=None)
+
+        if infos is None:
+            return None
+
+        return infos.storage_location
+
+    def storage_path(self):
+        l = self.storage_location()
+
+        if l is None:
+            return None
+
+        return self.aws().s3.path(l)
 
     def aws(
         self,

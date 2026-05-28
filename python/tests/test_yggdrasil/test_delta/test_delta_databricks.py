@@ -21,14 +21,12 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import time
 import unittest
 from typing import ClassVar
 
 import pyarrow as pa
 import pytest
 
-from yggdrasil.enums import Mode
 from yggdrasil.delta.io import DeltaOptions
 
 
@@ -37,7 +35,7 @@ def _has_databricks() -> bool:
 
 
 def _catalog() -> str:
-    return os.environ.get("DATABRICKS_INTEGRATION_CATALOG", "main").strip() or "main"
+    return os.environ.get("DATABRICKS_INTEGRATION_CATALOG", "trading_tgp_dev").strip() or "trading_tgp_dev"
 
 
 def _schema() -> str:
@@ -353,15 +351,11 @@ class TestStorageScan(_DeltaSQLBase):
 
     def test_table_has_delta_log(self) -> None:
         """Every Delta table has a _delta_log directory."""
-        tbl = self._table_name("scan_log")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
-        self._execute(f"INSERT INTO {tbl} VALUES (1)")
+        tbl = self.client.tables.table(self._table_name("scan_log"))
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1)")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.path import Path
-        root = Path.from_(location)
+        root = tbl.storage_path()
         children = [c.name for c in root.iterdir()]
         self.assertIn("_delta_log", children)
 
