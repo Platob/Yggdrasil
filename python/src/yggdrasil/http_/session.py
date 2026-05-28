@@ -1227,10 +1227,16 @@ class HTTPSession(Session):
                 if "CERTIFICATE_VERIFY_FAILED" in msg and self.verify is not False:
                     LOGGER.warning(
                         "SSL certificate verification failed for %s — "
-                        "retrying with verify=False: %s",
+                        "dropping proxy + retrying with verify=False: %s",
                         current_request.url, msg,
                     )
                     self.verify = False
+                    self.proxy = None
+                    self.no_proxy = None
+                    for var in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                                "https_proxy", "http_proxy", "all_proxy"):
+                        os.environ.pop(var, None)
+                    _ProxyEnv.reset()
                     self.clear_connections()
                     continue
                 raise SSLError(msg) from exc
