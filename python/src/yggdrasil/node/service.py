@@ -2,6 +2,7 @@
 
 Linux: systemd user service (~/.config/systemd/user/yggdrasil-node.service)
 macOS: launchd user agent (~/Library/LaunchAgents/com.yggdrasil.node.plist)
+Windows: Task Scheduler ONLOGON task driving a generated launcher .cmd
 """
 from __future__ import annotations
 
@@ -16,6 +17,10 @@ from yggdrasil.node.config import Settings, get_settings
 
 _SYSTEMD_UNIT = "yggdrasil-node.service"
 _LAUNCHD_LABEL = "com.yggdrasil.node"
+_WIN_TASK_NAME = "YggdrasilNode"
+_WIN_FRONT_TASK_NAME = "YggdrasilFront"
+_WIN_LAUNCHER = "yggdrasil-node.cmd"
+_WIN_FRONT_LAUNCHER = "yggdrasil-front.cmd"
 
 
 def _python_executable() -> str:
@@ -36,6 +41,8 @@ def is_service_installed(settings: Settings | None = None) -> bool:
         return (_systemd_dir() / _SYSTEMD_UNIT).exists()
     if is_macos():
         return (_launchd_dir() / f"{_LAUNCHD_LABEL}.plist").exists()
+    if is_windows():
+        return (_win_boot_dir(settings) / _WIN_LAUNCHER).exists()
     return False
 
 
@@ -203,6 +210,10 @@ def is_macos() -> bool:
     return platform.system() == "Darwin"
 
 
+def is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
 def install_service(settings: Settings | None = None, *, no_front: bool = False) -> tuple[bool, str]:
     """Install node (and optionally frontend) as a boot service. Returns (success, message)."""
     settings = settings or get_settings()
@@ -214,8 +225,10 @@ def install_service(settings: Settings | None = None, *, no_front: bool = False)
         return _install_systemd(settings, no_front=no_front)
     elif is_macos():
         return _install_launchd(settings, no_front=no_front)
+    elif is_windows():
+        return _install_schtasks(settings, no_front=no_front)
     else:
-        return False, f"Unsupported platform: {platform.system()}. Only Linux (systemd) and macOS (launchd) are supported."
+        return False, f"Unsupported platform: {platform.system()}."
 
 
 def _install_systemd(settings: Settings, *, no_front: bool = False) -> tuple[bool, str]:
@@ -309,6 +322,8 @@ def uninstall_service(settings: Settings | None = None, *, purge: bool = False) 
         ok, msg = _uninstall_systemd(settings)
     elif is_macos():
         ok, msg = _uninstall_launchd(settings)
+    elif is_windows():
+        ok, msg = _uninstall_schtasks(settings)
     else:
         return False, f"Unsupported platform: {platform.system()}."
 
@@ -368,6 +383,121 @@ def _uninstall_launchd(settings: Settings) -> tuple[bool, str]:
     return True, "; ".join(messages) if messages else "no agents found"
 
 
+def _win_boot_dir(settings: Settings) -> Path:
+    return settings.node_home / "boot"
+
+
+def _pythonw_executable() -> str:
+    """Prefer pythonw.exe (windowless) on Windows so the task has no console."""
+    py = Path(sys.executable)
+    pyw = py.with_name("pythonw.exe")
+    if pyw.exists():
+        return str(pyw)
+    return sys.executable
+
+
+def _node_launcher_cmd(settings: Settings) -> str:
+    python = _pythonw_executable()
+    lines = [
+        "@echo off",
+        f'set "YGG_NODE_PORT={settings.port}"',
+        f'set "YGG_NODE_HOST={settings.host}"',
+        f'set "YGG_NODE_HOME={settings.node_home}"',
+        f'set "YGG_NODE_NODE_ID={settings.node_id}"',
+        f'set "YGG_NODE_FRONT_HOME={settings.front_home}"',
+        'set "YGG_NODE_ALLOW_REMOTE=1"',
+        f'"{python}" -m yggdrasil.node.main',
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _front_launcher_cmd(settings: Settings) -> str:
+    npm = shutil.which("npm.cmd") or shutil.which("npm") or "npm.cmd"
+    lines = [
+        "@echo off",
+        f'cd /d "{settings.front_home}"',
+        f'set "YGG_NODE_PORT={settings.port}"',
+        f'set "PORT={settings.front_port}"',
+        f'set "NODE_API_URL=http://127.0.0.1:{settings.port}"',
+        f'"{npm}" run dev -- --hostname 0.0.0.0 --port {settings.front_port}',
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _install_schtasks(settings: Settings, *, no_front: bool = False) -> tuple[bool, str]:
+    boot_dir = _win_boot_dir(settings)
+    boot_dir.mkdir(parents=True, exist_ok=True)
+
+    launcher = boot_dir / _WIN_LAUNCHER
+    launcher.write_text(_node_launcher_cmd(settings), encoding="utf-8")
+    messages = [f"wrote {launcher}"]
+
+    install_front = not no_front and (settings.front_home / "package.json").exists()
+    if install_front:
+        front_launcher = boot_dir / _WIN_FRONT_LAUNCHER
+        front_launcher.write_text(_front_launcher_cmd(settings), encoding="utf-8")
+        messages.append(f"wrote {front_launcher}")
+
+    try:
+        subprocess.run(
+            [
+                "schtasks", "/Create", "/F",
+                "/SC", "ONLOGON",
+                "/TN", _WIN_TASK_NAME,
+                "/TR", f'cmd.exe /c "{launcher}"',
+            ],
+            check=True, capture_output=True,
+        )
+        messages.append(f"registered task {_WIN_TASK_NAME}")
+
+        if install_front:
+            subprocess.run(
+                [
+                    "schtasks", "/Create", "/F",
+                    "/SC", "ONLOGON",
+                    "/TN", _WIN_FRONT_TASK_NAME,
+                    "/TR", f'cmd.exe /c "{boot_dir / _WIN_FRONT_LAUNCHER}"',
+                ],
+                check=True, capture_output=True,
+            )
+            messages.append(f"registered task {_WIN_FRONT_TASK_NAME}")
+
+    except FileNotFoundError:
+        return False, "schtasks.exe not found — Task Scheduler is required."
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or e.stdout or b"").decode(errors="replace").strip()
+        return False, f"schtasks failed: {err or e}"
+
+    return True, "; ".join(messages)
+
+
+def _uninstall_schtasks(settings: Settings) -> tuple[bool, str]:
+    messages = []
+
+    for task in (_WIN_FRONT_TASK_NAME, _WIN_TASK_NAME):
+        try:
+            r = subprocess.run(
+                ["schtasks", "/Delete", "/F", "/TN", task],
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                messages.append(f"removed task {task}")
+        except FileNotFoundError:
+            pass
+
+    boot_dir = _win_boot_dir(settings)
+    for fname in (_WIN_LAUNCHER, _WIN_FRONT_LAUNCHER):
+        path = boot_dir / fname
+        if path.exists():
+            path.unlink()
+            messages.append(f"removed {path}")
+
+    from yggdrasil.node.daemon import stop_node
+    stop_node(settings)
+
+    return True, "; ".join(messages) if messages else "no tasks found"
+
+
 def service_status(settings: Settings | None = None) -> dict[str, str]:
     """Return status of installed services."""
     settings = settings or get_settings()
@@ -402,5 +532,28 @@ def service_status(settings: Settings | None = None) -> dict[str, str]:
                     result[label] = "unknown (no launchctl)"
             else:
                 result[label] = "not installed"
+
+    elif is_windows():
+        boot_dir = _win_boot_dir(settings)
+        for task, launcher in (
+            (_WIN_TASK_NAME, _WIN_LAUNCHER),
+            (_WIN_FRONT_TASK_NAME, _WIN_FRONT_LAUNCHER),
+        ):
+            if not (boot_dir / launcher).exists():
+                result[task] = "not installed"
+                continue
+            try:
+                r = subprocess.run(
+                    ["schtasks", "/Query", "/TN", task, "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True,
+                )
+                if r.returncode != 0:
+                    result[task] = "not registered"
+                    continue
+                # CSV row: "TaskName","NextRunTime","Status"
+                fields = [f.strip('"') for f in r.stdout.strip().split(",")]
+                result[task] = fields[2].lower() if len(fields) >= 3 else "unknown"
+            except FileNotFoundError:
+                result[task] = "unknown (no schtasks)"
 
     return result

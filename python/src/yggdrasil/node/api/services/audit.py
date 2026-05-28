@@ -22,7 +22,7 @@ class AuditLog:
             # Load recent entries on startup
             if log_path.exists():
                 try:
-                    with open(log_path, "r") as f:
+                    with open(log_path, "r", encoding="utf-8") as f:
                         for line in f.readlines()[-max_entries:]:
                             line = line.strip()
                             if line:
@@ -43,7 +43,7 @@ class AuditLog:
             self._entries.append(entry)
             if self._log_file is not None:
                 try:
-                    with open(self._log_file, "a") as f:
+                    with open(self._log_file, "a", encoding="utf-8") as f:
                         f.write(json.dumps(entry) + "\n")
                 except Exception:
                     pass
