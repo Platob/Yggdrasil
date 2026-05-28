@@ -57,6 +57,16 @@ const Icon = {
       <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
     </svg>
   ),
+  brain: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2a4 4 0 0 0-4 4v2a4 4 0 0 0-4 4 4 4 0 0 0 2 3.46V18a4 4 0 0 0 4 4h4a4 4 0 0 0 4-4v-2.54A4 4 0 0 0 20 12a4 4 0 0 0-4-4V6a4 4 0 0 0-4-4z" />
+    </svg>
+  ),
+  sparkle: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2l1.6 5.4L19 9l-5.4 1.6L12 16l-1.6-5.4L5 9l5.4-1.6L12 2zM5 18l.8 2.4L8 21l-2.2.6L5 24l-.8-2.4L2 21l2.2-.6L5 18zM19 14l.8 2.4L22 17l-2.2.6L19 20l-.8-2.4L16 17l2.2-.6L19 14z" />
+    </svg>
+  ),
   home: (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z" /><polyline points="9 22 9 12 15 12 15 22" />
@@ -115,7 +125,18 @@ const SERVICES: ServiceSection[] = [
     label: "Trading",
     prefix: "/trading",
     icon: Icon.chart,
-    items: [],
+    items: [
+      { href: "/trading", label: "Dashboard", icon: Icon.chart, exact: true },
+    ],
+  },
+  {
+    id: "ai",
+    label: "AI",
+    prefix: "/ai",
+    icon: Icon.sparkle,
+    items: [
+      { href: "/ai", label: "Assistant", icon: Icon.sparkle, exact: true },
+    ],
   },
 ];
 

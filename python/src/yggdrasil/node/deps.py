@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import Request
 
+from .services.ai import AIService
 from .services.call import CallService
 from .services.cmd import CmdService
 from .services.dag import DagService
@@ -15,6 +16,7 @@ from .services.monitor import MonitorService
 from .services.python import PythonExecService
 from .services.filesystem import FilesystemService
 from .services.run import RunService
+from .services.trading import TradingService
 
 
 def get_env_service(request: Request) -> EnvService:
@@ -67,3 +69,11 @@ def get_filesystem_service(request: Request) -> FilesystemService:
 
 def get_monitor_service(request: Request) -> MonitorService:
     return request.app.state.monitor_service
+
+
+def get_trading_service(request: Request) -> TradingService:
+    return request.app.state.trading_service
+
+
+def get_ai_service(request: Request) -> AIService:
+    return request.app.state.ai_service

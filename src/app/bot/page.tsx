@@ -1,7 +1,11 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback } from "react";
-import { bot, type NodeInfo } from "@/lib/api";
+import Link from "next/link";
+import {
+  bot, getPrices, aiAnalyzePortfolio,
+  type NodeInfo, type PriceQuote, type AIPortfolioAnalysis,
+} from "@/lib/api";
 import { YggdrasilLogo } from "@/components/logo";
 
 // ── Types ────────────────────────────────────────────────────
@@ -213,6 +217,23 @@ export default function BotDashboard() {
   const [ramHistory, setRamHistory] = useState<number[]>(Array(HISTORY_SIZE).fill(0));
   const [gpuHistory, setGpuHistory] = useState<number[]>(Array(HISTORY_SIZE).fill(0));
 
+  // Mini trading widget
+  const [topPrices, setTopPrices] = useState<PriceQuote[]>([]);
+  const [marketSummary, setMarketSummary] = useState<AIPortfolioAnalysis | null>(null);
+
+  useEffect(() => {
+    const wanted = new Set(["AAPL", "BTC-USD", "NVDA"]);
+    const fetchPrices = () => {
+      getPrices()
+        .then(all => setTopPrices(all.filter(p => wanted.has(p.symbol))))
+        .catch(() => {});
+    };
+    fetchPrices();
+    const id = setInterval(fetchPrices, 5000);
+    aiAnalyzePortfolio().then(setMarketSummary).catch(() => {});
+    return () => clearInterval(id);
+  }, []);
+
   // Fetch node info once - fallback to demo mode if bot unavailable
   useEffect(() => {
     bot.getNodeInfo()
@@ -333,6 +354,70 @@ export default function BotDashboard() {
           secondaryValue={metrics.gpuName}
           secondaryLabel=""
         />
+      </div>
+
+      {/* Quick actions + mini trading + AI market summary */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="nordic-card p-4">
+          <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">Quick Actions</h3>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              ["Chat",     "/bot/chat",    "#f26b3a"],
+              ["Execute",  "/bot/execute", "#5b9bd5"],
+              ["Trading",  "/trading",     "#4ade80"],
+              ["AI",       "/ai",          "#a78bfa"],
+            ] as const).map(([label, href, color]) => (
+              <Link
+                key={href}
+                href={href}
+                className="px-3 py-3 rounded-md text-sm font-medium text-center transition-colors border"
+                style={{ borderColor: color + "40", color, background: color + "10" }}
+              >
+                {label}
+              </Link>
+            ))}
+          </div>
+        </div>
+
+        <div className="nordic-card p-4">
+          <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">Top Markets</h3>
+          {topPrices.length === 0 ? (
+            <p className="text-xs text-muted">Loading prices…</p>
+          ) : (
+            <div className="space-y-2">
+              {topPrices.map(q => {
+                const up = q.change_pct >= 0;
+                return (
+                  <div key={q.symbol} className="flex items-center justify-between py-1">
+                    <span className="font-mono text-sm font-semibold">{q.symbol}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-sm" style={{ color: up ? "#4ade80" : "#f87171" }}>
+                        ${q.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                      </span>
+                      <span className="text-[10px] font-mono" style={{ color: up ? "#4ade80" : "#f87171" }}>
+                        {up ? "▲" : "▼"}{q.change_pct.toFixed(2)}%
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="nordic-card p-4">
+          <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">Market Summary</h3>
+          {marketSummary ? (
+            <div className="space-y-2">
+              <p className="text-xs text-foreground leading-relaxed">{marketSummary.summary}</p>
+              {marketSummary.recommendations[0] && (
+                <p className="text-xs text-primary leading-relaxed">→ {marketSummary.recommendations[0]}</p>
+              )}
+            </div>
+          ) : (
+            <p className="text-xs text-muted">No AI summary yet</p>
+          )}
+        </div>
       </div>
 
       {/* Bottom Section */}

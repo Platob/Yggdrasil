@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 
 from ..deps import get_messenger_service
 from ..schemas.messenger import (
@@ -72,3 +75,24 @@ async def poll_messages(
     service: MessengerService = Depends(get_messenger_service),
 ) -> MessageListResponse:
     return await service.poll_messages(name, after_id=after_id, timeout=timeout)
+
+
+@router.get("/channels/{name}/stream")
+async def stream_channel(
+    name: str,
+    service: MessengerService = Depends(get_messenger_service),
+) -> StreamingResponse:
+    """Server-Sent Events stream of messages on a channel.
+
+    The first event is the most recent message (for context) followed by
+    a live event for every message published after subscription.
+    """
+    async def _generate():
+        async for msg in service.stream_messages(name):
+            yield f"data: {json.dumps(msg.model_dump())}\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

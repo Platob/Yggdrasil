@@ -26,7 +26,10 @@ _MAX_MESSAGES = 1000
 
 
 class _Channel:
-    __slots__ = ("name", "messages", "members", "created_at", "last_active", "_last_active_mono", "_notify")
+    __slots__ = (
+        "name", "messages", "members", "created_at", "last_active",
+        "_last_active_mono", "_notify", "_subscribers",
+    )
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -37,6 +40,8 @@ class _Channel:
         self.last_active: str = now
         self._last_active_mono: float = time.monotonic()
         self._notify: asyncio.Event | None = None
+        # SSE subscriber queues — each connected client gets its own asyncio.Queue
+        self._subscribers: set[asyncio.Queue[Message]] = set()
 
     def touch(self) -> None:
         self.last_active = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -57,10 +62,26 @@ class _Channel:
             self._notify = asyncio.Event()
         return self._notify
 
-    def wake_pollers(self) -> None:
+    def wake_pollers(self, msg: Message | None = None) -> None:
         if self._notify is not None:
             self._notify.set()
             self._notify.clear()
+        if msg is not None and self._subscribers:
+            # Fan out to all SSE subscribers. Drop the message on a full
+            # queue rather than block other subscribers.
+            for q in list(self._subscribers):
+                try:
+                    q.put_nowait(msg)
+                except asyncio.QueueFull:
+                    pass
+
+    def subscribe(self) -> asyncio.Queue[Message]:
+        q: asyncio.Queue[Message] = asyncio.Queue(maxsize=256)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[Message]) -> None:
+        self._subscribers.discard(q)
 
 
 class MessengerService:
@@ -96,8 +117,8 @@ class MessengerService:
 
         LOGGER.info("Sent message %r in channel %r (sender=%s)", msg.id, req.channel, sender)
 
-        # Wake any long-pollers outside the lock so they can proceed.
-        ch.wake_pollers()
+        # Wake any long-pollers and SSE subscribers outside the lock.
+        ch.wake_pollers(msg)
         return msg
 
     async def list_channels(self) -> ChannelListResponse:
@@ -207,6 +228,31 @@ class MessengerService:
             channel=channel,
             messages=new,
         )
+
+    async def stream_messages(self, channel: str):
+        """Async generator yielding new messages for an SSE stream.
+
+        Subscribes the caller to the channel's fan-out queue. Yields each
+        new message as it is published. The generator runs forever until
+        the client disconnects; cleanup unsubscribes the queue.
+        """
+        with self._lock:
+            ch = self._channels.get(channel)
+            if ch is None:
+                ch = _Channel(channel)
+                self._channels[channel] = ch
+
+        q = ch.subscribe()
+        try:
+            # Replay-on-subscribe: yield the most recent message so the
+            # client immediately has context, then stream live updates.
+            if ch.messages:
+                yield ch.messages[-1]
+            while True:
+                msg = await q.get()
+                yield msg
+        finally:
+            ch.unsubscribe(q)
 
     # -- internals ---------------------------------------------------------
 

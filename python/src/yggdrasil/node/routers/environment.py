@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 
 from ..deps import get_environment_service
 from ..schemas.environment import (
@@ -18,8 +18,10 @@ router = APIRouter(tags=["environment"])
 
 @router.get("", response_model=EnvironmentListResponse)
 async def list_environments(
+    response: Response,
     service: EnvironmentService = Depends(get_environment_service),
 ) -> EnvironmentListResponse:
+    response.headers["Cache-Control"] = "max-age=5"
     return await service.list()
 
 

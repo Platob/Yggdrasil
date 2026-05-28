@@ -1,13 +1,34 @@
 from __future__ import annotations
 
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _log_startup(app: FastAPI, settings) -> None:
+    api_routes = [r for r in app.routes if isinstance(r, APIRoute)]
+    LOGGER.info(
+        "Yggdrasil node ready node_id=%s port=%d routes=%d version=%s",
+        settings.node_id, settings.port, len(api_routes), settings.app_version,
+    )
+    tag_counts: dict[str, int] = {}
+    for r in api_routes:
+        for tag in (r.tags or ["misc"]):
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    for tag, count in sorted(tag_counts.items()):
+        LOGGER.info("  /%-12s %d endpoints", tag, count)
 
 from .config import Settings, get_settings
 from .exceptions import register_exception_handlers
 from .routers import (
+    ai_router,
     call_router,
     cmd_router,
     dag_router,
@@ -21,8 +42,10 @@ from .routers import (
     monitor_router,
     python_router,
     run_router,
+    trading_router,
 )
 from .services import (
+    AIService,
     CallService,
     CmdService,
     DagService,
@@ -36,11 +59,17 @@ from .services import (
     MonitorService,
     PythonExecService,
     RunService,
+    TradingService,
 )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        _log_startup(app, settings)
+        yield
 
     app = FastAPI(
         title=settings.app_name,
@@ -48,6 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url=settings.docs_url,
         redoc_url=settings.redoc_url,
         openapi_url=settings.openapi_url,
+        lifespan=_lifespan,
     )
 
     app.state.settings = settings
@@ -73,6 +103,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         run_service=app.state.run_service,
     )
     app.state.filesystem_service = FilesystemService(settings)
+    app.state.trading_service = TradingService(settings)
+    app.state.ai_service = AIService(
+        settings,
+        trading_service=app.state.trading_service,
+    )
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -118,6 +153,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(monitor_router, prefix=f"{prefix}/monitor")
     app.include_router(dag_router, prefix=f"{prefix}/dag")
     app.include_router(filesystem_router, prefix=f"{prefix}/fs")
+    app.include_router(trading_router, prefix=f"{prefix}/trading")
+    app.include_router(ai_router, prefix=f"{prefix}/ai")
 
     return app
 

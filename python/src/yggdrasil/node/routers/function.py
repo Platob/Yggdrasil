@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 
 from ..deps import get_function_service, get_run_service
 from ..middleware import cached_response, invalidate_response_cache
@@ -23,8 +23,10 @@ router = APIRouter(tags=["function"])
 @router.get("", response_model=FunctionListResponse)
 @cached_response(ttl_seconds=3.0)
 async def list_functions(
+    response: Response,
     service: FunctionService = Depends(get_function_service),
 ) -> FunctionListResponse:
+    response.headers["Cache-Control"] = "max-age=5"
     return await service.list()
 
 

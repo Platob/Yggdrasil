@@ -17,10 +17,11 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, AsyncIterator
 
+from anyio import to_thread
 from fastapi.concurrency import run_in_threadpool
 
 from ..config import Settings
-from ..exceptions import NotFoundError
+from ..exceptions import NotFoundError, TimeoutError as BotTimeoutError
 from ..ids import make_id
 from ..schemas.function import FunctionEntry
 from ..schemas.run import (
@@ -33,6 +34,30 @@ from .function import FunctionService
 from .environment import EnvironmentService
 
 LOGGER = logging.getLogger(__name__)
+
+# Active execution states — used by /api/run/active.
+_ACTIVE_STATES = frozenset({"pending", "running"})
+
+
+def _configure_threadpool_size() -> int:
+    """Set the AnyIO default threadpool to min(32, cpu_count * 4).
+
+    FastAPI's run_in_threadpool defers to the AnyIO blocking-portal token,
+    which defaults to 40. We override once at import time so the limit
+    scales sensibly with hardware and never blows up unboundedly on a
+    single-core machine.
+    """
+    cpu = os.cpu_count() or 1
+    limit = min(32, max(4, cpu * 4))
+    try:
+        limiter = to_thread.current_default_thread_limiter()
+        limiter.total_tokens = limit
+    except Exception:
+        pass
+    return limit
+
+
+_THREADPOOL_LIMIT = _configure_threadpool_size()
 
 
 class RunService:
@@ -110,6 +135,19 @@ class RunService:
             items = list(self._runs.values())
         if function_id is not None:
             items = [r for r in items if r.function_id == function_id]
+        return RunListResponse(
+            node_id=self.settings.node_id,
+            runs=items,
+        )
+
+    async def active(self) -> RunListResponse:
+        """Return only runs currently in 'pending' or 'running' state.
+
+        Avoids scanning + serialising the full history when callers only
+        care about live work (dashboards, cancel UIs, queue depth probes).
+        """
+        with self._lock:
+            items = [r for r in self._runs.values() if r.status in _ACTIVE_STATES]
         return RunListResponse(
             node_id=self.settings.node_id,
             runs=items,

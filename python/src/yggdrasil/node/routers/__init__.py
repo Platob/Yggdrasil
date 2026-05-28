@@ -1,3 +1,4 @@
+from .ai import router as ai_router
 from .call import router as call_router
 from .cmd import router as cmd_router
 from .dag import router as dag_router
@@ -11,8 +12,10 @@ from .messenger import router as messenger_router
 from .monitor import router as monitor_router
 from .python import router as python_router
 from .run import router as run_router
+from .trading import router as trading_router
 
 __all__ = [
+    "ai_router",
     "call_router",
     "cmd_router",
     "dag_router",
@@ -26,4 +29,5 @@ __all__ = [
     "monitor_router",
     "python_router",
     "run_router",
+    "trading_router",
 ]

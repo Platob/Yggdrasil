@@ -19,6 +19,14 @@ async def list_runs(
     return await service.list()
 
 
+@router.get("/active", response_model=RunListResponse)
+async def list_active_runs(
+    service: RunService = Depends(get_run_service),
+) -> RunListResponse:
+    """Return runs currently in 'pending' or 'running' state."""
+    return await service.active()
+
+
 @router.post("", response_model=RunResponse)
 async def create_run(
     req: RunCreate,

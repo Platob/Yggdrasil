@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 
 from ..deps import get_job_service
 from ..schemas.job import (
@@ -19,8 +19,10 @@ router = APIRouter(tags=["job"])
 
 @router.get("", response_model=JobListResponse)
 async def list_jobs(
+    response: Response,
     service: JobService = Depends(get_job_service),
 ) -> JobListResponse:
+    response.headers["Cache-Control"] = "max-age=5"
     return await service.list_jobs()
 
 
