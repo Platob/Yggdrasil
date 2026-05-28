@@ -747,25 +747,23 @@ class ExpiringDict(Generic[K, V]):
         return val  # type: ignore[return-value]
 
     def __delitem__(self, key: K) -> None:
-        with self._lock:
-            entry = self._store.pop(key, ...)
+        # ``dict.pop`` is GIL-atomic on CPython — no lock needed for the
+        # single-key removal, which shrinks the lock footprint and
+        # rules out a class of deadlocks where the on_evict callback
+        # or a concurrent writer happens to contend on this RLock.
+        entry = self._store.pop(key, ...)
         if entry is ...:
             raise KeyError(key)
-        # entry is the (value, expires_at) tuple here.
         value, _ = entry  # type: ignore[misc]
         self._notify_evicted([(key, value)])
 
     def pop(self, key: K, *args) -> V:
-        with self._lock:
-            entry = self._store.pop(key, ...)
+        entry = self._store.pop(key, ...)
         if entry is ...:
             if args:
                 return args[0]
             raise KeyError(key)
         value, expires_at = entry  # type: ignore[misc]
-        # Always fire on_evict for an explicit pop, even if the entry
-        # had silently expired between checks — the value is leaving
-        # the cache and the callback may still need to dispose of it.
         self._notify_evicted([(key, value)])
         if self._is_expired(expires_at):
             return args[0] if args else None  # type: ignore[return-value]
@@ -783,8 +781,8 @@ class ExpiringDict(Generic[K, V]):
         return expires_at is None or now_utc_ns() < expires_at
 
     def __len__(self) -> int:
-        with self._lock:
-            return len(self._store)
+        # ``len(dict)`` is a single C call, GIL-atomic on CPython.
+        return len(self._store)
 
     def __iter__(self) -> Iterator[K]:
         return iter(self.keys())
@@ -895,28 +893,32 @@ class ExpiringDict(Generic[K, V]):
         result: Dict[K, V] = {}
         evicted: List[Tuple[K, V]] = []
         now = now_utc_ns()
-        with self._lock:
-            for key in keys:
-                entry = self._store.get(key)
-                if entry is not None:
-                    value, exp = entry
-                    if exp is None or now < exp:
-                        result[key] = value
-                    else:
-                        del self._store[key]
-                        evicted.append((key, value))
+        # Lock-free: ``dict.get`` and ``dict.pop`` are GIL-atomic.
+        # Holding the lock across a whole batch was pure deadlock
+        # surface area — a slow ``on_evict`` or contending writer
+        # would serialize unrelated batches behind us.
+        for key in keys:
+            entry = self._store.get(key)
+            if entry is None:
+                continue
+            value, exp = entry
+            if exp is None or now < exp:
+                result[key] = value
+                continue
+            removed = self._store.pop(key, ...)
+            if removed is not ...:
+                evicted.append((key, removed[0]))  # type: ignore[index]
         self._notify_evicted(evicted)
         return result
 
     def delete_many(self, keys: Iterable[K]) -> int:
         """Delete *keys*; returns count of keys actually removed."""
         evicted: List[Tuple[K, V]] = []
-        with self._lock:
-            for key in keys:
-                entry = self._store.pop(key, ...)
-                if entry is not ...:
-                    value, _ = entry  # type: ignore[misc]
-                    evicted.append((key, value))
+        for key in keys:
+            entry = self._store.pop(key, ...)
+            if entry is not ...:
+                value, _ = entry  # type: ignore[misc]
+                evicted.append((key, value))
         self._notify_evicted(evicted)
         return len(evicted)
 
@@ -924,54 +926,56 @@ class ExpiringDict(Generic[K, V]):
 
     def ttl(self, key: K) -> Optional[float]:
         """Remaining TTL in **seconds** for *key*, or ``None`` if gone/expired."""
-        evicted: List[Tuple[K, V]] = []
-        with self._lock:
-            entry = self._store.get(key)
-            if entry is None:
-                return None
-            value, expires_at = entry
-            if expires_at is None:
-                return None  # non-expiring
-            remaining_ns = expires_at - now_utc_ns()
-            if remaining_ns <= 0:
-                del self._store[key]
-                evicted.append((key, value))
-                self._notify_evicted(evicted)
-                return None
+        # Lock-free read — atomic under the GIL. ``on_evict`` runs
+        # OUTSIDE any lock (the in-lock variant was a latent
+        # deadlock: a callback that takes another lock could
+        # invert ordering with a writer).
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if expires_at is None:
+            return None  # non-expiring
+        remaining_ns = expires_at - now_utc_ns()
+        if remaining_ns > 0:
             return remaining_ns / 1_000_000_000
+        # Expired — try to drop atomically; only fire the callback
+        # if we won the race against a concurrent remover.
+        removed = self._store.pop(key, ...)
+        if removed is not ...:
+            self._notify_evicted([(key, removed[0])])  # type: ignore[index]
+        return None
 
     def ttl_ns(self, key: K) -> Optional[int]:
         """Remaining TTL in **nanoseconds** for *key*, or ``None``."""
-        evicted: List[Tuple[K, V]] = []
-        with self._lock:
-            entry = self._store.get(key)
-            if entry is None:
-                return None
-            value, expires_at = entry
-            if expires_at is None:
-                return None
-            remaining = expires_at - now_utc_ns()
-            if remaining <= 0:
-                del self._store[key]
-                evicted.append((key, value))
-                self._notify_evicted(evicted)
-                return None
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if expires_at is None:
+            return None
+        remaining = expires_at - now_utc_ns()
+        if remaining > 0:
             return remaining
+        removed = self._store.pop(key, ...)
+        if removed is not ...:
+            self._notify_evicted([(key, removed[0])])  # type: ignore[index]
+        return None
 
     def keys(self) -> list[K]:
+        # ``list(dict.items())`` is a single C call — atomic snapshot
+        # under the CPython GIL, no risk of "dict changed size during
+        # iteration" and no lock contention with writers.
         now = now_utc_ns()
-        with self._lock:
-            return [k for k, (_, exp) in self._store.items() if exp is None or now < exp]
+        return [k for k, (_, exp) in list(self._store.items()) if exp is None or now < exp]
 
     def values(self) -> list[V]:
         now = now_utc_ns()
-        with self._lock:
-            return [v for v, exp in self._store.values() if exp is None or now < exp]
+        return [v for v, exp in list(self._store.values()) if exp is None or now < exp]
 
     def items(self) -> list[Tuple[K, V]]:
         now = now_utc_ns()
-        with self._lock:
-            return [(k, v) for k, (v, exp) in self._store.items() if exp is None or now < exp]
+        return [(k, v) for k, (v, exp) in list(self._store.items()) if exp is None or now < exp]
 
     def snapshot(self) -> Dict[K, Tuple[V, Optional[int]]]:
         """
@@ -979,12 +983,11 @@ class ExpiringDict(Generic[K, V]):
         Useful for debugging or external persistence.
         """
         now = now_utc_ns()
-        with self._lock:
-            return {
-                k: (v, exp)
-                for k, (v, exp) in self._store.items()
-                if exp is None or now < exp
-            }
+        return {
+            k: (v, exp)
+            for k, (v, exp) in list(self._store.items())
+            if exp is None or now < exp
+        }
 
     def clear(self) -> None:
         """Drop every entry. Fires ``on_evict`` for each removed entry."""
@@ -1009,22 +1012,29 @@ class ExpiringDict(Generic[K, V]):
         """
         Reset the TTL of an existing, live key.
         Returns ``True`` if key existed and was refreshed, ``False`` otherwise.
-        Does NOT fire ``on_evict`` — the value isn't leaving the cache.
+        Fires ``on_evict`` ONLY when the call discovers a silently
+        expired entry and drops it; never when the key is genuinely
+        refreshed.
         """
         exp = self._expires_at_ns(ttl)
         evicted: List[Tuple[K, V]] = []
+        refreshed = False
         with self._lock:
             entry = self._store.get(key)
-            if entry is None:
-                return False
-            value, old_exp = entry
-            if self._is_expired(old_exp):
-                del self._store[key]
-                evicted.append((key, value))
-                self._notify_evicted(evicted)
-                return False
-            self._store[key] = (value, exp)
-            return True
+            if entry is not None:
+                value, old_exp = entry
+                if self._is_expired(old_exp):
+                    del self._store[key]
+                    evicted.append((key, value))
+                else:
+                    self._store[key] = (value, exp)
+                    refreshed = True
+        # ``on_evict`` MUST run outside the lock — running it inside
+        # was a deadlock waiting to happen (callbacks can be
+        # arbitrarily heavy or take their own locks).
+        if evicted:
+            self._notify_evicted(evicted)
+        return refreshed
 
     def get_or_set(
         self,
@@ -1038,35 +1048,47 @@ class ExpiringDict(Generic[K, V]):
 
         Fires ``on_evict`` if a previously-stored expired entry got
         replaced — the old value is leaving the cache.
+
+        Note: the ``default`` callable is invoked OUTSIDE the internal
+        lock. This rules out a class of deadlocks where ``default()``
+        takes another lock (or re-enters this cache from a different
+        thread). The tradeoff is that under contention two threads
+        may both invoke ``default()`` — the first writer wins, the
+        loser silently discards its own computation.
         """
-        # Lock-free fast path for the hit case — same rationale as
-        # ``get``. ``get_or_set`` is the workhorse of every "build it
-        # once, cache it forever" pattern (Databricks SDK schema /
-        # table / catalog caches), so the hit case dominates by orders
-        # of magnitude over the miss case.
+        # Lock-free fast path for the hit case — ``get_or_set`` is
+        # the workhorse of every "build it once, cache it forever"
+        # pattern (Databricks SDK schema / table / catalog caches),
+        # so the hit case dominates the miss case by orders of magnitude.
         entry = self._store.get(key)
         if entry is not None:
             value, expires_at = entry
             if expires_at is None or now_utc_ns() < expires_at:
                 return value
 
+        # Compute the new value OUTSIDE the lock so arbitrary user code
+        # never runs while we hold the cache RLock.
+        new_value: V = default() if callable(default) else default  # type: ignore[assignment]
+        exp = self._expires_at_ns(ttl)
+
         evicted: List[Tuple[K, V]] = []
         with self._lock:
             entry = self._store.get(key)
             if entry is not None:
-                value, expires_at = entry
-                if not self._is_expired(expires_at):
-                    return value
+                existing_value, existing_exp = entry
+                if not self._is_expired(existing_exp):
+                    # Another thread won the race — honor their value
+                    # and drop ours. ``new_value`` is never observed
+                    # by anyone else, so we silently discard it.
+                    return existing_value
                 # Expired entry — evict before replacing.
                 del self._store[key]
-                evicted.append((key, value))
-            value = default() if callable(default) else default
-            exp = self._expires_at_ns(ttl)
-            evicted.extend(self._put_locked(key, value, exp))
+                evicted.append((key, existing_value))
+            evicted.extend(self._put_locked(key, new_value, exp))
         if evicted:
             self._notify_evicted(evicted)
         self._maybe_schedule_purge()
-        return value
+        return new_value
 
     # ── RefreshResult convenience ─────────────────────────────
 
