@@ -84,9 +84,14 @@ export function Sidebar() {
       <div className="flex items-center gap-2.5 h-14 px-4 border-b border-sidebar-border shrink-0">
         <Link href="/" className="flex items-center gap-2.5">
           <YggLogoIcon size={26} />
-          <span className="font-bold text-xs tracking-[0.15em] uppercase text-foreground">
-            Yggdrasil
-          </span>
+          <div className="flex flex-col leading-tight">
+            <span className="font-bold text-xs tracking-[0.15em] uppercase text-foreground">
+              Yggdrasil
+            </span>
+            <span className="text-[8px] tracking-[0.2em] uppercase text-muted/70">
+              Living Brain
+            </span>
+          </div>
         </Link>
       </div>
 

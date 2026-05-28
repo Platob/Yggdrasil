@@ -4,7 +4,7 @@ import { Sidebar } from "@/components/Sidebar";
 
 export const metadata: Metadata = {
   title: "Yggdrasil",
-  description: "Yggdrasil - The World Tree of Distributed Computing",
+  description: "Yggdrasil - A Living Brain of Distributed Computing",
   keywords: ["yggdrasil", "distributed", "nodes", "python", "computing"],
 };
 

@@ -230,3 +230,28 @@ body {
   background-clip: text;
   color: transparent;
 }
+
+/* ── Brain pulse effects ──────────────────────────────────── */
+@keyframes neural-pulse {
+  0%, 100% { opacity: 0.6; box-shadow: 0 0 8px var(--frost-glow); }
+  50% { opacity: 1; box-shadow: 0 0 24px var(--frost-glow), 0 0 48px var(--frost-glow); }
+}
+.neural-pulse { animation: neural-pulse 2s ease-in-out infinite; }
+
+@keyframes synapse-fire {
+  0% { opacity: 0; transform: scale(0.5); }
+  20% { opacity: 1; transform: scale(1.1); }
+  100% { opacity: 0; transform: scale(2); }
+}
+.synapse-fire { animation: synapse-fire 1.5s ease-out infinite; }
+
+/* Brain wave background */
+@keyframes brain-wave {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+.brain-wave-bg {
+  background: linear-gradient(120deg, rgba(103,232,249,0.04), rgba(168,85,247,0.04), rgba(52,211,153,0.04));
+  background-size: 200% 200%;
+  animation: brain-wave 15s ease-in-out infinite;
+}

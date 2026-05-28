@@ -74,7 +74,7 @@ from typing import Any, Callable, TypeVar, overload
 __all__ = [
     "function", "dag", "schedule", "on_node",
     "step", "pipeline", "cron", "auto_dispatch",
-    "parallel", "cache",
+    "parallel", "cache", "deploy", "gpu", "retry",
     "FunctionHandle", "FunctionRun", "DagHandle",
     "get_input", "set_output",
 ]
@@ -1099,4 +1099,108 @@ def cache(handle=None, *, ttl_seconds: float = 300.0):
 
     if handle is not None:
         return _wrap(handle)
+    return _wrap
+
+
+def deploy(func=None, *, on: list[str] | None = None):
+    """Deploy a function to multiple nodes at once.
+
+    Usage::
+
+        @deploy(on=["http://worker-1:8100", "http://worker-2:8100"])
+        @function
+        def process(data): ...
+    """
+    def _wrap(handle):
+        if not isinstance(handle, FunctionHandle):
+            raise TypeError("@deploy must wrap a @function-decorated function")
+        if not on:
+            return handle
+        # Register the function on every target node
+        data: dict[str, Any] = {
+            "name": handle.name,
+            "code": handle.code,
+            "language": "python",
+            "description": handle.description,
+            "python_version": handle.python_version,
+            "dependencies": handle.dependencies,
+        }
+        for url in on:
+            try:
+                _post(f"{url.rstrip('/')}/api/v2/pyfunc", data)
+            except Exception as exc:
+                LOGGER.warning("Failed to deploy %s to %s: %s", handle.name, url, exc)
+        return handle
+    if func is not None:
+        return _wrap(func)
+    return _wrap
+
+
+def gpu(handle=None, *, min_gpus: int = 1):
+    """Pin a function to nodes with at least N GPUs.
+
+    Usage::
+
+        @gpu(min_gpus=2)
+        @function
+        def train_model(data): ...
+    """
+    def _wrap(h):
+        if not isinstance(h, FunctionHandle):
+            raise TypeError("@gpu must wrap a @function-decorated function")
+        original_call = h.__call__
+        def gpu_call(*args, **kwargs):
+            try:
+                url = _local_url()
+                peers_resp = urllib.request.urlopen(f"{url}/api/v2/network/peers", timeout=2)
+                peers = json.loads(peers_resp.read()).get("peers", [])
+                gpu_peers = [p for p in peers if p.get("gpu_count", 0) >= min_gpus]
+                if gpu_peers:
+                    best = min(gpu_peers, key=lambda p: (p.get("active_runs", 0), p.get("cpu_percent", 0)))
+                    return h.on(f"http://{best['host']}:{best['port']}").__call__(*args, **kwargs)
+            except Exception:
+                pass
+            return original_call(*args, **kwargs)
+        h.__call__ = gpu_call
+        return h
+    if handle is not None:
+        return _wrap(handle)
+    return _wrap
+
+
+def retry(func=None, *, max_attempts: int = 3, delay: float = 1.0):
+    """Retry a function call on failure.
+
+    Usage::
+
+        @retry(max_attempts=5, delay=2.0)
+        @function
+        def flaky_api_call(url): ...
+    """
+    def _wrap(h):
+        if not isinstance(h, FunctionHandle):
+            raise TypeError("@retry must wrap a @function-decorated function")
+        original_call = h.__call__
+        def retry_call(*args, **kwargs):
+            last_exc = None
+            run = None
+            for attempt in range(max_attempts):
+                try:
+                    run = original_call(*args, **kwargs)
+                    # Check result
+                    result = run.wait(wait=600.0, raise_error=False)
+                    if run.state.is_succeeded:
+                        return run
+                    last_exc = run._exception
+                except Exception as exc:
+                    last_exc = exc
+                if attempt < max_attempts - 1:
+                    time.sleep(delay * (2 ** attempt))  # exponential backoff
+            if last_exc:
+                raise last_exc
+            return run
+        h.__call__ = retry_call
+        return h
+    if func is not None:
+        return _wrap(func)
     return _wrap

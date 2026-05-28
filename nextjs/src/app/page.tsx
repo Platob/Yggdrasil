@@ -2,14 +2,15 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Globe } from "@/components/Globe";
+import { BrainHero } from "@/components/BrainHero";
 import { YggLogoIcon } from "@/components/YggLogo";
-import { getNodeCard, getStats } from "@/lib/api";
-import type { NodeCard, ClusterStats } from "@/lib/types";
+import { getNodeCard, getStats, getTopology } from "@/lib/api";
+import type { NodeCard, ClusterStats, TopologyResponse } from "@/lib/types";
 
 export default function WelcomePage() {
   const [card, setCard] = useState<NodeCard | null>(null);
   const [stats, setStats] = useState<ClusterStats | null>(null);
+  const [topology, setTopology] = useState<TopologyResponse | null>(null);
   const [error, setError] = useState(false);
 
   useEffect(() => {
@@ -38,23 +39,42 @@ export default function WelcomePage() {
     };
   }, []);
 
+  // Topology poll powers the neuron/synapse count pill below the title
+  useEffect(() => {
+    let active = true;
+    const tick = () => {
+      getTopology()
+        .then((t) => {
+          if (active) setTopology(t);
+        })
+        .catch(() => {
+          // Silently ignore; pill just won't render
+        });
+    };
+    tick();
+    const id = setInterval(tick, 10000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, []);
+
   const nodeId = card?.node_id ?? "---";
-  const lat = card?.lat ?? null;
-  const lon = card?.lon ?? null;
   const role = card?.role ?? "hybrid";
   const version = card?.version ?? "";
 
+  // Synapse estimate — every neuron is ~6 connected synapses (peer→self
+  // + ~3 interneurons + cross-links). Matches the visual density of BrainHero.
+  const neuronCount = topology?.nodes.length ?? 0;
+  const synapseEstimate = neuronCount > 0 ? neuronCount * 6 + 60 : 60;
+
   return (
-    <div className="relative w-full h-screen overflow-hidden">
-      {/* Aurora ambient layer behind the globe */}
+    <div className="relative w-full h-screen overflow-hidden brain-wave-bg">
+      {/* Aurora ambient layer behind the brain */}
       <div className="aurora-bg z-0" />
 
-      {/* Full-bleed globe background */}
-      <Globe
-        lat={lat}
-        lon={lon}
-        className="absolute inset-0 w-full h-full"
-      />
+      {/* Full-bleed brain hero */}
+      <BrainHero className="absolute inset-0 w-full h-full" />
 
       {/* Top gradient overlay for readability */}
       <div
@@ -121,12 +141,12 @@ export default function WelcomePage() {
           </h1>
 
           <p className="text-sm md:text-base text-foreground-dim tracking-widest uppercase">
-            The World Tree of Distributed Computing
+            A Living Brain of Distributed Computing
           </p>
 
           {/* Node status line */}
           <div className="flex items-center justify-center gap-3 mt-6">
-            <span className="w-2 h-2 rounded-full status-online" />
+            <span className="w-2 h-2 rounded-full status-online neural-pulse" />
             <span className="text-xs font-mono text-frost/80">
               {error ? "Backend unreachable" : nodeId}
             </span>
@@ -166,16 +186,22 @@ export default function WelcomePage() {
                 View Nodes
               </span>
             </Link>
-            {card && (
+            {topology && (
               <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-mono text-muted bg-white/[0.03] border border-white/[0.06]">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" />
-                  <line x1="2" y1="12" x2="22" y2="12" />
+                {/* Neuron/synapse glyph — small circuit-style icon */}
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="2.5" />
+                  <circle cx="4" cy="6" r="1.5" />
+                  <circle cx="20" cy="6" r="1.5" />
+                  <circle cx="4" cy="18" r="1.5" />
+                  <circle cx="20" cy="18" r="1.5" />
+                  <path d="M5.5 7l4.5 4M18.5 7L14 11M5.5 17L10 13M18.5 17L14 13" />
                 </svg>
-                {lat != null && lon != null
-                  ? `${lat.toFixed(2)}, ${lon.toFixed(2)}`
-                  : "Locating..."}
+                <span className="text-frost">{neuronCount}</span>
+                <span>neuron{neuronCount !== 1 ? "s" : ""}</span>
+                <span className="text-border">&middot;</span>
+                <span className="text-emerald">{synapseEstimate}</span>
+                <span>synapses</span>
               </div>
             )}
           </div>
