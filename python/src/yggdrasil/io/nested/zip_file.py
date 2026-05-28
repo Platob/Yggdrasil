@@ -380,12 +380,19 @@ class ZipFile(IO):
     ) -> Iterator[pa.RecordBatch]:
         """Walk every tabular entry and yield its batches in order.
 
+        Single archive open — the directory is parsed ONCE and every
+        tabular entry is decompressed inside the same
+        :class:`zipfile.ZipFile` handle. The lazy per-child
+        :meth:`ZipEntryFile._materialize` path re-parses the directory
+        per entry, which is wasteful when the caller is walking the
+        whole archive (the common Tabular read shape).
+
         Entries that DO resolve to a registered tabular leaf
         (parquet / csv / ndjson / arrow / …) stream their batches in
         archive order. Entries that don't resolve are skipped
         silently when at least one tabular entry is present — that's
         the contract for the zip-as-Tabular view. Use
-        :meth:`iter_children` for an unfiltered walk.
+        :meth:`iter_children` for an unfiltered lazy walk.
 
         Raises :class:`ValueError` when the archive has entries but
         NONE of them resolve to a registered tabular leaf — silently
@@ -394,32 +401,59 @@ class ZipFile(IO):
         format, …) behind an empty read. Empty archives still
         return zero batches without raising.
         """
-        children = list(self.iter_children())
-        if not children:
+        if self.size == 0:
             return
 
-        leaves: "list[tuple[ZipEntryFile, Tabular]]" = []
-        unresolved: "list[str]" = []
-        for child in children:
-            leaf = child._resolve_leaf()
-            if leaf is None:
-                unresolved.append(
-                    _describe_entry_resolution_failure(child.entry_name)
-                )
-                continue
-            leaves.append((child, leaf))
+        # Side-effect import: ensures the primitive leaves registered
+        # before we probe the media-type → Holder class table.
+        import yggdrasil.io.primitive  # noqa: F401
 
-        if not leaves:
-            exts = _registered_tabular_extensions()
-            raise ValueError(
-                f"{type(self).__name__}: archive has {len(children)} "
-                "entries but none resolve to a registered Tabular leaf. "
-                f"Reasons: {unresolved!r}. Registered tabular extensions: "
-                f"{exts!r}."
-            )
+        with self.view(pos=0) as v:
+            with zipfile.ZipFile(v, "r") as zf:
+                file_entries = [
+                    info for info in zf.infolist() if not info.is_dir()
+                ]
+                if not file_entries:
+                    return
 
-        for _child, leaf in leaves:
-            yield from leaf._read_arrow_batches(leaf.options_class()())
+                resolved: "list[tuple[zipfile.ZipInfo, type[Tabular]]]" = []
+                unresolved: "list[str]" = []
+                for info in file_entries:
+                    try:
+                        mt = MediaType.from_(info.filename, default=None)
+                    except Exception:
+                        mt = None
+                    cls = None
+                    if mt is not None:
+                        try:
+                            cls = Holder.class_for_media_type(mt, default=None)
+                        except Exception:
+                            cls = None
+                    if cls is None or cls is ZipEntryFile:
+                        unresolved.append(
+                            _describe_entry_resolution_failure(info.filename),
+                        )
+                        continue
+                    resolved.append((info, cls))
+
+                if not resolved:
+                    exts = _registered_tabular_extensions()
+                    raise ValueError(
+                        f"{type(self).__name__}: archive has "
+                        f"{len(file_entries)} entries but none resolve to a "
+                        "registered Tabular leaf. Reasons: "
+                        f"{unresolved!r}. Registered tabular extensions: "
+                        f"{exts!r}."
+                    )
+
+                # Decompress + dispatch inline so we never pay N
+                # directory parses for N entries.
+                for info, cls in resolved:
+                    payload = zf.read(info.filename)
+                    leaf = cls(holder=Memory(payload), owns_holder=True)
+                    yield from leaf._read_arrow_batches(
+                        leaf.options_class()(),
+                    )
 
     # ==================================================================
     # Write path
@@ -485,27 +519,45 @@ class ZipFile(IO):
         leaf.write_arrow_batches(batches, options=leaf.options_class()())
         entry_payload = leaf.to_bytes()
 
-        # Append: read survivors entry-by-entry to avoid materializing
-        # the whole archive at once.
-        survivors: "list[tuple[str, bytes]]" = []
-        if action is Mode.APPEND and self.size > 0:
-            with self.view(pos=0) as v:
-                with zipfile.ZipFile(v, "r") as zf:
-                    for info in zf.infolist():
-                        if info.is_dir():
-                            continue
-                        if info.filename == options.entry_name:
-                            continue
-                        survivors.append((info.filename, zf.read(info.filename)))
-
-        self.seek(0)
-        self.truncate(0)
         write_kwargs: dict = {"compression": options.compression}
         if options.compresslevel is not None:
             write_kwargs["compresslevel"] = options.compresslevel
+
+        if action is Mode.APPEND and self.size > 0:
+            # Append: build the new archive in a scratch buffer first.
+            # Reading FROM self while writing TO self is impossible, and
+            # the previous "read every survivor into a list" path
+            # materialized every survivor's decompressed bytes in
+            # memory simultaneously — multi-GB archives would balloon.
+            # Stream each survivor chunk-by-chunk from the source's
+            # ZipExtFile straight into the destination's writer; only
+            # the in-flight chunk lives in memory at any moment.
+            scratch = Memory()
+            with self.view(pos=0) as src_v:
+                with zipfile.ZipFile(src_v, "r") as src_zf:
+                    with zipfile.ZipFile(scratch, "w", **write_kwargs) as dst_zf:
+                        for info in src_zf.infolist():
+                            if info.is_dir():
+                                continue
+                            if info.filename == options.entry_name:
+                                continue
+                            with src_zf.open(info, "r") as src_entry:
+                                with dst_zf.open(info, "w") as dst_entry:
+                                    while True:
+                                        chunk = src_entry.read(1 << 20)
+                                        if not chunk:
+                                            break
+                                        dst_entry.write(chunk)
+                        dst_zf.writestr(options.entry_name, entry_payload)
+            scratch_bytes = scratch.to_bytes()
+            self.seek(0)
+            self.truncate(0)
+            self.write_bytes(scratch_bytes)
+            return
+
+        self.seek(0)
+        self.truncate(0)
         with zipfile.ZipFile(self, "w", **write_kwargs) as zf:
-            for name, blob in survivors:
-                zf.writestr(name, blob)
             zf.writestr(options.entry_name, entry_payload)
 
     def write_entries(self, entries: Iterable[tuple[str, bytes]]) -> None:
