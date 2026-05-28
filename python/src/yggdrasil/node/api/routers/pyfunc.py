@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import json
+import orjson
 from typing import Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import Field
+
+_SSE_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
 
 from ..deps import get_pyfunc_service, get_pyfuncrun_service
 from ..schemas.common import StrictModel
@@ -235,9 +237,9 @@ async def stream_func_run_logs(
 
     async def event_stream():
         async for event in pyfuncrun.stream_logs(run_id):
-            yield f"data: {json.dumps(event)}\n\n"
+            yield b"data: " + orjson.dumps(event) + b"\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.get("/{func_id}/runs/{run_id}/state")
@@ -251,6 +253,6 @@ async def stream_func_run_state(
 
     async def event_stream():
         async for state in pyfuncrun.stream_state(run_id):
-            yield f"data: {json.dumps(state)}\n\n"
+            yield b"data: " + orjson.dumps(state) + b"\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)

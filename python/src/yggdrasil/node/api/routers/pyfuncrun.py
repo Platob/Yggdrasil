@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import json
+import orjson
 
 from fastapi import APIRouter, Depends, Response
 from fastapi.responses import StreamingResponse
+
+_SSE_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
 
 from ...transport import serialize_result
 from ..deps import get_pyfuncrun_service
@@ -21,9 +23,15 @@ router = APIRouter(tags=["pyfuncrun"])
 @router.get("", response_model=PyFuncRunListResponse)
 async def list_runs(
     func_id: int | None = None,
+    status: str | None = None,
     service: PyFuncRunService = Depends(get_pyfuncrun_service),
 ) -> PyFuncRunListResponse:
-    return await service.list(func_id=func_id)
+    """List runs. ``status`` can be a comma-separated list (e.g. ``running,pending``)."""
+    resp = await service.list(func_id=func_id)
+    if status:
+        wanted = {s.strip() for s in status.split(",") if s.strip()}
+        resp.runs = [r for r in resp.runs if r.status in wanted]
+    return resp
 
 
 @router.post("", response_model=PyFuncRunResponse)
@@ -113,9 +121,9 @@ async def stream_logs(
 
     async def event_stream():
         async for event in service.stream_logs(run_id):
-            yield f"data: {json.dumps(event)}\n\n"
+            yield b"data: " + orjson.dumps(event) + b"\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.get("/{run_id}/state")
@@ -128,9 +136,9 @@ async def stream_state(
 
     async def event_stream():
         async for state in service.stream_state(run_id):
-            yield f"data: {json.dumps(state)}\n\n"
+            yield b"data: " + orjson.dumps(state) + b"\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.get("/{run_id}/result")

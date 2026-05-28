@@ -1,7 +1,13 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
-import { getFsListing, getFsContent } from "@/lib/api";
+import { useEffect, useState, useCallback, useRef } from "react";
+import {
+  getFsListing,
+  getFsContent,
+  getFsTail,
+  createFsWatchStream,
+  grepFs,
+} from "@/lib/api";
 import type { FsEntry } from "@/lib/types";
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -99,6 +105,8 @@ function FileIcon({ entry }: { entry: FsEntry }) {
   );
 }
 
+type ViewMode = "preview" | "tail";
+
 export default function FilesPage() {
   const [currentPath, setCurrentPath] = useState("");
   const [entries, setEntries] = useState<FsEntry[]>([]);
@@ -107,6 +115,33 @@ export default function FilesPage() {
   const [selectedFile, setSelectedFile] = useState<FsEntry | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
   const [loadingContent, setLoadingContent] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("preview");
+  const [tailLines, setTailLines] = useState<string[]>([]);
+  const [tailLive, setTailLive] = useState(false);
+  const tailEsRef = useRef<EventSource | null>(null);
+  const tailEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Grep panel state
+  const [grepOpen, setGrepOpen] = useState(false);
+  const [grepPattern, setGrepPattern] = useState("");
+  const [grepRegex, setGrepRegex] = useState(false);
+  const [grepResults, setGrepResults] = useState<
+    { path: string; line_number: number; line: string; match: string }[]
+  >([]);
+  const [grepLoading, setGrepLoading] = useState(false);
+
+  const runGrep = async () => {
+    if (!grepPattern.trim()) return;
+    setGrepLoading(true);
+    try {
+      const r = await grepFs(currentPath, grepPattern, { regex: grepRegex, max_matches: 200 });
+      setGrepResults(r.matches);
+    } catch {
+      setGrepResults([]);
+    } finally {
+      setGrepLoading(false);
+    }
+  };
 
   const fetchListing = useCallback(async (path: string) => {
     setLoading(true);
@@ -143,6 +178,9 @@ export default function FilesPage() {
   const openFile = async (entry: FsEntry) => {
     setSelectedFile(entry);
     setFileContent(null);
+    setTailLines([]);
+    setViewMode("preview");
+    setTailLive(false);
     if (isTextViewable(entry)) {
       setLoadingContent(true);
       try {
@@ -155,6 +193,45 @@ export default function FilesPage() {
       }
     }
   };
+
+  // Switch into tail mode: load last N lines once, optionally subscribe to SSE.
+  const enterTail = async () => {
+    if (!selectedFile) return;
+    setViewMode("tail");
+    try {
+      const t = await getFsTail(selectedFile.path, 300);
+      setTailLines(t.lines);
+    } catch {
+      setTailLines([]);
+    }
+  };
+
+  // SSE watch toggle
+  useEffect(() => {
+    if (!tailLive || viewMode !== "tail" || !selectedFile) {
+      if (tailEsRef.current) {
+        tailEsRef.current.close();
+        tailEsRef.current = null;
+      }
+      return;
+    }
+    const es = createFsWatchStream(selectedFile.path);
+    tailEsRef.current = es;
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data) as { line: string };
+        setTailLines((prev) => [...prev.slice(-500), data.line]);
+        setTimeout(() => tailEndRef.current?.scrollIntoView({ behavior: "smooth" }), 0);
+      } catch {
+        /* ignore non-JSON keepalives */
+      }
+    };
+    es.onerror = () => { /* let close happen naturally */ };
+    return () => {
+      es.close();
+      tailEsRef.current = null;
+    };
+  }, [tailLive, viewMode, selectedFile]);
 
   const navigateUp = () => {
     if (!currentPath) return;
@@ -185,23 +262,79 @@ export default function FilesPage() {
             )}
           </p>
         </div>
-        <button
-          onClick={() => fetchListing(currentPath)}
-          className="
-            px-3 py-1.5 rounded-lg text-xs font-medium
-            text-frost/70 hover:text-frost
-            bg-frost/5 hover:bg-frost/10
-            border border-frost/10 hover:border-frost/20
-            transition-all duration-150
-          "
-        >
-          <svg className="inline-block mr-1.5 -mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-            <polyline points="23 4 23 10 17 10" />
-            <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
-          </svg>
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setGrepOpen((v) => !v)}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium text-amber/70 hover:text-amber bg-amber/5 hover:bg-amber/10 border border-amber/10 hover:border-amber/20 transition-all"
+          >
+            <svg className="inline-block mr-1.5 -mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <circle cx="11" cy="11" r="8" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            {grepOpen ? "Hide search" : "Search"}
+          </button>
+          <button
+            onClick={() => fetchListing(currentPath)}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium text-frost/70 hover:text-frost bg-frost/5 hover:bg-frost/10 border border-frost/10 hover:border-frost/20 transition-all"
+          >
+            <svg className="inline-block mr-1.5 -mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <polyline points="23 4 23 10 17 10" />
+              <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
+            </svg>
+            Refresh
+          </button>
+        </div>
       </div>
+
+      {/* Grep / search-in-tree panel */}
+      {grepOpen && (
+        <div className="glass-card p-3 mb-4 space-y-2">
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={grepPattern}
+              onChange={(e) => setGrepPattern(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") runGrep(); }}
+              placeholder={`Search ${currentPath || "/"}  -  Enter to run`}
+              className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded px-2 py-1.5 text-xs font-mono outline-none focus:border-amber/30"
+              autoFocus
+            />
+            <label className="flex items-center gap-1 text-[10px] text-muted font-mono cursor-pointer">
+              <input type="checkbox" checked={grepRegex} onChange={(e) => setGrepRegex(e.target.checked)} />
+              regex
+            </label>
+            <button
+              onClick={runGrep}
+              disabled={grepLoading || !grepPattern.trim()}
+              className="px-3 py-1.5 rounded text-xs font-semibold bg-amber/15 text-amber border border-amber/30 hover:bg-amber/25 disabled:opacity-30"
+            >
+              {grepLoading ? "..." : "Grep"}
+            </button>
+          </div>
+          {grepResults.length > 0 && (
+            <div className="max-h-64 overflow-y-auto divide-y divide-white/[0.04] text-[11px] font-mono">
+              {grepResults.map((m, i) => (
+                <button
+                  key={i}
+                  onClick={() => {
+                    // Try to open the matching file via the listing
+                    const matching = entries.find((e) => e.path === m.path);
+                    if (matching) openFile(matching);
+                  }}
+                  className="w-full text-left flex items-baseline gap-2 py-1 hover:bg-white/[0.04]"
+                >
+                  <span className="text-frost/70 shrink-0">{m.path}</span>
+                  <span className="text-muted shrink-0">:{m.line_number}</span>
+                  <span className="text-foreground/80 truncate">{m.line}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {grepResults.length === 0 && !grepLoading && grepPattern && (
+            <p className="text-[11px] text-muted italic">no matches</p>
+          )}
+        </div>
+      )}
 
       {/* Breadcrumb navigation */}
       <div className="glass-card px-4 py-3 mb-4 flex items-center gap-1 overflow-x-auto">
@@ -385,31 +518,62 @@ export default function FilesPage() {
                 <span className="text-xs text-muted font-mono">Loading file content...</span>
               </div>
             )}
-            {fileContent != null && (
+            {fileContent != null && viewMode === "preview" && (
               <div className="flex-1 min-h-0 overflow-hidden rounded-lg border border-white/[0.06] bg-black/30">
                 <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/[0.06] bg-white/[0.02]">
-                  <span className="text-[10px] text-muted uppercase tracking-wider font-medium">Content</span>
-                  <span className="text-[10px] text-muted font-mono">
-                    {fileContent.split("\n").length} lines
-                  </span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] text-muted uppercase tracking-wider font-medium">Content</span>
+                    <span className="text-[10px] text-muted font-mono">{fileContent.split("\n").length} lines</span>
+                  </div>
+                  <button
+                    onClick={enterTail}
+                    className="text-[10px] text-amber/80 hover:text-amber font-mono uppercase tracking-wider"
+                  >
+                    tail -f
+                  </button>
                 </div>
                 <pre className="overflow-auto p-4 text-xs font-mono text-foreground/80 leading-relaxed max-h-[50vh] whitespace-pre-wrap break-words">
                   {fileContent}
                 </pre>
               </div>
             )}
+            {viewMode === "tail" && (
+              <div className="flex-1 min-h-0 overflow-hidden rounded-lg border border-amber/20 bg-black/40">
+                <div className="flex items-center justify-between px-3 py-1.5 border-b border-amber/10 bg-amber/5">
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] text-amber uppercase tracking-wider font-medium">Tail</span>
+                    <span className="text-[10px] text-muted font-mono">{tailLines.length} lines</span>
+                    {tailLive && <span className="text-[10px] text-emerald font-mono">live</span>}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() => setTailLive((v) => !v)}
+                      className="text-[10px] font-mono uppercase tracking-wider"
+                      style={{ color: tailLive ? "var(--emerald)" : "var(--muted)" }}
+                    >
+                      {tailLive ? "stop watch" : "start watch"}
+                    </button>
+                    <button
+                      onClick={() => { setViewMode("preview"); setTailLive(false); }}
+                      className="text-[10px] text-frost/80 hover:text-frost font-mono uppercase tracking-wider"
+                    >
+                      preview
+                    </button>
+                  </div>
+                </div>
+                <pre className="overflow-auto p-4 text-xs font-mono text-foreground/80 leading-relaxed max-h-[50vh] whitespace-pre-wrap break-words">
+                  {tailLines.join("\n")}
+                  <div ref={tailEndRef} />
+                </pre>
+              </div>
+            )}
 
             <div className="flex items-center gap-3 pt-2 border-t border-white/[0.06] shrink-0">
               <a
-                href={`/api/v2/fs/read?path=${encodeURIComponent(selectedFile.path)}`}
+                href={`/api/v2/fs/stream?path=${encodeURIComponent(selectedFile.path)}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="
-                  px-4 py-2 rounded-lg text-xs font-semibold
-                  bg-frost/10 text-frost border border-frost/20
-                  hover:bg-frost/20 hover:border-frost/40
-                  transition-all duration-150
-                "
+                className="px-4 py-2 rounded-lg text-xs font-semibold bg-frost/10 text-frost border border-frost/20 hover:bg-frost/20 hover:border-frost/40 transition-all"
               >
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="inline-block mr-1.5 -mt-0.5">
                   <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
@@ -418,9 +582,17 @@ export default function FilesPage() {
                 </svg>
                 Download
               </a>
+              {viewMode === "preview" && !selectedFile.is_dir && (
+                <button
+                  onClick={enterTail}
+                  className="px-4 py-2 rounded-lg text-xs font-semibold bg-amber/10 text-amber border border-amber/20 hover:bg-amber/20 hover:border-amber/40 transition-all"
+                >
+                  Tail
+                </button>
+              )}
               <button
-                onClick={() => { setSelectedFile(null); setFileContent(null); }}
-                className="px-4 py-2 rounded-lg text-xs font-medium text-muted hover:text-foreground transition-colors"
+                onClick={() => { setSelectedFile(null); setFileContent(null); setTailLive(false); }}
+                className="px-4 py-2 rounded-lg text-xs font-medium text-muted hover:text-foreground transition-colors ml-auto"
               >
                 Close
               </button>

@@ -5,14 +5,17 @@ Subcommands::
     ygg node start      Start node (background daemon, public by default)
     ygg node stop       Stop the running node
     ygg node serve      Start node + frontend (foreground)
+    ygg node back       Start backend only (Uvicorn API, foreground)
+    ygg node front      Start frontend only (Next.js dev server, foreground)
     ygg node status     Show running node status
     ygg node watch      Live TTY dashboard — auto-refreshing node stats
     ygg node logs       Tail the node log file (-f to follow)
     ygg node ps         List active runs
+    ygg node procs      Live per-run process metrics (CPU/RAM/duration)
+    ygg node mesh       Live cluster health: this node + every peer
     ygg node call       Run a function by name and print result
     ygg node health     Run health checks on the node
     ygg node create     Create a new named node
-    ygg node front      Start frontend only (Next.js dev server)
     ygg node install    Install node as boot service (systemd/launchd)
     ygg node uninstall  Remove boot service (--purge to delete data)
     ygg node run        Call a @remote function
@@ -80,6 +83,18 @@ def _build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--all", "-a", action="store_true", help="Show all runs, not just active.")
     ps.set_defaults(handler=_node_ps)
 
+    # procs — live per-run process metrics
+    procs = node_sub.add_parser("procs", help="Live per-run process metrics (CPU/RAM/duration).")
+    procs.add_argument("--interval", type=float, default=1.5, help="Refresh interval in seconds.")
+    procs.add_argument("--url", default=None, help="Node URL (default: local).")
+    procs.set_defaults(handler=_node_procs)
+
+    # mesh — live cluster health
+    mesh = node_sub.add_parser("mesh", help="Live cluster health: this node + every peer.")
+    mesh.add_argument("--interval", type=float, default=2.0, help="Refresh interval in seconds.")
+    mesh.add_argument("--url", default=None, help="Node URL (default: local).")
+    mesh.set_defaults(handler=_node_mesh)
+
     # call — run a function by name
     call = node_sub.add_parser("call", help="Run a function by name and print result.")
     call.add_argument("name", help="Function name.")
@@ -98,6 +113,14 @@ def _build_parser() -> argparse.ArgumentParser:
     create.add_argument("--start", action="store_true", default=False, help="Start the node after creation.")
     create.add_argument("--port", type=int, default=None, help="Bind port.")
     create.set_defaults(handler=_node_create)
+
+    # back
+    back = node_sub.add_parser("back", help="Start backend API only (foreground).")
+    back.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0).")
+    back.add_argument("--port", type=int, default=None, help="Bind port (default: 8100).")
+    back.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
+    back.add_argument("--name", default=None, help="Node ID override.")
+    back.set_defaults(handler=_node_back)
 
     # front
     front = node_sub.add_parser("front", help="Start frontend dev server only.")
@@ -167,7 +190,7 @@ def _ensure_node_running() -> str:
         return "http://127.0.0.1:8100"
 
 
-def _start_frontend(settings, *, node_port: int, front_port: int | None = None):
+def _start_frontend(settings, *, node_port: int, front_port: int | None = None, quiet: bool = True):
     import os
     import shutil
     import subprocess
@@ -204,8 +227,8 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None):
         [npm, "run", "dev", "--", "--hostname", "0.0.0.0", "--port", str(port)],
         cwd=str(front_home),
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL if quiet else None,
+        stderr=subprocess.DEVNULL if quiet else None,
     )
 
     from yggdrasil.cli.style import bold, cyan, out
@@ -370,6 +393,31 @@ def _node_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _node_back(args: argparse.Namespace) -> int:
+    from yggdrasil.cli.style import blue, cyan, dim, green, orange, out, print_logo
+    from yggdrasil.node.config import _find_open_port, get_settings
+    from yggdrasil.node.daemon import cleanup_old_logs, ensure_directories
+
+    _apply_node_env(args)
+    print_logo("YGGNODE")
+    settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
+    ensure_directories(settings)
+    cleanup_old_logs(settings)
+
+    port = args.port or _find_open_port(settings.port, settings.port + 100)
+    host = args.host or settings.host
+
+    out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
+    out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
+    out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
+    out(f"  {cyan('mode')}    {dim('backend only')}\n\n")
+
+    import uvicorn
+    uvicorn.run("yggdrasil.node.app:app", host=host, port=port, reload=args.reload)
+    return 0
+
+
 def _node_front(args: argparse.Namespace) -> int:
     import signal
     from yggdrasil.node.config import get_settings
@@ -379,7 +427,7 @@ def _node_front(args: argparse.Namespace) -> int:
     settings = get_settings()
 
     node_port = args.node_port or settings.port
-    proc = _start_frontend(settings, node_port=node_port, front_port=args.port)
+    proc = _start_frontend(settings, node_port=node_port, front_port=args.port, quiet=False)
     if proc is None:
         return 1
 
@@ -679,6 +727,141 @@ def _node_ps(args: argparse.Namespace) -> int:
         dur_str = f"{duration:.2f}s" if duration else "-"
         started = (r.get("started_at") or "")[:19]
         out(f"  {dim(rid)} {dim(fid)} {status_color(status.ljust(11))} {dim(dur_str.ljust(10))} {dim(started)}\n")
+    return 0
+
+
+def _node_procs(args: argparse.Namespace) -> int:
+    """Live TTY view of running PyFuncRuns with per-process CPU/RAM."""
+    import json
+    import time
+    import urllib.request
+    from yggdrasil.cli.style import bold, cyan, dim, green, magenta, orange, out, red, yellow, _CSI, _RESET
+
+    url = args.url or _ensure_node_running()
+    interval = args.interval
+
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None
+
+    sys.stdout.write("\033[?25l\033[2J\033[H")
+    try:
+        while True:
+            try:
+                with urllib.request.urlopen(f"{url}/api/v2/pyfuncrun?status=running,pending", timeout=3) as r:
+                    runs = json.loads(r.read()).get("runs", [])
+            except Exception as e:
+                runs = []
+                err = str(e)
+            else:
+                err = ""
+
+            sys.stdout.write("\033[H\033[J")
+            out(f"  {cyan('═' * 90)}\n")
+            out(f"  {bold('YGG PROCESSES')}  {dim('active and pending runs')}  {dim(f'every {interval}s')}\n")
+            out(f"  {cyan('═' * 90)}\n\n")
+
+            if err:
+                out(f"  {red('node unreachable:')} {err}\n")
+            elif not runs:
+                out(f"  {dim('no active runs')}\n")
+            else:
+                out(f"  {bold('PID'.ljust(8))} {bold('RUN'.ljust(20))} {bold('FUNC'.ljust(20))} ")
+                out(f"{bold('STATUS'.ljust(10))} {bold('CPU%'.rjust(7))} {bold('MEM(MB)'.rjust(10))} {bold('DUR(s)'.rjust(8))}\n")
+                out(f"  {dim('-' * 90)}\n")
+                for r in runs:
+                    rid = str(r.get("id", ""))[:18].ljust(20)
+                    fid = str(r.get("func_id", ""))[:18].ljust(20)
+                    status = r.get("status", "?")
+                    sc = green if status == "running" else yellow if status == "pending" else dim
+                    pid = r.get("pid")
+                    cpu_pct = "-"
+                    mem_mb = "-"
+                    if psutil is not None and pid:
+                        try:
+                            p = psutil.Process(int(pid))
+                            cpu_pct = f"{p.cpu_percent(interval=0.0):.1f}"
+                            mem_mb = f"{p.memory_info().rss / 1024 / 1024:.1f}"
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    duration = r.get("duration") or (
+                        (time.time() - time.mktime(time.strptime((r.get("started_at") or "")[:19], "%Y-%m-%dT%H:%M:%S")))
+                        if r.get("started_at") else None
+                    )
+                    dur_s = f"{duration:.1f}" if isinstance(duration, (int, float)) else "-"
+                    pid_s = str(pid) if pid else "-"
+                    out(f"  {dim(pid_s.ljust(8))} {cyan(rid)} {dim(fid)} {sc(status.ljust(10))} ")
+                    out(f"{cyan(cpu_pct.rjust(7))} {cyan(mem_mb.rjust(10))} {dim(dur_s.rjust(8))}\n")
+
+            out(f"\n  {dim('Ctrl+C to exit')}\n")
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        sys.stdout.write("\033[?25h\n")
+    return 0
+
+
+def _node_mesh(args: argparse.Namespace) -> int:
+    """Live cluster mesh view: self + every peer, side-by-side health."""
+    import json
+    import time
+    import urllib.request
+    from yggdrasil.cli.style import bold, cyan, dim, green, magenta, orange, out, red, yellow, _CSI, _RESET
+
+    url = args.url or _ensure_node_running()
+    interval = args.interval
+
+    sys.stdout.write("\033[?25l\033[2J\033[H")
+    try:
+        while True:
+            try:
+                with urllib.request.urlopen(f"{url}/api/v2/topology", timeout=3) as r:
+                    topo = json.loads(r.read())
+            except Exception as e:
+                topo, err = None, str(e)
+            else:
+                err = ""
+
+            sys.stdout.write("\033[H\033[J")
+            out(f"  {cyan('═' * 90)}\n")
+            out(f"  {bold('YGG MESH')}  {dim('cluster health')}  {dim(f'every {interval}s')}\n")
+            out(f"  {cyan('═' * 90)}\n\n")
+
+            if err or not topo:
+                out(f"  {red('node unreachable:')} {err or 'no topology'}\n")
+            else:
+                nodes = topo.get("nodes", [])
+                cpu_avg = topo.get("total_cpu_percent", 0)
+                out(f"  {dim('cluster')}  ")
+                out(f"{cyan('cpu_avg')} {bold(f'{cpu_avg:.1f}%')}  ")
+                out(f"{cyan('runs')} {bold(str(topo.get('total_active_runs', 0)))}  ")
+                out(f"{cyan('gpus')} {bold(str(topo.get('total_gpus', 0)))}  ")
+                out(f"{cyan('nodes')} {bold(str(len(nodes)))}\n\n")
+
+                hdr_fmt = "  {:<24} {:<8} {:<22} {:>7} {:>7} {:>7} {:>5}\n"
+                out(hdr_fmt.format("NODE", "ROLE", "ADDRESS", "CPU%", "MEM%", "RUNS", "GPUs"))
+                out(f"  {dim('-' * 88)}\n")
+                for n in nodes:
+                    cpu = n.get("cpu_percent", 0)
+                    mem = n.get("memory_percent", 0)
+                    cpu_c = red if cpu > 80 else yellow if cpu > 50 else green
+                    mem_c = red if mem > 80 else yellow if mem > 50 else green
+                    self_flag = "self" if n.get("self") else ""
+                    nid = (n.get("node_id") or "?")[:22].ljust(24)
+                    role = (str(n.get("role") or "?"))[:6].ljust(8)
+                    addr = f"{n.get('host', '?')}:{n.get('port', '?')}"[:20].ljust(22)
+                    cpu_s = cpu_c(f"{cpu:.1f}".rjust(7))
+                    mem_s = mem_c(f"{mem:.1f}".rjust(7))
+                    runs = str(n.get("active_runs", 0)).rjust(7)
+                    gpus = str(n.get("gpu_count", 0)).rjust(5)
+                    out(f"  {orange(nid) if n.get('self') else dim(nid)} {dim(role)} {dim(addr)} {cpu_s} {mem_s} {dim(runs)} {dim(gpus)}\n")
+
+            out(f"\n  {dim('Ctrl+C to exit')}\n")
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        sys.stdout.write("\033[?25h\n")
     return 0
 
 

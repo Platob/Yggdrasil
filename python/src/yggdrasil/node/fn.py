@@ -75,6 +75,7 @@ __all__ = [
     "function", "dag", "schedule", "on_node",
     "step", "pipeline", "cron", "auto_dispatch",
     "parallel", "cache", "deploy", "gpu", "retry",
+    "distribute",
     "FunctionHandle", "FunctionRun", "DagHandle",
     "get_input", "set_output",
 ]
@@ -130,6 +131,24 @@ def _get(url: str) -> dict:
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
+
+
+def _peers(timeout: float = 2.0) -> list[dict]:
+    """Fetch the live peer list from the local node. Empty on failure.
+
+    Used by @auto_dispatch, @parallel, @gpu, @distribute to find dispatch
+    targets. Inlined as a single shared call because every dispatch
+    decorator did exactly this dance.
+    """
+    try:
+        resp = urllib.request.urlopen(f"{_local_url()}/api/v2/network/peers", timeout=timeout)
+        return json.loads(resp.read()).get("peers", [])
+    except Exception:
+        return []
+
+
+def _peer_url(peer: dict) -> str:
+    return f"http://{peer['host']}:{peer['port']}"
 
 
 # ---------------------------------------------------------------------------
@@ -998,19 +1017,13 @@ def auto_dispatch(handle):
     original_call = handle.__call__
 
     def smart_call(*args, **kwargs):
-        # Query local /api/v2/stats to check load
         try:
-            url = _local_url()
-            resp = urllib.request.urlopen(f"{url}/api/v2/stats", timeout=2)
-            stats = json.loads(resp.read())
-            # If overloaded, query peers
-            if stats.get("active_runs", 0) >= stats.get("cpu_count", 4) and stats.get("peer_count", 0) > 0:
-                peers_resp = urllib.request.urlopen(f"{url}/api/v2/network/peers", timeout=2)
-                peers = json.loads(peers_resp.read()).get("peers", [])
+            stats = json.loads(urllib.request.urlopen(f"{_local_url()}/api/v2/stats", timeout=2).read())
+            if stats.get("active_runs", 0) >= stats.get("cpu_count", 4):
+                peers = _peers()
                 if peers:
                     best = min(peers, key=lambda p: (p.get("active_runs", 0), p.get("cpu_percent", 0)))
-                    peer_url = f"http://{best['host']}:{best['port']}"
-                    return handle.on(peer_url).__call__(*args, **kwargs)
+                    return handle.on(_peer_url(best)).__call__(*args, **kwargs)
         except Exception:
             pass
         return original_call(*args, **kwargs)
@@ -1038,28 +1051,17 @@ def parallel(func=None, *, max_workers: int | None = None):
         original_call = handle.__call__
 
         def parallel_call(*args, **kwargs):
-            # If single arg is a list, dispatch each element
-            if len(args) == 1 and isinstance(args[0], list):
-                items = args[0]
-                runs = []
-                # Get peer list once
-                try:
-                    url = _local_url()
-                    peers_resp = urllib.request.urlopen(f"{url}/api/v2/network/peers", timeout=2)
-                    peers = json.loads(peers_resp.read()).get("peers", [])
-                except Exception:
-                    peers = []
-
-                for i, item in enumerate(items):
-                    if peers and (i < max_workers if max_workers else len(items)):
-                        # Round-robin dispatch to peers
-                        peer = peers[i % len(peers)]
-                        peer_url = f"http://{peer['host']}:{peer['port']}"
-                        runs.append(handle.on(peer_url).__call__(item, **kwargs))
-                    else:
-                        runs.append(original_call(item, **kwargs))
-                return runs
-            return original_call(*args, **kwargs)
+            if len(args) != 1 or not isinstance(args[0], list):
+                return original_call(*args, **kwargs)
+            items = args[0]
+            peers = _peers()
+            runs = []
+            for i, item in enumerate(items):
+                if peers and (max_workers is None or i < max_workers):
+                    runs.append(handle.on(_peer_url(peers[i % len(peers)]))(item, **kwargs))
+                else:
+                    runs.append(original_call(item, **kwargs))
+            return runs
 
         handle.__call__ = parallel_call
         return handle
@@ -1103,33 +1105,72 @@ def cache(handle=None, *, ttl_seconds: float = 300.0):
 
 
 def deploy(func=None, *, on: list[str] | None = None):
-    """Deploy a function to multiple nodes at once.
+    """Register a function on multiple nodes. ``on=None`` auto-targets all peers.
+
+    Returns the handle unchanged — call it normally to run on the local node,
+    or use ``.on(url)`` to target one of the deployed copies.
 
     Usage::
 
         @deploy(on=["http://worker-1:8100", "http://worker-2:8100"])
         @function
         def process(data): ...
+
+        @deploy   # auto-replicate to every healthy peer
+        @function
+        def heartbeat(): ...
     """
     def _wrap(handle):
         if not isinstance(handle, FunctionHandle):
             raise TypeError("@deploy must wrap a @function-decorated function")
-        if not on:
-            return handle
-        # Register the function on every target node
+        targets = on if on is not None else [_peer_url(p) for p in _peers()]
         data: dict[str, Any] = {
             "name": handle.name,
             "code": handle.code,
-            "language": "python",
             "description": handle.description,
             "python_version": handle.python_version,
             "dependencies": handle.dependencies,
         }
-        for url in on:
+        for url in targets:
             try:
                 _post(f"{url.rstrip('/')}/api/v2/pyfunc", data)
             except Exception as exc:
                 LOGGER.warning("Failed to deploy %s to %s: %s", handle.name, url, exc)
+        return handle
+    if func is not None:
+        return _wrap(func)
+    return _wrap
+
+
+def distribute(func=None, *, min_peers: int = 0):
+    """Fan a single call out to every healthy peer; returns a list of FunctionRuns.
+
+    Each peer gets the same args/kwargs; results aggregate with
+    ``[r.wait() for r in runs]``. Local execution is included when no peers
+    exist (or peer count < ``min_peers``).
+
+    Usage::
+
+        @distribute
+        @function
+        def benchmark(): ...
+
+        runs = benchmark()
+        scores = [r.wait() for r in runs]
+    """
+    def _wrap(handle):
+        if not isinstance(handle, FunctionHandle):
+            raise TypeError("@distribute must wrap a @function-decorated function")
+        original_call = handle.__call__
+        def fanout(*args, **kwargs):
+            peers = _peers()
+            if len(peers) < min_peers:
+                return [original_call(*args, **kwargs)]
+            runs = [handle.on(_peer_url(p))(*args, **kwargs) for p in peers]
+            if not runs:
+                runs = [original_call(*args, **kwargs)]
+            return runs
+        handle.__call__ = fanout
         return handle
     if func is not None:
         return _wrap(func)
@@ -1150,16 +1191,10 @@ def gpu(handle=None, *, min_gpus: int = 1):
             raise TypeError("@gpu must wrap a @function-decorated function")
         original_call = h.__call__
         def gpu_call(*args, **kwargs):
-            try:
-                url = _local_url()
-                peers_resp = urllib.request.urlopen(f"{url}/api/v2/network/peers", timeout=2)
-                peers = json.loads(peers_resp.read()).get("peers", [])
-                gpu_peers = [p for p in peers if p.get("gpu_count", 0) >= min_gpus]
-                if gpu_peers:
-                    best = min(gpu_peers, key=lambda p: (p.get("active_runs", 0), p.get("cpu_percent", 0)))
-                    return h.on(f"http://{best['host']}:{best['port']}").__call__(*args, **kwargs)
-            except Exception:
-                pass
+            gpu_peers = [p for p in _peers() if p.get("gpu_count", 0) >= min_gpus]
+            if gpu_peers:
+                best = min(gpu_peers, key=lambda p: (p.get("active_runs", 0), p.get("cpu_percent", 0)))
+                return h.on(_peer_url(best))(*args, **kwargs)
             return original_call(*args, **kwargs)
         h.__call__ = gpu_call
         return h

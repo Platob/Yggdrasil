@@ -27,12 +27,14 @@ Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 3. **Multi-Python via uv** — `PyEnv` specifies `python_version` (3.11, 3.12, 3.13). `uv venv --python X.Y` creates isolated envs. Code is replicable across nodes with different system Pythons because uv downloads the right interpreter.
 4. **Dependency inference** — `@function` decorator infers dependencies from AST import analysis. Explicitly listed deps override inference. Dependencies are part of the content hash.
 
-## Permissions
+## Permissions & Security Posture
 
 1. **User identity** — every request carries a user identity (sha256 hash of key+hostname). `UserService` auto-registers the local user and discovers peers.
 2. **Open by default** — all operations are allowed for all users. Permission checks are a middleware concern, not service logic. The `user_hash` is logged on every mutation for audit trail, but never blocks.
 3. **Audit log** — mutations (create, update, delete, replicate) log `(timestamp, user_hash, operation, asset_hash)`. Read-only operations are not logged.
-4. **Node acts as user** — the node operates with the current user's full permissions. It can read/write files, install packages, run arbitrary code. No sandboxing — the node IS the user's workstation.
+4. **Node acts as user** — the node operates with the current user's full permissions. It can read/write files, install packages (`uv pip`, `npm install`), spawn subprocesses, execute arbitrary Python received over HTTP. There is no sandboxing, no syscall jail, no capability filter — the node IS the user's workstation, exposed as an HTTP API.
+5. **Intentional, not accidental** — POC mode prioritizes velocity and ergonomics over isolation. Running the node bound to a public interface on a hostile network is unsupported. For multi-tenant isolation, run one node per tenant in a VM or container and federate them via the v2 network mesh.
+6. **Secrets handling** — environment-variable secrets live in `~/.node/.env` (gitignored). The node never persists API keys to its asset store; replicated PyFuncs carry code only, not the env they execute in.
 
 ## Auto-configuration
 
@@ -73,9 +75,9 @@ python/src/yggdrasil/
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
   databricks/           Databricks SDK integrations
-src/                    Frontend (React 19, Next.js 16, Tailwind v4)
-  app/                  Next.js app router pages
-  components/           Shared React components (globe, sidebar, logo)
+nextjs/                 Frontend (React 19, Next.js 15, Tailwind v4)
+  src/app/              Next.js app router pages
+  src/components/       Shared React components (globe, brain mesh, sidebar)
 ```
 
 ## Node API
@@ -129,10 +131,14 @@ Core concepts — workstation as remote executor/driver:
 | Route | Description |
 |-------|-------------|
 | `/` | 3D globe welcome with node card |
-| `/nodes` | Cluster dashboard — KPI aggregation + node grid + functions/envs sidebar |
+| `/dashboard` | Cluster dashboard — Quick Actions, function/DAG mgmt |
+| `/nodes` | Cluster overview — KPI aggregation + node grid + sidebar |
 | `/nodes/[id]` | Per-node detail — resources, assets, replicated items |
+| `/dags` | DAG builder — chain functions across nodes |
 | `/chat` | Real-time messenger — channels, messages, SSE live updates |
 | `/files` | Filesystem browser — lazy directory listing, file preview |
+| `/metrics` | Per-function metrics + recent runs |
+| `/topology` | Neural Mesh — layered brain network visualization |
 
 ## Python Decorator Framework
 

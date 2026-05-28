@@ -56,7 +56,7 @@ def _find_open_port(start: int = 8100, end: int = 8200) -> int:
 
 
 def _default_front_home() -> Path:
-    return Path(__file__).resolve().parents[4]
+    return Path(__file__).resolve().parents[4] / "nextjs"
 
 
 @dataclass(frozen=True, slots=True)
