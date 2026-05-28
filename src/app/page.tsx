@@ -1,39 +1,23 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { WorldGlobe, type BotNode, type ArcDef } from "@/components/world-globe";
+import { bot, type TopologyResponse, type TopologyNode } from "@/lib/api";
 
-// ─── Data ────────────────────────────────────────────────────────────────────
-
-const BOT_NODES: BotNode[] = [
-  { id: "paris-01",     label: "Paris",         lat: 48.8566,  lng: 2.3522,    status: "online",  version: "0.1.0", uptime: 86400 },
-  { id: "nyc-01",       label: "New York",      lat: 40.7128,  lng: -74.006,   status: "online",  version: "0.1.0", uptime: 72000 },
-  { id: "sf-01",        label: "San Francisco", lat: 37.7749,  lng: -122.4194, status: "online",  version: "0.1.0", uptime: 43200 },
-  { id: "tokyo-01",     label: "Tokyo",         lat: 35.6762,  lng: 139.6503,  status: "online",  version: "0.1.0", uptime: 36000 },
-  { id: "sydney-01",    label: "Sydney",        lat: -33.8688, lng: 151.2093,  status: "pending", version: "0.1.0", uptime: 18000 },
-  { id: "london-01",    label: "London",        lat: 51.5074,  lng: -0.1278,   status: "online",  version: "0.1.0", uptime: 54000 },
-  { id: "singapore-01", label: "Singapore",     lat: 1.3521,   lng: 103.8198,  status: "online",  version: "0.1.0", uptime: 28800 },
-  { id: "brazil-01",    label: "São Paulo",     lat: -23.5505, lng: -46.6333,  status: "online",  version: "0.1.0", uptime: 21600 },
-  { id: "dubai-01",     label: "Dubai",         lat: 25.2048,  lng: 55.2708,   status: "online",  version: "0.1.0", uptime: 14400 },
-  { id: "mumbai-01",    label: "Mumbai",        lat: 19.076,   lng: 72.8777,   status: "online",  version: "0.1.0", uptime: 32400 },
-  { id: "berlin-01",    label: "Berlin",        lat: 52.52,    lng: 13.405,    status: "online",  version: "0.1.0", uptime: 64800 },
-  { id: "toronto-01",   label: "Toronto",       lat: 43.6532,  lng: -79.3832,  status: "offline", version: "0.0.9", uptime: 0 },
+// ─── Demo fallback (only used when the backend is unreachable) ───────────────
+// Kept small and explicitly labelled — never blended with real data.
+const DEMO_FALLBACK_NODES: BotNode[] = [
+  { id: "demo-paris",  label: "Paris (demo)",  lat: 48.8566, lng: 2.3522,    status: "pending", version: "demo", uptime: 0 },
+  { id: "demo-nyc",    label: "NYC (demo)",    lat: 40.7128, lng: -74.006,   status: "pending", version: "demo", uptime: 0 },
+  { id: "demo-tokyo",  label: "Tokyo (demo)",  lat: 35.6762, lng: 139.6503,  status: "pending", version: "demo", uptime: 0 },
+  { id: "demo-sydney", label: "Sydney (demo)", lat: -33.8688, lng: 151.2093, status: "pending", version: "demo", uptime: 0 },
 ];
 
-const ARCS: ArcDef[] = [
-  { fromId: "paris-01",     toId: "nyc-01"       },
-  { fromId: "nyc-01",       toId: "sf-01"        },
-  { fromId: "sf-01",        toId: "tokyo-01"     },
-  { fromId: "tokyo-01",     toId: "singapore-01" },
-  { fromId: "singapore-01", toId: "sydney-01"    },
-  { fromId: "london-01",    toId: "dubai-01"     },
-  { fromId: "dubai-01",     toId: "mumbai-01"    },
-  { fromId: "paris-01",     toId: "london-01"    },
-  { fromId: "berlin-01",    toId: "paris-01"     },
-  { fromId: "brazil-01",    toId: "nyc-01"       },
-  { fromId: "tokyo-01",     toId: "sydney-01"    },
-  { fromId: "singapore-01", toId: "mumbai-01"    },
+const DEMO_FALLBACK_ARCS: ArcDef[] = [
+  { fromId: "demo-paris", toId: "demo-nyc" },
+  { fromId: "demo-nyc",   toId: "demo-tokyo" },
+  { fromId: "demo-tokyo", toId: "demo-sydney" },
 ];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -45,6 +29,36 @@ function formatUptime(s: number) {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
+// Stable hash → lat/lng on a small ring when the node has no geo yet.
+// Keeps the globe usable even before IP geolocation resolves.
+function hashRingCoords(nodeId: string, index: number): { lat: number; lng: number } {
+  let h = 0;
+  for (let i = 0; i < nodeId.length; i++) h = (h * 31 + nodeId.charCodeAt(i)) | 0;
+  const angle = ((Math.abs(h) % 360) + index * 47) % 360;
+  const lat = (((Math.abs(h) >> 8) % 60) - 30) * 0.5;
+  const lng = angle - 180;
+  return { lat, lng };
+}
+
+function topologyToBotNode(n: TopologyNode, idx: number): BotNode {
+  const hasGeo = typeof n.lat === "number" && typeof n.lon === "number";
+  const coords = hasGeo
+    ? { lat: n.lat as number, lng: n.lon as number }
+    : hashRingCoords(n.node_id, idx);
+  // Topology never returns "offline" peers (the network service expires them).
+  // Pending = registered but idle (no active runs); online = doing work.
+  const status: BotNode["status"] = n.active_runs > 0 ? "online" : "pending";
+  return {
+    id: n.node_id,
+    label: n.self ? `${n.node_id} (this node)` : n.node_id,
+    lat: coords.lat,
+    lng: coords.lng,
+    status,
+    version: n.role,
+    uptime: Math.round(n.cpu_percent),
+  };
+}
+
 const STATUS_COLOR: Record<BotNode["status"], string> = {
   online: "#4ade80",
   pending: "#fbbf24",
@@ -53,8 +67,37 @@ const STATUS_COLOR: Record<BotNode["status"], string> = {
 
 // ─── Node Detail Panel ────────────────────────────────────────────────────────
 
-function NodePanel({ node, onClose }: { node: BotNode; onClose: () => void }) {
+function NodePanel({
+  node,
+  topo,
+  onClose,
+}: {
+  node: BotNode;
+  topo: TopologyNode | null;
+  onClose: () => void;
+}) {
   const col = STATUS_COLOR[node.status];
+  const rows: [string, string][] = topo
+    ? [
+        ["Node ID", topo.node_id],
+        ["Role", topo.role],
+        ["Host", `${topo.host}:${topo.port}`],
+        ["CPU", `${topo.cpu_percent.toFixed(1)}%`],
+        ["Memory", `${topo.memory_percent.toFixed(1)}%`],
+        ["Active runs", String(topo.active_runs)],
+        ["GPUs", String(topo.gpu_count)],
+        ["Latitude", node.lat.toFixed(4)],
+        ["Longitude", node.lng.toFixed(4)],
+      ]
+    : [
+        ["Node ID", node.id],
+        ["Status", node.status],
+        ["Version", node.version ?? "-"],
+        ["Uptime", formatUptime(node.uptime ?? 0)],
+        ["Latitude", node.lat.toFixed(4)],
+        ["Longitude", node.lng.toFixed(4)],
+      ];
+
   return (
     <div
       className="pointer-events-auto w-full rounded-xl p-4 backdrop-blur-md"
@@ -66,7 +109,7 @@ function NodePanel({ node, onClose }: { node: BotNode; onClose: () => void }) {
             className="w-2.5 h-2.5 rounded-full flex-shrink-0"
             style={{ background: col, boxShadow: `0 0 6px ${col}` }}
           />
-          <span className="font-semibold text-white text-sm">{node.label}</span>
+          <span className="font-semibold text-white text-sm truncate">{node.label}</span>
         </div>
         <button
           onClick={onClose}
@@ -78,22 +121,10 @@ function NodePanel({ node, onClose }: { node: BotNode; onClose: () => void }) {
         </button>
       </div>
       <div className="grid grid-cols-2 gap-y-2.5 gap-x-4 text-xs">
-        {([
-          ["Node ID",   node.id],
-          ["Status",    node.status],
-          ["Version",   node.version ?? "—"],
-          ["Uptime",    formatUptime(node.uptime ?? 0)],
-          ["Latitude",  node.lat.toFixed(4)],
-          ["Longitude", node.lng.toFixed(4)],
-        ] as [string, string][]).map(([k, v]) => (
+        {rows.map(([k, v]) => (
           <div key={k}>
             <div className="text-white/30 mb-0.5">{k}</div>
-            <div
-              className="font-mono text-white/80 truncate capitalize"
-              style={k === "Status" ? { color: col } : {}}
-            >
-              {v}
-            </div>
+            <div className="font-mono text-white/80 truncate">{v}</div>
           </div>
         ))}
       </div>
@@ -107,10 +138,14 @@ function StatsStrip({
   nodes,
   collapsed,
   onToggle,
+  demoMode,
+  loading,
 }: {
   nodes: BotNode[];
   collapsed: boolean;
   onToggle: () => void;
+  demoMode: boolean;
+  loading: boolean;
 }) {
   const online  = nodes.filter((n) => n.status === "online").length;
   const pending = nodes.filter((n) => n.status === "pending").length;
@@ -127,8 +162,13 @@ function StatsStrip({
         className="w-full flex items-center justify-between px-4 py-2.5 md:hidden"
       >
         <div className="flex items-center gap-2">
-          <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-          <span className="text-xs text-white/50 font-mono">{online}/{nodes.length} online</span>
+          <span
+            className="w-1.5 h-1.5 rounded-full"
+            style={{ background: demoMode ? "#fbbf24" : "#4ade80" }}
+          />
+          <span className="text-xs text-white/50 font-mono">
+            {loading ? "loading..." : `${online}/${nodes.length} active`}
+          </span>
         </div>
         <svg
           width="12" height="12" viewBox="0 0 24 24" fill="none"
@@ -139,11 +179,19 @@ function StatsStrip({
         </svg>
       </button>
 
-      {/* Stats row — always on md+, collapsible on mobile */}
+      {/* Stats row */}
       <div className={`px-4 pb-3 gap-5 ${collapsed ? "hidden md:flex" : "flex"} flex-wrap items-center pt-1 md:pt-3`}>
+        {demoMode && (
+          <span
+            className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider"
+            style={{ background: "rgba(251,191,36,0.15)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.4)" }}
+          >
+            DEMO · Backend offline
+          </span>
+        )}
         {([
-          ["online",  online,  "#4ade80"],
-          ["pending", pending, "#fbbf24"],
+          ["active",  online,  "#4ade80"],
+          ["idle",    pending, "#fbbf24"],
           ["offline", offline, "#ef4444"],
         ] as const).map(([label, count, color]) => (
           <div key={label} className="flex items-center gap-1.5">
@@ -185,36 +233,80 @@ function LogoMark() {
 // ─── Welcome Page ────────────────────────────────────────────────────────────
 
 export default function WelcomePage() {
+  const [topology, setTopology] = useState<TopologyResponse | null>(null);
+  const [demoMode, setDemoMode] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [statsCollapsed, setStatsCollapsed] = useState(true);
 
-  const selectedNode = BOT_NODES.find((n) => n.id === selectedId) ?? null;
+  // Fetch topology once on mount, then refresh every 10s.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    async function load() {
+      try {
+        const t = await bot.getTopology();
+        if (cancelled) return;
+        setTopology(t);
+        setDemoMode(false);
+        setLoading(false);
+      } catch {
+        if (cancelled) return;
+        setDemoMode(true);
+        setTopology(null);
+        setLoading(false);
+      }
+      if (!cancelled) timer = setTimeout(load, 10_000);
+    }
+    load();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  // Map topology → globe data. In demo mode use the small fallback set.
+  const { nodes, arcs } = useMemo(() => {
+    if (demoMode || !topology) {
+      return { nodes: DEMO_FALLBACK_NODES, arcs: DEMO_FALLBACK_ARCS };
+    }
+    const nodesMapped: BotNode[] = topology.nodes.map(topologyToBotNode);
+    // Arcs = self → each peer
+    const self = topology.nodes.find((n) => n.self);
+    const peers = topology.nodes.filter((n) => !n.self);
+    const arcsMapped: ArcDef[] = self
+      ? peers.map((p) => ({ fromId: self.node_id, toId: p.node_id }))
+      : [];
+    return { nodes: nodesMapped, arcs: arcsMapped };
+  }, [topology, demoMode]);
+
+  const selectedNode = nodes.find((n) => n.id === selectedId) ?? null;
+  const selectedTopo = topology?.nodes.find((n) => n.node_id === selectedId) ?? null;
+  const hasPeers = (topology?.nodes.length ?? 0) > 1;
 
   function handleSelect(id: string) {
     setSelectedId((prev) => (prev === id ? null : id));
-    // On mobile, collapse the stats drawer when a node is selected
     setStatsCollapsed(true);
   }
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#030306] font-sans">
 
-      {/* Full-bleed globe */}
       <WorldGlobe
-        nodes={BOT_NODES}
-        arcs={ARCS}
+        nodes={nodes}
+        arcs={arcs}
         selectedId={selectedId}
         onSelect={handleSelect}
         className="absolute inset-0 w-full h-full"
       />
 
-      {/* Soft vignette at top so nav reads */}
       <div
         className="absolute inset-x-0 top-0 h-28 pointer-events-none"
         style={{ background: "linear-gradient(to bottom, rgba(3,3,6,0.7) 0%, transparent 100%)" }}
       />
 
-      {/* ── Nav bar ─────────────────────────────────────────── */}
       <nav className="absolute inset-x-0 top-0 flex items-center justify-between px-4 md:px-6 py-3 z-10">
         <div className="flex items-center gap-2">
           <LogoMark />
@@ -224,11 +316,16 @@ export default function WelcomePage() {
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Tiny node counter — desktop only */}
           <div className="hidden md:flex items-center gap-1.5 mr-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{
+                background: demoMode ? "#fbbf24" : "#4ade80",
+                animation: demoMode ? "none" : "pulse 2s infinite",
+              }}
+            />
             <span className="text-[11px] text-white/40 font-mono">
-              {BOT_NODES.filter((n) => n.status === "online").length} online
+              {demoMode ? "demo" : `${nodes.length} node${nodes.length === 1 ? "" : "s"}`}
             </span>
           </div>
           <Link
@@ -241,28 +338,33 @@ export default function WelcomePage() {
         </div>
       </nav>
 
-      {/* ── Overlays: node panel + stats — pointer-events handled per-child ── */}
       <div className="absolute inset-0 z-10 pointer-events-none flex flex-col justify-between px-3 md:px-5 pb-4 pt-16 md:pt-5">
 
-        {/* Node detail panel — top-right on md, top on mobile */}
         <div className="flex justify-end md:mt-0">
           {selectedNode && (
             <div className="pointer-events-auto w-full max-w-[17rem]">
-              <NodePanel node={selectedNode} onClose={() => setSelectedId(null)} />
+              <NodePanel node={selectedNode} topo={selectedTopo} onClose={() => setSelectedId(null)} />
             </div>
           )}
         </div>
 
-        {/* Stats strip — bottom */}
         <StatsStrip
-          nodes={BOT_NODES}
+          nodes={nodes}
           collapsed={statsCollapsed}
           onToggle={() => setStatsCollapsed((c) => !c)}
+          demoMode={demoMode}
+          loading={loading}
         />
       </div>
 
-      {/* Hint text — only when nothing selected, fades at bottom-center */}
-      {!selectedNode && (
+      {/* Empty state — backend reachable but no peers registered yet */}
+      {!demoMode && !loading && !hasPeers && (
+        <p className="absolute bottom-20 md:bottom-5 left-1/2 -translate-x-1/2 text-[11px] text-white/30 pointer-events-none whitespace-nowrap z-10">
+          This node has no peers yet. Run another node and POST /api/hello.
+        </p>
+      )}
+
+      {!selectedNode && hasPeers && (
         <p className="absolute bottom-20 md:bottom-5 left-1/2 -translate-x-1/2 text-[10px] text-white/20 pointer-events-none whitespace-nowrap z-10 hidden md:block">
           Drag to rotate · Scroll to zoom · Click a node
         </p>

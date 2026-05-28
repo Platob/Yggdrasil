@@ -1,7 +1,12 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
-import { bot, type NodeInfo } from "@/lib/api";
+import { useEffect, useState, useRef } from "react";
+import {
+  bot,
+  type NodeInfo,
+  type NodeBackend,
+  type MetricsRecentRun,
+} from "@/lib/api";
 import { YggdrasilLogo } from "@/components/logo";
 
 // ── Types ────────────────────────────────────────────────────
@@ -16,41 +21,26 @@ interface SystemMetrics {
   gpuName: string;
 }
 
-interface ProcessInfo {
-  pid: number;
-  name: string;
-  cpu: number;
-  ram: number;
-  status: string;
-}
+const HISTORY_SIZE = 60;
 
-// ── Mock data generators (replace with real API calls) ───────
-function generateMockMetrics(): SystemMetrics {
+function snapshotToMetrics(snap: NodeBackend): SystemMetrics {
+  const ram = snap.memory_total_mb > 0
+    ? (snap.memory_used_mb / snap.memory_total_mb) * 100
+    : 0;
+  const gpu = snap.gpus[0];
   return {
-    cpu: Math.random() * 60 + 10,
-    ram: Math.random() * 40 + 30,
-    ramUsed: 8 + Math.random() * 6,
-    ramTotal: 32,
-    gpu: Math.random() * 50 + 5,
-    gpuMemUsed: 2 + Math.random() * 4,
-    gpuMemTotal: 12,
-    gpuName: "NVIDIA RTX 4090",
+    cpu: snap.cpu_percent,
+    ram,
+    ramUsed: snap.memory_used_mb / 1024,
+    ramTotal: snap.memory_total_mb / 1024,
+    gpu: gpu ? gpu.utilization_percent : 0,
+    gpuMemUsed: gpu ? gpu.memory_used_mb / 1024 : 0,
+    gpuMemTotal: gpu ? gpu.memory_total_mb / 1024 : 0,
+    gpuName: gpu ? gpu.name : "No GPU detected",
   };
 }
 
-function generateMockProcesses(): ProcessInfo[] {
-  const names = ["python", "yggdrasil", "node", "chromium", "nvdriver", "postgres"];
-  return names.map((name, i) => ({
-    pid: 1000 + i * 123,
-    name,
-    cpu: Math.random() * 25,
-    ram: Math.random() * 500 + 50,
-    status: Math.random() > 0.1 ? "running" : "sleeping",
-  })).sort((a, b) => b.cpu - a.cpu);
-}
-
 // ── Time Plot Component ──────────────────────────────────────
-const HISTORY_SIZE = 60; // 60 data points
 
 function TimePlot({
   data,
@@ -89,10 +79,8 @@ function TimePlot({
     const plotW = w - padding.left - padding.right;
     const plotH = h - padding.top - padding.bottom;
 
-    // Clear
     ctx.clearRect(0, 0, w, h);
 
-    // Grid lines
     ctx.strokeStyle = "rgba(255,255,255,0.05)";
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
@@ -103,12 +91,10 @@ function TimePlot({
       ctx.stroke();
     }
 
-    // Fill gradient
     const gradient = ctx.createLinearGradient(0, padding.top, 0, h - padding.bottom);
     gradient.addColorStop(0, color + "40");
     gradient.addColorStop(1, color + "00");
 
-    // Draw filled area
     ctx.beginPath();
     ctx.moveTo(padding.left, h - padding.bottom);
     data.forEach((val, i) => {
@@ -122,7 +108,6 @@ function TimePlot({
     ctx.fillStyle = gradient;
     ctx.fill();
 
-    // Draw line
     ctx.beginPath();
     data.forEach((val, i) => {
       const x = padding.left + (i / (HISTORY_SIZE - 1)) * plotW;
@@ -136,7 +121,6 @@ function TimePlot({
     ctx.lineJoin = "round";
     ctx.stroke();
 
-    // Current value dot
     if (data.length > 0) {
       const lastVal = data[data.length - 1];
       const x = padding.left + plotW;
@@ -171,29 +155,51 @@ function TimePlot({
   );
 }
 
-// ── Process List Component ───────────────────────────────────
-function ProcessList({ processes }: { processes: ProcessInfo[] }) {
+// ── Recent Runs (replaces fake process list) ─────────────────
+
+function statusColor(status: string): string {
+  if (status === "succeeded" || status === "completed") return "var(--success)";
+  if (status === "failed" || status === "error") return "var(--destructive)";
+  if (status === "running" || status === "pending") return "var(--warning)";
+  return "var(--muted)";
+}
+
+function RecentRunsList({ runs }: { runs: MetricsRecentRun[] }) {
   return (
     <div className="nordic-card p-4">
-      <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">Active Processes</h3>
+      <h3 className="text-xs font-medium text-muted uppercase tracking-wider mb-3">
+        Recent Runs <span className="text-muted/60">({runs.length})</span>
+      </h3>
       <div className="space-y-1">
-        <div className="grid grid-cols-[1fr_60px_80px_70px] gap-2 text-[10px] text-muted uppercase tracking-wider pb-2 border-b border-border">
-          <span>Name</span>
-          <span className="text-right">PID</span>
-          <span className="text-right">CPU %</span>
-          <span className="text-right">RAM MB</span>
+        <div className="grid grid-cols-[80px_1fr_80px_80px] gap-2 text-[10px] text-muted uppercase tracking-wider pb-2 border-b border-border">
+          <span>Run</span>
+          <span>Func</span>
+          <span className="text-right">Status</span>
+          <span className="text-right">Duration</span>
         </div>
         <div className="max-h-[200px] overflow-y-auto space-y-0.5">
-          {processes.map((p) => (
-            <div key={p.pid} className="grid grid-cols-[1fr_60px_80px_70px] gap-2 py-1.5 text-sm hover:bg-card-hover rounded transition-colors">
-              <span className="font-mono text-foreground truncate">{p.name}</span>
-              <span className="font-mono text-muted text-right">{p.pid}</span>
-              <span className="font-mono text-right" style={{ color: p.cpu > 50 ? "var(--destructive)" : p.cpu > 20 ? "var(--warning)" : "var(--success)" }}>
-                {p.cpu.toFixed(1)}%
-              </span>
-              <span className="font-mono text-muted text-right">{p.ram.toFixed(0)}</span>
-            </div>
-          ))}
+          {runs.length === 0 ? (
+            <div className="py-6 text-center text-xs text-muted">No recent runs.</div>
+          ) : (
+            runs.map((r) => (
+              <div
+                key={r.id}
+                className="grid grid-cols-[80px_1fr_80px_80px] gap-2 py-1.5 text-sm hover:bg-card-hover rounded transition-colors"
+              >
+                <span className="font-mono text-muted truncate">#{r.id}</span>
+                <span className="font-mono text-foreground truncate">fn#{r.func_id}</span>
+                <span
+                  className="font-mono text-right text-xs"
+                  style={{ color: statusColor(r.status) }}
+                >
+                  {r.status}
+                </span>
+                <span className="font-mono text-right text-muted">
+                  {r.duration === null ? "-" : `${(r.duration * 1000).toFixed(0)}ms`}
+                </span>
+              </div>
+            ))
+          )}
         </div>
       </div>
     </div>
@@ -204,52 +210,80 @@ function ProcessList({ processes }: { processes: ProcessInfo[] }) {
 export default function BotDashboard() {
   const [node, setNode] = useState<NodeInfo | null>(null);
   const [demoMode, setDemoMode] = useState(false);
-  const [refreshRate, setRefreshRate] = useState(1000);
+  const [snap, setSnap] = useState<NodeBackend | null>(null);
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
-  const [processes, setProcesses] = useState<ProcessInfo[]>([]);
-  
-  // History buffers
+  const [recentRuns, setRecentRuns] = useState<MetricsRecentRun[]>([]);
+
+  // History buffers — pushed as snapshots arrive over SSE.
   const [cpuHistory, setCpuHistory] = useState<number[]>(Array(HISTORY_SIZE).fill(0));
   const [ramHistory, setRamHistory] = useState<number[]>(Array(HISTORY_SIZE).fill(0));
   const [gpuHistory, setGpuHistory] = useState<number[]>(Array(HISTORY_SIZE).fill(0));
 
-  // Fetch node info once - fallback to demo mode if bot unavailable
+  // 1) Identity card from /api/hello. Demo mode if the node isn't reachable.
   useEffect(() => {
     bot.getNodeInfo()
-      .then(setNode)
+      .then((info) => {
+        setNode(info);
+        setDemoMode(false);
+      })
       .catch(() => {
-        // Bot unavailable - enter demo mode
         setDemoMode(true);
         setNode({
-          node_id: "demo-node-001",
-          host: "localhost",
+          node_id: "offline",
+          host: "127.0.0.1",
           port: 8100,
-          version: "0.1.0-demo",
-          uptime: 3600,
-          channels: ["general"],
-          functions: ["echo", "ping", "execute"],
+          version: "—",
+          uptime: 0,
+          channels: [],
+          functions: [],
         });
       });
   }, []);
 
-  // Periodic metrics fetch
-  const fetchMetrics = useCallback(() => {
-    // TODO: Replace with real API call when bot is connected: bot.getSystemMetrics()
-    const m = generateMockMetrics();
-    setMetrics(m);
-    setCpuHistory((prev) => [...prev.slice(1), m.cpu]);
-    setRamHistory((prev) => [...prev.slice(1), m.ram]);
-    setGpuHistory((prev) => [...prev.slice(1), m.gpu]);
-    
-    // TODO: Replace with real API call: bot.getProcesses()
-    setProcesses(generateMockProcesses());
+  // 2) Live backend snapshots via SSE. Auto-falls back to demo mode on error.
+  useEffect(() => {
+    let zeroedOut = false;
+    const cleanup = bot.streamBackend(
+      (s) => {
+        setSnap(s);
+        setDemoMode(false);
+        const m = snapshotToMetrics(s);
+        setMetrics(m);
+        setCpuHistory((prev) => [...prev.slice(1), m.cpu]);
+        setRamHistory((prev) => [...prev.slice(1), m.ram]);
+        setGpuHistory((prev) => [...prev.slice(1), m.gpu]);
+      },
+      () => {
+        // Stream dropped — flip into demo mode without injecting fake data.
+        setDemoMode(true);
+        if (!zeroedOut) {
+          zeroedOut = true;
+          setMetrics((prev) => prev ?? {
+            cpu: 0, ram: 0, ramUsed: 0, ramTotal: 0,
+            gpu: 0, gpuMemUsed: 0, gpuMemTotal: 0,
+            gpuName: "Backend offline",
+          });
+        }
+      },
+    );
+    return cleanup;
   }, []);
 
+  // 3) Recent runs (every 5s). Not critical — fails silently into [].
   useEffect(() => {
-    fetchMetrics();
-    const interval = setInterval(fetchMetrics, refreshRate);
-    return () => clearInterval(interval);
-  }, [refreshRate, fetchMetrics]);
+    let cancelled = false;
+    async function load() {
+      try {
+        const m = await bot.getMetrics();
+        if (!cancelled) setRecentRuns(m.recent_runs);
+      } catch {
+        if (!cancelled) setRecentRuns([]);
+      }
+    }
+    load();
+    const interval = setInterval(load, 5000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
 
   if (!node || !metrics) {
     return (
@@ -266,6 +300,20 @@ export default function BotDashboard() {
 
   return (
     <div className="p-6 space-y-6 animate-in">
+      {/* Demo banner */}
+      {demoMode && (
+        <div
+          className="px-4 py-2 rounded-lg text-xs font-medium"
+          style={{
+            background: "rgba(251,191,36,0.10)",
+            border: "1px solid rgba(251,191,36,0.30)",
+            color: "#fbbf24",
+          }}
+        >
+          Backend offline — demo mode. Live metrics paused; no fake data is being injected.
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex items-center gap-4">
@@ -281,22 +329,9 @@ export default function BotDashboard() {
             </div>
           </div>
         </div>
-        
-        {/* Status + Refresh Rate */}
+
+        {/* Status */}
         <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-muted">Refresh:</span>
-            <select
-              value={refreshRate}
-              onChange={(e) => setRefreshRate(Number(e.target.value))}
-              className="bg-card border border-border rounded px-2 py-1 text-xs font-mono text-foreground focus:outline-none focus:border-primary"
-            >
-              <option value={500}>500ms</option>
-              <option value={1000}>1s</option>
-              <option value={2000}>2s</option>
-              <option value={5000}>5s</option>
-            </select>
-          </div>
           <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full ${demoMode ? "bg-warning/10 border border-warning/20" : "bg-success/10 border border-success/20"}`}>
             <div className={`status-dot ${demoMode ? "pending" : "online"}`} />
             <span className={`text-xs font-medium ${demoMode ? "text-warning" : "text-success"}`}>
@@ -321,7 +356,7 @@ export default function BotDashboard() {
           label="Memory"
           value={metrics.ram}
           unit="%"
-          secondaryValue={`${metrics.ramUsed.toFixed(1)}/${metrics.ramTotal}GB`}
+          secondaryValue={`${metrics.ramUsed.toFixed(1)}/${metrics.ramTotal.toFixed(1)}GB`}
           secondaryLabel="Used"
         />
         <TimePlot
@@ -337,8 +372,7 @@ export default function BotDashboard() {
 
       {/* Bottom Section */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Process List */}
-        <ProcessList processes={processes} />
+        <RecentRunsList runs={recentRuns} />
 
         {/* System Info */}
         <div className="nordic-card p-4">
@@ -347,12 +381,16 @@ export default function BotDashboard() {
             <InfoRow label="Node ID" value={node.node_id} mono />
             <InfoRow label="Version" value={node.version} mono />
             <InfoRow label="Host" value={`${node.host}:${node.port}`} mono />
-            <InfoRow label="Uptime" value={formatUptime(node.uptime)} />
-            <InfoRow label="Latitude" value="48.8566" mono primary />
-            <InfoRow label="Longitude" value="2.3522" mono primary />
-            <InfoRow label="RAM Total" value={`${metrics.ramTotal} GB`} />
+            <InfoRow label="Uptime" value={formatUptime(snap?.uptime_seconds ?? node.uptime)} />
+            <InfoRow label="Hostname" value={snap?.hostname ?? "-"} mono />
+            <InfoRow label="Platform" value={snap?.platform ?? "-"} mono />
+            <InfoRow label="Python" value={snap?.python_version ?? "-"} mono />
+            <InfoRow label="CPU cores" value={String(snap?.cpu_count ?? "-")} />
+            <InfoRow label="RAM Total" value={`${metrics.ramTotal.toFixed(1)} GB`} />
             <InfoRow label="GPU" value={metrics.gpuName} />
-            <InfoRow label="GPU Memory" value={`${metrics.gpuMemUsed.toFixed(1)}/${metrics.gpuMemTotal} GB`} />
+            <InfoRow label="GPU Memory" value={metrics.gpuMemTotal > 0 ? `${metrics.gpuMemUsed.toFixed(1)}/${metrics.gpuMemTotal.toFixed(1)} GB` : "-"} />
+            <InfoRow label="Active runs" value={String(snap?.active_runs ?? 0)} />
+            <InfoRow label="Total runs" value={String(snap?.total_runs ?? 0)} />
             <InfoRow label="Functions" value={`${node.functions.length} registered`} />
           </div>
         </div>
@@ -371,8 +409,8 @@ function InfoRow({ label, value, mono, primary }: { label: string; value: string
 }
 
 function formatUptime(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
   const hours = Math.floor(seconds / 3600);
   const mins = Math.floor((seconds % 3600) / 60);
   return `${hours}h ${mins}m`;

@@ -184,6 +184,10 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         state = request.app.state
         snap = state.backend_service.snapshot()
         peers_resp = await state.network_service.get_peers()
+        # Self geo via the v1 geo module — cached after first hit; non-blocking
+        # only because we already paid the lookup cost on node start.
+        from ..geo import get_location
+        self_lat, self_lon = get_location()
         self_node = {
             "node_id": settings.node_id,
             "host": settings.host,
@@ -194,6 +198,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
             "active_runs": state.pyfuncrun_service.active_count,
             "gpu_count": len(snap.gpus),
             "self": True,
+            "lat": self_lat,
+            "lon": self_lon,
         }
         peer_nodes = [
             {
@@ -201,6 +207,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
                 "role": str(p.role), "cpu_percent": p.cpu_percent,
                 "memory_percent": p.memory_percent, "active_runs": p.active_runs,
                 "gpu_count": p.gpu_count, "self": False,
+                "lat": p.lat, "lon": p.lon,
             }
             for p in peers_resp.peers
         ]

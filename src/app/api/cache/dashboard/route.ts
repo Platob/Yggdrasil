@@ -1,4 +1,4 @@
-import { botAPI, BotAPIError } from "@/lib/bot-client";
+import { botAPI } from "@/lib/bot-client";
 import type { NodeInfo, ChannelInfo } from "@/lib/api";
 
 export const dynamic = "force-dynamic";

@@ -187,14 +187,16 @@ function NodeSpikes({
         const endPos = pos.clone().add(normal.clone().multiplyScalar(h));
         const col = statusColor(node.status);
 
+        const lineArr = new Float32Array([...pos.toArray(), ...endPos.toArray()]);
         return (
           <group key={node.id}>
             <line>
               <bufferGeometry>
                 <bufferAttribute
                   attach="attributes-position"
+                  args={[lineArr, 3]}
                   count={2}
-                  array={new Float32Array([...pos.toArray(), ...endPos.toArray()])}
+                  array={lineArr}
                   itemSize={3}
                 />
               </bufferGeometry>
