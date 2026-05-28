@@ -48,7 +48,34 @@ class LazyTabular(Tabular[O], Generic[O]):
         raise TypeError("LazyTabular is read-only.")
 
     def _collect_schema(self, options: O) -> "Schema":
+        # Bypass any cached schema on the source — the plan's projections
+        # / joins reshape the schema in ways the source can't anticipate.
         return self._plan.execute(self._source).collect_schema(options)
+
+    # -- Autonomous-plan helpers ---------------------------------------------
+
+    def into(self, target: Tabular, *, mode: Any = None) -> Any:
+        """Build an :class:`InsertPlan` that feeds this lazy SELECT into *target*.
+
+        Returns the unexecuted :class:`InsertPlan` so callers can
+        chain ``.execute()`` or hand the plan around as a Tabular.
+        """
+        from .execution_plan import InsertPlan
+        plan = self._plan.copy()
+        plan.bind(self._source)
+        return InsertPlan(target=target, source=plan, mode=mode)
+
+    def merge_into(
+        self,
+        target: Tabular,
+        *,
+        on: Any,
+    ) -> Any:
+        """Open a :class:`MergePlan` with this lazy SELECT as the source."""
+        from .execution_plan import MergePlan
+        plan = self._plan.copy()
+        plan.bind(self._source)
+        return MergePlan(target=target, source=plan).on(on)
 
     # Lazy transforms — mutate plan, return self
     def select(self, *columns) -> "LazyTabular[O]": self._plan.select(*columns); return self

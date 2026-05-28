@@ -41,6 +41,8 @@ def _exec(node: PlanNode, tables: dict[str, "Tabular"]) -> "Tabular":
         raise ValueError(f"Table {node.name!r} not found. Available: {sorted(tables)}")
     if isinstance(node, InsertNode):
         return _exec_insert(node, tables)
+    if isinstance(node, MergeNode):
+        return _exec_merge(node, tables)
     raise NotImplementedError(f"Cannot execute {type(node).__name__}")
 
 
@@ -562,17 +564,56 @@ def _apply_qualify(result: "Tabular", qualify: Any) -> "Tabular":
 
 
 def _exec_insert(node: InsertNode, tables: dict[str, "Tabular"]) -> "Tabular":
-    from yggdrasil.arrow.tabular import ArrowTabular
-    from yggdrasil.execution.expr.nodes import Literal
+    """Bind the AST :class:`InsertNode` to a concrete :class:`InsertPlan`
+    and execute it against the supplied table dictionary."""
+    from .execution_plan import InsertPlan
 
     if not node.target or node.target.name not in tables:
         raise ValueError(f"Target table {getattr(node.target, 'name', None)!r} not found")
     target = tables[node.target.name]
-    if node.source:
-        target.write_table(_exec(node.source, tables))
-    elif node.values:
-        cols = node.columns or [f"col{i}" for i in range(len(node.values[0]))]
-        pydict = {c: [r[i].value if isinstance(r[i], Literal) else r[i] if i < len(r) else None
-                       for r in node.values] for i, c in enumerate(cols)}
-        target.write_table(pa.table(pydict))
+
+    src_tab: "Tabular | None" = None
+    if node.source is not None:
+        src_tab = _exec(node.source, tables)
+
+    plan = InsertPlan(
+        target=target,
+        source=src_tab,
+        columns=list(node.columns) if node.columns else None,
+        values=([list(r) for r in node.values] if node.values else None),
+    )
+    plan.execute()
+    return target
+
+
+def _exec_merge(node: MergeNode, tables: dict[str, "Tabular"]) -> "Tabular":
+    """Bind the AST :class:`MergeNode` to a :class:`MergePlan` and run it."""
+    from .execution_plan import MergePlan
+    from .ops import SubqueryRef, TableRef
+
+    if not node.target or node.target.name not in tables:
+        raise ValueError(f"Target table {getattr(node.target, 'name', None)!r} not found")
+    target = tables[node.target.name]
+
+    src_tab: "Tabular | None"
+    src = node.source
+    if isinstance(src, TableRef):
+        src_tab = tables.get(src.name)
+        if src_tab is None:
+            raise ValueError(f"Source table {src.name!r} not found")
+    elif isinstance(src, SubqueryRef):
+        src_tab = _exec(src.plan, tables)
+    elif isinstance(src, PlanNode):
+        src_tab = _exec(src, tables)
+    else:
+        raise TypeError(f"Cannot resolve MERGE source {type(src).__name__}")
+
+    plan = MergePlan(
+        target=target,
+        source=src_tab,
+        on=node.on,
+        when_matched=list(node.when_matched) if node.when_matched else None,
+        when_not_matched=list(node.when_not_matched) if node.when_not_matched else None,
+    )
+    plan.execute()
     return target
