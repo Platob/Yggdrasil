@@ -25,11 +25,13 @@ Notes
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import logging
 import re
 import time
-from typing import Any, Callable, ClassVar, Dict, Iterable, List, Optional, TypeVar, TYPE_CHECKING, Union
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar, TYPE_CHECKING, Union
 
 from databricks.sdk import ClustersAPI
 from databricks.sdk.client_types import ClientType
@@ -46,18 +48,17 @@ from databricks.sdk.service.compute import (
     PythonPyPiLibrary,
     State,
 )
-from yggdrasil.enums import Scheme
-from yggdrasil.dataclasses.singleton import Singleton
+
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.environ.pip_settings import PipIndexSettings
 from yggdrasil.http_.headers import DEFAULT_HOSTNAME
-from yggdrasil.url import URL, URLBased
+from yggdrasil.url import URL
 from yggdrasil.pyutils.equality import dicts_equal
 from yggdrasil.version import VersionInfo
 
-from .service import Clusters, PYTHON_BY_DBR
-from ..client import DatabricksResource
 from ..compute.execution_context import ExecutionContext
+from .service import Clusters, PYTHON_BY_DBR
+from ..resource import DatabricksResource
 
 if TYPE_CHECKING:
     from ..compute.command_execution import CommandExecution
@@ -73,21 +74,13 @@ F = TypeVar("F", bound=Callable[..., Any])
 _EDIT_ARG_NAMES = set(inspect.signature(ClustersAPI.edit).parameters.keys())
 _GROUPNAME_RE = re.compile(r"\bGroupName\((?P<group>[^)]*)\)")
 
-_POOL_MANAGED_FIELDS: frozenset[str] = frozenset({
-    "node_type_id",
-    "driver_node_type_id",
-    "enable_elastic_disk",
-    "aws_attributes",
-    "gcp_attributes",
-})
 
+def _library_sig(lib: Library) -> tuple[str, Any]:
+    """
+    Return a stable-ish signature for a library definition.
 
-def _library_dedup_key(lib: Library) -> tuple[str, str]:
-    """Return a key suitable for deduplicating library install requests.
-
-    PyPI libraries are keyed by their normalized bare package name so that
-    different version specs (``pkg==1.0`` vs ``pkg==2.0``) or repos collapse
-    to the same key.  JARs, wheels, and requirements files are keyed by path.
+    This is used to deduplicate install requests against already installed
+    cluster libraries.
     """
     if getattr(lib, "jar", None):
         return ("jar", lib.jar)
@@ -95,18 +88,9 @@ def _library_dedup_key(lib: Library) -> tuple[str, str]:
         return ("whl", lib.whl)
     if getattr(lib, "requirements", None):
         return ("requirements", lib.requirements)
-    if getattr(lib, "pypi", None) and lib.pypi.package:
-        return ("pypi", _normalize_pip_pkg_name(lib.pypi.package))
+    if getattr(lib, "pypi", None):
+        return ("pypi", lib.pypi.package, lib.pypi.repo)
     return ("other", repr(lib))
-
-
-def _dedupe_libraries(libraries: list[Library]) -> list[Library]:
-    """Deduplicate a list of libraries, keeping the last occurrence."""
-    seen: dict[tuple[str, str], int] = {}
-    for idx, lib in enumerate(libraries):
-        seen[_library_dedup_key(lib)] = idx
-    keep = sorted(seen.values())
-    return [libraries[i] for i in keep]
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +133,8 @@ def _normalize_pip_pkg_name(spec: str) -> str:
     return name.replace("_", "-")
 
 
-class Cluster(Singleton, DatabricksResource, URLBased):
+@dataclass
+class Cluster(DatabricksResource):
     """
     High-level Databricks cluster helper.
 
@@ -166,71 +151,25 @@ class Cluster(Singleton, DatabricksResource, URLBased):
     Notes
     -----
     ``Cluster`` caches ``ClusterDetails`` and refreshes them lazily.
-    Inherits :class:`Singleton` (``_SINGLETON_TTL = None``) so two
-    callers asking for the same cluster under the same service share
-    the live ``ClusterDetails`` cache and the per-cluster execution
-    contexts.
-
-    URL-addressable through :class:`URLBased` under
-    :attr:`Scheme.DATABRICKS_CLUSTER` (``dbks+cluster://``): a cluster
-    round-trips through ``dbks+cluster://<host>/<cluster_id>`` so a
-    caller with just the URL can rebuild the live handle via
-    :meth:`URLBased.dispatch` / :meth:`Cluster.from_url`.
     """
 
-    scheme: ClassVar[Scheme] = Scheme.DATABRICKS_CLUSTER
+    service: Clusters = dataclasses.field(
+        default_factory=Clusters.current,
+        repr=False,
+        compare=False,
+    )
+    cluster_id: Optional[str] = None
+    cluster_name: Optional[str] = None
 
-    _SINGLETON_TTL: ClassVar[Any] = None
+    _details: Optional[ClusterDetails] = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _details_refresh_time: float = dataclasses.field(default=0.0, repr=False, hash=False, compare=False)
+    _contexts: dict[str, ExecutionContext] = dataclasses.field(default_factory=dict, repr=False, hash=False, compare=False)
 
-    @classmethod
-    def _singleton_key(
-        cls,
-        service: "Clusters | None" = None,
-        cluster_id: str | None = None,
-        cluster_name: str | None = None,
-        **_kwargs: Any,
-    ) -> Any:
-        return (cls, service, cluster_id, cluster_name)
-
-    def __new__(
-        cls,
-        service: "Clusters | None" = None,
-        cluster_id: str | None = None,
-        cluster_name: str | None = None,
-        **kwargs: Any,
-    ) -> "Cluster":
-        return super().__new__(
-            cls,
-            service=service,
-            cluster_id=cluster_id,
-            cluster_name=cluster_name,
-            **kwargs,
-        )
-
-    def __init__(
-        self,
-        service: Clusters | None = None,
-        cluster_id: str | None = None,
-        cluster_name: str | None = None,
-        *,
-        details: Optional[ClusterDetails] = None,
-        details_refresh_time: float = 0.0,
-        contexts: dict[str, ExecutionContext] = None,
-        singleton_ttl: Any = ...,
-    ):
-        # ``singleton_ttl`` is consumed by :meth:`Singleton.__new__`;
-        # accept here so the signature stays open.
-        del singleton_ttl
-        if getattr(self, "_initialized", False):
-            return
-
-        super().__init__()
-        self.service = service or Clusters.current()
-        self.cluster_id = cluster_id
-        self.cluster_name = cluster_name
-        self._details = details
-        self._details_refresh_time = details_refresh_time
-        self._contexts = contexts or {}
+    # ------------------------------------------------------------------ #
+    # Construction and identity
+    # ------------------------------------------------------------------ #
+    def __post_init__(self) -> None:
+        super().__post_init__()
 
         if self.cluster_name and not self.cluster_id:
             found = self.service.find_cluster(
@@ -240,70 +179,17 @@ class Cluster(Singleton, DatabricksResource, URLBased):
             object.__setattr__(self, "cluster_id", found.cluster_id)
             object.__setattr__(self, "_details", found._details)
 
-        self._initialized = True
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(url={self.url()})"
 
     def __str__(self) -> str:
-        return self.explore_url.to_string()
-
-    def __hash__(self):
-        return hash(self.explore_url)
-
-    def __eq__(self, other):
-        return isinstance(other, Cluster) and self.explore_url == other.explore_url
-
-    @property
-    def explore_url(self) -> URL:
-        """Workspace UI URL pointing at this cluster's compute page."""
-        return self.client.base_url.with_path(
-            f"/compute/clusters/{self.cluster_id or 'unknown'}"
-        )
+        return self.url().to_string()
 
     def url(self) -> URL:
-        """Deprecated alias for :attr:`explore_url` (method form)."""
-        return self.explore_url
-
-    # ------------------------------------------------------------------ #
-    # URLBased contract — round-trippable identity via dbks+cluster://
-    # ------------------------------------------------------------------ #
-    def to_url(self) -> URL:
-        """Render this cluster as ``dbks+cluster://<host>/<cluster_id>``.
-
-        The host comes from the bound :class:`DatabricksClient`; the
-        single path segment is the cluster id. ``cluster_name`` is not
-        emitted — the canonical identity for a cluster is its id, and a
-        consumer that needs the name can refresh from the live details.
-        """
-        host = self.client.base_url.host or ""
-        cid = self.cluster_id or ""
-        return URL.from_(f"{self.scheme.value}://{host}/{cid}")
-
-    @classmethod
-    def from_url(cls, url: "URL | str", **kwargs: Any) -> "Cluster":
-        """Build a :class:`Cluster` from a ``dbks+cluster://host/<id>`` URL.
-
-        Resolves the underlying :class:`DatabricksClient` from the URL
-        host (or :meth:`DatabricksClient.current` when the URL carries
-        no host). The first path segment is the cluster id; trailing
-        segments are tolerated for forward compatibility but ignored.
-        """
-        from ..client import DatabricksClient
-
-        u = URL.from_(url)
-        parts = [p for p in (u.path or "/").lstrip("/").split("/") if p]
-        if not parts:
-            raise ValueError(
-                f"Cannot derive cluster_id from URL {u!r} — expected "
-                f"``{cls.scheme.value}://<host>/<cluster_id>``."
-            )
-        cluster_id = parts[0]
-        service = kwargs.pop("service", None)
-        if service is None:
-            client = (
-                DatabricksClient(host=f"https://{u.host}/")
-                if u.host else DatabricksClient.current()
-            )
-            service = client.compute.clusters
-        return cls(service=service, cluster_id=cluster_id, **kwargs)
+        """Return the Databricks workspace URL for this cluster."""
+        return URL.from_str(
+            f"{self.client.base_url.to_string().rstrip('/')}/compute/clusters/{self.cluster_id or 'unknown'}"
+        )
 
     # ------------------------------------------------------------------ #
     # SDK clients
@@ -426,7 +312,7 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         Also waits for library installation completion after the cluster becomes
         stable.
         """
-        wait = WaitingConfig.from_(wait)
+        wait = WaitingConfig.check_arg(wait)
         if not wait:
             return self
 
@@ -486,7 +372,7 @@ class Cluster(Singleton, DatabricksResource, URLBased):
     def update(
         self,
         *,
-        single_user_name: str | None = None,
+        single_user_name: Optional[str] = None,
         libraries: Optional[list[Union[str, Library]]] = None,
         permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
         wait: WaitingConfigArg = True,
@@ -525,13 +411,13 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         if dicts_equal(current, desired, keys=_EDIT_ARG_NAMES):
             return self
 
-        LOGGER.debug("Updating cluster %r with %s", self, desired)
+        LOGGER.debug("Updating %s with %s", self, desired)
 
         self.wait_for_status(wait=wait)
         self.clusters_client().edit(**desired)
         self.update_permissions(permissions=permissions)
 
-        LOGGER.info("Updated cluster %r", self)
+        LOGGER.info("Updated %s", self)
         self.wait_for_status(wait=wait)
         return self
 
@@ -604,19 +490,13 @@ class Cluster(Singleton, DatabricksResource, URLBased):
     def _editable_details_from(details: Optional[ClusterDetails]) -> dict[str, Any]:
         """
         Extract editable fields from cluster details for Databricks ``edit``.
-
-        When ``instance_pool_id`` is set, fields that Databricks auto-populates
-        from the pool are stripped so they don't cause spurious diffs.
         """
         if details is None:
             return {}
-        raw = details.as_shallow_dict()
-        has_pool = bool(raw.get("instance_pool_id"))
         return {
             key: value
-            for key, value in raw.items()
+            for key, value in details.as_shallow_dict().items()
             if key in _EDIT_ARG_NAMES
-            and not (has_pool and key in _POOL_MANAGED_FIELDS)
         }
 
     # ------------------------------------------------------------------ #
@@ -637,9 +517,9 @@ class Cluster(Singleton, DatabricksResource, URLBased):
             return self
 
         client = self.clusters_client()
-        wait = WaitingConfig.from_(wait)
+        wait = WaitingConfig.check_arg(wait)
 
-        LOGGER.debug("Starting cluster %r", self)
+        LOGGER.debug("Starting %s", self)
 
         try:
             client.start(cluster_id=self.cluster_id)
@@ -649,7 +529,7 @@ class Cluster(Singleton, DatabricksResource, URLBased):
                 return self
             client.start(cluster_id=self.cluster_id)
 
-        LOGGER.info("Started cluster %r", self)
+        LOGGER.info("Started %s", self)
         self.wait_for_status(wait=wait)
         return self
 
@@ -670,9 +550,9 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         if not self.cluster_id:
             return
 
-        LOGGER.debug("Deleting cluster %r", self)
+        LOGGER.debug("Deleting %s", self)
         self.clusters_client().delete(cluster_id=self.cluster_id)
-        LOGGER.info("Deleted cluster %r", self)
+        LOGGER.info("Deleted %s", self)
 
     # ------------------------------------------------------------------ #
     # Execution contexts and commands
@@ -681,8 +561,8 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         self,
         *,
         language: Optional[Language] = None,
-        context_id: str | None = None,
-        context_key: str | None = None,
+        context_id: Optional[str] = None,
+        context_key: Optional[str] = None,
     ) -> ExecutionContext:
         """
         Return an execution context for this cluster.
@@ -713,10 +593,10 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         context: Optional[ExecutionContext | str] = None,
         command: Optional[str | Callable] = None,
         *,
-        command_str: str | None = None,
+        command_str: Optional[str] = None,
         func: Optional[Callable] = None,
         language: Optional[Language] = None,
-        command_id: str | None = None,
+        command_id: Optional[str] = None,
         environ: Optional[Union[Iterable[str], Dict[str, str]]] = None,
     ) -> "CommandExecution":
         """
@@ -789,11 +669,10 @@ class Cluster(Singleton, DatabricksResource, URLBased):
 
         if skipped:
             LOGGER.debug(
-                "Skipping blacklisted runtime package(s) on cluster %r: %s",
-                self, ", ".join(skipped),
+                "install_libraries: skipping blacklisted runtime package(s): %s",
+                ", ".join(skipped),
             )
 
-        allowed = _dedupe_libraries(allowed)
         normalized = self._dedupe_uninstalled_libraries(allowed)
 
         if not normalized:
@@ -892,7 +771,7 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         if not self.is_running:
             return self
 
-        wait = WaitingConfig.from_(wait)
+        wait = WaitingConfig.check_arg(wait)
         if not wait:
             return self
 
@@ -913,7 +792,7 @@ class Cluster(Singleton, DatabricksResource, URLBased):
                         self._uninstall_libraries(failed)
                     except Exception:
                         LOGGER.exception(
-                            "Failed to uninstall broken libraries %s from cluster %r",
+                            "Failed to uninstall broken libraries %s from %s",
                             failed,
                             self,
                         )
@@ -923,9 +802,7 @@ class Cluster(Singleton, DatabricksResource, URLBased):
                 if raise_error:
                     raise DatabricksError(message)
 
-                LOGGER.error(
-                    "Library install failed on cluster %r: %s", self, failed,
-                )
+                LOGGER.error(message)
                 return self
 
             running = [
@@ -949,12 +826,12 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         """
         Remove libraries that are already present on the cluster.
         """
-        existing_keys = {
-            _library_dedup_key(status.library)
+        existing_sigs = {
+            _library_sig(status.library)
             for status in self.installed_library_statuses()
             if getattr(status, "library", None) is not None
         }
-        return [lib for lib in libraries if _library_dedup_key(lib) not in existing_keys]
+        return [lib for lib in libraries if _library_sig(lib) not in existing_sigs]
 
     @staticmethod
     def _check_library(
