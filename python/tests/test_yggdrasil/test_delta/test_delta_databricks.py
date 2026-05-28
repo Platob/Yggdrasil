@@ -561,3 +561,211 @@ class TestMergeDeletionVectors(_DeltaSQLBase):
         self.assertEqual(
             pairs, [(1, "a"), (2, "B"), (3, "c"), (5, "E")],
         )
+
+
+# ---------------------------------------------------------------------------
+# Lazy tabular ↔ Databricks SQL — same query, two engines
+# ---------------------------------------------------------------------------
+
+
+class TestLazyTabularVsDatabricksSQL(_DeltaSQLBase):
+    """Same predicate, two engines: warehouse SQL vs yggdrasil's lazy
+    :class:`DeltaFolder` reader.
+
+    The Databricks side runs ``SELECT * FROM tbl WHERE <pred>`` on the
+    SQL warehouse and returns Arrow rows. The lazy side reads the
+    parquet files directly off the table's storage path, applies the
+    same predicate via ``DeltaOptions.predicate`` (pushed down to
+    Arrow expression filtering), and returns Arrow rows without a
+    warehouse round trip.
+
+    The two outputs must agree — locks in predicate-pushdown
+    correctness across the full type / NULL / partition matrix.
+    Each test ``self.assertEqual`` ‑s the sorted row sets so file
+    iteration order on the lazy side can't flake the comparison.
+    """
+
+    @staticmethod
+    def _pylist_of_rows(table: pa.Table, columns: list[str]) -> list[tuple]:
+        """Materialize *columns* of *table* as a sortable list of tuples."""
+        cols = [table.column(c).to_pylist() for c in columns]
+        return sorted(zip(*cols))
+
+    def test_simple_comparison_filter(self) -> None:
+        """``WHERE id > 5`` — single column, numeric compare."""
+        tbl = self._table("lazy_gt")
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA"
+        )
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES "
+            "(1, 'a'), (5, 'e'), (10, 'j'), (12, 'l'), (3, 'c')"
+        )
+
+        sql_out = self._read_sql_arrow(
+            f"SELECT * FROM {tbl.full_name()} WHERE id > 5"
+        )
+        from yggdrasil.execution.expr import col
+        ygg_out = self._delta_folder(tbl).read_arrow_table(
+            options=DeltaOptions(predicate=col("id") > 5),
+        )
+
+        self.assertEqual(
+            self._pylist_of_rows(sql_out, ["id", "val"]),
+            self._pylist_of_rows(ygg_out, ["id", "val"]),
+        )
+
+    def test_conjunction_predicate(self) -> None:
+        """``WHERE id >= 5 AND id < 12`` — range bound via AND."""
+        tbl = self._table("lazy_and")
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA"
+        )
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES "
+            "(1, 'a'), (5, 'e'), (8, 'h'), (12, 'l'), (15, 'o')"
+        )
+
+        sql_out = self._read_sql_arrow(
+            f"SELECT * FROM {tbl.full_name()} "
+            "WHERE id >= 5 AND id < 12"
+        )
+        from yggdrasil.execution.expr import col
+        ygg_out = self._delta_folder(tbl).read_arrow_table(
+            options=DeltaOptions(
+                predicate=(col("id") >= 5) & (col("id") < 12),
+            ),
+        )
+
+        self.assertEqual(
+            self._pylist_of_rows(sql_out, ["id", "val"]),
+            self._pylist_of_rows(ygg_out, ["id", "val"]),
+        )
+
+    def test_in_list_predicate(self) -> None:
+        """``WHERE id IN (...)`` — set membership."""
+        tbl = self._table("lazy_in")
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA"
+        )
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES "
+            "(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')"
+        )
+
+        sql_out = self._read_sql_arrow(
+            f"SELECT * FROM {tbl.full_name()} WHERE id IN (2, 4)"
+        )
+        from yggdrasil.execution.expr import col
+        ygg_out = self._delta_folder(tbl).read_arrow_table(
+            options=DeltaOptions(predicate=col("id").is_in([2, 4])),
+        )
+
+        self.assertEqual(
+            self._pylist_of_rows(sql_out, ["id", "val"]),
+            self._pylist_of_rows(ygg_out, ["id", "val"]),
+        )
+
+    def test_null_predicate(self) -> None:
+        """``WHERE val IS NOT NULL`` — null handling under both engines."""
+        tbl = self._table("lazy_null")
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA"
+        )
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES "
+            "(1, 'a'), (2, NULL), (3, 'c'), (4, NULL), (5, 'e')"
+        )
+
+        sql_out = self._read_sql_arrow(
+            f"SELECT * FROM {tbl.full_name()} WHERE val IS NOT NULL"
+        )
+        from yggdrasil.execution.expr import col
+        ygg_out = self._delta_folder(tbl).read_arrow_table(
+            options=DeltaOptions(predicate=~col("val").is_null()),
+        )
+
+        self.assertEqual(
+            self._pylist_of_rows(sql_out, ["id", "val"]),
+            self._pylist_of_rows(ygg_out, ["id", "val"]),
+        )
+
+    def test_partition_filter_matches_sql(self) -> None:
+        """``WHERE region = 'us'`` on a partitioned table — the lazy
+        path prunes partition directories before reading parquet,
+        but the rows that come out match the SQL view exactly."""
+        tbl = self._table("lazy_part")
+        self._execute(f"""
+            CREATE TABLE {tbl.full_name()} (id BIGINT, region STRING, val STRING)
+            USING DELTA PARTITIONED BY (region)
+        """)
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES "
+            "(1, 'us', 'a'), (2, 'eu', 'b'), (3, 'us', 'c'), "
+            "(4, 'apac', 'd'), (5, 'eu', 'e')"
+        )
+
+        sql_out = self._read_sql_arrow(
+            f"SELECT * FROM {tbl.full_name()} WHERE region = 'us'"
+        )
+        from yggdrasil.execution.expr import col
+        ygg_out = self._delta_folder(tbl).read_arrow_table(
+            options=DeltaOptions(predicate=col("region") == "us"),
+        )
+
+        self.assertEqual(
+            self._pylist_of_rows(sql_out, ["id", "region", "val"]),
+            self._pylist_of_rows(ygg_out, ["id", "region", "val"]),
+        )
+
+    def test_combined_partition_and_row_filter(self) -> None:
+        """``WHERE region = 'us' AND id > 1`` — partition prune AND
+        intra-file filter together; both engines must converge on
+        the same rows."""
+        tbl = self._table("lazy_combo")
+        self._execute(f"""
+            CREATE TABLE {tbl.full_name()} (id BIGINT, region STRING, val STRING)
+            USING DELTA PARTITIONED BY (region)
+        """)
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES "
+            "(1, 'us', 'a'), (2, 'us', 'b'), (3, 'eu', 'c'), "
+            "(4, 'us', 'd'), (5, 'apac', 'e')"
+        )
+
+        sql_out = self._read_sql_arrow(
+            f"SELECT * FROM {tbl.full_name()} "
+            "WHERE region = 'us' AND id > 1"
+        )
+        from yggdrasil.execution.expr import col
+        ygg_out = self._delta_folder(tbl).read_arrow_table(
+            options=DeltaOptions(
+                predicate=(col("region") == "us") & (col("id") > 1),
+            ),
+        )
+
+        self.assertEqual(
+            self._pylist_of_rows(sql_out, ["id", "region", "val"]),
+            self._pylist_of_rows(ygg_out, ["id", "region", "val"]),
+        )
+
+    def test_no_predicate_full_scan(self) -> None:
+        """Sanity floor: with no predicate at all both engines return
+        the whole table — same rows, same columns, same count."""
+        tbl = self._table("lazy_full")
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA"
+        )
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} SELECT id, "
+            "concat('v', cast(id AS STRING)) AS val FROM range(100)"
+        )
+
+        sql_out = self._read_sql_arrow(f"SELECT * FROM {tbl.full_name()}")
+        ygg_out = self._delta_folder(tbl).read_arrow_table()
+
+        self.assertEqual(sql_out.num_rows, ygg_out.num_rows)
+        self.assertEqual(
+            self._pylist_of_rows(sql_out, ["id", "val"]),
+            self._pylist_of_rows(ygg_out, ["id", "val"]),
+        )
