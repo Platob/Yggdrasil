@@ -84,12 +84,33 @@ class _DeltaSQLBase(unittest.TestCase):
         type(self)._tables.append(name)
         return name
 
+    def _table(self, tag: str):
+        """Mint a unique table handle bound to this workspace.
+
+        Returns the :class:`Table` object — callers reach for
+        :meth:`Table.storage_path` to get a UC-credentialed Path on
+        the underlying cloud storage. The fully-qualified name lives
+        on ``table.full_name()`` and is tracked for class teardown.
+        """
+        return self.client.tables.table(self._table_name(tag))
+
     def _execute(self, sql: str):
         return self.sql.execute(sql)
 
     def _read_sql_arrow(self, sql: str) -> pa.Table:
         result = self._execute(sql)
         return result.read_arrow_table()
+
+    def _delta_folder(self, table) -> "DeltaFolder":
+        """Open a :class:`DeltaFolder` over *table*'s cloud storage.
+
+        Uses :meth:`Table.storage_path` so the underlying read carries
+        UC-vended temporary credentials (auto-refreshing) — a raw
+        ``Path.from_(location)`` against the same URL would fail with
+        ``AccessDenied`` on managed Delta tables.
+        """
+        from yggdrasil.io.nested.delta import DeltaFolder
+        return DeltaFolder(path=table.storage_path())
 
 
 # ---------------------------------------------------------------------------
@@ -102,19 +123,11 @@ class TestSQLWriteDeltaFolderRead(_DeltaSQLBase):
 
     def test_create_insert_read_via_storage(self) -> None:
         """CREATE TABLE + INSERT via SQL, read Delta log from storage location."""
-        tbl = self._table_name("sql_wr")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT, val STRING) USING DELTA")
-        self._execute(f"INSERT INTO {tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        tbl = self._table("sql_wr")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1, 'a'), (2, 'b'), (3, 'c')")
 
-        # Get storage location
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-        self.assertTrue(location, "Table must have a storage location")
-
-        # Read via DeltaFolder
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
+        folder = self._delta_folder(tbl)
         snap = folder.snapshot()
 
         self.assertGreaterEqual(snap.version, 0)
@@ -127,18 +140,13 @@ class TestSQLWriteDeltaFolderRead(_DeltaSQLBase):
 
     def test_append_multiple_inserts(self) -> None:
         """Multiple INSERTs produce multiple versions readable by DeltaFolder."""
-        tbl = self._table_name("sql_app")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
-        self._execute(f"INSERT INTO {tbl} VALUES (1), (2)")
-        self._execute(f"INSERT INTO {tbl} VALUES (3), (4)")
-        self._execute(f"INSERT INTO {tbl} VALUES (5)")
+        tbl = self._table("sql_app")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1), (2)")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (3), (4)")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (5)")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
+        folder = self._delta_folder(tbl)
         snap = folder.snapshot()
 
         self.assertGreaterEqual(snap.version, 2)
@@ -147,35 +155,24 @@ class TestSQLWriteDeltaFolderRead(_DeltaSQLBase):
 
     def test_overwrite_via_sql(self) -> None:
         """INSERT OVERWRITE replaces data, DeltaFolder sees new version."""
-        tbl = self._table_name("sql_ow")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
-        self._execute(f"INSERT INTO {tbl} VALUES (1), (2), (3)")
-        self._execute(f"INSERT OVERWRITE {tbl} VALUES (99)")
+        tbl = self._table("sql_ow")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1), (2), (3)")
+        self._execute(f"INSERT OVERWRITE {tbl.full_name()} VALUES (99)")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
-        out = folder.read_arrow_table()
+        out = self._delta_folder(tbl).read_arrow_table()
         self.assertEqual(out.column("id").to_pylist(), [99])
 
     def test_partitioned_table_via_sql(self) -> None:
         """Partitioned table created via SQL, read with partition pruning."""
-        tbl = self._table_name("sql_part")
+        tbl = self._table("sql_part")
         self._execute(f"""
-            CREATE TABLE {tbl} (id BIGINT, region STRING, val STRING)
+            CREATE TABLE {tbl.full_name()} (id BIGINT, region STRING, val STRING)
             USING DELTA PARTITIONED BY (region)
         """)
-        self._execute(f"INSERT INTO {tbl} VALUES (1, 'us', 'a'), (2, 'eu', 'b'), (3, 'us', 'c')")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1, 'us', 'a'), (2, 'eu', 'b'), (3, 'us', 'c')")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
+        folder = self._delta_folder(tbl)
         snap = folder.snapshot()
 
         self.assertEqual(snap.partition_columns, ["region"])
@@ -185,21 +182,15 @@ class TestSQLWriteDeltaFolderRead(_DeltaSQLBase):
 
     def test_schema_matches_sql(self) -> None:
         """DeltaFolder schema matches what SQL reports."""
-        tbl = self._table_name("sql_sch")
+        tbl = self._table("sql_sch")
         self._execute(f"""
-            CREATE TABLE {tbl} (
+            CREATE TABLE {tbl.full_name()} (
                 id BIGINT, name STRING, score DOUBLE, active BOOLEAN
             ) USING DELTA
         """)
-        self._execute(f"INSERT INTO {tbl} VALUES (1, 'alice', 95.5, true)")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1, 'alice', 95.5, true)")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
-        schema = folder.collect_schema()
+        schema = self._delta_folder(tbl).collect_schema()
         names = [f.name for f in schema.fields]
         self.assertEqual(names, ["id", "name", "score", "active"])
 
@@ -269,19 +260,12 @@ class TestBidirectionalComparison(_DeltaSQLBase):
 
     def test_sql_write_compare_sql_vs_deltafolder(self) -> None:
         """Write via SQL, read via both SQL and DeltaFolder, compare."""
-        tbl = self._table_name("cmp_sql")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT, val STRING) USING DELTA")
-        self._execute(f"INSERT INTO {tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        tbl = self._table("cmp_sql")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1, 'a'), (2, 'b'), (3, 'c')")
 
-        sql_out = self._read_sql_arrow(f"SELECT * FROM {tbl} ORDER BY id")
-
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
-        ygg_out = folder.read_arrow_table()
+        sql_out = self._read_sql_arrow(f"SELECT * FROM {tbl.full_name()} ORDER BY id")
+        ygg_out = self._delta_folder(tbl).read_arrow_table()
 
         self.assertEqual(
             sorted(sql_out.column("id").to_pylist()),
@@ -294,22 +278,16 @@ class TestBidirectionalComparison(_DeltaSQLBase):
 
     def test_arrow_insert_compare_sql_vs_deltafolder(self) -> None:
         """Write via arrow_insert_into, read via SQL and DeltaFolder, compare."""
-        tbl = self._table_name("cmp_arr")
+        tbl = self._table("cmp_arr")
         data = pa.table({
             "id": pa.array([10, 20, 30, 40, 50], type=pa.int64()),
             "score": pa.array([1.1, 2.2, 3.3, 4.4, 5.5], type=pa.float64()),
         })
-        self.sql.arrow_insert_into(data, table=tbl, mode="overwrite",
+        self.sql.arrow_insert_into(data, table=tbl.full_name(), mode="overwrite",
                                     wait=True, raise_error=True)
 
-        sql_out = self._read_sql_arrow(f"SELECT * FROM {tbl} ORDER BY id")
-
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        ygg_out = DeltaFolder(path=Path.from_(location)).read_arrow_table()
+        sql_out = self._read_sql_arrow(f"SELECT * FROM {tbl.full_name()} ORDER BY id")
+        ygg_out = self._delta_folder(tbl).read_arrow_table()
 
         self.assertEqual(
             sorted(sql_out.column("id").to_pylist()),
@@ -318,18 +296,13 @@ class TestBidirectionalComparison(_DeltaSQLBase):
 
     def test_multi_version_time_travel(self) -> None:
         """Multiple SQL inserts, DeltaFolder reads each version."""
-        tbl = self._table_name("cmp_tt")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
-        self._execute(f"INSERT INTO {tbl} VALUES (1), (2)")
-        self._execute(f"INSERT INTO {tbl} VALUES (3)")
-        self._execute(f"INSERT INTO {tbl} VALUES (4), (5)")
+        tbl = self._table("cmp_tt")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1), (2)")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (3)")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (4), (5)")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
+        folder = self._delta_folder(tbl)
         snap = folder.snapshot()
 
         head_ids = sorted(folder.read_arrow_table().column("id").to_pylist())
@@ -351,7 +324,7 @@ class TestStorageScan(_DeltaSQLBase):
 
     def test_table_has_delta_log(self) -> None:
         """Every Delta table has a _delta_log directory."""
-        tbl = self.client.tables.table(self._table_name("scan_log"))
+        tbl = self._table("scan_log")
         self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
         self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1)")
 
@@ -361,21 +334,17 @@ class TestStorageScan(_DeltaSQLBase):
 
     def test_snapshot_metadata_matches_sql_describe(self) -> None:
         """Snapshot protocol/metadata matches DESCRIBE output."""
-        tbl = self._table_name("scan_meta")
+        tbl = self._table("scan_meta")
         self._execute(f"""
-            CREATE TABLE {tbl} (id BIGINT, name STRING, score DOUBLE)
+            CREATE TABLE {tbl.full_name()} (id BIGINT, name STRING, score DOUBLE)
             USING DELTA
         """)
-        self._execute(f"INSERT INTO {tbl} VALUES (1, 'a', 1.5)")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1, 'a', 1.5)")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
+        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl.full_name()}")
         num_files_sql = detail.column("numFiles")[0].as_py()
 
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
-        snap = folder.snapshot()
+        snap = self._delta_folder(tbl).snapshot()
 
         self.assertEqual(snap.num_active_files(), num_files_sql)
         self.assertIsNotNone(snap.metadata)
@@ -385,20 +354,14 @@ class TestStorageScan(_DeltaSQLBase):
 
     def test_file_stats_match_sql_count(self) -> None:
         """AddFile stats numRecords matches SQL COUNT(*)."""
-        tbl = self._table_name("scan_stats")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
-        self._execute(f"INSERT INTO {tbl} SELECT id FROM range(100)")
+        tbl = self._table("scan_stats")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} SELECT id FROM range(100)")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        count_out = self._read_sql_arrow(f"SELECT COUNT(*) AS cnt FROM {tbl}")
+        count_out = self._read_sql_arrow(f"SELECT COUNT(*) AS cnt FROM {tbl.full_name()}")
         sql_count = count_out.column("cnt")[0].as_py()
 
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
-        snap = folder.snapshot()
+        snap = self._delta_folder(tbl).snapshot()
 
         ygg_count = sum(
             json.loads(add.stats).get("numRecords", 0)
@@ -418,33 +381,183 @@ class TestSchemaEvolution(_DeltaSQLBase):
 
     def test_add_column_via_sql(self) -> None:
         """ALTER TABLE ADD COLUMN, DeltaFolder sees updated schema."""
-        tbl = self._table_name("evo_add")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
-        self._execute(f"INSERT INTO {tbl} VALUES (1)")
-        self._execute(f"ALTER TABLE {tbl} ADD COLUMN (name STRING)")
-        self._execute(f"INSERT INTO {tbl} VALUES (2, 'bob')")
+        tbl = self._table("evo_add")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1)")
+        self._execute(f"ALTER TABLE {tbl.full_name()} ADD COLUMN (name STRING)")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (2, 'bob')")
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
-        schema = folder.collect_schema()
+        schema = self._delta_folder(tbl).collect_schema()
         names = [f.name for f in schema.fields]
         self.assertIn("name", names)
 
     def test_table_properties_via_sql(self) -> None:
         """Table properties set via SQL are visible in snapshot config."""
-        tbl = self._table_name("evo_prop")
-        self._execute(f"CREATE TABLE {tbl} (id BIGINT) USING DELTA")
-        self._execute(f"ALTER TABLE {tbl} SET TBLPROPERTIES ('delta.minReaderVersion' = '1')")
+        tbl = self._table("evo_prop")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
+        self._execute(
+            f"ALTER TABLE {tbl.full_name()} "
+            "SET TBLPROPERTIES ('delta.minReaderVersion' = '1')"
+        )
 
-        detail = self._read_sql_arrow(f"DESCRIBE DETAIL {tbl}")
-        location = detail.column("location")[0].as_py()
-
-        from yggdrasil.io.nested.delta import DeltaFolder
-        from yggdrasil.path import Path
-        folder = DeltaFolder(path=Path.from_(location))
-        snap = folder.snapshot()
+        snap = self._delta_folder(tbl).snapshot()
         self.assertIsNotNone(snap.protocol)
+
+
+# ---------------------------------------------------------------------------
+# Deletion vectors — MERGE on DV-enabled tables marks rows instead of rewriting
+# ---------------------------------------------------------------------------
+
+
+class TestMergeDeletionVectors(_DeltaSQLBase):
+    """MERGE INTO a DV-enabled Delta table emits deletion vectors
+    instead of rewriting the underlying parquet files.
+
+    On ``delta.enableDeletionVectors=true``, an UPDATE/DELETE inside
+    a MERGE either:
+
+    - stamps a deletion vector on the existing AddFile (marking the
+      matched rows as deleted), and appends a new AddFile carrying
+      just the updated rows, OR
+    - encodes the DV inline on the AddFile when the row count fits
+      under the inline threshold.
+
+    The snapshot's :attr:`AddFile.deletion_vector` slot is non-None
+    on the resulting AddFiles; ``num_active_files()`` typically
+    grows because the new rows ride on a fresh file. The DeltaFolder
+    read path filters DV-marked rows out, so the materialised table
+    reflects the post-MERGE state.
+    """
+
+    def _create_dv_table(self, tag: str):
+        tbl = self._table(tag)
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) "
+            "USING DELTA "
+            "TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')"
+        )
+        return tbl
+
+    def test_merge_update_emits_deletion_vector(self) -> None:
+        """A MERGE WHEN MATCHED UPDATE stamps DVs on the touched files."""
+        tbl = self._create_dv_table("dv_upd")
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} "
+            "VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')"
+        )
+        self._execute(f"""
+            MERGE INTO {tbl.full_name()} t
+            USING (
+              SELECT 1 AS id, 'A' AS val UNION ALL
+              SELECT 3 AS id, 'C' AS val
+            ) s
+            ON t.id = s.id
+            WHEN MATCHED THEN UPDATE SET t.val = s.val
+        """)
+
+        snap = self._delta_folder(tbl).snapshot()
+        dv_files = [
+            add for add in snap.active_files.values()
+            if add.deletion_vector is not None
+        ]
+        self.assertGreater(
+            len(dv_files), 0,
+            "MERGE on a DV-enabled table should produce at least "
+            "one AddFile with a deletion_vector attached.",
+        )
+
+    def test_merge_update_reads_back_correctly(self) -> None:
+        """DeltaFolder filters DV-marked rows; the materialised
+        table matches the post-MERGE SQL view."""
+        tbl = self._create_dv_table("dv_read")
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} "
+            "VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')"
+        )
+        self._execute(f"""
+            MERGE INTO {tbl.full_name()} t
+            USING (
+              SELECT 2 AS id, 'B' AS val UNION ALL
+              SELECT 4 AS id, 'D' AS val
+            ) s
+            ON t.id = s.id
+            WHEN MATCHED THEN UPDATE SET t.val = s.val
+        """)
+
+        sql_pairs = sorted(
+            zip(
+                self._read_sql_arrow(
+                    f"SELECT id, val FROM {tbl.full_name()} ORDER BY id"
+                ).column("id").to_pylist(),
+                self._read_sql_arrow(
+                    f"SELECT id, val FROM {tbl.full_name()} ORDER BY id"
+                ).column("val").to_pylist(),
+            )
+        )
+        ygg = self._delta_folder(tbl).read_arrow_table()
+        ygg_pairs = sorted(
+            zip(ygg.column("id").to_pylist(), ygg.column("val").to_pylist())
+        )
+        self.assertEqual(sql_pairs, ygg_pairs)
+
+    def test_merge_delete_emits_deletion_vector(self) -> None:
+        """WHEN MATCHED THEN DELETE on a DV-enabled table marks rows
+        via the DV slot instead of rewriting files."""
+        tbl = self._create_dv_table("dv_del")
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} "
+            "VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')"
+        )
+        self._execute(f"""
+            MERGE INTO {tbl.full_name()} t
+            USING (SELECT 2 AS id UNION ALL SELECT 4 AS id) s
+            ON t.id = s.id
+            WHEN MATCHED THEN DELETE
+        """)
+
+        snap = self._delta_folder(tbl).snapshot()
+        dv_files = [
+            add for add in snap.active_files.values()
+            if add.deletion_vector is not None
+        ]
+        self.assertGreater(len(dv_files), 0)
+
+        out = self._delta_folder(tbl).read_arrow_table()
+        self.assertEqual(
+            sorted(out.column("id").to_pylist()), [1, 3],
+        )
+
+    def test_merge_mixed_update_insert_with_dv(self) -> None:
+        """A full ``WHEN MATCHED UPDATE … WHEN NOT MATCHED INSERT``
+        MERGE on a DV-enabled table reconciles both branches: matched
+        rows get DV-marked, unmatched rows land as new AddFiles."""
+        tbl = self._create_dv_table("dv_mix")
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} "
+            "VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+        )
+        self._execute(f"""
+            MERGE INTO {tbl.full_name()} t
+            USING (
+              SELECT 2 AS id, 'B' AS val UNION ALL
+              SELECT 5 AS id, 'E' AS val
+            ) s
+            ON t.id = s.id
+            WHEN MATCHED THEN UPDATE SET t.val = s.val
+            WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)
+        """)
+
+        snap = self._delta_folder(tbl).snapshot()
+        dv_files = [
+            add for add in snap.active_files.values()
+            if add.deletion_vector is not None
+        ]
+        self.assertGreater(len(dv_files), 0)
+
+        out = self._delta_folder(tbl).read_arrow_table()
+        pairs = sorted(
+            zip(out.column("id").to_pylist(), out.column("val").to_pylist())
+        )
+        self.assertEqual(
+            pairs, [(1, "a"), (2, "B"), (3, "c"), (5, "E")],
+        )
