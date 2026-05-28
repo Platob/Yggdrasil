@@ -102,11 +102,23 @@ def _decode_payload(payload: bytes) -> Set[int]:
 # Encode
 # ---------------------------------------------------------------------------
 
+def _encode_simple_payload(row_ids: Iterable[int]) -> bytes:
+    """Encode *row_ids* as the simple-list deletion-vector envelope.
+
+    Layout: ``<I magic><Q count><Q row>...``. Always emits the
+    simple-list envelope regardless of cardinality — readers from
+    other engines (delta-rs, Spark) only need to support this
+    shape to consume our DVs at small / medium row counts.
+    """
+    rows = sorted(set(int(r) for r in row_ids))
+    return (struct.pack("<I", _MAGIC_SIMPLE) + struct.pack("<Q", len(rows))
+            + b"".join(struct.pack("<Q", r) for r in rows))
+
+
 def _encode_dv_payload(row_ids: Iterable[int]) -> bytes:
     rows = sorted(set(int(r) for r in row_ids))
     if len(rows) <= _ROARING_THRESHOLD:
-        return (struct.pack("<I", _MAGIC_SIMPLE) + struct.pack("<Q", len(rows))
-                + b"".join(struct.pack("<Q", r) for r in rows))
+        return _encode_simple_payload(rows)
 
     # Roaring64 envelope: group by high 32 bits, encode each as portable Roaring
     chunks: dict[int, list[int]] = {}
