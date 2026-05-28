@@ -459,20 +459,23 @@ class ExpiringDict(Generic[K, V]):
     # ── serialization ────────────────────────────────────────
 
     def __getstate__(self) -> Dict[str, Any]:
-        with self._lock:
-            now = now_utc_ns()
-            return {
-                "default_ttl_ns": self._default_ttl_ns,
-                "max_size": self._max_size,
-                # refresher and on_evict are intentionally excluded —
-                # not picklable in general (closures, bound methods, ...).
-                "store": {
-                    k: (v, exp)
-                    for k, (v, exp) in self._store.items()
-                    if exp is None or now < exp
-                },
-                "last_purge_ns": now,
-            }
+        # ``list(dict.items())`` is a single GIL-atomic C call, so we
+        # don't need to serialize pickle/deepcopy against concurrent
+        # writers — they either land before or after the snapshot.
+        now = now_utc_ns()
+        snapshot = list(self._store.items())
+        return {
+            "default_ttl_ns": self._default_ttl_ns,
+            "max_size": self._max_size,
+            # refresher and on_evict are intentionally excluded —
+            # not picklable in general (closures, bound methods, ...).
+            "store": {
+                k: (v, exp)
+                for k, (v, exp) in snapshot
+                if exp is None or now < exp
+            },
+            "last_purge_ns": now,
+        }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self._default_ttl_ns = state.get("default_ttl_ns")
@@ -845,11 +848,14 @@ class ExpiringDict(Generic[K, V]):
         """
         explicit_ttl = ttl is not ...
 
-        # Snapshot source outside our lock to avoid lock-ordering deadlocks
+        # Snapshot source via the GIL-atomic ``list(dict.items())`` —
+        # no need to take ``other._lock``. Cross-instance lock
+        # acquisition was the only place this class could land in a
+        # lock-ordering hazard with another ExpiringDict, so dropping
+        # it removes the last residual deadlock surface.
         if isinstance(other, ExpiringDict):
             snapshot_ts = now_utc_ns()
-            with other._lock:
-                source_raw: list = list(other._store.items())
+            source_raw: list = list(other._store.items())
             is_expiring_dict = True
         elif other is not None:
             if hasattr(other, "items"):
@@ -889,14 +895,16 @@ class ExpiringDict(Generic[K, V]):
         self._maybe_schedule_purge()
 
     def get_many(self, keys: Iterable[K]) -> Dict[K, V]:
-        """Return ``{key: value}`` for all live keys in *keys*."""
+        """Return ``{key: value}`` for all live keys in *keys*.
+
+        Pure read — no eviction side-effect. Lock-free; relies on
+        the GIL atomicity of ``dict.get``. Expired entries are skipped
+        but left in place for the background purge / next ``get`` to
+        evict (the previous pop-on-expire path raced with concurrent
+        refreshers).
+        """
         result: Dict[K, V] = {}
-        evicted: List[Tuple[K, V]] = []
         now = now_utc_ns()
-        # Lock-free: ``dict.get`` and ``dict.pop`` are GIL-atomic.
-        # Holding the lock across a whole batch was pure deadlock
-        # surface area — a slow ``on_evict`` or contending writer
-        # would serialize unrelated batches behind us.
         for key in keys:
             entry = self._store.get(key)
             if entry is None:
@@ -904,11 +912,6 @@ class ExpiringDict(Generic[K, V]):
             value, exp = entry
             if exp is None or now < exp:
                 result[key] = value
-                continue
-            removed = self._store.pop(key, ...)
-            if removed is not ...:
-                evicted.append((key, removed[0]))  # type: ignore[index]
-        self._notify_evicted(evicted)
         return result
 
     def delete_many(self, keys: Iterable[K]) -> int:
@@ -925,42 +928,36 @@ class ExpiringDict(Generic[K, V]):
     # ── inspection ───────────────────────────────────────────
 
     def ttl(self, key: K) -> Optional[float]:
-        """Remaining TTL in **seconds** for *key*, or ``None`` if gone/expired."""
-        # Lock-free read — atomic under the GIL. ``on_evict`` runs
-        # OUTSIDE any lock (the in-lock variant was a latent
-        # deadlock: a callback that takes another lock could
-        # invert ordering with a writer).
+        """Remaining TTL in **seconds** for *key*, or ``None`` if gone/expired.
+
+        Pure inspection — no eviction side-effect. (The previous
+        evict-on-expired variant raced with concurrent refresh and
+        could drop a freshly-set value; lazy eviction happens in
+        ``get`` and the background sweep.)
+        """
         entry = self._store.get(key)
         if entry is None:
             return None
-        value, expires_at = entry
+        _, expires_at = entry
         if expires_at is None:
             return None  # non-expiring
         remaining_ns = expires_at - now_utc_ns()
-        if remaining_ns > 0:
-            return remaining_ns / 1_000_000_000
-        # Expired — try to drop atomically; only fire the callback
-        # if we won the race against a concurrent remover.
-        removed = self._store.pop(key, ...)
-        if removed is not ...:
-            self._notify_evicted([(key, removed[0])])  # type: ignore[index]
-        return None
+        if remaining_ns <= 0:
+            return None
+        return remaining_ns / 1_000_000_000
 
     def ttl_ns(self, key: K) -> Optional[int]:
         """Remaining TTL in **nanoseconds** for *key*, or ``None``."""
         entry = self._store.get(key)
         if entry is None:
             return None
-        value, expires_at = entry
+        _, expires_at = entry
         if expires_at is None:
             return None
         remaining = expires_at - now_utc_ns()
-        if remaining > 0:
-            return remaining
-        removed = self._store.pop(key, ...)
-        if removed is not ...:
-            self._notify_evicted([(key, removed[0])])  # type: ignore[index]
-        return None
+        if remaining <= 0:
+            return None
+        return remaining
 
     def keys(self) -> list[K]:
         # ``list(dict.items())`` is a single C call — atomic snapshot
