@@ -215,7 +215,49 @@ class StreamingPyFuncRunTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    # --- 8. Concurrent short runs -----------------------------------------
+    # --- 8. Runtime cleanup after completion -----------------------------
+
+    def test_runtime_cleanup_after_completion(self) -> None:
+        async def run() -> None:
+            settings = _make_settings(self.tmp_home)
+            _, pyfunc, pyfuncrun = _build_services(settings)
+            fid = await _register_func(pyfunc, "quick_clean", "print('done')\n")
+            resp = await pyfuncrun.create(PyFuncRunCreate(func_id=fid))
+            await pyfuncrun.wait(resp.run.id, timeout=10)
+            # The supervisor pops _runtimes before signaling completion, so by
+            # the time wait() returns the runtime must already be gone — no
+            # zombie deques / replay buffers accumulate across thousands of runs.
+            self.assertNotIn(resp.run.id, pyfuncrun._runtimes)
+            # The entry stays in history so /get and terminal replay still work.
+            entry = await pyfuncrun.get(resp.run.id)
+            self.assertEqual(entry.status, "completed")
+
+        asyncio.run(run())
+
+    # --- 9. Error event precedes complete --------------------------------
+
+    def test_error_event_precedes_complete(self) -> None:
+        async def run() -> None:
+            settings = _make_settings(self.tmp_home)
+            _, pyfunc, pyfuncrun = _build_services(settings)
+            fid = await _register_func(pyfunc, "slow_err", "import time\ntime.sleep(60)\n")
+            resp = await pyfuncrun.create(PyFuncRunCreate(func_id=fid, timeout=0.3))
+            event_types: list[str] = []
+            async for event in pyfuncrun.stream_logs(resp.run.id):
+                event_types.append(event["type"])
+                if event["type"] == "complete":
+                    break
+            self.assertIn("error", event_types)
+            self.assertIn("complete", event_types)
+            self.assertLess(
+                event_types.index("error"),
+                event_types.index("complete"),
+                f"error event must precede complete; got {event_types}",
+            )
+
+        asyncio.run(run())
+
+    # --- 10. Concurrent short runs ----------------------------------------
 
     def test_concurrent_short_runs(self) -> None:
         async def run() -> None:

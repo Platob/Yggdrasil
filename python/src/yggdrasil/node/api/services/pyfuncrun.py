@@ -32,7 +32,7 @@ from .pyfunc import PyFuncService
 
 LOGGER = logging.getLogger(__name__)
 
-_TERMINAL_EVENT_TYPES = {"complete", "error"}
+_TERMINAL_EVENT_TYPES = {"complete"}
 
 
 class _RunRuntime:
@@ -492,6 +492,13 @@ class PyFuncRunService:
                     success=(final.status == "completed"),
                 )
 
+            # Drop the runtime BEFORE signaling completion so wait()/cancel()
+            # callers observe a consistent terminal state. Existing subscriber
+            # generators keep their own reference and finish draining safely;
+            # new subscribers fall into the terminal replay path using the
+            # final entry.stdout / entry.stderr.
+            with self._lock:
+                self._runtimes.pop(run_id, None)
             runtime.completed.set()
             # Unblock any subscriber still waiting on the bus.
             for q in list(runtime.subscribers):
@@ -597,13 +604,8 @@ class PyFuncRunService:
             stdout_truncated=runtime.stdout_truncated,
             stderr_truncated=runtime.stderr_truncated,
         )
-        self._publish(runtime, {
-            "type": "complete",
-            "run_id": run_id,
-            "status": status,
-            "returncode": returncode,
-            "duration": duration,
-        })
+        # Emit error before complete so subscribers see both — complete is the
+        # only terminal event, so the subscription loop won't exit early.
         if error is not None:
             self._publish(runtime, {
                 "type": "error",
@@ -611,6 +613,13 @@ class PyFuncRunService:
                 "error": error,
                 "timestamp": entry.completed_at,
             })
+        self._publish(runtime, {
+            "type": "complete",
+            "run_id": run_id,
+            "status": status,
+            "returncode": returncode,
+            "duration": duration,
+        })
 
     def _terminate_process(self, proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:
