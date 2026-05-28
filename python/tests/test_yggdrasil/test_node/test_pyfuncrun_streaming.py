@@ -174,6 +174,8 @@ class StreamingPyFuncRunTests(unittest.TestCase):
             self.assertLess(elapsed, 3.0, f"timeout was supposed to fire in 0.5s, run took {elapsed:.2f}s total")
             self.assertEqual(final.status, "failed")
             self.assertIn("timed out", final.error or "")
+            # Make sure fractional-second timeouts aren't truncated to "0s".
+            self.assertIn("0.5", final.error or "")
 
         asyncio.run(run())
 

@@ -432,7 +432,7 @@ class PyFuncRunService:
                 self._finalize(
                     run_id, runtime, status="failed",
                     returncode=returncode, duration=duration,
-                    error=f"timed out after {timeout:.0f}s",
+                    error=f"timed out after {timeout:g}s",
                     outputs_path=outputs_path,
                 )
                 return
