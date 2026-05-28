@@ -451,7 +451,6 @@ class Volume(DatabricksPath):
             if not _looks_like_already_exists(exc):
                 raise
 
-    @property
     def exists(self) -> bool:
         """``True`` if this volume is reachable via the Unity Catalog API."""
         try:

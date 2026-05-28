@@ -442,7 +442,6 @@ class UCCatalog(DatabricksPath, Singleton):
     def infos(self) -> CatalogInfo:
         return self.read_infos()
 
-    @property
     def exists(self) -> bool:
         """``True`` if this catalog is reachable via the Unity Catalog API."""
         try:
