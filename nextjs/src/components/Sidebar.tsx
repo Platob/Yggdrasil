@@ -53,6 +53,15 @@ const Icons = {
       <line x1="6" y1="20" x2="6" y2="14" />
     </svg>
   ),
+  topology: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="5" r="2" />
+      <circle cx="5" cy="19" r="2" />
+      <circle cx="19" cy="19" r="2" />
+      <path d="M12 7v3M12 13L7 17M12 13l5 4" />
+      <circle cx="12" cy="12" r="1" fill="currentColor" />
+    </svg>
+  ),
 };
 
 const NAV_ITEMS = [
@@ -60,6 +69,7 @@ const NAV_ITEMS = [
   { href: "/", label: "Home", icon: Icons.home, exact: true },
   { href: "/metrics", label: "Metrics", icon: Icons.metrics },
   { href: "/nodes", label: "Nodes", icon: Icons.nodes },
+  { href: "/topology", label: "Topology", icon: Icons.topology },
   { href: "/dags", label: "DAGs", icon: Icons.dags },
   { href: "/chat", label: "Chat", icon: Icons.chat },
   { href: "/files", label: "Files", icon: Icons.files },

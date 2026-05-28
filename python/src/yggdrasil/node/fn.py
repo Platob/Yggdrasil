@@ -74,6 +74,7 @@ from typing import Any, Callable, TypeVar, overload
 __all__ = [
     "function", "dag", "schedule", "on_node",
     "step", "pipeline", "cron", "auto_dispatch",
+    "parallel", "cache",
     "FunctionHandle", "FunctionRun", "DagHandle",
     "get_input", "set_output",
 ]
@@ -1016,3 +1017,86 @@ def auto_dispatch(handle):
 
     handle.__call__ = smart_call
     return handle
+
+
+def parallel(func=None, *, max_workers: int | None = None):
+    """Wrap a function to fan-out across the cluster when called with a list.
+
+    Usage::
+
+        @parallel
+        @function
+        def process(item): return item * 2
+
+        # Calling with a list dispatches each item to a peer node
+        runs = process([1, 2, 3, 4, 5])
+        results = [r.wait() for r in runs]
+    """
+    def _wrap(handle):
+        if not isinstance(handle, FunctionHandle):
+            raise TypeError("@parallel must wrap a @function-decorated function")
+        original_call = handle.__call__
+
+        def parallel_call(*args, **kwargs):
+            # If single arg is a list, dispatch each element
+            if len(args) == 1 and isinstance(args[0], list):
+                items = args[0]
+                runs = []
+                # Get peer list once
+                try:
+                    url = _local_url()
+                    peers_resp = urllib.request.urlopen(f"{url}/api/v2/network/peers", timeout=2)
+                    peers = json.loads(peers_resp.read()).get("peers", [])
+                except Exception:
+                    peers = []
+
+                for i, item in enumerate(items):
+                    if peers and (i < max_workers if max_workers else len(items)):
+                        # Round-robin dispatch to peers
+                        peer = peers[i % len(peers)]
+                        peer_url = f"http://{peer['host']}:{peer['port']}"
+                        runs.append(handle.on(peer_url).__call__(item, **kwargs))
+                    else:
+                        runs.append(original_call(item, **kwargs))
+                return runs
+            return original_call(*args, **kwargs)
+
+        handle.__call__ = parallel_call
+        return handle
+
+    if func is not None:
+        return _wrap(func)
+    return _wrap
+
+
+def cache(handle=None, *, ttl_seconds: float = 300.0):
+    """Cache function results by (args, kwargs) for ttl_seconds.
+
+    Usage::
+
+        @cache(ttl_seconds=60)
+        @function
+        def expensive_lookup(key): ...
+    """
+    def _wrap(h):
+        if not isinstance(h, FunctionHandle):
+            raise TypeError("@cache must wrap a @function-decorated function")
+        cache_store: dict = {}  # (args_tuple, kwargs_frozenset) -> (run, expires_at)
+        original_call = h.__call__
+
+        def cached_call(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            now = time.monotonic()
+            cached = cache_store.get(key)
+            if cached and cached[1] > now:
+                return cached[0]
+            run = original_call(*args, **kwargs)
+            cache_store[key] = (run, now + ttl_seconds)
+            return run
+
+        h.__call__ = cached_call
+        return h
+
+    if handle is not None:
+        return _wrap(handle)
+    return _wrap
