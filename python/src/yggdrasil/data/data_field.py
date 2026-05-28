@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
+import logging
 import os
 import pathlib
 from collections import OrderedDict
@@ -69,6 +70,45 @@ __all__ = [
 # ======================================================================
 # Module-level constants & private helpers
 # ======================================================================
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _short_type_name(obj: Any) -> str:
+    """Short type-name head for debug logging — drops nested children.
+
+    Renders ``int64`` as-is but collapses ``list<item: int64>`` →
+    ``list``, ``Struct({"a": Int32})`` → ``Struct``, ``ARRAY[INT]`` →
+    ``ARRAY`` so per-cast debug lines stay readable when nested dtypes
+    would otherwise dump their full schema metadata into the log.
+    """
+    s = str(obj)
+    for sep in ("<", "(", "["):
+        i = s.find(sep)
+        if i > 0:
+            s = s[:i]
+    return s.strip()
+
+
+def _log_field_cast(method: str, field: "Field", source: Any, length: int) -> None:
+    """Compact one-line DEBUG log for a Field-level cast.
+
+    Only call from inside an ``isEnabledFor(DEBUG)`` guard — the source
+    type extraction and length lookup are cheap but pointless when
+    debug is off, and the cast path is hot enough that paying for them
+    unconditionally is measurable.
+    """
+    src_type = getattr(source, "type", None) or getattr(source, "dtype", None)
+    if src_type is None:
+        src_type = type(source).__name__
+    LOGGER.debug(
+        "%s field=%r %s -> %s rows=%d",
+        method, field.name,
+        _short_type_name(src_type),
+        field.type_id.name.lower(),
+        length,
+    )
+
 
 _TYPE_JSON_METADATA_KEY = b"type_json"
 #: ``str`` form of the ``type_json`` key. Spark stores metadata
@@ -3408,6 +3448,8 @@ class Field(BaseChildrenFields):
             return array
         options = get_cast_options_class().check(options=options, **more)
         scoped = options.with_target(self)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            _log_field_cast("cast_arrow_array", self, array, len(array))
         # Wrap any inner failure in CastError carrying the *current*
         # field as the target.  Nested rebuilds (struct / list / map
         # children, tabular per-column) all funnel through this method
@@ -3445,6 +3487,8 @@ class Field(BaseChildrenFields):
             return table
         options = get_cast_options_class().check(options=options, **more)
         scoped = options.with_target(self)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            _log_field_cast("cast_arrow_tabular", self, table, table.num_rows)
         # Per-column failures raise CastError from the inner
         # ``cast_arrow_array`` wrap — that's the atomic field-level
         # context the caller wants. Don't re-wrap here: a tabular-level
@@ -3475,6 +3519,11 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return iter(batches)
         options = get_cast_options_class().check(options=options, **more)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "cast_arrow_batch_iterator field=%r -> %s",
+                self.name, self.type_id.name.lower(),
+            )
         return self.to_struct().dtype.cast_arrow_batch_iterator(
             batches, options=options.with_target(self)
         )
@@ -3489,6 +3538,8 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return series
         options = get_cast_options_class().check(options=options, **more)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            _log_field_cast("cast_polars_series", self, series, len(series))
         casted = self.dtype.cast_polars_series(
             series, options=options.with_target(self)
         )
@@ -3516,6 +3567,13 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return data
         options = get_cast_options_class().check(options=options, **more)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            # ``LazyFrame`` has no row count without collecting — fall
+            # back to -1 so the log line stays one shape across both.
+            length = getattr(data, "height", None)
+            if length is None:
+                length = -1
+            _log_field_cast("cast_polars_tabular", self, data, length)
         casted = self.to_struct().dtype.cast_polars_tabular(
             data, options=options.with_target(self)
         )
@@ -3531,6 +3589,8 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return series
         options = get_cast_options_class().check(options=options, **more)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            _log_field_cast("cast_pandas_series", self, series, len(series))
         casted = self.dtype.cast_pandas_series(
             series, options=options.with_target(self)
         )
@@ -3545,6 +3605,8 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return data
         options = get_cast_options_class().check(options=options, **more)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            _log_field_cast("cast_pandas_tabular", self, data, len(data))
         casted = self.dtype.cast_pandas_tabular(data, options=options.with_target(self))
         return self.finalize_pandas(casted)
 
@@ -3559,6 +3621,11 @@ class Field(BaseChildrenFields):
             return column
         options = get_cast_options_class().check(options=options, **more)
         options = options.with_target(self).check_source(column)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "cast_spark_column field=%r -> %s",
+                self.name, self.type_id.name.lower(),
+            )
         casted = self.dtype.cast_spark_column(column, options=options)
         return self.finalize_spark_column(casted, default_scalar=default_scalar)
 
@@ -3571,6 +3638,13 @@ class Field(BaseChildrenFields):
         if self.dtype.type_id == DataTypeId.OBJECT:
             return data
         options = get_cast_options_class().check(options=options, **more)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            # Spark DataFrames don't expose row count without an action
+            # — skip the row count and just log the field/dtype pair.
+            LOGGER.debug(
+                "cast_spark_tabular field=%r -> %s",
+                self.name, self.type_id.name.lower(),
+            )
         casted = self.dtype.cast_spark_tabular(data, options=options.with_target(self))
         return self.finalize_spark(casted)
 
