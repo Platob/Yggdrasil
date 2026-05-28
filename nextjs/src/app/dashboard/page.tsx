@@ -2,8 +2,8 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
-import { getStats, getAudit, createFunc } from "@/lib/api";
-import type { ClusterStats, AuditEntry } from "@/lib/types";
+import { getStats, getAudit, createFunc, getHealth } from "@/lib/api";
+import type { ClusterStats, AuditEntry, HealthResponse } from "@/lib/types";
 
 // ── Format uptime as "2d 4h" or "12m" etc. ───────────────────
 function formatUptime(seconds: number): string {
@@ -153,9 +153,44 @@ function opStyle(op: string): { bg: string; text: string } {
   return { bg: "rgba(103,232,249,0.1)", text: "var(--frost)" };
 }
 
+// ── Health colour map ──────────────────────────────────────
+function healthStyle(status: string): { dot: string; text: string; label: string } {
+  if (status === "healthy" || status === "ok") {
+    return { dot: "var(--emerald)", text: "var(--emerald)", label: "Healthy" };
+  }
+  if (status === "degraded" || status === "warning") {
+    return { dot: "var(--amber)", text: "var(--amber)", label: "Degraded" };
+  }
+  return { dot: "var(--rose)", text: "var(--rose)", label: "Down" };
+}
+
+// ── Mini Sparkline (cluster pulse) ─────────────────────────
+function PulseSparkline({ values, color }: { values: number[]; color: string }) {
+  if (values.length === 0) return null;
+  const max = Math.max(...values, 1);
+  return (
+    <div className="flex items-end gap-[3px] h-10">
+      {values.map((v, i) => (
+        <div
+          key={i}
+          className="flex-1 rounded-sm transition-all duration-300"
+          style={{
+            height: `${Math.max(3, (v / max) * 40)}px`,
+            background: color,
+            opacity: 0.3 + (i / Math.max(1, values.length - 1)) * 0.7,
+            boxShadow: i === values.length - 1 ? `0 0 6px ${color}` : "none",
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
 export default function DashboardPage() {
   const [stats, setStats] = useState<ClusterStats | null>(null);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [pulseHistory, setPulseHistory] = useState<number[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
@@ -170,6 +205,8 @@ export default function DashboardPage() {
     try {
       const s = await getStats();
       setStats(s);
+      // Keep a rolling 30-sample history of active_runs for the pulse widget.
+      setPulseHistory((prev) => [...prev.slice(-29), s.active_runs]);
       setError(false);
     } catch {
       setError(true);
@@ -184,6 +221,15 @@ export default function DashboardPage() {
       setAudit(a.entries);
     } catch {
       // Silently ignore audit errors
+    }
+  }, []);
+
+  const fetchHealth = useCallback(async () => {
+    try {
+      const h = await getHealth();
+      setHealth(h);
+    } catch {
+      setHealth({ status: "down", node_id: "", checks: {} });
     }
   }, []);
 
@@ -212,7 +258,8 @@ export default function DashboardPage() {
   useEffect(() => {
     fetchStats();
     fetchAudit();
-  }, [fetchStats, fetchAudit]);
+    fetchHealth();
+  }, [fetchStats, fetchAudit, fetchHealth]);
 
   // Poll stats every 3s
   useEffect(() => {
@@ -225,6 +272,12 @@ export default function DashboardPage() {
     const id = setInterval(fetchAudit, 5000);
     return () => clearInterval(id);
   }, [fetchAudit]);
+
+  // Poll health every 10s
+  useEffect(() => {
+    const id = setInterval(fetchHealth, 10000);
+    return () => clearInterval(id);
+  }, [fetchHealth]);
 
   if (loading) {
     return (
@@ -270,10 +323,60 @@ export default function DashboardPage() {
             <span className="font-mono">{stats.node_id}</span> overview
           </p>
         </div>
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.06]">
-          <span className="w-1.5 h-1.5 rounded-full status-online" />
-          <span className="text-[11px] font-mono text-muted">Live - 3s</span>
+        <div className="flex items-center gap-2">
+          {/* Health badge */}
+          {health && (() => {
+            const hs = healthStyle(health.status);
+            return (
+              <div
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.06]"
+                title={Object.entries(health.checks)
+                  .map(([k, v]) => `${k}: ${v.status}`)
+                  .join(" • ")}
+              >
+                <span
+                  className="w-1.5 h-1.5 rounded-full"
+                  style={{ background: hs.dot, boxShadow: `0 0 8px ${hs.dot}` }}
+                />
+                <span className="text-[11px] font-mono" style={{ color: hs.text }}>
+                  {hs.label}
+                </span>
+              </div>
+            );
+          })()}
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.06]">
+            <span className="w-1.5 h-1.5 rounded-full status-online" />
+            <span className="text-[11px] font-mono text-muted">Live - 3s</span>
+          </div>
         </div>
+      </div>
+
+      {/* Cluster Pulse widget — recent active_runs sparkline */}
+      <div className="relative runic-card p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+            </svg>
+            Cluster Pulse
+          </h2>
+          <div className="flex items-baseline gap-2">
+            <span
+              className="text-2xl font-bold font-mono gradient-frost"
+              style={{ color: stats.active_runs > 0 ? "var(--amber)" : undefined }}
+            >
+              {stats.active_runs}
+            </span>
+            <span className="text-[10px] text-muted uppercase tracking-widest">active</span>
+          </div>
+        </div>
+        <PulseSparkline
+          values={pulseHistory}
+          color={stats.active_runs > 0 ? "var(--amber)" : "var(--frost)"}
+        />
+        <p className="text-[10px] text-muted/60 font-mono mt-2 text-right">
+          last {pulseHistory.length} samples &middot; 3s interval
+        </p>
       </div>
 
       {/* Quick Actions row */}
@@ -452,12 +555,49 @@ export default function DashboardPage() {
 
             <div className="space-y-1.5">
               <label className="text-[10px] text-muted uppercase tracking-wider font-medium">Code</label>
-              <textarea
-                value={newFuncCode}
-                onChange={(e) => setNewFuncCode(e.target.value)}
-                rows={10}
-                className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-xs font-mono text-foreground placeholder-muted/50 outline-none focus:border-frost/30 transition-colors resize-none"
-              />
+              {/* Code editor pane — fake gutter (line numbers) + monospace dark textarea. */}
+              <div className="rounded-lg overflow-hidden border border-white/[0.08] bg-[#0a0a14]">
+                {/* Editor toolbar */}
+                <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/[0.06] bg-white/[0.02]">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-rose/60" />
+                    <span className="w-2 h-2 rounded-full bg-amber/60" />
+                    <span className="w-2 h-2 rounded-full bg-emerald/60" />
+                    <span className="ml-2 text-[10px] uppercase tracking-widest font-bold text-frost">
+                      Python
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-mono text-muted/60">
+                    {newFuncCode.split("\n").length} lines &middot; 80 cols
+                  </span>
+                </div>
+                {/* Gutter + textarea */}
+                <div className="relative flex">
+                  {/* Line numbers gutter */}
+                  <div
+                    aria-hidden
+                    className="select-none text-right text-[11px] font-mono text-muted/40 leading-[1.5] py-3 pl-3 pr-2 border-r border-white/[0.05] bg-black/30"
+                    style={{ minWidth: "2.4rem" }}
+                  >
+                    {newFuncCode.split("\n").map((_, i) => (
+                      <div key={i}>{i + 1}</div>
+                    ))}
+                  </div>
+                  <textarea
+                    value={newFuncCode}
+                    onChange={(e) => setNewFuncCode(e.target.value)}
+                    rows={12}
+                    spellCheck={false}
+                    wrap="off"
+                    cols={80}
+                    className="flex-1 bg-transparent px-3 py-3 text-[12px] font-mono text-foreground placeholder-muted/50 outline-none resize-none leading-[1.5] overflow-x-auto"
+                    style={{
+                      caretColor: "var(--frost)",
+                      tabSize: 4,
+                    }}
+                  />
+                </div>
+              </div>
             </div>
 
             {newFuncError && <p className="text-xs text-rose font-mono">{newFuncError}</p>}

@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
-import { getMetrics } from "@/lib/api";
-import type { MetricsResponse } from "@/lib/types";
+import { useEffect, useState, useCallback, useRef } from "react";
+import { getMetrics, getAudit } from "@/lib/api";
+import type { MetricsResponse, AuditEntry } from "@/lib/types";
 
 // ── Relative time ────────────────────────────────────────────
 function timeAgo(ts: string | null): string {
@@ -61,10 +61,21 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+// ── Per-op terminal colour ───────────────────────────────────
+function opColor(op: string): string {
+  if (op === "create") return "var(--emerald)";
+  if (op === "update") return "var(--frost)";
+  if (op === "delete") return "var(--rose)";
+  return "var(--foreground-dim)";
+}
+
 export default function MetricsPage() {
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const consoleRef = useRef<HTMLDivElement>(null);
+  const [autoScroll, setAutoScroll] = useState(true);
 
   const fetchMetrics = useCallback(async () => {
     try {
@@ -78,11 +89,34 @@ export default function MetricsPage() {
     }
   }, []);
 
+  const fetchAudit = useCallback(async () => {
+    try {
+      const a = await getAudit(20);
+      // Newest first from the API — render oldest -> newest for terminal feel.
+      setAudit([...a.entries].reverse());
+    } catch {
+      // Silently ignore audit errors
+    }
+  }, []);
+
   useEffect(() => {
     fetchMetrics();
     const id = setInterval(fetchMetrics, 5000);
     return () => clearInterval(id);
   }, [fetchMetrics]);
+
+  useEffect(() => {
+    fetchAudit();
+    const id = setInterval(fetchAudit, 2000);
+    return () => clearInterval(id);
+  }, [fetchAudit]);
+
+  // Auto-scroll console to bottom on new entries when enabled.
+  useEffect(() => {
+    if (autoScroll && consoleRef.current) {
+      consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
+    }
+  }, [audit, autoScroll]);
 
   if (loading) {
     return (
@@ -252,7 +286,7 @@ export default function MetricsPage() {
         </div>
 
         {/* Recent runs */}
-        <div className="runic-card p-5 space-y-3">
+        <div className="runic-card p-5 space-y-3 lg:col-span-1">
           <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <line x1="12" y1="2" x2="12" y2="6" />
@@ -292,6 +326,69 @@ export default function MetricsPage() {
               })}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* ── Live Console — terminal-style audit stream ───────── */}
+      <div className="relative runic-card p-5 space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="4 17 10 11 4 5" />
+              <line x1="12" y1="19" x2="20" y2="19" />
+            </svg>
+            Live Console
+            <span className="relative flex h-2 w-2 ml-1">
+              <span
+                className="absolute inline-flex h-full w-full rounded-full opacity-75"
+                style={{ background: "var(--emerald)", animation: "pulse-frost 1.5s ease-in-out infinite" }}
+              />
+              <span className="relative inline-flex rounded-full h-2 w-2" style={{ background: "var(--emerald)" }} />
+            </span>
+          </h2>
+          <label className="flex items-center gap-1.5 text-[10px] text-muted font-mono cursor-pointer">
+            <input
+              type="checkbox"
+              checked={autoScroll}
+              onChange={(e) => setAutoScroll(e.target.checked)}
+              className="accent-frost"
+            />
+            auto-scroll
+          </label>
+        </div>
+        <div
+          ref={consoleRef}
+          className="font-mono text-[11px] leading-relaxed rounded-lg bg-[#04040b] border border-white/[0.06] p-3 h-64 overflow-y-auto"
+        >
+          {audit.length === 0 ? (
+            <p className="text-muted/40 italic">No events yet — waiting for activity...</p>
+          ) : (
+            audit.map((entry, i) => (
+              <div
+                key={`${entry.asset_id}-${entry.timestamp}-${i}`}
+                className="whitespace-nowrap"
+              >
+                <span className="text-muted/60">[{entry.timestamp}]</span>{" "}
+                <span style={{ color: opColor(entry.operation) }}>{entry.operation}</span>{" "}
+                <span className="text-foreground-dim">{entry.asset_type}</span>{" "}
+                <span className="text-muted">#{entry.asset_id}</span>
+                {entry.detail && (
+                  <>
+                    {" "}
+                    <span className="text-muted/70">({entry.detail})</span>
+                  </>
+                )}
+              </div>
+            ))
+          )}
+          {/* Blinking caret at the bottom */}
+          <span
+            className="inline-block w-2 h-3 align-middle"
+            style={{
+              background: "var(--frost)",
+              animation: "pulse-frost 1s steps(1) infinite",
+            }}
+          />
         </div>
       </div>
     </div>
