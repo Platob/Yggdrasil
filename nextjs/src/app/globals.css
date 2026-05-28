@@ -1,0 +1,257 @@
+@import "tailwindcss";
+
+/* ── Nordic dark theme tokens ──────────────────────────────── */
+:root {
+  --background: #050510;
+  --background-elevated: #0a0a1a;
+  --foreground: #e4e2df;
+  --foreground-dim: #9a9894;
+  --muted: #5a5856;
+  --border: #1a1a2e;
+  --border-accent: #2a2a42;
+  --card: #0c0c1e;
+  --card-hover: #12122a;
+  --sidebar-bg: #06060f;
+  --sidebar-border: #141428;
+  --frost: #67e8f9;
+  --frost-dim: #22d3ee;
+  --frost-glow: rgba(103, 232, 249, 0.15);
+  --emerald: #34d399;
+  --emerald-glow: rgba(52, 211, 153, 0.15);
+  --amber: #fbbf24;
+  --amber-glow: rgba(251, 191, 36, 0.15);
+  --rose: #f43f5e;
+  --rose-glow: rgba(244, 63, 94, 0.15);
+  --primary: #67e8f9;
+  --primary-dim: #22d3ee;
+  --primary-glow: rgba(103, 232, 249, 0.12);
+  --radius: 0.75rem;
+  --radius-sm: 0.5rem;
+  --radius-lg: 1rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-background-elevated: var(--background-elevated);
+  --color-foreground: var(--foreground);
+  --color-foreground-dim: var(--foreground-dim);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-border-accent: var(--border-accent);
+  --color-card: var(--card);
+  --color-card-hover: var(--card-hover);
+  --color-sidebar-bg: var(--sidebar-bg);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-frost: var(--frost);
+  --color-frost-dim: var(--frost-dim);
+  --color-frost-glow: var(--frost-glow);
+  --color-emerald: var(--emerald);
+  --color-emerald-glow: var(--emerald-glow);
+  --color-amber: var(--amber);
+  --color-amber-glow: var(--amber-glow);
+  --color-rose: var(--rose);
+  --color-rose-glow: var(--rose-glow);
+  --color-primary: var(--primary);
+  --color-primary-dim: var(--primary-dim);
+  --color-primary-glow: var(--primary-glow);
+}
+
+/* ── Base ──────────────────────────────────────────────────── */
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+::selection {
+  background: var(--frost);
+  color: #000;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-accent);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+/* ── Animations ───────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-in {
+  animation: fadeIn 0.5s ease-out;
+}
+
+@keyframes pulse-frost {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.pulse-frost {
+  animation: pulse-frost 2s ease-in-out infinite;
+}
+
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: 0 0 8px var(--frost-glow); }
+  50% { box-shadow: 0 0 24px var(--frost-glow), 0 0 48px var(--frost-glow); }
+}
+.glow-pulse {
+  animation: glow-pulse 3s ease-in-out infinite;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+.float {
+  animation: float 6s ease-in-out infinite;
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+.spin-slow {
+  animation: spin-slow 20s linear infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ── Glassmorphism card ───────────────────────────────────── */
+.glass-card {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-lg);
+  transition: all 0.2s ease;
+}
+.glass-card:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* ── Status dots ──────────────────────────────────────────── */
+.status-online {
+  background: var(--emerald);
+  box-shadow: 0 0 8px var(--emerald-glow);
+}
+.status-offline {
+  background: var(--rose);
+  box-shadow: 0 0 8px var(--rose-glow);
+}
+.status-pending {
+  background: var(--amber);
+  box-shadow: 0 0 8px var(--amber-glow);
+  animation: pulse-frost 1.5s ease-in-out infinite;
+}
+
+/* ── Subtle noise texture overlay ─────────────────────────── */
+.noise-bg::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  opacity: 0.02;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  pointer-events: none;
+}
+
+/* ── Stellar / Nordic effects ─────────────────────────── */
+@keyframes aurora {
+  0%, 100% { transform: translateX(-10%) translateY(0); opacity: 0.4; }
+  50% { transform: translateX(10%) translateY(-5%); opacity: 0.7; }
+}
+.aurora-bg {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(103,232,249,0.08), rgba(52,211,153,0.05), rgba(168,85,247,0.06));
+  filter: blur(60px);
+  animation: aurora 20s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes twinkle {
+  0%, 100% { opacity: 0.3; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+.twinkle { animation: twinkle 3s ease-in-out infinite; }
+
+@keyframes constellation {
+  0% { stroke-dashoffset: 100; }
+  100% { stroke-dashoffset: 0; }
+}
+.constellation-line {
+  stroke-dasharray: 100;
+  animation: constellation 3s ease-out forwards;
+}
+
+/* Runic border effect for cards */
+.runic-card {
+  position: relative;
+  background: rgba(255,255,255,0.03);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(103,232,249,0.15);
+  border-radius: 1rem;
+}
+.runic-card::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  background: linear-gradient(135deg, rgba(103,232,249,0.3), transparent 50%, rgba(168,85,247,0.2));
+  border-radius: 1rem;
+  z-index: -1;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.runic-card:hover::before { opacity: 1; }
+
+/* Glow text */
+.glow-frost { text-shadow: 0 0 20px rgba(103,232,249,0.5); }
+.glow-emerald { text-shadow: 0 0 20px rgba(52,211,153,0.5); }
+.glow-amber { text-shadow: 0 0 20px rgba(251,191,36,0.5); }
+
+/* Gradient text */
+.gradient-frost {
+  background: linear-gradient(135deg, #67e8f9, #34d399);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* ── Brain pulse effects ──────────────────────────────────── */
+@keyframes neural-pulse {
+  0%, 100% { opacity: 0.6; box-shadow: 0 0 8px var(--frost-glow); }
+  50% { opacity: 1; box-shadow: 0 0 24px var(--frost-glow), 0 0 48px var(--frost-glow); }
+}
+.neural-pulse { animation: neural-pulse 2s ease-in-out infinite; }
+
+@keyframes synapse-fire {
+  0% { opacity: 0; transform: scale(0.5); }
+  20% { opacity: 1; transform: scale(1.1); }
+  100% { opacity: 0; transform: scale(2); }
+}
+.synapse-fire { animation: synapse-fire 1.5s ease-out infinite; }
+
+/* Brain wave background */
+@keyframes brain-wave {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+.brain-wave-bg {
+  background: linear-gradient(120deg, rgba(103,232,249,0.04), rgba(168,85,247,0.04), rgba(52,211,153,0.04));
+  background-size: 200% 200%;
+  animation: brain-wave 15s ease-in-out infinite;
+}

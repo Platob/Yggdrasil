@@ -30,11 +30,17 @@ def _launchd_dir() -> Path:
     return Path.home() / "Library" / "LaunchAgents"
 
 
+def is_service_installed(settings: Settings | None = None) -> bool:
+    settings = settings or get_settings()
+    if is_linux():
+        return (_systemd_dir() / _SYSTEMD_UNIT).exists()
+    if is_macos():
+        return (_launchd_dir() / f"{_LAUNCHD_LABEL}.plist").exists()
+    return False
+
+
 def _systemd_unit_content(settings: Settings) -> str:
     python = _python_executable()
-    node_home = settings.node_home
-    front_home = settings.front_home
-    npm = shutil.which("npm") or ""
 
     lines = [
         "[Unit]",
@@ -46,8 +52,9 @@ def _systemd_unit_content(settings: Settings) -> str:
         f"ExecStart={python} -m yggdrasil.node.main",
         f"Environment=YGG_NODE_PORT={settings.port}",
         f"Environment=YGG_NODE_HOST={settings.host}",
-        f"Environment=YGG_NODE_HOME={node_home}",
-        f"Environment=YGG_NODE_FRONT_HOME={front_home}",
+        f"Environment=YGG_NODE_HOME={settings.node_home}",
+        f"Environment=YGG_NODE_NODE_ID={settings.node_id}",
+        f"Environment=YGG_NODE_FRONT_HOME={settings.front_home}",
         "Environment=YGG_NODE_ALLOW_REMOTE=1",
         f"Environment=PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
         "Restart=on-failure",

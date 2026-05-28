@@ -104,11 +104,10 @@ def get_node_url(settings: Settings | None = None) -> str:
     return f"http://127.0.0.1:{settings.port}"
 
 
-def spawn_node(settings: Settings | None = None, *, allow_remote: bool = False) -> tuple[int, int]:
-    """Ensure a bot is running. Returns (pid, port).
+def spawn_node(settings: Settings | None = None, *, host: str = "0.0.0.0") -> tuple[int, int]:
+    """Ensure a node is running. Returns (pid, port).
 
-    If a bot is already running, returns its pid/port.
-    Otherwise spawns a new background process.
+    Defaults to public binding (0.0.0.0) with remote access enabled.
     """
     settings = settings or get_settings()
     ensure_directories(settings)
@@ -124,9 +123,10 @@ def spawn_node(settings: Settings | None = None, *, allow_remote: bool = False) 
 
     env = os.environ.copy()
     env["YGG_NODE_PORT"] = str(port)
+    env["YGG_NODE_HOST"] = host
     env["YGG_NODE_HOME"] = str(settings.node_home)
-    if allow_remote:
-        env["YGG_NODE_ALLOW_REMOTE"] = "1"
+    env["YGG_NODE_NODE_ID"] = settings.node_id
+    env["YGG_NODE_ALLOW_REMOTE"] = "1"
 
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(

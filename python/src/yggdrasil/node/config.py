@@ -8,22 +8,38 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+_NODE_ID_FILE = ".ygg_node_id"
 
-def _user_key() -> str:
-    raw = f"{os.getlogin() if hasattr(os, 'login') else 'user'}-{platform.node()}"
+
+def _stable_node_id() -> str:
+    """Return a stable node ID, persisted in ~/.node/.ygg_node_id.
+
+    On first call generates ``{hostname}-{8hex}`` and writes it to disk.
+    Subsequent calls return the same ID. Override with YGG_NODE_NODE_ID env var.
+    """
+    env_id = os.getenv("YGG_NODE_NODE_ID")
+    if env_id:
+        return env_id
+
+    node_root = Path.home() / ".node"
+    id_file = node_root / _NODE_ID_FILE
+    if id_file.exists():
+        try:
+            return id_file.read_text().strip()
+        except OSError:
+            pass
+
+    node_id = f"{platform.node()}-{uuid.uuid4().hex[:8]}"
+    node_root.mkdir(parents=True, exist_ok=True)
     try:
-        raw = os.getlogin() + "@" + platform.node()
+        id_file.write_text(node_id)
     except OSError:
-        raw = os.environ.get("USER", os.environ.get("USERNAME", "user")) + "@" + platform.node()
-    return hashlib.sha256(raw.encode()).hexdigest()[:12]
+        pass
+    return node_id
 
 
 def _node_home() -> Path:
-    return Path.home() / ".ygg" / _user_key()
-
-
-def _default_node_id() -> str:
-    return os.getenv("YGG_NODE_NODE_ID", f"{platform.node()}-{uuid.uuid4().hex[:8]}")
+    return Path.home() / ".node" / _stable_node_id()
 
 
 def _find_open_port(start: int = 8100, end: int = 8200) -> int:
@@ -40,7 +56,7 @@ def _find_open_port(start: int = 8100, end: int = 8200) -> int:
 
 
 def _default_front_home() -> Path:
-    return Path(__file__).resolve().parents[4] / "next" / "ygg"
+    return Path(__file__).resolve().parents[4] / "nextjs"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +71,7 @@ class Settings:
     redoc_url: str = "/redoc"
     openapi_url: str = "/openapi.json"
     api_prefix: str = "/api"
-    node_id: str = field(default_factory=_default_node_id)
+    node_id: str = field(default_factory=_stable_node_id)
     node_home: Path = field(default_factory=_node_home)
     front_home: Path = field(default_factory=_default_front_home)
     max_cmd_timeout: float = 300.0
@@ -119,7 +135,7 @@ def get_settings() -> Settings:
         redoc_url=os.getenv("YGG_NODE_REDOC_URL", "/redoc"),
         openapi_url=os.getenv("YGG_NODE_OPENAPI_URL", "/openapi.json"),
         api_prefix=os.getenv("YGG_NODE_API_PREFIX", "/api"),
-        node_id=_default_node_id(),
+        node_id=_stable_node_id(),
         node_home=Path(
             os.getenv("YGG_NODE_HOME", str(_node_home()))
         ).expanduser().resolve(),

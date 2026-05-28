@@ -58,7 +58,9 @@ def get_run_service(request: Request) -> RunService:
 
 
 def get_dag_service(request: Request) -> DagService:
-    return request.app.state.dag_service
+    # In the combined app the v2 service owns state.dag_service; v1 sits
+    # at state.v1_dag_service. In the v1-only app there's just one.
+    return getattr(request.app.state, "v1_dag_service", request.app.state.dag_service)
 
 
 def get_filesystem_service(request: Request) -> FilesystemService:

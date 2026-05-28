@@ -2,6 +2,45 @@
 
 Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 
+## Coding Style
+
+1. **Inline over micro-functions** — prefer inlining logic directly where it's used. Don't extract one-liner helpers, don't create utility functions called from a single site, don't wrap stdlib calls in project-specific wrappers. A 15-line method is better than 5 three-line functions calling each other. Extract only when the same logic appears 3+ times or the extracted function has genuine standalone semantics (e.g. `make_id`, `serialize_result`).
+2. **Flat call stacks** — avoid deep delegation chains like `router → service → helper → sub-helper → util`. Routers call services. Services do the work. Two levels max for the common path.
+3. **No defensive wrappers** — don't wrap `json.loads` in a `safe_parse_json`, don't wrap `Path.mkdir` in an `ensure_dir`. Call stdlib directly. Handle errors at the boundary where they matter.
+4. **No premature abstraction** — three similar blocks of code is fine. A `BaseService` with one subclass is not. Don't create interfaces, registries, or plugin systems until the third concrete user exists.
+5. **Collocate related code** — keep schemas, service logic, and the router for one concept readable together. Jumping between 5 files to understand one endpoint is worse than a 200-line service file.
+6. **Delete dead code** — no commented-out blocks, no `# TODO: maybe later`, no unused imports. If it's not called, it doesn't exist.
+7. **Prefer data over code** — dicts and lists over class hierarchies. Pydantic models over hand-rolled validation. Enum values over if/elif chains.
+
+## Communication & Transport
+
+1. **Arrow IPC for tabular data** — all structured data between nodes uses `application/vnd.apache.arrow.stream`. Use `transport.serialize_result` / `deserialize_result` which auto-dispatches: Arrow for tables/dataframes, yggdrasil pickle for complex Python objects.
+2. **Stream everything** — SSE for logs, metrics, run state. Chunked HTTP for file transfer (64KB). Never buffer an entire large response in memory. Use `StreamingResponse` + async generators.
+3. **Lazy by default** — don't fetch what you don't need. Directory listings are lazy (click to expand). File contents only on demand. Peer metadata cached with TTL, refreshed on access. Cache small payloads (<4MB) in `ExpiringDict`, stream anything larger.
+4. **Connection pooling** — reuse `httpx.AsyncClient` per peer node instead of creating one per request. The `NetworkService` owns the pool.
+5. **Content-addressed assets** — every asset (PyFunc, PyEnv, DAG) has a `content_hash` (sha256 of defining content). Two assets with the same hash are identical regardless of which node created them. Use hash for fast replication diff: only replicate what changed.
+
+## Asset Design
+
+1. **Self-describing** — every asset carries all metadata to rebuild it anywhere: code, dependencies, python version, content hash. No external references that can't be resolved.
+2. **Cross-references by hash** — when a PyFuncRun references a PyFunc and PyEnv, it stores their content hashes. A receiving node can verify it has the right versions or request them.
+3. **Multi-Python via uv** — `PyEnv` specifies `python_version` (3.11, 3.12, 3.13). `uv venv --python X.Y` creates isolated envs. Code is replicable across nodes with different system Pythons because uv downloads the right interpreter.
+4. **Dependency inference** — `@function` decorator infers dependencies from AST import analysis. Explicitly listed deps override inference. Dependencies are part of the content hash.
+
+## Permissions
+
+1. **User identity** — every request carries a user identity (sha256 hash of key+hostname). `UserService` auto-registers the local user and discovers peers.
+2. **Open by default** — all operations are allowed for all users. Permission checks are a middleware concern, not service logic. The `user_hash` is logged on every mutation for audit trail, but never blocks.
+3. **Audit log** — mutations (create, update, delete, replicate) log `(timestamp, user_hash, operation, asset_hash)`. Read-only operations are not logged.
+4. **Node acts as user** — the node operates with the current user's full permissions. It can read/write files, install packages, run arbitrary code. No sandboxing — the node IS the user's workstation.
+
+## Auto-configuration
+
+1. **Zero-config decorators** — `@function` infers name, code, dependencies, python version. `@function(auto_env=True)` also creates a matching PyEnv with the right Python version and deps.
+2. **Auto-env creation** — when a function is registered without an explicit environment, the system auto-creates one named `auto_{func_name}` with inferred deps.
+3. **Multi-python** — `uv venv --python 3.11/3.12/3.13` creates isolated envs. Code is replicable across nodes with different system Pythons.
+4. **Auto-install on start** — `ygg node start` auto-registers systemd/launchd boot services so the node survives reboots.
+
 ## Principles
 
 1. **Exceptions** — derive from `YGGException`. API errors use `yggdrasil.exceptions.api`. No ad-hoc exception classes.
@@ -17,12 +56,19 @@ Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 ```
 python/src/yggdrasil/
   node/                 Node server (FastAPI, default :8100)
-    routers/            HTTP handlers (function, environment, run, monitor, ...)
-    services/           Business logic + state
-    schemas/            Pydantic models
+    api/                v2 API — formalized PyEnv/PyFunc/PyFuncRun concepts
+      schemas/          Pydantic models (PyEnv, PyFunc, PyFuncRun, DAG, Backend, Network)
+      services/         Business logic (env mgmt, execution, metrics, peer mesh)
+      routers/          HTTP handlers mounted at /api/v2/*
+      app.py            Standalone v2 FastAPI app factory
+      deps.py           Dependency injection
+    routers/            v1 HTTP handlers (function, environment, run, monitor, ...)
+    services/           v1 Business logic + state
+    schemas/            v1 Pydantic models
     geo.py              IP geolocation
     ids.py              Int64 ID generation (xxhash)
     fn.py               @function decorator framework
+    transport.py        Arrow IPC + pickle serialization for inter-node comms
     path.py             NodePath — pathlib-like local/remote filesystem
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
@@ -52,16 +98,41 @@ src/                    Frontend (React 19, Next.js 16, Tailwind v4)
 | `/api/env` | Environment variable get/set |
 | `/api/fs` | Filesystem operations (ls, read, write, mkdir, upload, streaming) |
 
-## Frontend Routes
+## Node v2 API (PyEnv / PyFunc / PyFuncRun)
+
+Core concepts — workstation as remote executor/driver:
+
+- **PyEnv** — Python environment (uv venv). Has `execute_pyfunc()` for inner dispatch.
+- **PyFunc** — Executable (code + deps + metadata). Upserted by name.
+- **PyFuncRun** — Execution = PyEnv + PyFunc + args/kwargs + metadata.
+- **DAG** — Composed of sub-PyFuncs with edges, cross-node orchestration.
+- **Backend** — Node metadata: CPU, RAM, GPU, disk, network metrics (SSE streaming).
+- **Network** — Peer mesh. Nodes swap roles (driver/executor/hybrid). Arrow IPC transport.
+
+| Prefix | Description |
+|--------|-------------|
+| `/api/ping` | Fast health check (`{pong: true, node_id}`) |
+| `/api/card` | Full node identity card (hardware, geo, counts) |
+| `/api/v2/pyenv` | PyEnv CRUD (create, get, list, update, delete) |
+| `/api/v2/pyfunc` | PyFunc CRUD |
+| `/api/v2/pyfuncrun` | PyFuncRun CRUD + `/logs` SSE + `/result` Arrow IPC |
+| `/api/v2/dag` | DAG CRUD + `/{id}/run` execution |
+| `/api/v2/backend` | Node metrics snapshot + `/history` + `/stream` SSE |
+| `/api/v2/network` | Self info + `/register` + `/peers` + `/role` + `/dispatch` + `/arrow` + `/ping` |
+| `/api/v2/fs` | Filesystem CRUD (ls, stat, read, write, delete, move, mkdir, stream, upload) |
+| `/api/v2/user` | User identity (`/me`, list, register from peers) |
+| `/api/v2/messenger` | Chat channels + messages + SSE streaming |
+| `/api/v2/replicate` | Export/import/push/pull node assets between nodes |
+
+## Frontend Routes (nextjs/)
 
 | Route | Description |
 |-------|-------------|
-| `/` | 3D globe welcome |
-| `/bot` | Bot dashboard — node info, registry |
-| `/bot/chat` | Messaging chat interface |
-| `/bot/execute` | Direct Python/shell code execution |
-| `/bot/network` | 3D network visualization |
-| `/msg` | Messaging channels |
+| `/` | 3D globe welcome with node card |
+| `/nodes` | Cluster dashboard — KPI aggregation + node grid + functions/envs sidebar |
+| `/nodes/[id]` | Per-node detail — resources, assets, replicated items |
+| `/chat` | Real-time messenger — channels, messages, SSE live updates |
+| `/files` | Filesystem browser — lazy directory listing, file preview |
 
 ## Python Decorator Framework
 
@@ -91,10 +162,12 @@ The `@function` decorator infers: name, source code, dependencies (AST), python 
 
 ## CLI
 
-`ygg node serve` — node + frontend | `ygg node front` — frontend only
-`ygg node serve --no-front` — node only | `ygg node status/stop` — daemon
-`ygg node install/uninstall` — boot service (systemd/launchd)
-`ygg node run` — call a @remote function | `ygg node chat` — YGGCHAT terminal
+`ygg node start` — background daemon (auto-installs boot service)
+`ygg node stop` — stop the daemon
+`ygg node create <name>` — create named node at `~/.node/<name>/`
+`ygg node serve` — foreground server + frontend
+`ygg node status` — show pid, port, boot service state
+`ygg node run <func>` — call a @remote function
 `ygg databricks` — Databricks management CLI
 
 ## Environment
