@@ -462,6 +462,7 @@ class DeltaFolder(Folder):
         *,
         options: "DeltaOptions",
         mode: "Mode",
+        operation: "str | None" = None,
         operation_parameters: "dict[str, Any] | None" = None,
         is_blind_append: "bool | None" = None,
     ) -> CommitInfo:
@@ -469,19 +470,26 @@ class DeltaFolder(Folder):
 
         Centralizes the payload shape the three commit sites
         (write / upsert / delete) used to build inline so callers and
-        tests have a single helper to reach for. ``operation``,
-        ``engineInfo``, ``timestamp`` come from *options* and the
+        tests have a single helper to reach for. ``operation`` /
+        ``engineInfo`` / ``timestamp`` come from *options* and the
         process clock; ``operationParameters.mode`` and
         ``isBlindAppend`` derive from *mode* unless overridden.
+
+        The explicit *operation* argument wins over ``options.operation``
+        so callers that always want a fixed label (e.g. the DELETE
+        retain path) don't need to mutate the returned payload.
         """
         params = operation_parameters
         if params is None:
             params = {"mode": mode.name.lower()}
         if is_blind_append is None:
             is_blind_append = mode is Mode.APPEND
+        op_label = operation if operation is not None else (
+            str(options.operation or "WRITE")
+        )
         return CommitInfo(payload={
             "timestamp": int(time.time() * 1000),
-            "operation": str(options.operation or "WRITE"),
+            "operation": op_label,
             "operationParameters": params,
             "engineInfo": str(options.engine_info or "yggdrasil"),
             "isBlindAppend": bool(is_blind_append),
@@ -573,13 +581,10 @@ class DeltaFolder(Folder):
 
         new_actions.append(self._build_commit_info(
             options=options, mode=Mode.OVERWRITE,
+            operation="DELETE",
             operation_parameters={},
             is_blind_append=False,
         ))
-        # Override the operation label — _build_commit_info defaults to
-        # "WRITE", but a DELETE retain commit should carry the literal
-        # "DELETE" string for tooling compatibility.
-        new_actions[-1].payload["operation"] = "DELETE"
         next_version = snap.version + 1
         self._commit_atomic(next_version, new_actions)
         self._log.extend_listing(format_commit_name(next_version))

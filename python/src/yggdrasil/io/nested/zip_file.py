@@ -29,18 +29,22 @@ without the caller knowing the inner format.
 Writing
 -------
 
-:meth:`_write_arrow_batches` packs the incoming batches into a
-single entry whose name comes from ``options.entry_name``. The
-extension picks the inner format (``data.parquet`` → parquet,
-``data.csv`` → csv, …). Mode dispatch:
+Two surfaces:
 
-- **OVERWRITE** — fresh archive containing one entry.
-- **APPEND** — keep existing entries that don't share the new name,
-  add the new entry, rewrite the archive (zip's central directory
-  sits at EOF, so a "true" append still requires a rewrite at this
-  layer — but per-entry payloads are streamed through, not
-  re-decompressed).
-- **IGNORE** / **ERROR_IF_EXISTS** — guard non-empty archives.
+- :meth:`ZipFile.entry` returns a :class:`ZipEntryFile` per name —
+  the per-entry handle is both readable and writable.
+  ``with z.entry("data.bin").open("wb") as f: f.write(...)`` stages
+  bytes in a private buffer and commits on clean exit; commits
+  against different entry names can run in parallel
+  (per-archive lock holds only for the brief central-directory
+  rewrite, survivors stream chunk-by-chunk).
+
+- :meth:`_write_arrow_batches` (the whole-archive Tabular hook)
+  packs the incoming batches into one entry whose name comes from
+  ``options.entry_name``. ``OVERWRITE`` writes a fresh archive
+  containing the single entry; ``APPEND`` keeps existing entries
+  whose names differ from the new one and adds the new entry;
+  ``IGNORE`` / ``ERROR_IF_EXISTS`` guard non-empty archives.
 
 Convenience helper :meth:`write_entries` packs arbitrary
 ``(name, bytes)`` pairs into a fresh archive.
@@ -806,7 +810,7 @@ class ZipFile(IO):
         return Mode.OVERWRITE
 
     # ==================================================================
-    # Per-entry commit — used by ZipEntryWriter
+    # Per-entry commit — driven by ZipEntryFile._flush_to_archive
     # ==================================================================
 
     def _commit_entry(
