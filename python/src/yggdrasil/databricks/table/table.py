@@ -24,7 +24,6 @@ import logging
 import re
 import time
 import uuid
-from threading import RLock
 from typing import Any, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal, ClassVar
 
 import pyarrow as pa
@@ -935,14 +934,11 @@ class Table(DatabricksPath):
     volume slot are shared across views into the same UC resource.
     """
 
-    # Per-class singleton cache + per-class lock — keeps Table
-    # singletons separated — both dict AND lock — from
-    # :class:`UCCatalog`, :class:`UCSchema`, :class:`Volume`, and
-    # the rest of the project's :class:`Singleton` users. The
-    # standalone lock means a hot UC-table walk under one schema
-    # doesn't contend with a parallel volumes walk under another.
+    # Per-class singleton cache — keeps Table singletons separated
+    # from :class:`UCCatalog`, :class:`UCSchema`, :class:`Volume`,
+    # and the rest of the project's :class:`Singleton` users. No
+    # companion lock — :class:`ExpiringDict.get_or_set` is GIL-atomic.
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
     # Cache every Table under the singleton convention; the cached
     # ``TableInfo`` / columns / staging-volume slot are worth keeping
     # for the process lifetime so navigation through
@@ -1007,22 +1003,21 @@ class Table(DatabricksPath):
             schema_name=schema_name,
             table_name=table_name,
         )
-        with cls._INSTANCES_LOCK:
-            existing = cls._INSTANCES.get(key)
-            if existing is not None:
-                return existing
-            instance = _allocate()
+        ttl_arg = (
+            float(singleton_ttl)
+            if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+            else singleton_ttl
+        )
+
+        def _build() -> "Table":
+            inst = _allocate()
             try:
-                object.__setattr__(instance, "_singleton_key_", key)
+                object.__setattr__(inst, "_singleton_key_", key)
             except AttributeError:
                 pass
-            ttl_arg = (
-                float(singleton_ttl)
-                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
-                else singleton_ttl
-            )
-            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
-            return instance
+            return inst
+
+        return cls._INSTANCES.get_or_set(key, _build, ttl=ttl_arg)
 
     def _stat_uncached(self) -> IOStats:
         return IOStats(

@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import time
 from abc import abstractmethod
-from threading import RLock
 from typing import Any, ClassVar, Optional
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
@@ -85,22 +84,23 @@ class RemotePath(Path):
     # accidental cardinality explosions.
     #
     # Concrete subclasses (:class:`S3Path`, :class:`DatabricksPath`,
-    # :class:`HTTPPath`, …) override ``_INSTANCES`` and
-    # ``_INSTANCES_LOCK`` with their OWN per-class dict + RLock so a
-    # hot ``__new__`` race on S3 doesn't serialize against a hot
-    # Databricks Volume construction. Sharing one cache across
-    # implementations was a pure contention-amplifier — the default
-    # ``_singleton_key`` already includes ``cls`` so collisions are
-    # impossible, partitioning by class only buys parallelism. The
-    # base-class instance below stays as a fallback for any caller
-    # that constructs :class:`RemotePath` directly or for a brand-new
-    # subclass that hasn't declared its own yet.
+    # :class:`HTTPPath`, …) override ``_INSTANCES`` with their OWN
+    # per-class dict so a hot ``__new__`` race on S3 doesn't
+    # serialize against a hot Databricks Volume construction.
+    # Sharing one cache across implementations was a pure
+    # contention-amplifier — the default ``_singleton_key`` already
+    # includes ``cls`` so collisions are impossible, partitioning by
+    # class only buys parallelism. The base-class instance below
+    # stays as a fallback for any caller that constructs
+    # :class:`RemotePath` directly or for a brand-new subclass that
+    # hasn't declared its own yet. No companion lock anywhere —
+    # :class:`ExpiringDict.get_or_set` (used by
+    # :class:`Singleton.__new__`) is GIL-atomic and cannot deadlock.
     _SINGLETON_TTL: ClassVar[Any] = _STAT_CACHE_TTL
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,
         max_size=10_000,
     )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     # ------------------------------------------------------------------
     # Inner buffered-page cache — reduces remote round trips for

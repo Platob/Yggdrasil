@@ -463,14 +463,13 @@ class Volumes(DatabricksService):
             return
         # Singleton key is ``(cls, client, catalog, schema, name)`` —
         # mirror :meth:`Volume._singleton_key` exactly so the pop hits.
+        # ``ExpiringDict.pop`` is GIL-atomic; no external mutex needed.
         key = Volume._singleton_key(
             self, catalog_name=c, schema_name=s, volume_name=v,
         )
-        with Volume._INSTANCES_LOCK:
-            Volume._INSTANCES.pop(key, None)
+        Volume._INSTANCES.pop(key, None)
 
     @classmethod
     def invalidate_all(cls) -> None:
         """Clear the entire singleton cache."""
-        with Volume._INSTANCES_LOCK:
-            Volume._INSTANCES.clear()
+        Volume._INSTANCES.clear()

@@ -80,7 +80,6 @@ import os
 import logging
 import time
 from collections.abc import Mapping
-from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
@@ -214,7 +213,6 @@ class Folder(Path):
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_FOLDER_PATH_SINGLETON_TTL, max_size=10_000,
     )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     # Per-leaf-partition data cache. Keyed by the full URL string of
     # the partition directory (e.g. ``file:///cache/partition_key=ab/``);

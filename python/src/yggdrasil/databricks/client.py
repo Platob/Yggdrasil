@@ -278,9 +278,10 @@ class DatabricksClient(Singleton, URLBased):
     # Per-class singleton cache. Two clients constructed with the
     # same canonicalised init kwargs (env defaults applied, host
     # normalised) collapse to one instance — same SDK clients, same
-    # lazy service caches, same cached Config.
+    # lazy service caches, same cached Config. No companion lock —
+    # :class:`ExpiringDict.get_or_set` (used by
+    # :class:`Singleton.__new__`) is GIL-atomic.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=None)
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
     # Cache every constructed client for the process lifetime — SDK
     # handles, lazy service slots, and the cached Config aren't worth
     # rebuilding when the same identity comes back.

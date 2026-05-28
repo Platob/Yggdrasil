@@ -13,7 +13,6 @@ from __future__ import annotations
 import base64
 import logging
 import time
-from threading import RLock
 from typing import Any, ClassVar, Iterator
 
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
@@ -40,13 +39,12 @@ class DBFSPath(DatabricksPath):
     _SERVICE_CLASS: ClassVar[type] = DBFSService
 
     # Per-class singleton cache — partitioned away from VolumePath /
-    # WorkspacePath so a DBFS-heavy listing doesn't serialize against
-    # other Databricks surfaces.
+    # WorkspacePath. No companion lock —
+    # :class:`ExpiringDict.get_or_set` is GIL-atomic.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,
         max_size=10_000,
     )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     # ==================================================================
     # Path rendering

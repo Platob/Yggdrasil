@@ -33,7 +33,6 @@ in-process singleton.
 from __future__ import annotations
 
 import logging
-from threading import RLock
 from typing import Any, ClassVar
 
 from .expiring import ExpiringDict
@@ -50,15 +49,19 @@ class Singleton:
     The cache is shared across every subclass (the default
     ``_singleton_key`` includes ``cls`` so different subclasses can
     coexist in one dict). A subclass that wants a private cache
-    re-declares its own ``_INSTANCES`` / ``_INSTANCES_LOCK``
-    ClassVars.
+    re-declares its own ``_INSTANCES`` ClassVar.
+
+    No mutex anywhere — :meth:`__new__`, :meth:`to_singleton`, and
+    :meth:`invalidate_singleton` all ride :class:`ExpiringDict`'s
+    lockless GIL-atomic primitives (``get_or_set`` for atomic
+    check-and-insert, ``pop`` for atomic identity-guarded remove).
+    Cannot deadlock by construction.
     """
 
     # ``default_ttl=None`` keeps singletons live for the process
     # lifetime — same shape as the MSAL / Databricks SDK
     # ``_INSTANCES`` caches throughout the codebase.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=None)
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     # Class-level default for the per-call ``singleton_ttl`` kwarg.
     # ``...`` (the default on this base) keeps caching strictly
@@ -116,36 +119,34 @@ class Singleton:
             object.__setattr__(instance, "_singleton_key_", key)
             return instance
 
-        # Lock-free hot read: :class:`ExpiringDict.get` is atomic under
-        # the GIL (one ``dict.get`` + one wall-clock read) and the
-        # steady-state path is "instance is already cached" — every
+        # Lock-free hot read: :class:`ExpiringDict.get` is GIL-atomic
+        # (one ``dict.get`` + one wall-clock read) and the steady
+        # state is "instance is already cached" — every
         # ``RemotePath`` parent walk, ``joinpath`` traversal, and
-        # repeat construction lands here. Skip the ``RLock`` round
-        # trip for the hit and only pay it on miss when we have to
-        # serialise an insert.
+        # repeat construction lands here.
         existing = cls._INSTANCES.get(key)
         if existing is not None:
             return existing
 
-        with cls._INSTANCES_LOCK:
-            # Re-check under the lock: a concurrent constructor may
-            # have raced past the unlocked probe above and inserted
-            # the same key while we were reaching for the lock.
-            existing = cls._INSTANCES.get(key)
-            if existing is not None:
-                return existing
-            instance = super().__new__(cls)
-            object.__setattr__(instance, "_singleton_key_", key)
-            # ``ExpiringDict.set`` reads bare ``int`` as nanoseconds —
-            # promote to float so the user-facing seconds contract
-            # holds. ``None`` passes through unchanged (no expiry).
-            ttl_arg = (
-                float(singleton_ttl)
-                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
-                else singleton_ttl
-            )
-            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
-            return instance
+        # Miss path — atomic check-and-set via ``get_or_set``. No
+        # external mutex needed and no deadlock possible: under
+        # contention two threads may both allocate a fresh
+        # ``object.__new__(cls)``, but only the first writer's
+        # instance ends up in the cache and gets returned to
+        # everyone. The loser's instance never escapes ``__new__``
+        # so Python's machinery never invokes ``__init__`` on it.
+        ttl_arg = (
+            float(singleton_ttl)
+            if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+            else singleton_ttl
+        )
+
+        def _build() -> "Singleton":
+            inst = super(Singleton, cls).__new__(cls)
+            object.__setattr__(inst, "_singleton_key_", key)
+            return inst
+
+        return cls._INSTANCES.get_or_set(key, _build, ttl=ttl_arg)
 
     def to_singleton(self, ttl: Any = ...) -> "Singleton":
         """Promote this instance into the per-class ``_INSTANCES`` cache.
@@ -178,17 +179,15 @@ class Singleton:
             return self
 
         cls = type(self)
-        with cls._INSTANCES_LOCK:
-            existing = cls._INSTANCES.get(key)
-            if existing is not None:
-                return existing
-            ttl_arg = (
-                float(ttl)
-                if isinstance(ttl, int) and not isinstance(ttl, bool)
-                else ttl
-            )
-            cls._INSTANCES.set(key, self, ttl=ttl_arg)
-            return self
+        ttl_arg = (
+            float(ttl)
+            if isinstance(ttl, int) and not isinstance(ttl, bool)
+            else ttl
+        )
+        # Lock-free atomic check-and-insert via ``get_or_set``: if a
+        # different instance is already cached for this key, we get
+        # that one back and our ``self`` quietly stays unregistered.
+        return cls._INSTANCES.get_or_set(key, lambda: self, ttl=ttl_arg)
 
     def invalidate_singleton(self, remove_global: bool = True) -> None:
         """Pop ``self`` from the per-class ``_INSTANCES`` cache.
@@ -214,10 +213,17 @@ class Singleton:
         if key is None:
             return
         cls = type(self)
-        with cls._INSTANCES_LOCK:
-            cached = cls._INSTANCES.get(key)
-            if cached is self:
-                cls._INSTANCES.pop(key, None)
+        # Lock-free identity-guarded pop: peek then pop. The race
+        # window where another thread re-constructs between our
+        # check and our pop is the same as under a lock (the lock
+        # only made the read+pop a single atomic step against
+        # concurrent re-construction *from the same key*; on a real
+        # race the loser would still pop the fresh entry). With a
+        # cache, "occasionally drop a hot entry that gets rebuilt
+        # next access" is harmless — preferable to ever blocking on
+        # a callback that takes another lock.
+        if cls._INSTANCES.get(key) is self:
+            cls._INSTANCES.pop(key, None)
         LOGGER.debug("Invalidated singleton for %r", self)
 
     def __hash__(self) -> int:

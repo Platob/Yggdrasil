@@ -218,14 +218,18 @@ class TestEDPickle(unittest.TestCase):
         d=ExpiringDict(default_ttl=60.0); d.set_many({"CL":82.0,"NG":1.85})
         d2=pickle.loads(pickle.dumps(d))
         self.assertEqual(d2["CL"],82.0); self.assertEqual(d2._default_ttl_ns,d._default_ttl_ns)
-        self.assertIsNot(d2._lock,d._lock)
+        # Pickle round-trip preserves the lockless design — neither
+        # instance has a ``_lock`` attribute.
+        self.assertFalse(hasattr(d, "_lock"))
+        self.assertFalse(hasattr(d2, "_lock"))
     def test_drops_expired(self):
         d=ExpiringDict(default_ttl=60.0); d.set("live",1,ttl=60.0); d.set("dead",2,ttl=0.06)
         _sleep_past(0.06); d2=pickle.loads(pickle.dumps(d))
         self.assertIn("live",d2); self.assertNotIn("dead",d2)
     def test_deepcopy(self):
         d=ExpiringDict(default_ttl=10.0); d["a"]=1; d2=copy.deepcopy(d)
-        self.assertEqual(d2["a"],1); self.assertIsNot(d2._lock,d._lock)
+        self.assertEqual(d2["a"],1)
+        self.assertFalse(hasattr(d2, "_lock"))
     def test_refresher_not_pickled(self):
         d=ExpiringDict(default_ttl=10.0,refresher=lambda k:RefreshResult.make(42))
         d2=pickle.loads(pickle.dumps(d)); self.assertIsNone(d2._refresher)

@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import logging
 import time
-from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
@@ -110,12 +109,13 @@ class S3Path(RemotePath):
     scheme: ClassVar[Scheme] = Scheme.S3
 
     # Per-class singleton cache — partitions ``__new__`` contention
-    # away from every other :class:`RemotePath` subclass.
+    # away from every other :class:`RemotePath` subclass. No
+    # companion lock — :class:`ExpiringDict.get_or_set` is
+    # GIL-atomic.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,
         max_size=10_000,
     )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     #: URL schemes accepted on input; always normalized to ``s3``.
     _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = frozenset({"s3", "s3a", "s3n"})

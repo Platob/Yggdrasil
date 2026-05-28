@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import logging
 import time
-from threading import RLock
 from typing import Any, ClassVar, Iterator, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
@@ -81,12 +80,11 @@ class Volume(DatabricksResource, Singleton):
 
     DEFAULT_INFO_TTL: ClassVar[float] = 1800.0  # 30 minutes
 
-    # Per-class singleton cache + per-class lock so this surface
-    # stays separated — both the dict AND the lock — from
+    # Per-class singleton cache so this surface stays separated from
     # :class:`UCCatalog`, :class:`UCSchema`, :class:`UCTable`, and
-    # the rest of the project's :class:`Singleton` users.
+    # the rest of the project's :class:`Singleton` users. No
+    # companion lock — :class:`ExpiringDict.get_or_set` is GIL-atomic.
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
     # Cache every Volume under the singleton convention; the cached
     # ``VolumeInfo`` and credentials refresher are worth keeping for
     # the process lifetime so navigation / repeated reads don't keep
@@ -142,22 +140,21 @@ class Volume(DatabricksResource, Singleton):
             schema_name=str(schema_name),
             volume_name=str(volume_name),
         )
-        with cls._INSTANCES_LOCK:
-            existing = cls._INSTANCES.get(key)
-            if existing is not None:
-                return existing
-            instance = _allocate()
+        ttl_arg = (
+            float(singleton_ttl)
+            if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
+            else singleton_ttl
+        )
+
+        def _build() -> "Volume":
+            inst = _allocate()
             try:
-                object.__setattr__(instance, "_singleton_key_", key)
+                object.__setattr__(inst, "_singleton_key_", key)
             except AttributeError:
                 pass
-            ttl_arg = (
-                float(singleton_ttl)
-                if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
-                else singleton_ttl
-            )
-            cls._INSTANCES.set(key, instance, ttl=ttl_arg)
-            return instance
+            return inst
+
+        return cls._INSTANCES.get_or_set(key, _build, ttl=ttl_arg)
 
     def __init__(
         self,

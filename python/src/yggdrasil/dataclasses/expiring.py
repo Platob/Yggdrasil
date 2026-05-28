@@ -363,8 +363,11 @@ class ExpiringDict(Generic[K, V]):
     """
     Thread-safe dictionary where every key carries an individual TTL.
 
-    Built on the same nanosecond time-utils and ``RLock`` discipline as
-    ``Expiring``.  No subclassing required.
+    Built on the same nanosecond time-utils as ``Expiring`` but
+    fully lockless — every mutation rides the CPython GIL atomicity
+    of ``dict.__setitem__`` / ``dict.pop`` / ``list(dict.items())``
+    with permissive race semantics, so the cache can never deadlock.
+    No subclassing required.
 
     Parameters
     ----------
@@ -391,10 +394,10 @@ class ExpiringDict(Generic[K, V]):
 
     Serialization
     -------------
-    ``__getstate__`` / ``__setstate__`` are implemented: only live (non-expired)
-    entries are persisted; the lock is recreated on load.  The
-    ``on_evict`` and ``refresher`` callbacks are NOT persisted — they're
-    typically closures over runtime state. Compatible with ``pickle``,
+    ``__getstate__`` / ``__setstate__`` are implemented: only live
+    (non-expired) entries are persisted. The ``on_evict`` and
+    ``refresher`` callbacks are NOT persisted — they're typically
+    closures over runtime state. Compatible with ``pickle``,
     ``copy.deepcopy``, and ``joblib``.
     """
 
@@ -404,22 +407,20 @@ class ExpiringDict(Generic[K, V]):
     # (``self._store`` etc.) down to a slot descriptor read, which
     # shows up as a measurable shave on ``get`` / ``set``.
     #
-    # ``_lock`` is retained as a slot for backward-compat with any
-    # caller that reaches into ``cache._lock`` (no such caller exists
-    # in the repo); internal code no longer acquires it. Every
-    # mutation path relies on the CPython GIL atomicity of ``dict.get``
-    # / ``dict.pop`` / ``dict.__setitem__`` / ``list(dict.items())``
-    # and accepts permissive race semantics in exchange (a cache that
-    # briefly over-counts by one entry or loses a single write under
-    # contention is still a correct cache; a cache that deadlocks
-    # isn't).
+    # No ``_lock`` slot. Every mutation path relies on the CPython
+    # GIL atomicity of ``dict.get`` / ``dict.pop`` / ``dict.__setitem__``
+    # / ``list(dict.items())`` and accepts permissive race semantics
+    # (a cache that briefly over-counts by one entry or loses a
+    # single overwrite under contention is still a correct cache; a
+    # cache that deadlocks isn't). Removing the lock attribute
+    # eliminates the last place a caller could reach in and
+    # serialize against us.
     __slots__ = (
         "_default_ttl_ns",
         "_max_size",
         "_refresher",
         "_on_evict",
         "_store",
-        "_lock",
         "_last_purge_ns",
         "_purge_pending",
     )
@@ -439,10 +440,6 @@ class ExpiringDict(Generic[K, V]):
         self._refresher = refresher
         self._on_evict = on_evict
         self._store: Dict[K, Tuple[V, Optional[int]]] = {}
-        # Retained for backward compatibility; never acquired by the
-        # class itself. External code that reached for ``cache._lock``
-        # still finds a real ``RLock``.
-        self._lock: RLock = RLock()
         # Background-purge tracking (ns epoch integers — GIL-atomic reads on CPython)
         self._last_purge_ns: int = now_utc_ns()
         self._purge_pending: bool = False
@@ -496,7 +493,6 @@ class ExpiringDict(Generic[K, V]):
         self._refresher = None
         self._on_evict = None
         self._store = state.get("store", {})
-        self._lock = RLock()
         self._last_purge_ns = int(state.get("last_purge_ns", now_utc_ns()))
         self._purge_pending = False
 

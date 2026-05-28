@@ -189,7 +189,6 @@ def _expiring_contention_scenarios(threads: int, repeat: int) -> list[dict]:
 
 class _PathSingleton(Singleton):
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=300.0)
-    _INSTANCES_LOCK: ClassVar[threading.RLock] = threading.RLock()
     _SINGLETON_TTL: ClassVar[Any] = 300.0
     __slots__ = ("_initialized", "_singleton_key_")
 
@@ -225,8 +224,7 @@ def _singleton_scenarios(threads: int, repeat: int) -> list[dict]:
     # in ExpiringDict.get.
     class _Forever(Singleton):
         _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=None)
-        _INSTANCES_LOCK: ClassVar[threading.RLock] = threading.RLock()
-        _SINGLETON_TTL: ClassVar[Any] = None
+            _SINGLETON_TTL: ClassVar[Any] = None
         __slots__ = ("_initialized", "_singleton_key_")
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -261,8 +259,7 @@ def _singleton_scenarios(threads: int, repeat: int) -> list[dict]:
     # a fraction. Exercises both the bypass path and the writer.
     class _Churn(Singleton):
         _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=300.0)
-        _INSTANCES_LOCK: ClassVar[threading.RLock] = threading.RLock()
-        _SINGLETON_TTL: ClassVar[Any] = 300.0
+            _SINGLETON_TTL: ClassVar[Any] = 300.0
         __slots__ = ("_initialized", "_singleton_key_")
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:

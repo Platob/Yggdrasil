@@ -36,7 +36,6 @@ the service.
 
 from __future__ import annotations
 
-from threading import RLock
 from typing import Any, Callable, ClassVar, Optional, Tuple
 
 from yggdrasil.dataclasses import ExpiringDict
@@ -307,14 +306,14 @@ class DatabricksPath(DatabricksResource, RemotePath):
     scheme: ClassVar[Scheme] = Scheme.DBFS
 
     # Per-class singleton cache for the DatabricksPath dispatcher
-    # itself. Concrete subclasses override with their OWN dict +
-    # lock so each surface (DBFS / Volumes / Workspace) sees lock
-    # contention only from its own callers.
+    # itself. Concrete subclasses override with their OWN dict so
+    # each surface (DBFS / Volumes / Workspace) keeps independent
+    # storage. No companion lock — :class:`ExpiringDict.get_or_set`
+    # (called by :class:`Singleton.__new__`) is GIL-atomic.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,
         max_size=10_000,
     )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     #: Canonical POSIX prefix for the legacy string shape
     #: (``/dbfs/``, ``/Workspace/``, ``/Volumes/``). Empty on the

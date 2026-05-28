@@ -40,7 +40,6 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 
 from databricks.sdk.errors import PermissionDenied
@@ -95,13 +94,12 @@ class VolumePath(DatabricksPath):
     # import cycle.
 
     # Per-class singleton cache — partitioned away from DBFSPath /
-    # WorkspacePath so a Volumes-heavy ``iterdir`` doesn't serialize
-    # against other Databricks surfaces.
+    # WorkspacePath. No companion lock —
+    # :class:`ExpiringDict.get_or_set` is GIL-atomic.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,
         max_size=10_000,
     )
-    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     def __init__(
         self,

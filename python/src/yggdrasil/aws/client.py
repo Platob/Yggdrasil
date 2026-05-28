@@ -964,7 +964,6 @@ class AWSService(ABC):
     """
 
     _INSTANCES: ClassVar[dict[Tuple[type, "AWSClient"], "AWSService"]] = {}
-    _INSTANCES_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
 
@@ -977,13 +976,15 @@ class AWSService(ABC):
         if client is None:
             client = AWSClient.current()
         key = (cls, client)
-        with cls._INSTANCES_LOCK:
-            cached = cls._INSTANCES.get(key)
-            if cached is not None:
-                return cached  # type: ignore[return-value]
-            instance = super().__new__(cls)
-            cls._INSTANCES[key] = instance
-            return instance  # type: ignore[return-value]
+        cached = cls._INSTANCES.get(key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        # ``dict.setdefault`` is GIL-atomic: under contention two
+        # threads may both allocate, but only the first writer's
+        # instance ends up in the cache and is returned to all
+        # callers. No external mutex needed.
+        instance = super().__new__(cls)
+        return cls._INSTANCES.setdefault(key, instance)  # type: ignore[return-value]
 
     def __init__(self, client: Optional[AWSClient] = None) -> None:
         if getattr(self, "_initialized", False):
