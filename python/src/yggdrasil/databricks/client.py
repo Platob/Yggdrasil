@@ -1246,6 +1246,29 @@ class DatabricksClient(Singleton, URLBased):
             temporary=temporary,
         )
 
+    def open(
+        self,
+        path: Any,
+        mode: "Mode | str | None" = None,
+        **kwargs: Any,
+    ) -> "IO":
+        """Open ``path`` against this workspace and return an :class:`IO` cursor.
+
+        Defaults to a :class:`DatabricksPath` resolved through
+        :meth:`dbfs_path` — strings like ``/Volumes/cat/sch/vol/x`` or
+        ``dbfs+volume:///cat/sch/vol/x`` dispatch to the right concrete
+        subclass (DBFS / Volumes / Workspace). A pre-built
+        :class:`~yggdrasil.path.Path` is opened verbatim so callers can
+        mix in S3/HTTP/local paths without losing the workspace binding.
+
+        ``mode`` and ``**kwargs`` ride straight through to
+        :meth:`Path.open` (which forwards to :meth:`IO.open`).
+        """
+        from yggdrasil.path import Path
+
+        target = path if isinstance(path, Path) else self.dbfs_path(path)
+        return target.open(mode=mode, **kwargs)
+
     @staticmethod
     def _base_tmp_path(
         catalog_name: str | None = None,
