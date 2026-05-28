@@ -20,14 +20,16 @@ own session when one is attached so the connection pool is reused.
 """
 from __future__ import annotations
 
+from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator
 
+from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Mode, Scheme
 from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import RemotePath
+from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
-from yggdrasil.dataclasses import WaitingConfig
 
 if TYPE_CHECKING:
     from .session import HTTPSession
@@ -57,6 +59,15 @@ class HTTPPath(RemotePath):
     #: ``s3``); ``http`` and ``https`` are not interchangeable on the
     #: wire, so the holder remembers which the caller asked for.
     _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https"})
+
+    # Per-class singleton cache — partitions HTTP construction
+    # contention away from S3Path / DatabricksPath / future
+    # backends.
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=_STAT_CACHE_TTL,
+        max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     def __init__(
         self,

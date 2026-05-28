@@ -123,8 +123,8 @@ class MSALAuth(Authorization):
     # Per-(cls, cache_key) singleton cache. Subclasses inherit the slot.
     # The ``cls`` component lets a subclass with different defaults stay
     # distinct from the base even for an identical config tuple.
-    # ``ExpiringDict`` owns its own internal lock and an atomic
-    # ``get_or_set`` — no external mutex needed, and a TTL can be wired
+    # ``ExpiringDict.get_or_set`` is lock-free and atomic under the
+    # CPython GIL — no external mutex needed, and a TTL can be wired
     # in later (e.g. drop unused configs after N hours) without touching
     # this site. ``default_ttl=None`` keeps entries for the process
     # lifetime; per-token expiry lives inside the singleton itself.
@@ -149,10 +149,11 @@ class MSALAuth(Authorization):
     ) -> "MSALAuth":
         cache_key = _resolve_config(tenant_id, client_id, client_secret, authority, scopes)
         key = (cls, cache_key)
-        # ExpiringDict.get_or_set is atomic under its own internal lock:
-        # two callers racing the same config either both observe the
-        # winner's instance or one of them runs the factory once and
-        # the other sees it via the cache — no external mutex needed.
+        # ExpiringDict.get_or_set is lock-free + GIL-atomic — two
+        # callers racing the same config either both observe the
+        # winner's instance, or both run the factory once and the
+        # loser's fresh instance is silently discarded by the
+        # check-after-build re-probe. No external mutex needed.
         return cls._INSTANCES.get_or_set(key, lambda: object.__new__(cls))
 
     def __init__(

@@ -13,17 +13,19 @@ from __future__ import annotations
 import base64
 import logging
 import time
+from threading import RLock
 from typing import Any, ClassVar, Iterator
 
+from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Scheme
 from yggdrasil.io.io_stats import IOStats, IOKind
+from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
 
 from ..path import DatabricksPath
 from .service import DBFSService
 
 __all__ = ["DBFSPath"]
-from ...dataclasses import WaitingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,15 @@ class DBFSPath(DatabricksPath):
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_DBFS
     NAMESPACE_PREFIX: ClassVar[str] = "/dbfs/"
     _SERVICE_CLASS: ClassVar[type] = DBFSService
+
+    # Per-class singleton cache — partitioned away from VolumePath /
+    # WorkspacePath so a DBFS-heavy listing doesn't serialize against
+    # other Databricks surfaces.
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=_STAT_CACHE_TTL,
+        max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     # ==================================================================
     # Path rendering

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import time
+from threading import RLock
 from typing import Any, ClassVar, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
 
 from databricks.sdk.errors import DatabricksError, NotFound
@@ -72,9 +73,12 @@ class UCCatalog(DatabricksPath, Singleton):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_CATALOG
 
-    # Per-class singleton cache so this surface stays separate from
-    # the rest of the project's :class:`Singleton` users.
+    # Per-class singleton cache + per-class lock so this surface
+    # stays separated — both the dict AND the lock — from
+    # :class:`UCSchema`, :class:`UCTable`, :class:`Volume`, and the
+    # rest of the project's :class:`Singleton` users.
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
     # Cache every catalog under the singleton convention; the cached
     # ``CatalogInfo`` and tag state are worth keeping for the
     # process lifetime so navigation through ``catalogs[name]`` /

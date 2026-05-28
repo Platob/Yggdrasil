@@ -80,12 +80,21 @@ class RemotePath(Path):
     # below a certain threshold) can pin their own default here.
     DEFAULT_BUFFER_SIZE: ClassVar["int | None"] = _DEFAULT_BUFFER_SIZE
 
-    # Activate the :class:`Singleton` cache for every concrete remote
-    # backend: 5-minute default TTL, bounded at 10 000 entries as
-    # defence-in-depth against accidental cardinality explosions.
-    # The default ``_singleton_key`` includes ``cls`` so S3Path /
-    # DatabricksPath / future Azure paths can share one ``_INSTANCES``
-    # dict without colliding.
+    # Activate the :class:`Singleton` cache: 5-minute default TTL,
+    # bounded at 10 000 entries as defence-in-depth against
+    # accidental cardinality explosions.
+    #
+    # Concrete subclasses (:class:`S3Path`, :class:`DatabricksPath`,
+    # :class:`HTTPPath`, …) override ``_INSTANCES`` and
+    # ``_INSTANCES_LOCK`` with their OWN per-class dict + RLock so a
+    # hot ``__new__`` race on S3 doesn't serialize against a hot
+    # Databricks Volume construction. Sharing one cache across
+    # implementations was a pure contention-amplifier — the default
+    # ``_singleton_key`` already includes ``cls`` so collisions are
+    # impossible, partitioning by class only buys parallelism. The
+    # base-class instance below stays as a fallback for any caller
+    # that constructs :class:`RemotePath` directly or for a brand-new
+    # subclass that hasn't declared its own yet.
     _SINGLETON_TTL: ClassVar[Any] = _STAT_CACHE_TTL
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,

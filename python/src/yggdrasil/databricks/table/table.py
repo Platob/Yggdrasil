@@ -24,6 +24,7 @@ import logging
 import re
 import time
 import uuid
+from threading import RLock
 from typing import Any, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal, ClassVar
 
 import pyarrow as pa
@@ -934,9 +935,14 @@ class Table(DatabricksPath):
     volume slot are shared across views into the same UC resource.
     """
 
-    # Per-class singleton cache — keeps Table singletons separate
-    # from the rest of the project's :class:`Singleton` users.
+    # Per-class singleton cache + per-class lock — keeps Table
+    # singletons separated — both dict AND lock — from
+    # :class:`UCCatalog`, :class:`UCSchema`, :class:`Volume`, and
+    # the rest of the project's :class:`Singleton` users. The
+    # standalone lock means a hot UC-table walk under one schema
+    # doesn't contend with a parallel volumes walk under another.
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
     # Cache every Table under the singleton convention; the cached
     # ``TableInfo`` / columns / staging-volume slot are worth keeping
     # for the process lifetime so navigation through

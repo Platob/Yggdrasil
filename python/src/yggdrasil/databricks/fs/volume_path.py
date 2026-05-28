@@ -40,6 +40,7 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from threading import RLock
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 
 from databricks.sdk.errors import PermissionDenied
@@ -48,8 +49,9 @@ from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
 from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.enums.media_type import MediaType
-from yggdrasil.dataclasses import WaitingConfig
+from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.io.io_stats import IOStats, IOKind
+from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
 from ..path import DatabricksPath
 
@@ -91,6 +93,15 @@ class VolumePath(DatabricksPath):
     # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
     # import cycle.
+
+    # Per-class singleton cache — partitioned away from DBFSPath /
+    # WorkspacePath so a Volumes-heavy ``iterdir`` doesn't serialize
+    # against other Databricks surfaces.
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=_STAT_CACHE_TTL,
+        max_size=10_000,
+    )
+    _INSTANCES_LOCK: ClassVar[RLock] = RLock()
 
     def __init__(
         self,
