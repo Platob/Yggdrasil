@@ -88,6 +88,70 @@ class TestOptions:
         assert ParquetFile.options_class() is ParquetOptions
 
 
+class TestWriteArrowTableBypassesBatchHook:
+    """``write_arrow_table`` should hand the table straight to
+    ``pq.write_table`` instead of paying the
+    ``table.to_batches()`` → ``_write_arrow_batches`` round trip
+    that the base class default would force."""
+
+    def test_overwrite_path_skips_batch_hook(self, monkeypatch) -> None:
+        # Patch _write_arrow_batches to count invocations; the
+        # OVERWRITE fast path must not call it.
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        calls = {"n": 0}
+        original = ParquetFile._write_arrow_batches
+
+        def counting(self, batches, options):
+            calls["n"] += 1
+            return original(self, batches, options)
+
+        monkeypatch.setattr(ParquetFile, "_write_arrow_batches", counting)
+
+        table = pa.table({"id": list(range(1000))})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(table)
+
+        assert calls["n"] == 0, (
+            f"_write_arrow_batches fired {calls['n']} times; "
+            "OVERWRITE should bypass through pq.write_table."
+        )
+
+        # Bytes are still valid parquet — round-trip checks payload.
+        reread = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert reread.equals(table)
+
+    def test_append_path_uses_batch_hook(self, monkeypatch) -> None:
+        # APPEND keeps the read-modify-rewrite path; we must NOT
+        # skip the batch hook there. Verify by writing once with
+        # OVERWRITE (default) then appending — second write fires
+        # _write_arrow_batches.
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        seed = pa.table({"id": [1, 2, 3]})
+        more = pa.table({"id": [4, 5]})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = {"n": 0}
+        original = ParquetFile._write_arrow_batches
+
+        def counting(self, batches, options):
+            calls["n"] += 1
+            return original(self, batches, options)
+
+        monkeypatch.setattr(ParquetFile, "_write_arrow_batches", counting)
+
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+            more, mode=Mode.APPEND,
+        )
+        assert calls["n"] >= 1, "APPEND must route through the batch hook."
+
+        out = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert sorted(out.column("id").to_pylist()) == [1, 2, 3, 4, 5]
+
+
 class TestPandasIndexRoundTrip(__import__(
     "yggdrasil.pandas.tests", fromlist=["PandasTestCase"],
 ).PandasTestCase):

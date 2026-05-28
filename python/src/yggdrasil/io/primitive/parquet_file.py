@@ -424,6 +424,53 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                         if casted.num_rows > 0:
                             writer.write_batch(casted, row_group_size=options.row_group_size)
 
+    def _write_arrow_table(self, table: pa.Table, options: ParquetOptions) -> None:
+        """Write *table* directly via ``pq.write_table``.
+
+        Bypasses the base ``_write_arrow_table`` → ``table.to_batches()``
+        → ``_write_arrow_batches`` round trip for the OVERWRITE-shaped
+        modes — ``pq.write_table`` lays out row groups internally with
+        no per-batch Python dispatch, so a single 1M-row table is
+        one C-level call instead of N ``writer.write_batch`` hops.
+
+        Merge modes (APPEND / UPSERT / MERGE) still fall through to
+        the batch hook — the existing read-modify-rewrite path wants
+        a batch stream, and there's no parquet-side fast path that
+        avoids the rewrite anyway.
+        """
+        mode = options.mode
+        is_merge = (
+            mode in (Mode.APPEND, Mode.UPSERT, Mode.MERGE)
+            or (mode is Mode.AUTO and options.match_by_keys)
+        )
+        # ``IGNORE`` / ``ERROR_IF_EXISTS`` on a non-empty buffer can't
+        # be answered without the size check the batch hook already
+        # carries; route there for correctness.
+        guarded = (
+            mode in (Mode.IGNORE, Mode.ERROR_IF_EXISTS)
+            and not self.holder_is_overwrite
+            and self.size_known
+            and self.size > 0
+        )
+        if is_merge or guarded:
+            return self._write_arrow_batches(iter(table.to_batches()), options)
+
+        casted = options.cast_arrow_table(table)
+        write_options = options.check_source(casted.schema)
+        schema = write_options.merged.to_arrow_schema()
+        if casted.schema != schema:
+            casted = casted.cast(schema)
+        with self.arrow_output_stream() as sink:
+            pq.write_table(
+                casted,
+                sink,
+                row_group_size=options.row_group_size,
+                compression=options.compression,
+                compression_level=options.compression_level,
+                use_dictionary=options.use_dictionary,
+                write_statistics=options.write_statistics,
+            )
+
     # ==================================================================
     # Pandas — tag each index level as a Field, set_index() on read
     # ==================================================================
