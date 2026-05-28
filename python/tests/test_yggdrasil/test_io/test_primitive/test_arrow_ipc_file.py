@@ -418,3 +418,75 @@ class TestWriteArrowTableBypassesBatchHook:
 
         with path.open("rb") as cursor:
             assert cursor.read_arrow_table().column("id").to_pylist() == [99]
+
+
+class TestReadArrowTableBypassesBatchHook:
+    """``ArrowIPCFile._read_arrow_table`` routes through
+    :meth:`RecordBatchFileReader.read_all` — a single C++ call that
+    decodes every batch into one :class:`pa.Table` — instead of
+    streaming ``_read_arrow_batches`` and re-stitching via
+    ``pa.Table.from_batches``."""
+
+    @staticmethod
+    def _counting_patch(monkeypatch):
+        calls = {"n": 0}
+        original = ArrowIPCFile._read_arrow_batches
+
+        def counting(self, options):
+            calls["n"] += 1
+            return original(self, options)
+
+        monkeypatch.setattr(ArrowIPCFile, "_read_arrow_batches", counting)
+        return calls
+
+    def test_read_arrow_table_skips_batch_hook(self, monkeypatch) -> None:
+        table = pa.table({"id": list(range(1000))})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(table)
+
+        calls = self._counting_patch(monkeypatch)
+        out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert calls["n"] == 0
+        assert out.equals(table)
+
+    def test_row_limit_applied_on_fast_path(self) -> None:
+        from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCOptions
+
+        table = pa.table({"id": list(range(1000))})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(table)
+
+        out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table(
+            options=ArrowIPCOptions(row_limit=42),
+        )
+        assert out.num_rows == 42
+        assert out.column("id").to_pylist() == list(range(42))
+
+    def test_target_projection_on_fast_path(self) -> None:
+        """``options.target`` with a subset of columns drops the
+        unused columns post-read (the IPC format reads all batches,
+        but the projection still applies via apply_post_read_table)."""
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.data.data_field import Field
+
+        seed = pa.table({"id": [1, 2, 3], "skip": ["a", "b", "c"], "keep": [10, 20, 30]})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        target = Field.from_(pa.schema([
+            pa.field("id", pa.int64()),
+            pa.field("keep", pa.int64()),
+        ]))
+        out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table(
+            options=CastOptions(target=target),
+        )
+        assert out.column_names == ["id", "keep"]
+        assert out.column("keep").to_pylist() == [10, 20, 30]
+
+    def test_empty_file_falls_back_to_base(self, monkeypatch) -> None:
+        # size == 0 path lands in the base for empty-schema synthesis.
+        mem = Memory()
+        calls = self._counting_patch(monkeypatch)
+        out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert calls["n"] >= 1
+        assert out.num_rows == 0

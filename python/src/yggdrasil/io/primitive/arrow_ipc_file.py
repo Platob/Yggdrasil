@@ -160,6 +160,8 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         post-read :meth:`CastOptions.cast_arrow_tabular` still
         reshapes the table to the caller's ``target_field`` — and
         bypasses for free when the source schema already matches.
+        ``options.row_limit`` is applied after the read so the slice
+        still wins.
         """
         if self.size_known and self.size == 0:
             return super()._read_arrow_table(options)
@@ -174,7 +176,10 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         except FileNotFoundError:
             return super()._read_arrow_table(options)
         table = options.cast_arrow_table(table)
-        return options.apply_post_read_table(table)
+        table = options.apply_post_read_table(table)
+        if options.row_limit is not None and table.num_rows > options.row_limit:
+            table = table.slice(0, options.row_limit)
+        return table
 
     def _collect_schema(self, options: ArrowIPCOptions) -> Schema:
         """Read the schema straight from the IPC footer.
