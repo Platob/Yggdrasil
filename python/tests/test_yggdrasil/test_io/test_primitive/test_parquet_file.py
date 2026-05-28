@@ -89,14 +89,14 @@ class TestOptions:
 
 
 class TestWriteArrowTableBypassesBatchHook:
-    """``write_arrow_table`` should hand the table straight to
-    ``pq.write_table`` instead of paying the
-    ``table.to_batches()`` → ``_write_arrow_batches`` round trip
-    that the base class default would force."""
+    """``ParquetFile._write_arrow_table`` should route the
+    "replace the buffer wholesale" shapes straight through
+    ``pq.write_table`` and only fall through to
+    ``_write_arrow_batches`` for read-modify-rewrite merge cases
+    and the guarded ``IGNORE`` / ``ERROR_IF_EXISTS`` paths."""
 
-    def test_overwrite_path_skips_batch_hook(self, monkeypatch) -> None:
-        # Patch _write_arrow_batches to count invocations; the
-        # OVERWRITE fast path must not call it.
+    @staticmethod
+    def _counting_patch(monkeypatch):
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
         calls = {"n": 0}
@@ -107,49 +107,231 @@ class TestWriteArrowTableBypassesBatchHook:
             return original(self, batches, options)
 
         monkeypatch.setattr(ParquetFile, "_write_arrow_batches", counting)
+        return calls
 
+    def test_overwrite_on_empty_skips_batch_hook(self, monkeypatch) -> None:
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        calls = self._counting_patch(monkeypatch)
         table = pa.table({"id": list(range(1000))})
         mem = Memory()
         ParquetFile(holder=mem, owns_holder=False).write_arrow_table(table)
 
-        assert calls["n"] == 0, (
-            f"_write_arrow_batches fired {calls['n']} times; "
-            "OVERWRITE should bypass through pq.write_table."
-        )
+        assert calls["n"] == 0
+        assert ParquetFile(
+            holder=mem, owns_holder=False,
+        ).read_arrow_table().equals(table)
 
-        # Bytes are still valid parquet — round-trip checks payload.
-        reread = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
-        assert reread.equals(table)
-
-    def test_append_path_uses_batch_hook(self, monkeypatch) -> None:
-        # APPEND keeps the read-modify-rewrite path; we must NOT
-        # skip the batch hook there. Verify by writing once with
-        # OVERWRITE (default) then appending — second write fires
-        # _write_arrow_batches.
+    def test_explicit_overwrite_on_nonempty_skips_batch_hook(
+        self, monkeypatch,
+    ) -> None:
         from yggdrasil.enums import Mode
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3]})
-        more = pa.table({"id": [4, 5]})
         mem = Memory()
         ParquetFile(holder=mem, owns_holder=False).write_arrow_table(seed)
 
-        calls = {"n": 0}
-        original = ParquetFile._write_arrow_batches
-
-        def counting(self, batches, options):
-            calls["n"] += 1
-            return original(self, batches, options)
-
-        monkeypatch.setattr(ParquetFile, "_write_arrow_batches", counting)
-
+        # Buffer is non-empty now; explicit OVERWRITE must still
+        # bypass.
+        calls = self._counting_patch(monkeypatch)
+        replacement = pa.table({"id": [99]})
         ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
-            more, mode=Mode.APPEND,
+            replacement, mode=Mode.OVERWRITE,
         )
-        assert calls["n"] >= 1, "APPEND must route through the batch hook."
+        assert calls["n"] == 0
+
+        out = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert out.column("id").to_pylist() == [99]
+
+    def test_truncate_routes_to_fast_path(self, monkeypatch) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [42]}), mode=Mode.TRUNCATE,
+        )
+        assert calls["n"] == 0
+
+        out = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert out.column("id").to_pylist() == [42]
+
+    def test_append_to_nonempty_uses_batch_hook(self, monkeypatch) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [4, 5]}), mode=Mode.APPEND,
+        )
+        assert calls["n"] >= 1
 
         out = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
         assert sorted(out.column("id").to_pylist()) == [1, 2, 3, 4, 5]
+
+    def test_append_to_empty_skips_batch_hook(self, monkeypatch) -> None:
+        """APPEND on an empty buffer reduces to OVERWRITE — the
+        merge logic has nothing to merge against, so the fast path
+        is safe and the batch hook is overhead."""
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        calls = self._counting_patch(monkeypatch)
+        table = pa.table({"id": [1, 2, 3]})
+        ParquetFile(holder=Memory(), owns_holder=False).write_arrow_table(
+            table, mode=Mode.APPEND,
+        )
+        assert calls["n"] == 0
+
+    def test_auto_on_nonempty_uses_batch_hook(self, monkeypatch) -> None:
+        """AUTO with no ``match_by`` resolves to APPEND semantics
+        on a non-empty buffer — the existing data must survive, so
+        the batch hook owns the rewrite."""
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [4, 5]}),
+        )  # default mode = AUTO
+        assert calls["n"] >= 1
+
+        out = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert sorted(out.column("id").to_pylist()) == [1, 2, 3, 4, 5]
+
+    def test_ignore_on_nonempty_uses_batch_hook(self, monkeypatch) -> None:
+        """IGNORE on a non-empty buffer must NOT clobber existing
+        data — that's the batch hook's size-check + return."""
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+        original_bytes = mem.to_bytes()
+
+        calls = self._counting_patch(monkeypatch)
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [99]}), mode=Mode.IGNORE,
+        )
+        assert calls["n"] >= 1
+        # Bytes unchanged — IGNORE skipped the write.
+        assert mem.to_bytes() == original_bytes
+
+    def test_error_if_exists_on_nonempty_uses_batch_hook(
+        self, monkeypatch,
+    ) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        with pytest.raises(FileExistsError):
+            ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+                pa.table({"id": [99]}), mode=Mode.ERROR_IF_EXISTS,
+            )
+        assert calls["n"] >= 1
+
+    def test_upsert_with_match_by_uses_batch_hook(self, monkeypatch) -> None:
+        """UPSERT (or AUTO+match_by) needs the read-modify-rewrite
+        path so the keyed dedup actually fires."""
+        from yggdrasil.enums import Mode
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        seed = pa.table({"id": [1, 2, 3], "v": ["a", "b", "c"]})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [2, 4], "v": ["B", "d"]}),
+            mode=Mode.UPSERT, match_by=["id"],
+        )
+        assert calls["n"] >= 1
+
+        out = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
+        pairs = sorted(
+            zip(out.column("id").to_pylist(), out.column("v").to_pylist())
+        )
+        assert pairs == [(1, "a"), (2, "B"), (3, "c"), (4, "d")]
+
+    def test_compression_and_row_group_options_pass_through(self) -> None:
+        """The fast path must thread the parquet writer options the
+        same way the batch path does — compression, row_group_size,
+        statistics, dictionary."""
+        from yggdrasil.io.primitive.parquet_file import (
+            ParquetFile, ParquetOptions,
+        )
+
+        # 10k rows so multiple row groups are possible.
+        table = pa.table({"id": list(range(10_000))})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+            table,
+            options=ParquetOptions(
+                compression="snappy",
+                row_group_size=1_000,
+                write_statistics=True,
+                use_dictionary=True,
+            ),
+        )
+
+        # Inspect via pyarrow directly to confirm the options landed.
+        import pyarrow.parquet as _pq
+        reader = _pq.ParquetFile(pa.BufferReader(mem.to_bytes()))
+        assert reader.num_row_groups == 10  # 10_000 / 1_000
+        meta = reader.metadata.row_group(0).column(0)
+        assert meta.compression.lower() == "snappy"
+
+    def test_target_schema_cast_applied_on_fast_path(self) -> None:
+        """When ``options.target`` reshapes the input, the fast path
+        must still apply the cast — otherwise the bytes encode the
+        wrong dtype."""
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.data.data_field import Field
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        # int64 source, int32 target — the fast path should cast.
+        source = pa.table({"id": pa.array([1, 2, 3], type=pa.int64())})
+        target = Field.from_(pa.schema([pa.field("id", pa.int32())]))
+
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
+            source, options=CastOptions(target=target),
+        )
+
+        # Read back the raw schema to confirm the cast committed.
+        import pyarrow.parquet as _pq
+        schema = _pq.ParquetFile(pa.BufferReader(mem.to_bytes())).schema_arrow
+        assert schema.field("id").type == pa.int32()
+
+    def test_empty_table_fast_path(self) -> None:
+        """An empty pa.Table on the fast path must still produce a
+        valid parquet file with the table's schema."""
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        empty = pa.table({"id": pa.array([], type=pa.int64())})
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(empty)
+
+        reread = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert reread.num_rows == 0
+        assert reread.schema.field("id").type == pa.int64()
 
 
 class TestPandasIndexRoundTrip(__import__(

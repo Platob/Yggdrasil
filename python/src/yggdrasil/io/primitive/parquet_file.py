@@ -427,32 +427,37 @@ class ParquetFile(IO[bytes, ParquetOptions]):
     def _write_arrow_table(self, table: pa.Table, options: ParquetOptions) -> None:
         """Write *table* directly via ``pq.write_table``.
 
-        Bypasses the base ``_write_arrow_table`` → ``table.to_batches()``
-        → ``_write_arrow_batches`` round trip for the OVERWRITE-shaped
-        modes — ``pq.write_table`` lays out row groups internally with
-        no per-batch Python dispatch, so a single 1M-row table is
-        one C-level call instead of N ``writer.write_batch`` hops.
+        Bypasses the base ``_write_arrow_table`` →
+        ``table.to_batches()`` → ``_write_arrow_batches`` round trip
+        when the effective action is "replace the buffer wholesale"
+        — ``pq.write_table`` lays out row groups internally with no
+        per-batch Python dispatch, so a 1M-row table costs one
+        C-level call instead of N ``writer.write_batch`` hops.
 
-        Merge modes (APPEND / UPSERT / MERGE) still fall through to
-        the batch hook — the existing read-modify-rewrite path wants
-        a batch stream, and there's no parquet-side fast path that
-        avoids the rewrite anyway.
+        The fast path runs when *either*:
+
+        - The mode is explicitly ``OVERWRITE`` / ``TRUNCATE``, OR
+        - The buffer is empty (an OVERWRITE wins regardless of the
+          caller's nominal mode — ``APPEND`` to empty *is* an
+          ``OVERWRITE``, and ``IGNORE`` / ``ERROR_IF_EXISTS`` on
+          empty also reduce to plain write).
+
+        Every other shape (merge against existing rows, guarded
+        ``IGNORE`` / ``ERROR_IF_EXISTS`` on non-empty) falls through
+        to ``_write_arrow_batches`` where the read-modify-rewrite /
+        size-check + raise / skip logic already lives.
         """
         mode = options.mode
-        is_merge = (
-            mode in (Mode.APPEND, Mode.UPSERT, Mode.MERGE)
-            or (mode is Mode.AUTO and options.match_by_keys)
-        )
-        # ``IGNORE`` / ``ERROR_IF_EXISTS`` on a non-empty buffer can't
-        # be answered without the size check the batch hook already
-        # carries; route there for correctness.
-        guarded = (
-            mode in (Mode.IGNORE, Mode.ERROR_IF_EXISTS)
-            and not self.holder_is_overwrite
+        has_existing = (
+            not self.holder_is_overwrite
             and self.size_known
             and self.size > 0
         )
-        if is_merge or guarded:
+        truly_overwrite = (
+            mode in (Mode.OVERWRITE, Mode.TRUNCATE)
+            or not has_existing
+        )
+        if not truly_overwrite:
             return self._write_arrow_batches(iter(table.to_batches()), options)
 
         casted = options.cast_arrow_table(table)
