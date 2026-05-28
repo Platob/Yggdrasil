@@ -466,15 +466,15 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         if casted.schema != schema:
             casted = casted.cast(schema)
         with self.arrow_output_stream() as sink:
-            pq.write_table(
-                casted,
+            with pq.ParquetWriter(
                 sink,
-                row_group_size=options.row_group_size,
+                schema,
                 compression=options.compression,
                 compression_level=options.compression_level,
                 use_dictionary=options.use_dictionary,
                 write_statistics=options.write_statistics,
-            )
+            ) as writer:
+                writer.write_table(casted, row_group_size=options.row_group_size)
 
     # ==================================================================
     # Pandas — tag each index level as a Field, set_index() on read

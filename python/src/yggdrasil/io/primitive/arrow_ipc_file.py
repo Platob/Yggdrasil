@@ -327,3 +327,47 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                         writer.write_batch(casted_batch)
 
         return None
+
+    def _write_arrow_table(self, table: pa.Table, options: ArrowIPCOptions) -> None:
+        """Write *table* directly via ``writer.write_table``.
+
+        The base ``Tabular._write_arrow_table`` splits the table into
+        record batches and feeds them through ``_write_arrow_batches``,
+        which loops calling ``writer.write_batch`` per batch.
+        PyArrow's ``RecordBatchFileWriter.write_table(table)`` is one
+        C-level call that lays out the IPC blocks internally — no
+        per-batch Python dispatch.
+
+        The fast path runs when the effective action is "replace the
+        buffer wholesale": ``OVERWRITE`` / ``TRUNCATE``, OR any mode
+        on an empty buffer (which all reduce to a plain write). Every
+        other shape (merge against existing rows, guarded ``IGNORE``
+        / ``ERROR_IF_EXISTS`` on non-empty) falls through to
+        ``_write_arrow_batches`` where the read-modify-rewrite /
+        size-check + raise / skip logic already lives.
+        """
+        has_existing = (
+            not self.holder_is_overwrite
+            and self.size_known
+            and self.size > 0
+        )
+        truly_overwrite = (
+            options.mode in (Mode.OVERWRITE, Mode.TRUNCATE)
+            or not has_existing
+        )
+        if not truly_overwrite:
+            return self._write_arrow_batches(iter(table.to_batches()), options)
+
+        casted = options.cast_arrow_table(table)
+        write_options = options.check_source(casted.schema)
+        schema = write_options.merged.to_arrow_schema()
+        if casted.schema != schema:
+            casted = casted.cast(schema)
+        nbytes_hint = get_arrow_nbytes(casted) if casted.num_rows > 0 else 0
+        with self.arrow_output_stream() as sink:
+            with ipc.RecordBatchFileWriter(
+                sink, schema,
+                options=options.to_writer_options(nbytes_hint),
+            ) as writer:
+                writer.write_table(casted)
+        return None

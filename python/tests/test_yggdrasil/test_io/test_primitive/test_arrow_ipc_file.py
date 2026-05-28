@@ -215,3 +215,187 @@ class TestLocalPathRoundTrip:
             cursor.write_arrow_table(table)
         with path.open("rb") as cursor:
             assert cursor.read_arrow_table().equals(table)
+
+
+class TestWriteArrowTableBypassesBatchHook:
+    """``ArrowIPCFile._write_arrow_table`` routes the "replace the
+    buffer wholesale" shapes straight through ``writer.write_table``
+    and only falls through to ``_write_arrow_batches`` for
+    read-modify-rewrite merge cases and the guarded ``IGNORE`` /
+    ``ERROR_IF_EXISTS`` paths."""
+
+    @staticmethod
+    def _counting_patch(monkeypatch):
+        calls = {"n": 0}
+        original = ArrowIPCFile._write_arrow_batches
+
+        def counting(self, batches, options):
+            calls["n"] += 1
+            return original(self, batches, options)
+
+        monkeypatch.setattr(ArrowIPCFile, "_write_arrow_batches", counting)
+        return calls
+
+    def test_overwrite_on_empty_skips_batch_hook(self, monkeypatch) -> None:
+        calls = self._counting_patch(monkeypatch)
+        table = pa.table({"id": list(range(1000))})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(table)
+
+        assert calls["n"] == 0
+        assert ArrowIPCFile(
+            holder=mem, owns_holder=False,
+        ).read_arrow_table().equals(table)
+
+    def test_explicit_overwrite_on_nonempty_skips_batch_hook(
+        self, monkeypatch,
+    ) -> None:
+        from yggdrasil.enums import Mode
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [99]}), mode=Mode.OVERWRITE,
+        )
+        assert calls["n"] == 0
+        out = ArrowIPCFile(
+            holder=mem, owns_holder=False,
+        ).read_arrow_table()
+        assert out.column("id").to_pylist() == [99]
+
+    def test_truncate_routes_to_fast_path(self, monkeypatch) -> None:
+        from yggdrasil.enums import Mode
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [42]}), mode=Mode.TRUNCATE,
+        )
+        assert calls["n"] == 0
+        out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert out.column("id").to_pylist() == [42]
+
+    def test_append_to_nonempty_uses_batch_hook(self, monkeypatch) -> None:
+        from yggdrasil.enums import Mode
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [4, 5]}), mode=Mode.APPEND,
+        )
+        assert calls["n"] >= 1
+        out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert sorted(out.column("id").to_pylist()) == [1, 2, 3, 4, 5]
+
+    def test_append_to_empty_skips_batch_hook(self, monkeypatch) -> None:
+        """APPEND on empty reduces to OVERWRITE — fast path is safe."""
+        from yggdrasil.enums import Mode
+
+        calls = self._counting_patch(monkeypatch)
+        table = pa.table({"id": [1, 2, 3]})
+        ArrowIPCFile(holder=Memory(), owns_holder=False).write_arrow_table(
+            table, mode=Mode.APPEND,
+        )
+        assert calls["n"] == 0
+
+    def test_auto_on_nonempty_uses_batch_hook(self, monkeypatch) -> None:
+        """AUTO without match_by resolves to APPEND on a non-empty
+        buffer — must NOT clobber existing data."""
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [4, 5]}),  # default mode = AUTO
+        )
+        assert calls["n"] >= 1
+        out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert sorted(out.column("id").to_pylist()) == [1, 2, 3, 4, 5]
+
+    def test_ignore_on_nonempty_uses_batch_hook(self, monkeypatch) -> None:
+        from yggdrasil.enums import Mode
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+        original_bytes = mem.to_bytes()
+
+        calls = self._counting_patch(monkeypatch)
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [99]}), mode=Mode.IGNORE,
+        )
+        assert calls["n"] >= 1
+        assert mem.to_bytes() == original_bytes
+
+    def test_error_if_exists_on_nonempty_uses_batch_hook(
+        self, monkeypatch,
+    ) -> None:
+        from yggdrasil.enums import Mode
+
+        seed = pa.table({"id": [1, 2, 3]})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        with pytest.raises(FileExistsError):
+            ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(
+                pa.table({"id": [99]}), mode=Mode.ERROR_IF_EXISTS,
+            )
+        assert calls["n"] >= 1
+
+    def test_upsert_with_match_by_uses_batch_hook(self, monkeypatch) -> None:
+        from yggdrasil.enums import Mode
+
+        seed = pa.table({"id": [1, 2, 3], "v": ["a", "b", "c"]})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(seed)
+
+        calls = self._counting_patch(monkeypatch)
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [2, 4], "v": ["B", "d"]}),
+            mode=Mode.UPSERT, match_by=["id"],
+        )
+        assert calls["n"] >= 1
+        out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
+        pairs = sorted(
+            zip(out.column("id").to_pylist(), out.column("v").to_pylist())
+        )
+        assert pairs == [(1, "a"), (2, "B"), (3, "c"), (4, "d")]
+
+    def test_target_schema_cast_applied_on_fast_path(self) -> None:
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.data.data_field import Field
+
+        source = pa.table({"id": pa.array([1, 2, 3], type=pa.int64())})
+        target = Field.from_(pa.schema([pa.field("id", pa.int32())]))
+
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(
+            source, options=CastOptions(target=target),
+        )
+
+        # Read back via stdlib IPC reader to confirm the cast committed.
+        import pyarrow.ipc as _ipc
+        reader = _ipc.RecordBatchFileReader(pa.BufferReader(mem.to_bytes()))
+        assert reader.schema.field("id").type == pa.int32()
+
+    def test_empty_table_fast_path(self) -> None:
+        empty = pa.table({"id": pa.array([], type=pa.int64())})
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(empty)
+
+        reread = ArrowIPCFile(
+            holder=mem, owns_holder=False,
+        ).read_arrow_table()
+        assert reread.num_rows == 0
+        assert reread.schema.field("id").type == pa.int64()
