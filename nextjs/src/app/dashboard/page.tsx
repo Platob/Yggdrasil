@@ -187,6 +187,28 @@ export default function DashboardPage() {
     }
   }, []);
 
+  const handleCreateFunc = async () => {
+    const name = newFuncName.trim();
+    if (!name) {
+      setNewFuncError("Name is required");
+      return;
+    }
+    setNewFuncSaving(true);
+    setNewFuncError("");
+    try {
+      await createFunc({ name, code: newFuncCode });
+      setNewFuncOpen(false);
+      setNewFuncName("");
+      setNewFuncCode("def hello():\n    return 'world'\n");
+      fetchStats();
+      fetchAudit();
+    } catch (err) {
+      setNewFuncError(err instanceof Error ? err.message : "Create failed");
+    } finally {
+      setNewFuncSaving(false);
+    }
+  };
+
   useEffect(() => {
     fetchStats();
     fetchAudit();
@@ -236,11 +258,14 @@ export default function DashboardPage() {
   const memColor = stats.memory_percent > 80 ? "var(--rose)" : stats.memory_percent > 50 ? "var(--amber)" : "var(--emerald)";
 
   return (
-    <div className="p-6 space-y-6 overflow-y-auto h-screen animate-in">
+    <div className="relative p-6 space-y-6 overflow-y-auto h-screen animate-in">
+      {/* Ambient aurora behind the page content */}
+      <div className="aurora-bg" />
+
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="relative flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-foreground">Dashboard</h1>
+          <h1 className="text-2xl font-bold text-foreground glow-frost">Dashboard</h1>
           <p className="text-sm text-muted mt-1">
             <span className="font-mono">{stats.node_id}</span> overview
           </p>
@@ -251,8 +276,55 @@ export default function DashboardPage() {
         </div>
       </div>
 
+      {/* Quick Actions row */}
+      <div className="relative flex flex-wrap gap-3">
+        <QuickAction
+          onClick={() => {
+            setNewFuncOpen(true);
+            setNewFuncError("");
+          }}
+          icon={
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          }
+          label="New Function"
+        />
+        <QuickAction
+          href="/dags"
+          icon={
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="5" cy="6" r="3" />
+              <circle cx="19" cy="6" r="3" />
+              <circle cx="12" cy="18" r="3" />
+              <path d="M7.5 8l3 7M16.5 8l-3 7" />
+            </svg>
+          }
+          label="New DAG"
+        />
+        <QuickAction
+          href="/files"
+          icon={
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+            </svg>
+          }
+          label="Browse Files"
+        />
+        <QuickAction
+          href="/chat"
+          icon={
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+            </svg>
+          }
+          label="Open Chat"
+        />
+      </div>
+
       {/* Big numbers row */}
-      <div className="flex flex-wrap gap-3">
+      <div className="relative flex flex-wrap gap-3">
         <BigStatCard label="Functions" value={stats.func_count} color="var(--frost)" />
         <BigStatCard label="Environments" value={stats.env_count} color="var(--emerald)" />
         <BigStatCard label="DAGs" value={stats.dag_count} color="var(--frost)" />
@@ -266,7 +338,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Live metric cards */}
-      <div className="flex flex-wrap gap-3">
+      <div className="relative flex flex-wrap gap-3">
         <MetricCard
           label="CPU"
           value={`${stats.cpu_percent.toFixed(1)}%`}
@@ -298,7 +370,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Activity feed */}
-      <div className="glass-card p-5 space-y-3">
+      <div className="relative glass-card p-5 space-y-3">
         <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <circle cx="12" cy="12" r="10" />
