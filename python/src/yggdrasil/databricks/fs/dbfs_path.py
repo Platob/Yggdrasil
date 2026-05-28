@@ -6,12 +6,25 @@ stream via ``dbfs.open(write=True)`` which the SDK chunk-uploads
 under the hood. The new design folds those calls into the
 :class:`Holder` byte primitives so :class:`IO` over a DBFS
 path Just Works.
+
+Cluster-mount fast path
+-----------------------
+
+On a Databricks runtime, ``/dbfs/...`` is the FUSE mount that
+exposes DBFS as a regular Linux filesystem. Reads, stats, listdirs,
+mkdirs, and removes all run at filesystem speed off the kernel; the
+``dbfs.*`` REST API (with its 1 MiB chunked reads and base64
+encoding) is only used off-cluster. Note ``self.api_path`` strips
+the ``/dbfs/`` prefix for the SDK — the kernel mount uses
+``self.full_path()`` (which keeps the prefix).
 """
 
 from __future__ import annotations
 
 import base64
 import logging
+import os
+import stat as _stat
 import time
 from typing import Any, ClassVar, Iterator
 
@@ -29,6 +42,54 @@ __all__ = ["DBFSPath"]
 logger = logging.getLogger(__name__)
 
 _DBFS_CHUNK = 1 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Local /dbfs FUSE mount fast path
+# ---------------------------------------------------------------------------
+
+_LOCAL_DBFS_MOUNT_PROBED: bool = False
+_LOCAL_DBFS_MOUNT_AVAILABLE: bool = False
+
+
+def _dbfs_mount_available() -> bool:
+    """``True`` when ``/dbfs/...`` is reachable via the kernel mount.
+
+    Conjunction of "this process runs inside a Databricks runtime"
+    (``DATABRICKS_RUNTIME_VERSION`` env var) and "``/dbfs`` exists on
+    disk". Cached after the first probe; the result is logged once at
+    INFO so an operator can confirm the fast path is engaged.
+    """
+    global _LOCAL_DBFS_MOUNT_PROBED, _LOCAL_DBFS_MOUNT_AVAILABLE
+    if _LOCAL_DBFS_MOUNT_PROBED:
+        return _LOCAL_DBFS_MOUNT_AVAILABLE
+    try:
+        from yggdrasil.databricks.client import DatabricksClient
+        in_runtime = DatabricksClient.is_in_databricks_environment()
+    except Exception:
+        in_runtime = False
+    has_mount = bool(in_runtime) and os.path.isdir("/dbfs")
+    _LOCAL_DBFS_MOUNT_AVAILABLE = has_mount
+    _LOCAL_DBFS_MOUNT_PROBED = True
+    if has_mount:
+        logger.info(
+            "DBFSPath: /dbfs kernel mount detected — short-circuiting "
+            "stat/read/ls/mkdir/remove/upload off the DBFS REST API.",
+        )
+    else:
+        logger.debug(
+            "DBFSPath: /dbfs kernel mount unavailable "
+            "(in_runtime=%s, /dbfs exists=%s) — routing through DBFS API.",
+            in_runtime, os.path.isdir("/dbfs"),
+        )
+    return _LOCAL_DBFS_MOUNT_AVAILABLE
+
+
+def _reset_dbfs_mount_probe() -> None:
+    """Test hook — drop the cached probe result."""
+    global _LOCAL_DBFS_MOUNT_PROBED, _LOCAL_DBFS_MOUNT_AVAILABLE
+    _LOCAL_DBFS_MOUNT_PROBED = False
+    _LOCAL_DBFS_MOUNT_AVAILABLE = False
 
 
 class DBFSPath(DatabricksPath):
@@ -66,6 +127,40 @@ class DBFSPath(DatabricksPath):
     # ==================================================================
 
     def _stat_uncached(self) -> IOStats:
+        if _dbfs_mount_available():
+            mount_path = self.full_path()
+            try:
+                st = os.stat(mount_path)
+            except FileNotFoundError:
+                logger.debug(
+                    "stat via /dbfs mount: %r -> MISSING", mount_path,
+                )
+                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
+            except OSError as exc:
+                logger.debug(
+                    "stat via /dbfs mount: %r -> OSError %r, "
+                    "falling back to DBFS API", mount_path, exc,
+                )
+            else:
+                if _stat.S_ISDIR(st.st_mode):
+                    logger.debug(
+                        "stat via /dbfs mount: %r -> DIRECTORY",
+                        mount_path,
+                    )
+                    return IOStats(
+                        kind=IOKind.DIRECTORY,
+                        size=0,
+                        mtime=st.st_mtime,
+                    )
+                logger.debug(
+                    "stat via /dbfs mount: %r -> FILE size=%d",
+                    mount_path, st.st_size,
+                )
+                return IOStats(
+                    kind=IOKind.FILE,
+                    size=int(st.st_size),
+                    mtime=st.st_mtime,
+                )
         try:
             info = self._call(
                 self.client.workspace_client().dbfs.get_status, self.api_path
@@ -96,6 +191,65 @@ class DBFSPath(DatabricksPath):
         *,
         singleton_ttl: Any = False,
     ) -> Iterator["DBFSPath"]:
+        if _dbfs_mount_available():
+            scan_root = self.full_path()
+            # Build children from the URL path (the SDK-shape, ``/tmp/x``)
+            # not from ``full_path`` — ``full_path`` includes the
+            # ``/dbfs/`` prefix and round-tripping that string through
+            # the URL parser would treat the leading segment as a host.
+            url_root = (self.url.path or "/").rstrip("/") or "/"
+            try:
+                scan = os.scandir(scan_root)
+            except FileNotFoundError:
+                logger.debug(
+                    "ls via /dbfs mount: %r -> not found", scan_root,
+                )
+                return
+            except (NotADirectoryError, PermissionError) as exc:
+                logger.warning(
+                    "Cannot scan DBFS directory %r: %r", self, exc,
+                )
+                return
+            yielded = 0
+            with scan as it:
+                for entry in it:
+                    child_url_path = (
+                        f"{url_root}/{entry.name}" if url_root != "/"
+                        else f"/{entry.name}"
+                    )
+                    child = type(self)(
+                        url=URL(scheme=self.scheme, path=child_url_path),
+                        service=self.service,
+                        singleton_ttl=singleton_ttl,
+                    )
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        is_dir = _stat.S_ISDIR(st.st_mode)
+                        child._persist_stat_cache(
+                            IOStats(
+                                kind=(
+                                    IOKind.DIRECTORY
+                                    if is_dir
+                                    else IOKind.FILE
+                                ),
+                                size=0 if is_dir else int(st.st_size),
+                                mtime=st.st_mtime,
+                            )
+                        )
+                    except OSError:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    yielded += 1
+                    yield child
+                    if recursive and is_dir:
+                        yield from child._ls(
+                            recursive=True,
+                            singleton_ttl=singleton_ttl,
+                        )
+            logger.debug(
+                "ls via /dbfs mount: %r -> %d entries (recursive=%s)",
+                scan_root, yielded, recursive,
+            )
+            return
         try:
             entries = list(
                 self._call(self.client.workspace_client().dbfs.list, self.api_path)
@@ -142,8 +296,24 @@ class DBFSPath(DatabricksPath):
     # ==================================================================
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
+        logger.debug(
+            "Creating DBFS directory %r (parents=%s, exist_ok=%s)",
+            self, parents, exist_ok,
+        )
+        if _dbfs_mount_available():
+            mount_path = self.full_path()
+            try:
+                if parents:
+                    os.makedirs(mount_path, exist_ok=exist_ok)
+                else:
+                    os.mkdir(mount_path)
+            except FileExistsError:
+                if not exist_ok:
+                    raise
+            self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
+            logger.debug("mkdir via /dbfs mount: %r", mount_path)
+            return
         del parents
-        logger.debug("Creating DBFS directory %r", self)
         try:
             self._call(self.client.workspace_client().dbfs.mkdirs, self.api_path)
         except Exception as exc:
@@ -153,7 +323,20 @@ class DBFSPath(DatabricksPath):
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
-        logger.debug("Deleting DBFS file %r", self)
+        logger.debug(
+            "Deleting DBFS file %r (missing_ok=%s)", self, missing_ok,
+        )
+        if _dbfs_mount_available():
+            try:
+                os.remove(self.full_path())
+                logger.debug("rm via /dbfs mount: %r", self.full_path())
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+            except IsADirectoryError:
+                raise
+            self.invalidate_singleton()
+            return
         try:
             self._call(
                 self.client.workspace_client().dbfs.delete,
@@ -174,10 +357,26 @@ class DBFSPath(DatabricksPath):
     ) -> None:
         del wait
         logger.debug(
-            "Deleting DBFS directory %r (recursive=%s)",
-            self,
-            recursive,
+            "Deleting DBFS directory %r (recursive=%s, missing_ok=%s)",
+            self, recursive, missing_ok,
         )
+        if _dbfs_mount_available():
+            import shutil
+            mount_path = self.full_path()
+            try:
+                if recursive:
+                    shutil.rmtree(mount_path)
+                else:
+                    os.rmdir(mount_path)
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+            self.invalidate_singleton()
+            logger.debug(
+                "rmdir via /dbfs mount: %r (recursive=%s)",
+                mount_path, recursive,
+            )
+            return
         try:
             self._call(
                 self.client.workspace_client().dbfs.delete,
@@ -206,6 +405,45 @@ class DBFSPath(DatabricksPath):
         """
         if n == 0:
             return memoryview(b"")
+
+        # Cluster fast path — read off the /dbfs FUSE mount, skipping
+        # the 1 MiB chunked + base64-encoded REST loop entirely.
+        if _dbfs_mount_available():
+            mount_path = self.full_path()
+            try:
+                with open(mount_path, "rb") as fh:
+                    if pos:
+                        fh.seek(pos)
+                    data = fh.read() if n < 0 else fh.read(n)
+            except FileNotFoundError as exc:
+                logger.debug(
+                    "read via /dbfs mount: %r -> NOT FOUND", mount_path,
+                )
+                raise FileNotFoundError(self.full_path()) from exc
+            except OSError as exc:
+                logger.debug(
+                    "read via /dbfs mount: %r -> OSError %r, "
+                    "falling back to DBFS API", mount_path, exc,
+                )
+            else:
+                logger.debug(
+                    "read via /dbfs mount: %r -> %d bytes "
+                    "(pos=%d, n=%s)",
+                    mount_path, len(data), pos, "EOF" if n < 0 else n,
+                )
+                if not self._stat_cached:
+                    try:
+                        st = os.stat(mount_path)
+                        self._persist_stat_cache(
+                            IOStats(
+                                size=int(st.st_size),
+                                kind=IOKind.FILE,
+                                mtime=st.st_mtime,
+                            )
+                        )
+                    except OSError:
+                        pass
+                return memoryview(data)
 
         out = bytearray()
         offset = pos
@@ -315,6 +553,49 @@ class DBFSPath(DatabricksPath):
             self,
             size if size >= 0 else "?",
         )
+        # Cluster fast path — write straight to the /dbfs kernel mount.
+        if _dbfs_mount_available():
+            mount_path = self.full_path()
+            parent = os.path.dirname(mount_path)
+            if parent and not os.path.isdir(parent):
+                logger.debug(
+                    "upload via /dbfs mount: auto-creating parent %r",
+                    parent,
+                )
+                os.makedirs(parent, exist_ok=True)
+            if hasattr(content, "seek"):
+                stream = content
+                try:
+                    stream.seek(0)
+                except Exception:
+                    pass
+                bytes_written = 0
+                with open(mount_path, "wb") as fh:
+                    while True:
+                        chunk = stream.read(_DBFS_CHUNK)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        bytes_written += len(chunk)
+                if size == -1:
+                    size = bytes_written
+            else:
+                payload = bytes(content)
+                size = len(payload)
+                with open(mount_path, "wb") as fh:
+                    fh.write(payload)
+            logger.debug(
+                "upload via /dbfs mount: %r -> %d bytes",
+                mount_path, size,
+            )
+            self._persist_stat_cache(
+                IOStats(
+                    kind=IOKind.FILE,
+                    size=int(max(size, 0)),
+                    mtime=time.time(),
+                )
+            )
+            return int(max(size, -1))
         api_path = self.api_path
         dbfs = self.client.workspace_client().dbfs
 
