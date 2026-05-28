@@ -245,6 +245,38 @@ export async function getFsContent(path: string): Promise<string> {
   return res.content;
 }
 
+export function getFsTail(path: string, n = 200): Promise<{ path: string; lines: string[] }> {
+  return jsonFetch<{ path: string; lines: string[] }>(
+    `/api/v2/fs/tail?path=${encodeURIComponent(path)}&n=${n}`,
+  );
+}
+
+export function getFsHead(path: string, n = 100): Promise<{ path: string; lines: string[] }> {
+  return jsonFetch<{ path: string; lines: string[] }>(
+    `/api/v2/fs/head?path=${encodeURIComponent(path)}&n=${n}`,
+  );
+}
+
+export function createFsWatchStream(path: string): EventSource {
+  return new EventSource(`/api/v2/fs/watch?path=${encodeURIComponent(path)}`);
+}
+
+export function grepFs(
+  path: string,
+  pattern: string,
+  opts: { regex?: boolean; case_sensitive?: boolean; max_matches?: number } = {},
+): Promise<{
+  path: string;
+  pattern: string;
+  count: number;
+  matches: { path: string; line_number: number; line: string; match: string }[];
+}> {
+  return jsonFetch("/api/v2/fs/grep", {
+    method: "POST",
+    body: JSON.stringify({ path, pattern, ...opts }),
+  });
+}
+
 // ── Messenger ──────────────────────────────────────────────────────────────
 
 export function getChannels(): Promise<{ node_id: string; channels: ChannelInfo[] }> {

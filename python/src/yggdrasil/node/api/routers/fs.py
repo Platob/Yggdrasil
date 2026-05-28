@@ -203,6 +203,48 @@ async def tree_listing(path: str = "", depth: int = 3, service: FsService = Depe
     return {"path": path, "depth": depth, "tree": walk(root, 0)}
 
 
+@router.get("/head")
+async def head_file(path: str, n: int = 100, service: FsService = Depends(get_fs_service)) -> dict:
+    """First N lines of a file. Default 100."""
+    return {"path": path, "lines": service.head_lines(path, n=n)}
+
+
+@router.get("/tail")
+async def tail_file(path: str, n: int = 100, service: FsService = Depends(get_fs_service)) -> dict:
+    """Last N lines of a file. Default 100. Uses byte-back scan, no full load."""
+    return {"path": path, "lines": service.tail_lines(path, n=n)}
+
+
+@router.get("/watch")
+async def watch_file(path: str, service: FsService = Depends(get_fs_service)) -> StreamingResponse:
+    """SSE tail -f. Streams each new line as ``data: {line}\\n\\n``."""
+    import json as _json
+    async def stream():
+        async for line in service.watch_tail(path):
+            yield f"data: {_json.dumps({'line': line})}\n\n"
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+class _GrepRequest(StrictModel):
+    path: str = ""
+    pattern: str
+    max_matches: int = 200
+    case_sensitive: bool = False
+    regex: bool = False
+
+
+@router.post("/grep")
+async def grep_files(req: _GrepRequest, service: FsService = Depends(get_fs_service)) -> dict:
+    """Recursive grep over text files. Returns matches with line numbers."""
+    matches = service.grep(
+        req.path, req.pattern,
+        max_matches=req.max_matches,
+        case_sensitive=req.case_sensitive,
+        regex=req.regex,
+    )
+    return {"path": req.path, "pattern": req.pattern, "count": len(matches), "matches": matches}
+
+
 @router.get("/du")
 async def disk_usage(path: str = "", service: FsService = Depends(get_fs_service)) -> dict:
     """Total disk usage of a directory (recursive)."""

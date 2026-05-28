@@ -192,3 +192,94 @@ class FsService:
 
         LOGGER.info("Stream-wrote file %r (%d bytes)", path, resolved.stat().st_size)
         return self._entry(resolved)
+
+    def head_lines(self, path: str, n: int = 100) -> list[str]:
+        """First N lines. Inline because we never need it elsewhere."""
+        resolved = self._resolve(path)
+        if not resolved.exists() or resolved.is_dir():
+            raise NotFoundError(f"File not found: {path!r}")
+        out: list[str] = []
+        with open(resolved, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= n:
+                    break
+                out.append(line.rstrip("\n"))
+        return out
+
+    def tail_lines(self, path: str, n: int = 100) -> list[str]:
+        """Last N lines via a tail-from-end byte scan (no whole-file load)."""
+        resolved = self._resolve(path)
+        if not resolved.exists() or resolved.is_dir():
+            raise NotFoundError(f"File not found: {path!r}")
+        # Read backwards in 8 KB chunks until we have n+1 newlines or hit BOF.
+        block = 8192
+        with open(resolved, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            data = b""
+            while size > 0 and data.count(b"\n") <= n:
+                read = min(block, size)
+                size -= read
+                f.seek(size)
+                data = f.read(read) + data
+        text = data.decode("utf-8", errors="replace")
+        return text.splitlines()[-n:]
+
+    async def watch_tail(self, path: str, poll_seconds: float = 0.5) -> AsyncIterator[str]:
+        """SSE-style tail -f. Yields each new line as it appears."""
+        import asyncio
+        resolved = self._resolve(path)
+        if not resolved.exists() or resolved.is_dir():
+            raise NotFoundError(f"File not found: {path!r}")
+        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)  # start at EOF
+            while True:
+                line = f.readline()
+                if line:
+                    yield line.rstrip("\n")
+                else:
+                    await asyncio.sleep(poll_seconds)
+
+    def grep(self, path: str, pattern: str, *, max_matches: int = 200,
+             case_sensitive: bool = False, regex: bool = False) -> list[dict]:
+        """Recursive substring/regex search over text files inside ``path``.
+
+        Returns a list of {path, line_number, line, match} dicts. Skips files
+        whose first 1 KB is mostly non-text (heuristic null-byte check).
+        """
+        import re
+        from ...exceptions import NotFoundError
+        root = self._resolve(path) if path else self._root
+        if not root.exists():
+            raise NotFoundError(f"Path not found: {path!r}")
+        flags = 0 if case_sensitive else re.IGNORECASE
+        prog = re.compile(pattern if regex else re.escape(pattern), flags)
+        results: list[dict] = []
+        targets = [root] if root.is_file() else list(root.rglob("*"))
+        for p in targets:
+            if len(results) >= max_matches:
+                break
+            if not p.is_file():
+                continue
+            try:
+                # Quick binary skip
+                with open(p, "rb") as fh:
+                    head = fh.read(1024)
+                if b"\x00" in head:
+                    continue
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    for lineno, line in enumerate(fh, start=1):
+                        if len(results) >= max_matches:
+                            break
+                        m = prog.search(line)
+                        if m:
+                            rel = str(p.relative_to(self._root))
+                            results.append({
+                                "path": rel,
+                                "line_number": lineno,
+                                "line": line.rstrip("\n")[:500],
+                                "match": m.group(0),
+                            })
+            except (OSError, UnicodeDecodeError):
+                continue
+        return results
