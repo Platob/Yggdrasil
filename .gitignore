@@ -222,3 +222,5 @@ __marimo__/
 /python/\*/
 .next/
 .claude/worktrees/
+node_modules/
+tsconfig.tsbuildinfo
