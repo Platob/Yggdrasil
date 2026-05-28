@@ -95,7 +95,9 @@ async def run_func_by_name(
     pyfunc: PyFuncService = Depends(get_pyfunc_service),
     pyfuncrun: PyFuncRunService = Depends(get_pyfuncrun_service),
 ) -> PyFuncRunResponse:
-    """Run a function by name. Resolves name to ID, creates a run, returns immediately."""
+    """Run a function by name. Resolves the name, creates a PyFuncRun, and
+    returns immediately with the pending entry — the subprocess runs in the
+    background. Use /{run_id}/wait, /logs, or /state to consume it."""
     func = await pyfunc.get_by_name(name)
     create_req = PyFuncRunCreate(
         func_id=func.id,
@@ -160,7 +162,8 @@ async def run_func(
     req: _FuncRunRequest,
     pyfuncrun: PyFuncRunService = Depends(get_pyfuncrun_service),
 ) -> PyFuncRunResponse:
-    """Run a function directly by its ID. Creates a PyFuncRun and returns the result."""
+    """Run a function by its ID. Returns immediately with the pending PyFuncRun;
+    follow with GET /{run_id}/wait or GET /{run_id}/logs to consume the result."""
     create_req = PyFuncRunCreate(
         func_id=func_id,
         env_id=req.env_id,

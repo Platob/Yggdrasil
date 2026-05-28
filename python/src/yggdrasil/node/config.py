@@ -83,6 +83,9 @@ class Settings:
     max_environments: int = 32
     max_functions: int = 256
     max_runs_history: int = 512
+    max_log_lines_per_stream: int = 1000
+    run_heartbeat_interval: float = 2.0
+    run_cancel_grace_seconds: float = 1.5
 
     @property
     def local_clients(self) -> set[str]:
@@ -151,4 +154,7 @@ def get_settings() -> Settings:
         max_environments=int(os.getenv("YGG_NODE_MAX_ENVIRONMENTS", "32")),
         max_functions=int(os.getenv("YGG_NODE_MAX_FUNCTIONS", "256")),
         max_runs_history=int(os.getenv("YGG_NODE_MAX_RUNS_HISTORY", "512")),
+        max_log_lines_per_stream=int(os.getenv("YGG_NODE_MAX_LOG_LINES", "1000")),
+        run_heartbeat_interval=float(os.getenv("YGG_NODE_RUN_HEARTBEAT", "2.0")),
+        run_cancel_grace_seconds=float(os.getenv("YGG_NODE_RUN_CANCEL_GRACE", "1.5")),
     )

@@ -122,7 +122,9 @@ async def run_in_env(
     pyfunc: PyFuncService = Depends(get_pyfunc_service),
     pyfuncrun: PyFuncRunService = Depends(get_pyfuncrun_service),
 ) -> PyFuncRunResponse:
-    """Execute code in a specific environment. Creates a temporary PyFunc, runs it, returns the run."""
+    """Execute code in a specific environment. Creates an ephemeral PyFunc,
+    spawns the run, and returns the pending entry immediately — the subprocess
+    runs in the background. Follow with /pyfuncrun/{id}/wait or /logs."""
     # Validate env exists
     await pyenv.get(env_id)
     # Create an ephemeral function for this code

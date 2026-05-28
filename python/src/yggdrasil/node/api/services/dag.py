@@ -300,7 +300,9 @@ class DAGService:
             kwargs=args,
         )
         response = await self._pyfuncrun.create(req)
-        run = response.run
+        # create() now returns immediately with a pending entry — DAGs need
+        # the terminal state to chain steps, so we await completion here.
+        run = await self._pyfuncrun.wait(response.run.id)
         if run.status == "failed":
             raise RuntimeError(
                 f"Step {step.id!r} failed: {run.stderr or 'unknown error'}"
