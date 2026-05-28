@@ -6,8 +6,12 @@ import json
 import logging
 import os
 import platform
-import resource as resource_mod
 import subprocess
+
+if platform.system() != "Windows":
+    import resource as resource_mod
+else:
+    resource_mod = None
 import sys
 import tempfile
 import time

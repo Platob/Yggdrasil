@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import platform
 import signal
 import socket
 import subprocess
@@ -128,13 +129,22 @@ def spawn_node(settings: Settings | None = None, *, host: str = "0.0.0.0") -> tu
     env["YGG_NODE_NODE_ID"] = settings.node_id
     env["YGG_NODE_ALLOW_REMOTE"] = "1"
 
+    popen_kwargs: dict = {}
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
     with open(log_file, "a") as lf:
         proc = subprocess.Popen(
             [sys.executable, "-m", "yggdrasil.node.main"],
             env=env,
             stdout=lf,
             stderr=lf,
-            start_new_session=True,
+            **popen_kwargs,
         )
 
     for _ in range(30):
