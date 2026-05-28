@@ -118,6 +118,11 @@ def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
         except Exception:
             pass
 
+    # LATERAL VIEW EXPLODE / POSEXPLODE — apply before WHERE so the
+    # exploded column can be referenced in the predicate.
+    if getattr(node, "lateral_views", None):
+        result = _apply_lateral_views(result, node.lateral_views)
+
     # WHERE — push predicate into CastOptions for I/O-level optimization,
     # or use Tabular.filter() for Spark/Arrow engine-native dispatch.
     if node.where is not None:
@@ -420,6 +425,40 @@ def _apply_projections(result: "Tabular", projections: list) -> "Tabular":
             return result
 
     return ArrowTabular(pa.table(dict(zip(out_names, out_arrays))))
+
+
+def _apply_lateral_views(result: "Tabular", lateral_views: list) -> "Tabular":
+    """Apply LATERAL VIEW EXPLODE / POSEXPLODE clauses.
+
+    Supports the Meteologica-style ``LATERAL VIEW EXPLODE(col) tbl AS x``
+    and ``LATERAL VIEW POSEXPLODE(col) tbl AS pos, val`` patterns. For
+    each view, the named list column is flattened, scalar columns are
+    repeated per element, and the result is rebound to the column
+    aliases.
+    """
+    from yggdrasil.arrow.tabular import ArrowTabular
+    from yggdrasil.execution.expr.nodes import Column, FunctionCall
+    from .func_registry import explode_table, posexplode_table
+
+    table = result.read_arrow_table()
+    for lv in lateral_views:
+        func = lv.function
+        if not isinstance(func, FunctionCall):
+            continue
+        fn = func.name.upper()
+        if not func.args or not isinstance(func.args[0], Column):
+            continue
+        src_col = func.args[0].name
+        if src_col not in table.column_names:
+            continue
+        if fn in ("EXPLODE", "EXPLODE_OUTER"):
+            out_col = lv.column_aliases[0] if lv.column_aliases else src_col
+            table = explode_table(table, src_col, out_col=out_col)
+        elif fn in ("POSEXPLODE", "POSEXPLODE_OUTER"):
+            pos_col = lv.column_aliases[0] if lv.column_aliases else "pos"
+            val_col = lv.column_aliases[1] if len(lv.column_aliases) > 1 else src_col
+            table = posexplode_table(table, src_col, pos_col=pos_col, out_col=val_col)
+    return ArrowTabular(table)
 
 
 def _apply_qualify(result: "Tabular", qualify: Any) -> "Tabular":

@@ -846,6 +846,81 @@ class TestQualifyExecution:
         assert result.read_arrow_table().num_rows == 3
 
 
+class TestLateralViewExecution:
+    def test_explode_simple(self):
+        data = ArrowTabular(pa.table({
+            "id": [1, 2, 3],
+            "tags": [["a", "b"], ["c"], ["d", "e", "f"]],
+        }))
+        node = parse_sql(
+            "SELECT id, tag FROM t LATERAL VIEW EXPLODE(tags) tv AS tag",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"t": data})
+        rows = result.read_arrow_table().to_pylist()
+        assert len(rows) == 6
+        assert rows[0] == {"id": 1, "tag": "a"}
+        assert rows[5] == {"id": 3, "tag": "f"}
+
+    def test_posexplode(self):
+        data = ArrowTabular(pa.table({
+            "id": [1, 2],
+            "vals": [[10, 20, 30], [100]],
+        }))
+        node = parse_sql(
+            "SELECT id, p, v FROM t LATERAL VIEW POSEXPLODE(vals) tv AS p, v",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"t": data})
+        rows = result.read_arrow_table().to_pylist()
+        assert len(rows) == 4
+        assert rows[0] == {"id": 1, "p": 0, "v": 10}
+        assert rows[3] == {"id": 2, "p": 0, "v": 100}
+
+    def test_explode_in_cte(self):
+        data = ArrowTabular(pa.table({
+            "id": [1, 2],
+            "tags": [["x", "y"], ["z"]],
+        }))
+        node = parse_sql(
+            "WITH exploded AS ("
+            "  SELECT id, tag FROM t LATERAL VIEW EXPLODE(tags) tv AS tag"
+            ") "
+            "SELECT * FROM exploded ORDER BY id, tag",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"t": data})
+        rows = result.read_arrow_table().to_pylist()
+        assert len(rows) == 3
+
+    def test_explode_then_qualify(self):
+        """Meteologica pattern: explode array, then keep latest per partition."""
+        data = ArrowTabular(pa.table({
+            "content_id": [1, 1, 2, 2],
+            "issue_date": [100, 200, 100, 200],
+            "values": [[1.0, 2.0], [3.0, 4.0], [5.0], [6.0, 7.0]],
+        }))
+        node = parse_sql(
+            "WITH exploded AS ("
+            "  SELECT content_id, issue_date, v FROM forecast "
+            "  LATERAL VIEW EXPLODE(values) tv AS v"
+            "), latest AS ("
+            "  SELECT content_id, v FROM exploded "
+            "  QUALIFY ROW_NUMBER() OVER ("
+            "    PARTITION BY content_id ORDER BY issue_date DESC) = 1"
+            ") "
+            "SELECT * FROM latest ORDER BY content_id",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"forecast": data})
+        rows = result.read_arrow_table().to_pylist()
+        # For each content_id, keep only the latest issue_date's exploded rows
+        # cid 1 latest is issue_date 200 -> [3.0, 4.0], but row_number=1 means
+        # only one row per partition (the first after sort) -> just one value
+        # The implementation gives one row per partition.
+        assert len(rows) == 2
+
+
 class TestForecastIntegration:
     def test_filter_by_metric_and_date(self, forecast_data):
         node = parse_sql(
