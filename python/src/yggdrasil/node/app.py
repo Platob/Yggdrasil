@@ -101,7 +101,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.filesystem_service = FilesystemService(settings)
 
     # -- v2 API services (PyEnv / PyFunc / PyFuncRun / Fs) -------------------
-    audit = AuditLog()
+    audit = AuditLog(settings)
     app.state.audit = audit
 
     v2_fs = FsService(settings)

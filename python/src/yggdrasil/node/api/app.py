@@ -49,7 +49,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     # -- Services -----------------------------------------------------------
-    audit = AuditLog()
+    audit = AuditLog(settings)
     app.state.audit = audit
 
     fs = FsService(settings)
@@ -176,6 +176,76 @@ def create_api(settings: Settings | None = None) -> FastAPI:
                 {"id": r.id, "func_id": r.func_id, "status": r.status, "duration": r.duration, "started_at": r.started_at}
                 for r in recent_runs
             ],
+        }
+
+    @app.get(f"{prefix}/topology")
+    async def get_topology(request: Request):
+        """Full cluster view: this node + all peers with their cards."""
+        state = request.app.state
+        snap = state.backend_service.snapshot()
+        peers_resp = await state.network_service.get_peers()
+        self_node = {
+            "node_id": settings.node_id,
+            "host": settings.host,
+            "port": settings.port,
+            "role": str(state.backend_service.role),
+            "cpu_percent": snap.cpu_percent,
+            "memory_percent": (round(snap.memory_used_mb / snap.memory_total_mb * 100, 1) if snap.memory_total_mb else 0),
+            "active_runs": state.pyfuncrun_service.active_count,
+            "gpu_count": len(snap.gpus),
+            "self": True,
+        }
+        peer_nodes = [
+            {
+                "node_id": p.node_id, "host": p.host, "port": p.port,
+                "role": str(p.role), "cpu_percent": p.cpu_percent,
+                "memory_percent": p.memory_percent, "active_runs": p.active_runs,
+                "gpu_count": p.gpu_count, "self": False,
+            }
+            for p in peers_resp.peers
+        ]
+        return {
+            "nodes": [self_node] + peer_nodes,
+            "total_cpu_percent": (self_node["cpu_percent"] + sum(p["cpu_percent"] for p in peer_nodes)) / (len(peer_nodes) + 1),
+            "total_active_runs": self_node["active_runs"] + sum(p["active_runs"] for p in peer_nodes),
+            "total_gpus": self_node["gpu_count"] + sum(p["gpu_count"] for p in peer_nodes),
+        }
+
+    @app.get(f"{prefix}/health")
+    async def health_check(request: Request):
+        """Health check with subsystem status."""
+        state = request.app.state
+        checks: dict = {}
+
+        try:
+            snap = state.backend_service.snapshot()
+            checks["backend"] = {"status": "ok", "cpu": snap.cpu_percent}
+        except Exception as e:
+            checks["backend"] = {"status": "error", "error": str(e)}
+
+        try:
+            envs = await state.pyenv_service.list()
+            checks["pyenv"] = {"status": "ok", "count": len(envs.envs)}
+        except Exception as e:
+            checks["pyenv"] = {"status": "error", "error": str(e)}
+
+        try:
+            funcs = await state.pyfunc_service.list()
+            checks["pyfunc"] = {"status": "ok", "count": len(funcs.funcs)}
+        except Exception as e:
+            checks["pyfunc"] = {"status": "error", "error": str(e)}
+
+        try:
+            peers = await state.network_service.get_peers()
+            checks["network"] = {"status": "ok", "peers": len(peers.peers)}
+        except Exception as e:
+            checks["network"] = {"status": "error", "error": str(e)}
+
+        all_ok = all(c["status"] == "ok" for c in checks.values())
+        return {
+            "status": "healthy" if all_ok else "degraded",
+            "node_id": settings.node_id,
+            "checks": checks,
         }
 
     # -- Routers ------------------------------------------------------------
