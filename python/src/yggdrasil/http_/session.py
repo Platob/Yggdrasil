@@ -93,6 +93,7 @@ from yggdrasil.http_.cache_config import CacheConfig
 from yggdrasil.http_.send_config import DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.url import URL
 
+from .user_agents import random_user_agent
 from .exceptions import (
     InsecureRequestWarning,
     LocationParseError,
@@ -1293,6 +1294,10 @@ class HTTPSession(Session):
                 response.release_conn()
                 next_retries.sleep(response=response)
                 retries = next_retries
+                if response.status == 429:
+                    rotated_headers = HTTPHeaders(current_request.headers)
+                    rotated_headers["User-Agent"] = random_user_agent()
+                    current_request = current_request.copy(headers=rotated_headers)
                 continue
 
             return response
