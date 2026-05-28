@@ -57,7 +57,7 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.enums import MimeTypes, Mode
+from yggdrasil.enums import MimeTypes, Mode, ModeLike
 from yggdrasil.enums.media_type import MediaType
 from yggdrasil.enums.mime_type import MimeType
 from yggdrasil.io.holder import IO
@@ -66,7 +66,7 @@ from yggdrasil.path.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 
 
-__all__ = ["ZipFile", "ZipOptions", "ZipEntryFile", "ZipEntryWriter"]
+__all__ = ["ZipFile", "ZipOptions", "ZipEntryFile"]
 
 
 def _registered_tabular_extensions() -> "list[str]":
@@ -136,13 +136,29 @@ class ZipOptions(CastOptions):
 
 
 class ZipEntryFile(IO):
-    """:class:`IO` over a single zip entry's uncompressed payload.
+    """:class:`IO` over a single zip entry — readable AND writable.
 
-    The payload is fetched from the parent archive on first access
-    and cached in the inner :class:`Memory` holder. Reading the
-    archive's directory (``ZipFile.list_entries`` / ``iter_children``)
-    is a fixed-cost walk; per-entry decompression only happens for
-    the entries the caller actually touches.
+    Read side
+        Payload is fetched from the parent archive on first access
+        and cached in the inner :class:`Memory` holder. Reading the
+        archive's directory
+        (:meth:`ZipFile.list_entries` / :meth:`ZipFile.iter_children`)
+        is a fixed-cost walk; per-entry decompression only happens for
+        the entries the caller actually touches.
+
+    Write side
+        Bytes written into the inner :class:`Memory` holder get
+        committed to the parent archive on close
+        (``with entry.open("wb") as f: f.write(...)``) or after a
+        Tabular call (:meth:`write_arrow_batches`). The commit takes a
+        per-archive :class:`threading.Lock`, so concurrent writers
+        against different entry names are safe.
+
+    The ``mode`` slot, set by :meth:`ZipFile.entry`, controls how a
+    commit handles a pre-existing entry of the same name: ``AUTO`` /
+    ``OVERWRITE`` replace, ``ERROR_IF_EXISTS`` raises, ``IGNORE``
+    skips, ``APPEND`` concatenates the new bytes onto the existing
+    payload.
 
     Tabular hooks dispatch on the entry name's extension via
     :meth:`Holder.class_for_media_type`, so a parquet entry's
@@ -156,6 +172,7 @@ class ZipEntryFile(IO):
         "_materialized",
         "_uncompressed_size",
         "_zip_info",
+        "_entry_mode",
     )
 
     def __init__(
@@ -164,9 +181,10 @@ class ZipEntryFile(IO):
         entry_name: str,
         zip_parent: "ZipFile",
         zip_info: "zipfile.ZipInfo | None" = None,
+        mode: ModeLike = Mode.AUTO,
         **kwargs,
     ) -> None:
-        # Empty Memory holder; bytes land here on materialize.
+        # Empty Memory holder; bytes land here on materialize or write.
         super().__init__(holder=Memory(), owns_holder=True, **kwargs)
         self.entry_name: str = entry_name
         self._zip_parent: "ZipFile" = zip_parent
@@ -176,7 +194,13 @@ class ZipEntryFile(IO):
         self._uncompressed_size: "int | None" = (
             zip_info.file_size if zip_info is not None else None
         )
+        # ``zip_info=None`` AND no parent bytes → treat as empty
+        # writer target (don't try to materialize a non-existent
+        # entry). ``zip_info=None`` with a non-empty parent leaves
+        # ``_materialized`` False so a read falls through to the
+        # directory probe and surfaces the missing-entry error.
         self._materialized: bool = False
+        self._entry_mode: Mode = Mode.from_(mode, default=Mode.AUTO)
 
     # ==================================================================
     # Lazy materialization
@@ -277,6 +301,129 @@ class ZipEntryFile(IO):
             return Schema.empty()
         return leaf._collect_schema(leaf.options_class()())
 
+    # ==================================================================
+    # Write surface — commits to parent archive on close
+    # ==================================================================
+
+    def open(
+        self,
+        mode: ModeLike = "rb+",
+        **kwargs,
+    ) -> "IO":
+        """Acquire an :class:`IO` cursor for read or write.
+
+        Write modes (``"wb"``, ``"w"``, ``"ab"``, …) reset the inner
+        :class:`Memory` holder and return a cursor wrapped in a
+        commit-on-exit context manager — the staged bytes commit into
+        the parent archive when the ``with`` block exits cleanly. An
+        exception inside the block drops the staged bytes without
+        committing.
+
+        Read modes materialize from the parent archive on first
+        access and return a regular cursor — no commit fires.
+        """
+        m = Mode.from_(mode, default=Mode.AUTO)
+        is_write = m.writable and m is not Mode.READ_ONLY and m is not Mode.AUTO
+        if is_write:
+            self._reset_staged_bytes()
+            kwargs.setdefault("owns_holder", True)
+            cursor = super().open(mode, **kwargs)
+            return _CommitOnExit(entry=self, cursor=cursor)
+        if not self._materialized:
+            self._materialize()
+        return super().open(mode, **kwargs)
+
+    def _reset_staged_bytes(self) -> None:
+        """Truncate the inner Memory holder so a write starts clean."""
+        self._parent.seek(0)
+        self._parent.truncate(0)
+        self._materialized = True  # the empty buffer IS the entry now
+
+    def _flush_to_archive(self) -> None:
+        """Push the staged bytes into the parent archive.
+
+        Called explicitly by :class:`_CommitOnExit` on clean exit of
+        ``with entry.open("wb") as f:``, never by Disposable lifecycle
+        — the name avoids colliding with the inherited
+        :meth:`Disposable.commit` hook which fires on every close.
+
+        Honours :attr:`_entry_mode` against any pre-existing entry of
+        the same name:
+
+        - ``AUTO`` / ``OVERWRITE`` — replace.
+        - ``ERROR_IF_EXISTS`` — raise :class:`FileExistsError`.
+        - ``IGNORE`` — skip silently.
+        - ``APPEND`` — concatenate new bytes after the existing
+          payload (entry-level append, not archive-level).
+        """
+        payload = self._parent.to_bytes()
+        mode = self._entry_mode
+        if mode in (Mode.ERROR_IF_EXISTS, Mode.IGNORE, Mode.APPEND):
+            existing = self._read_existing_payload()
+            if existing is not None:
+                if mode is Mode.ERROR_IF_EXISTS:
+                    raise FileExistsError(
+                        f"Entry {self.entry_name!r} already exists in "
+                        f"{self._zip_parent!r}; refusing to overwrite "
+                        f"under mode={mode!r}."
+                    )
+                if mode is Mode.IGNORE:
+                    return
+                if mode is Mode.APPEND:
+                    payload = existing + payload
+        self._zip_parent._commit_entry(self.entry_name, payload)
+
+    def _read_existing_payload(self) -> "bytes | None":
+        """Return the pre-existing entry's bytes, or ``None`` if missing."""
+        if self._zip_parent.size == 0:
+            return None
+        with self._zip_parent.view(pos=0) as v:
+            with zipfile.ZipFile(v, "r") as zf:
+                try:
+                    return zf.read(self.entry_name)
+                except KeyError:
+                    return None
+
+    def _write_arrow_batches(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        options,
+    ) -> None:
+        """Pack *batches* through the format implied by ``entry_name``.
+
+        Inferred Tabular leaf encodes the batches into a fresh
+        :class:`Memory` buffer; those bytes become the entry's payload
+        and commit through the same path the raw-bytes write uses.
+        """
+        # Side-effect import: ensures the primitive leaves are registered.
+        import yggdrasil.io.primitive  # noqa: F401
+
+        try:
+            mt = MediaType.from_(self.entry_name, default=None)
+        except Exception:
+            mt = None
+        cls = None
+        if mt is not None:
+            try:
+                cls = Holder.class_for_media_type(mt, default=None)
+            except Exception:
+                cls = None
+        if cls is None or cls is ZipEntryFile:
+            exts = _registered_tabular_extensions()
+            raise ValueError(
+                f"{type(self).__name__}: cannot infer Tabular leaf for "
+                f"entry_name {self.entry_name!r} — "
+                f"{_describe_entry_resolution_failure(self.entry_name)}. "
+                f"Registered tabular extensions: {exts!r}."
+            )
+
+        leaf = cls(holder=Memory(), owns_holder=True)
+        leaf.write_arrow_batches(batches, options=leaf.options_class()())
+        encoded = leaf.to_bytes()
+        self._reset_staged_bytes()
+        self._parent.write_bytes(encoded, 0)
+        self._flush_to_archive()
+
     def __repr__(self) -> str:
         state = "materialized" if self._materialized else "lazy"
         return (
@@ -349,30 +496,58 @@ class ZipFile(IO):
                 return [info.filename for info in zf.infolist() if not info.is_dir()]
 
     # ==================================================================
-    # Per-entry write surface — z.entry("name").open() / .write_arrow_batches
+    # Per-entry handle — read AND write surface
     # ==================================================================
 
-    def entry(self, entry_name: str) -> "ZipEntryWriter":
-        """Return a per-entry writer for *entry_name*.
+    def entry(
+        self,
+        name: str,
+        *,
+        mode: ModeLike = Mode.AUTO,
+    ) -> ZipEntryFile:
+        """Return a :class:`ZipEntryFile` for *name* — readable AND writable.
 
-        The returned :class:`ZipEntryWriter` exposes two ergonomic
-        shapes:
+        The returned handle supports both surfaces::
 
-        - ``with z.entry("data.bin").open("wb") as f: f.write(...)``
-          — raw byte stream into the entry; commits on close.
-        - ``z.entry("data.parquet").write_arrow_batches(batches)``
-          — tabular write that picks the inner format from the
-          extension and commits the encoded bytes.
+            # Raw byte write — auto-commits on close.
+            with z.entry("data.bin").open("wb") as f:
+                f.write(b"...")
 
-        Writes against different ``entry_name`` values can run in
-        parallel: each writer stages its bytes in a private scratch
-        :class:`Memory`, and the commit phase takes a per-archive
+            # Tabular write — encoded through the inner format.
+            z.entry("data.parquet").write_arrow_batches(batches)
+
+            # Read existing entries.
+            entry = z.entry("data.bin")
+            payload = entry.to_bytes()
+
+        Writes against different *name* values can run in parallel:
+        each handle stages its bytes in a private :class:`Memory`
+        holder, and the commit phase takes a per-archive
         :class:`threading.Lock` only for the brief central-directory
-        rewrite. The archive ends up containing every committed
-        entry; writes against the *same* ``entry_name`` race —
-        last commit wins.
+        rewrite. Writes against the same *name* race — the
+        :attr:`mode` controls the resolution
+        (``AUTO``/``OVERWRITE`` replace, ``ERROR_IF_EXISTS`` raises,
+        ``IGNORE`` skips, ``APPEND`` concatenates).
+
+        Unlike :meth:`child`, no error is raised when *name* doesn't
+        exist — the returned handle is a writer-target.
         """
-        return ZipEntryWriter(parent=self, entry_name=entry_name)
+        info: "zipfile.ZipInfo | None" = None
+        if self.size > 0:
+            with self.view(pos=0) as v:
+                with zipfile.ZipFile(v, "r") as zf:
+                    try:
+                        info = zf.getinfo(name)
+                    except KeyError:
+                        info = None
+        return self.adopt_child(
+            ZipEntryFile(
+                entry_name=name,
+                zip_parent=self,
+                zip_info=info,
+                mode=mode,
+            )
+        )
 
     def child(self, entry_name: str) -> ZipEntryFile:
         """Return a lazy :class:`ZipEntryFile` for *entry_name*.
@@ -685,147 +860,38 @@ class ZipFile(IO):
 
 
 # ---------------------------------------------------------------------------
-# ZipEntryWriter — per-entry ergonomic write surface
+# Internal: commit-on-clean-exit wrapper for ZipEntryFile.open(write_mode)
 # ---------------------------------------------------------------------------
 
 
-class ZipEntryWriter:
-    """Per-entry writer returned by :meth:`ZipFile.entry`.
+class _CommitOnExit:
+    """Wrap a write cursor so the staged bytes commit on clean exit.
 
-    Stages bytes in a private :class:`Memory` scratch and commits
-    them to the parent archive via :meth:`ZipFile._commit_entry`.
-    Concurrent writers against different ``entry_name`` values are
-    safe — only the brief commit phase takes the parent's write lock.
-
-    Two surfaces:
-
-    - :meth:`open` returns a context manager yielding an :class:`IO`
-      cursor. The bytes you write before exit get committed on close.
-    - :meth:`write_arrow_batches` packs an iterable of Arrow batches
-      through the Tabular leaf inferred from *entry_name*'s extension
-      and commits the encoded bytes.
+    On exception inside the ``with`` block the staged bytes are
+    discarded — the parent archive is not modified. This is the
+    single chokepoint :meth:`ZipEntryFile.open` uses to make
+    ``with entry.open("wb") as f: f.write(...)`` atomic from the
+    caller's viewpoint.
     """
 
-    __slots__ = ("_parent", "_entry_name", "_compression", "_compresslevel")
+    __slots__ = ("_entry", "_cursor")
 
-    def __init__(
-        self,
-        *,
-        parent: "ZipFile",
-        entry_name: str,
-        compression: int = zipfile.ZIP_DEFLATED,
-        compresslevel: "int | None" = None,
-    ) -> None:
-        self._parent = parent
-        self._entry_name = entry_name
-        self._compression = compression
-        self._compresslevel = compresslevel
-
-    @property
-    def entry_name(self) -> str:
-        return self._entry_name
-
-    # ------------------------------------------------------------------
-    # Raw byte surface — context manager
-    # ------------------------------------------------------------------
-
-    def open(self, mode: str = "wb") -> "_EntryWriteContext":
-        """Stage a write into this entry; commit on context exit.
-
-        Only write modes (``"wb"``, ``"w"``) are supported — a
-        per-entry read surface lives on :meth:`ZipFile.child`. The
-        yielded :class:`IO` is a fresh :class:`Memory` cursor; on
-        close, its bytes commit into the parent archive under
-        :attr:`entry_name`.
-        """
-        if not (mode == "wb" or mode == "w"):
-            raise ValueError(
-                f"ZipEntryWriter.open only supports write modes; "
-                f"got {mode!r}. Use ZipFile.child({self._entry_name!r}) "
-                "for reads."
-            )
-        return _EntryWriteContext(self)
-
-    # ------------------------------------------------------------------
-    # Tabular surface
-    # ------------------------------------------------------------------
-
-    def write_arrow_batches(
-        self,
-        batches: Iterable[pa.RecordBatch],
-        *,
-        options: "CastOptions | None" = None,
-    ) -> None:
-        """Pack *batches* through the format implied by ``entry_name``.
-
-        Picks the inner :class:`Tabular` leaf from the entry name's
-        extension (``data.parquet`` → parquet, ``data.csv`` → csv,
-        …), runs the leaf's writer against an in-memory holder,
-        then commits the encoded bytes via :meth:`ZipFile._commit_entry`.
-        """
-        # Side-effect import: ensures the primitive leaves are registered.
-        import yggdrasil.io.primitive  # noqa: F401
-
-        try:
-            mt = MediaType.from_(self._entry_name, default=None)
-        except Exception:
-            mt = None
-        cls = None
-        if mt is not None:
-            try:
-                cls = Holder.class_for_media_type(mt, default=None)
-            except Exception:
-                cls = None
-        if cls is None:
-            exts = _registered_tabular_extensions()
-            raise ValueError(
-                f"ZipEntryWriter: cannot infer Tabular leaf for "
-                f"entry_name {self._entry_name!r} — "
-                f"{_describe_entry_resolution_failure(self._entry_name)}. "
-                f"Registered tabular extensions: {exts!r}."
-            )
-
-        leaf = cls(holder=Memory(), owns_holder=True)
-        leaf_options = options if options is not None else leaf.options_class()()
-        leaf.write_arrow_batches(batches, options=leaf_options)
-        payload = leaf.to_bytes()
-        self._parent._commit_entry(
-            self._entry_name,
-            payload,
-            compression=self._compression,
-            compresslevel=self._compresslevel,
-        )
-
-
-class _EntryWriteContext:
-    """Context manager yielded by :meth:`ZipEntryWriter.open`."""
-
-    __slots__ = ("_writer", "_io")
-
-    def __init__(self, writer: "ZipEntryWriter") -> None:
-        self._writer = writer
-        self._io: "IO | None" = None
+    def __init__(self, *, entry: "ZipEntryFile", cursor: IO) -> None:
+        self._entry = entry
+        self._cursor = cursor
 
     def __enter__(self) -> IO:
-        # Stage bytes in a private Memory holder; commit on exit so
-        # concurrent writers don't trip over a half-written central
-        # directory.
-        self._io = IO(holder=Memory(), owns_holder=True)
-        return self._io
+        return self._cursor.__enter__()
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is not None:
-            # Caller raised — drop the staged bytes, don't commit.
-            self._io = None
-            return
-        io = self._io
-        self._io = None
-        if io is None:
-            return
-        payload = io.to_bytes()
-        self._writer._parent._commit_entry(
-            self._writer.entry_name,
-            payload,
-            compression=self._writer._compression,
-            compresslevel=self._writer._compresslevel,
-        )
+    def __exit__(self, exc_type, exc, tb) -> "bool | None":
+        # Flush BEFORE closing the cursor — closing the cursor
+        # releases the ZipEntryFile's Memory holder, after which
+        # ``self._parent.to_bytes()`` reads as empty.
+        if exc_type is None:
+            try:
+                self._entry._flush_to_archive()
+            finally:
+                self._cursor.__exit__(None, None, None)
+            return False
+        # Exception path: drop staged bytes, just close the cursor.
+        return self._cursor.__exit__(exc_type, exc, tb)

@@ -208,9 +208,10 @@ class TestAppendStreaming:
 # ---------------------------------------------------------------------------
 
 
-class TestEntryWriter:
-    """`z.entry("name")` — ergonomic per-entry writes via context
-    manager or Tabular shortcut."""
+class TestEntryReadWrite:
+    """`z.entry(name, *, mode)` returns a :class:`ZipEntryFile` that's
+    both readable and writable — single handle for the per-entry
+    surface."""
 
     def test_entry_open_writes_raw_bytes(self) -> None:
         from yggdrasil.io.nested.zip_file import ZipFile as _Zip
@@ -285,12 +286,58 @@ class TestEntryWriter:
         ) as zfile:
             assert zfile.namelist() == ["data.parquet"]
 
-    def test_entry_open_rejects_read_mode(self) -> None:
+    def test_entry_returns_zip_entry_file(self) -> None:
         from yggdrasil.io.nested.zip_file import ZipFile as _Zip
 
         zf = _Zip(holder=Memory(), owns_holder=False)
-        with pytest.raises(ValueError, match="write modes"):
-            zf.entry("x.bin").open("rb")
+        entry = zf.entry("x.bin")
+        assert isinstance(entry, ZipEntryFile)
+
+    def test_entry_read_existing(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+
+        raw = _build_archive({"x.bin": b"alpha"})
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+        entry = zf.entry("x.bin")
+        assert entry.to_bytes() == b"alpha"
+
+    def test_entry_mode_error_if_exists(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.enums import Mode
+
+        raw = _build_archive({"x.bin": b"old"})
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+        with pytest.raises(FileExistsError):
+            with zf.entry("x.bin", mode=Mode.ERROR_IF_EXISTS).open("wb") as f:
+                f.write(b"new")
+
+    def test_entry_mode_ignore_skips_existing(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.enums import Mode
+
+        raw = _build_archive({"x.bin": b"keep-me"})
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+        with zf.entry("x.bin", mode=Mode.IGNORE).open("wb") as f:
+            f.write(b"ignored")
+
+        with stdlib_zipfile.ZipFile(
+            __import__("io").BytesIO(zf.to_bytes()), "r",
+        ) as zfile:
+            assert zfile.read("x.bin") == b"keep-me"
+
+    def test_entry_mode_append_concatenates(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.enums import Mode
+
+        raw = _build_archive({"log.txt": b"first\n"})
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+        with zf.entry("log.txt", mode=Mode.APPEND).open("wb") as f:
+            f.write(b"second\n")
+
+        with stdlib_zipfile.ZipFile(
+            __import__("io").BytesIO(zf.to_bytes()), "r",
+        ) as zfile:
+            assert zfile.read("log.txt") == b"first\nsecond\n"
 
 
 class TestParallelEntryWrites:
