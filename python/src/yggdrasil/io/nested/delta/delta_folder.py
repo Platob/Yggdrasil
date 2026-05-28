@@ -710,7 +710,11 @@ class DeltaFolder(Folder):
     def iter_children(self) -> "Iterator":
         snap = self.snapshot()
         for add in snap.active_files.values():
-            yield self.adopt_child(ParquetFile(holder=snap.resolve(add), owns_holder=False))
+            yield ParquetFile(
+                holder=snap.resolve(add),
+                owns_holder=False,
+                tabular_parent=self,
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -486,7 +486,6 @@ def is_tabular_source(obj: Any) -> bool:
 
 
 O = TypeVar("O", bound=CastOptions)
-_ChildT = TypeVar("_ChildT", bound="Tabular")
 
 
 _TABULAR_FORMAT_REGISTRY: "dict[str, type[Tabular]]" = {}
@@ -496,10 +495,10 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     """Pure interface — Arrow record-batch source/sink + engine fan-out.
 
     No state, no lifecycle, with the single exception of a
-    :attr:`parent` back-pointer for tree-shaped sources (folders,
-    archives, partitioned tables) where a child Tabular wants to
-    walk back up to whatever yielded it. :meth:`adopt_child` is the
-    parent-stamp helper aggregators call when handing back a child.
+    :attr:`tabular_parent` back-pointer for tree-shaped sources
+    (folders, archives, partitioned tables) where a child Tabular
+    wants to walk back up to whatever yielded it. Aggregators pass
+    ``tabular_parent=self`` at child construction.
 
     Concrete implementers add whatever substrate they need (a
     holder + cursor for byte-backed shapes, a session reference
@@ -540,8 +539,8 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         """Initialize the tree-parent slot.
 
         Subclasses chain ``super().__init__(**kwargs)`` and don't
-        otherwise touch :attr:`tabular_parent` — aggregators set it
-        via :meth:`adopt_child` when they yield / mint the child.
+        otherwise touch :attr:`tabular_parent` — aggregators pass
+        ``tabular_parent=self`` at child construction.
 
         The slot is named ``tabular_parent`` (not ``parent``) so it
         doesn't collide with :attr:`yggdrasil.io.path.path.Path.parent`,
@@ -563,28 +562,6 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     @property
     def url(self) -> "URL":
         return self.to_url()
-
-    # ==================================================================
-    # Parent / child linkage
-    # ==================================================================
-
-    def adopt_child(self, child: "_ChildT") -> "_ChildT":
-        """Stamp ``child.tabular_parent = self`` and return *child*.
-
-        Used by aggregator Tabulars (folders, archives, partitioned
-        tables) inside their child-yielding hooks (``iter_children``,
-        ``make_child``) so consumers can walk back up the tree
-        without the aggregator scattering the same line of attribute
-        assignment across every implementation::
-
-            for entry in self.path.iterdir():
-                yield self.adopt_child(LeafIO(holder=entry))
-
-        Re-adopting an already-attached child is fine — the slot
-        is just overwritten. No checks, no ceremony.
-        """
-        child.tabular_parent = self
-        return child
 
     # ==================================================================
     # Static values — column → constant invariants across every row

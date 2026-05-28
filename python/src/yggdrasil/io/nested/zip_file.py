@@ -479,12 +479,11 @@ class ZipFile(IO):
         for info in infos:
             if info.is_dir():
                 continue
-            yield self.adopt_child(
-                ZipEntryFile(
-                    entry_name=info.filename,
-                    zip_parent=self,
-                    zip_info=info,
-                )
+            yield ZipEntryFile(
+                entry_name=info.filename,
+                zip_parent=self,
+                zip_info=info,
+                tabular_parent=self,
             )
 
     def list_entries(self) -> "list[str]":
@@ -540,13 +539,12 @@ class ZipFile(IO):
                         info = zf.getinfo(name)
                     except KeyError:
                         info = None
-        return self.adopt_child(
-            ZipEntryFile(
-                entry_name=name,
-                zip_parent=self,
-                zip_info=info,
-                mode=mode,
-            )
+        return ZipEntryFile(
+            entry_name=name,
+            zip_parent=self,
+            zip_info=info,
+            mode=mode,
+            tabular_parent=self,
         )
 
     def child(self, entry_name: str) -> ZipEntryFile:
@@ -566,8 +564,11 @@ class ZipFile(IO):
                         f"No entry named {entry_name!r} in {self!r}. "
                         f"Available: {names!r}."
                     )
-        return self.adopt_child(
-            ZipEntryFile(entry_name=entry_name, zip_parent=self, zip_info=info)
+        return ZipEntryFile(
+            entry_name=entry_name,
+            zip_parent=self,
+            zip_info=info,
+            tabular_parent=self,
         )
 
     # ==================================================================
