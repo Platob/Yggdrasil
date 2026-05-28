@@ -164,6 +164,9 @@ class DeltaFolder(Folder):
             mode=Mode.READ_ONLY,
         )
 
+        target_field_names = (
+            set(target_schema.names) if target_schema is not None else None
+        )
         for add in snap.prune_files(prune_values=prune):
             dv = decode_deletion_vector(add.deletion_vector, table_root=self.path,
                                         sidecar_cache=sidecar_cache)
@@ -172,6 +175,26 @@ class DeltaFolder(Folder):
             try:
                 with leaf as opened:
                     for batch in opened._read_arrow_batches(leaf_opts):
+                        # Databricks DBR with row-tracking enabled
+                        # (auto-enabled on DV tables) stamps
+                        # ``_row-id-col-<uuid>`` /
+                        # ``_row-commit-version-col-<uuid>`` columns
+                        # onto AddFiles created post-feature-enable.
+                        # Drop anything that isn't part of the
+                        # table's logical schema so concurrent
+                        # AddFiles with mixed schemas concatenate
+                        # cleanly via ``pa.Table.from_batches``.
+                        if target_field_names is not None:
+                            extra = [
+                                n for n in batch.schema.names
+                                if n not in target_field_names
+                            ]
+                            if extra:
+                                keep = [
+                                    n for n in batch.schema.names
+                                    if n in target_field_names
+                                ]
+                                batch = batch.select(keep)
                         masked = mask_batch_with_dv(batch, dv, base_offset=base_offset)
                         base_offset += batch.num_rows
                         if masked.num_rows == 0:

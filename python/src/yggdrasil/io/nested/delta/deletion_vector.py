@@ -158,6 +158,56 @@ def encode_inline_deletion_vector(row_ids: Iterable[int]) -> DeletionVectorDescr
         cardinality=len(set(row_ids) if not isinstance(row_ids, (set, frozenset)) else row_ids),
     )
 
+_HEX_UUID_CHARS = frozenset("0123456789abcdef")
+
+
+def _resolve_uuid_dv_path(
+    table_root: "Path",
+    raw_path: str,
+) -> "Path | None":
+    """Build the on-disk DV sidecar path for ``storageType='u'``.
+
+    Handles two encodings of ``pathOrInlineDv``:
+
+    - **Yggdrasil's writer** — the raw 32-char lowercase hex UUID
+      stored verbatim. On disk:
+      ``<table_root>/deletion_vector_<hex>.bin``.
+
+    - **Delta spec** — ``<random-prefix><Z85-encoded-UUID>`` where
+      the prefix is 0-2 chars and the Z85 portion is exactly 20
+      chars (16 bytes base85). On disk:
+      ``<table_root>/<prefix>/deletion_vector_<canonical-UUID>.bin``.
+      Databricks DBR / OSS Delta writers emit this shape.
+
+    The hex form is detected by exact shape (32 chars, all lowercase
+    hex) so a Z85 string can't be mis-routed through it. Returns
+    ``None`` when neither shape resolves cleanly.
+    """
+    # Yggdrasil's hex writer — exact 32-char lowercase hex.
+    if (
+        len(raw_path) == 32
+        and all(c in _HEX_UUID_CHARS for c in raw_path)
+    ):
+        return table_root / f"deletion_vector_{raw_path}.bin"
+
+    # Spec-compliant Z85 path — the dominant shape on Databricks /
+    # delta-rs / Spark Delta writers.
+    if len(raw_path) >= 20:
+        z85_uuid = raw_path[-20:]
+        prefix = raw_path[:-20]
+        try:
+            uuid_bytes = base64.b85decode(
+                z85_uuid.encode("ascii").translate(_Z85_TO_B85),
+            )
+            uuid_str = str(_uuid.UUID(bytes=uuid_bytes))
+        except Exception:
+            uuid_str = None
+        if uuid_str is not None:
+            leaf = f"deletion_vector_{uuid_str}.bin"
+            return table_root / prefix / leaf if prefix else table_root / leaf
+    return None
+
+
 def write_uuid_deletion_vector(row_ids: Iterable[int], *, table_root: "Path") -> DeletionVectorDescriptor:
     payload = _encode_dv_payload(row_ids)
     framed = struct.pack(">I", len(payload)) + payload + struct.pack(">I", 0)
@@ -207,10 +257,9 @@ def decode_deletion_vector(
     if storage == "p":
         sidecar_path = table_root / raw_path
     else:
-        uid = raw_path
-        if uid and not (uid[0].isalnum() and uid[0] not in "ghijklmnopqrstuvwxyz"):
-            uid = uid[1:]
-        sidecar_path = table_root / f"deletion_vector_{uid}.bin"
+        sidecar_path = _resolve_uuid_dv_path(table_root, raw_path)
+        if sidecar_path is None:
+            return DeletionVector(descriptor=descriptor)
 
     offset = int(descriptor.offset or 0)
     size = int(descriptor.size_in_bytes or 0)
