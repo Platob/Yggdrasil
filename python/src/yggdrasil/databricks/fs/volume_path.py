@@ -898,23 +898,29 @@ class VolumePath(DatabricksPath):
                     "read via kernel mount: %r -> NOT FOUND", api_path,
                 )
                 raise FileNotFoundError(self.full_path()) from exc
-            logger.debug(
-                "read via kernel mount: %r -> %d bytes (pos=%d, n=%s)",
-                api_path, len(data), pos, "EOF" if n < 0 else n,
-            )
-            if not self._stat_cached:
-                try:
-                    st = os.stat(api_path)
-                    self._persist_stat_cache(
-                        stats=IOStats(
-                            size=int(st.st_size),
-                            kind=IOKind.FILE,
-                            mtime=st.st_mtime,
+            except OSError as exc:
+                logger.debug(
+                    "read via kernel mount: %r -> OSError %r, "
+                    "falling back to Files API", api_path, exc,
+                )
+            else:
+                logger.debug(
+                    "read via kernel mount: %r -> %d bytes (pos=%d, n=%s)",
+                    api_path, len(data), pos, "EOF" if n < 0 else n,
+                )
+                if not self._stat_cached:
+                    try:
+                        st = os.stat(api_path)
+                        self._persist_stat_cache(
+                            stats=IOStats(
+                                size=int(st.st_size),
+                                kind=IOKind.FILE,
+                                mtime=st.st_mtime,
+                            )
                         )
-                    )
-                except OSError:
-                    pass
-            return memoryview(data)
+                    except OSError:
+                        pass
+                return memoryview(data)
         try:
             response = self._call(
                 self.client.workspace_client().files.download, self.api_path

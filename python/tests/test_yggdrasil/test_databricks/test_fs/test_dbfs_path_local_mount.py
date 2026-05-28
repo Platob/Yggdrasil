@@ -322,3 +322,41 @@ class TestDbfsApiStillUsedOffCluster:
         assert stats.size == 99
         service.client.workspace_client.return_value.dbfs.get_status \
             .assert_called_once()
+
+
+# ===========================================================================
+# OSError fallback inside the fast path
+# ===========================================================================
+
+
+class TestOSErrorFallback:
+    """Unexpected ``OSError`` (other than ``FileNotFoundError``) inside
+    the fast path falls through to the DBFS REST API instead of
+    crashing. Covers e.g. permission errors, transient mount-layer
+    glitches."""
+
+    def test_stat_oserror_falls_back_to_api(
+        self, fake_dbfs_root, monkeypatch, service,
+    ):
+        # Make ``os.stat`` raise a non-FileNotFoundError OSError;
+        # the API path should then fire.
+        import os
+        real_stat = os.stat
+
+        def bad_stat(path, *a, **kw):
+            if "/dbfs/tmp/explode" in str(path):
+                raise PermissionError("simulated")
+            return real_stat(path, *a, **kw)
+
+        monkeypatch.setattr(os, "stat", bad_stat)
+        info = MagicMock()
+        info.is_dir = False
+        info.file_size = 7
+        info.modification_time = 0
+        service.client.workspace_client.return_value.dbfs.get_status \
+            .return_value = info
+        p = DBFSPath("/dbfs/tmp/explode", service=service)
+        stats = p._stat_uncached()
+        assert stats.size == 7
+        service.client.workspace_client.return_value.dbfs.get_status \
+            .assert_called_once()

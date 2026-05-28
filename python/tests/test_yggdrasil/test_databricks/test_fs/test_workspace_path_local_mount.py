@@ -349,3 +349,38 @@ class TestWorkspaceApiStillUsedOffCluster:
         assert stats.size == 42
         service.client.workspace_client.return_value.workspace \
             .get_status.assert_called_once()
+
+
+# ===========================================================================
+# OSError fallback inside the fast path
+# ===========================================================================
+
+
+class TestOSErrorFallback:
+
+    def test_read_oserror_falls_back_to_api(
+        self, fake_workspace_root, monkeypatch, service,
+    ):
+        # ``open`` raising a non-FileNotFoundError OSError must route
+        # the request through ``workspace.download`` instead of
+        # crashing — covers permission errors and transient mount
+        # layer glitches.
+        import builtins
+        real_open = builtins.open
+
+        def bad_open(path, *a, **kw):
+            if "/Workspace/Users/alice/explode" in str(path):
+                raise PermissionError("simulated")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", bad_open)
+        response = MagicMock()
+        response.contents = MagicMock()
+        response.contents.read.return_value = b"recovered"
+        service.client.workspace_client.return_value.workspace.download \
+            .return_value = response
+        p = WorkspacePath(
+            "/Workspace/Users/alice/explode", service=service,
+        )
+        mv = p._read_mv(-1, 0)
+        assert bytes(mv) == b"recovered"

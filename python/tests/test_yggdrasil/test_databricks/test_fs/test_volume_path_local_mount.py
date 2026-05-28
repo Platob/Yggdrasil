@@ -408,6 +408,33 @@ class TestRemoveDirFastPath:
 # ===========================================================================
 
 
+class TestOSErrorFallback:
+
+    def test_read_oserror_falls_back_to_files_api(
+        self, fake_volume_root, monkeypatch, service,
+    ):
+        import builtins
+        real_open = builtins.open
+
+        def bad_open(path, *a, **kw):
+            if "/Volumes/cat/sch/vol/explode" in str(path):
+                raise PermissionError("simulated")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", bad_open)
+        files = service.client.workspace_client.return_value.files
+        response = MagicMock()
+        response.contents = MagicMock()
+        response.contents.read.return_value = b"recovered"
+        response.last_modified = None
+        files.download.return_value = response
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/explode", service=service,
+        )
+        mv = p._read_mv(-1, 0)
+        assert bytes(mv) == b"recovered"
+
+
 class TestFilesApiPathStillUsedOffCluster:
     """When the local-mount probe returns False (the off-cluster
     case), every operation must still go through ``files.*`` — the
