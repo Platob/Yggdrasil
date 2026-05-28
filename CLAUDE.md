@@ -73,9 +73,10 @@ python/src/yggdrasil/
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
   databricks/           Databricks SDK integrations
-src/                    Frontend (React 19, Next.js 16, Tailwind v4)
-  app/                  Next.js app router pages
-  components/           Shared React components (globe, sidebar, logo)
+nextjs/                 Frontend (React 19, Next.js 16, Tailwind v4)
+  src/app/              Next.js app router pages
+  src/components/       Shared React components (globe, sidebar, logo)
+  src/lib/              API clients
 ```
 
 ## Node API
@@ -129,10 +130,11 @@ Core concepts — workstation as remote executor/driver:
 | Route | Description |
 |-------|-------------|
 | `/` | 3D globe welcome with node card |
-| `/nodes` | Cluster dashboard — KPI aggregation + node grid + functions/envs sidebar |
-| `/nodes/[id]` | Per-node detail — resources, assets, replicated items |
-| `/chat` | Real-time messenger — channels, messages, SSE live updates |
-| `/files` | Filesystem browser — lazy directory listing, file preview |
+| `/bot` | Bot dashboard wired to live backend |
+| `/bot/chat` | Bot chat — channels, messages, polled updates |
+| `/bot/execute` | Direct Python / shell execution console |
+| `/bot/network` | 3D peer network visualization |
+| `/msg` | Real-time messenger — channels, messages, SSE live updates |
 
 ## Python Decorator Framework
 
