@@ -772,6 +772,80 @@ class TestMeteologicaStyleSQL:
 # Integration — Execute Meteologica-style queries with real data
 # ===========================================================================
 
+class TestQualifyExecution:
+    def test_qualify_row_number_eq_1(self):
+        data = ArrowTabular(pa.table({
+            "content_id": [1, 1, 2, 2, 3],
+            "issue_date": [1, 2, 1, 2, 1],
+            "value": [10, 20, 30, 40, 50],
+        }))
+        node = parse_sql(
+            "SELECT content_id, value FROM forecast "
+            "QUALIFY ROW_NUMBER() OVER (PARTITION BY content_id "
+            "  ORDER BY issue_date DESC) = 1",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"forecast": data})
+        rows = result.read_arrow_table().to_pylist()
+        # Latest per content_id: cid=1 -> value=20, cid=2 -> value=40, cid=3 -> value=50
+        assert len(rows) == 3
+        by_cid = {r["content_id"]: r["value"] for r in rows}
+        assert by_cid == {1: 20, 2: 40, 3: 50}
+
+    def test_qualify_row_number_le_2(self):
+        data = ArrowTabular(pa.table({
+            "content_id": [1, 1, 1, 2, 2, 2],
+            "ts": [1, 2, 3, 1, 2, 3],
+            "value": [10, 20, 30, 40, 50, 60],
+        }))
+        node = parse_sql(
+            "SELECT content_id, value FROM forecast "
+            "QUALIFY ROW_NUMBER() OVER (PARTITION BY content_id "
+            "  ORDER BY ts DESC) <= 2",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"forecast": data})
+        rows = result.read_arrow_table().to_pylist()
+        # Top 2 per content_id by ts: cid=1 -> (30, 20), cid=2 -> (60, 50)
+        assert len(rows) == 4
+        cid1 = sorted(r["value"] for r in rows if r["content_id"] == 1)
+        cid2 = sorted(r["value"] for r in rows if r["content_id"] == 2)
+        assert cid1 == [20, 30]
+        assert cid2 == [50, 60]
+
+    def test_qualify_no_partition(self):
+        data = ArrowTabular(pa.table({
+            "id": [1, 2, 3, 4, 5],
+            "score": [10, 30, 20, 50, 40],
+        }))
+        node = parse_sql(
+            "SELECT id, score FROM t "
+            "QUALIFY ROW_NUMBER() OVER (ORDER BY score DESC) = 1",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"t": data})
+        rows = result.read_arrow_table().to_pylist()
+        assert len(rows) == 1
+        assert rows[0]["id"] == 4
+        assert rows[0]["score"] == 50
+
+    def test_qualify_unsupported_falls_back(self):
+        # A QUALIFY that isn't a ROW_NUMBER comparison falls back to no-op
+        # rather than crashing.
+        data = ArrowTabular(pa.table({
+            "id": [1, 2, 3],
+            "score": [10, 20, 30],
+        }))
+        node = parse_sql(
+            "SELECT id FROM t "
+            "QUALIFY SUM(score) OVER (ORDER BY id) > 5",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"t": data})
+        # SUM window is not supported; result is unfiltered (graceful fallback)
+        assert result.read_arrow_table().num_rows == 3
+
+
 class TestForecastIntegration:
     def test_filter_by_metric_and_date(self, forecast_data):
         node = parse_sql(

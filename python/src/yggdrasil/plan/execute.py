@@ -148,6 +148,11 @@ def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
         if rewritten is not None:
             result = result.filter(rewritten)
 
+    # QUALIFY (Databricks window-function filter) — runs before projection so
+    # it can reference columns that aren't in the final SELECT list.
+    if getattr(node, "qualify", None) is not None:
+        result = _apply_qualify(result, node.qualify)
+
     # Projection — apply scalar functions via Arrow kernels, then select
     if node.projections and not has_agg:
         result = _apply_projections(result, node.projections)
@@ -415,6 +420,83 @@ def _apply_projections(result: "Tabular", projections: list) -> "Tabular":
             return result
 
     return ArrowTabular(pa.table(dict(zip(out_names, out_arrays))))
+
+
+def _apply_qualify(result: "Tabular", qualify: Any) -> "Tabular":
+    """Execute a QUALIFY clause on the result.
+
+    Currently handles the most common Meteologica-style pattern:
+    ``QUALIFY ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) = N``
+    by computing row numbers per partition and filtering. Other window
+    expressions fall back to a no-op so the query still completes.
+    """
+    from yggdrasil.arrow.tabular import ArrowTabular
+    from yggdrasil.execution.expr.nodes import (
+        Column, Comparison, FunctionCall, Literal, SortOrder, WindowFunction,
+    )
+    from yggdrasil.execution.expr.operators import CompareOp
+    import pyarrow.compute as pc
+
+    if not (isinstance(qualify, Comparison)
+            and isinstance(qualify.left, WindowFunction)
+            and isinstance(qualify.right, Literal)):
+        return result  # fallback for unsupported QUALIFY shapes
+
+    wf = qualify.left
+    if not (isinstance(wf.function, FunctionCall)
+            and wf.function.name.upper() in ("ROW_NUMBER", "RANK", "DENSE_RANK")):
+        return result
+
+    target_rank = qualify.right.value
+    cmp_op = qualify.op
+    win = wf.window
+    pb_cols = [c.name for c in win.partition_by if isinstance(c, Column)]
+    sort_keys: list[tuple[str, str]] = []
+    for so in win.order_by:
+        if isinstance(so, SortOrder) and isinstance(so.expr, Column):
+            sort_keys.append(
+                (so.expr.name, "ascending" if so.ascending else "descending"))
+
+    table = result.read_arrow_table()
+    if table.num_rows == 0 or table.num_columns == 0:
+        return result
+
+    # Partition keys first so equal partitions are contiguous; sort keys then
+    # rank rows within each partition.
+    full_sort = [(c, "ascending") for c in pb_cols] + sort_keys
+    if full_sort:
+        table = table.take(pc.sort_indices(table, sort_keys=full_sort))
+
+    # Compute row numbers within partitions
+    if pb_cols:
+        partition_arrays = [table.column(c).to_pylist() for c in pb_cols]
+        row_numbers = []
+        last_key = object()
+        n = 0
+        for i in range(table.num_rows):
+            key = tuple(arr[i] for arr in partition_arrays)
+            if key != last_key:
+                n = 1
+                last_key = key
+            else:
+                n += 1
+            row_numbers.append(n)
+    else:
+        row_numbers = list(range(1, table.num_rows + 1))
+
+    rn_array = pa.array(row_numbers, type=pa.int64())
+    rank_literal = pa.scalar(target_rank, type=pa.int64())
+    cmp_map = {
+        CompareOp.EQ: pc.equal,
+        CompareOp.NE: pc.not_equal,
+        CompareOp.LT: pc.less,
+        CompareOp.LE: pc.less_equal,
+        CompareOp.GT: pc.greater,
+        CompareOp.GE: pc.greater_equal,
+    }
+    mask = cmp_map.get(cmp_op, pc.equal)(rn_array, rank_literal)
+    filtered = table.filter(mask)
+    return ArrowTabular(filtered)
 
 
 def _exec_insert(node: InsertNode, tables: dict[str, "Tabular"]) -> "Tabular":
