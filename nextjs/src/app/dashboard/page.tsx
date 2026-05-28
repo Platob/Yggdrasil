@@ -414,6 +414,72 @@ export default function DashboardPage() {
           </div>
         )}
       </div>
+
+      {/* ── New Function modal ─────────────────────────────── */}
+      {newFuncOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+          onClick={() => setNewFuncOpen(false)}
+        >
+          <div
+            className="runic-card p-6 w-full max-w-2xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold gradient-frost">New Function</h2>
+              <button
+                onClick={() => setNewFuncOpen(false)}
+                className="text-muted hover:text-foreground transition-colors"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] text-muted uppercase tracking-wider font-medium">Name</label>
+              <input
+                type="text"
+                value={newFuncName}
+                onChange={(e) => setNewFuncName(e.target.value)}
+                placeholder="my_function"
+                autoFocus
+                className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-sm font-mono text-foreground placeholder-muted/50 outline-none focus:border-frost/30 transition-colors"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] text-muted uppercase tracking-wider font-medium">Code</label>
+              <textarea
+                value={newFuncCode}
+                onChange={(e) => setNewFuncCode(e.target.value)}
+                rows={10}
+                className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-xs font-mono text-foreground placeholder-muted/50 outline-none focus:border-frost/30 transition-colors resize-none"
+              />
+            </div>
+
+            {newFuncError && <p className="text-xs text-rose font-mono">{newFuncError}</p>}
+
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setNewFuncOpen(false)}
+                className="px-4 py-2 text-sm rounded-lg bg-white/[0.04] hover:bg-white/[0.06] border border-white/[0.08]"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCreateFunc}
+                disabled={newFuncSaving}
+                className="px-4 py-2 text-sm rounded-lg bg-frost/20 text-frost border border-frost/30 hover:bg-frost/30 disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                {newFuncSaving ? "Creating..." : "Create"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

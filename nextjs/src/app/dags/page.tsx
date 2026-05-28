@@ -11,6 +11,7 @@ import {
   getFuncs,
   runFuncByName,
 } from "@/lib/api";
+import { ConfirmModal } from "@/components/ConfirmModal";
 import type {
   DAGEntry,
   DAGRunEntry,
@@ -109,6 +110,9 @@ export default function DagsPage() {
   const [scheduleInterval, setScheduleInterval] = useState("60");
   const [scheduleMaxRuns, setScheduleMaxRuns] = useState("");
   const [scheduling, setScheduling] = useState(false);
+
+  // Delete confirmation
+  const [pendingDeleteId, setPendingDeleteId] = useState<number | null>(null);
 
   // Quick run modal
   const [quickRunOpen, setQuickRunOpen] = useState(false);
@@ -530,7 +534,7 @@ export default function DagsPage() {
                       {expandedDag === dag.id ? "Hide Runs" : "Show Runs"}
                     </button>
                     <button
-                      onClick={() => handleDeleteDag(dag.id)}
+                      onClick={() => setPendingDeleteId(dag.id)}
                       className="
                         ml-auto px-3 py-1.5 rounded-lg text-[11px] font-medium
                         text-rose/60 hover:text-rose
@@ -943,6 +947,25 @@ export default function DagsPage() {
           </div>
         </div>
       )}
+
+      {/* ── Delete confirmation ─────────────────────────────── */}
+      <ConfirmModal
+        open={pendingDeleteId != null}
+        title="Delete DAG"
+        message={
+          pendingDeleteId != null
+            ? `Delete DAG "${dags.find((d) => d.id === pendingDeleteId)?.name ?? `#${pendingDeleteId}`}"? This cannot be undone.`
+            : ""
+        }
+        danger
+        onCancel={() => setPendingDeleteId(null)}
+        onConfirm={() => {
+          if (pendingDeleteId != null) {
+            handleDeleteDag(pendingDeleteId);
+            setPendingDeleteId(null);
+          }
+        }}
+      />
     </div>
   );
 }
