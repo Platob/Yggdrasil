@@ -73,10 +73,9 @@ python/src/yggdrasil/
   cli/                  ygg CLI
   exceptions/api.py     APIError hierarchy
   databricks/           Databricks SDK integrations
-nextjs/                 Frontend (React 19, Next.js 16, Tailwind v4)
+nextjs/                 Frontend (React 19, Next.js 15, Tailwind v4)
   src/app/              Next.js app router pages
-  src/components/       Shared React components (globe, sidebar, logo)
-  src/lib/              API clients
+  src/components/       Shared React components (globe, brain mesh, sidebar)
 ```
 
 ## Node API
@@ -130,11 +129,14 @@ Core concepts — workstation as remote executor/driver:
 | Route | Description |
 |-------|-------------|
 | `/` | 3D globe welcome with node card |
-| `/bot` | Bot dashboard wired to live backend |
-| `/bot/chat` | Bot chat — channels, messages, polled updates |
-| `/bot/execute` | Direct Python / shell execution console |
-| `/bot/network` | 3D peer network visualization |
-| `/msg` | Real-time messenger — channels, messages, SSE live updates |
+| `/dashboard` | Cluster dashboard — Quick Actions, function/DAG mgmt |
+| `/nodes` | Cluster overview — KPI aggregation + node grid + sidebar |
+| `/nodes/[id]` | Per-node detail — resources, assets, replicated items |
+| `/dags` | DAG builder — chain functions across nodes |
+| `/chat` | Real-time messenger — channels, messages, SSE live updates |
+| `/files` | Filesystem browser — lazy directory listing, file preview |
+| `/metrics` | Per-function metrics + recent runs |
+| `/topology` | Neural Mesh — layered brain network visualization |
 
 ## Python Decorator Framework
 

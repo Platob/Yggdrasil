@@ -1,314 +1,274 @@
-// Browser-side bot client. All requests go through the /api/bot/* rewrite
-// configured in next.config.ts, which proxies to the FastAPI node.
-// Server code should use src/lib/bot-client.ts instead.
+// Browser-side client for the Yggdrasil FastAPI v2 backend.
+//
+// All requests target relative URLs which Next.js rewrites to
+// http://127.0.0.1:8100 (or BOT_API_URL) — see nextjs/next.config.ts.
 
-// ── Types ──────────────────────────────────────────────────────────────────
+import type {
+  AuditEntry,
+  ChannelInfo,
+  ClusterStats,
+  DAGEntry,
+  DAGRunEntry,
+  FsEntry,
+  HealthResponse,
+  Message,
+  MetricsResponse,
+  NodeBackend,
+  NodeCard,
+  NodeMeta,
+  PyEnvEntry,
+  PyFuncEntry,
+  PyFuncRunEntry,
+  TopologyResponse,
+  UserCard,
+} from "./types";
 
-export interface NodeInfo {
-  node_id: string;
-  host: string;
-  port: number;
-  version: string;
-  uptime: number;
-  channels: string[];
-  functions: string[];
-  lat?: number | null;
-  lon?: number | null;
-}
+// ── Low-level fetch helper ─────────────────────────────────────────────────
 
-export interface ChannelInfo {
-  name: string;
-  created_at: string;
-  last_active: string;
-  message_count: number;
-  members: string[];
-}
-
-export interface Message {
-  id: string;
-  sender: string;
-  text: string;
-  channel: string;
-  timestamp: string;
-  node_id: string;
-}
-
-export interface ChannelListResponse {
-  node_id: string;
-  channels: ChannelInfo[];
-}
-
-export interface MessageListResponse {
-  node_id: string;
-  channel: string;
-  messages: Message[];
-}
-
-export interface ChannelResponse {
-  node_id: string;
-  channel: ChannelInfo;
-}
-
-export interface PythonResponse {
-  id: string;
-  node_id: string;
-  returncode: number | null;
-  stdout: string | null;
-  stderr: string | null;
-  result: unknown;
-  duration: number | null;
-  status: string;
-}
-
-export interface CmdResponse {
-  id: string;
-  node_id: string;
-  command: string[];
-  returncode: number | null;
-  stdout: string | null;
-  stderr: string | null;
-  duration: number | null;
-  status: string;
-}
-
-// v2 topology / stats / health / metrics ------------------------------------
-
-export interface TopologyNode {
-  node_id: string;
-  host: string;
-  port: number;
-  role: string;
-  cpu_percent: number;
-  memory_percent: number;
-  active_runs: number;
-  gpu_count: number;
-  self: boolean;
-  lat?: number | null;
-  lon?: number | null;
-}
-
-export interface TopologyResponse {
-  nodes: TopologyNode[];
-  total_cpu_percent: number;
-  total_active_runs: number;
-  total_gpus: number;
-}
-
-export interface StatsResponse {
-  node_id: string;
-  uptime: number;
-  cpu_percent: number;
-  memory_percent: number;
-  active_runs: number;
-  total_runs: number;
-  env_count: number;
-  func_count: number;
-  dag_count: number;
-  scheduled_dags: number;
-  peer_count: number;
-  gpu_count: number;
-}
-
-export interface HealthCheck {
-  status: "ok" | "error" | string;
-  [key: string]: unknown;
-}
-
-export interface HealthResponse {
-  status: "healthy" | "degraded" | string;
-  node_id: string;
-  checks: Record<string, HealthCheck>;
-}
-
-export interface MetricsTopRun {
-  id: number;
-  name: string;
-  runs: number;
-}
-
-export interface MetricsTopDuration {
-  id: number;
-  name: string;
-  avg_ms: number;
-}
-
-export interface MetricsRecentRun {
-  id: number;
-  func_id: number;
-  status: string;
-  duration: number | null;
-  started_at: string | null;
-}
-
-export interface MetricsResponse {
-  node_id: string;
-  top_by_runs: MetricsTopRun[];
-  top_by_duration: MetricsTopDuration[];
-  success_rate: { id: number; name: string; rate: number }[];
-  recent_runs: MetricsRecentRun[];
-}
-
-// Mirrors python/src/yggdrasil/node/api/schemas/backend.py:NodeBackend
-export interface GpuInfo {
-  index: number;
-  name: string;
-  memory_used_mb: number;
-  memory_total_mb: number;
-  utilization_percent: number;
-  temperature_c: number;
-}
-
-export interface NetworkIO {
-  bytes_sent: number;
-  bytes_recv: number;
-  packets_sent: number;
-  packets_recv: number;
-}
-
-export interface NodeBackend {
-  node_id: string;
-  role: string;
-  hostname: string;
-  platform: string;
-  python_version: string;
-  cpu_count: number;
-  cpu_percent: number;
-  memory_used_mb: number;
-  memory_total_mb: number;
-  disk_used_mb: number;
-  disk_total_mb: number;
-  gpus: GpuInfo[];
-  network: NetworkIO;
-  uptime_seconds: number;
-  active_runs: number;
-  total_runs: number;
-  timestamp: string;
-}
-
-export interface BackendResponse {
-  backend: NodeBackend;
-}
-
-// ── Fetch helper ───────────────────────────────────────────────────────────
-
-const BASE = "/api/bot";
-
-async function jget<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { Accept: "application/json" },
+async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+    },
   });
   if (!res.ok) {
-    throw new Error(`GET ${path} failed: ${res.status} ${res.statusText}`);
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = typeof body?.detail === "string" ? body.detail : JSON.stringify(body);
+    } catch {
+      try { detail = await res.text(); } catch { /* ignore */ }
+    }
+    throw new Error(`HTTP ${res.status} ${res.statusText}: ${detail || url}`);
   }
+  // 204 No Content
+  if (res.status === 204) return undefined as unknown as T;
   return (await res.json()) as T;
 }
 
-async function jpost<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+// ── Node identity ──────────────────────────────────────────────────────────
+
+export function getNodeCard(): Promise<NodeCard> {
+  return jsonFetch<NodeCard>("/api/card");
+}
+
+// ── Aggregate endpoints ────────────────────────────────────────────────────
+
+export function getStats(): Promise<ClusterStats> {
+  return jsonFetch<ClusterStats>("/api/v2/stats");
+}
+
+export function getTopology(): Promise<TopologyResponse> {
+  return jsonFetch<TopologyResponse>("/api/v2/topology");
+}
+
+export function getHealth(): Promise<HealthResponse> {
+  return jsonFetch<HealthResponse>("/api/v2/health");
+}
+
+export function getMetrics(): Promise<MetricsResponse> {
+  return jsonFetch<MetricsResponse>("/api/v2/metrics");
+}
+
+export function getAudit(limit = 100): Promise<{ entries: AuditEntry[] }> {
+  return jsonFetch<{ entries: AuditEntry[] }>(`/api/v2/audit?limit=${limit}`);
+}
+
+// ── Backend ────────────────────────────────────────────────────────────────
+
+export function getBackend(): Promise<{ backend: NodeBackend }> {
+  return jsonFetch<{ backend: NodeBackend }>("/api/v2/backend");
+}
+
+// SSE: emits NodeBackend snapshots every ~1s. The handler reads
+// `event.data` as JSON.
+export function createBackendStream(): EventSource {
+  return new EventSource("/api/v2/backend/stream");
+}
+
+// ── Network / peers ────────────────────────────────────────────────────────
+
+export function getPeers(): Promise<{ node_id: string; peers: NodeMeta[] }> {
+  return jsonFetch<{ node_id: string; peers: NodeMeta[] }>("/api/v2/network/peers");
+}
+
+// ── PyEnv ──────────────────────────────────────────────────────────────────
+
+export function getEnvs(): Promise<{ node_id: string; envs: PyEnvEntry[] }> {
+  return jsonFetch<{ node_id: string; envs: PyEnvEntry[] }>("/api/v2/pyenv");
+}
+
+// ── PyFunc ─────────────────────────────────────────────────────────────────
+
+export function getFuncs(): Promise<{ node_id: string; funcs: PyFuncEntry[] }> {
+  return jsonFetch<{ node_id: string; funcs: PyFuncEntry[] }>("/api/v2/pyfunc");
+}
+
+export interface CreateFuncInput {
+  name: string;
+  code: string;
+  description?: string;
+  python_version?: string;
+  dependencies?: string[];
+  env_id?: number | null;
+}
+
+export function createFunc(input: CreateFuncInput): Promise<{ func: PyFuncEntry }> {
+  return jsonFetch<{ func: PyFuncEntry }>("/api/v2/pyfunc", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(input),
   });
-  if (!res.ok) {
-    throw new Error(`POST ${path} failed: ${res.status} ${res.statusText}`);
+}
+
+export function bulkDeleteFuncs(
+  ids: number[],
+): Promise<{ deleted: number; failed: { id: number; error: string }[] }> {
+  return jsonFetch<{ deleted: number; failed: { id: number; error: string }[] }>(
+    "/api/v2/pyfunc/bulk/delete",
+    { method: "POST", body: JSON.stringify({ ids }) },
+  );
+}
+
+// Trigger a function by name, then wait for the result. The chat-style "Quick
+// Run" expects a single returned value, not a pending run, so we block here.
+export async function runFuncByName(
+  name: string,
+  args: unknown[] = [],
+  kwargs: Record<string, unknown> = {},
+): Promise<unknown> {
+  const triggered = await jsonFetch<{ run: PyFuncRunEntry }>(
+    `/api/v2/pyfunc/by-name/${encodeURIComponent(name)}/run`,
+    { method: "POST", body: JSON.stringify({ args, kwargs }) },
+  );
+  // Poll the wait endpoint; default 60s timeout to keep the UI responsive.
+  const final = await jsonFetch<{ run: PyFuncRunEntry }>(
+    `/api/v2/pyfuncrun/${triggered.run.id}/wait?timeout=60`,
+  );
+  if (final.run.status === "failed" || final.run.error) {
+    throw new Error(final.run.error || `Run #${final.run.id} failed`);
   }
-  return (await res.json()) as T;
+  // Prefer the structured result; fall back to stdout for fire-and-forget funcs.
+  return final.run.result ?? final.run.stdout ?? final.run;
+}
+
+// ── PyFuncRun ──────────────────────────────────────────────────────────────
+
+export function getRuns(): Promise<{ node_id: string; runs: PyFuncRunEntry[] }> {
+  return jsonFetch<{ node_id: string; runs: PyFuncRunEntry[] }>("/api/v2/pyfuncrun");
+}
+
+// ── DAG ────────────────────────────────────────────────────────────────────
+
+export function getDags(): Promise<{ node_id: string; dags: DAGEntry[] }> {
+  return jsonFetch<{ node_id: string; dags: DAGEntry[] }>("/api/v2/dag");
+}
+
+export interface CreateDagInput {
+  name: string;
+  description?: string;
+  steps: {
+    id: string;
+    ref: {
+      node_url: string | null;
+      func_id: number | null;
+      env_id: number | null;
+      args: Record<string, unknown>;
+    };
+    depends_on: string[];
+  }[];
+  edges: {
+    from_step: string;
+    to_step: string;
+    output_key: string;
+    input_key: string;
+  }[];
+}
+
+export function createDag(input: CreateDagInput): Promise<{ dag: DAGEntry }> {
+  return jsonFetch<{ dag: DAGEntry }>("/api/v2/dag", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteDag(dagId: number): Promise<{ dag: DAGEntry }> {
+  return jsonFetch<{ dag: DAGEntry }>(`/api/v2/dag/${dagId}`, { method: "DELETE" });
+}
+
+export function runDag(dagId: number): Promise<{ run: DAGRunEntry }> {
+  return jsonFetch<{ run: DAGRunEntry }>(`/api/v2/dag/${dagId}/run`, { method: "POST" });
+}
+
+export function getDagRuns(dagId: number): Promise<{ node_id: string; runs: DAGRunEntry[] }> {
+  return jsonFetch<{ node_id: string; runs: DAGRunEntry[] }>(`/api/v2/dag/${dagId}/run`);
+}
+
+export function scheduleDag(
+  dagId: number,
+  intervalSeconds: number,
+  maxRuns?: number,
+): Promise<{ dag: DAGEntry }> {
+  return jsonFetch<{ dag: DAGEntry }>(`/api/v2/dag/${dagId}/schedule`, {
+    method: "POST",
+    body: JSON.stringify({
+      interval_seconds: intervalSeconds,
+      max_runs: maxRuns ?? null,
+    }),
+  });
+}
+
+// ── User ───────────────────────────────────────────────────────────────────
+
+export function getUsers(): Promise<{ node_id: string; users: UserCard[] }> {
+  return jsonFetch<{ node_id: string; users: UserCard[] }>("/api/v2/user");
+}
+
+// ── Filesystem ─────────────────────────────────────────────────────────────
+
+export function getFsListing(
+  path: string,
+): Promise<{ node_id: string; path: string; entries: FsEntry[] }> {
+  const url = path
+    ? `/api/v2/fs/ls?path=${encodeURIComponent(path)}`
+    : "/api/v2/fs/ls";
+  return jsonFetch<{ node_id: string; path: string; entries: FsEntry[] }>(url);
+}
+
+// Returns just the file content as a string (the route also returns encoding/size
+// but the legacy file viewer only ever reads `.content`).
+export async function getFsContent(path: string): Promise<string> {
+  const res = await jsonFetch<{ path: string; content: string; encoding: string; size: number }>(
+    `/api/v2/fs/read?path=${encodeURIComponent(path)}`,
+  );
+  return res.content;
 }
 
 // ── Messenger ──────────────────────────────────────────────────────────────
 
-export async function getChannels(): Promise<ChannelInfo[]> {
-  const resp = await jget<ChannelListResponse>("/messenger/channels");
-  return resp.channels;
-}
-
-export async function getMessages(channel: string, limit = 200): Promise<Message[]> {
-  const resp = await jget<MessageListResponse>(
-    `/messenger/channels/${encodeURIComponent(channel)}/messages?limit=${limit}`,
+export function getChannels(): Promise<{ node_id: string; channels: ChannelInfo[] }> {
+  return jsonFetch<{ node_id: string; channels: ChannelInfo[] }>(
+    "/api/v2/messenger/channels",
   );
-  return resp.messages;
 }
 
-export async function sendMessage(text: string, sender: string, channel: string): Promise<Message> {
-  return jpost<Message>("/messenger", { text, sender, channel });
-}
-
-export async function pollMessages(
+export function getMessages(
   channel: string,
-  afterId: string,
-  timeout = 25,
-): Promise<Message[]> {
-  const q = new URLSearchParams();
-  if (afterId) q.set("after_id", afterId);
-  q.set("timeout", String(timeout));
-  const resp = await jget<MessageListResponse>(
-    `/messenger/channels/${encodeURIComponent(channel)}/poll?${q.toString()}`,
+  limit = 50,
+): Promise<{ channel: string; messages: Message[] }> {
+  return jsonFetch<{ channel: string; messages: Message[] }>(
+    `/api/v2/messenger/${encodeURIComponent(channel)}?limit=${limit}`,
   );
-  return resp.messages;
 }
 
-export async function createChannel(name: string): Promise<ChannelResponse> {
-  const res = await fetch(`${BASE}/messenger/channels?name=${encodeURIComponent(name)}`, {
+export function sendMessage(channel: string, content: string): Promise<Message> {
+  return jsonFetch<Message>(`/api/v2/messenger/${encodeURIComponent(channel)}`, {
     method: "POST",
-    headers: { Accept: "application/json" },
+    body: JSON.stringify({ channel, content }),
   });
-  if (!res.ok) {
-    throw new Error(`createChannel failed: ${res.status} ${res.statusText}`);
-  }
-  return (await res.json()) as ChannelResponse;
 }
 
-// ── Execute ────────────────────────────────────────────────────────────────
-
-export async function executePython(code: string): Promise<PythonResponse> {
-  return jpost<PythonResponse>("/python", { code });
+export function createMessageStream(channel: string): EventSource {
+  return new EventSource(`/api/v2/messenger/${encodeURIComponent(channel)}/stream`);
 }
-
-export async function executeCmd(command: string[]): Promise<CmdResponse> {
-  return jpost<CmdResponse>("/cmd", { command });
-}
-
-// ── Bot namespace (v1 + v2 grouped) ────────────────────────────────────────
-
-export const bot = {
-  async getNodeInfo(): Promise<NodeInfo> {
-    return jget<NodeInfo>("/hello");
-  },
-  async getTopology(): Promise<TopologyResponse> {
-    return jget<TopologyResponse>("/v2/topology");
-  },
-  async getStats(): Promise<StatsResponse> {
-    return jget<StatsResponse>("/v2/stats");
-  },
-  async getHealth(): Promise<HealthResponse> {
-    return jget<HealthResponse>("/v2/health");
-  },
-  async getMetrics(): Promise<MetricsResponse> {
-    return jget<MetricsResponse>("/v2/metrics");
-  },
-  async getBackend(): Promise<NodeBackend> {
-    const resp = await jget<BackendResponse>("/v2/backend");
-    return resp.backend;
-  },
-  // Opens an SSE stream of NodeBackend snapshots from /api/v2/backend/stream.
-  // Returns a cleanup function. The backend router emits raw
-  // NodeBackend.model_dump() per "data:" line (no wrapper envelope).
-  streamBackend(
-    onSnap: (snap: NodeBackend) => void,
-    onError?: (e: Event) => void,
-  ): () => void {
-    const es = new EventSource(`${BASE}/v2/backend/stream`);
-    es.onmessage = (ev) => {
-      try {
-        const data = JSON.parse(ev.data) as NodeBackend;
-        onSnap(data);
-      } catch {
-        // Malformed line: skip.
-      }
-    };
-    es.onerror = (e) => {
-      if (onError) onError(e);
-    };
-    return () => es.close();
-  },
-};

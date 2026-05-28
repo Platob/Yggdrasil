@@ -22,10 +22,18 @@ const nextConfig: NextConfig = {
   },
   async rewrites() {
     return [
-      // Bot API proxy - all /api/bot/* routes go to FastAPI
+      // Proxy /api/v2/* to the FastAPI backend
       {
-        source: "/api/bot/:path*",
-        destination: `${BOT_API_URL}/api/:path*`,
+        source: "/api/v2/:path*",
+        destination: `${BOT_API_URL}/api/v2/:path*`,
+      },
+      {
+        source: "/api/card",
+        destination: `${BOT_API_URL}/api/card`,
+      },
+      {
+        source: "/api/ping",
+        destination: `${BOT_API_URL}/api/ping`,
       },
     ];
   },

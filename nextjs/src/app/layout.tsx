@@ -1,27 +1,27 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-
-const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
-const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
+import { Sidebar } from "@/components/Sidebar";
 
 export const metadata: Metadata = {
   title: "Yggdrasil",
-  description: "Yggdrasil - The World Tree of Distributed Systems",
-  keywords: ["yggdrasil", "bot", "distributed", "python", "dashboard", "trading", "data"],
+  description: "Yggdrasil - A Living Brain of Distributed Computing",
+  keywords: ["yggdrasil", "distributed", "nodes", "python", "computing"],
 };
 
 export const viewport: Viewport = {
-  themeColor: "#050507",
+  themeColor: "#050510",
   width: "device-width",
   initialScale: 1,
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} bg-background`}>
-      <body className="min-h-screen bg-background text-foreground antialiased">
-        {children}
+    <html lang="en" className="dark">
+      <body className="min-h-screen bg-background text-foreground antialiased noise-bg">
+        <Sidebar />
+        <main className="ml-[200px] min-h-screen">
+          {children}
+        </main>
       </body>
     </html>
   );
