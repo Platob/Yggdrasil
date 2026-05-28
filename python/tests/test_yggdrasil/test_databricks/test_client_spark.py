@@ -157,6 +157,14 @@ class TestClassifyDependency:
     def test_installed_dist_default_is_local(self, monkeypatch) -> None:
         # ``ygg`` is editable in this repo; force the editable
         # detector off so we exercise the LOCAL branch alone.
+        from importlib.metadata import PackageNotFoundError, distribution
+        try:
+            distribution("ygg")
+        except PackageNotFoundError:
+            pytest.skip(
+                "ygg is not installed as a distribution in this environment; "
+                "the LOCAL-classification path requires `pip install -e .`."
+            )
         import yggdrasil.databricks.registry as reg
         monkeypatch.setattr(reg, "_detect_editable", lambda dist: False)
         info = classify_dependency("ygg")
@@ -166,15 +174,22 @@ class TestClassifyDependency:
 
     def test_editable_install_is_editable(self) -> None:
         # Skip when the dev environment installed ``ygg`` non-editably
-        # (e.g. ``pip install .`` instead of ``pip install -e .``). The
-        # editable bit comes from PEP 610 ``direct_url.json`` — probe
-        # the same source the production classifier uses so the test
-        # only runs in environments that can actually satisfy its
-        # premise.
-        from importlib.metadata import distribution
+        # (e.g. ``pip install .`` instead of ``pip install -e .``), or
+        # not at all. The editable bit comes from PEP 610
+        # ``direct_url.json`` — probe the same source the production
+        # classifier uses so the test only runs in environments that
+        # can actually satisfy its premise.
+        from importlib.metadata import PackageNotFoundError, distribution
         from yggdrasil.databricks.registry import _detect_editable
 
-        if not _detect_editable(distribution("ygg")):
+        try:
+            dist = distribution("ygg")
+        except PackageNotFoundError:
+            pytest.skip(
+                "ygg is not installed as a distribution in this environment; "
+                "the EDITABLE-classification path requires `pip install -e .`."
+            )
+        if not _detect_editable(dist):
             pytest.skip(
                 "ygg is installed non-editably in this environment; the "
                 "EDITABLE-classification path can only be exercised after "
