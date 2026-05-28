@@ -40,10 +40,24 @@ def spark_json_to_schema(schema_string: str) -> Schema:
 
 
 def _parse_field(raw: Mapping[str, Any]) -> Field:
+    meta = raw.get("metadata") or None
+    metadata: "dict[bytes, bytes] | None" = None
+    if isinstance(meta, Mapping) and meta:
+        # Spark metadata is string-keyed JSON. Round-trip back into
+        # Arrow's bytes-keyed convention so the field's metadata is
+        # available via the same API on both sides.
+        metadata = {}
+        for k, v in meta.items():
+            key = k.encode("utf-8") if isinstance(k, str) else bytes(k)
+            value = v.encode("utf-8") if isinstance(v, str) else (
+                v if isinstance(v, bytes) else str(v).encode("utf-8")
+            )
+            metadata[key] = value
     return Field(
         name=str(raw["name"]),
         dtype=_parse_type(raw["type"]),
         nullable=bool(raw.get("nullable", True)),
+        metadata=metadata,
     )
 
 
@@ -88,11 +102,31 @@ def schema_to_spark_json(schema: Schema) -> str:
 
 
 def _field_to_spark(field: Field) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    raw = field.metadata
+    if raw:
+        # Field.metadata is a bytes→bytes dict (Arrow convention);
+        # Spark expects JSON-serializable string keys + values. Decode
+        # both sides as UTF-8, falling back to repr() for values that
+        # don't decode (e.g. encoded type-json blobs).
+        for k, v in raw.items():
+            try:
+                key = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+            except UnicodeDecodeError:
+                key = repr(k)
+            if isinstance(v, bytes):
+                try:
+                    value = v.decode("utf-8")
+                except UnicodeDecodeError:
+                    value = repr(v)
+            else:
+                value = v
+            metadata[key] = value
     return {
         "name": field.name,
         "type": _type_to_spark(field.dtype),
         "nullable": bool(field.nullable),
-        "metadata": {},
+        "metadata": metadata,
     }
 
 

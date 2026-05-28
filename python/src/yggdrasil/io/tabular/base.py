@@ -1207,12 +1207,12 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
     def read_arrow_dataset(
         self, options: "O | None" = None, **kwargs: Any,
-    ) -> "pds.SparkDataset":
+    ) -> "pds.Dataset":
         return self._read_arrow_dataset(
             self.check_options(options, overrides=locals())
         )
 
-    def _read_arrow_dataset(self, options: O) -> "pds.SparkDataset":
+    def _read_arrow_dataset(self, options: O) -> "pds.Dataset":
         pds = pyarrow_dataset_module()
         reader = self._read_arrow_batch_reader(options)
         return pds.dataset(reader, schema=reader.schema)

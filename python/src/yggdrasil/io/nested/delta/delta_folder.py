@@ -264,12 +264,7 @@ class DeltaFolder(Folder):
             actions.extend(new_adds)
             if options.txn_app_id is not None and options.txn_version is not None:
                 actions.append(Txn(app_id=options.txn_app_id, version=int(options.txn_version)))
-            actions.append(CommitInfo(payload={
-                "timestamp": int(time.time() * 1000), "operation": str(options.operation or "WRITE"),
-                "operationParameters": {"mode": action.name.lower()},
-                "engineInfo": str(options.engine_info or "yggdrasil"),
-                "isBlindAppend": action is Mode.APPEND,
-            }))
+            actions.append(self._build_commit_info(options=options, mode=action))
             return actions
 
         self._with_commit_retry(build_actions=build, cleanup=None,
@@ -330,11 +325,11 @@ class DeltaFolder(Folder):
             actions.extend(incoming_adds)
             if options.txn_app_id is not None and options.txn_version is not None:
                 actions.append(Txn(app_id=options.txn_app_id, version=int(options.txn_version)))
-            actions.append(CommitInfo(payload={
-                "timestamp": int(time.time() * 1000), "operation": str(options.operation or "WRITE"),
-                "operationParameters": {"mode": "upsert"},
-                "engineInfo": str(options.engine_info or "yggdrasil"), "isBlindAppend": False,
-            }))
+            actions.append(self._build_commit_info(
+                options=options, mode=Mode.APPEND,
+                operation_parameters={"mode": "upsert"},
+                is_blind_append=False,
+            ))
             return actions
 
         def cleanup() -> None:
@@ -462,6 +457,36 @@ class DeltaFolder(Folder):
                 stats=_collect_stats(payload_batches) if getattr(options, "collect_stats", True) else None,
             )
 
+    def _build_commit_info(
+        self,
+        *,
+        options: "DeltaOptions",
+        mode: "Mode",
+        operation_parameters: "dict[str, Any] | None" = None,
+        is_blind_append: "bool | None" = None,
+    ) -> CommitInfo:
+        """Build a :class:`CommitInfo` action from the active options + mode.
+
+        Centralizes the payload shape the three commit sites
+        (write / upsert / delete) used to build inline so callers and
+        tests have a single helper to reach for. ``operation``,
+        ``engineInfo``, ``timestamp`` come from *options* and the
+        process clock; ``operationParameters.mode`` and
+        ``isBlindAppend`` derive from *mode* unless overridden.
+        """
+        params = operation_parameters
+        if params is None:
+            params = {"mode": mode.name.lower()}
+        if is_blind_append is None:
+            is_blind_append = mode is Mode.APPEND
+        return CommitInfo(payload={
+            "timestamp": int(time.time() * 1000),
+            "operation": str(options.operation or "WRITE"),
+            "operationParameters": params,
+            "engineInfo": str(options.engine_info or "yggdrasil"),
+            "isBlindAppend": bool(is_blind_append),
+        })
+
     def _commit_atomic(self, version: int, actions: "Iterable[DeltaAction]") -> None:
         self._log.log_path.mkdir(parents=True, exist_ok=True)
         commit_path = self._log.log_path / format_commit_name(version)
@@ -546,9 +571,15 @@ class DeltaFolder(Folder):
                     reader_features=sorted({*(snap.protocol.reader_features or []), "deletionVectors"}),
                     writer_features=sorted({*(snap.protocol.writer_features or []), "deletionVectors"})))
 
-        new_actions.append(CommitInfo(payload={"timestamp": ts, "operation": "DELETE",
-                                               "engineInfo": str(options.engine_info or "yggdrasil"),
-                                               "isBlindAppend": False}))
+        new_actions.append(self._build_commit_info(
+            options=options, mode=Mode.OVERWRITE,
+            operation_parameters={},
+            is_blind_append=False,
+        ))
+        # Override the operation label — _build_commit_info defaults to
+        # "WRITE", but a DELETE retain commit should carry the literal
+        # "DELETE" string for tooling compatibility.
+        new_actions[-1].payload["operation"] = "DELETE"
         next_version = snap.version + 1
         self._commit_atomic(next_version, new_actions)
         self._log.extend_listing(format_commit_name(next_version))

@@ -201,3 +201,126 @@ class TestAppendStreaming:
         assert read_back
         combined = pa.Table.from_batches(read_back)
         assert combined["x"].to_pylist() == [99, 100]
+
+
+# ---------------------------------------------------------------------------
+# Per-entry write surface
+# ---------------------------------------------------------------------------
+
+
+class TestEntryWriter:
+    """`z.entry("name")` — ergonomic per-entry writes via context
+    manager or Tabular shortcut."""
+
+    def test_entry_open_writes_raw_bytes(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+
+        zf = _Zip(holder=Memory(), owns_holder=False)
+        with zf.entry("notes.txt").open("wb") as f:
+            f.write(b"hello entry")
+
+        # Reread off the underlying archive bytes.
+        with stdlib_zipfile.ZipFile(
+            __import__("io").BytesIO(zf.to_bytes()), "r",
+        ) as zfile:
+            assert zfile.namelist() == ["notes.txt"]
+            assert zfile.read("notes.txt") == b"hello entry"
+
+    def test_entry_open_committed_payload_replaces_prior_entry(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+
+        # Pre-populate with one entry under the same name.
+        raw = _build_archive({"x.bin": b"old"})
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+
+        with zf.entry("x.bin").open("wb") as f:
+            f.write(b"new")
+
+        with stdlib_zipfile.ZipFile(
+            __import__("io").BytesIO(zf.to_bytes()), "r",
+        ) as zfile:
+            assert zfile.read("x.bin") == b"new"
+
+    def test_entry_open_preserves_other_entries(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+
+        raw = _build_archive({"a.bin": b"alpha", "b.bin": b"beta"})
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+
+        with zf.entry("c.bin").open("wb") as f:
+            f.write(b"gamma")
+
+        with stdlib_zipfile.ZipFile(
+            __import__("io").BytesIO(zf.to_bytes()), "r",
+        ) as zfile:
+            assert set(zfile.namelist()) == {"a.bin", "b.bin", "c.bin"}
+            assert zfile.read("a.bin") == b"alpha"
+            assert zfile.read("b.bin") == b"beta"
+            assert zfile.read("c.bin") == b"gamma"
+
+    def test_entry_open_exception_drops_staged_bytes(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+
+        zf = _Zip(holder=Memory(), owns_holder=False)
+        try:
+            with zf.entry("aborted.bin").open("wb") as f:
+                f.write(b"partial")
+                raise RuntimeError("user code raised")
+        except RuntimeError:
+            pass
+
+        # Archive remains empty — the staged bytes never reached the
+        # central directory.
+        assert zf.size == 0
+
+    def test_entry_write_arrow_batches_packs_parquet(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+
+        table = pa.table({"x": [1, 2, 3]})
+        zf = _Zip(holder=Memory(), owns_holder=False)
+        zf.entry("data.parquet").write_arrow_batches(iter(table.to_batches()))
+
+        with stdlib_zipfile.ZipFile(
+            __import__("io").BytesIO(zf.to_bytes()), "r",
+        ) as zfile:
+            assert zfile.namelist() == ["data.parquet"]
+
+    def test_entry_open_rejects_read_mode(self) -> None:
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+
+        zf = _Zip(holder=Memory(), owns_holder=False)
+        with pytest.raises(ValueError, match="write modes"):
+            zf.entry("x.bin").open("rb")
+
+
+class TestParallelEntryWrites:
+    """Concurrent ``z.entry("a") / z.entry("b") / ...`` writes must
+    end up with every committed entry in the archive — the per-entry
+    commit holds a per-archive lock for the central-directory rewrite
+    so the directory never tears."""
+
+    def test_concurrent_distinct_entries_all_persist(self) -> None:
+        import concurrent.futures as cf
+        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+
+        zf = _Zip(holder=Memory(), owns_holder=False)
+        n = 16
+
+        def write_one(i: int) -> None:
+            with zf.entry(f"part-{i:02d}.bin").open("wb") as f:
+                # Variable-size payloads so the test exercises
+                # different commit timings.
+                f.write(f"payload-{i}".encode() * (i + 1))
+
+        with cf.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(write_one, range(n)))
+
+        with stdlib_zipfile.ZipFile(
+            __import__("io").BytesIO(zf.to_bytes()), "r",
+        ) as zfile:
+            names = sorted(zfile.namelist())
+            assert names == [f"part-{i:02d}.bin" for i in range(n)]
+            # Every payload must be intact.
+            for i in range(n):
+                expected = f"payload-{i}".encode() * (i + 1)
+                assert zfile.read(f"part-{i:02d}.bin") == expected

@@ -49,6 +49,7 @@ Convenience helper :meth:`write_entries` packs arbitrary
 from __future__ import annotations
 
 import dataclasses
+import threading
 import zipfile
 from typing import ClassVar, Iterable, Iterator
 
@@ -65,7 +66,7 @@ from yggdrasil.path.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 
 
-__all__ = ["ZipFile", "ZipOptions", "ZipEntryFile"]
+__all__ = ["ZipFile", "ZipOptions", "ZipEntryFile", "ZipEntryWriter"]
 
 
 def _registered_tabular_extensions() -> "list[str]":
@@ -298,6 +299,18 @@ class ZipFile(IO):
     def options_class(cls):
         return ZipOptions
 
+    # ``_write_lock`` serializes the per-entry commit (central-directory
+    # rewrite) so concurrent ``z.entry("a").open()`` /
+    # ``z.entry("b").open()`` writers can stage bytes in private
+    # buffers in parallel without corrupting the archive's directory.
+    @property
+    def _write_lock(self) -> threading.Lock:
+        lock = self.__dict__.get("__zip_write_lock__")
+        if lock is None:
+            lock = threading.Lock()
+            self.__dict__["__zip_write_lock__"] = lock
+        return lock
+
     # ==================================================================
     # Children surface — lazy iteration
     # ==================================================================
@@ -334,6 +347,32 @@ class ZipFile(IO):
         with self.view(pos=0) as v:
             with zipfile.ZipFile(v, "r") as zf:
                 return [info.filename for info in zf.infolist() if not info.is_dir()]
+
+    # ==================================================================
+    # Per-entry write surface — z.entry("name").open() / .write_arrow_batches
+    # ==================================================================
+
+    def entry(self, entry_name: str) -> "ZipEntryWriter":
+        """Return a per-entry writer for *entry_name*.
+
+        The returned :class:`ZipEntryWriter` exposes two ergonomic
+        shapes:
+
+        - ``with z.entry("data.bin").open("wb") as f: f.write(...)``
+          — raw byte stream into the entry; commits on close.
+        - ``z.entry("data.parquet").write_arrow_batches(batches)``
+          — tabular write that picks the inner format from the
+          extension and commits the encoded bytes.
+
+        Writes against different ``entry_name`` values can run in
+        parallel: each writer stages its bytes in a private scratch
+        :class:`Memory`, and the commit phase takes a per-archive
+        :class:`threading.Lock` only for the brief central-directory
+        rewrite. The archive ends up containing every committed
+        entry; writes against the *same* ``entry_name`` race —
+        last commit wins.
+        """
+        return ZipEntryWriter(parent=self, entry_name=entry_name)
 
     def child(self, entry_name: str) -> ZipEntryFile:
         """Return a lazy :class:`ZipEntryFile` for *entry_name*.
@@ -589,3 +628,204 @@ class ZipFile(IO):
         if mode is Mode.UPSERT or mode is Mode.MERGE:
             return Mode.APPEND
         return Mode.OVERWRITE
+
+    # ==================================================================
+    # Per-entry commit — used by ZipEntryWriter
+    # ==================================================================
+
+    def _commit_entry(
+        self,
+        entry_name: str,
+        payload: bytes,
+        *,
+        compression: int = zipfile.ZIP_DEFLATED,
+        compresslevel: "int | None" = None,
+    ) -> None:
+        """Merge *payload* into the archive under *entry_name*.
+
+        Replaces any existing entry of the same name. The archive's
+        central directory is rewritten under :attr:`_write_lock` so
+        concurrent commits against different entry names don't
+        corrupt the directory. Survivors stream chunk-by-chunk into a
+        scratch buffer — the merge never materializes the whole
+        archive in memory.
+        """
+        write_kwargs: dict = {"compression": compression}
+        if compresslevel is not None:
+            write_kwargs["compresslevel"] = compresslevel
+
+        with self._write_lock:
+            if self.size == 0:
+                # Empty target — fresh archive with just this entry.
+                with zipfile.ZipFile(self, "w", **write_kwargs) as zf:
+                    zf.writestr(entry_name, payload)
+                return
+
+            scratch = Memory()
+            with self.view(pos=0) as src_v:
+                with zipfile.ZipFile(src_v, "r") as src_zf:
+                    with zipfile.ZipFile(scratch, "w", **write_kwargs) as dst_zf:
+                        for info in src_zf.infolist():
+                            if info.is_dir():
+                                continue
+                            if info.filename == entry_name:
+                                continue
+                            with src_zf.open(info, "r") as src_entry:
+                                with dst_zf.open(info, "w") as dst_entry:
+                                    while True:
+                                        chunk = src_entry.read(1 << 20)
+                                        if not chunk:
+                                            break
+                                        dst_entry.write(chunk)
+                        dst_zf.writestr(entry_name, payload)
+            scratch_bytes = scratch.to_bytes()
+            self.seek(0)
+            self.truncate(0)
+            self.write_bytes(scratch_bytes)
+
+
+# ---------------------------------------------------------------------------
+# ZipEntryWriter — per-entry ergonomic write surface
+# ---------------------------------------------------------------------------
+
+
+class ZipEntryWriter:
+    """Per-entry writer returned by :meth:`ZipFile.entry`.
+
+    Stages bytes in a private :class:`Memory` scratch and commits
+    them to the parent archive via :meth:`ZipFile._commit_entry`.
+    Concurrent writers against different ``entry_name`` values are
+    safe — only the brief commit phase takes the parent's write lock.
+
+    Two surfaces:
+
+    - :meth:`open` returns a context manager yielding an :class:`IO`
+      cursor. The bytes you write before exit get committed on close.
+    - :meth:`write_arrow_batches` packs an iterable of Arrow batches
+      through the Tabular leaf inferred from *entry_name*'s extension
+      and commits the encoded bytes.
+    """
+
+    __slots__ = ("_parent", "_entry_name", "_compression", "_compresslevel")
+
+    def __init__(
+        self,
+        *,
+        parent: "ZipFile",
+        entry_name: str,
+        compression: int = zipfile.ZIP_DEFLATED,
+        compresslevel: "int | None" = None,
+    ) -> None:
+        self._parent = parent
+        self._entry_name = entry_name
+        self._compression = compression
+        self._compresslevel = compresslevel
+
+    @property
+    def entry_name(self) -> str:
+        return self._entry_name
+
+    # ------------------------------------------------------------------
+    # Raw byte surface — context manager
+    # ------------------------------------------------------------------
+
+    def open(self, mode: str = "wb") -> "_EntryWriteContext":
+        """Stage a write into this entry; commit on context exit.
+
+        Only write modes (``"wb"``, ``"w"``) are supported — a
+        per-entry read surface lives on :meth:`ZipFile.child`. The
+        yielded :class:`IO` is a fresh :class:`Memory` cursor; on
+        close, its bytes commit into the parent archive under
+        :attr:`entry_name`.
+        """
+        if not (mode == "wb" or mode == "w"):
+            raise ValueError(
+                f"ZipEntryWriter.open only supports write modes; "
+                f"got {mode!r}. Use ZipFile.child({self._entry_name!r}) "
+                "for reads."
+            )
+        return _EntryWriteContext(self)
+
+    # ------------------------------------------------------------------
+    # Tabular surface
+    # ------------------------------------------------------------------
+
+    def write_arrow_batches(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        *,
+        options: "CastOptions | None" = None,
+    ) -> None:
+        """Pack *batches* through the format implied by ``entry_name``.
+
+        Picks the inner :class:`Tabular` leaf from the entry name's
+        extension (``data.parquet`` → parquet, ``data.csv`` → csv,
+        …), runs the leaf's writer against an in-memory holder,
+        then commits the encoded bytes via :meth:`ZipFile._commit_entry`.
+        """
+        # Side-effect import: ensures the primitive leaves are registered.
+        import yggdrasil.io.primitive  # noqa: F401
+
+        try:
+            mt = MediaType.from_(self._entry_name, default=None)
+        except Exception:
+            mt = None
+        cls = None
+        if mt is not None:
+            try:
+                cls = Holder.class_for_media_type(mt, default=None)
+            except Exception:
+                cls = None
+        if cls is None:
+            exts = _registered_tabular_extensions()
+            raise ValueError(
+                f"ZipEntryWriter: cannot infer Tabular leaf for "
+                f"entry_name {self._entry_name!r} — "
+                f"{_describe_entry_resolution_failure(self._entry_name)}. "
+                f"Registered tabular extensions: {exts!r}."
+            )
+
+        leaf = cls(holder=Memory(), owns_holder=True)
+        leaf_options = options if options is not None else leaf.options_class()()
+        leaf.write_arrow_batches(batches, options=leaf_options)
+        payload = leaf.to_bytes()
+        self._parent._commit_entry(
+            self._entry_name,
+            payload,
+            compression=self._compression,
+            compresslevel=self._compresslevel,
+        )
+
+
+class _EntryWriteContext:
+    """Context manager yielded by :meth:`ZipEntryWriter.open`."""
+
+    __slots__ = ("_writer", "_io")
+
+    def __init__(self, writer: "ZipEntryWriter") -> None:
+        self._writer = writer
+        self._io: "IO | None" = None
+
+    def __enter__(self) -> IO:
+        # Stage bytes in a private Memory holder; commit on exit so
+        # concurrent writers don't trip over a half-written central
+        # directory.
+        self._io = IO(holder=Memory(), owns_holder=True)
+        return self._io
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            # Caller raised — drop the staged bytes, don't commit.
+            self._io = None
+            return
+        io = self._io
+        self._io = None
+        if io is None:
+            return
+        payload = io.to_bytes()
+        self._writer._parent._commit_entry(
+            self._writer.entry_name,
+            payload,
+            compression=self._writer._compression,
+            compresslevel=self._writer._compresslevel,
+        )
