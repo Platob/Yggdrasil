@@ -133,19 +133,23 @@ function ConnectionLines({ bots }: { bots: BotNode[] }) {
 
   return (
     <>
-      {lines.map((points, i) => (
-        <line key={i}>
-          <bufferGeometry>
-            <bufferAttribute
-              attach="attributes-position"
-              count={2}
-              array={new Float32Array([...points[0].toArray(), ...points[1].toArray()])}
-              itemSize={3}
-            />
-          </bufferGeometry>
-          <lineBasicMaterial color="#f26b3a" transparent opacity={0.3} />
-        </line>
-      ))}
+      {lines.map((points, i) => {
+        const arr = new Float32Array([...points[0].toArray(), ...points[1].toArray()]);
+        return (
+          <line key={i}>
+            <bufferGeometry>
+              <bufferAttribute
+                attach="attributes-position"
+                args={[arr, 3]}
+                count={2}
+                array={arr}
+                itemSize={3}
+              />
+            </bufferGeometry>
+            <lineBasicMaterial color="#f26b3a" transparent opacity={0.3} />
+          </line>
+        );
+      })}
     </>
   );
 }
