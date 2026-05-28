@@ -71,7 +71,11 @@ import time
 import urllib.request
 from typing import Any, Callable, TypeVar, overload
 
-__all__ = ["function", "dag", "FunctionHandle", "FunctionRun", "DagHandle", "get_input", "set_output"]
+__all__ = [
+    "function", "dag", "schedule", "on_node",
+    "FunctionHandle", "FunctionRun", "DagHandle",
+    "get_input", "set_output",
+]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -805,6 +809,78 @@ def get_input(key: str = "input", default: Any = None) -> Any:
         return default
     inputs = json.loads(raw)
     return inputs.get(key, default)
+
+
+def schedule(
+    interval: float | None = None,
+    *,
+    every_seconds: float | None = None,
+    max_runs: int | None = None,
+):
+    """Schedule a function to run periodically on the local node.
+
+    Wraps the function in a single-step DAG and triggers the v2 DAG
+    schedule API, which runs the DAG every ``every_seconds`` (or
+    ``interval``) seconds. Optionally caps the number of runs.
+
+    Usage::
+
+        @schedule(every_seconds=60)
+        @function
+        def heartbeat():
+            print("alive")
+    """
+    if interval is not None and every_seconds is None:
+        every_seconds = interval
+    if every_seconds is None:
+        raise ValueError("@schedule requires interval or every_seconds")
+
+    def _wrap(handle):
+        if not isinstance(handle, FunctionHandle):
+            raise TypeError("@schedule must wrap a @function-decorated function")
+        # Register the function first so we have a func_id to reference
+        handle._ensure_registered()
+        url = _local_url()
+        dag_data = {
+            "name": f"sched_{handle.name}",
+            "description": f"Scheduled execution of {handle.name}",
+            "steps": [{
+                "id": "step",
+                "ref": {
+                    "func_id": handle._function_id,
+                    "env_id": handle._environment_id,
+                    "node_url": handle._node_url,
+                    "args": {},
+                },
+                "depends_on": [],
+            }],
+            "edges": [],
+        }
+        dag_resp = _post(f"{url}/api/v2/dag", dag_data)
+        dag_id = dag_resp["dag"]["id"]
+        sched_data = {"interval_seconds": every_seconds, "max_runs": max_runs}
+        _post(f"{url}/api/v2/dag/{dag_id}/schedule", sched_data)
+        return handle
+
+    return _wrap
+
+
+def on_node(node_url: str):
+    """Pin a function to always execute on a specific remote node.
+
+    Usage::
+
+        @on_node("http://gpu-node:8100")
+        @function
+        def train_model(data):
+            ...
+    """
+    def _wrap(handle):
+        if not isinstance(handle, FunctionHandle):
+            raise TypeError("@on_node must wrap a @function-decorated function")
+        return handle.on(node_url)
+
+    return _wrap
 
 
 def set_output(key: str = "result", value: Any = None) -> None:

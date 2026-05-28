@@ -4,17 +4,38 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Globe } from "@/components/Globe";
 import { YggLogoIcon } from "@/components/YggLogo";
-import { getNodeCard } from "@/lib/api";
-import type { NodeCard } from "@/lib/types";
+import { getNodeCard, getStats } from "@/lib/api";
+import type { NodeCard, ClusterStats } from "@/lib/types";
 
 export default function WelcomePage() {
   const [card, setCard] = useState<NodeCard | null>(null);
+  const [stats, setStats] = useState<ClusterStats | null>(null);
   const [error, setError] = useState(false);
 
   useEffect(() => {
     getNodeCard()
       .then(setCard)
       .catch(() => setError(true));
+  }, []);
+
+  // Live ticker: poll /api/v2/stats every 5s
+  useEffect(() => {
+    let active = true;
+    const tick = () => {
+      getStats()
+        .then((s) => {
+          if (active) setStats(s);
+        })
+        .catch(() => {
+          // Silently ignore stats fetch errors
+        });
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
   }, []);
 
   const nodeId = card?.node_id ?? "---";
@@ -126,6 +147,26 @@ export default function WelcomePage() {
               </div>
             )}
           </div>
+
+          {/* Live stats ticker (auto-refresh every 5s) */}
+          {stats && (
+            <div className="flex items-center justify-center gap-2 mt-6 text-[11px] font-mono text-foreground-dim">
+              <span className="text-frost">{stats.func_count}</span>
+              <span>function{stats.func_count !== 1 ? "s" : ""}</span>
+              <span className="text-border">&bull;</span>
+              <span className="text-emerald">{stats.env_count}</span>
+              <span>environment{stats.env_count !== 1 ? "s" : ""}</span>
+              <span className="text-border">&bull;</span>
+              <span className="text-frost">{stats.dag_count}</span>
+              <span>DAG{stats.dag_count !== 1 ? "s" : ""}</span>
+              <span className="text-border">&bull;</span>
+              <span className="text-amber">{stats.scheduled_dags}</span>
+              <span>scheduled</span>
+              <span className="text-border">&bull;</span>
+              <span className="text-foreground">{stats.total_runs}</span>
+              <span>run{stats.total_runs !== 1 ? "s" : ""}</span>
+            </div>
+          )}
         </div>
       </div>
 

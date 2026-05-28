@@ -168,6 +168,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"pong": True, "node_id": _ping_node_id, "uptime": round(time.monotonic() - _ping_start, 1)}
 
     prefix = settings.api_prefix
+
+    @app.get(f"{prefix}/v2/stats")
+    async def get_stats(request: Request):
+        """Aggregate cluster-wide statistics in one call."""
+        state = request.app.state
+        snap = state.backend_service.snapshot()
+        envs = await state.pyenv_service.list()
+        funcs = await state.pyfunc_service.list()
+        dags = await state.v2_dag_service.list()
+        peers = await state.network_service.get_peers()
+        mem_pct = (
+            round(snap.memory_used_mb / snap.memory_total_mb * 100, 1)
+            if snap.memory_total_mb else 0
+        )
+        return {
+            "node_id": settings.node_id,
+            "uptime": snap.uptime_seconds,
+            "cpu_percent": snap.cpu_percent,
+            "memory_percent": mem_pct,
+            "active_runs": state.pyfuncrun_service.active_count,
+            "total_runs": state.pyfuncrun_service.total_count,
+            "env_count": len(envs.envs),
+            "func_count": len(funcs.funcs),
+            "dag_count": len(dags.dags),
+            "scheduled_dags": sum(1 for d in dags.dags if d.schedule_active),
+            "peer_count": len(peers.peers),
+            "gpu_count": len(snap.gpus),
+        }
+
     app.include_router(env_router, prefix=f"{prefix}/env")
     app.include_router(cmd_router, prefix=f"{prefix}/cmd")
     app.include_router(python_router, prefix=f"{prefix}/python")

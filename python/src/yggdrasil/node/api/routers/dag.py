@@ -40,6 +40,16 @@ async def get_dag(
     return DAGResponse(dag=entry)
 
 
+@router.head("/{dag_id}")
+async def head_dag(
+    dag_id: int,
+    service: DAGService = Depends(get_dag_service),
+) -> dict:
+    """Existence check by ID. Returns 200 if found, 404 otherwise."""
+    await service.get(dag_id)
+    return {}
+
+
 @router.put("/{dag_id}", response_model=DAGResponse)
 async def update_dag(
     dag_id: int,

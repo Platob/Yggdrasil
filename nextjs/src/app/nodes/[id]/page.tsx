@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { ResourceBar } from "@/components/ResourceBar";
-import { getBackend, getEnvs, getFuncs, getRuns, getNodeCard, getDags, getDagRuns } from "@/lib/api";
+import { getBackend, getEnvs, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs } from "@/lib/api";
 import type { NodeBackend, NodeCard, PyEnvEntry, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
 
 function formatUptime(seconds: number): string {
@@ -94,6 +94,8 @@ export default function NodeDetailPage() {
   const [loadingDagRuns, setLoadingDagRuns] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const [selectedFuncIds, setSelectedFuncIds] = useState<Set<number>>(new Set());
+  const [deletingFuncs, setDeletingFuncs] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -307,35 +309,100 @@ export default function NodeDetailPage() {
               <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
             </svg>
             Functions
+            {selectedFuncIds.size > 0 && (
+              <button
+                onClick={async () => {
+                  if (deletingFuncs) return;
+                  setDeletingFuncs(true);
+                  try {
+                    const ids = Array.from(selectedFuncIds);
+                    await bulkDeleteFuncs(ids);
+                    setSelectedFuncIds(new Set());
+                    // Refresh the function list
+                    const res = await getFuncs();
+                    setFuncs(res.funcs);
+                  } catch {
+                    // Bulk delete failed silently
+                  } finally {
+                    setDeletingFuncs(false);
+                  }
+                }}
+                disabled={deletingFuncs}
+                className="
+                  px-2.5 py-1 rounded text-[10px] font-semibold uppercase tracking-wider
+                  bg-rose/10 text-rose border border-rose/20
+                  hover:bg-rose/20 hover:border-rose/40
+                  disabled:opacity-30 disabled:cursor-not-allowed
+                  transition-all duration-150
+                "
+              >
+                {deletingFuncs ? "Deleting..." : `Delete ${selectedFuncIds.size}`}
+              </button>
+            )}
             <span className="ml-auto text-foreground-dim font-mono">{funcs.length}</span>
           </h2>
           {funcs.length === 0 ? (
             <p className="text-xs text-muted/60 italic py-4">No functions registered</p>
           ) : (
             <div className="space-y-2 max-h-72 overflow-y-auto">
-              {funcs.map((f) => (
-                <div
-                  key={f.id}
-                  className="px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04]"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-mono font-medium text-foreground">{f.name}</span>
-                    <span className="text-[10px] text-muted font-mono">{f.run_count} runs</span>
-                  </div>
-                  {f.description && (
-                    <p className="text-[11px] text-muted mt-0.5">{f.description}</p>
-                  )}
-                  {f.dependencies.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-1.5">
-                      {f.dependencies.map((dep) => (
-                        <span key={dep} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-frost/5 text-frost/60">
-                          {dep}
-                        </span>
-                      ))}
+              {funcs.map((f) => {
+                const checked = selectedFuncIds.has(f.id);
+                return (
+                  <div
+                    key={f.id}
+                    className={`
+                      px-3 py-2.5 rounded-lg border transition-colors
+                      ${checked
+                        ? "bg-rose/5 border-rose/20"
+                        : "bg-white/[0.02] border-white/[0.04]"}
+                    `}
+                  >
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => {
+                          setSelectedFuncIds((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(f.id)) next.delete(f.id);
+                            else next.add(f.id);
+                            return next;
+                          });
+                        }}
+                        className="
+                          shrink-0 w-3.5 h-3.5 rounded
+                          appearance-none bg-white/[0.04] border border-white/[0.12]
+                          checked:bg-rose checked:border-rose
+                          cursor-pointer transition-colors
+                          relative
+                        "
+                        style={{
+                          backgroundImage: checked
+                            ? "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23050510' stroke-width='3'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E\")"
+                            : undefined,
+                          backgroundSize: "75%",
+                          backgroundPosition: "center",
+                          backgroundRepeat: "no-repeat",
+                        }}
+                      />
+                      <span className="text-xs font-mono font-medium text-foreground flex-1 truncate">{f.name}</span>
+                      <span className="text-[10px] text-muted font-mono shrink-0">{f.run_count} runs</span>
                     </div>
-                  )}
-                </div>
-              ))}
+                    {f.description && (
+                      <p className="text-[11px] text-muted mt-0.5 pl-5">{f.description}</p>
+                    )}
+                    {f.dependencies.length > 0 && (
+                      <div className="flex flex-wrap gap-1 mt-1.5 pl-5">
+                        {f.dependencies.map((dep) => (
+                          <span key={dep} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-frost/5 text-frost/60">
+                            {dep}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>

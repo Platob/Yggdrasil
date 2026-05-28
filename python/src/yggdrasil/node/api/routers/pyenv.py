@@ -46,6 +46,16 @@ async def get_env(
     return PyEnvResponse(env=entry)
 
 
+@router.head("/{env_id}")
+async def head_env(
+    env_id: int,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> dict:
+    """Existence check by ID. Returns 200 if found, 404 otherwise."""
+    await service.get(env_id)
+    return {}
+
+
 @router.put("/{env_id}", response_model=PyEnvResponse)
 async def update_env(
     env_id: int,
@@ -55,12 +65,44 @@ async def update_env(
     return await service.update(env_id, req)
 
 
+@router.patch("/{env_id}", response_model=PyEnvResponse)
+async def patch_env(
+    env_id: int,
+    req: PyEnvUpdate,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvResponse:
+    """Partial update on an existing env. 404s if missing."""
+    return await service.update(env_id, req)
+
+
 @router.delete("/{env_id}", response_model=PyEnvResponse)
 async def delete_env(
     env_id: int,
     service: PyEnvService = Depends(get_pyenv_service),
 ) -> PyEnvResponse:
     return await service.delete(env_id)
+
+
+class _BulkDeleteEnvRequest(StrictModel):
+    """Body for bulk-delete: list of env IDs to delete."""
+    ids: list[int]
+
+
+@router.post("/bulk/delete")
+async def bulk_delete_envs(
+    req: _BulkDeleteEnvRequest,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> dict:
+    """Delete many envs in one request. Continues on per-ID failures."""
+    deleted = 0
+    failed: list[dict] = []
+    for eid in req.ids:
+        try:
+            await service.delete(eid)
+            deleted += 1
+        except Exception as exc:
+            failed.append({"id": eid, "error": str(exc)})
+    return {"deleted": deleted, "failed": failed}
 
 
 class _EnvRunRequest(StrictModel):

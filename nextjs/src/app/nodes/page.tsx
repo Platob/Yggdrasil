@@ -13,6 +13,7 @@ import {
   getAudit,
   getDags,
   getRuns,
+  getStats,
   createBackendStream,
 } from "@/lib/api";
 import type {
@@ -25,6 +26,7 @@ import type {
   AuditEntry,
   DAGEntry,
   PyFuncRunEntry,
+  ClusterStats,
 } from "@/lib/types";
 
 // ── Helper: convert NodeBackend to NodeMeta for the self card ──
@@ -144,6 +146,7 @@ export default function NodesPage() {
   const [activeRuns, setActiveRuns] = useState<PyFuncRunEntry[]>([]);
   const [users, setUsers] = useState<UserCard[]>([]);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
+  const [stats, setStats] = useState<ClusterStats | null>(null);
   const [cpuHistory, setCpuHistory] = useState<number[]>([]);
   const [memHistory, setMemHistory] = useState<number[]>([]);
   const [loading, setLoading] = useState(true);
@@ -153,7 +156,7 @@ export default function NodesPage() {
   // ── Initial data fetch ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
     try {
-      const [backendRes, peersRes, envsRes, funcsRes, dagsRes, runsRes, usersRes, auditRes] = await Promise.allSettled([
+      const [backendRes, peersRes, envsRes, funcsRes, dagsRes, runsRes, usersRes, auditRes, statsRes] = await Promise.allSettled([
         getBackend(),
         getPeers(),
         getEnvs(),
@@ -162,7 +165,9 @@ export default function NodesPage() {
         getRuns(),
         getUsers(),
         getAudit(),
+        getStats(),
       ]);
+      if (statsRes.status === "fulfilled") setStats(statsRes.value);
       if (backendRes.status === "fulfilled") {
         setBackend(backendRes.value.backend);
         setCpuHistory((prev) => [...prev.slice(-5), backendRes.value.backend.cpu_percent]);
@@ -233,17 +238,19 @@ export default function NodesPage() {
   }
 
   // ── Aggregated KPIs ────────────────────────────────────────
-  const totalNodes = allNodes.length;
-  const totalCpuCores = (backend?.cpu_count ?? 0) + peers.reduce((sum, p) => sum + 0, 0);
-  // Weighted average CPU %: self backend has real data, peers have cpu_percent
-  const allCpuPercents = allNodes.map((n) => n.node.cpu_percent);
-  const clusterCpuPercent =
-    allCpuPercents.length > 0
-      ? allCpuPercents.reduce((a, b) => a + b, 0) / allCpuPercents.length
-      : 0;
-  const totalMemoryMb = (backend?.memory_total_mb ?? 0);
-  const totalGpus = (backend?.gpus.length ?? 0) + peers.reduce((sum, p) => sum + p.gpu_count, 0);
-  const totalActiveRuns = allNodes.reduce((sum, n) => sum + n.node.active_runs, 0);
+  // Prefer the consolidated /api/v2/stats payload when available — it's one
+  // call instead of fanning out across backend+peers+dags client-side.
+  const totalNodes = stats ? stats.peer_count + 1 : allNodes.length;
+  const totalCpuCores = backend?.cpu_count ?? 0;
+  const clusterCpuPercent = stats?.cpu_percent ?? (
+    allNodes.length > 0
+      ? allNodes.map((n) => n.node.cpu_percent).reduce((a, b) => a + b, 0) / allNodes.length
+      : 0
+  );
+  const totalMemoryMb = backend?.memory_total_mb ?? 0;
+  const totalGpus = stats?.gpu_count ?? ((backend?.gpus.length ?? 0) + peers.reduce((sum, p) => sum + p.gpu_count, 0));
+  const totalActiveRuns = stats?.active_runs ?? allNodes.reduce((sum, n) => sum + n.node.active_runs, 0);
+  const totalDags = stats?.dag_count ?? dagList.length;
 
   if (loading) {
     return (
@@ -325,8 +332,8 @@ export default function NodesPage() {
           />
           <KpiCard
             label="DAGs"
-            value={String(dagList.length)}
-            color={dagList.length > 0 ? "var(--frost)" : "var(--muted)"}
+            value={String(totalDags)}
+            color={totalDags > 0 ? "var(--frost)" : "var(--muted)"}
           />
         </div>
 

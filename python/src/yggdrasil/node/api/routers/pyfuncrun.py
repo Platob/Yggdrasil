@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 
 from ...transport import serialize_result
 from ..deps import get_pyfuncrun_service
+from ..schemas.common import StrictModel
 from ..schemas.pyfuncrun import (
     PyFuncRunCreate,
     PyFuncRunListResponse,
@@ -40,6 +41,38 @@ async def get_run(
 ) -> PyFuncRunResponse:
     entry = await service.get(run_id)
     return PyFuncRunResponse(run=entry)
+
+
+@router.head("/{run_id}")
+async def head_run(
+    run_id: int,
+    service: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> dict:
+    """Existence check by ID. Returns 200 if found, 404 otherwise."""
+    await service.get(run_id)
+    return {}
+
+
+class _BulkDeleteRunRequest(StrictModel):
+    """Body for bulk-delete: list of run IDs to delete."""
+    ids: list[int]
+
+
+@router.post("/bulk/delete")
+async def bulk_delete_runs(
+    req: _BulkDeleteRunRequest,
+    service: PyFuncRunService = Depends(get_pyfuncrun_service),
+) -> dict:
+    """Delete many runs in one request. Continues on per-ID failures."""
+    deleted = 0
+    failed: list[dict] = []
+    for rid in req.ids:
+        try:
+            await service.delete(rid)
+            deleted += 1
+        except Exception as exc:
+            failed.append({"id": rid, "error": str(exc)})
+    return {"deleted": deleted, "failed": failed}
 
 
 @router.post("/{run_id}/cancel", response_model=PyFuncRunResponse)

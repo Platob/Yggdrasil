@@ -47,6 +47,38 @@ async def get_func_by_name(
     return PyFuncResponse(func=entry)
 
 
+@router.head("/by-name/{name}")
+async def head_func_by_name(
+    name: str,
+    service: PyFuncService = Depends(get_pyfunc_service),
+) -> dict:
+    """Existence check by name. Returns 200 if found, 404 otherwise."""
+    await service.get_by_name(name)
+    return {}
+
+
+class _BulkDeleteFuncRequest(StrictModel):
+    """Body for bulk-delete: list of func IDs to delete."""
+    ids: list[int]
+
+
+@router.post("/bulk/delete")
+async def bulk_delete_funcs(
+    req: _BulkDeleteFuncRequest,
+    service: PyFuncService = Depends(get_pyfunc_service),
+) -> dict:
+    """Delete many functions in one request. Continues on per-ID failures."""
+    deleted = 0
+    failed: list[dict] = []
+    for fid in req.ids:
+        try:
+            await service.delete(fid)
+            deleted += 1
+        except Exception as exc:
+            failed.append({"id": fid, "error": str(exc)})
+    return {"deleted": deleted, "failed": failed}
+
+
 class _FuncRunRequest(StrictModel):
     """Inline body for the convenience run endpoint."""
     env_id: int | None = None
@@ -85,12 +117,32 @@ async def get_func(
     return PyFuncResponse(func=entry)
 
 
+@router.head("/{func_id}")
+async def head_func(
+    func_id: int,
+    service: PyFuncService = Depends(get_pyfunc_service),
+) -> dict:
+    """Existence check by ID. Returns 200 if found, 404 otherwise."""
+    await service.get(func_id)
+    return {}
+
+
 @router.put("/{func_id}", response_model=PyFuncResponse)
 async def update_func(
     func_id: int,
     req: PyFuncUpdate,
     service: PyFuncService = Depends(get_pyfunc_service),
 ) -> PyFuncResponse:
+    return await service.update(func_id, req)
+
+
+@router.patch("/{func_id}", response_model=PyFuncResponse)
+async def patch_func(
+    func_id: int,
+    req: PyFuncUpdate,
+    service: PyFuncService = Depends(get_pyfunc_service),
+) -> PyFuncResponse:
+    """Partial update on an existing function. Unlike PUT (upsert), 404s if missing."""
     return await service.update(func_id, req)
 
 

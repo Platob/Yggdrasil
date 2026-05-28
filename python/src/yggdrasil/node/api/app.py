@@ -112,8 +112,38 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     async def ping():
         return {"pong": True, "node_id": _ping_node_id, "uptime": round(time.monotonic() - _ping_start, 1)}
 
-    # -- Routers ------------------------------------------------------------
+    # -- Aggregate cluster stats (one call instead of N) --------------------
     prefix = f"{settings.api_prefix}/v2"
+
+    @app.get(f"{prefix}/stats")
+    async def get_stats(request: Request):
+        """Aggregate cluster-wide statistics in one call."""
+        state = request.app.state
+        snap = state.backend_service.snapshot()
+        envs = await state.pyenv_service.list()
+        funcs = await state.pyfunc_service.list()
+        dags = await state.dag_service.list()
+        peers = await state.network_service.get_peers()
+        mem_pct = (
+            round(snap.memory_used_mb / snap.memory_total_mb * 100, 1)
+            if snap.memory_total_mb else 0
+        )
+        return {
+            "node_id": settings.node_id,
+            "uptime": snap.uptime_seconds,
+            "cpu_percent": snap.cpu_percent,
+            "memory_percent": mem_pct,
+            "active_runs": state.pyfuncrun_service.active_count,
+            "total_runs": state.pyfuncrun_service.total_count,
+            "env_count": len(envs.envs),
+            "func_count": len(funcs.funcs),
+            "dag_count": len(dags.dags),
+            "scheduled_dags": sum(1 for d in dags.dags if d.schedule_active),
+            "peer_count": len(peers.peers),
+            "gpu_count": len(snap.gpus),
+        }
+
+    # -- Routers ------------------------------------------------------------
     app.include_router(card_router, prefix=f"{settings.api_prefix}/card")
     app.include_router(pyenv_router, prefix=f"{prefix}/pyenv")
     app.include_router(pyfunc_router, prefix=f"{prefix}/pyfunc")

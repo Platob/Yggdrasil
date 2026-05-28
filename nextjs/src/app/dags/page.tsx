@@ -9,6 +9,7 @@ import {
   runDag,
   scheduleDag,
   getFuncs,
+  runFuncByName,
 } from "@/lib/api";
 import type {
   DAGEntry,
@@ -108,6 +109,13 @@ export default function DagsPage() {
   const [scheduleInterval, setScheduleInterval] = useState("60");
   const [scheduleMaxRuns, setScheduleMaxRuns] = useState("");
   const [scheduling, setScheduling] = useState(false);
+
+  // Quick run modal
+  const [quickRunOpen, setQuickRunOpen] = useState(false);
+  const [quickRunName, setQuickRunName] = useState("");
+  const [quickRunRunning, setQuickRunRunning] = useState(false);
+  const [quickRunResult, setQuickRunResult] = useState<unknown>(null);
+  const [quickRunError, setQuickRunError] = useState("");
 
   // Builder state
   const [builderName, setBuilderName] = useState("");
@@ -265,6 +273,30 @@ export default function DagsPage() {
       setCreating(false);
     }
   };
+
+  // Quick run a function by name
+  const handleQuickRun = async () => {
+    const name = quickRunName.trim();
+    if (!name || quickRunRunning) return;
+    setQuickRunRunning(true);
+    setQuickRunError("");
+    setQuickRunResult(null);
+    try {
+      const result = await runFuncByName(name);
+      setQuickRunResult(result);
+    } catch (err) {
+      setQuickRunError(err instanceof Error ? err.message : "Run failed");
+    } finally {
+      setQuickRunRunning(false);
+    }
+  };
+
+  // Filter functions for autocomplete suggestions
+  const quickRunSuggestions = quickRunName
+    ? funcs
+        .filter((f) => f.name.toLowerCase().includes(quickRunName.toLowerCase()))
+        .slice(0, 5)
+    : [];
 
   // Builder helpers
   const addStep = () => {
@@ -780,6 +812,137 @@ export default function DagsPage() {
           </button>
         </div>
       </div>
+
+      {/* ── Quick Run floating action button ────────────────────── */}
+      <button
+        onClick={() => {
+          setQuickRunOpen(true);
+          setQuickRunResult(null);
+          setQuickRunError("");
+        }}
+        className="
+          fixed bottom-6 right-6 z-40
+          w-14 h-14 rounded-full
+          bg-frost/15 text-frost border border-frost/30
+          hover:bg-frost/25 hover:border-frost/50
+          backdrop-blur-md
+          transition-all duration-150
+          flex items-center justify-center
+          glow-pulse
+        "
+        title="Quick Run a function"
+        style={{ boxShadow: "0 4px 24px rgba(103,232,249,0.2)" }}
+      >
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polygon points="5 3 19 12 5 21 5 3" />
+        </svg>
+      </button>
+
+      {/* ── Quick Run modal ─────────────────────────────────────── */}
+      {quickRunOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: "rgba(5,5,16,0.7)", backdropFilter: "blur(4px)" }}
+          onClick={() => setQuickRunOpen(false)}
+        >
+          <div
+            className="glass-card p-6 w-full max-w-md space-y-4"
+            onClick={(e) => e.stopPropagation()}
+            style={{ background: "rgba(12,12,30,0.95)" }}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                Quick Run
+              </h3>
+              <button
+                onClick={() => setQuickRunOpen(false)}
+                className="text-muted hover:text-foreground transition-colors"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Name input with autocomplete */}
+            <div className="space-y-1.5 relative">
+              <label className="text-[10px] text-muted uppercase tracking-wider font-medium">
+                Function Name
+              </label>
+              <input
+                type="text"
+                value={quickRunName}
+                onChange={(e) => setQuickRunName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleQuickRun();
+                }}
+                placeholder="my_function"
+                autoFocus
+                className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-sm font-mono text-foreground placeholder-muted/50 outline-none focus:border-frost/30 transition-colors"
+              />
+              {quickRunSuggestions.length > 0 && quickRunName !== quickRunSuggestions[0]?.name && (
+                <div className="absolute top-full left-0 right-0 mt-1 rounded-lg bg-card border border-white/[0.08] overflow-hidden z-10">
+                  {quickRunSuggestions.map((f) => (
+                    <button
+                      key={f.id}
+                      onClick={() => setQuickRunName(f.name)}
+                      className="w-full text-left px-3 py-1.5 text-xs font-mono text-foreground-dim hover:text-foreground hover:bg-white/[0.04] transition-colors"
+                    >
+                      {f.name}
+                      {f.description && (
+                        <span className="text-muted ml-2 text-[10px]">{f.description}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Run button */}
+            <button
+              onClick={handleQuickRun}
+              disabled={!quickRunName.trim() || quickRunRunning}
+              className="
+                w-full px-4 py-2.5 rounded-lg text-sm font-semibold
+                bg-emerald/10 text-emerald border border-emerald/20
+                hover:bg-emerald/20 hover:border-emerald/40
+                disabled:opacity-30 disabled:cursor-not-allowed
+                transition-all duration-150
+              "
+            >
+              {quickRunRunning ? (
+                <span className="flex items-center justify-center gap-2">
+                  <div className="w-4 h-4 border-2 border-emerald/30 border-t-emerald rounded-full spin-slow" />
+                  Running...
+                </span>
+              ) : (
+                "Run"
+              )}
+            </button>
+
+            {/* Error */}
+            {quickRunError && (
+              <p className="text-xs text-rose font-mono">{quickRunError}</p>
+            )}
+
+            {/* Result */}
+            {quickRunResult != null && (
+              <div className="space-y-1.5">
+                <span className="text-[10px] text-muted uppercase tracking-wider font-medium">Result</span>
+                <pre className="text-[11px] font-mono text-foreground-dim bg-black/30 rounded-lg p-3 overflow-x-auto max-h-60">
+                  {typeof quickRunResult === "string"
+                    ? quickRunResult
+                    : JSON.stringify(quickRunResult, null, 2)}
+                </pre>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
