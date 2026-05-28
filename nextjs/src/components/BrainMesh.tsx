@@ -4,7 +4,7 @@ import { useRef, useMemo, useState, useEffect } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { OrbitControls, Line } from "@react-three/drei";
 import * as THREE from "three";
-import type { TopologyNode } from "@/lib/types";
+import type { TopologyNode, NodeBackend } from "@/lib/types";
 
 // ── Nordic palette (mirrors globals.css --frost/--emerald/--amber/--rose) ──
 const COLOR_FROST = "#67e8f9";
@@ -303,7 +303,10 @@ function PulsingCell({
 }
 
 // ── Axon — curved line + traveling pulse sphere ────────────────────────
-function AxonComponent({ axon }: { axon: Axon }) {
+// activityRef.current is in [0..1]; higher values speed up pulses and
+// brighten the axon line, simulating a wave of activation rippling
+// across the brain when the cluster is busy.
+function AxonComponent({ axon, activityRef }: { axon: Axon; activityRef: { current: number } }) {
   const pulseRef = useRef<THREE.Mesh>(null);
   const tRef = useRef(axon.pulseOffset);
 
@@ -311,21 +314,21 @@ function AxonComponent({ axon }: { axon: Axon }) {
   const points = useMemo(() => axon.curve.getPoints(24), [axon.curve]);
 
   useFrame((_, delta) => {
-    tRef.current += delta;
+    const activity = activityRef.current;
+    // Speed scales 1x..3x with activity; quiet cluster ~ slow drift,
+    // busy cluster ~ fast traveling waves
+    tRef.current += delta * (1 + activity * 2);
     if (!pulseRef.current) return;
-    // Phase 0..1 along the curve; loops indefinitely
     const phase = ((tRef.current % axon.pulseDuration) / axon.pulseDuration);
     const pt = axon.curve.getPoint(phase);
     pulseRef.current.position.copy(pt);
-    // Fade at the endpoints so pulses appear and dissolve smoothly
     const fade =
-      phase < 0.08
-        ? phase / 0.08
-        : phase > 0.92
-        ? (1 - phase) / 0.08
-        : 1;
+      phase < 0.08 ? phase / 0.08 :
+      phase > 0.92 ? (1 - phase) / 0.08 : 1;
     const mat = pulseRef.current.material as THREE.MeshBasicMaterial;
-    mat.opacity = 0.7 * fade;
+    mat.opacity = (0.55 + 0.4 * activity) * fade;
+    // Pulse radius scales too — visible wave-front
+    pulseRef.current.scale.setScalar(1 + activity * 0.8);
   });
 
   return (
@@ -423,10 +426,12 @@ function BrainScene({
   cells,
   axons,
   onNodeClick,
+  activityRef,
 }: {
   cells: Cell[];
   axons: Axon[];
   onNodeClick?: (n: TopologyNode) => void;
+  activityRef: { current: number };
 }) {
   return (
     <>
@@ -437,7 +442,7 @@ function BrainScene({
       <DustField />
 
       {axons.map((a, i) => (
-        <AxonComponent key={`axon-${i}`} axon={a} />
+        <AxonComponent key={`axon-${i}`} axon={a} activityRef={activityRef} />
       ))}
       {cells.map((c) => (
         <PulsingCell key={c.id} cell={c} onClick={onNodeClick} />
@@ -469,6 +474,30 @@ export function BrainMesh({ nodes, onNodeClick, className = "" }: BrainMeshProps
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  // activityRef is read every frame inside useFrame and updated from the
+  // /api/v2/backend/stream SSE; using a ref avoids re-rendering the whole
+  // Canvas on every snapshot (1Hz).
+  const activityRef = useRef(0);
+  useEffect(() => {
+    if (!mounted) return;
+    const es = new EventSource("/api/v2/backend/stream");
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data) as NodeBackend;
+        // Combine CPU% and active_runs into a 0..1 activity factor with a
+        // bit of exponential easing so small loads still register visually.
+        const cpu01 = data.cpu_percent / 100;
+        const runs01 = Math.min(1, data.active_runs / Math.max(1, data.cpu_count));
+        const target = Math.min(1, Math.max(cpu01, runs01 * 0.8));
+        // EMA smoothing — prevents jitter every snapshot
+        activityRef.current = activityRef.current * 0.6 + target * 0.4;
+      } catch {
+        /* ignore non-JSON keepalive */
+      }
+    };
+    return () => es.close();
+  }, [mounted]);
 
   // Rebuild scene when the set of node ids changes; cell positions are
   // deterministic from the id list, so 5s polls won't jitter the layout.
@@ -510,7 +539,7 @@ export function BrainMesh({ nodes, onNodeClick, className = "" }: BrainMeshProps
       dpr={[1, 1.5]}
       style={{ width: "100%", height: "560px", background: "transparent" }}
     >
-      <BrainScene cells={cells} axons={axons} onNodeClick={onNodeClick} />
+      <BrainScene cells={cells} axons={axons} onNodeClick={onNodeClick} activityRef={activityRef} />
     </Canvas>
   );
 }
