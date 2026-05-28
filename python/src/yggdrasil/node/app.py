@@ -197,6 +197,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "gpu_count": len(snap.gpus),
         }
 
+    @app.get(f"{prefix}/v2/metrics")
+    async def get_metrics(request: Request):
+        """Detailed metrics: top functions by runs, top by duration, recent activity."""
+        state = request.app.state
+        funcs = await state.pyfunc_service.list()
+        runs = await state.pyfuncrun_service.list()
+
+        top_by_runs = sorted(funcs.funcs, key=lambda f: f.run_count, reverse=True)[:5]
+        top_by_duration = sorted(
+            [f for f in funcs.funcs if f.avg_duration_ms > 0],
+            key=lambda f: f.avg_duration_ms,
+            reverse=True,
+        )[:5]
+        success_rate_funcs = sorted(
+            [f for f in funcs.funcs if (f.success_count + f.failure_count) > 0],
+            key=lambda f: f.success_count / (f.success_count + f.failure_count),
+            reverse=True,
+        )[:5]
+
+        recent_runs = sorted(runs.runs, key=lambda r: r.started_at or "", reverse=True)[:10]
+
+        return {
+            "node_id": settings.node_id,
+            "top_by_runs": [{"id": f.id, "name": f.name, "runs": f.run_count} for f in top_by_runs],
+            "top_by_duration": [{"id": f.id, "name": f.name, "avg_ms": f.avg_duration_ms} for f in top_by_duration],
+            "success_rate": [
+                {"id": f.id, "name": f.name, "rate": round(f.success_count / (f.success_count + f.failure_count) * 100, 1)}
+                for f in success_rate_funcs
+            ],
+            "recent_runs": [
+                {"id": r.id, "func_id": r.func_id, "status": r.status, "duration": r.duration, "started_at": r.started_at}
+                for r in recent_runs
+            ],
+        }
+
     app.include_router(env_router, prefix=f"{prefix}/env")
     app.include_router(cmd_router, prefix=f"{prefix}/cmd")
     app.include_router(python_router, prefix=f"{prefix}/python")

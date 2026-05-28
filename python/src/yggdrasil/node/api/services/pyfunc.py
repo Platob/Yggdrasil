@@ -149,6 +149,26 @@ class PyFuncService:
                     update={"run_count": entry.run_count + 1, "last_run_at": now}
                 )
 
+    def record_run_completion(self, func_id: int, duration_ms: float, success: bool) -> None:
+        """Update perf metrics after a run completes."""
+        with self._lock:
+            entry = self._funcs.get(func_id)
+            if entry is None:
+                return
+            new_success = entry.success_count + (1 if success else 0)
+            new_failure = entry.failure_count + (0 if success else 1)
+            total_runs = new_success + new_failure
+            new_avg = (
+                (entry.avg_duration_ms * (total_runs - 1) + duration_ms) / total_runs
+                if total_runs > 0 else 0
+            )
+            self._funcs[func_id] = entry.model_copy(update={
+                "last_duration_ms": duration_ms,
+                "avg_duration_ms": round(new_avg, 2),
+                "success_count": new_success,
+                "failure_count": new_failure,
+            })
+
     # -- replication --------------------------------------------------------
 
     async def replicate_to(self, func_id: int, target_url: str) -> dict:

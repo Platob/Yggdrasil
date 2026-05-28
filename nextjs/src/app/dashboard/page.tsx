@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { getStats, getAudit } from "@/lib/api";
+import Link from "next/link";
+import { getStats, getAudit, createFunc } from "@/lib/api";
 import type { ClusterStats, AuditEntry } from "@/lib/types";
 
 // ── Format uptime as "2d 4h" or "12m" etc. ───────────────────
@@ -56,10 +57,10 @@ function BigStatCard({
     }
   }, [value]);
   return (
-    <div className="glass-card p-5 flex-1 min-w-[140px]">
+    <div className="runic-card p-5 flex-1 min-w-[140px]">
       <p
-        className="text-4xl font-bold font-mono transition-colors duration-500"
-        style={{ color: flash ? "var(--frost)" : color || "var(--foreground)" }}
+        className={`text-4xl font-bold font-mono transition-all duration-500 gradient-frost ${flash ? "glow-frost" : ""}`}
+        style={{ color: color }}
       >
         {value}
       </p>
@@ -67,6 +68,38 @@ function BigStatCard({
         {label}
       </p>
     </div>
+  );
+}
+
+// ── Quick Action button ─────────────────────────────────────
+function QuickAction({
+  href,
+  onClick,
+  icon,
+  label,
+}: {
+  href?: string;
+  onClick?: () => void;
+  icon: React.ReactNode;
+  label: string;
+}) {
+  const inner = (
+    <div className="runic-card p-4 flex items-center gap-3 cursor-pointer transition-all hover:bg-white/[0.05]">
+      <span className="text-frost shrink-0">{icon}</span>
+      <span className="text-xs font-medium text-foreground-dim">{label}</span>
+    </div>
+  );
+  if (href) {
+    return (
+      <Link href={href} className="flex-1 min-w-[160px]">
+        {inner}
+      </Link>
+    );
+  }
+  return (
+    <button onClick={onClick} className="flex-1 min-w-[160px] text-left">
+      {inner}
+    </button>
   );
 }
 
@@ -125,6 +158,13 @@ export default function DashboardPage() {
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+
+  // New Function modal
+  const [newFuncOpen, setNewFuncOpen] = useState(false);
+  const [newFuncName, setNewFuncName] = useState("");
+  const [newFuncCode, setNewFuncCode] = useState("def hello():\n    return 'world'\n");
+  const [newFuncSaving, setNewFuncSaving] = useState(false);
+  const [newFuncError, setNewFuncError] = useState("");
 
   const fetchStats = useCallback(async () => {
     try {

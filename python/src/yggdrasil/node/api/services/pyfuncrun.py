@@ -91,6 +91,11 @@ class PyFuncRunService:
         )
 
         self._pyfunc.increment_run_count(req.func_id)
+        self._pyfunc.record_run_completion(
+            req.func_id,
+            duration_ms=(result.duration or 0.0) * 1000,
+            success=(result.status == "completed"),
+        )
         return PyFuncRunResponse(run=result)
 
     async def get(self, run_id: int) -> PyFuncRunEntry:

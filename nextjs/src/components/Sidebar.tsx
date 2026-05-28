@@ -46,11 +46,19 @@ const Icons = {
       <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
     </svg>
   ),
+  metrics: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="18" y1="20" x2="18" y2="10" />
+      <line x1="12" y1="20" x2="12" y2="4" />
+      <line x1="6" y1="20" x2="6" y2="14" />
+    </svg>
+  ),
 };
 
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard", icon: Icons.dashboard, exact: true },
   { href: "/", label: "Home", icon: Icons.home, exact: true },
+  { href: "/metrics", label: "Metrics", icon: Icons.metrics },
   { href: "/nodes", label: "Nodes", icon: Icons.nodes },
   { href: "/dags", label: "DAGs", icon: Icons.dags },
   { href: "/chat", label: "Chat", icon: Icons.chat },
