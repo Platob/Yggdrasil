@@ -127,7 +127,7 @@ class UCSchema(DatabricksPath):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_SCHEMA
 
-    NAMESPACE_PREFIX: ClassVar[str] = "/Schemas"
+    NAMESPACE_PREFIX: ClassVar[str] = "/Schemas/"
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
     _SINGLETON_TTL: ClassVar[Any] = None
 

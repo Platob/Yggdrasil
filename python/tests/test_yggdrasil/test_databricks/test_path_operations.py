@@ -423,6 +423,7 @@ class TestFullNameAndPath:
             schema_name="sales",
         )
         assert sch.full_name() == "main.sales"
+        assert sch.full_path() == "/Schemas/main/sales"
 
     def test_uc_schema_full_name_quoted(self, schemas_service):
         sch = UCSchema(
