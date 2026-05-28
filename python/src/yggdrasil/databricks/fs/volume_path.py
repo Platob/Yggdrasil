@@ -30,6 +30,18 @@ carries a botocore :class:`RefreshableCredentials`-backed session
 that re-invokes :meth:`temporary_credentials` on every near-expiry
 refresh cycle. One fewer hop per read / write, no Unity Catalog
 quota burn for the bulk transfer.
+
+Cluster-mount fast path
+-----------------------
+
+Inside a Databricks runtime, ``/Volumes/...`` is exposed as a FUSE
+mount. Reads, stats, listings, mkdirs, removes, and uploads all run
+through the kernel mount via stdlib syscalls instead of paying a
+Files-API round trip per operation. The probe lives in
+:func:`_local_mount_available` and is gated on
+``DatabricksClient.is_in_databricks_environment()`` AND
+``os.path.isdir("/Volumes")``. Off-cluster the existing Files-API
+path runs unchanged.
 """
 
 from __future__ import annotations
