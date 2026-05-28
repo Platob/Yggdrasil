@@ -91,6 +91,8 @@ _QUERY_RESERVED = frozenset({
     "ARRAY", "MAP", "STRUCT",
     # Interval / Extract
     "INTERVAL", "EXTRACT",
+    # Qualify
+    "QUALIFY",
 })
 
 _CMP_OPS = {"=": CompareOp.EQ, "==": CompareOp.EQ, "!=": CompareOp.NE,
@@ -361,6 +363,10 @@ class SQLQueryParser:
         if self._accept_kw("HAVING"):
             node.having = self._parse_expr()
 
+        # QUALIFY (Databricks window-function filter)
+        if self._accept_kw("QUALIFY"):
+            node.qualify = self._parse_expr()
+
         # ORDER BY
         if self._is_kw("ORDER"):
             self._eat()
@@ -415,8 +421,8 @@ class SQLQueryParser:
             return self._eat().text
         return None
 
-    _CLAUSE_KW = frozenset({"FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT",
-        "OFFSET", "UNION", "INTERSECT", "EXCEPT", "ON", "JOIN", "INNER", "LEFT",
+    _CLAUSE_KW = frozenset({"FROM", "WHERE", "GROUP", "HAVING", "QUALIFY", "ORDER", "LIMIT",
+        "OFFSET", "UNION", "INTERSECT", "EXCEPT", "ON", "USING", "JOIN", "INNER", "LEFT",
         "RIGHT", "FULL", "CROSS", "LATERAL", "WHEN", "THEN", "ELSE", "END", "AND", "OR"})
     _JOIN_KW = frozenset({"JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"})
 
@@ -434,15 +440,47 @@ class SQLQueryParser:
                 self._expect_kind("rparen")
                 alias = self._parse_optional_alias()
                 return SubqueryRef(plan=sub, alias=alias or "_subquery")
+            if self._is_kw("VALUES"):
+                # (VALUES (...), (...)) [AS] alias [(col1, col2, ...)]
+                return self._parse_values_from_item(in_parens=True)
             inner = self._parse_from_clause()
             self._expect_kind("rparen")
             return inner
+        # Bare VALUES at FROM start (no parens, less common but accepted)
+        if self._is_kw("VALUES"):
+            return self._parse_values_from_item(in_parens=False)
         # String literal as path/URL source: FROM '/path/to/file.parquet'
         if self.cur.kind == "string":
             path = self._eat().text
             alias = self._parse_optional_alias()
             return TableRef(name=path, alias=alias)
         return self._parse_table_ref()
+
+    def _parse_values_from_item(self, in_parens: bool) -> Any:
+        """Parse ``VALUES (...), (...) AS alias [(col_aliases)]`` as a from-item.
+
+        Returns a ValuesRef carrying the row data plus optional column
+        aliases; the executor materialises it as an in-memory table.
+        """
+        from .ops import ValuesRef
+        self._expect_kw("VALUES")
+        values = self._parse_values_list()
+        if in_parens:
+            self._expect_kind("rparen")
+        self._accept_kw("AS")
+        alias = None
+        col_aliases: list[str] = []
+        if self.cur.kind in ("ident", "keyword") and not self._is_kw(*self._CLAUSE_KW):
+            alias = self._eat().text
+            if self.cur.kind == "lparen":
+                self._eat()
+                while self.cur.kind != "rparen":
+                    col_aliases.append(self._ident_or_kw().text)
+                    if self.cur.kind == "comma":
+                        self._eat()
+                self._expect_kind("rparen")
+        return ValuesRef(values=values, alias=alias or "_values",
+                         columns=col_aliases or None)
 
     def _parse_table_ref(self) -> TableRef:
         parts: list[str] = [self._ident_or_kw().text]
@@ -465,6 +503,22 @@ class SQLQueryParser:
         on_pred = None
         if self._accept_kw("ON"):
             on_pred = self._parse_expr()
+        elif self._accept_kw("USING"):
+            self._expect_kind("lparen")
+            cols: list[str] = []
+            while self.cur.kind != "rparen":
+                cols.append(self._ident_or_kw().text)
+                if self.cur.kind == "comma":
+                    self._eat()
+            self._expect_kind("rparen")
+            # Convert USING(a, b) into ON left.a = right.a AND left.b = right.b
+            conditions = []
+            for c in cols:
+                conditions.append(Comparison(Column(name=c), CompareOp.EQ, Column(name=c)))
+            if len(conditions) == 1:
+                on_pred = conditions[0]
+            else:
+                on_pred = Logical(LogicalOp.AND, tuple(conditions))
         return JoinClause(left=left, right=right, join_type=jt, on=on_pred)
 
     def _parse_join_type(self) -> JoinType:
@@ -658,7 +712,54 @@ class SQLQueryParser:
             self._eat(); items.append(self._parse_or())
         return items
 
+    def _try_parse_lambda(self) -> "Expression | None":
+        """Detect ``param -> body`` or ``(p1, p2, ...) -> body`` lambdas.
+
+        Returns the Lambda expression on match, or None if the current
+        position isn't a lambda (caller falls through to normal parsing).
+        Used by higher-order functions like TRANSFORM, FILTER, AGGREGATE.
+        """
+        from yggdrasil.execution.expr.nodes import Lambda
+        saved = self.pos
+        params: list[str] = []
+        if self.cur.kind in ("ident", "keyword"):
+            # Single-param: x -> body
+            nxt, nxt2 = self._peek(1), self._peek(2)
+            if (nxt.kind == "op" and nxt.text == "-"
+                    and nxt2.kind == "op" and nxt2.text == ">"):
+                params.append(self._eat().text)
+                self._eat(); self._eat()  # - >
+                body = self._parse_or()
+                return Lambda(tuple(params), body)
+        elif self.cur.kind == "lparen":
+            # Multi-param: (p1, p2) -> body
+            self._eat()
+            if self.cur.kind not in ("ident", "keyword"):
+                self.pos = saved
+                return None
+            while self.cur.kind in ("ident", "keyword"):
+                params.append(self._eat().text)
+                if self.cur.kind == "comma":
+                    self._eat()
+                    continue
+                break
+            if (self.cur.kind != "rparen"
+                    or self._peek(1).kind != "op" or self._peek(1).text != "-"
+                    or self._peek(2).kind != "op" or self._peek(2).text != ">"):
+                self.pos = saved
+                return None
+            self._eat()  # )
+            self._eat(); self._eat()  # - >
+            body = self._parse_or()
+            return Lambda(tuple(params), body)
+        return None
+
     def _parse_or(self) -> Expression:
+        # Lambda detection — has to happen before arithmetic so `x -> ...`
+        # isn't parsed as `x - (>...)`.
+        lam = self._try_parse_lambda()
+        if lam is not None:
+            return lam
         left = self._parse_and()
         operands: list[Expression] = []
         while self._accept_kw("OR") is not None:
@@ -989,7 +1090,8 @@ class SQLQueryParser:
             inner = self._parse_or()
             self._expect_kind("rparen")
             return self._fold_cast(inner, head.upper)
-        raise self._error(f"unexpected use of type keyword {head.text!r}")
+        # Fall back to treating it as a column name (e.g., `date` as column)
+        return self._parse_column()
 
     def _parse_type_head(self) -> str:
         t = self.cur
@@ -1043,9 +1145,23 @@ class SQLQueryParser:
     def _parse_exists(self) -> Expression:
         self._expect_kw("EXISTS")
         self._expect_kind("lparen")
-        sub = self._parse_statement()
+        # EXISTS(SELECT ...) → subquery existence check
+        # EXISTS(arr, x -> x > 0) → Databricks higher-order function
+        if self._is_kw("SELECT", "WITH"):
+            sub = self._parse_statement()
+            self._expect_kind("rparen")
+            return FunctionCall(name="EXISTS", args=(Literal(value=str(sub)),))
+        # Higher-order form: parse as a regular function call body
+        args: list[Expression] = []
+        if self.cur.kind != "rparen":
+            while True:
+                args.append(self._parse_or())
+                if self.cur.kind == "comma":
+                    self._eat()
+                    continue
+                break
         self._expect_kind("rparen")
-        return FunctionCall(name="EXISTS", args=(Literal(value=str(sub)),))
+        return FunctionCall(name="EXISTS", args=tuple(args))
 
     # ---- INTERVAL literal ------------------------------------------------
 
@@ -1056,29 +1172,34 @@ class SQLQueryParser:
     })
 
     def _parse_interval(self) -> Expression:
-        """Parse ``INTERVAL 'value' unit`` → FunctionCall("INTERVAL", ...)."""
+        """Parse ``INTERVAL 'value' unit`` or ``INTERVAL N unit`` → FunctionCall("INTERVAL", ...)."""
         self._expect_kw("INTERVAL")
-        value_tok = self._expect_kind("string")
+        # Accept either string literal ('value') or numeric literal (N)
+        if self.cur.kind == "string":
+            value_text = self._eat().text
+        elif self.cur.kind == "number":
+            value_text = _coerce_number(self._eat().text)
+        else:
+            raise self._error("expected string or number after INTERVAL")
         # Unit keyword — might be tokenized as ident or keyword
         t = self.cur
         if t.kind in ("ident", "keyword") and t.upper in self._INTERVAL_UNITS:
             unit = self._eat().upper
-            # Normalize plural forms to singular
-            if unit.endswith("S") and unit not in ("HOURS",) and len(unit) > 3:
-                unit = unit.rstrip("S")
-            elif unit == "DAYS":
-                unit = "DAY"
-            elif unit == "HOURS":
-                unit = "HOUR"
-            elif unit == "WEEKS":
-                unit = "WEEK"
+            unit = self._normalize_interval_unit(unit)
         else:
             raise self._error(
                 f"expected interval unit (DAY, HOUR, MINUTE, SECOND, "
                 f"MONTH, YEAR, WEEK) after INTERVAL literal"
             )
         return FunctionCall(name="INTERVAL",
-            args=(Literal(value=value_tok.text), Literal(value=unit)))
+            args=(Literal(value=value_text), Literal(value=unit)))
+
+    @staticmethod
+    def _normalize_interval_unit(unit: str) -> str:
+        _PLURAL_MAP = {"DAYS": "DAY", "HOURS": "HOUR", "MINUTES": "MINUTE",
+                        "SECONDS": "SECOND", "MONTHS": "MONTH", "YEARS": "YEAR",
+                        "WEEKS": "WEEK"}
+        return _PLURAL_MAP.get(unit, unit)
 
     # ---- EXTRACT(field FROM expr) ----------------------------------------
 

@@ -28,7 +28,7 @@ from yggdrasil.execution.expr.nodes import (
 )
 
 from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
-from .ops import CTE, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef
+from .ops import CTE, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef, ValuesRef
 
 if TYPE_CHECKING:
     pass
@@ -90,6 +90,10 @@ def _emit_select(node: SelectNode, d: Dialect) -> str:
     if node.having is not None:
         parts.append("HAVING " + _emit_expr(node.having, d))
 
+    # QUALIFY
+    if node.qualify is not None:
+        parts.append("QUALIFY " + _emit_expr(node.qualify, d))
+
     # ORDER BY
     if node.order_by:
         parts.append("ORDER BY " + ", ".join(_emit_order(o, d) for o in node.order_by))
@@ -128,6 +132,16 @@ def _emit_from(item: Any, d: Dialect) -> str:
     if isinstance(item, SubqueryRef):
         inner = _emit(item.plan, d)
         return f"({inner}) {_quote_ident(item.alias, d)}"
+    if isinstance(item, ValuesRef):
+        rows = ", ".join(
+            "(" + ", ".join(_emit_expr(v, d) for v in row) + ")"
+            for row in item.values
+        )
+        sql = f"(VALUES {rows}) {_quote_ident(item.alias, d)}"
+        if item.columns:
+            cols = ", ".join(_quote_ident(c, d) for c in item.columns)
+            sql += f" ({cols})"
+        return sql
     if isinstance(item, JoinClause):
         left_sql = _emit_from(item.left, d)
         right_sql = _emit_from(item.right, d)

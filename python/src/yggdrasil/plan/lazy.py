@@ -56,7 +56,20 @@ class LazyTabular(Tabular[O], Generic[O]):
     def filter(self, predicate) -> "LazyTabular[O]": self._plan.filter(predicate); return self
     def unique(self, by) -> "LazyTabular[O]": self._plan.unique(by); return self
     def limit(self, n) -> "LazyTabular[O]": self._plan.limit(n); return self
+    def offset(self, n) -> "LazyTabular[O]": self._plan.offset(n); return self
     def cast(self, options=None, **kw) -> "LazyTabular[O]": self._plan.cast(options, **kw); return self
+
+    def group_by(self, *keys, aggregations=None) -> "LazyTabular[O]":
+        self._plan.group_by(*keys, aggregations=aggregations); return self
+
+    def having(self, predicate) -> "LazyTabular[O]":
+        self._plan.having(predicate); return self
+
+    def order_by(self, *keys) -> "LazyTabular[O]":
+        self._plan.order_by(*keys); return self
+
+    def with_cte(self, name, plan) -> "LazyTabular[O]":
+        self._plan.with_cte(name, plan); return self
 
     def join(self, right, on, how="inner", *, suffix="_right") -> "LazyTabular[O]":
         self._plan.join(right, on=on, how=how, suffix=suffix); return self

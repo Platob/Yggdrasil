@@ -19,7 +19,7 @@ from .execution_plan import ExecutionPlan, SelectPlan
 from .func_registry import BUILTIN_REGISTRY, FunctionMeta, FunctionRegistry
 from .lazy import LazyTabular
 from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
-from .ops import CTE, JoinOp, ResampleOp, SetOp, UnionOp
+from .ops import CTE, GroupByOp, JoinOp, OrderByOp, ResampleOp, SetOp, UnionOp
 
 __all__ = [
     "BUILTIN_REGISTRY",
@@ -27,10 +27,12 @@ __all__ = [
     "ExecutionPlan",
     "FunctionMeta",
     "FunctionRegistry",
+    "GroupByOp",
     "InsertNode",
     "JoinOp",
     "LazyTabular",
     "MergeNode",
+    "OrderByOp",
     "PlanNode",
     "ResampleOp",
     "ScanNode",

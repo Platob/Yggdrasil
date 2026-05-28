@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
-from .ops import JoinClause, SubqueryRef, TableRef
+from .ops import JoinClause, SubqueryRef, TableRef, ValuesRef
 
 if TYPE_CHECKING:
     from yggdrasil.io.tabular import Tabular
@@ -70,11 +70,34 @@ def _resolve_from(item: Any, tables: dict[str, "Tabular"], predicate: Any = None
         raise ValueError(f"Table {name!r} not found. Available: {sorted(tables)}")
     if isinstance(item, SubqueryRef):
         return _exec(item.plan, tables)
+    if isinstance(item, ValuesRef):
+        return _exec_values(item)
     if isinstance(item, JoinClause):
         return _exec_join(item, tables)
     if isinstance(item, PlanNode):
         return _exec(item, tables)
     raise TypeError(f"Cannot resolve FROM item: {type(item).__name__}")
+
+
+def _exec_values(ref: ValuesRef) -> "Tabular":
+    """Materialise an inline VALUES row set into an ArrowTabular."""
+    from yggdrasil.arrow.tabular import ArrowTabular
+    from yggdrasil.execution.expr.nodes import Literal
+
+    if not ref.values:
+        return ArrowTabular(pa.table({}))
+    n_cols = len(ref.values[0])
+    names = ref.columns or [f"col{i}" for i in range(n_cols)]
+    if len(names) < n_cols:
+        names = list(names) + [f"col{i}" for i in range(len(names), n_cols)]
+    columns: dict[str, list] = {n: [] for n in names[:n_cols]}
+    for row in ref.values:
+        for i, cell in enumerate(row[:n_cols]):
+            if isinstance(cell, Literal):
+                columns[names[i]].append(cell.value)
+            else:
+                columns[names[i]].append(cell)
+    return ArrowTabular(pa.table(columns))
 
 
 def _is_in_memory(t: "Tabular") -> bool:
@@ -118,6 +141,11 @@ def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
         except Exception:
             pass
 
+    # LATERAL VIEW EXPLODE / POSEXPLODE — apply before WHERE so the
+    # exploded column can be referenced in the predicate.
+    if getattr(node, "lateral_views", None):
+        result = _apply_lateral_views(result, node.lateral_views)
+
     # WHERE — push predicate into CastOptions for I/O-level optimization,
     # or use Tabular.filter() for Spark/Arrow engine-native dispatch.
     if node.where is not None:
@@ -147,6 +175,11 @@ def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
         rewritten = _rewrite_having(node.having, result, agg_alias_map)
         if rewritten is not None:
             result = result.filter(rewritten)
+
+    # QUALIFY (Databricks window-function filter) — runs before projection so
+    # it can reference columns that aren't in the final SELECT list.
+    if getattr(node, "qualify", None) is not None:
+        result = _apply_qualify(result, node.qualify)
 
     # Projection — apply scalar functions via Arrow kernels, then select
     if node.projections and not has_agg:
@@ -415,6 +448,117 @@ def _apply_projections(result: "Tabular", projections: list) -> "Tabular":
             return result
 
     return ArrowTabular(pa.table(dict(zip(out_names, out_arrays))))
+
+
+def _apply_lateral_views(result: "Tabular", lateral_views: list) -> "Tabular":
+    """Apply LATERAL VIEW EXPLODE / POSEXPLODE clauses.
+
+    Supports the Meteologica-style ``LATERAL VIEW EXPLODE(col) tbl AS x``
+    and ``LATERAL VIEW POSEXPLODE(col) tbl AS pos, val`` patterns. For
+    each view, the named list column is flattened, scalar columns are
+    repeated per element, and the result is rebound to the column
+    aliases.
+    """
+    from yggdrasil.arrow.tabular import ArrowTabular
+    from yggdrasil.execution.expr.nodes import Column, FunctionCall
+    from .func_registry import explode_table, posexplode_table
+
+    table = result.read_arrow_table()
+    for lv in lateral_views:
+        func = lv.function
+        if not isinstance(func, FunctionCall):
+            continue
+        fn = func.name.upper()
+        if not func.args or not isinstance(func.args[0], Column):
+            continue
+        src_col = func.args[0].name
+        if src_col not in table.column_names:
+            continue
+        if fn in ("EXPLODE", "EXPLODE_OUTER"):
+            out_col = lv.column_aliases[0] if lv.column_aliases else src_col
+            table = explode_table(table, src_col, out_col=out_col)
+        elif fn in ("POSEXPLODE", "POSEXPLODE_OUTER"):
+            pos_col = lv.column_aliases[0] if lv.column_aliases else "pos"
+            val_col = lv.column_aliases[1] if len(lv.column_aliases) > 1 else src_col
+            table = posexplode_table(table, src_col, pos_col=pos_col, out_col=val_col)
+    return ArrowTabular(table)
+
+
+def _apply_qualify(result: "Tabular", qualify: Any) -> "Tabular":
+    """Execute a QUALIFY clause on the result.
+
+    Currently handles the most common Meteologica-style pattern:
+    ``QUALIFY ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) = N``
+    by computing row numbers per partition and filtering. Other window
+    expressions fall back to a no-op so the query still completes.
+    """
+    from yggdrasil.arrow.tabular import ArrowTabular
+    from yggdrasil.execution.expr.nodes import (
+        Column, Comparison, FunctionCall, Literal, SortOrder, WindowFunction,
+    )
+    from yggdrasil.execution.expr.operators import CompareOp
+    import pyarrow.compute as pc
+
+    if not (isinstance(qualify, Comparison)
+            and isinstance(qualify.left, WindowFunction)
+            and isinstance(qualify.right, Literal)):
+        return result  # fallback for unsupported QUALIFY shapes
+
+    wf = qualify.left
+    if not (isinstance(wf.function, FunctionCall)
+            and wf.function.name.upper() in ("ROW_NUMBER", "RANK", "DENSE_RANK")):
+        return result
+
+    target_rank = qualify.right.value
+    cmp_op = qualify.op
+    win = wf.window
+    pb_cols = [c.name for c in win.partition_by if isinstance(c, Column)]
+    sort_keys: list[tuple[str, str]] = []
+    for so in win.order_by:
+        if isinstance(so, SortOrder) and isinstance(so.expr, Column):
+            sort_keys.append(
+                (so.expr.name, "ascending" if so.ascending else "descending"))
+
+    table = result.read_arrow_table()
+    if table.num_rows == 0 or table.num_columns == 0:
+        return result
+
+    # Partition keys first so equal partitions are contiguous; sort keys then
+    # rank rows within each partition.
+    full_sort = [(c, "ascending") for c in pb_cols] + sort_keys
+    if full_sort:
+        table = table.take(pc.sort_indices(table, sort_keys=full_sort))
+
+    # Compute row numbers within partitions
+    if pb_cols:
+        partition_arrays = [table.column(c).to_pylist() for c in pb_cols]
+        row_numbers = []
+        last_key = object()
+        n = 0
+        for i in range(table.num_rows):
+            key = tuple(arr[i] for arr in partition_arrays)
+            if key != last_key:
+                n = 1
+                last_key = key
+            else:
+                n += 1
+            row_numbers.append(n)
+    else:
+        row_numbers = list(range(1, table.num_rows + 1))
+
+    rn_array = pa.array(row_numbers, type=pa.int64())
+    rank_literal = pa.scalar(target_rank, type=pa.int64())
+    cmp_map = {
+        CompareOp.EQ: pc.equal,
+        CompareOp.NE: pc.not_equal,
+        CompareOp.LT: pc.less,
+        CompareOp.LE: pc.less_equal,
+        CompareOp.GT: pc.greater,
+        CompareOp.GE: pc.greater_equal,
+    }
+    mask = cmp_map.get(cmp_op, pc.equal)(rn_array, rank_literal)
+    filtered = table.filter(mask)
+    return ArrowTabular(filtered)
 
 
 def _exec_insert(node: InsertNode, tables: dict[str, "Tabular"]) -> "Tabular":

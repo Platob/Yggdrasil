@@ -2065,6 +2065,24 @@ class Subscript(Expression):
         self.index = index
 
 
+class Lambda(Expression):
+    """``(p1, p2, ...) -> body`` — a lambda for higher-order functions.
+
+    Databricks higher-order functions (TRANSFORM, FILTER, AGGREGATE,
+    EXISTS, FORALL, ZIP_WITH, REDUCE) take a lambda as one of their
+    arguments. ``params`` are the parameter names; ``body`` is the
+    expression evaluated per element. SQL renders as
+    ``(p1, p2) -> body`` (parens omitted for single-param lambdas).
+    """
+
+    __slots__ = ("params", "body")
+    _FIELD_NAMES: ClassVar["tuple[str, ...]"] = ("params", "body")
+
+    def __init__(self, params: "tuple[str, ...]", body: Expression) -> None:
+        self.params = params if isinstance(params, tuple) else tuple(params)
+        self.body = body
+
+
 # ---------------------------------------------------------------------------
 # Coercion — let users pass plain Python values where an Expression
 # is expected (most common case is ``col("x") == 5``).

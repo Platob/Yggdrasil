@@ -78,6 +78,7 @@ class SelectNode(PlanNode):
     where: "Predicate | None" = None
     group_by: list[Any] | None = None
     having: "Predicate | None" = None
+    qualify: "Predicate | None" = None
     order_by: list[Any] | None = None
     limit: int | None = None
     offset: int | None = None
