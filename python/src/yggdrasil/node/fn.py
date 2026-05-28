@@ -900,12 +900,12 @@ def set_output(key: str = "result", value: Any = None) -> None:
         existing: dict[str, Any] = {}
         if os.path.exists(outputs_file):
             try:
-                with open(outputs_file) as f:
+                with open(outputs_file, encoding="utf-8") as f:
                     existing = json.load(f)
             except (json.JSONDecodeError, OSError):
                 pass
         existing[key] = value
-        with open(outputs_file, "w") as f:
+        with open(outputs_file, "w", encoding="utf-8") as f:
             json.dump(existing, f)
 
 
