@@ -35,6 +35,11 @@ class PyFuncRunEntry(StrictModel):
     node_id: str = ""
     progress: float = 0.0
     log_lines: int = 0
+    pid: int | None = None
+    heartbeat_at: str | None = None
+    cancellation_requested: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 class PyFuncRunResponse(StrictModel):
