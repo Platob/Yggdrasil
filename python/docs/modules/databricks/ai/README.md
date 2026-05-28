@@ -134,7 +134,7 @@ arrow_table = result.to_arrow_table()
 idx = vs.endpoint("my-endpoint").index("main.ml.products_idx")
 
 print(idx.name)
-print(idx.exists)
+print(idx.exists())
 print(idx.is_ready)
 print(idx.indexed_row_count)
 print(idx.primary_key)

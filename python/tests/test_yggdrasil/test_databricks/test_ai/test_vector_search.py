@@ -211,7 +211,7 @@ class TestVectorSearchEndpoint(VectorSearchTestCase):
     def test_exists_false_on_not_found(self):
         self.endpoints_api.get_endpoint.side_effect = NotFound("missing")
         ep = self.vs.endpoint("rag-endpoint")
-        self.assertFalse(ep.exists)
+        self.assertFalse(ep.exists())
 
     def test_is_online_reads_status(self):
         self.endpoints_api.get_endpoint.return_value = _build_endpoint_info(

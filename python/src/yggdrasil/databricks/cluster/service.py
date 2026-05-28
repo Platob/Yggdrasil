@@ -312,7 +312,6 @@ class Clusters(DatabricksService):
             if new_details.spark_env_vars is None:
                 new_details.spark_env_vars = {}
             str_urls = " ".join(pip_settings.extra_index_urls)
-            # note: original code used UV_INDEX by mistake; keep behavior but avoid clobbering explicitly set vars
             new_details.spark_env_vars.setdefault("UV_EXTRA_INDEX_URL", str_urls)
             new_details.spark_env_vars.setdefault("PIP_EXTRA_INDEX_URL", str_urls)
 
@@ -349,6 +348,7 @@ class Clusters(DatabricksService):
         found = self.find_cluster(
             cluster_id=cluster_id,
             cluster_name=cluster_name,
+            sources=[ClusterSource.API],
             raise_error=False,
         )
 
@@ -477,49 +477,30 @@ class Clusters(DatabricksService):
 
         return instance
 
-    def list(
-        self,
-        *,
-        name: str | None = None,
-        sources: Optional[list[ClusterSource]] = None,
-        limit: int | None = None,
-    ) -> Iterator["Cluster"]:
-        from .cluster import Cluster
-
-        client = self.client.workspace_client().clusters
-        cnt, limit = 0, limit or float("inf")
-
-        if name:
-            filter_by = ListClustersFilterBy(
-                cluster_sources=sources
-            )
-        else:
-            filter_by = None
-
-        for details in client.list(
-            filter_by=filter_by
-        ):
-            if name:
-                if name == details.cluster_name:
-                    cluster = Cluster(service=self).set_details(details=details)
-                    yield cluster
-                    cnt += 1
-            else:
-                cluster = Cluster(service=self).set_details(details=details)
-
-                yield cluster
-                cnt += 1
-
-            if cnt >= limit:
-                break
-
     def find_cluster(
         self,
-        cluster_id: str | None = None,
+        obj: Any = None,
         *,
+        cluster_id: str | None = None,
         cluster_name: str | None = None,
+        sources: Optional[list[ClusterSource]] = ...,
         raise_error: bool | None = None,
     ) -> Optional["Cluster"]:
+        if obj is not None:
+            from .cluster import Cluster
+
+            if isinstance(obj, Cluster):
+                return obj
+            if isinstance(obj, str):
+                if _CLUSTER_ID_RE.match(obj):
+                    cluster_id = cluster_id or obj
+                else:
+                    cluster_name = cluster_name or obj
+            else:
+                raise TypeError(
+                    f"obj must be Cluster | str | None, got {type(obj).__name__}"
+                )
+
         if not cluster_name and not cluster_id:
             raise ValueError("Either name or cluster_id must be provided")
 
@@ -548,11 +529,11 @@ class Clusters(DatabricksService):
                 service=self,
                 cluster_id=details.cluster_id,
                 cluster_name=details.cluster_name,
-                _details=details,
+                details=details,
             )
 
         # last resort: list scan (expensive)
-        for cluster in self.list():
+        for cluster in self.list(name=cluster_name, limit=1, sources=sources):
             if cluster_name == cluster.details.cluster_name:
                 set_cached_cluster_name(
                     client=self.client,
@@ -564,3 +545,35 @@ class Clusters(DatabricksService):
         if raise_error:
             raise ValueError(f"Cannot find databricks cluster {cluster_name!r}")
         return None
+
+    def list(
+        self,
+        *,
+        name: str | None = None,
+        sources: Optional[list[ClusterSource]] = ...,
+        limit: int | None = None,
+    ) -> Iterator["Cluster"]:
+        from .cluster import Cluster
+
+        client = self.client.workspace_client().clusters
+        cnt, limit = 0, limit or float("inf")
+
+        if sources is ...:
+            sources = [ClusterSource.API]
+
+        filter_by = ListClustersFilterBy(cluster_sources=sources) if name else None
+
+        for details in client.list(filter_by=filter_by):
+            if name:
+                if name == details.cluster_name:
+                    cluster = Cluster(service=self).set_details(details=details)
+                    yield cluster
+                    cnt += 1
+            else:
+                cluster = Cluster(service=self).set_details(details=details)
+
+                yield cluster
+                cnt += 1
+
+            if cnt >= limit:
+                break

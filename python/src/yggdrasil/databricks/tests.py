@@ -44,6 +44,7 @@ caches your service uses.
 """
 from __future__ import annotations
 
+import os
 import unittest
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
@@ -68,38 +69,47 @@ class DatabricksTestCase(unittest.TestCase):
     """Base class for Databricks service / resource unit tests."""
 
     #: Workspace host used for the synthetic client.
-    HOST: str = "https://test.databricks.net"
+    HOST: str = os.getenv("DATABRICKS_HOST", "https://test.databricks.net")
 
     #: Service-account / PAT placeholder used to satisfy ``DatabricksClient``
     #: at construction time. No real authentication is ever performed.
-    TOKEN: str = "fake-pat-not-a-secret"
+    TOKEN: str = os.getenv("DATABRICKS_TOKEN", "fake-pat-not-a-secret")
 
     #: Default Unity catalog name handed to tests that need a three-part
     #: identifier without caring which catalog they target. Override on the
     #: subclass when a test suite exercises catalog-specific behavior.
-    CATALOG_NAME: str = "main"
+    CATALOG_NAME: str = "trading"
 
     #: Default Unity schema name. Pairs with :attr:`CATALOG_NAME` for the
     #: ``<catalog>.<schema>.<object>`` shape most Databricks tests build.
-    SCHEMA_NAME: str = "default"
+    SCHEMA_NAME: str = "unittest"
 
     # ------------------------------------------------------------------ #
     # setUp / tearDown
     # ------------------------------------------------------------------ #
     def setUp(self) -> None:
         super().setUp()
+
+        from yggdrasil.databricks.client import DatabricksClient
+
         WorkspaceClient, AccountClient = _import_sdk()
 
-        # Build a real client and install autospec'd mocks for every SDK
-        # boundary. We bypass make_config entirely by pre-populating the
-        # private slots that ``workspace_client()`` / ``account_client()`` check.
-        self.workspace_client = MagicMock(spec=WorkspaceClient)
-        self.account_client = MagicMock(spec=AccountClient)
-        self.workspace_config = MagicMock()
-        self.account_config = MagicMock()
+        env = os.getenv("DATABRICKS_HOST")
+
+        if env:
+            self.client = DatabricksClient(host=env)
+            self.workspace_client = self.client.workspace_client()
+            self.account_client = MagicMock(spec=AccountClient)
+            self.workspace_config = self.client.workspace_config
+            self.account_config = MagicMock()
+        else:
+            self.client = DatabricksClient(host=self.HOST, token=self.TOKEN, auth_type="pat")
+            self.workspace_client = MagicMock(spec=WorkspaceClient)
+            self.account_client = MagicMock(spec=AccountClient)
+            self.workspace_config = MagicMock()
+            self.account_config = MagicMock()
 
         self._clear_databricks_caches()
-        self.client = self.make_client()
 
         # Inject mocks into the lazy slots so workspace_client() / config
         # short-circuit instead of going through the auth path.
@@ -130,11 +140,6 @@ class DatabricksTestCase(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # Hooks for subclasses
     # ------------------------------------------------------------------ #
-    def make_client(self):
-        """Build the synthetic :class:`DatabricksClient`. Override to customise."""
-        from yggdrasil.databricks.client import DatabricksClient
-        return DatabricksClient(host=self.HOST, token=self.TOKEN, auth_type="pat")
-
     def extra_caches_to_clear(self) -> tuple:
         """Return additional ``(module, attribute)`` cache locations to reset.
 

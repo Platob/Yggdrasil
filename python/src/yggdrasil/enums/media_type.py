@@ -39,12 +39,14 @@ from __future__ import annotations
 import io as _stdio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Iterable, Union, Any
-
-from yggdrasil.lazy_imports import path_class
+from typing import IO, Iterable, Union, Any, TYPE_CHECKING
 
 from yggdrasil.enums.codec import Codec
 from yggdrasil.enums.mime_type import MimeType, MimeTypes
+from yggdrasil.lazy_imports import path_class
+
+if TYPE_CHECKING:
+    from yggdrasil.url import URL
 
 __all__ = ["MediaType", "MediaTypes"]
 
@@ -249,20 +251,15 @@ class MediaType:
         if fast_parsed is not None:
             return fast_parsed
 
-        # Backend-aware "is this a directory sink?" probe — older
-        # paths exposed ``is_dir_sink``; the new substrate uses
-        # ``is_dir``. Fall through gracefully if neither is present
-        # (a string-shaped pseudo-path) so we just attempt the
-        # IO sniff next.
         is_dir_sink = getattr(path, "is_dir_sink", None)
         try:
             if callable(is_dir_sink) and is_dir_sink():
-                return MediaType(MimeTypes.FOLDER)
+                return MediaType(MimeTypes.DIRECTORY)
         except Exception:
             pass
         try:
             if path.is_dir():
-                return MediaType(MimeTypes.FOLDER)
+                return MediaType(MimeTypes.DIRECTORY)
         except Exception:
             pass
 
@@ -295,7 +292,7 @@ class MediaType:
     @classmethod
     def from_url(
         cls,
-        url: URL,
+        url: "URL",
         default: Any = ...,
     ):
         from yggdrasil.url import URL as _URL
@@ -309,7 +306,7 @@ class MediaType:
             return default
 
         if not url.path or url.path == "/":
-            return cls.from_mime(MimeTypes.FOLDER, default=default)
+            return cls.from_mime(MimeTypes.DIRECTORY, default=default)
 
         return cls.from_many(
             url.extensions,
@@ -553,6 +550,7 @@ class MediaType:
 
 class MediaTypes:
     OCTET_STREAM = MediaType(mime_type=MimeTypes.OCTET_STREAM, codec=None)
+    DIRECTORY = MediaType(mime_type=MimeTypes.DIRECTORY, codec=None)
     PARQUET = MediaType(mime_type=MimeTypes.PARQUET, codec=None)
     JSON = MediaType(mime_type=MimeTypes.JSON, codec=None)
     ARROW_IPC = MediaType(mime_type=MimeTypes.ARROW_IPC, codec=None)

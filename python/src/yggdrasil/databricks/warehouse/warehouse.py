@@ -47,13 +47,6 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, List, Mapping, Optional, Union, TYPE_CHECKING
 
-from yggdrasil.http_.exceptions import (
-    exceptions as _http_exceptions,
-    disable_warnings,
-)
-from yggdrasil.http_.retry import Retry
-from yggdrasil.http_.timeout import Timeout
-
 from databricks.sdk.errors import InternalError, DeadlineExceeded, TemporarilyUnavailable
 from databricks.sdk.service.sql import (
     Disposition,
@@ -73,6 +66,10 @@ from yggdrasil.databricks.warehouse.wh_utils import (
     serverless_sibling_spec,
 )
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.http_.exceptions import (
+    exceptions as _http_exceptions,
+    disable_warnings,
+)
 from yggdrasil.pyutils.equality import dicts_equal
 from .statement import (
     WarehousePreparedStatement,
@@ -753,12 +750,9 @@ class SQLWarehouse(
         if not start:
             return result
 
-        LOGGER.debug(
-            "Executing %r:\n%s",
-            self, statement.text,
-        )
-
+        LOGGER.debug("Executing %r:\n%s", self, statement.text)
         itry, start = 0, time.time()
+
         while True:
             try:
                 response = sdk_client.execute_statement(
@@ -788,12 +782,8 @@ class SQLWarehouse(
                 itry += 1
 
         result.set_api_response(response)
+        LOGGER.info("Started %r", result)
         result.iteration = 1
-
-        LOGGER.info(
-            "Executed %r",
-            result
-        )
         return result
 
     # ------------------------------------------------------------------

@@ -109,7 +109,7 @@ def _normalize_privileges(
         yield normalized
 
 
-class UCSchema(DatabricksPath, Singleton):
+class UCSchema(DatabricksPath):
     """A single Unity Catalog schema — lifecycle, table navigation, tags.
 
     Identity is ``(client, catalog_name, schema_name)``: two callers
@@ -127,15 +127,8 @@ class UCSchema(DatabricksPath, Singleton):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_SCHEMA
 
-    # Per-class singleton cache so this surface stays separated from
-    # :class:`UCCatalog`, :class:`UCTable`, :class:`Volume`, and the
-    # rest of the project's :class:`Singleton` users. No companion
-    # lock — :class:`ExpiringDict.get_or_set` is GIL-atomic.
+    NAMESPACE_PREFIX: ClassVar[str] = "/Schemas"
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
-    # Cache every schema under the singleton convention — the cached
-    # ``SchemaInfo`` and tag state are worth keeping for the
-    # process lifetime so navigation through ``catalogs[name][schema]``
-    # / ``tables`` doesn't keep refetching.
     _SINGLETON_TTL: ClassVar[Any] = None
 
     @classmethod
@@ -275,17 +268,44 @@ class UCSchema(DatabricksPath, Singleton):
     def size(self) -> int:
         return 0
 
-    def full_path(self) -> str:
-        return self.full_name()
+    @property
+    def parent(self) -> "IO | None":
+        return self.catalog
 
-    def _stat(self) -> IOStats:
-        return self._stat_uncached()
+    @property
+    def parents(self) -> "Iterator[IO]":
+        yield self.catalog
+
+    def full_path(self) -> str:
+        return f"{self.NAMESPACE_PREFIX}{self.catalog_name}/{self.schema_name}"
+
+    def _from_url(self, url: URL) -> "DatabricksPath":
+        parts = url.parts
+        n = len(parts)
+
+        if n <= 1:
+            return self
+        elif n == 2:
+            # /<catalog>
+            return self.catalog
+        elif n == 3:
+            # /<catalog>/<schema> — this schema itself
+            return self
+        elif n == 4:
+            # /<catalog>/<schema>/<table_or_volume>
+            return self.table(parts[3])
+        else:
+            raise ValueError(
+                f"URL {url} has too many parts to resolve against a Schema "
+                f"(got {n}, expected 1-4)."
+            )
 
     def _stat_uncached(self) -> IOStats:
+        infos = self.read_infos(default=None)
+        kind = IOKind.MISSING if infos is None else IOKind.DIRECTORY
+
         return IOStats(
-            size=0,
-            mtime=0.0,
-            kind=IOKind.DIRECTORY if self.exists else IOKind.MISSING,
+            kind=kind,
             media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_SCHEMA,
         )
 
@@ -318,8 +338,11 @@ class UCSchema(DatabricksPath, Singleton):
         *,
         singleton_ttl: Any = False,
     ) -> Iterator["Path"]:
-        del recursive, singleton_ttl
-        return iter(())
+        for volume in self.service.volumes.list(catalog_name=self.catalog_name, schema_name=self.schema_name):
+            if recursive:
+                yield from volume.ls(recursive=recursive, singleton_ttl=singleton_ttl)
+            else:
+                yield volume
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents
@@ -464,7 +487,33 @@ class UCSchema(DatabricksPath, Singleton):
         object.__setattr__(self, "_infos_fetched_at", now)
         return self._infos
 
-    @property
+    def read_infos(self, default: Any = ...):
+        now = time.time()
+
+        if self._infos is not None:
+            age = now - (self._infos_fetched_at or 0.0)
+            if self._infos_ttl is None or age < self._infos_ttl:
+                return self._infos
+            logger.debug(
+                "Cache expired for schema %r (age=%.0fs, ttl=%.0fs) — refreshing",
+                self, age, self._infos_ttl,
+            )
+
+        logger.debug("Fetching schema info for %r from remote", self)
+        try:
+            infos = self.client.workspace_client().schemas.get(full_name=self.full_name())
+        except Exception:
+            if default is ...:
+                return default
+
+            logger.warning(f"Schema {self.full_name(safe=True)} not found", exc_info=True)
+            return default
+
+        logger.info("Fetched schema info for %r from remote", self)
+        object.__setattr__(self, "_infos", infos)
+        object.__setattr__(self, "_infos_fetched_at", now)
+        return infos
+
     def exists(self) -> bool:
         """``True`` if this schema is reachable via the Unity Catalog API."""
         try:
@@ -568,7 +617,7 @@ class UCSchema(DatabricksPath, Singleton):
         storage_root: str | None = None,
     ) -> "UCSchema":
         """Create this schema if it does not already exist, then return ``self``."""
-        if not self.exists:
+        if not self.exists():
             self.create(
                 comment=comment,
                 properties=properties,

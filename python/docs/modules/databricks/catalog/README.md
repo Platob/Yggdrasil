@@ -41,7 +41,7 @@ cat = Catalog(client=client, name="analytics")
 cat.create(missing_ok=True, comment="Analytics catalog")
 
 # Check existence
-print(cat.exists)
+print(cat.exists())
 
 # Delete
 cat.delete(if_exists=True)
@@ -66,7 +66,7 @@ for table in schema.tables():
 
 # Create / ensure
 schema.create(missing_ok=True, comment="Raw landing zone")
-print(schema.exists)
+print(schema.exists())
 schema.delete(if_exists=True)
 ```
 
@@ -90,7 +90,7 @@ print(orders.schema_name)             # "sales"
 print(orders.owner)
 print(orders.storage_location)        # Delta path
 print(orders.data_source_format)      # "DELTA"
-print(orders.exists)
+print(orders.exists())
 
 # Create from Arrow schema
 schema = pa.schema([

@@ -39,7 +39,6 @@ from databricks.sdk.service.catalog import (
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
-from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema, Schema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
@@ -55,16 +54,16 @@ from yggdrasil.databricks.sql.sql_utils import (
 )
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.url import URL
-from yggdrasil.io.holder import IO
-from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.path import Path
-from yggdrasil.io.primitive import ParquetFile
-from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.execution.expr import (
     Predicate,
 )
 from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
+from yggdrasil.io.holder import IO
+from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.path import Path
+from yggdrasil.url import URL
 
 from ..fs import VolumePath
 from ..volume import Volume
@@ -934,15 +933,8 @@ class Table(DatabricksPath):
     volume slot are shared across views into the same UC resource.
     """
 
-    # Per-class singleton cache — keeps Table singletons separated
-    # from :class:`UCCatalog`, :class:`UCSchema`, :class:`Volume`,
-    # and the rest of the project's :class:`Singleton` users. No
-    # companion lock — :class:`ExpiringDict.get_or_set` is GIL-atomic.
+    NAMESPACE_PREFIX: ClassVar[str] = "/Tables/"
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
-    # Cache every Table under the singleton convention; the cached
-    # ``TableInfo`` / columns / staging-volume slot are worth keeping
-    # for the process lifetime so navigation through
-    # ``schema['<table>']`` doesn't keep refetching.
     _SINGLETON_TTL: ClassVar[Any] = None
 
     @classmethod
@@ -1019,13 +1011,44 @@ class Table(DatabricksPath):
 
         return cls._INSTANCES.get_or_set(key, _build, ttl=ttl_arg)
 
+    @property
+    def parent(self):
+        return self.schema
+
+    @property
+    def parents(self) -> "Iterator[DatabricksPath]":
+        yield self.schema
+        yield self.catalog
+
     def _stat_uncached(self) -> IOStats:
+        infos = self.read_infos(default=None)
+        kind = IOKind.MISSING if infos is None else IOKind.DIRECTORY
+
         return IOStats(
-            size=0,
-            mtime=0,
-            kind=IOKind.DIRECTORY if self.exists else IOKind.MISSING,
+            kind=kind,
             media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_TABLE
         )
+
+    def _from_url(self, url: URL) -> "DatabricksPath":
+        parts = url.parts
+        n = len(parts)
+
+        if n <= 1:
+            return self
+        elif n == 2:
+            # /<catalog>
+            return self.catalog
+        elif n == 3:
+            # /<catalog>/<schema>
+            return self.schema
+        elif n == 4:
+            # /<catalog>/<schema>/<table> — this table itself
+            return self
+        else:
+            raise ValueError(
+                f"URL {url} has too many parts to resolve against a Table "
+                f"(got {n}, expected 1-4)."
+            )
 
     def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
         raise NotImplementedError("Table is a read-only resource")
@@ -1035,7 +1058,7 @@ class Table(DatabricksPath):
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents, exist_ok
-        if not self.exists:
+        if not self.exists():
             raise NotImplementedError("Table is a read-only resource")
 
     def _ls(
@@ -1055,7 +1078,7 @@ class Table(DatabricksPath):
         self.delete(wait=wait, missing_ok=missing_ok)
 
     def full_path(self) -> str:
-        return self.full_name()
+        return f"{self.NAMESPACE_PREFIX}{self.catalog_name}/{self.schema_name}/{self.table_name}"
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_TABLE
 
@@ -1349,7 +1372,7 @@ class Table(DatabricksPath):
         try:
             execution = self.sql.execute(query)
         except Exception:
-            if not self.exists and options.target:
+            if not self.exists() and options.target:
                 self.create(options.target)
                 s: pa.Schema = options.target.to_arrow_schema()
                 yield pa.RecordBatch.from_pylist([], schema=s)
@@ -1389,7 +1412,7 @@ class Table(DatabricksPath):
         try:
             execution = self.sql.execute(query)
         except Exception:
-            if not self.exists and options.target:
+            if not self.exists() and options.target:
                 self.create(options.target)
                 s: pa.Schema = options.target.to_spark_schema()
                 return options.get_spark_session(
@@ -1597,7 +1620,6 @@ class Table(DatabricksPath):
     # Databricks SDK — lazy-loaded properties
     # =========================================================================
 
-    @property
     def exists(self) -> bool:
         try:
             _ = self.infos
@@ -1629,6 +1651,28 @@ class Table(DatabricksPath):
             len(self._columns), getattr(infos, "table_type", None),
         )
         return infos
+
+    def read_infos(self, default: Any = ...):
+        """Basic :class:`TableInfo` — TTL-cached."""
+        if self._infos is not None and self._is_fresh(self._infos_fetched_at):
+            return self._infos
+
+        info = self.client.tables.find_table_remote(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            table_name=self.table_name,
+            default=None
+        )
+
+        if info is None:
+            if default is ...:
+                raise NotFound(
+                    f"Volume {self.full_name(safe=True)} not found"
+                )
+            return None
+
+        self._store_infos(info)
+        return info
 
     @property
     def infos(self) -> TableInfo:
@@ -2027,7 +2071,7 @@ class Table(DatabricksPath):
         if data_source_format is None:
             data_source_format = DataSourceFormat.DELTA if table_type == TableType.MANAGED else DataSourceFormat.PARQUET
 
-        if self.exists:
+        if self.exists():
             data_source_format = self.infos.data_source_format
 
             if mode == Mode.OVERWRITE and data_source_format == DataSourceFormat.DELTA:
@@ -2088,7 +2132,7 @@ class Table(DatabricksPath):
         enable_deletion_vectors: bool | None = None,
         target_file_size: int | None = None,
         column_mapping_mode: str | None = None,
-        auto_tag: bool = True,
+        auto_tag: bool = False,
         record_ygg_properties: bool = True,
     ) -> "Table":
         schema_info = DataSchema.from_any(description)
@@ -2443,7 +2487,7 @@ class Table(DatabricksPath):
         columns + storage + properties — so the behaviour ends up
         symmetric with :meth:`sql_create`.
         """
-        if missing_ok and self.exists:
+        if missing_ok and self.exists():
             return self
 
         schema_info = DataSchema.from_any(definition).autotag()
@@ -3324,13 +3368,6 @@ class Table(DatabricksPath):
 
         prepared = _prepare_batch(sql_texts)
 
-        logger.debug(
-            "Arrow insert into table %r (mode=%s, match_by=%s, "
-            "statements=%d, retry=%s)",
-            target_location, mode_enum.name, match_by, len(prepared),
-            retry_active,
-        )
-
         batch = self.sql.execute_many(
             statements=prepared,
             wait=wait,
@@ -3649,7 +3686,7 @@ class Table(DatabricksPath):
         if mode_enum == Mode.OVERWRITE and not match_by:
             self.delete(wait=True, missing_ok=True, delete_staging=False)
 
-        if not self.exists:
+        if not self.exists():
             target_field = cast_options.target
             if target_field is not None:
                 self.create(

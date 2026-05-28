@@ -864,7 +864,7 @@ class MimeTypes:
     )
 
     # --- Filesystem containers ---
-    FOLDER = MimeType.define(
+    DIRECTORY = MimeType.define(
         MimeType(
             "FOLDER",
             # `inode/directory` is what `file --mime-type` returns on

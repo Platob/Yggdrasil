@@ -148,7 +148,7 @@ class TestSchemaIntegration(_SchemaFixture):
         self.assertIs(resolved, direct)
 
     def test_schema_exists_after_create(self) -> None:
-        self.assertTrue(self.schema.exists)
+        self.assertTrue(self.schema.exists())
 
     def test_schema_full_name(self) -> None:
         self.assertEqual(

@@ -44,14 +44,14 @@ from databricks.sdk.service.catalog import (
     VolumeInfo,
     VolumeOperation,
 )
-
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.enums import Mode, ModeLike, Scheme
-from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
-from yggdrasil.databricks.client import DatabricksResource
-from yggdrasil.dataclasses import Singleton
+from yggdrasil.databricks.client import DatabricksClient
+from yggdrasil.databricks.path import DatabricksPath
+from yggdrasil.dataclasses import Singleton, WaitingConfig
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
+from yggdrasil.enums import Mode, ModeLike, Scheme, IOKind, MediaTypes
+from yggdrasil.io import IOStats
 from yggdrasil.url import URL
 
 if TYPE_CHECKING:
@@ -66,7 +66,7 @@ __all__ = ["Volume"]
 logger = logging.getLogger(__name__)
 
 
-class Volume(DatabricksResource, Singleton):
+class Volume(DatabricksPath):
     """A single Unity Catalog volume — metadata, credentials, storage path.
 
     Construct via :meth:`Volumes.volume` /
@@ -79,16 +79,8 @@ class Volume(DatabricksResource, Singleton):
     """
 
     DEFAULT_INFO_TTL: ClassVar[float] = 1800.0  # 30 minutes
-
-    # Per-class singleton cache so this surface stays separated from
-    # :class:`UCCatalog`, :class:`UCSchema`, :class:`UCTable`, and
-    # the rest of the project's :class:`Singleton` users. No
-    # companion lock — :class:`ExpiringDict.get_or_set` is GIL-atomic.
+    NAMESPACE_PREFIX: ClassVar[str] = "/Volumes/"
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
-    # Cache every Volume under the singleton convention; the cached
-    # ``VolumeInfo`` and credentials refresher are worth keeping for
-    # the process lifetime so navigation / repeated reads don't keep
-    # refetching.
     _SINGLETON_TTL: ClassVar[Any] = None
 
     @classmethod
@@ -163,35 +155,34 @@ class Volume(DatabricksResource, Singleton):
         schema_name: str | None = None,
         volume_name: str | None = None,
         *,
+        client: DatabricksClient | None = None,
         infos: VolumeInfo | None = None,
         infos_fetched_at: float | None = None,
         infos_ttl: float | None = None,
         singleton_ttl: "int | None" = ...,
     ) -> None:
-        # ``singleton_ttl`` is consumed by ``__new__``; accept here so
-        # the auto-init pass after ``__new__`` doesn't trip on it.
         del singleton_ttl
-        # Singleton-cached instances are re-entered on every constructor
-        # call (Python always invokes __init__ after __new__). Skip the
-        # second pass so the live cache survives — but rebind the service
-        # so the latest workspace handle wins, and accept newer ``infos``
-        # so callers can refresh the cached entry through the constructor.
+
+        if service is None:
+            from .volumes import Volumes
+            service = Volumes.current() if client is None else Volumes(client=client)
+
         if getattr(self, "_initialized", False):
             if service is not None:
                 self.service = service
             if infos is not None:
                 self._store_infos(infos, fetched_at=infos_fetched_at)
             return
-        if service is None:
-            from .volumes import Volumes
-            service = Volumes.current()
-        super().__init__(service=service)
+
         self.catalog_name = str(catalog_name)
         self.schema_name = str(schema_name)
         self.volume_name = str(volume_name)
-        self._infos_ttl: float = (
-            self.DEFAULT_INFO_TTL if infos_ttl is None else float(infos_ttl)
-        )
+
+        super().__init__(service=service, url=URL(
+            scheme=self.scheme,
+            path=f"{self.NAMESPACE_PREFIX}{self.catalog_name}/{self.schema_name}/{self.volume_name}"
+        ))
+        self._infos_ttl: float = self.DEFAULT_INFO_TTL if infos_ttl is None else float(infos_ttl)
         self._infos: Optional[VolumeInfo] = infos
         self._infos_fetched_at: Optional[float] = (
             infos_fetched_at if (infos is not None and infos_fetched_at is not None)
@@ -215,6 +206,23 @@ class Volume(DatabricksResource, Singleton):
     def name(self) -> str:
         return self.volume_name
 
+    def _from_url(self, url: URL) -> "DatabricksPath":
+        parts = url.parts
+        n = len(parts)
+
+        if n <= 1:
+            return self
+        elif n == 2:
+            return self.catalog
+        elif n == 3:
+            c, s = parts[1:3]
+            return self.service.schemas.schema(catalog_name=c, schema_name=s)
+        elif n == 4:
+            c, s, v = parts[1:4]
+            return self.service.volume(catalog_name=c, schema_name=s, volume_name=v)
+        else:
+            raise ValueError(f"URL {url} has too many parts to resolve against a Volume (got {n}, expected 1-4).")
+
     def __str__(self) -> str:
         return self.full_name()
 
@@ -233,15 +241,10 @@ class Volume(DatabricksResource, Singleton):
     # ── URL ───────────────────────────────────────────────────────────────────
 
     @property
-    def url(self) -> URL:
-        """Workspace UI URL pointing at this volume's Catalog Explorer page."""
+    def explore_url(self) -> URL:
         return self.client.base_url.with_path(
             f"/explore/data/volumes/{self.catalog_name}/{self.schema_name}/{self.volume_name}"
         )
-
-    @property
-    def explore_url(self) -> URL:
-        return self.url
 
     @classmethod
     def from_url(cls, url: "URL | str", **kwargs: Any) -> "Volume":
@@ -382,7 +385,7 @@ class Volume(DatabricksResource, Singleton):
         """Cached :class:`VolumeInfo` (5-minute TTL by default)."""
         return self.read_info()
 
-    def read_info(self, *, refresh: bool = False) -> VolumeInfo:
+    def read_info(self, *, refresh: bool = False, default: Any = ...) -> VolumeInfo:
         """Return the SDK's :class:`VolumeInfo` for this volume.
 
         Refreshes whenever the cached entry is past
@@ -394,13 +397,26 @@ class Volume(DatabricksResource, Singleton):
         if not refresh and self._is_fresh():
             return self._infos  # type: ignore[return-value]
 
+        info = None
         try:
             info = self.client.workspace_client().volumes.read(self.full_name())
         except Exception as exc:
             if not _looks_like_not_found(exc):
-                raise
-            self._ensure_volume()
-            info = self.client.workspace_client().volumes.read(self.full_name())
+                if default is ...:
+                    raise
+                logger.warning(f"Volume {self.full_name(safe=True)} not found", exc_info=True)
+                return default
+
+        if info is None:
+            try:
+                self._ensure_volume()
+                info = self.client.workspace_client().volumes.read(self.full_name())
+            except Exception:
+                if default is ...:
+                    raise
+                logger.warning(f"Volume {self.full_name(safe=True)} not found", exc_info=True)
+                return default
+
         return self._store_infos(info)
 
     def _ensure_volume(self) -> None:
@@ -610,6 +626,15 @@ class Volume(DatabricksResource, Singleton):
             )
         return self._schema
 
+    @property
+    def parent(self) -> "DatabricksPath | None":
+        return self.schema
+
+    @property
+    def parents(self) -> "Iterator[DatabricksPath]":
+        yield self.schema
+        yield self.catalog
+
     def path(
         self,
         sub: str = "",
@@ -686,7 +711,7 @@ class Volume(DatabricksResource, Singleton):
         volume_type: Any = None,
     ) -> "Volume":
         """Create this volume if it does not already exist, then return ``self``."""
-        if not self.exists:
+        if not self.exists():
             self.create(
                 comment=comment,
                 storage_location=storage_location,
@@ -803,6 +828,31 @@ class Volume(DatabricksResource, Singleton):
         )
         return self
 
+    def _stat_uncached(self) -> IOStats:
+        infos = self.read_info(default=None)
+
+        return IOStats(
+            kind=IOKind.MISSING if infos is None else IOKind.DIRECTORY,
+            media_type=MediaTypes.DIRECTORY
+        )
+
+    def _ls(self, recursive: bool = False, *, singleton_ttl: Any = False) -> Iterator["VolumePath"]:
+        pass
+
+    def full_path(self) -> str:
+        return f"/Volumes/{self.catalog_name}/{self.schema_name}/{self.volume_name}"
+
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
+        self.create()
+        return None
+
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
+        self.delete(wait=wait)
+        return None
+
+    def _remove_dir(self, recursive: bool, missing_ok: bool, wait: WaitingConfig) -> None:
+        self.delete(wait=wait)
+        return None
 
 # ---------------------------------------------------------------------------
 # Helpers — shared with VolumePath via re-export from

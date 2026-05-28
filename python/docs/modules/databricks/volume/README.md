@@ -43,7 +43,7 @@ print(vol.owner)
 print(vol.comment)
 print(vol.storage_location())    # s3://bucket/path or abfss://...
 print(vol.volume_id)
-print(vol.exists)
+print(vol.exists())
 print(vol.explore_url)           # Databricks UI link
 ```
 
@@ -61,7 +61,7 @@ vol.create(missing_ok=True, comment="Raw landing area")
 # Ensure with a single call (idempotent)
 vol.ensure_created(comment="Raw landing area")
 
-print(vol.exists)
+print(vol.exists())
 ```
 
 ## Delete

@@ -176,14 +176,14 @@ class TestTableLifecycleIntegration(_TableFixture):
     table_prefix = "yg_lifecycle"
 
     def test_exists_after_create(self) -> None:
-        self.assertTrue(self.table.exists)
+        self.assertTrue(self.table.exists())
 
     def test_ensure_created_is_idempotent(self) -> None:
         # Second ensure_created on a same-shape table must NOT raise —
         # the AUTO mode path returns self.
         result = self.table.ensure_created(_sample_schema())
         self.assertIs(result, self.table)
-        self.assertTrue(self.table.exists)
+        self.assertTrue(self.table.exists())
 
     def test_or_replace_resets_table_in_place(self) -> None:
         # Drop a row in so we can detect the replacement.
@@ -193,7 +193,7 @@ class TestTableLifecycleIntegration(_TableFixture):
             or_replace=True,
         )
         self.assertIs(replaced, self.table)
-        self.assertTrue(self.table.exists)
+        self.assertTrue(self.table.exists())
         count = self.client.sql(
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
@@ -274,7 +274,7 @@ class TestTableInfoIntegration(_TableFixture):
             f"{self.catalog_name}.{self.schema_name}."
             f"yg_ghost_{secrets.token_hex(4)}"
         )
-        self.assertFalse(ghost.exists)
+        self.assertFalse(ghost.exists())
 
 
 @pytest.mark.integration
@@ -566,7 +566,7 @@ class TestTableCloneIntegration(_TableFixture):
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(f"Cannot clone table: {exc}.")
         self.assertEqual(cloned.table_name, target_name)
-        self.assertTrue(cloned.exists)
+        self.assertTrue(cloned.exists())
         rows = self.client.sql(
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
@@ -588,7 +588,7 @@ class TestTableCloneIntegration(_TableFixture):
             first = self.table.clone(target_name)
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(f"Cannot clone table: {exc}.")
-        self.assertTrue(first.exists)
+        self.assertTrue(first.exists())
         # Second call with missing_ok must not raise even though the
         # target is already there.
         self.table.clone(target_name, missing_ok=True)
@@ -629,7 +629,7 @@ class TestTableViewIntegration(_TableFixture):
             )
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(f"Cannot create view: {exc}.")
-        self.assertTrue(view.exists)
+        self.assertTrue(view.exists())
         _ = view.infos  # warm the cache so ``is_view`` reads from it
         self.assertTrue(view.is_view)
         self.assertIsNotNone(view.view_definition)
@@ -673,7 +673,7 @@ class TestTableViewIntegration(_TableFixture):
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(f"Cannot rename view: {exc}.")
         self.assertEqual(view.table_name, new_name)
-        self.assertTrue(view.exists)
+        self.assertTrue(view.exists())
 
 
 @pytest.mark.integration
@@ -718,7 +718,7 @@ class TestTableStoragePathIntegration(_TableFixture):
                 f"Cannot create staging volume {volume.full_name()}: {exc}."
             )
         try:
-            self.assertTrue(volume.exists)
+            self.assertTrue(volume.exists())
         finally:
             # The fixture's tearDownClass also drops the staging volume
             # via ``Table.delete(delete_staging=True)``; calling it

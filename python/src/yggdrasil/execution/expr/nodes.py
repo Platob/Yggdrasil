@@ -266,17 +266,23 @@ class Expression:
     def __and__(self, other: "ExpressionLike") -> "Logical":
         return Logical(LogicalOp.AND, (self, _coerce(other)))
 
+    and_ = __and__
+
     def __rand__(self, other: "ExpressionLike") -> "Logical":
         return Logical(LogicalOp.AND, (_coerce(other), self))
 
     def __or__(self, other: "ExpressionLike") -> "Logical":
         return Logical(LogicalOp.OR, (self, _coerce(other)))
 
+    or_ = __or__
+
     def __ror__(self, other: "ExpressionLike") -> "Logical":
         return Logical(LogicalOp.OR, (_coerce(other), self))
 
     def __invert__(self) -> "Not":
         return Not(self)
+
+    invert = __invert__
 
     # ------------------------------------------------------------------
     # Named membership / null / cast / alias helpers — lifted up to

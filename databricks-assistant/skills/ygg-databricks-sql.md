@@ -98,7 +98,7 @@ tbl.delete()   # drop table
 ### Inspect
 
 ```python
-tbl.exists
+tbl.exists()
 tbl.schema         # yggdrasil Schema
 tbl.arrow_schema   # pyarrow.Schema
 tbl.columns        # list[Field]

@@ -129,7 +129,7 @@ class TestSchemaLifecycleIntegration(_SchemaFixture):
     """``create`` / ``ensure_created`` / ``update`` / ``delete`` round-trips."""
 
     def test_exists_after_create(self) -> None:
-        self.assertTrue(self.schema.exists)
+        self.assertTrue(self.schema.exists())
 
     def test_ensure_created_is_idempotent(self) -> None:
         # Second ensure_created call must NOT raise — the
@@ -138,7 +138,7 @@ class TestSchemaLifecycleIntegration(_SchemaFixture):
             comment="yggdrasil schema integration",
         )
         self.assertIs(result, self.schema)
-        self.assertTrue(self.schema.exists)
+        self.assertTrue(self.schema.exists())
 
     def test_create_missing_ok_false_raises_on_existing(self) -> None:
         with self.assertRaises(DatabricksError):
@@ -211,7 +211,7 @@ class TestSchemaInfoIntegration(_SchemaFixture):
         ghost = self.client.schemas(
             catalog_name=self.catalog_name,
         ).schema(schema_name=f"yg_ghost_{secrets.token_hex(4)}")
-        self.assertFalse(ghost.exists)
+        self.assertFalse(ghost.exists())
 
 
 @pytest.mark.integration

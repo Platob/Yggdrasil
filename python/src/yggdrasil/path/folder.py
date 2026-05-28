@@ -182,7 +182,7 @@ class Folder(Path):
     leaking across long-running workers.
     """
 
-    mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
+    mime_type: ClassVar[MimeTypes] = MimeTypes.DIRECTORY
 
     __slots__ = (
         "path",

@@ -189,6 +189,9 @@ def _resolve_databricks_subclass(
     from .fs.dbfs_path import DBFSPath
     from .fs.volume_path import VolumePath
     from .fs.workspace_path import WorkspacePath
+    from .table.table import Table
+    from .schema.schema import UCSchema
+    from .catalog.catalog import UCCatalog
 
     candidate: "URL | None" = url
     if candidate is None and isinstance(data, URL):
@@ -207,20 +210,8 @@ def _resolve_databricks_subclass(
     candidate = _strip_dbfs_family_prefix(candidate)
     scheme = (candidate.scheme or "").lower()
 
-    if scheme == Scheme.DATABRICKS_VOLUME.value:
-        # Dispatch by path-segment count under the ``/Volumes/`` namespace
-        # so the Unity Catalog hierarchy maps cleanly onto the URL:
-        #
-        #   ``/Volumes``                      → :class:`VolumePath` (root)
-        #   ``/Volumes/cat``                  → :class:`Catalog`
-        #   ``/Volumes/cat/sch``              → :class:`Schema`
-        #   ``/Volumes/cat/sch/vol``          → :class:`Volume`
-        #   ``/Volumes/cat/sch/vol/<rest>``   → :class:`VolumePath`
-        #
-        # Catalog / Schema / Volume are off-family resources (not
-        # :class:`DatabricksPath` subclasses) — :meth:`DatabricksPath.__new__`
-        # routes them through their own :meth:`from_url` constructor.
-        parts = [p for p in (candidate.path or "/").lstrip("/").split("/") if p]
+    if scheme == VolumePath.scheme.value:
+        parts = candidate.parts
         depth = len(parts)
         if depth == 1:
             from yggdrasil.databricks.catalog.catalog import UCCatalog
@@ -240,24 +231,14 @@ def _resolve_databricks_subclass(
     if scheme == Scheme.DATABRICKS_DBFS.value:
         return DBFSPath, candidate
     if scheme == Scheme.DATABRICKS_TABLE.value:
-        # :class:`Table` lives in ``yggdrasil.databricks.table.table``
-        # and is *not* a :class:`DatabricksPath` subclass — it's a
-        # logical Unity Catalog resource on the same ``dbfs+...``
-        # family. The dispatcher still surfaces it here so callers
-        # that go through ``DatabricksPath(...)`` don't have to know
-        # the SQL module exists.
         from yggdrasil.databricks.table.table import Table
 
         return Table, candidate
     if scheme == Scheme.DATABRICKS_CATALOG.value:
-        # ``dbfs+catalog:///cat`` — explicit catalog URL form. Routes
-        # to the same :class:`Catalog` resource the volume-path dispatch
-        # picks for ``dbfs+volume:///cat``.
         from yggdrasil.databricks.catalog.catalog import UCCatalog
 
         return UCCatalog, candidate
     if scheme == Scheme.DATABRICKS_SCHEMA.value:
-        # ``dbfs+schema:///cat/sch`` — explicit schema URL form.
         from yggdrasil.databricks.schema.schema import UCSchema
 
         return UCSchema, candidate
@@ -273,7 +254,7 @@ def _resolve_databricks_subclass(
 # ===========================================================================
 
 
-class DatabricksPath(DatabricksResource, RemotePath):
+class DatabricksPath(RemotePath, DatabricksResource):
     """Abstract :class:`RemotePath` for Databricks namespaces.
 
     Mutualizes the :class:`DatabricksResource` surface — ``self.service``,
@@ -305,26 +286,13 @@ class DatabricksPath(DatabricksResource, RemotePath):
 
     scheme: ClassVar[Scheme] = Scheme.DBFS
 
-    # Per-class singleton cache for the DatabricksPath dispatcher
-    # itself. Concrete subclasses override with their OWN dict so
-    # each surface (DBFS / Volumes / Workspace) keeps independent
-    # storage. No companion lock — :class:`ExpiringDict.get_or_set`
-    # (called by :class:`Singleton.__new__`) is GIL-atomic.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,
         max_size=10_000,
     )
 
-    #: Canonical POSIX prefix for the legacy string shape
-    #: (``/dbfs/``, ``/Workspace/``, ``/Volumes/``). Empty on the
-    #: abstract base; concrete subclasses override.
     NAMESPACE_PREFIX: ClassVar[Optional[str]] = None
 
-    #: :class:`DatabricksService` subclass to use as the default when
-    #: a path is constructed without an explicit ``service=`` / ``client=``.
-    #: Each concrete subclass declares its typed service
-    #: (:class:`DBFSService` / :class:`Volumes` / :class:`Workspaces`)
-    #: so ``self.service`` is always the right collection-level handle.
     _SERVICE_CLASS: ClassVar[type] = DatabricksService
 
     @classmethod
@@ -452,20 +420,15 @@ class DatabricksPath(DatabricksResource, RemotePath):
             from .fs.dbfs_path import DBFSPath
             from .fs.volume_path import VolumePath
             from .fs.workspace_path import WorkspacePath
+            from .table.table import Table
+            from .catalog.catalog import UCCatalog
+            from .schema.schema import UCSchema
 
-            if target in (DBFSPath, VolumePath, WorkspacePath):
+            if target in (DBFSPath, VolumePath, WorkspacePath, UCSchema, UCCatalog):
                 if normalized is not None:
                     data = None
                     url = normalized
                 instance = target.__new__(target, data=data, url=url, **kwargs)
-                # The dispatcher just normalized the seed via
-                # ``_resolve_databricks_subclass``; stash it on the
-                # target instance so the auto-fired ``__init__``
-                # skips the re-parse. ``target.__new__`` itself
-                # only re-stashes when it had to do the work
-                # locally — here ``url=`` arrived pre-normalized
-                # so the inner ``__new__`` doesn't see the
-                # POSIX seed.
                 if normalized is not None and not getattr(
                     instance,
                     "_initialized",
@@ -516,18 +479,6 @@ class DatabricksPath(DatabricksResource, RemotePath):
             else:
                 service = self._SERVICE_CLASS.current()
 
-        # ``__new__`` already normalized POSIX-string seeds into a
-        # canonical URL and stashed the result on the instance — pick
-        # it up and skip the ``_coerce_to_url_str`` + ``URL.from_`` +
-        # ``_strip_dbfs_family_prefix`` chain we'd otherwise repeat.
-        # The stash is keyed to the seed that produced it, so callers
-        # passing an explicit ``url=`` kwarg still go through the
-        # parse path below (no stash was made for that case). The
-        # stash lives in a process-wide id-keyed dict, not on
-        # ``self.__dict__``, so popping it doesn't leave a dummy
-        # slot that every later ``_stat_cached_fresh`` / ``size`` /
-        # ``exists`` hit has to probe past — CPython retains dummy
-        # entries from popped keys until the dict is rebuilt.
         pending = _PENDING_URL_STASH.pop(id(self), None)
         if pending is not None:
             url = pending
@@ -561,12 +512,17 @@ class DatabricksPath(DatabricksResource, RemotePath):
                     if not url.scheme:
                         url = url.with_scheme(target_token)
 
-        super().__init__(
-            service=service,
+        RemotePath.__init__(
+            self,
             data=data,
             url=url,
             temporary=temporary,
             **kwargs,
+        )
+        DatabricksResource.__init__(
+            self,
+            service=service,
+
         )
 
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep

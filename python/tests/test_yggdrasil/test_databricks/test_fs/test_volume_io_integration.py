@@ -220,7 +220,12 @@ class TestVolumePandasRoundTrip(_VolumeIOFixture, PandasTestCase):
             self.assertFrameEqual(loaded, df)
         finally:
             path.unlink(missing_ok=True)
-
+    
+    def test_storage_path(self):
+        v = self.volume / "external"
+        
+        assert v.client is self.volume.client
+    
 
 @pytest.mark.integration
 class TestVolumeNavigation(_VolumeIOFixture):
