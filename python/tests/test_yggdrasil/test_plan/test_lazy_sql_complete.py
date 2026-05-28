@@ -846,6 +846,72 @@ class TestQualifyExecution:
         assert result.read_arrow_table().num_rows == 3
 
 
+class TestValuesInFrom:
+    def test_values_no_column_list(self):
+        node = parse_sql(
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t",
+            dialect="databricks",
+        )
+        result = node.execute()
+        rows = result.read_arrow_table().to_pylist()
+        assert len(rows) == 2
+
+    def test_values_with_column_list(self):
+        node = parse_sql(
+            "SELECT * FROM (VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')) "
+            "AS t(id, name)",
+            dialect="databricks",
+        )
+        result = node.execute()
+        rows = result.read_arrow_table().to_pylist()
+        assert rows == [
+            {"id": 1, "name": "alice"},
+            {"id": 2, "name": "bob"},
+            {"id": 3, "name": "carol"},
+        ]
+
+    def test_values_in_cte(self):
+        node = parse_sql(
+            "WITH lookup AS ("
+            "  SELECT * FROM (VALUES "
+            "    (1, 'Station_A', '/europe/wind'), "
+            "    (2, 'Station_B', '/europe/solar')"
+            "  ) AS t(content_id, content_name, content_path)"
+            ") "
+            "SELECT * FROM lookup",
+            dialect="databricks",
+        )
+        result = node.execute()
+        rows = result.read_arrow_table().to_pylist()
+        assert len(rows) == 2
+        assert rows[0]["content_name"] == "Station_A"
+
+    def test_values_join_with_data(self):
+        data = ArrowTabular(pa.table({
+            "id": [1, 2, 3],
+            "val": [10, 20, 30],
+        }))
+        node = parse_sql(
+            "SELECT d.val, m.name FROM data d "
+            "JOIN (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS m(id, name) "
+            "ON d.id = m.id",
+            dialect="databricks",
+        )
+        result = node.execute(tables={"data": data})
+        rows = result.read_arrow_table().to_pylist()
+        assert len(rows) == 3
+
+    def test_values_roundtrip(self):
+        sql_in = "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)"
+        node = parse_sql(sql_in, dialect="databricks")
+        emitted = node.to_sql(dialect="databricks")
+        assert "VALUES" in emitted
+        node2 = parse_sql(emitted, dialect="databricks")
+        result = node2.execute()
+        rows = result.read_arrow_table().to_pylist()
+        assert len(rows) == 2
+
+
 class TestLambdaParser:
     def test_transform_lambda(self):
         node = parse_sql(

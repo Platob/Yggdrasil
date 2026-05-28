@@ -28,7 +28,7 @@ from yggdrasil.execution.expr.nodes import (
 )
 
 from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
-from .ops import CTE, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef
+from .ops import CTE, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef, ValuesRef
 
 if TYPE_CHECKING:
     pass
@@ -132,6 +132,16 @@ def _emit_from(item: Any, d: Dialect) -> str:
     if isinstance(item, SubqueryRef):
         inner = _emit(item.plan, d)
         return f"({inner}) {_quote_ident(item.alias, d)}"
+    if isinstance(item, ValuesRef):
+        rows = ", ".join(
+            "(" + ", ".join(_emit_expr(v, d) for v in row) + ")"
+            for row in item.values
+        )
+        sql = f"(VALUES {rows}) {_quote_ident(item.alias, d)}"
+        if item.columns:
+            cols = ", ".join(_quote_ident(c, d) for c in item.columns)
+            sql += f" ({cols})"
+        return sql
     if isinstance(item, JoinClause):
         left_sql = _emit_from(item.left, d)
         right_sql = _emit_from(item.right, d)

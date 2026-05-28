@@ -109,5 +109,18 @@ class OrderByOp:
     keys: list[tuple[str, bool]]  # (column, ascending)
 
 
+@dataclasses.dataclass(slots=True)
+class ValuesRef:
+    """An inline ``VALUES (...), (...) AS alias [(col1, col2, ...)]`` in FROM.
+
+    Carries the raw row data (list of lists of Expression nodes) and
+    optional column aliases. The executor materialises it as an
+    in-memory table by evaluating each row's literal/expression values.
+    """
+    values: list  # list[list[Expression]]
+    alias: str = "_values"
+    columns: list[str] | None = None
+
+
 # Type alias for anything that can appear in a FROM clause
-FromItem = TableRef | SubqueryRef | JoinClause | LateralViewItem
+FromItem = TableRef | SubqueryRef | JoinClause | LateralViewItem | ValuesRef

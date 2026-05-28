@@ -440,15 +440,47 @@ class SQLQueryParser:
                 self._expect_kind("rparen")
                 alias = self._parse_optional_alias()
                 return SubqueryRef(plan=sub, alias=alias or "_subquery")
+            if self._is_kw("VALUES"):
+                # (VALUES (...), (...)) [AS] alias [(col1, col2, ...)]
+                return self._parse_values_from_item(in_parens=True)
             inner = self._parse_from_clause()
             self._expect_kind("rparen")
             return inner
+        # Bare VALUES at FROM start (no parens, less common but accepted)
+        if self._is_kw("VALUES"):
+            return self._parse_values_from_item(in_parens=False)
         # String literal as path/URL source: FROM '/path/to/file.parquet'
         if self.cur.kind == "string":
             path = self._eat().text
             alias = self._parse_optional_alias()
             return TableRef(name=path, alias=alias)
         return self._parse_table_ref()
+
+    def _parse_values_from_item(self, in_parens: bool) -> Any:
+        """Parse ``VALUES (...), (...) AS alias [(col_aliases)]`` as a from-item.
+
+        Returns a ValuesRef carrying the row data plus optional column
+        aliases; the executor materialises it as an in-memory table.
+        """
+        from .ops import ValuesRef
+        self._expect_kw("VALUES")
+        values = self._parse_values_list()
+        if in_parens:
+            self._expect_kind("rparen")
+        self._accept_kw("AS")
+        alias = None
+        col_aliases: list[str] = []
+        if self.cur.kind in ("ident", "keyword") and not self._is_kw(*self._CLAUSE_KW):
+            alias = self._eat().text
+            if self.cur.kind == "lparen":
+                self._eat()
+                while self.cur.kind != "rparen":
+                    col_aliases.append(self._ident_or_kw().text)
+                    if self.cur.kind == "comma":
+                        self._eat()
+                self._expect_kind("rparen")
+        return ValuesRef(values=values, alias=alias or "_values",
+                         columns=col_aliases or None)
 
     def _parse_table_ref(self) -> TableRef:
         parts: list[str] = [self._ident_or_kw().text]

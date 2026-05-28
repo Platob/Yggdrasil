@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
-from .ops import JoinClause, SubqueryRef, TableRef
+from .ops import JoinClause, SubqueryRef, TableRef, ValuesRef
 
 if TYPE_CHECKING:
     from yggdrasil.io.tabular import Tabular
@@ -70,11 +70,34 @@ def _resolve_from(item: Any, tables: dict[str, "Tabular"], predicate: Any = None
         raise ValueError(f"Table {name!r} not found. Available: {sorted(tables)}")
     if isinstance(item, SubqueryRef):
         return _exec(item.plan, tables)
+    if isinstance(item, ValuesRef):
+        return _exec_values(item)
     if isinstance(item, JoinClause):
         return _exec_join(item, tables)
     if isinstance(item, PlanNode):
         return _exec(item, tables)
     raise TypeError(f"Cannot resolve FROM item: {type(item).__name__}")
+
+
+def _exec_values(ref: ValuesRef) -> "Tabular":
+    """Materialise an inline VALUES row set into an ArrowTabular."""
+    from yggdrasil.arrow.tabular import ArrowTabular
+    from yggdrasil.execution.expr.nodes import Literal
+
+    if not ref.values:
+        return ArrowTabular(pa.table({}))
+    n_cols = len(ref.values[0])
+    names = ref.columns or [f"col{i}" for i in range(n_cols)]
+    if len(names) < n_cols:
+        names = list(names) + [f"col{i}" for i in range(len(names), n_cols)]
+    columns: dict[str, list] = {n: [] for n in names[:n_cols]}
+    for row in ref.values:
+        for i, cell in enumerate(row[:n_cols]):
+            if isinstance(cell, Literal):
+                columns[names[i]].append(cell.value)
+            else:
+                columns[names[i]].append(cell)
+    return ArrowTabular(pa.table(columns))
 
 
 def _is_in_memory(t: "Tabular") -> bool:
