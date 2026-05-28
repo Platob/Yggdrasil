@@ -92,7 +92,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         function_service=app.state.function_service,
         environment_service=app.state.environment_service,
     )
-    app.state.dag_service = DagService(
+    # v1 DAG service lives at v1_dag_service so the v2 router (which uses
+    # state.dag_service) can own the canonical name. v1 router's deps fall
+    # back to state.v1_dag_service when present.
+    app.state.v1_dag_service = DagService(
         settings,
         function_service=app.state.function_service,
         environment_service=app.state.environment_service,
@@ -123,7 +126,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.pyenv_service = pyenv
     app.state.pyfunc_service = pyfunc
     app.state.pyfuncrun_service = pyfuncrun
-    app.state.v2_dag_service = v2_dag
+    app.state.dag_service = v2_dag      # canonical: v2 owns this slot
+    app.state.v2_dag_service = v2_dag   # kept as alias for older code
     app.state.backend_service = backend
     app.state.network_service = network
     app.state.replicate_service = replicate
