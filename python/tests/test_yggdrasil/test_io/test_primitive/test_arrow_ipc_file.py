@@ -399,3 +399,22 @@ class TestWriteArrowTableBypassesBatchHook:
         ).read_arrow_table()
         assert reread.num_rows == 0
         assert reread.schema.field("id").type == pa.int64()
+
+    def test_cursor_opened_in_overwrite_mode_takes_fast_path(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """``path.open("wb")`` gives a cursor with parent.mode =
+        OVERWRITE — ``holder_is_overwrite`` is True, so the override
+        skips the merge path even when the underlying file has bytes."""
+        path = LocalPath(str(tmp_path / "x.arrow"))
+        with path.open("wb") as cursor:
+            cursor.write_arrow_table(pa.table({"id": [1, 2, 3]}))
+
+        calls = self._counting_patch(monkeypatch)
+        with path.open("wb") as cursor:
+            assert isinstance(cursor, ArrowIPCFile)
+            cursor.write_arrow_table(pa.table({"id": [99]}))
+        assert calls["n"] == 0
+
+        with path.open("rb") as cursor:
+            assert cursor.read_arrow_table().column("id").to_pylist() == [99]

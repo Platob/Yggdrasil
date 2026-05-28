@@ -333,6 +333,31 @@ class TestWriteArrowTableBypassesBatchHook:
         assert reread.num_rows == 0
         assert reread.schema.field("id").type == pa.int64()
 
+    def test_cursor_opened_in_overwrite_mode_takes_fast_path(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """``path.open("wb")`` gives a cursor with parent.mode = OVERWRITE
+        — ``holder_is_overwrite`` is True, so the override's
+        ``has_existing`` check short-circuits to False even when the
+        underlying file already contains bytes. The fast path runs."""
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        path = LocalPath(str(tmp_path / "x.parquet"))
+        # Pre-populate so the file is non-empty on disk.
+        with path.open("wb") as cursor:
+            cursor.write_arrow_table(pa.table({"id": [1, 2, 3]}))
+
+        calls = self._counting_patch(monkeypatch)
+        # Re-open with "wb" — cursor.holder_is_overwrite must skip
+        # the merge path even though path.size > 0 on disk.
+        with path.open("wb") as cursor:
+            assert isinstance(cursor, ParquetFile)
+            cursor.write_arrow_table(pa.table({"id": [99]}))
+        assert calls["n"] == 0
+
+        with path.open("rb") as cursor:
+            assert cursor.read_arrow_table().column("id").to_pylist() == [99]
+
 
 class TestPandasIndexRoundTrip(__import__(
     "yggdrasil.pandas.tests", fromlist=["PandasTestCase"],
