@@ -465,3 +465,110 @@ class TestParquetWriteBenchmarks(ArrowTestCase):
             report.add(f"batches={n:<4d} (max_chunksize={bs})", ms, nbytes)
             self.assertGreater(nbytes, 0)
         report.flush()
+
+
+# ---------------------------------------------------------------------------
+# write_arrow_table fast path vs the batch hook
+# ---------------------------------------------------------------------------
+
+
+def _write_table_via_override(table: pa.Table) -> bytes:
+    """OVERWRITE through ``ParquetFile.write_arrow_table`` — the
+    fast path I just added.  One ``ParquetWriter.write_table`` C
+    call, no Python-level batch iteration."""
+    io_obj = ParquetFile()
+    io_obj.write_arrow_table(table)
+    return bytes(io_obj.getvalue())
+
+
+def _write_table_via_batch_hook(table: pa.Table) -> bytes:
+    """OVERWRITE through ``ParquetFile._write_arrow_batches`` —
+    the pre-override shape that loops calling
+    ``writer.write_batch(batch)`` per batch.  Used to measure the
+    cost the fast path removes."""
+    io_obj = ParquetFile()
+    io_obj._write_arrow_batches(iter(table.to_batches()), ParquetOptions())
+    return bytes(io_obj.getvalue())
+
+
+def _read_table_via_override(payload: bytes) -> pa.Table:
+    """``read_arrow_table`` through the override — single
+    ``pq.ParquetFile.read`` call."""
+    io_obj = ParquetFile()
+    io_obj.write_bytes(payload, 0)
+    return io_obj.read_arrow_table()
+
+
+def _read_table_via_batch_hook(payload: bytes) -> pa.Table:
+    """Materialize ``_read_arrow_batches`` then stitch via
+    ``pa.Table.from_batches`` — the base class shape the override
+    replaces."""
+    io_obj = ParquetFile()
+    io_obj.write_bytes(payload, 0)
+    batches = list(io_obj._read_arrow_batches(ParquetOptions()))
+    return pa.Table.from_batches(batches)
+
+
+@unittest.skipUnless(_benchmark_mode(), "set YGG_BENCHMARK=1 to run benchmarks")
+class TestParquetTableOverrideBenchmark(ArrowTestCase):
+    """Wall-clock measurement of the ``_write_arrow_table`` /
+    ``_read_arrow_table`` overrides vs forcing the batch hook.
+
+    The override should be measurably faster on a sufficiently large
+    table because pyarrow lays out row groups in one C-level call
+    rather than N ``writer.write_batch`` hops through Python."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.n_rows = _bench_rows()
+        cls.numeric = _make_numeric_table(cls.n_rows)
+        cls.mixed = _make_mixed_table(cls.n_rows)
+
+    def test_write_override_vs_batch_hook_numeric(self) -> None:
+        report = _BenchReport(
+            f"write override vs batch hook (numeric, n={self.n_rows})"
+        )
+        ms_fast, nb_fast = _time_write(
+            lambda: _write_table_via_override(self.numeric),
+        )
+        ms_slow, nb_slow = _time_write(
+            lambda: _write_table_via_batch_hook(self.numeric),
+        )
+        report.add("write_arrow_table  (override)", ms_fast, nb_fast)
+        report.add("write_arrow_batches(batch hk)", ms_slow, nb_slow)
+        self.assertGreater(nb_fast, 0)
+        self.assertGreater(nb_slow, 0)
+        report.flush()
+
+    def test_write_override_vs_batch_hook_mixed(self) -> None:
+        report = _BenchReport(
+            f"write override vs batch hook (mixed, n={self.n_rows})"
+        )
+        ms_fast, nb_fast = _time_write(
+            lambda: _write_table_via_override(self.mixed),
+        )
+        ms_slow, nb_slow = _time_write(
+            lambda: _write_table_via_batch_hook(self.mixed),
+        )
+        report.add("write_arrow_table  (override)", ms_fast, nb_fast)
+        report.add("write_arrow_batches(batch hk)", ms_slow, nb_slow)
+        report.flush()
+
+    def test_read_override_vs_batch_hook(self) -> None:
+        # Seed the buffer once via the fast path, then time both
+        # read shapes against the same parquet bytes.
+        payload = _write_table_via_override(self.mixed)
+        report = _BenchReport(
+            f"read override vs batch hook (mixed, n={self.n_rows})"
+        )
+        t0 = time.perf_counter()
+        fast = _read_table_via_override(payload)
+        ms_fast = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
+        slow = _read_table_via_batch_hook(payload)
+        ms_slow = (time.perf_counter() - t0) * 1000.0
+        report.add("read_arrow_table  (override)", ms_fast, fast.num_rows)
+        report.add("read_arrow_batches(batch hk)", ms_slow, slow.num_rows)
+        self.assertEqual(fast.num_rows, slow.num_rows)
+        report.flush()

@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import decimal
+import logging
 import os
 import random
 import time
@@ -47,6 +48,8 @@ if TYPE_CHECKING:
     from yggdrasil.execution.expr import Predicate
 
 __all__ = ["ConcurrentDeltaCommitError", "DeltaFolder", "DeltaOptions"]
+
+logger = logging.getLogger(__name__)
 
 
 class ConcurrentDeltaCommitError(RuntimeError):
@@ -168,6 +171,10 @@ class DeltaFolder(Folder):
             set(target_schema.names) if target_schema is not None else None
         )
         for add in snap.prune_files(prune_values=prune):
+            logger.debug(
+                "DeltaFolder read: AddFile path=%s size=%d dv=%s",
+                add.path, add.size, add.deletion_vector,
+            )
             dv = decode_deletion_vector(add.deletion_vector, table_root=self.path,
                                         sidecar_cache=sidecar_cache)
             leaf = ParquetFile(holder=snap.resolve(add), owns_holder=False)
@@ -175,21 +182,31 @@ class DeltaFolder(Folder):
             try:
                 with leaf as opened:
                     for batch in opened._read_arrow_batches(leaf_opts):
-                        # Databricks DBR with row-tracking enabled
-                        # (auto-on for DV tables) stamps internal
+                        # Databricks DBR auto-enables row tracking on
+                        # DV tables, which both stamps internal
                         # ``_row-id-col-<uuid>`` /
                         # ``_row-commit-version-col-<uuid>`` columns
-                        # onto AddFiles created post-feature-enable.
-                        # Drop anything not in the table's logical
-                        # schema so mixed-schema AddFiles concatenate
-                        # cleanly via ``pa.Table.from_batches``.
-                        if (target_field_names is not None
-                                and not target_field_names.issuperset(
-                                    batch.schema.names)):
-                            batch = batch.select([
-                                n for n in batch.schema.names
-                                if n in target_field_names
-                            ])
+                        # onto post-feature AddFiles AND flips the
+                        # nullability metadata on existing columns
+                        # across files. Project to the table's
+                        # canonical schema names AND re-wrap each
+                        # batch with ``target_schema``'s field
+                        # metadata so ``pa.Table.from_batches`` can
+                        # concatenate cleanly across heterogeneous
+                        # files.
+                        if (target_schema is not None
+                                and batch.schema != target_schema):
+                            present = [
+                                n for n in target_schema.names
+                                if n in batch.schema.names
+                            ]
+                            if present:
+                                batch = pa.record_batch(
+                                    [batch.column(n) for n in present],
+                                    schema=pa.schema([
+                                        target_schema.field(n) for n in present
+                                    ]),
+                                )
                         masked = mask_batch_with_dv(batch, dv, base_offset=base_offset)
                         base_offset += batch.num_rows
                         if masked.num_rows == 0:

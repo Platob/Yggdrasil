@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import logging
 import struct
 import uuid as _uuid
 from typing import TYPE_CHECKING, Iterable, Optional, Set
@@ -13,6 +14,8 @@ from yggdrasil.io.nested.delta.protocol import DeletionVectorDescriptor
 if TYPE_CHECKING:
     import pyarrow as pa
     from yggdrasil.path import Path
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DeletionVector", "DeletionVectorDescriptor",
@@ -238,19 +241,43 @@ def decode_deletion_vector(
 
     offset = int(descriptor.offset or 0)
     size = int(descriptor.size_in_bytes or 0)
+    logger.debug(
+        "decode_deletion_vector: storage=%s pathOrInline=%r offset=%d "
+        "size=%d -> sidecar=%s",
+        storage, raw_path, offset, size, sidecar_path,
+    )
     cache_key = f"{sidecar_path.full_path()}|{offset}|{size}"
     cached = sidecar_cache.get(cache_key) if sidecar_cache is not None else None
     if cached is None:
         try:
             with sidecar_path.open("rb") as bio:
                 bio.seek(offset); raw = bio.read(size + 8)
-            if raw and len(raw) >= 4:
-                fs = struct.unpack(">I", raw[:4])[0]
-                cached = bytes(raw[4:4 + fs]) if 0 < fs <= size else bytes(raw[:size])
-            else: cached = b""
-        except Exception: cached = b""
+            # File layout per Delta protocol:
+            #   <4 bytes BE size header><size bytes payload><4 bytes BE CRC>
+            # The previous code took ``raw[:size]`` when the BE size
+            # header didn't fit ``0 < fs <= size`` (which it never does
+            # — the header value is size+4 for CRC), folding the header
+            # into the payload and truncating the actual DV bytes. Slice
+            # off the header and take exactly ``size`` bytes of payload.
+            if size > 0 and len(raw) >= 4 + size:
+                cached = bytes(raw[4:4 + size])
+            else:
+                cached = b""
+                logger.warning(
+                    "DV sidecar short read: path=%s size=%d got=%d bytes",
+                    sidecar_path, size, len(raw),
+                )
+        except Exception as exc:
+            logger.warning(
+                "DV sidecar read failed: path=%s -> %r", sidecar_path, exc,
+            )
+            cached = b""
         if sidecar_cache is not None: sidecar_cache[cache_key] = cached
-    return DeletionVector(descriptor=descriptor, deleted_rows=_decode_payload(cached))
+    rows = _decode_payload(cached)
+    logger.debug(
+        "DV decoded: %d deleted rows from %s", len(rows), sidecar_path,
+    )
+    return DeletionVector(descriptor=descriptor, deleted_rows=rows)
 
 
 def mask_batch_with_dv(batch: "pa.RecordBatch", dv: Optional[DeletionVector], *,

@@ -769,3 +769,93 @@ class TestLazyTabularVsDatabricksSQL(_DeltaSQLBase):
             self._pylist_of_rows(sql_out, ["id", "val"]),
             self._pylist_of_rows(ygg_out, ["id", "val"]),
         )
+
+
+# ---------------------------------------------------------------------------
+# Table.lazy(sql=...) — submit SQL and read through the Tabular interface
+# ---------------------------------------------------------------------------
+
+
+class TestTableLazySQL(_DeltaSQLBase):
+    """`tbl.lazy(sql="...")` returns a deferred :class:`Tabular`.
+
+    The query runs on the warehouse so the result handle is ready,
+    but the rows aren't materialised until the caller invokes a
+    Tabular hook (read_arrow_table / read_arrow_batches / ...).
+    ``{self}`` in the query string is substituted with this table's
+    quoted full name so callers don't repeat ``tbl.full_name(safe=True)``
+    in every query.
+    """
+
+    def test_lazy_with_self_placeholder(self) -> None:
+        tbl = self._table("lazy_self")
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA"
+        )
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES "
+            "(1, 'a'), (5, 'e'), (10, 'j'), (12, 'l')"
+        )
+
+        out = tbl.lazy(sql="SELECT id, val FROM {self} WHERE id > 5").read_arrow_table()
+        ids = sorted(out.column("id").to_pylist())
+        self.assertEqual(ids, [10, 12])
+
+    def test_lazy_without_placeholder(self) -> None:
+        """A query without ``{self}`` flows through verbatim — the
+        caller is responsible for the FROM clause."""
+        tbl = self._table("lazy_explicit")
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA"
+        )
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES (1), (2), (3)"
+        )
+
+        out = tbl.lazy(
+            sql=f"SELECT COUNT(*) AS n FROM {tbl.full_name()}"
+        ).read_arrow_table()
+        self.assertEqual(out.column("n")[0].as_py(), 3)
+
+    def test_lazy_aggregation_matches_full_scan(self) -> None:
+        """Aggregations via lazy SQL produce the same result as
+        applying the same aggregation against ``DeltaFolder``-side
+        arrow tables — bytes are equal modulo column ordering."""
+        tbl = self._table("lazy_agg")
+        self._execute(
+            f"CREATE TABLE {tbl.full_name()} (region STRING, v DOUBLE) USING DELTA"
+        )
+        self._execute(
+            f"INSERT INTO {tbl.full_name()} VALUES "
+            "('us', 1.0), ('us', 2.0), ('eu', 3.0), ('apac', 4.0)"
+        )
+
+        lazy_out = tbl.lazy(
+            sql="SELECT region, SUM(v) AS s FROM {self} GROUP BY region",
+        ).read_arrow_table()
+        # Cross-check via the storage path.
+        full = self._delta_folder(tbl).read_arrow_table()
+        sums_by_region = {}
+        for region, v in zip(
+            full.column("region").to_pylist(),
+            full.column("v").to_pylist(),
+        ):
+            sums_by_region[region] = sums_by_region.get(region, 0.0) + v
+
+        lazy_pairs = sorted(
+            zip(
+                lazy_out.column("region").to_pylist(),
+                lazy_out.column("s").to_pylist(),
+            )
+        )
+        self.assertEqual(
+            lazy_pairs,
+            sorted(sums_by_region.items()),
+        )
+
+    def test_lazy_returns_self_when_sql_is_none(self) -> None:
+        """``lazy()`` without a SQL argument hands back the table
+        itself so callers can chain on the table's own data without
+        an extra round trip."""
+        tbl = self._table("lazy_self_back")
+        self.assertIs(tbl.lazy(), tbl)

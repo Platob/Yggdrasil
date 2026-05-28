@@ -1549,6 +1549,40 @@ class Table(DatabricksPath):
             *args,
             **kwargs
         )
+
+    def lazy(
+        self,
+        sql: str | PreparedStatement | None = None,
+        **kwargs,
+    ) -> "Tabular":
+        """Return a deferred :class:`Tabular` for *sql* against this table.
+
+        When *sql* is provided, submits the query via
+        :attr:`sql.execute` and returns the resulting
+        :class:`StatementResult` — itself a :class:`Tabular`. The
+        warehouse executes the query eagerly so the result handle is
+        ready, but the rows aren't materialised until the caller
+        invokes a Tabular hook (``read_arrow_table`` /
+        ``read_arrow_batches`` / ``read_pandas_frame`` …)::
+
+            handle = tbl.lazy(sql="SELECT id, val FROM {self} WHERE id > 5")
+            arrow = handle.read_arrow_table()
+
+        ``{self}`` in the query string is substituted with the
+        backtick-quoted full name of this table — saves the caller
+        from concatenating ``tbl.full_name(safe=True)`` into every
+        query. When no ``{self}`` placeholder is present, the SQL
+        flows through verbatim.
+
+        Calling ``lazy()`` with ``sql=None`` returns the table itself
+        (already a :class:`Tabular`) so callers that want to chain on
+        the table's own data hand back the same object.
+        """
+        if sql is None:
+            return self
+        if isinstance(sql, str) and "{self}" in sql:
+            sql = sql.format(self=self.full_name(safe=True))
+        return self.sql.execute(statement=sql, **kwargs)
     
     @property
     def catalog(self) -> "UCCatalog":

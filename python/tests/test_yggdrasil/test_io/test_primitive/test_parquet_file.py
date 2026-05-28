@@ -785,3 +785,60 @@ class TestReadArrowTableBypassesBatchHook:
         out = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
         assert calls["n"] >= 1
         assert out.num_rows == 0
+
+
+class TestFastPathEquivalence:
+    """The fast path (``writer.write_table``) must produce *the same
+    table* on read-back as the slow path (``writer.write_batch`` loop)
+    for the same input. Byte equality is too strict — pyarrow can
+    reorder row groups internally or stamp different write metadata
+    — but the Arrow Table that comes back has to match."""
+
+    @pytest.fixture
+    def fixtures(self):
+        # Numeric only (no string compression variance).
+        numeric = pa.table({
+            "id": pa.array(list(range(10_000)), type=pa.int64()),
+            "x": pa.array([float(i) / 7.0 for i in range(10_000)], type=pa.float64()),
+        })
+        # Mixed types — strings + bools.
+        mixed = pa.table({
+            "id": pa.array(list(range(5_000)), type=pa.int64()),
+            "v": pa.array([f"row-{i}" for i in range(5_000)], type=pa.string()),
+            "flag": pa.array([i % 2 == 0 for i in range(5_000)], type=pa.bool_()),
+        })
+        return {"numeric": numeric, "mixed": mixed}
+
+    def _write_fast(self, table) -> bytes:
+        mem = Memory()
+        ParquetFile(holder=mem, owns_holder=False).write_arrow_table(table)
+        return bytes(mem.to_bytes())
+
+    def _write_slow(self, table) -> bytes:
+        # Force the batch path by writing through _write_arrow_batches.
+        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        mem = Memory()
+        leaf = ParquetFile(holder=mem, owns_holder=False)
+        leaf._write_arrow_batches(iter(table.to_batches()), ParquetOptions())
+        return bytes(mem.to_bytes())
+
+    def test_numeric_round_trip_matches(self, fixtures) -> None:
+        table = fixtures["numeric"]
+        fast = self._write_fast(table)
+        slow = self._write_slow(table)
+        # Read both back via raw pyarrow — independent of yggdrasil.
+        import pyarrow.parquet as _pq
+        fast_table = _pq.read_table(pa.BufferReader(fast))
+        slow_table = _pq.read_table(pa.BufferReader(slow))
+        assert fast_table.equals(slow_table)
+        assert fast_table.equals(table)
+
+    def test_mixed_round_trip_matches(self, fixtures) -> None:
+        table = fixtures["mixed"]
+        fast = self._write_fast(table)
+        slow = self._write_slow(table)
+        import pyarrow.parquet as _pq
+        fast_table = _pq.read_table(pa.BufferReader(fast))
+        slow_table = _pq.read_table(pa.BufferReader(slow))
+        assert fast_table.equals(slow_table)
+        assert fast_table.equals(table)

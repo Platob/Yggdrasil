@@ -490,3 +490,63 @@ class TestReadArrowTableBypassesBatchHook:
         out = ArrowIPCFile(holder=mem, owns_holder=False).read_arrow_table()
         assert calls["n"] >= 1
         assert out.num_rows == 0
+
+
+class TestFastPathEquivalence:
+    """The fast path (``writer.write_table``) must produce *the same
+    table* on read-back as the slow path (``writer.write_batch`` loop).
+    Byte equality is too strict — pyarrow can stamp different IPC
+    block padding — but the materialised Arrow Table has to match."""
+
+    @pytest.fixture
+    def fixtures(self):
+        numeric = pa.table({
+            "id": pa.array(list(range(10_000)), type=pa.int64()),
+            "x": pa.array([float(i) / 7.0 for i in range(10_000)], type=pa.float64()),
+        })
+        mixed = pa.table({
+            "id": pa.array(list(range(5_000)), type=pa.int64()),
+            "v": pa.array([f"row-{i}" for i in range(5_000)], type=pa.string()),
+            "flag": pa.array([i % 2 == 0 for i in range(5_000)], type=pa.bool_()),
+        })
+        return {"numeric": numeric, "mixed": mixed}
+
+    def _write_fast(self, table) -> bytes:
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_arrow_table(table)
+        return bytes(mem.to_bytes())
+
+    def _write_slow(self, table) -> bytes:
+        from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCOptions
+        mem = Memory()
+        leaf = ArrowIPCFile(holder=mem, owns_holder=False)
+        leaf._write_arrow_batches(iter(table.to_batches()), ArrowIPCOptions())
+        return bytes(mem.to_bytes())
+
+    def test_numeric_round_trip_matches(self, fixtures) -> None:
+        table = fixtures["numeric"]
+        fast = self._write_fast(table)
+        slow = self._write_slow(table)
+        import pyarrow.ipc as _ipc
+        fast_table = _ipc.RecordBatchFileReader(
+            pa.BufferReader(fast),
+        ).read_all()
+        slow_table = _ipc.RecordBatchFileReader(
+            pa.BufferReader(slow),
+        ).read_all()
+        assert fast_table.equals(slow_table)
+        assert fast_table.equals(table)
+
+    def test_mixed_round_trip_matches(self, fixtures) -> None:
+        table = fixtures["mixed"]
+        fast = self._write_fast(table)
+        slow = self._write_slow(table)
+        import pyarrow.ipc as _ipc
+        fast_table = _ipc.RecordBatchFileReader(
+            pa.BufferReader(fast),
+        ).read_all()
+        slow_table = _ipc.RecordBatchFileReader(
+            pa.BufferReader(slow),
+        ).read_all()
+        assert fast_table.equals(slow_table)
+        assert fast_table.equals(table)
