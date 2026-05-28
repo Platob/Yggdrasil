@@ -191,6 +191,12 @@ def _render(expr: Expression, dialect: Dialect, *, parent_prec: int) -> str:
         base = _render(expr.expr, dialect, parent_prec=_PREC_LEAF)
         idx = _render(expr.index, dialect, parent_prec=0)
         return f"{base}[{idx}]"
+    from yggdrasil.execution.expr.nodes import Lambda  # local import to avoid cycle
+    if isinstance(expr, Lambda):
+        body = _render(expr.body, dialect, parent_prec=0)
+        if len(expr.params) == 1:
+            return f"{expr.params[0]} -> {body}"
+        return f"({', '.join(expr.params)}) -> {body}"
 
     raise NotImplementedError(
         f"SQL backend does not implement node type {type(expr).__name__}."

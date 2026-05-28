@@ -680,7 +680,54 @@ class SQLQueryParser:
             self._eat(); items.append(self._parse_or())
         return items
 
+    def _try_parse_lambda(self) -> "Expression | None":
+        """Detect ``param -> body`` or ``(p1, p2, ...) -> body`` lambdas.
+
+        Returns the Lambda expression on match, or None if the current
+        position isn't a lambda (caller falls through to normal parsing).
+        Used by higher-order functions like TRANSFORM, FILTER, AGGREGATE.
+        """
+        from yggdrasil.execution.expr.nodes import Lambda
+        saved = self.pos
+        params: list[str] = []
+        if self.cur.kind in ("ident", "keyword"):
+            # Single-param: x -> body
+            nxt, nxt2 = self._peek(1), self._peek(2)
+            if (nxt.kind == "op" and nxt.text == "-"
+                    and nxt2.kind == "op" and nxt2.text == ">"):
+                params.append(self._eat().text)
+                self._eat(); self._eat()  # - >
+                body = self._parse_or()
+                return Lambda(tuple(params), body)
+        elif self.cur.kind == "lparen":
+            # Multi-param: (p1, p2) -> body
+            self._eat()
+            if self.cur.kind not in ("ident", "keyword"):
+                self.pos = saved
+                return None
+            while self.cur.kind in ("ident", "keyword"):
+                params.append(self._eat().text)
+                if self.cur.kind == "comma":
+                    self._eat()
+                    continue
+                break
+            if (self.cur.kind != "rparen"
+                    or self._peek(1).kind != "op" or self._peek(1).text != "-"
+                    or self._peek(2).kind != "op" or self._peek(2).text != ">"):
+                self.pos = saved
+                return None
+            self._eat()  # )
+            self._eat(); self._eat()  # - >
+            body = self._parse_or()
+            return Lambda(tuple(params), body)
+        return None
+
     def _parse_or(self) -> Expression:
+        # Lambda detection — has to happen before arithmetic so `x -> ...`
+        # isn't parsed as `x - (>...)`.
+        lam = self._try_parse_lambda()
+        if lam is not None:
+            return lam
         left = self._parse_and()
         operands: list[Expression] = []
         while self._accept_kw("OR") is not None:
@@ -1066,9 +1113,23 @@ class SQLQueryParser:
     def _parse_exists(self) -> Expression:
         self._expect_kw("EXISTS")
         self._expect_kind("lparen")
-        sub = self._parse_statement()
+        # EXISTS(SELECT ...) → subquery existence check
+        # EXISTS(arr, x -> x > 0) → Databricks higher-order function
+        if self._is_kw("SELECT", "WITH"):
+            sub = self._parse_statement()
+            self._expect_kind("rparen")
+            return FunctionCall(name="EXISTS", args=(Literal(value=str(sub)),))
+        # Higher-order form: parse as a regular function call body
+        args: list[Expression] = []
+        if self.cur.kind != "rparen":
+            while True:
+                args.append(self._parse_or())
+                if self.cur.kind == "comma":
+                    self._eat()
+                    continue
+                break
         self._expect_kind("rparen")
-        return FunctionCall(name="EXISTS", args=(Literal(value=str(sub)),))
+        return FunctionCall(name="EXISTS", args=tuple(args))
 
     # ---- INTERVAL literal ------------------------------------------------
 

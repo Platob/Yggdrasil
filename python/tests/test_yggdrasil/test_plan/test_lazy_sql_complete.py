@@ -846,6 +846,107 @@ class TestQualifyExecution:
         assert result.read_arrow_table().num_rows == 3
 
 
+class TestLambdaParser:
+    def test_transform_lambda(self):
+        node = parse_sql(
+            "SELECT TRANSFORM(arr, x -> x * 2) FROM t",
+            dialect="databricks",
+        )
+        fc = node.projections[0]
+        assert isinstance(fc, FunctionCall)
+        assert fc.name == "TRANSFORM"
+        from yggdrasil.execution.expr.nodes import Lambda
+        assert isinstance(fc.args[1], Lambda)
+        assert fc.args[1].params == ("x",)
+
+    def test_filter_lambda(self):
+        node = parse_sql(
+            "SELECT FILTER(arr, x -> x > 0) FROM t",
+            dialect="databricks",
+        )
+        from yggdrasil.execution.expr.nodes import Lambda
+        fc = node.projections[0]
+        assert isinstance(fc.args[1], Lambda)
+
+    def test_aggregate_multi_param_lambda(self):
+        node = parse_sql(
+            "SELECT AGGREGATE(arr, 0, (acc, x) -> acc + x) FROM t",
+            dialect="databricks",
+        )
+        from yggdrasil.execution.expr.nodes import Lambda
+        fc = node.projections[0]
+        assert isinstance(fc.args[2], Lambda)
+        assert fc.args[2].params == ("acc", "x")
+
+    def test_zip_with_lambda(self):
+        node = parse_sql(
+            "SELECT ZIP_WITH(a, b, (x, y) -> x + y) FROM t",
+            dialect="databricks",
+        )
+        from yggdrasil.execution.expr.nodes import Lambda
+        fc = node.projections[0]
+        assert isinstance(fc.args[2], Lambda)
+        assert fc.args[2].params == ("x", "y")
+
+    def test_exists_higher_order(self):
+        # EXISTS(arr, lambda) is the Databricks higher-order form
+        node = parse_sql(
+            "SELECT EXISTS(arr, x -> x > 0) FROM t",
+            dialect="databricks",
+        )
+        from yggdrasil.execution.expr.nodes import Lambda
+        fc = node.projections[0]
+        assert fc.name == "EXISTS"
+        assert isinstance(fc.args[1], Lambda)
+
+    def test_exists_subquery_still_works(self):
+        # Subquery EXISTS — the older form must still parse
+        node = parse_sql(
+            "SELECT * FROM t WHERE EXISTS(SELECT 1 FROM u WHERE u.id = t.id)"
+        )
+        assert node.where is not None
+
+    def test_lambda_roundtrip_single_param(self):
+        node = parse_sql("SELECT TRANSFORM(arr, x -> x * 2) FROM t", dialect="databricks")
+        sql = node.to_sql(dialect="databricks")
+        assert "->" in sql
+        # Re-parse
+        node2 = parse_sql(sql, dialect="databricks")
+        from yggdrasil.execution.expr.nodes import Lambda
+        assert isinstance(node2.projections[0].args[1], Lambda)
+
+    def test_lambda_roundtrip_multi_param(self):
+        node = parse_sql(
+            "SELECT AGGREGATE(arr, 0, (acc, x) -> acc + x) FROM t",
+            dialect="databricks",
+        )
+        sql = node.to_sql(dialect="databricks")
+        assert "(acc, x) ->" in sql
+
+    def test_lambda_free_columns_excludes_params(self):
+        from yggdrasil.execution.expr import free_columns
+        from yggdrasil.execution.expr.nodes import Lambda
+        node = parse_sql(
+            "SELECT TRANSFORM(my_arr, x -> x + my_offset) FROM t",
+            dialect="databricks",
+        )
+        fc = node.projections[0]
+        cols = free_columns(fc)
+        # 'x' is a lambda param — should not be a free column
+        assert "x" not in cols
+        assert "my_arr" in cols
+        assert "my_offset" in cols
+
+    def test_lambda_with_complex_body(self):
+        node = parse_sql(
+            "SELECT FILTER(arr, x -> CAST(x AS DOUBLE) > 0.5) FROM t",
+            dialect="databricks",
+        )
+        from yggdrasil.execution.expr.nodes import Lambda
+        fc = node.projections[0]
+        assert isinstance(fc.args[1], Lambda)
+
+
 class TestLateralViewExecution:
     def test_explode_simple(self):
         data = ArrowTabular(pa.table({

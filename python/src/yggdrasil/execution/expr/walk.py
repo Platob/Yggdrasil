@@ -22,6 +22,7 @@ from .nodes import (
     FunctionCall,
     InList,
     IsNull,
+    Lambda,
     Like,
     Logical,
     Not,
@@ -86,6 +87,8 @@ def walk(expr: Expression) -> "Iterable[Expression]":
     elif isinstance(expr, Subscript):
         yield from walk(expr.expr)
         yield from walk(expr.index)
+    elif isinstance(expr, Lambda):
+        yield from walk(expr.body)
 
 
 def free_columns(expr: Expression) -> "tuple[str, ...]":
@@ -94,10 +97,13 @@ def free_columns(expr: Expression) -> "tuple[str, ...]":
     Order is first-encounter (pre-order walk), de-duplicated. Used
     by the Python backend to build a value-resolution closure and
     by the schema emitter to advertise the predicate's input
-    surface.
+    surface. Lambda parameters are bound locally and excluded.
     """
     seen: "dict[str, None]" = {}
+    bound: set[str] = set()
     for node in walk(expr):
-        if isinstance(node, Column):
+        if isinstance(node, Lambda):
+            bound.update(node.params)
+        elif isinstance(node, Column) and node.name not in bound:
             seen.setdefault(node.name, None)
     return tuple(seen)
