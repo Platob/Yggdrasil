@@ -73,6 +73,7 @@ from typing import Any, Callable, TypeVar, overload
 
 __all__ = [
     "function", "dag", "schedule", "on_node",
+    "step", "pipeline", "cron", "auto_dispatch",
     "FunctionHandle", "FunctionRun", "DagHandle",
     "get_input", "set_output",
 ]
@@ -905,3 +906,113 @@ def set_output(key: str = "result", value: Any = None) -> None:
         existing[key] = value
         with open(outputs_file, "w") as f:
             json.dump(existing, f)
+
+
+# ---------------------------------------------------------------------------
+# Additional sugar decorators
+# ---------------------------------------------------------------------------
+
+
+def step(func=None, **decorator_kwargs):
+    """Alias for @function -- semantic sugar for DAG steps.
+
+    Usage::
+
+        @step
+        def extract(): ...
+
+        @step(name="custom_name")
+        def transform(): ...
+    """
+    return function(func, **decorator_kwargs)
+
+
+def pipeline(name: str, *handles, description: str = ""):
+    """Create a DAG by passing handles directly. Cleaner than ``dag(name, h1 >> h2 >> h3)``.
+
+    Usage::
+
+        @function
+        def extract(): ...
+        @function
+        def transform(): ...
+        @function
+        def load(): ...
+
+        etl = pipeline("etl", extract, transform, load)
+        run = etl()
+    """
+    if not handles:
+        raise ValueError("@pipeline requires at least one function")
+    # Build chain manually since handles is variadic
+    if len(handles) == 1:
+        chain = _DagChain([handles[0]])
+    else:
+        chain = handles[0] >> handles[1]
+        for h in handles[2:]:
+            chain = chain >> h
+    return dag(name, chain, description=description)
+
+
+def cron(expression: str):
+    """Schedule a function via cron-like expression. Currently supports simple intervals.
+
+    Usage::
+
+        @cron("every 60s")
+        @function
+        def heartbeat(): ...
+
+        @cron("every 5m")
+        @function
+        def cleanup(): ...
+    """
+    # Parse "every Ns/Nm/Nh" expressions
+    expr = expression.strip().lower()
+    if not expr.startswith("every "):
+        raise ValueError(f"cron expression must be 'every Nunit', got {expression!r}")
+    parts = expr.removeprefix("every ").strip()
+    if parts.endswith("s"):
+        seconds = float(parts[:-1])
+    elif parts.endswith("m"):
+        seconds = float(parts[:-1]) * 60
+    elif parts.endswith("h"):
+        seconds = float(parts[:-1]) * 3600
+    else:
+        raise ValueError(f"unit must be s/m/h, got {parts!r}")
+    return schedule(every_seconds=seconds)
+
+
+def auto_dispatch(handle):
+    """Mark a function to use smart dispatch -- execution routes to least-loaded peer.
+
+    Usage::
+
+        @auto_dispatch
+        @function
+        def heavy_compute(): ...
+    """
+    if not isinstance(handle, FunctionHandle):
+        raise TypeError("@auto_dispatch must wrap a @function-decorated function")
+    original_call = handle.__call__
+
+    def smart_call(*args, **kwargs):
+        # Query local /api/v2/stats to check load
+        try:
+            url = _local_url()
+            resp = urllib.request.urlopen(f"{url}/api/v2/stats", timeout=2)
+            stats = json.loads(resp.read())
+            # If overloaded, query peers
+            if stats.get("active_runs", 0) >= stats.get("cpu_count", 4) and stats.get("peer_count", 0) > 0:
+                peers_resp = urllib.request.urlopen(f"{url}/api/v2/network/peers", timeout=2)
+                peers = json.loads(peers_resp.read()).get("peers", [])
+                if peers:
+                    best = min(peers, key=lambda p: (p.get("active_runs", 0), p.get("cpu_percent", 0)))
+                    peer_url = f"http://{best['host']}:{best['port']}"
+                    return handle.on(peer_url).__call__(*args, **kwargs)
+        except Exception:
+            pass
+        return original_call(*args, **kwargs)
+
+    handle.__call__ = smart_call
+    return handle

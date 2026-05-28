@@ -38,6 +38,10 @@ class PyFuncEntry(StrictModel):
     content_hash: str = ""
     replicated_at: str | None = None
     replicated_from: str | None = None
+    avg_duration_ms: float = 0.0
+    last_duration_ms: float = 0.0
+    success_count: int = 0
+    failure_count: int = 0
 
 
 class PyFuncResponse(StrictModel):
