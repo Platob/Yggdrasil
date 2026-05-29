@@ -311,7 +311,9 @@ class XLSXSheetFile(IO[bytes, XlsxOptions]):
             scratch = _stdlib_io.BytesIO()
             wb_out.save(scratch)
             with self._xlsx_parent.arrow_output_stream() as sink:
-                sink.write(scratch.getvalue())
+                # ``getbuffer()`` is a zero-copy memoryview over the
+                # scratch; ``getvalue()`` would copy the whole workbook.
+                sink.write(scratch.getbuffer())
         finally:
             wb_out.close()
 
