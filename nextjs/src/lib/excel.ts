@@ -122,6 +122,42 @@ export async function readFile(base: string, path: string): Promise<Grid> {
   return arrowToGrid(await fetch(url.toString()));
 }
 
+// -- Saga catalog (any connected node is an entry point to the whole mesh) --
+
+export interface SagaTableRef { catalog: string; schema: string; name: string; full_name: string; }
+
+async function sagaJson<T>(base: string, path: string): Promise<T> {
+  const res = await fetch(`${normalizeBase(base)}/api/v2/saga${path}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  return res.json() as Promise<T>;
+}
+
+export async function sagaCatalogs(base: string): Promise<string[]> {
+  const d = await sagaJson<{ catalogs: { name: string }[] }>(base, "/catalog");
+  return d.catalogs.map((c) => c.name);
+}
+
+export async function sagaTables(base: string, catalog: string): Promise<SagaTableRef[]> {
+  const schemas = await sagaJson<{ schemas: { name: string }[] }>(base, `/catalog/${encodeURIComponent(catalog)}/schema`);
+  const out: SagaTableRef[] = [];
+  for (const s of schemas.schemas) {
+    const ts = await sagaJson<{ tables: SagaTableRef[] }>(base, `/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(s.name)}/table`);
+    out.push(...ts.tables);
+  }
+  return out;
+}
+
+// Run SQL on the connected node and stream the Arrow result into a grid. The
+// node federates the query across the mesh (compute follows the data).
+export async function sagaSql(base: string, sql: string): Promise<Grid> {
+  const res = await fetch(`${normalizeBase(base)}/api/v2/saga/sql.arrow`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sql }),
+  });
+  return arrowToGrid(res);
+}
+
 // Write a grid back to a node file. We ship CSV (trivial to build in JS,
 // and the node parses it) rather than encoding parquet in the browser.
 export async function writeFileCsv(base: string, path: string, grid: Grid): Promise<{ rows: number; columns: number }> {
