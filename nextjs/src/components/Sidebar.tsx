@@ -101,6 +101,13 @@ const Icons = {
       <path d="M11 4c-2 0-3 1.2-3 4v8c0 2.8-1 4-3 4" />
     </svg>
   ),
+  saga: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <ellipse cx="12" cy="5" rx="8" ry="3" />
+      <path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5" />
+      <path d="M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6" />
+    </svg>
+  ),
 };
 
 const NAV_ITEMS = [
@@ -113,6 +120,7 @@ const NAV_ITEMS = [
   { href: "/dags", label: "DAGs", icon: Icons.dags },
   { href: "/chat", label: "Chat", icon: Icons.chat },
   { href: "/files", label: "Files", icon: Icons.files },
+  { href: "/saga", label: "Saga", icon: Icons.saga },
   { href: "/excel", label: "Excel", icon: Icons.excel },
 ];
 

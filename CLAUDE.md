@@ -125,6 +125,7 @@ Core concepts — workstation as remote executor/driver:
 | `/api/v2/tabular` | LazyTabular inspect/preview/write — schema + metadata + bounded typed-row preview (JSON `/preview` or Arrow IPC `/preview.arrow`) + bounded in-place edit (`?node=` proxied). Drives the reusable `TabularModal` |
 | `/api/v2/workbook` | ExcelFile (xlsx) surface — `/sheets` (dims), `/read` (windowed sheet → Arrow IPC), `/edit` (surgical cell/range edits preserving formulas + other sheets). `?node=` proxied |
 | `/api/v2/analysis` | polars **lazy**-over-Arrow analytics (scan + projection/predicate/slice pushdown + streaming) — `/aggregate`, `/describe`, `/finance`, `/series` (adaptive downsample + x-zoom), `/ohlc` (candlesticks). All take `filters` (predicate pushdown). `/export` applies a `Transform` (filters + casts incl. timezone→UTC + projection) and downloads in any media type (csv/parquet/json/ndjson/arrow/xlsx). `?node=` proxied. Drives the `TabularModal` Analyze panel (pivot/series/candles + collapsible filters&casts + Download-as) and `Chart` (bar/line/area/candle, MA overlay, volume panel). Analyze fetches are client-cached |
+| `/api/v2/saga` | **Saga** distributed catalog — `catalog`/`schema`/`table` CRUD hierarchy (column + statistics metadata, `/refresh`, `/discover` folder scan) + SQL editor: `/sql` (bounded JSON grid), `/sql.arrow` (Arrow IPC stream, disk-spilled to `spill_root` when heavy), `/explain` (plan + emitted SQL + referenced tables). Parses via `plan.sql_parser` (default postgres dialect, others supported), executes via `plan.execute` over registered tables and node-rooted file URLs with predicate/projection/limit pushdown. `?node=` proxied; compute follows the data |
 | `/api/v2/user` | User identity (`/me`, list, register from peers) |
 | `/api/v2/messenger` | Chat channels + messages + SSE streaming |
 | `/api/v2/replicate` | Export/import/push/pull node assets between nodes |
@@ -140,6 +141,7 @@ Core concepts — workstation as remote executor/driver:
 | `/dags` | DAG builder — chain functions across nodes |
 | `/chat` | Real-time messenger — channels, messages, SSE live updates |
 | `/files` | Filesystem browser — lazy directory listing, file preview |
+| `/saga` | Distributed catalog — lazy catalog/schema/table tree (column + stats detail) + SQL editor (Run/Explain, dialect + default catalog/schema, results grid, plan view) |
 | `/metrics` | Per-function metrics + recent runs |
 | `/topology` | Neural Mesh — layered brain network visualization |
 
@@ -186,3 +188,5 @@ The `@function` decorator infers: name, source code, dependencies (AST), python 
 | `YGG_NODE_PORT` | 8100 | Node port |
 | `YGG_NODE_FRONT_PORT` | 3000 | Frontend port |
 | `BOT_API_URL` | `http://127.0.0.1:8100` | Frontend → node proxy |
+| `YGG_NODE_TMP_TTL` | 86400 | Seconds before the tmp/spill janitor reclaims a scratch file (1 day) |
+| `YGG_NODE_SAGA_DIALECT` | postgres | Default SQL dialect for the Saga editor |

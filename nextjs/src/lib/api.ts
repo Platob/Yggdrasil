@@ -654,6 +654,104 @@ export function analysisOhlc(
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
+// ── Saga catalog ─────────────────────────────────────────────────────────
+
+export interface ColumnSpec { name: string; dtype: string; nullable: boolean; comment: string; }
+export interface ColumnStat {
+  column: string; null_count: number | null; distinct_count: number | null;
+  min: unknown; max: unknown;
+}
+export interface TableStatistics {
+  row_count: number | null; size_bytes: number | null;
+  columns: ColumnStat[]; computed_at: string | null;
+}
+export interface CatalogEntry {
+  id: number; name: string; comment: string; owner: string; dialect: string;
+  storage_location: string; node_id: string; schema_count: number;
+  properties: Record<string, string>; created_at: string; updated_at: string;
+}
+export interface SchemaEntry {
+  id: number; catalog: string; name: string; full_name: string; comment: string;
+  table_count: number; properties: Record<string, string>; created_at: string; updated_at: string;
+}
+export interface TableEntry {
+  id: number; catalog: string; schema: string; name: string; full_name: string;
+  table_type: string; format: string; source_url: string; node: string | null;
+  comment: string; columns: ColumnSpec[]; statistics: TableStatistics;
+  properties: Record<string, string>; created_at: string; updated_at: string;
+}
+export interface SqlColumn { name: string; dtype: string; }
+export interface SqlResult {
+  node_id: string; columns: SqlColumn[]; rows: (string | number | boolean | null)[][];
+  row_count: number; truncated: boolean; elapsed_ms: number;
+  plan_sql: string; referenced_tables: string[];
+}
+export interface ExplainResult {
+  node_id: string; dialect: string; plan: string; plan_sql: string;
+  referenced_tables: string[]; statement: string;
+}
+
+const sagaNode = (node?: string) => (node ? `?node=${encodeURIComponent(node)}` : "");
+
+export function getCatalogs(node?: string, fresh = false): Promise<{ node_id: string; catalogs: CatalogEntry[] }> {
+  return cachedGet<{ node_id: string; catalogs: CatalogEntry[] }>(`/api/v2/saga/catalog${sagaNode(node)}`, TTL.DEFINITION, jsonFetch, fresh);
+}
+
+export function getSchemas(catalog: string, node?: string, fresh = false): Promise<{ node_id: string; catalog: string; schemas: SchemaEntry[] }> {
+  return cachedGet<{ node_id: string; catalog: string; schemas: SchemaEntry[] }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema${sagaNode(node)}`, TTL.DEFINITION, jsonFetch, fresh);
+}
+
+export function getTables(catalog: string, schema: string, node?: string, fresh = false): Promise<{ node_id: string; catalog: string; schema: string; tables: TableEntry[] }> {
+  return cachedGet<{ node_id: string; catalog: string; schema: string; tables: TableEntry[] }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table${sagaNode(node)}`, TTL.DEFINITION, jsonFetch, fresh);
+}
+
+export function getTable(catalog: string, schema: string, name: string, node?: string): Promise<{ table: TableEntry }> {
+  return jsonFetch(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}${sagaNode(node)}`);
+}
+
+export async function createCatalog(body: { name: string; comment?: string; dialect?: string }): Promise<{ catalog: CatalogEntry }> {
+  const r = await jsonFetch<{ catalog: CatalogEntry }>("/api/v2/saga/catalog", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function createSchema(catalog: string, body: { name: string; comment?: string }): Promise<{ schema: SchemaEntry }> {
+  const r = await jsonFetch<{ schema: SchemaEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema`, { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function createTable(catalog: string, schema: string, body: { name: string; source_url: string; node?: string | null; table_type?: string; comment?: string; infer?: boolean }): Promise<{ table: TableEntry }> {
+  const r = await jsonFetch<{ table: TableEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table`, { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function refreshTable(catalog: string, schema: string, name: string): Promise<{ table: TableEntry }> {
+  const r = await jsonFetch<{ table: TableEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}/refresh`, { method: "POST", body: "{}" });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function deleteCatalogEntity(path: string): Promise<void> {
+  await jsonFetch(`/api/v2/saga/${path}`, { method: "DELETE" });
+  invalidate("saga/catalog");
+}
+
+export async function discoverTables(body: { catalog: string; schema: string; path?: string; node?: string | null; recursive?: boolean }): Promise<{ tables: TableEntry[] }> {
+  const r = await jsonFetch<{ tables: TableEntry[] }>("/api/v2/saga/discover", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export function runSql(body: { sql: string; dialect?: string; catalog?: string; schema?: string; node?: string; limit?: number }): Promise<SqlResult> {
+  return jsonFetch<SqlResult>("/api/v2/saga/sql", { method: "POST", body: JSON.stringify(body) });
+}
+
+export function explainSql(body: { sql: string; dialect?: string; catalog?: string; schema?: string }): Promise<ExplainResult> {
+  return jsonFetch<ExplainResult>("/api/v2/saga/explain", { method: "POST", body: JSON.stringify(body) });
+}
+
 // ── Messenger ──────────────────────────────────────────────────────────────
 
 export function getChannels(fresh = false): Promise<{ node_id: string; channels: ChannelInfo[] }> {
