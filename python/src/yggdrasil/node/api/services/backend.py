@@ -36,6 +36,8 @@ class BackendService:
         self._last_collect: float = 0
         self._active_runs_fn = lambda: 0
         self._total_runs_fn = lambda: 0
+        self._gpu_cache: list[GpuInfo] = []
+        self._gpu_cache_ts: float = 0
 
     def bind_run_counters(self, active_fn, total_fn) -> None:
         self._active_runs_fn = active_fn
@@ -93,7 +95,11 @@ class BackendService:
         except ImportError:
             pass
 
-        gpus = self._collect_gpus()
+        now_mono = time.monotonic()
+        if now_mono - self._gpu_cache_ts > 30.0:
+            self._gpu_cache = self._collect_gpus()
+            self._gpu_cache_ts = now_mono
+        gpus = self._gpu_cache
 
         return NodeBackend(
             node_id=self.settings.node_id,

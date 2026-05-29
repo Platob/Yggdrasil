@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import FastAPI, Request
@@ -22,6 +23,9 @@ from .api.routers import (
     replicate_router as v2_replicate_router,
     user_router as v2_user_router,
 )
+from .api.routers.trading import router as v2_trading_router
+from .api.routers.ai import router as v2_ai_router
+from .api.services.ai import AIService
 from .api.services.audit import AuditLog
 from .api.services.backend import BackendService
 from .api.services.dag import DAGService as V2DagService
@@ -32,6 +36,7 @@ from .api.services.pyfunc import PyFuncService
 from .api.services.pyfuncrun import PyFuncRunService
 from .api.services.messenger import MessengerService as V2MessengerService
 from .api.services.replicate import ReplicateService
+from .api.services.trading import TradingService
 from .api.services.user import UserService
 from .routers import (
     call_router,
@@ -122,6 +127,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     user_svc = UserService(settings)
     v2_messenger = V2MessengerService(settings)
 
+    trading = TradingService(settings)
+    ai = AIService(
+        settings,
+        pyfunc_service=pyfunc,
+        pyfuncrun_service=pyfuncrun,
+        backend_service=backend,
+    )
+
     app.state.fs_service = v2_fs
     app.state.pyenv_service = pyenv
     app.state.pyfunc_service = pyfunc
@@ -133,6 +146,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.replicate_service = replicate
     app.state.user_service = user_svc
     app.state.v2_messenger_service = v2_messenger
+    app.state.trading_service = trading
+    app.state.ai_service = ai
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -178,10 +193,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Aggregate cluster-wide statistics in one call."""
         state = request.app.state
         snap = state.backend_service.snapshot()
-        envs = await state.pyenv_service.list()
-        funcs = await state.pyfunc_service.list()
-        dags = await state.v2_dag_service.list()
-        peers = await state.network_service.get_peers()
+        envs, funcs, dags, peers = await asyncio.gather(
+            state.pyenv_service.list(),
+            state.pyfunc_service.list(),
+            state.v2_dag_service.list(),
+            state.network_service.get_peers(),
+        )
         mem_pct = (
             round(snap.memory_used_mb / snap.memory_total_mb * 100, 1)
             if snap.memory_total_mb else 0
@@ -205,8 +222,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_metrics(request: Request):
         """Detailed metrics: top functions by runs, top by duration, recent activity."""
         state = request.app.state
-        funcs = await state.pyfunc_service.list()
-        runs = await state.pyfuncrun_service.list()
+        funcs, runs = await asyncio.gather(
+            state.pyfunc_service.list(),
+            state.pyfuncrun_service.list(),
+        )
 
         top_by_runs = sorted(funcs.funcs, key=lambda f: f.run_count, reverse=True)[:5]
         top_by_duration = sorted(
@@ -271,35 +290,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get(f"{prefix}/v2/health")
     async def health_check(request: Request):
-        """Health check with subsystem status."""
+        """Health check with subsystem status — all probes run in parallel."""
         state = request.app.state
-        checks: dict = {}
 
-        try:
+        async def _check_backend():
             snap = state.backend_service.snapshot()
-            checks["backend"] = {"status": "ok", "cpu": snap.cpu_percent}
-        except Exception as e:
-            checks["backend"] = {"status": "error", "error": str(e)}
+            return "backend", {"status": "ok", "cpu": snap.cpu_percent}
 
-        try:
+        async def _check_pyenv():
             envs = await state.pyenv_service.list()
-            checks["pyenv"] = {"status": "ok", "count": len(envs.envs)}
-        except Exception as e:
-            checks["pyenv"] = {"status": "error", "error": str(e)}
+            return "pyenv", {"status": "ok", "count": len(envs.envs)}
 
-        try:
+        async def _check_pyfunc():
             funcs = await state.pyfunc_service.list()
-            checks["pyfunc"] = {"status": "ok", "count": len(funcs.funcs)}
-        except Exception as e:
-            checks["pyfunc"] = {"status": "error", "error": str(e)}
+            return "pyfunc", {"status": "ok", "count": len(funcs.funcs)}
 
-        try:
+        async def _check_network():
             peers = await state.network_service.get_peers()
-            checks["network"] = {"status": "ok", "peers": len(peers.peers)}
-        except Exception as e:
-            checks["network"] = {"status": "error", "error": str(e)}
+            return "network", {"status": "ok", "peers": len(peers.peers)}
 
-        all_ok = all(c["status"] == "ok" for c in checks.values())
+        results = await asyncio.gather(
+            _check_backend(), _check_pyenv(), _check_pyfunc(), _check_network(),
+            return_exceptions=True,
+        )
+        checks: dict = {}
+        for r in results:
+            if isinstance(r, Exception):
+                name = getattr(r, "_check_name", "unknown")
+                checks[name] = {"status": "error", "error": str(r)}
+            else:
+                name, data = r
+                checks[name] = data
+
+        all_ok = all(c.get("status") == "ok" for c in checks.values())
         return {
             "status": "healthy" if all_ok else "degraded",
             "node_id": settings.node_id,
@@ -332,6 +355,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(v2_fs_router, prefix=f"{prefix}/v2/fs")
     app.include_router(v2_user_router, prefix=f"{prefix}/v2/user")
     app.include_router(v2_messenger_router, prefix=f"{prefix}/v2/messenger")
+    app.include_router(v2_trading_router, prefix=f"{prefix}/v2/trading")
+    app.include_router(v2_ai_router, prefix=f"{prefix}/v2/ai")
 
     @app.get(f"{prefix}/v2/audit")
     async def get_audit(limit: int = 100):

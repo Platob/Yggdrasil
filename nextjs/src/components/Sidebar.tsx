@@ -62,11 +62,18 @@ const Icons = {
       <circle cx="12" cy="12" r="1" fill="currentColor" />
     </svg>
   ),
+  trading: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" />
+      <polyline points="16 7 22 7 22 13" />
+    </svg>
+  ),
 };
 
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard", icon: Icons.dashboard, exact: true },
   { href: "/", label: "Home", icon: Icons.home, exact: true },
+  { href: "/trading", label: "Trading", icon: Icons.trading },
   { href: "/metrics", label: "Metrics", icon: Icons.metrics },
   { href: "/nodes", label: "Nodes", icon: Icons.nodes },
   { href: "/topology", label: "Topology", icon: Icons.topology },

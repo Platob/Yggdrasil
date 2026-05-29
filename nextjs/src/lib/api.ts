@@ -4,6 +4,8 @@
 // http://127.0.0.1:8100 (or BOT_API_URL) — see nextjs/next.config.ts.
 
 import type {
+  AIAnalysis,
+  AIQueryResponse,
   AuditEntry,
   ChannelInfo,
   ClusterStats,
@@ -16,10 +18,13 @@ import type {
   NodeBackend,
   NodeCard,
   NodeMeta,
+  PortfolioResponse,
   PyEnvEntry,
   PyFuncEntry,
   PyFuncRunEntry,
+  SignalListResponse,
   TopologyResponse,
+  TradeSignal,
   UserCard,
 } from "./types";
 
@@ -303,4 +308,77 @@ export function sendMessage(channel: string, content: string): Promise<Message> 
 
 export function createMessageStream(channel: string): EventSource {
   return new EventSource(`/api/v2/messenger/${encodeURIComponent(channel)}/stream`);
+}
+
+// ── Trading ────────────────────────────────────────────────────────────────
+
+export interface TradeSignalInput {
+  name: string;
+  symbol: string;
+  direction: "buy" | "sell" | "hold";
+  confidence?: number;
+  price?: number | null;
+  metadata?: Record<string, unknown>;
+  func_id?: number | null;
+}
+
+export function emitSignal(input: TradeSignalInput): Promise<{ signal: TradeSignal }> {
+  return jsonFetch<{ signal: TradeSignal }>("/api/v2/trading/signals", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function getSignals(symbol?: string, limit = 50): Promise<SignalListResponse> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (symbol) params.set("symbol", symbol);
+  return jsonFetch<SignalListResponse>(`/api/v2/trading/signals?${params}`);
+}
+
+export function createSignalStream(): EventSource {
+  return new EventSource("/api/v2/trading/signals/stream");
+}
+
+export function getPortfolio(): Promise<PortfolioResponse> {
+  return jsonFetch<PortfolioResponse>("/api/v2/trading/portfolio");
+}
+
+export interface PositionInput {
+  qty: number;
+  avg_price: number;
+  current_price?: number | null;
+}
+
+export function upsertPosition(symbol: string, input: PositionInput): Promise<{ position: unknown }> {
+  return jsonFetch<{ position: unknown }>(`/api/v2/trading/portfolio/${encodeURIComponent(symbol)}`, {
+    method: "PUT",
+    body: JSON.stringify({ symbol, ...input }),
+  });
+}
+
+export function deletePosition(symbol: string): Promise<{ deleted: boolean; symbol: string }> {
+  return jsonFetch<{ deleted: boolean; symbol: string }>(
+    `/api/v2/trading/portfolio/${encodeURIComponent(symbol)}`,
+    { method: "DELETE" },
+  );
+}
+
+// ── AI ─────────────────────────────────────────────────────────────────────
+
+export function getAIStatus(): Promise<{ available: boolean }> {
+  return jsonFetch<{ available: boolean }>("/api/v2/ai/status");
+}
+
+export function analyzeFunc(funcId: number, query?: string): Promise<AIAnalysis> {
+  return jsonFetch<AIAnalysis>("/api/v2/ai/analyze", {
+    method: "POST",
+    body: JSON.stringify({ func_id: funcId, query: query ?? null }),
+  });
+}
+
+export function aiQuery(question: string): Promise<AIQueryResponse> {
+  return jsonFetch<AIQueryResponse>("/api/v2/ai/query", {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
 }

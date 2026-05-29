@@ -94,6 +94,10 @@ node = [
   "psutil>=5.9",
 ]
 
+ai = [
+  "anthropic>=0.40",
+]
+
 mongoengine = [
   "mongoengine>=0.29",
 ]

@@ -345,6 +345,70 @@ export interface Message {
   node_id: string;
 }
 
+// ── Trading ────────────────────────────────────────────────────────────────
+
+export interface TradeSignal {
+  id: number;
+  func_id: number | null;
+  name: string;
+  symbol: string;
+  direction: "buy" | "sell" | "hold";
+  confidence: number;
+  price: number | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  expires_at: string | null;
+}
+
+export interface Position {
+  symbol: string;
+  qty: number;
+  avg_price: number;
+  current_price: number | null;
+  pnl: number | null;
+  pnl_pct: number | null;
+  opened_at: string;
+  updated_at: string;
+}
+
+export interface Portfolio {
+  positions: Position[];
+  total_pnl: number;
+  total_pnl_pct: number;
+  updated_at: string;
+}
+
+export interface SignalListResponse {
+  node_id: string;
+  signals: TradeSignal[];
+}
+
+export interface PortfolioResponse {
+  node_id: string;
+  portfolio: Portfolio;
+}
+
+// ── AI ─────────────────────────────────────────────────────────────────────
+
+export interface AIAnalysis {
+  available: boolean;
+  func_id?: number;
+  func_name?: string;
+  analysis: string;
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
+export interface AIQueryResponse {
+  available: boolean;
+  answer: string;
+  context?: Record<string, unknown>;
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
 // ── User ───────────────────────────────────────────────────────────────────
 
 export interface UserCard {

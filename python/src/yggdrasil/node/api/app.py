@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import FastAPI, Request
@@ -22,6 +23,9 @@ from .routers import (
     replicate_router,
     user_router,
 )
+from .routers.ai import router as ai_router
+from .routers.trading import router as trading_router
+from .services.ai import AIService
 from .services.audit import AuditLog
 from .services.backend import BackendService
 from .services.dag import DAGService
@@ -32,6 +36,7 @@ from .services.pyfunc import PyFuncService
 from .services.pyfuncrun import PyFuncRunService
 from .services.messenger import MessengerService as V2MessengerService
 from .services.replicate import ReplicateService
+from .services.trading import TradingService
 from .services.user import UserService
 
 
@@ -69,6 +74,9 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     user_svc = UserService(settings)
     v2_messenger = V2MessengerService(settings)
 
+    trading = TradingService(settings)
+    ai = AIService(settings, pyfunc_service=pyfunc, pyfuncrun_service=pyfuncrun, backend_service=backend)
+
     app.state.pyenv_service = pyenv
     app.state.pyfunc_service = pyfunc
     app.state.pyfuncrun_service = pyfuncrun
@@ -78,6 +86,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.state.replicate_service = replicate
     app.state.user_service = user_svc
     app.state.v2_messenger_service = v2_messenger
+    app.state.trading_service = trading
+    app.state.ai_service = ai
 
     # -- Middleware ----------------------------------------------------------
 
@@ -120,10 +130,12 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         """Aggregate cluster-wide statistics in one call."""
         state = request.app.state
         snap = state.backend_service.snapshot()
-        envs = await state.pyenv_service.list()
-        funcs = await state.pyfunc_service.list()
-        dags = await state.dag_service.list()
-        peers = await state.network_service.get_peers()
+        envs, funcs, dags, peers = await asyncio.gather(
+            state.pyenv_service.list(),
+            state.pyfunc_service.list(),
+            state.dag_service.list(),
+            state.network_service.get_peers(),
+        )
         mem_pct = (
             round(snap.memory_used_mb / snap.memory_total_mb * 100, 1)
             if snap.memory_total_mb else 0
@@ -147,9 +159,10 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     async def get_metrics(request: Request):
         """Detailed metrics: top functions by runs, top by duration, recent activity."""
         state = request.app.state
-        funcs = await state.pyfunc_service.list()
-        runs = await state.pyfuncrun_service.list()
-
+        funcs, runs = await asyncio.gather(
+            state.pyfunc_service.list(),
+            state.pyfuncrun_service.list(),
+        )
         top_by_runs = sorted(funcs.funcs, key=lambda f: f.run_count, reverse=True)[:5]
         top_by_duration = sorted(
             [f for f in funcs.funcs if f.avg_duration_ms > 0],
@@ -220,35 +233,38 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     @app.get(f"{prefix}/health")
     async def health_check(request: Request):
-        """Health check with subsystem status."""
+        """Health check — all probes run in parallel."""
         state = request.app.state
-        checks: dict = {}
 
-        try:
+        async def _check_backend():
             snap = state.backend_service.snapshot()
-            checks["backend"] = {"status": "ok", "cpu": snap.cpu_percent}
-        except Exception as e:
-            checks["backend"] = {"status": "error", "error": str(e)}
+            return "backend", {"status": "ok", "cpu": snap.cpu_percent}
 
-        try:
+        async def _check_pyenv():
             envs = await state.pyenv_service.list()
-            checks["pyenv"] = {"status": "ok", "count": len(envs.envs)}
-        except Exception as e:
-            checks["pyenv"] = {"status": "error", "error": str(e)}
+            return "pyenv", {"status": "ok", "count": len(envs.envs)}
 
-        try:
+        async def _check_pyfunc():
             funcs = await state.pyfunc_service.list()
-            checks["pyfunc"] = {"status": "ok", "count": len(funcs.funcs)}
-        except Exception as e:
-            checks["pyfunc"] = {"status": "error", "error": str(e)}
+            return "pyfunc", {"status": "ok", "count": len(funcs.funcs)}
 
-        try:
+        async def _check_network():
             peers = await state.network_service.get_peers()
-            checks["network"] = {"status": "ok", "peers": len(peers.peers)}
-        except Exception as e:
-            checks["network"] = {"status": "error", "error": str(e)}
+            return "network", {"status": "ok", "peers": len(peers.peers)}
 
-        all_ok = all(c["status"] == "ok" for c in checks.values())
+        results = await asyncio.gather(
+            _check_backend(), _check_pyenv(), _check_pyfunc(), _check_network(),
+            return_exceptions=True,
+        )
+        checks: dict = {}
+        for r in results:
+            if isinstance(r, Exception):
+                checks.setdefault("error", {"status": "error", "error": str(r)})
+            else:
+                name, data = r
+                checks[name] = data
+
+        all_ok = all(c.get("status") == "ok" for c in checks.values())
         return {
             "status": "healthy" if all_ok else "degraded",
             "node_id": settings.node_id,
@@ -267,6 +283,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(fs_router, prefix=f"{prefix}/fs")
     app.include_router(user_router, prefix=f"{prefix}/user")
     app.include_router(messenger_router, prefix=f"{prefix}/messenger")
+    app.include_router(trading_router, prefix=f"{prefix}/trading")
+    app.include_router(ai_router, prefix=f"{prefix}/ai")
 
     @app.get(f"{prefix}/audit")
     async def get_audit(limit: int = 100):

@@ -2,8 +2,8 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
-import { getStats, getAudit, createFunc, getHealth } from "@/lib/api";
-import type { ClusterStats, AuditEntry, HealthResponse } from "@/lib/types";
+import { getStats, getAudit, createFunc, getHealth, aiQuery, createBackendStream } from "@/lib/api";
+import type { ClusterStats, AuditEntry, HealthResponse, NodeBackend } from "@/lib/types";
 
 // ── Format uptime as "2d 4h" or "12m" etc. ───────────────────
 function formatUptime(seconds: number): string {
@@ -186,6 +186,66 @@ function PulseSparkline({ values, color }: { values: number[]; color: string }) 
   );
 }
 
+// ── AI Query Panel ──────────────────────────────────────────
+function AIPanel() {
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [model, setModel] = useState("");
+
+  const handleQuery = async () => {
+    const q = question.trim();
+    if (!q) return;
+    setLoading(true);
+    setAnswer("");
+    try {
+      const res = await aiQuery(q);
+      setAnswer(res.answer);
+      if (res.model) setModel(res.model.split("-").slice(0, 3).join("-"));
+    } catch (e) {
+      setAnswer(e instanceof Error ? e.message : "Query failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="glass-card p-5 space-y-3">
+      <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="10" />
+          <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3" />
+          <line x1="12" y1="17" x2="12.01" y2="17" strokeWidth="3" strokeLinecap="round" />
+        </svg>
+        AI Assistant
+        {model && <span className="ml-auto font-mono text-muted/50 text-[9px] normal-case">{model}</span>}
+      </h2>
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && handleQuery()}
+          placeholder="Ask about your node, functions, or get optimization tips…"
+          className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-xs font-mono text-foreground placeholder-muted/50 outline-none focus:border-frost/30 transition-colors"
+        />
+        <button
+          onClick={handleQuery}
+          disabled={loading || !question.trim()}
+          className="px-4 py-2 text-xs rounded-lg bg-frost/15 text-frost border border-frost/25 hover:bg-frost/25 disabled:opacity-30 disabled:cursor-not-allowed transition-colors shrink-0"
+        >
+          {loading ? "…" : "Ask"}
+        </button>
+      </div>
+      {answer && (
+        <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.05] text-xs text-foreground-dim font-mono whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto">
+          {answer}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function DashboardPage() {
   const [stats, setStats] = useState<ClusterStats | null>(null);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
@@ -193,6 +253,7 @@ export default function DashboardPage() {
   const [pulseHistory, setPulseHistory] = useState<number[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const sseRef = useRef<EventSource | null>(null);
 
   // New Function modal
   const [newFuncOpen, setNewFuncOpen] = useState(false);
@@ -200,20 +261,6 @@ export default function DashboardPage() {
   const [newFuncCode, setNewFuncCode] = useState("def hello():\n    return 'world'\n");
   const [newFuncSaving, setNewFuncSaving] = useState(false);
   const [newFuncError, setNewFuncError] = useState("");
-
-  const fetchStats = useCallback(async () => {
-    try {
-      const s = await getStats();
-      setStats(s);
-      // Keep a rolling 30-sample history of active_runs for the pulse widget.
-      setPulseHistory((prev) => [...prev.slice(-29), s.active_runs]);
-      setError(false);
-    } catch {
-      setError(true);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
 
   const fetchAudit = useCallback(async () => {
     try {
@@ -246,7 +293,6 @@ export default function DashboardPage() {
       setNewFuncOpen(false);
       setNewFuncName("");
       setNewFuncCode("def hello():\n    return 'world'\n");
-      fetchStats();
       fetchAudit();
     } catch (err) {
       setNewFuncError(err instanceof Error ? err.message : "Create failed");
@@ -255,29 +301,89 @@ export default function DashboardPage() {
     }
   };
 
+  // Initial load
   useEffect(() => {
-    fetchStats();
-    fetchAudit();
-    fetchHealth();
-  }, [fetchStats, fetchAudit, fetchHealth]);
+    Promise.all([getStats(), getAudit(), getHealth()]).then(([s, a, h]) => {
+      setStats(s);
+      setPulseHistory([s.active_runs]);
+      setAudit(a.entries);
+      setHealth(h);
+      setLoading(false);
+    }).catch(() => {
+      setError(true);
+      setLoading(false);
+    });
+  }, [fetchAudit, fetchHealth]);
 
-  // Poll stats every 3s
+  // SSE: live backend stream replaces 3s stat polling for CPU/RAM/run counts.
+  // Stats (func/dag/env counts) still need a REST poll since the SSE stream
+  // only carries NodeBackend, not cluster counts.
   useEffect(() => {
-    const id = setInterval(fetchStats, 3000);
-    return () => clearInterval(id);
-  }, [fetchStats]);
+    let fallbackId: ReturnType<typeof setInterval> | null = null;
 
-  // Poll audit every 5s
-  useEffect(() => {
-    const id = setInterval(fetchAudit, 5000);
-    return () => clearInterval(id);
-  }, [fetchAudit]);
+    const es = createBackendStream();
+    sseRef.current = es;
+    es.onmessage = (e) => {
+      try {
+        const raw = JSON.parse(e.data) as NodeBackend;
+        const backend: NodeBackend = (raw as { backend?: NodeBackend }).backend ?? raw;
+        setStats((prev) => {
+          if (!prev) return prev;
+          const mem_pct = backend.memory_total_mb > 0
+            ? Math.round(backend.memory_used_mb / backend.memory_total_mb * 1000) / 10
+            : prev.memory_percent;
+          return {
+            ...prev,
+            cpu_percent: backend.cpu_percent,
+            memory_percent: mem_pct,
+            active_runs: backend.active_runs,
+            total_runs: backend.total_runs,
+            uptime: backend.uptime_seconds,
+          };
+        });
+        setPulseHistory((prev) => [...prev.slice(-29), backend.active_runs]);
+        setError(false);
+      } catch {
+        // ignore parse errors
+      }
+    };
+    es.onerror = () => {
+      // SSE disconnected; fall back to polling — interval cleaned up in outer return
+      es.close();
+      sseRef.current = null;
+      if (!fallbackId) {
+        fallbackId = setInterval(async () => {
+          try {
+            const s = await getStats();
+            setStats(s);
+            setPulseHistory((prev) => [...prev.slice(-29), s.active_runs]);
+          } catch { /* ignore */ }
+        }, 3000);
+      }
+    };
+    return () => {
+      es.close();
+      sseRef.current = null;
+      if (fallbackId) clearInterval(fallbackId);
+    };
+  }, []);
 
-  // Poll health every 10s
+  // Slow polls: audit every 5s, health every 10s, counts every 15s
   useEffect(() => {
-    const id = setInterval(fetchHealth, 10000);
-    return () => clearInterval(id);
-  }, [fetchHealth]);
+    const audId = setInterval(fetchAudit, 5000);
+    const healthId = setInterval(fetchHealth, 10000);
+    const countsId = setInterval(async () => {
+      try {
+        const s = await getStats();
+        setStats((prev) => prev ? { ...prev, func_count: s.func_count, env_count: s.env_count, dag_count: s.dag_count, scheduled_dags: s.scheduled_dags, peer_count: s.peer_count, gpu_count: s.gpu_count } : s);
+      } catch { /* ignore */ }
+    }, 15000);
+    return () => {
+      clearInterval(audId);
+      clearInterval(healthId);
+      clearInterval(countsId);
+    };
+  }, [fetchAudit, fetchHealth]);
 
   if (loading) {
     return (
@@ -346,7 +452,7 @@ export default function DashboardPage() {
           })()}
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.06]">
             <span className="w-1.5 h-1.5 rounded-full status-online" />
-            <span className="text-[11px] font-mono text-muted">Live - 3s</span>
+            <span className="text-[11px] font-mono text-muted">SSE Live</span>
           </div>
         </div>
       </div>
@@ -470,6 +576,11 @@ export default function DashboardPage() {
           value={String(stats.gpu_count)}
           color={stats.gpu_count > 0 ? "var(--emerald)" : "var(--muted)"}
         />
+      </div>
+
+      {/* AI Assistant */}
+      <div className="relative">
+        <AIPanel />
       </div>
 
       {/* Activity feed */}
