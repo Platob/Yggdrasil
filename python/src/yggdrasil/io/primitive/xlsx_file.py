@@ -41,7 +41,11 @@ from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.io.base import IO
 from yggdrasil.path.memory import Memory
 
-__all__ = ["XLSXFile", "XlsxOptions", "XLSXSheetFile"]
+__all__ = [
+    "XLSXFile", "XlsxOptions", "XLSXSheetFile",
+    # Friendlier names for the workbook surface — same classes.
+    "ExcelFile", "ExcelSheet",
+]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -551,6 +555,128 @@ class XLSXFile(IO[bytes, XlsxOptions]):
         finally:
             wb.close()
 
+    # ==================================================================
+    # Workbook introspection + windowed reads (frontend-facing surface)
+    # ==================================================================
+
+    def sheet_infos(self) -> "list[dict]":
+        """Per-sheet ``{name, rows, cols, visible}`` for the whole workbook.
+
+        One ``read_excel`` pass; the dims come from calamine's sheet metadata
+        so a virtualized grid can size itself before pulling any rows.
+        """
+        if self.size == 0:
+            return []
+        with self.arrow_input_stream() as v:
+            data = v.read()
+        parser = _fastexcel().read_excel(data)
+        infos: list[dict] = []
+        for name in parser.sheet_names:
+            sheet = parser.load_sheet(name, header_row=None)
+            infos.append({
+                "name": name,
+                "rows": int(sheet.total_height),
+                "cols": int(sheet.width),
+                "visible": bool(getattr(sheet, "visible", True)),
+            })
+        return infos
+
+    def read_range(
+        self,
+        sheet_name: str | None = None,
+        *,
+        header: bool = True,
+        skip_rows: int = 0,
+        n_rows: int | None = None,
+        columns: "list[str] | list[int] | None" = None,
+    ) -> pa.Table:
+        """Read a bounded window of a sheet straight into Arrow.
+
+        ``skip_rows`` / ``n_rows`` push the row window down into calamine so a
+        scroll fetch never materializes the whole sheet; ``columns`` selects a
+        column subset. This is the fast path behind the workbook viewport.
+        """
+        if self.size == 0:
+            return pa.table({})
+        with self.arrow_input_stream() as v:
+            data = v.read()
+        parser = _fastexcel().read_excel(data)
+        sheets = parser.sheet_names
+        if not sheets:
+            return pa.table({})
+        name = sheet_name or sheets[0]
+        if name not in sheets:
+            raise KeyError(f"No sheet named {name!r}; available: {sheets!r}")
+        sheet = parser.load_sheet(
+            name,
+            header_row=0 if header else None,
+            skip_rows=skip_rows or None,
+            n_rows=n_rows,
+            use_columns=columns,
+        )
+        return pa.Table.from_batches([sheet.to_arrow()])
+
+    def apply_edits(
+        self,
+        sheet_name: str,
+        cells: "Iterable[tuple[int, int, Any]]",
+        *,
+        create: bool = False,
+    ) -> int:
+        """Apply a batch of ``(row, col, value)`` cell edits (1-based) in place.
+
+        One openpyxl load + one save for the whole batch — surgical, so every
+        untouched cell keeps its value, formula, and formatting, and every
+        other sheet is preserved (unlike the Arrow round-trip writer which
+        rebuilds the workbook from values only). Returns the number of cells
+        written. Values that look like ``=...`` are stored as formulas.
+        """
+        openpyxl = _openpyxl()
+        if self.size > 0:
+            with self.arrow_input_stream() as v:
+                wb = openpyxl.load_workbook(_stdlib_io.BytesIO(v.read()))
+        else:
+            wb = openpyxl.Workbook()
+            wb.active.title = sheet_name
+        try:
+            if sheet_name not in wb.sheetnames:
+                if not create:
+                    raise KeyError(
+                        f"No sheet named {sheet_name!r}; available: {wb.sheetnames!r}. "
+                        f"Pass create=True to add it."
+                    )
+                wb.create_sheet(title=sheet_name)
+            ws = wb[sheet_name]
+            n = 0
+            for row, col, value in cells:
+                ws.cell(row=row, column=col, value=value)
+                n += 1
+            scratch = _stdlib_io.BytesIO()
+            wb.save(scratch)
+        finally:
+            wb.close()
+        with self.arrow_output_stream() as sink:
+            sink.write(scratch.getvalue())
+        return n
+
+    def edit_range(
+        self,
+        sheet_name: str,
+        start_row: int,
+        start_col: int,
+        values: "Iterable[Iterable[Any]]",
+        *,
+        create: bool = False,
+    ) -> int:
+        """Overwrite a rectangular range from ``(start_row, start_col)`` (1-based)
+        with a 2-D ``values`` block, in one surgical save. See :meth:`apply_edits`."""
+        cells = [
+            (start_row + i, start_col + j, value)
+            for i, row in enumerate(values)
+            for j, value in enumerate(row)
+        ]
+        return self.apply_edits(sheet_name, cells, create=create)
+
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
             return Mode.OVERWRITE
@@ -561,3 +687,8 @@ class XLSXFile(IO[bytes, XlsxOptions]):
         if mode is Mode.APPEND or mode is Mode.UPSERT or mode is Mode.MERGE:
             return Mode.APPEND
         return Mode.OVERWRITE
+
+
+# The workbook leaf and its per-sheet child, under the names the product uses.
+ExcelFile = XLSXFile
+ExcelSheet = XLSXSheetFile

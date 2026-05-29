@@ -28,6 +28,44 @@
   --radius: 0.75rem;
   --radius-sm: 0.5rem;
   --radius-lg: 1rem;
+  /* surfaces — themed so glass/modals adapt to light mode */
+  --glass-bg: rgba(255, 255, 255, 0.03);
+  --glass-bg-hover: rgba(255, 255, 255, 0.05);
+  --glass-border: rgba(255, 255, 255, 0.06);
+  --modal-bg: rgba(10, 11, 26, 0.92);
+  --modal-scrim: rgba(0, 0, 0, 0.72);
+}
+
+/* ── Light theme — toggled via data-theme on <html> ─────────── */
+:root[data-theme="light"] {
+  --background: #f3f5f9;
+  --background-elevated: #ffffff;
+  --foreground: #181b22;
+  --foreground-dim: #444853;
+  --muted: #6c707b;
+  --border: #e3e6ee;
+  --border-accent: #ccd1dc;
+  --card: #ffffff;
+  --card-hover: #eef1f6;
+  --sidebar-bg: #eceff4;
+  --sidebar-border: #dde1ea;
+  --frost: #0e7490;
+  --frost-dim: #0891b2;
+  --frost-glow: rgba(8, 145, 178, 0.18);
+  --emerald: #047857;
+  --emerald-glow: rgba(4, 120, 87, 0.18);
+  --amber: #b45309;
+  --amber-glow: rgba(180, 83, 9, 0.18);
+  --rose: #be123c;
+  --rose-glow: rgba(190, 18, 60, 0.18);
+  --primary: #0e7490;
+  --primary-dim: #0891b2;
+  --primary-glow: rgba(8, 145, 178, 0.12);
+  --glass-bg: rgba(0, 0, 0, 0.025);
+  --glass-bg-hover: rgba(0, 0, 0, 0.05);
+  --glass-border: rgba(0, 0, 0, 0.08);
+  --modal-bg: rgba(255, 255, 255, 0.96);
+  --modal-scrim: rgba(20, 24, 35, 0.45);
 }
 
 @theme inline {
@@ -131,16 +169,25 @@ body {
 
 /* ── Glassmorphism card ───────────────────────────────────── */
 .glass-card {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--glass-bg);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   transition: all 0.2s ease;
 }
 .glass-card:hover {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: rgba(255, 255, 255, 0.1);
+  background: var(--glass-bg-hover);
+}
+
+/* Modal surface — more opaque than a glass card so dialogs read clearly. */
+.modal-surface {
+  background: var(--modal-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
 }
 
 /* ── Status dots ──────────────────────────────────────────── */

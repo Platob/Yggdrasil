@@ -85,6 +85,7 @@ api = [
   "fastapi",
   "uvicorn",
   "pydantic>=2.10",
+  "httpx",
 ]
 
 node = [
@@ -92,6 +93,7 @@ node = [
   "uvicorn",
   "pydantic>=2.10",
   "psutil>=5.9",
+  "httpx",
 ]
 
 mongoengine = [

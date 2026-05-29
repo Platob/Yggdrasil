@@ -17,8 +17,8 @@ export function ConfirmModal({
 }) {
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="runic-card p-6 max-w-md w-full mx-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--modal-scrim)] backdrop-blur-sm">
+      <div className="modal-surface p-6 max-w-md w-full mx-4">
         <h2 className="text-lg font-semibold mb-2">{title}</h2>
         <p className="text-sm text-foreground-dim mb-6">{message}</p>
         <div className="flex justify-end gap-2">

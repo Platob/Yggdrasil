@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import platform
 import socket
@@ -89,6 +88,21 @@ class Settings:
     max_log_lines_per_stream: int = 1000
     run_heartbeat_interval: float = 2.0
     run_cancel_grace_seconds: float = 1.5
+    # Largest slice of a file the /fs/read preview will pull into memory.
+    # Bigger files are read up to this cap and flagged ``truncated`` — the
+    # node never loads a multi-GB file whole just to preview it.
+    max_read_bytes: int = 4 * 1024 * 1024
+    # Upper bound on tree nodes a single recursive fs walk (du / search / grep)
+    # visits before it stops and reports a partial result — keeps a scan of a
+    # huge tree bounded in both time and memory.
+    du_max_entries: int = 200_000
+    # Rows the tabular preview reads. A file at or under this count is read
+    # whole, so the bounded in-place editor can safely save it back; bigger
+    # files stay read-only previews.
+    tabular_preview_max_rows: int = 2000
+    # Rows an analysis (aggregate / describe / finance) pulls before computing.
+    # Bounds memory/time; results over this cap are flagged truncated.
+    analysis_max_rows: int = 200_000
     # Seconds a PyEnv's resolved interpreter version + installed-library
     # listing stays cached before the next ``pip list`` subprocess runs —
     # keeps the UI's per-env package view from flooding the node.
@@ -168,6 +182,10 @@ def get_settings() -> Settings:
         max_log_lines_per_stream=int(os.getenv("YGG_NODE_MAX_LOG_LINES", "1000")),
         run_heartbeat_interval=float(os.getenv("YGG_NODE_RUN_HEARTBEAT", "2.0")),
         run_cancel_grace_seconds=float(os.getenv("YGG_NODE_RUN_CANCEL_GRACE", "1.5")),
+        max_read_bytes=int(os.getenv("YGG_NODE_MAX_READ_BYTES", str(4 * 1024 * 1024))),
+        du_max_entries=int(os.getenv("YGG_NODE_DU_MAX_ENTRIES", "200000")),
+        tabular_preview_max_rows=int(os.getenv("YGG_NODE_TABULAR_PREVIEW_ROWS", "2000")),
+        analysis_max_rows=int(os.getenv("YGG_NODE_ANALYSIS_MAX_ROWS", "200000")),
         pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
         seed_defaults=_as_bool(os.getenv("YGG_NODE_SEED_DEFAULTS"), True),
     )

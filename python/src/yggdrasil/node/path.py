@@ -216,25 +216,50 @@ class NodePath:
             return base64.b64decode(content).decode(encoding)
         return content
 
-    def read_bytes(self) -> bytes:
+    def read_bytes(self, offset: int = 0, length: int | None = None) -> bytes:
+        """Read the whole file, or a byte range ``[offset, offset+length)``.
+
+        A ranged read seeks locally and uses the node's ``/fs/read?offset=&
+        max_bytes=`` window remotely — so paging through a large remote file
+        never pulls the whole thing across the network.
+        """
         if self.is_local:
-            return self._local_path().read_bytes()
-        resp = _get(f"{self._node_url}/api/v2/fs/read?path={_quote(str(self._path))}")
+            if offset == 0 and length is None:
+                return self._local_path().read_bytes()
+            with open(self._local_path(), "rb") as f:
+                if offset:
+                    f.seek(offset)
+                return f.read(length if length is not None else -1)
+        url = f"{self._node_url}/api/v2/fs/read?path={_quote(str(self._path))}&offset={offset}"
+        if length is not None:
+            url += f"&max_bytes={length}"
+        resp = _get(url)
         content = resp.get("content", "")
         if resp.get("encoding") == "base64":
             return base64.b64decode(content)
         return content.encode()
 
-    def iterdir(self) -> Iterator[NodePath]:
+    def iterdir(self, offset: int = 0, limit: int | None = None) -> Iterator[NodePath]:
+        """Yield child paths, optionally a single page ``[offset, offset+limit)``.
+
+        Remote listings page through ``/fs/ls?offset=&limit=`` so a directory
+        with a million entries streams a window at a time instead of one giant
+        response.
+        """
         if self.is_local:
-            for child in sorted(self._local_path().iterdir()):
+            children = sorted(self._local_path().iterdir())
+            window = children[offset:offset + limit] if limit is not None else children[offset:]
+            for child in window:
                 yield NodePath(
                     str(self._path / child.name),
                     node_url=self._node_url,
                     _root=self._root,
                 )
             return
-        resp = _get(f"{self._node_url}/api/v2/fs/ls?path={_quote(str(self._path))}")
+        url = f"{self._node_url}/api/v2/fs/ls?path={_quote(str(self._path))}&offset={offset}"
+        if limit is not None:
+            url += f"&limit={limit}"
+        resp = _get(url)
         for entry in resp.get("entries", []):
             yield NodePath(
                 entry["path"],

@@ -121,7 +121,10 @@ Core concepts — workstation as remote executor/driver:
 | `/api/v2/dag` | DAG CRUD + `/{id}/run` execution |
 | `/api/v2/backend` | Node metrics snapshot + `/history` + `/stream` SSE |
 | `/api/v2/network` | Self info + `/register` + `/peers` + `/role` + `/dispatch` + `/arrow` + `/ping` |
-| `/api/v2/fs` | Filesystem CRUD (ls, stat, read, write, delete, move, mkdir, stream, upload) |
+| `/api/v2/fs` | Filesystem CRUD (ls, stat, read, write, delete, move, mkdir, stream, upload, download zip, tree, du, search, grep). `/nodes` lists global-tree roots; every read/write takes `?node=` to proxy to a linked peer |
+| `/api/v2/tabular` | LazyTabular inspect/preview/write — schema + metadata + bounded typed-row preview (JSON `/preview` or Arrow IPC `/preview.arrow`) + bounded in-place edit (`?node=` proxied). Drives the reusable `TabularModal` |
+| `/api/v2/workbook` | ExcelFile (xlsx) surface — `/sheets` (dims), `/read` (windowed sheet → Arrow IPC), `/edit` (surgical cell/range edits preserving formulas + other sheets). `?node=` proxied |
+| `/api/v2/analysis` | polars **lazy**-over-Arrow analytics (scan + projection/predicate/slice pushdown + streaming) — `/aggregate`, `/describe`, `/finance`, `/series` (adaptive downsample + x-zoom), `/ohlc` (candlesticks). All take `filters` (predicate pushdown). `/export` applies a `Transform` (filters + casts incl. timezone→UTC + projection) and downloads in any media type (csv/parquet/json/ndjson/arrow/xlsx). `?node=` proxied. Drives the `TabularModal` Analyze panel (pivot/series/candles + collapsible filters&casts + Download-as) and `Chart` (bar/line/area/candle, MA overlay, volume panel). Analyze fetches are client-cached |
 | `/api/v2/user` | User identity (`/me`, list, register from peers) |
 | `/api/v2/messenger` | Chat channels + messages + SSE streaming |
 | `/api/v2/replicate` | Export/import/push/pull node assets between nodes |

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import AsyncIterator
@@ -68,19 +69,40 @@ class FsService:
             raise NotFoundError(f"Path not found: {path!r}")
         return self._entry(resolved)
 
-    async def ls(self, path: str = "") -> FsListResponse:
+    async def ls(self, path: str = "", *, offset: int = 0, limit: int | None = None) -> FsListResponse:
         resolved = self._resolve(path)
         if not resolved.exists():
             raise NotFoundError(f"Directory not found: {path!r}")
         if not resolved.is_dir():
             raise ForbiddenError(f"Path is not a directory: {path!r}")
 
+        # os.scandir caches each entry's type (one readdir, no per-child stat
+        # for is_dir) and hands back a stat with a single syscall. Collect raw
+        # tuples, sort, then build FsEntry pydantic models for ONLY the
+        # requested page — a 100k-entry directory pages without constructing
+        # 100k models.
+        root_str = str(self._root.resolve())
+        raw: list[tuple[bool, str, str, int, float]] = []
+        with os.scandir(resolved) as it:
+            for de in it:
+                try:
+                    is_dir = de.is_dir()
+                    st = de.stat()
+                except OSError:
+                    continue
+                raw.append((
+                    is_dir, de.name, os.path.relpath(de.path, root_str),
+                    0 if is_dir else st.st_size, st.st_mtime,
+                ))
+        raw.sort(key=lambda r: (not r[0], r[1].lower()))
+        total = len(raw)
+        window = raw[offset:offset + limit] if limit is not None else raw[offset:]
         entries = [
-            self._entry(child)
-            for child in sorted(
-                resolved.iterdir(),
-                key=lambda p: (not p.is_dir(), p.name.lower()),
+            FsEntry(
+                path=rel, name=name, is_dir=is_dir, size=size,
+                modified_at=dt.datetime.fromtimestamp(mtime, tz=dt.timezone.utc).isoformat(),
             )
+            for (is_dir, name, rel, size, mtime) in window
         ]
 
         try:
@@ -94,28 +116,61 @@ class FsService:
             node_id=self.settings.node_id,
             path=display,
             entries=entries,
+            total=total,
+            offset=offset,
         )
 
-    async def read(self, path: str) -> FsReadResponse:
+    async def read(self, path: str, *, max_bytes: int | None = None, offset: int = 0) -> FsReadResponse:
         resolved = self._resolve(path)
         if not resolved.exists():
             raise NotFoundError(f"File not found: {path!r}")
         if resolved.is_dir():
             raise ForbiddenError(f"Cannot read a directory as a file: {path!r}")
 
+        # Bound the read: never pull more than the cap into memory just to
+        # preview. A caller may ask for a smaller window but not a larger one,
+        # and ``offset`` reads a byte range so a remote NodePath can page.
+        cap = self.settings.max_read_bytes if max_bytes is None else max_bytes
+        cap = max(1, min(cap, self.settings.max_read_bytes))
+        offset = max(0, offset)
+        full_size = resolved.stat().st_size
+        # Read cap+1 so we can tell there's more without loading it all.
+        with open(resolved, "rb") as fh:
+            if offset:
+                fh.seek(offset)
+            raw = fh.read(cap + 1)
+        if len(raw) > cap:
+            raw = raw[:cap]
+        truncated = offset + len(raw) < full_size
+
         try:
-            content = resolved.read_text(encoding="utf-8")
+            content = raw.decode("utf-8")
             encoding = "utf-8"
-        except (UnicodeDecodeError, ValueError):
-            content = base64.b64encode(resolved.read_bytes()).decode("ascii")
-            encoding = "base64"
+        except UnicodeDecodeError:
+            # A clean truncation can split a trailing multibyte char; drop up
+            # to 3 trailing bytes and retry before deciding the file is binary.
+            text: str | None = None
+            if truncated:
+                for back in (1, 2, 3):
+                    try:
+                        text = raw[:-back].decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+            if text is not None:
+                content, encoding = text, "utf-8"
+            else:
+                content = base64.b64encode(raw).decode("ascii")
+                encoding = "base64"
 
         rel = str(resolved.relative_to(self._root))
         return FsReadResponse(
             path=rel,
             content=content,
             encoding=encoding,
-            size=resolved.stat().st_size,
+            size=full_size,
+            offset=offset,
+            truncated=truncated,
         )
 
     async def write(self, req: FsWriteRequest) -> FsEntry:
@@ -167,6 +222,37 @@ class FsService:
         resolved.mkdir(parents=True, exist_ok=True)
         LOGGER.info("Created directory %r", path)
         return self._entry(resolved)
+
+    def build_dir_zip(self, path: str) -> tuple[Path, str]:
+        """Zip a directory into a temp file (bounded by du_max_entries) and
+        return ``(zip_path, archive_name)``. The caller streams then unlinks the
+        temp file. Writing to disk keeps memory flat regardless of folder size.
+        """
+        import tempfile
+        import zipfile
+
+        resolved = self._resolve(path)
+        if not resolved.exists():
+            raise NotFoundError(f"Path not found: {path!r}")
+        if not resolved.is_dir():
+            raise ForbiddenError(f"Not a directory: {path!r}")
+
+        cap = self.settings.du_max_entries
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tmp.close()
+        count = 0
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in resolved.rglob("*"):
+                if count >= cap:
+                    break
+                if p.is_file():
+                    try:
+                        zf.write(p, p.relative_to(resolved))
+                        count += 1
+                    except OSError:
+                        continue
+        archive_name = f"{resolved.name or 'node'}.zip"
+        return Path(tmp.name), archive_name
 
     async def stream_read(self, path: str) -> AsyncIterator[bytes]:
         resolved = self._resolve(path)
@@ -241,11 +327,15 @@ class FsService:
                     await asyncio.sleep(poll_seconds)
 
     def grep(self, path: str, pattern: str, *, max_matches: int = 200,
-             case_sensitive: bool = False, regex: bool = False) -> list[dict]:
+             case_sensitive: bool = False, regex: bool = False) -> tuple[list[dict], bool]:
         """Recursive substring/regex search over text files inside ``path``.
 
-        Returns a list of {path, line_number, line, match} dicts. Skips files
-        whose first 1 KB is mostly non-text (heuristic null-byte check).
+        Returns ``(matches, truncated)`` where each match is a
+        {path, line_number, line, match} dict. Skips files whose first 1 KB is
+        mostly non-text (heuristic null-byte check). The walk stops once it has
+        either filled ``max_matches`` or visited ``du_max_entries`` tree nodes,
+        so a huge tree never gets materialized or fully scanned — ``truncated``
+        flags when a cap cut the walk short.
         """
         import re
         from ...exceptions import NotFoundError
@@ -255,9 +345,19 @@ class FsService:
         flags = 0 if case_sensitive else re.IGNORECASE
         prog = re.compile(pattern if regex else re.escape(pattern), flags)
         results: list[dict] = []
-        targets = [root] if root.is_file() else list(root.rglob("*"))
+        scan_cap = self.settings.du_max_entries
+        scanned = 0
+        truncated = False
+        # rglob is a generator — iterate it lazily so we never hold the whole
+        # tree in memory; bail the moment a cap is hit.
+        targets = iter([root]) if root.is_file() else root.rglob("*")
         for p in targets:
             if len(results) >= max_matches:
+                truncated = True
+                break
+            scanned += 1
+            if scanned > scan_cap:
+                truncated = True
                 break
             if not p.is_file():
                 continue
@@ -270,6 +370,7 @@ class FsService:
                 with open(p, "r", encoding="utf-8", errors="replace") as fh:
                     for lineno, line in enumerate(fh, start=1):
                         if len(results) >= max_matches:
+                            truncated = True
                             break
                         m = prog.search(line)
                         if m:
@@ -282,4 +383,4 @@ class FsService:
                             })
             except (OSError, UnicodeDecodeError):
                 continue
-        return results
+        return results, truncated
