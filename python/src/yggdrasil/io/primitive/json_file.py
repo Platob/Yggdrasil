@@ -22,7 +22,6 @@ bracket.
 from __future__ import annotations
 
 import dataclasses
-import json
 from typing import TYPE_CHECKING, ClassVar, Iterable, Iterator
 
 import pyarrow as pa
@@ -30,6 +29,7 @@ import pyarrow.json as pa_json
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
+from yggdrasil.pickle import json as json_module
 from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import pyarrow_dataset_module
 from yggdrasil.io.base import IO
@@ -155,15 +155,14 @@ class JSONFile(IO[bytes, JsonOptions]):
         object that straddled pyarrow's block boundary).
         """
         v.seek(0)
-        data = v.read()
-        # ``json.loads`` parses ``bytes`` directly (auto-detecting the
-        # UTF family per RFC 4627), so skip the intermediate ``decode()``
-        # str — a full extra copy of the payload — for the common UTF-8
-        # case. Non-UTF encodings still decode explicitly.
-        if (options.encoding or "utf-8").lower().replace("-", "") in ("utf8", "utf16", "utf32"):
-            parsed = json.loads(data)
-        else:
-            parsed = json.loads(data.decode(options.encoding))
+        # The orjson-backed module parses bytes (and the requested
+        # encoding) directly — no intermediate ``decode()`` str copy.
+        # ``safe=True`` is the plain orjson parse (no type-restoring
+        # walk): we want the raw parsed values and let Arrow infer types
+        # in ``from_pylist``.
+        parsed = json_module.loads(
+            v.read(), encoding=options.encoding, safe=True,
+        )
         if isinstance(parsed, list):
             if parsed:
                 yield options.cast_arrow_batch(
@@ -239,12 +238,16 @@ class JSONFile(IO[bytes, JsonOptions]):
         for batch in iterator:
             rows.extend(cast_opts.cast_arrow_batch(batch).to_pylist())
 
-        text = json.dumps(
+        # ``dumps(..., to_bytes=True)`` emits encoded bytes directly
+        # (orjson-fast, ``safe=True`` handles datetime/Decimal/UUID/…),
+        # so no separate ``str`` + ``.encode()`` round trip.
+        payload = json_module.dumps(
             rows,
             indent=options.indent,
             ensure_ascii=options.ensure_ascii,
             sort_keys=options.sort_keys,
-            default=str,
+            encoding=options.encoding,
+            to_bytes=True,
         )
         # Drive the JSON payload through the IO's
         # :meth:`arrow_output_stream`, which yields a
@@ -252,7 +255,7 @@ class JSONFile(IO[bytes, JsonOptions]):
         # payload — applying any codec on the holder's MediaType
         # (e.g. ``.json.gz``) — on context exit.
         with self.arrow_output_stream() as sink:
-            sink.write(text.encode(options.encoding))
+            sink.write(payload)
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
