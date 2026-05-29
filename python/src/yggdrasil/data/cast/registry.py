@@ -397,7 +397,7 @@ def convert(
     origin = get_origin(target_hint) or target_hint
     args = get_args(target_hint)
 
-    if origin is list or origin is set:
+    if origin is list or origin is set or origin is frozenset:
         return convert_to_python_iterable(value, origin, args, options=options)  # type: ignore[return-value]
     if origin is tuple:
         return convert_tuple(value, args, options)  # type: ignore[return-value]
@@ -615,7 +615,7 @@ def convert_to_python_iterable(
     options: Optional["CastOptions"] = None,
 ) -> Any:
     """
-    Convert `value` into list/set with recursive casting.
+    Convert `value` into a list / set / frozenset with recursive casting.
 
     Fast path: when the element hint is ``Any`` / ``object`` we skip the
     per-element ``convert()`` call and materialize the container directly

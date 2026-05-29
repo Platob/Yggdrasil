@@ -243,6 +243,14 @@ class TestContainers:
     def test_set_int(self) -> None:
         assert convert({"1", "2"}, set[int]) == {1, 2}
 
+    def test_frozenset_int(self) -> None:
+        result = convert(["1", "2", "1"], frozenset[int])
+        assert result == frozenset({1, 2})
+        assert isinstance(result, frozenset)
+
+    def test_bare_frozenset(self) -> None:
+        assert convert(["a", "b"], frozenset) == frozenset({"a", "b"})
+
     def test_variadic_tuple_int(self) -> None:
         assert convert(["1", "2"], tuple[int, ...]) == (1, 2)
 
