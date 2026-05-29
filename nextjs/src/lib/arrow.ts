@@ -19,7 +19,20 @@ function normalizeCell(v: unknown): TabularCell {
   return String(v);
 }
 
-export async function fetchArrowTable(url: string): Promise<DecodedTable> {
+// Small LRU+TTL cache of decoded tables keyed by URL — sheet-switches, zoom-
+// back, and re-opening the same window hit the client instead of re-fetching
+// and re-decoding. Bounded so it never grows heavy.
+const _cache = new Map<string, { t: number; v: DecodedTable }>();
+const ARROW_TTL = 30_000;
+const ARROW_MAX = 8;
+
+export function clearArrowCache(): void { _cache.clear(); }
+
+export async function fetchArrowTable(url: string, useCache = true): Promise<DecodedTable> {
+  if (useCache) {
+    const hit = _cache.get(url);
+    if (hit && Date.now() - hit.t < ARROW_TTL) return hit.v;
+  }
   const res = await fetch(url);
   if (!res.ok) {
     let detail = "";
@@ -35,5 +48,10 @@ export async function fetchArrowTable(url: string): Promise<DecodedTable> {
     for (let c = 0; c < colVectors.length; c++) row.push(normalizeCell(colVectors[c]?.get(r)));
     rows.push(row);
   }
-  return { columns, rows, numRows: table.numRows };
+  const result = { columns, rows, numRows: table.numRows };
+  if (useCache) {
+    _cache.set(url, { t: Date.now(), v: result });
+    if (_cache.size > ARROW_MAX) _cache.delete(_cache.keys().next().value as string);
+  }
+  return result;
 }

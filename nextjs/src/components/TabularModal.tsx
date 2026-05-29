@@ -37,7 +37,7 @@ import {
   type FilterSpec,
   type CastSpec,
 } from "@/lib/api";
-import { fetchArrowTable } from "@/lib/arrow";
+import { fetchArrowTable, clearArrowCache } from "@/lib/arrow";
 import Chart, { type ChartType } from "@/components/Chart";
 
 const AGGS: AggFunc[] = ["sum", "mean", "min", "max", "count", "median", "std", "var"];
@@ -159,6 +159,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const [stat, setStat] = useState<{ modified_at?: string; size?: number } | null>(null);
   const [facetCol, setFacetCol] = useState<number | null>(null);   // open column profile
   const [sort, setSort] = useState<{ col: number; dir: "asc" | "desc" } | null>(null);
+  const [hidden, setHidden] = useState<Set<number>>(new Set());    // hidden columns
 
   const decodeInto = useCallback(async (url: string) => {
     const t = await fetchArrowTable(url);
@@ -292,6 +293,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
       }
       setEdited(new Set());
       setSaved(true);
+      clearArrowCache();   // file changed — drop stale decoded windows
     } catch (e) {
       setError(e instanceof Error ? e.message : "save failed");
     } finally {
@@ -714,17 +716,19 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
           </div>
         )}
 
-        {/* Active filters (predicate chips) — visible + removable in grid mode */}
-        {mode === "grid" && filters.length > 0 && (
+        {/* Active view state — predicate chips, sort, hidden cols (grid mode) */}
+        {mode === "grid" && (filters.length > 0 || hidden.size > 0 || sort) && (
           <div className="flex items-center gap-1.5 flex-wrap shrink-0 text-[10px] font-mono">
-            <span className="text-muted/60">filters:</span>
+            {filters.length > 0 && <span className="text-muted/60">filters:</span>}
             {filters.map((f, i) => (
               <span key={i} className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-frost/10 text-frost border border-frost/20">
                 {f.column} {f.op} {!["is_null", "not_null"].includes(f.op) ? String(f.value) : ""}
                 <button onClick={() => setFilters((fs) => fs.filter((_, j) => j !== i))} className="text-frost/60 hover:text-rose">✕</button>
               </span>
             ))}
-            <button onClick={() => setFilters([])} className="text-muted hover:text-foreground underline">clear</button>
+            {filters.length > 0 && <button onClick={() => setFilters([])} className="text-muted hover:text-foreground underline">clear</button>}
+            {sort && <span className="px-1.5 py-0.5 rounded bg-emerald/10 text-emerald border border-emerald/20">sort {columns[sort.col]?.name} {sort.dir === "asc" ? "▲" : "▼"} <button onClick={() => setSort(null)} className="text-emerald/60 hover:text-rose">✕</button></span>}
+            {hidden.size > 0 && <button onClick={() => setHidden(new Set())} className="px-1.5 py-0.5 rounded bg-amber/10 text-amber border border-amber/20">{hidden.size} hidden ⟲</button>}
             <span className="text-muted/50 ml-1">showing {viewOrder.length} of {grid.length}{readOnly ? " loaded" : ""}</span>
           </div>
         )}
@@ -745,25 +749,36 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
               <thead className="sticky top-0 bg-[#0d1117] z-10">
                 <tr>
                   <th className="px-2 py-1.5 text-right text-muted/40 border-b border-white/[0.06] w-10">#</th>
-                  {columns.map((col, ci) => (
+                  {columns.map((col, ci) => hidden.has(ci) ? null : (
                     <th key={ci} className="px-2 py-1.5 text-left border-b border-white/[0.06] whitespace-nowrap relative">
-                      <button onClick={() => setFacetCol((c) => (c === ci ? null : ci))} className="text-frost/80 hover:text-frost inline-flex items-center gap-1" title="Column profile / filter">
+                      <button
+                        onClick={() => setFacetCol((c) => (c === ci ? null : ci))}
+                        onContextMenu={(e) => { e.preventDefault(); setFacetCol(ci); }}
+                        className="text-frost/80 hover:text-frost inline-flex items-center gap-1" title="Click or right-click for column tools">
                         {col.name}<span className="text-muted/50 font-normal">{col.type}</span>
                         {sort?.col === ci && <span className="text-emerald">{sort.dir === "asc" ? "▲" : "▼"}</span>}
                         <span className="text-muted/40">▾</span>
                       </button>
                       {facetCol === ci && facet && (
-                        <div className="absolute left-0 top-full mt-1 z-30 modal-surface p-2.5 w-60 text-[11px] font-mono normal-case font-normal space-y-1.5" onClick={(e) => e.stopPropagation()}>
+                        <div className="absolute left-0 top-full mt-1 z-30 modal-surface p-2.5 w-64 text-[11px] font-mono normal-case font-normal space-y-1.5" onClick={(e) => e.stopPropagation()}>
                           <div className="flex items-center justify-between">
-                            <span className="text-frost/80">{col.name}</span>
+                            <span className="text-frost/80 truncate">{col.name}</span>
                             <div className="flex gap-1.5 text-[10px]">
                               <button onClick={() => setSort({ col: ci, dir: "asc" })} className="text-muted hover:text-emerald">sort ▲</button>
                               <button onClick={() => setSort({ col: ci, dir: "desc" })} className="text-muted hover:text-emerald">sort ▼</button>
-                              {sort?.col === ci && <button onClick={() => setSort(null)} className="text-muted hover:text-foreground">clear</button>}
+                              {sort?.col === ci && <button onClick={() => setSort(null)} className="text-muted hover:text-foreground">clr</button>}
                             </div>
                           </div>
+                          {/* Column actions */}
+                          <div className="flex flex-wrap gap-1 text-[10px]">
+                            <button onClick={() => { setHidden((h) => new Set(h).add(ci)); setFacetCol(null); }} className="px-1.5 py-0.5 rounded bg-white/[0.05] text-muted hover:text-foreground">hide</button>
+                            <button onClick={() => { navigator.clipboard?.writeText(grid.map((r) => r[ci] ?? "").join("\n")); setFacetCol(null); }} className="px-1.5 py-0.5 rounded bg-white/[0.05] text-muted hover:text-foreground">copy</button>
+                            <button onClick={() => { setMode("analyze"); setAnalyzeKind("pivot"); setGroupBy(col.name); setFacetCol(null); }} className="px-1.5 py-0.5 rounded bg-frost/10 text-frost">pivot by</button>
+                            {isNumericType(col.type) && <button onClick={() => { setMode("analyze"); setAnalyzeKind("series"); setSeriesCol(col.name); setFacetCol(null); }} className="px-1.5 py-0.5 rounded bg-emerald/10 text-emerald">plot</button>}
+                            <button onClick={() => { setXCol(col.name); setFacetCol(null); }} className="px-1.5 py-0.5 rounded bg-white/[0.05] text-muted hover:text-foreground">as x</button>
+                          </div>
                           <div className="text-[10px] text-muted/70">{facet.distinct.length} distinct · {facet.nulls} null{facet.numeric ? ` · min ${facet.numeric.min.toLocaleString(undefined, { maximumFractionDigits: 2 })} · max ${facet.numeric.max.toLocaleString(undefined, { maximumFractionDigits: 2 })} · μ ${facet.numeric.mean.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : ""}</div>
-                          <div className="max-h-44 overflow-auto space-y-0.5">
+                          <div className="max-h-40 overflow-auto space-y-0.5">
                             {facet.distinct.slice(0, 12).map(([val, cnt]) => (
                               <button key={val}
                                 onClick={() => { setFilters((fs) => [...fs, { column: col.name, op: "==", value: Number.isNaN(Number(val)) || val === "" ? val : Number(val) }]); setFacetCol(null); }}
@@ -774,7 +789,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                             ))}
                             {facet.distinct.length > 12 && <div className="text-[10px] text-muted/50 px-1.5">+{facet.distinct.length - 12} more</div>}
                           </div>
-                          <div className="text-[9px] text-muted/40">click a value to filter == (over loaded rows)</div>
+                          <div className="text-[9px] text-muted/40">click a value → filter == (loaded rows)</div>
                         </div>
                       )}
                     </th>
@@ -787,7 +802,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                   return (
                     <tr key={ri} className="hover:bg-white/[0.02]">
                       <td className="px-2 py-1 text-right text-muted/40 border-b border-white/[0.03] select-none">{readOnly ? page * PAGE + ri : ri}</td>
-                      {row.map((cell, ci) => (
+                      {row.map((cell, ci) => hidden.has(ci) ? null : (
                         <td key={ci} className="border-b border-white/[0.03] p-0">
                           {readOnly ? (
                             <span className="block px-2 py-1 text-foreground/75 truncate max-w-[280px]">{cell}</span>
