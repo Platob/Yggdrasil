@@ -564,8 +564,8 @@ export default function FilesPage() {
       {/* File preview / edit modal */}
       {selected && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={closeModal} />
-          <div className={`relative glass-card p-6 w-full space-y-4 z-10 flex flex-col ${fileContent != null ? "max-w-3xl max-h-[85vh]" : "max-w-lg"}`}>
+          <div className="absolute inset-0 bg-[var(--modal-scrim)] backdrop-blur-sm" onClick={closeModal} />
+          <div className={`relative modal-surface p-6 w-full space-y-4 z-10 flex flex-col ${fileContent != null ? "max-w-3xl max-h-[85vh]" : "max-w-lg"}`}>
             <div className="flex items-start justify-between shrink-0">
               <div className="flex items-center gap-3 min-w-0">
                 <FileIcon entry={selected.entry} />

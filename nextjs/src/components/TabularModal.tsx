@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   getTabularInspect,
+  getFsStat,
   tabularPreviewArrowUrl,
   writeTabular,
   isWorkbookName,
@@ -111,6 +112,8 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const [casts, setCasts] = useState<CastSpec[]>([]);
   const [dlOpen, setDlOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [stat, setStat] = useState<{ modified_at?: string; size?: number } | null>(null);
 
   const decodeInto = useCallback(async (url: string) => {
     const t = await fetchArrowTable(url);
@@ -189,6 +192,15 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   }, [isWorkbook, path, node, loadSheet, decodeInto]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Lazily fetch stat (mtime/size) the first time the info popover opens.
+  useEffect(() => {
+    if (infoOpen && !stat) {
+      getFsStat(path, node)
+        .then((s) => setStat({ modified_at: s.modified_at, size: s.size }))
+        .catch(() => setStat({}));
+    }
+  }, [infoOpen, stat, path, node]);
 
   const switchSheet = (sheet: string) => { setActiveSheet(sheet); loadSheet(sheet, sheets); };
 
@@ -347,8 +359,8 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative glass-card p-5 w-full max-w-5xl max-h-[88vh] z-10 flex flex-col gap-3">
+      <div className="absolute inset-0 bg-[var(--modal-scrim)] backdrop-blur-sm" onClick={onClose} />
+      <div className="relative modal-surface p-5 w-full max-w-5xl max-h-[88vh] z-10 flex flex-col gap-3">
         {/* Header */}
         <div className="flex items-start justify-between shrink-0">
           <div className="min-w-0">
@@ -361,10 +373,40 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                 {readOnly ? "read-only" : "editable"}
               </span>
               {isWorkbook && <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-frost/15 text-frost">arrow</span>}
+              <button onClick={() => setInfoOpen((v) => !v)} title="Source info"
+                className={`ml-0.5 ${infoOpen ? "text-frost" : "text-muted hover:text-foreground"}`}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="16" x2="12" y2="12" /><line x1="12" y1="8" x2="12.01" y2="8" /></svg>
+              </button>
             </div>
             <p className="text-[11px] text-muted font-mono truncate mt-1" title={info?.source_url}>
               <span className="text-frost/70">{nodeLabel ?? node ?? "local"}</span>{" : "}{info?.source_url ?? path}
             </p>
+            {infoOpen && (
+              <div className="absolute left-0 top-14 z-30 modal-surface p-3 w-[26rem] max-w-[80vw] text-[11px] font-mono space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="text-frost/80 uppercase tracking-wider text-[10px]">source</span>
+                  <button onClick={() => setInfoOpen(false)} className="text-muted hover:text-foreground">✕</button>
+                </div>
+                {[
+                  ["name", name],
+                  ["node", nodeLabel ?? node ?? "local"],
+                  ["url", info?.source_url ?? path],
+                  ["media type", info?.media_type ?? "--"],
+                  ["format", path.split(".").pop() ?? "--"],
+                  ["size", stat?.size != null ? formatSize(stat.size) : (info ? formatSize(info.size_bytes) : "…")],
+                  ["modified", stat?.modified_at ? new Date(stat.modified_at).toLocaleString() : "…"],
+                  ["rows", isWorkbook ? String(total) : (info?.row_count != null ? String(info.row_count) : "large")],
+                  ["columns", String(columns.length || info?.column_count || 0)],
+                  ["schema hash", info?.schema_hash || "--"],
+                  ["editable", String(!readOnly)],
+                ].map(([k, v]) => (
+                  <div key={k} className="flex gap-2">
+                    <span className="text-muted/70 w-24 shrink-0">{k}</span>
+                    <span className="text-foreground/85 break-all">{v}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-2 shrink-0 ml-4">
             <div className="flex rounded-lg overflow-hidden border border-white/[0.08] text-[10px] font-mono">

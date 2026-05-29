@@ -315,6 +315,10 @@ export function getFsNodes(fresh = false): Promise<{ node_id: string; nodes: FsN
   );
 }
 
+export function getFsStat(path: string, node?: string): Promise<FsEntry> {
+  return jsonFetch<FsEntry>(`/api/v2/fs/stat?path=${encodeURIComponent(path)}${nodeParam(node)}`);
+}
+
 export function getFsListing(
   path: string,
   node?: string,

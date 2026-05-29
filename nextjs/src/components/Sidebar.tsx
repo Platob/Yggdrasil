@@ -1,8 +1,35 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { YggLogoIcon } from "./YggLogo";
+
+function ThemeToggle({ collapsed }: { collapsed: boolean }) {
+  const [light, setLight] = useState(false);
+  useEffect(() => { setLight(document.documentElement.getAttribute("data-theme") === "light"); }, []);
+  const toggle = () => {
+    const next = !light;
+    setLight(next);
+    document.documentElement.setAttribute("data-theme", next ? "light" : "dark");
+    if (!next) document.documentElement.removeAttribute("data-theme");
+    try { localStorage.setItem("ygg-theme", next ? "light" : "dark"); } catch { /* ignore */ }
+  };
+  return (
+    <button
+      onClick={toggle}
+      title={light ? "Switch to dark" : "Switch to light"}
+      className={`flex items-center gap-2 ${collapsed ? "justify-center w-full" : ""} text-muted hover:text-foreground transition-colors`}
+    >
+      {light ? (
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" /></svg>
+      ) : (
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+      )}
+      {!collapsed && <span className="text-[11px] font-mono">{light ? "Light" : "Dark"}</span>}
+    </button>
+  );
+}
 
 const Icons = {
   excel: (
@@ -82,60 +109,64 @@ const NAV_ITEMS = [
   { href: "/excel", label: "Excel", icon: Icons.excel },
 ];
 
-export function Sidebar() {
+export function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
   const pathname = usePathname();
 
   return (
-    <aside className="fixed left-0 top-0 h-full w-[200px] flex flex-col z-50 bg-sidebar-bg border-r border-sidebar-border">
+    <aside className={`fixed left-0 top-0 h-full ${collapsed ? "w-[60px]" : "w-[200px]"} flex flex-col z-50 bg-sidebar-bg border-r border-sidebar-border transition-[width] duration-200`}>
+      {/* Collapse toggle — straddles the right edge, vertically centered */}
+      <button
+        onClick={onToggle}
+        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        className="absolute top-1/2 -right-3 -translate-y-1/2 z-50 w-6 h-6 rounded-full bg-card border border-border-accent text-muted hover:text-frost hover:border-frost/40 flex items-center justify-center shadow-md"
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: collapsed ? "rotate(180deg)" : "none" }}>
+          <polyline points="15 18 9 12 15 6" />
+        </svg>
+      </button>
+
       {/* Logo header */}
-      <div className="flex items-center gap-2.5 h-14 px-4 border-b border-sidebar-border shrink-0">
-        <Link href="/" className="flex items-center gap-2.5">
+      <div className={`flex items-center h-14 border-b border-sidebar-border shrink-0 ${collapsed ? "justify-center px-0" : "gap-2.5 px-4"}`}>
+        <Link href="/" className="flex items-center gap-2.5" title="Yggdrasil">
           <YggLogoIcon size={26} />
-          <div className="flex flex-col leading-tight">
-            <span className="font-bold text-xs tracking-[0.15em] uppercase text-foreground">
-              Yggdrasil
-            </span>
-            <span className="text-[8px] tracking-[0.2em] uppercase text-muted/70">
-              Living Brain
-            </span>
-          </div>
+          {!collapsed && (
+            <div className="flex flex-col leading-tight">
+              <span className="font-bold text-xs tracking-[0.15em] uppercase text-foreground">Yggdrasil</span>
+              <span className="text-[8px] tracking-[0.2em] uppercase text-muted/70">Living Brain</span>
+            </div>
+          )}
         </Link>
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 py-4 px-2 space-y-1">
+      <nav className="flex-1 py-4 px-2 space-y-1 overflow-y-auto">
         {NAV_ITEMS.map((item) => {
-          const active = item.exact
-            ? pathname === item.href
-            : pathname.startsWith(item.href);
+          const active = item.exact ? pathname === item.href : pathname.startsWith(item.href);
           return (
             <Link
               key={item.href}
               href={item.href}
+              title={item.label}
               className={`
-                flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium
-                transition-all duration-150
-                ${
-                  active
-                    ? "bg-frost/10 text-frost border-l-2 border-frost"
-                    : "text-foreground-dim hover:text-foreground hover:bg-white/[0.03] border-l-2 border-transparent"
-                }
+                flex items-center ${collapsed ? "justify-center" : "gap-3"} px-3 py-2 rounded-lg text-sm font-medium transition-all duration-150
+                ${active
+                  ? "bg-frost/10 text-frost border-l-2 border-frost"
+                  : "text-foreground-dim hover:text-foreground hover:bg-white/[0.03] border-l-2 border-transparent"}
               `}
             >
-              <span className={active ? "text-frost" : "text-muted"}>
-                {item.icon}
-              </span>
-              {item.label}
+              <span className={active ? "text-frost" : "text-muted"}>{item.icon}</span>
+              {!collapsed && item.label}
             </Link>
           );
         })}
       </nav>
 
-      {/* Bottom status */}
-      <div className="px-4 py-3 border-t border-sidebar-border">
-        <div className="flex items-center gap-2">
+      {/* Bottom: theme toggle + status */}
+      <div className={`py-3 border-t border-sidebar-border flex flex-col gap-2.5 ${collapsed ? "px-0 items-center" : "px-4"}`}>
+        <ThemeToggle collapsed={collapsed} />
+        <div className={`flex items-center gap-2 ${collapsed ? "justify-center" : ""}`} title="Connected">
           <span className="w-1.5 h-1.5 rounded-full status-online" />
-          <span className="text-[11px] text-muted font-mono">Connected</span>
+          {!collapsed && <span className="text-[11px] text-muted font-mono">Connected</span>}
         </div>
       </div>
     </aside>
