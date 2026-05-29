@@ -22,6 +22,7 @@ from .routers import (
     pyfuncrun_router,
     replicate_router,
     tabular_router,
+    analysis_router,
     workbook_router,
     user_router,
 )
@@ -36,6 +37,7 @@ from .services.pyfuncrun import PyFuncRunService
 from .services.messenger import MessengerService as V2MessengerService
 from .services.replicate import ReplicateService
 from .services.tabular import TabularService
+from .services.analysis import AnalysisService
 from .services.user import UserService
 from .services.excel import ExcelService
 
@@ -60,6 +62,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     fs = FsService(settings)
     app.state.fs_service = fs
     app.state.tabular_service = TabularService(settings, fs=fs)
+    app.state.analysis_service = AnalysisService(settings, fs=fs)
 
     pyenv = PyEnvService(settings, audit=audit)
     pyfunc = PyFuncService(settings, audit=audit)
@@ -274,6 +277,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(replicate_router, prefix=f"{prefix}/replicate")
     app.include_router(fs_router, prefix=f"{prefix}/fs")
     app.include_router(tabular_router, prefix=f"{prefix}/tabular")
+    app.include_router(analysis_router, prefix=f"{prefix}/analysis")
     app.include_router(workbook_router, prefix=f"{prefix}/workbook")
     app.include_router(user_router, prefix=f"{prefix}/user")
     app.include_router(messenger_router, prefix=f"{prefix}/messenger")

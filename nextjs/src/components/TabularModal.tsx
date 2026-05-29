@@ -22,11 +22,20 @@ import {
   workbookReadArrowUrl,
   editWorkbook,
   fsDownloadUrl,
+  aggregate,
+  finance,
   type TabularInspect,
   type TabularCell,
   type WorkbookSheet,
+  type AggFunc,
+  type AggregateResult,
+  type FinanceResult,
 } from "@/lib/api";
 import { fetchArrowTable } from "@/lib/arrow";
+import Chart, { type ChartType } from "@/components/Chart";
+
+const AGGS: AggFunc[] = ["sum", "mean", "min", "max", "count", "median", "std", "var"];
+const isNumericType = (t: string) => /int|float|double|decimal/i.test(t);
 
 const EDIT_CAP = 2000; // rows we'll load into an editable grid
 const PAGE = 100;      // row page size for read-only viewports
@@ -72,10 +81,29 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const [page, setPage] = useState(0);   // read-only viewport page
   const [total, setTotal] = useState(0); // total data rows (for paging)
 
+  // Analyze mode (pivot + finance + charts)
+  const [mode, setMode] = useState<"grid" | "analyze">("grid");
+  const [analyzeKind, setAnalyzeKind] = useState<"pivot" | "finance">("pivot");
+  const [groupBy, setGroupBy] = useState("");
+  const [measureCol, setMeasureCol] = useState("");
+  const [aggFn, setAggFn] = useState<AggFunc>("sum");
+  const [chartType, setChartType] = useState<ChartType>("bar");
+  const [pivot, setPivot] = useState<AggregateResult | null>(null);
+  const [financeCol, setFinanceCol] = useState("");
+  const [fin, setFin] = useState<FinanceResult | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeErr, setAnalyzeErr] = useState<string | null>(null);
+
   const decodeInto = useCallback(async (url: string) => {
     const t = await fetchArrowTable(url);
     setColumns(t.columns);
     setGrid(t.rows.map((r) => r.map((v) => (v === null || v === undefined ? "" : String(v)))));
+    // seed analyze defaults from the schema (first numeric measure, first
+    // non-numeric dimension) so the Analyze panel is ready to run.
+    const nums = t.columns.filter((c) => isNumericType(c.type)).map((c) => c.name);
+    const dim = t.columns.find((c) => !isNumericType(c.type))?.name ?? "";
+    if (nums.length) { setMeasureCol((m) => m || nums[0]); setFinanceCol((m) => m || nums[0]); }
+    setGroupBy((g) => g || dim);
   }, []);
 
   // ``dims`` is passed explicitly (never read from `sheets` state) so this
@@ -187,6 +215,35 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     }
   };
 
+  const numericCols = columns.filter((c) => isNumericType(c.type)).map((c) => c.name);
+  const allCols = columns.map((c) => c.name);
+
+  const runPivot = async () => {
+    if (!measureCol) return;
+    setAnalyzing(true); setAnalyzeErr(null);
+    try {
+      const res = await aggregate(path, groupBy ? [groupBy] : [], [{ column: measureCol, agg: aggFn }], node);
+      setPivot(res);
+    } catch (e) {
+      setAnalyzeErr(e instanceof Error ? e.message : "aggregate failed");
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const runFinance = async () => {
+    if (!financeCol) return;
+    setAnalyzing(true); setAnalyzeErr(null);
+    try {
+      const res = await finance(path, financeCol, { window: 20, limit: 2000, node });
+      setFin(res);
+    } catch (e) {
+      setAnalyzeErr(e instanceof Error ? e.message : "finance failed");
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
   const dirty = edited.size > 0;
   const meta: [string, string][] = isWorkbook
     ? [
@@ -229,11 +286,22 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
               <span className="text-frost/70">{nodeLabel ?? node ?? "local"}</span>{" : "}{info?.source_url ?? path}
             </p>
           </div>
-          <button onClick={onClose} className="text-muted hover:text-foreground shrink-0 ml-4">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </button>
+          <div className="flex items-center gap-2 shrink-0 ml-4">
+            <div className="flex rounded-lg overflow-hidden border border-white/[0.08] text-[10px] font-mono">
+              {(["grid", "analyze"] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setMode(m)}
+                  className={`px-3 py-1 uppercase tracking-wider ${mode === m ? "bg-emerald/15 text-emerald" : "text-muted hover:text-foreground"}`}
+                >{m}</button>
+              ))}
+            </div>
+            <button onClick={onClose} className="text-muted hover:text-foreground">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         {/* Metadata strip */}
@@ -267,13 +335,117 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
           </div>
         )}
 
-        {readOnly && !loading && !error && (
+        {mode === "grid" && readOnly && !loading && !error && (
           <div className="shrink-0 rounded bg-amber/[0.06] border border-amber/15 px-3 py-1.5 text-[10px] font-mono text-amber/90">
             Read-only — over the {EDIT_CAP}-row editable cap. Showing the first {grid.length} rows; download for the full file.
           </div>
         )}
 
+        {/* Analyze panel — pivot + finance + charts */}
+        {mode === "analyze" && (
+          <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30 p-3 space-y-3">
+            <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap">
+              {(["pivot", "finance"] as const).map((k) => (
+                <button key={k} onClick={() => setAnalyzeKind(k)}
+                  className={`px-2.5 py-1 rounded ${analyzeKind === k ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{k}</button>
+              ))}
+              <span className="w-px h-4 bg-white/10 mx-1" />
+              {analyzeKind === "pivot" ? (
+                <>
+                  <label className="text-muted">group</label>
+                  <select value={groupBy} onChange={(e) => setGroupBy(e.target.value)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
+                    <option value="">(none)</option>
+                    {allCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <label className="text-muted">of</label>
+                  <select value={measureCol} onChange={(e) => setMeasureCol(e.target.value)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
+                    {(numericCols.length ? numericCols : allCols).map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <select value={aggFn} onChange={(e) => setAggFn(e.target.value as AggFunc)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
+                    {AGGS.map((a) => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                  <button onClick={runPivot} disabled={analyzing || !measureCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
+                </>
+              ) : (
+                <>
+                  <label className="text-muted">series</label>
+                  <select value={financeCol} onChange={(e) => setFinanceCol(e.target.value)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
+                    {(numericCols.length ? numericCols : allCols).map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <button onClick={runFinance} disabled={analyzing || !financeCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
+                </>
+              )}
+              {analyzeKind === "pivot" && (
+                <span className="ml-auto flex items-center gap-1">
+                  {(["bar", "line", "area"] as ChartType[]).map((t) => (
+                    <button key={t} onClick={() => setChartType(t)}
+                      className={`px-2 py-1 rounded ${chartType === t ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{t}</button>
+                  ))}
+                </span>
+              )}
+            </div>
+
+            {analyzeErr && <div className="text-[11px] text-rose/90 font-mono">{analyzeErr}</div>}
+            {analyzing && <div className="text-[11px] text-muted font-mono">computing…</div>}
+
+            {/* Pivot result */}
+            {analyzeKind === "pivot" && pivot && !analyzing && (
+              <div className="space-y-3">
+                <Chart
+                  type={chartType}
+                  labels={pivot.rows.map((r) => String(r[0]))}
+                  values={pivot.rows.map((r) => Number(r[pivot.columns.length - 1]))}
+                  color="var(--emerald)"
+                  yLabel={pivot.columns[pivot.columns.length - 1]}
+                />
+                <div className="text-[10px] text-muted font-mono">
+                  {pivot.group_count} groups · {pivot.source_rows.toLocaleString()} rows{pivot.truncated ? " (capped)" : ""}
+                </div>
+                <table className="w-full text-[11px] font-mono border-collapse">
+                  <thead><tr>{pivot.columns.map((c) => <th key={c} className="px-2 py-1 text-left text-frost/80 border-b border-white/[0.06]">{c}</th>)}</tr></thead>
+                  <tbody>
+                    {pivot.rows.slice(0, 50).map((r, i) => (
+                      <tr key={i} className="hover:bg-white/[0.02]">
+                        {r.map((v, j) => <td key={j} className="px-2 py-1 border-b border-white/[0.03] text-foreground/80">{v == null ? "" : typeof v === "number" ? Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(v)}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Finance result */}
+            {analyzeKind === "finance" && fin && !analyzing && (
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] font-mono">
+                  {[
+                    ["points", String(fin.value.length)],
+                    ["cum return", fin.cum_return.at(-1) != null ? `${(fin.cum_return.at(-1)! * 100).toFixed(2)}%` : "--"],
+                    ["roll vol (20)", fin.roll_vol.at(-1) != null ? `${(fin.roll_vol.at(-1)! * 100).toFixed(2)}%` : "--"],
+                    ["window", String(fin.window)],
+                  ].map(([k, v]) => (
+                    <div key={k} className="rounded bg-white/[0.03] border border-white/[0.06] px-2 py-1.5">
+                      <div className="text-muted/60 uppercase tracking-wider text-[9px]">{k}</div><div className="text-foreground/80">{v}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="text-[10px] text-frost/70 font-mono">cumulative return</div>
+                <Chart type="area" labels={fin.index} values={fin.cum_return} color="var(--emerald)" yLabel="cum return" />
+                <div className="text-[10px] text-frost/70 font-mono">{fin.column} + rolling mean</div>
+                <Chart type="line" labels={fin.index} values={fin.value} color="var(--frost)" yLabel={fin.column} />
+              </div>
+            )}
+
+            {!pivot && !fin && !analyzing && !analyzeErr && (
+              <div className="text-[11px] text-muted font-mono py-8 text-center">
+                Pick {analyzeKind === "pivot" ? "a group + measure" : "a numeric series"} and hit run.
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Grid */}
+        {mode === "grid" && (
         <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30">
           {loading ? (
             <div className="flex items-center justify-center py-16">
@@ -319,6 +491,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
             </table>
           )}
         </div>
+        )}
 
         {/* Footer */}
         <div className="flex items-center gap-3 pt-1 shrink-0">

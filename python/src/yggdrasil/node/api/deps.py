@@ -10,6 +10,7 @@ from .services.pyfunc import PyFuncService
 from .services.pyfuncrun import PyFuncRunService
 from .services.fs import FsService
 from .services.tabular import TabularService
+from .services.analysis import AnalysisService
 from .services.replicate import ReplicateService
 from .services.user import UserService
 from .services.messenger import MessengerService as V2MessengerService
@@ -22,6 +23,10 @@ def get_fs_service(request: Request) -> FsService:
 
 def get_tabular_service(request: Request) -> TabularService:
     return request.app.state.tabular_service
+
+
+def get_analysis_service(request: Request) -> AnalysisService:
+    return request.app.state.analysis_service
 
 
 def get_pyenv_service(request: Request) -> PyEnvService:

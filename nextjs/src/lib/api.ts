@@ -506,6 +506,65 @@ export async function editWorkbook(
   return res;
 }
 
+// ── Analysis (pivot / describe / finance) ───────────────────────────────────
+export type AggFunc = "sum" | "mean" | "min" | "max" | "count" | "median" | "std" | "var";
+
+export interface AggregateResult {
+  columns: string[];
+  rows: TabularCell[][];
+  group_count: number;
+  source_rows: number;
+  truncated: boolean;
+}
+
+export function aggregate(
+  path: string,
+  group_by: string[],
+  measures: { column: string; agg: AggFunc }[],
+  node?: string,
+  limit = 500,
+): Promise<AggregateResult> {
+  return jsonFetch(`/api/v2/analysis/aggregate${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
+    method: "POST",
+    body: JSON.stringify({ path, group_by, measures, limit }),
+  });
+}
+
+export interface DescribeResult {
+  statistics: string[];
+  columns: string[];
+  rows: TabularCell[][];
+  truncated: boolean;
+}
+
+export function describe(path: string, node?: string): Promise<DescribeResult> {
+  return jsonFetch(`/api/v2/analysis/describe?path=${encodeURIComponent(path)}${nodeParam(node)}`);
+}
+
+export interface FinanceResult {
+  column: string;
+  window: number;
+  index: (string | number)[];
+  value: (number | null)[];
+  pct_change: (number | null)[];
+  cum_return: (number | null)[];
+  roll_mean: (number | null)[];
+  roll_vol: (number | null)[];
+  truncated: boolean;
+}
+
+export function finance(
+  path: string,
+  column: string,
+  opts: { order_by?: string; window?: number; limit?: number; node?: string } = {},
+): Promise<FinanceResult> {
+  const { node, ...body } = opts;
+  return jsonFetch(`/api/v2/analysis/finance${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
+    method: "POST",
+    body: JSON.stringify({ path, column, ...body }),
+  });
+}
+
 // ── Messenger ──────────────────────────────────────────────────────────────
 
 export function getChannels(fresh = false): Promise<{ node_id: string; channels: ChannelInfo[] }> {
