@@ -168,12 +168,29 @@ class HTTPStream(MemoryStream):
             )
 
     def _open_range_connection(self, offset: int) -> Any:
-        """Issue a Range request and bind the response as the new source."""
+        """Issue a Range request and bind the response as the new source.
+
+        *offset* is the number of body bytes already consumed. When the
+        original request itself carried a ``Range: bytes=<base>-[<end>]``
+        (a bounded / offset read), the resume must continue from
+        ``base + offset`` and preserve the original upper bound — not
+        from ``offset`` alone, which would be an absolute address into
+        the wrong part of the object and silently corrupt the read.
+        """
         session = self._session_ref
         request = self._request
         headers = {**dict(request.headers)}
-        if offset > 0:
-            headers["Range"] = f"bytes={offset}-"
+        base, end = 0, ""
+        original = headers.get("Range")
+        if original and original.startswith("bytes="):
+            spec = original[len("bytes="):].split("-", 1)
+            if spec[0].strip().isdigit():
+                base = int(spec[0].strip())
+            if len(spec) > 1:
+                end = spec[1].strip()
+        start = base + offset
+        if start > 0 or end:
+            headers["Range"] = f"bytes={start}-{end}"
 
         url = request.url
         scheme = url.scheme

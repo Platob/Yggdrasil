@@ -255,6 +255,7 @@ class VolumePath(DatabricksPath):
         *,
         params: "dict[str, str] | None" = None,
         body: Any = None,
+        range_header: "str | None" = None,
         preload_content: bool = True,
     ) -> Any:
         """Issue one Files-API request; return the raw :class:`HTTPResponse`.
@@ -262,7 +263,8 @@ class VolumePath(DatabricksPath):
         Status translation is the caller's job — see
         :meth:`_raise_for_files_status`. The session retries transient
         wire failures (429 / 5xx / SSL EOF) internally before this
-        returns.
+        returns; an open *range_header* (``bytes=<off>-``) resumes
+        mid-stream from the last received byte.
         """
         url = self.client.base_url.with_path(
             f"/api/2.0/fs/{kind}{quote(api_path, safe='/')}"
@@ -270,10 +272,13 @@ class VolumePath(DatabricksPath):
         if params:
             for key, value in params.items():
                 url = url.add_param(key=key, value=value)
+        headers = {"Authorization": self.client.files_authorization()}
+        if range_header is not None:
+            headers["Range"] = range_header
         return self.client.files_session().fetch(
             method,
             url,
-            headers={"Authorization": self.client.files_authorization()},
+            headers=headers,
             body=body,
             preload_content=preload_content,
         )
@@ -311,20 +316,6 @@ class VolumePath(DatabricksPath):
         if status == 409:
             raise FileExistsError(detail)
         raise OSError(f"Files API {status} for {api_path}: {detail}")
-
-    def _head_meta(self, kind: str, api_path: str) -> Any:
-        """``HEAD`` probe — the response on 2xx, ``None`` otherwise.
-
-        Mirrors the old ``files.get_metadata`` /
-        ``get_directory_metadata`` SDK probes whose every failure
-        (NotFound, permission, transient) collapsed to "treat as absent"
-        at the :meth:`_stat_uncached` call site.
-        """
-        try:
-            resp = self._fs_request("HEAD", kind, api_path)
-        except Exception:
-            return None
-        return resp if resp.ok else None
 
     def _list_directory(self, api_path: str) -> Iterator[Any]:
         """Yield directory entries, following ``next_page_token`` pagination.
@@ -408,21 +399,27 @@ class VolumePath(DatabricksPath):
         else:
             probes = (("directories", IOKind.DIRECTORY), ("files", IOKind.FILE))
         for kind, io_kind in probes:
-            resp = self._head_meta(kind, api_path)
-            if resp is None:
+            # ``HEAD`` probe — any failure (NotFound, permission,
+            # transient after the session exhausted its retries) collapses
+            # to "treat as absent" and falls through to the next probe.
+            try:
+                resp = self._fs_request("HEAD", kind, api_path)
+            except Exception:
                 continue
+            if not resp.ok:
+                continue
+            lm = _header(resp.headers, "Last-Modified")
+            parsed = parse_http_date(lm) if lm else None
+            mtime = parsed.timestamp() if parsed else 0.0
             if io_kind is IOKind.FILE:
+                ct = _header(resp.headers, "Content-Type")
                 return IOStats(
                     kind=IOKind.FILE,
                     size=int(_header(resp.headers, "Content-Length") or 0),
-                    mtime=_mtime_from_headers(resp.headers),
-                    media_type=_media_type_from_headers(resp.headers),
+                    mtime=mtime,
+                    media_type=MediaType.from_(ct, default=None) if ct else None,
                 )
-            return IOStats(
-                kind=IOKind.DIRECTORY,
-                size=0,
-                mtime=_mtime_from_headers(resp.headers),
-            )
+            return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=mtime)
         # Implicit-directory fallback. A ``PUT /files`` to a brand-new
         # ``/Volumes/<...>/parent/file.bin`` silently materialises the
         # file without creating an explicit ``parent`` entry, so a
@@ -1036,12 +1033,25 @@ class VolumePath(DatabricksPath):
                         pass
                 return memoryview(data)
         api_path = self.api_path
-        # Stream the body through :class:`HTTPStream` (preload off) so a
-        # mid-flight SSL EOF / connection reset resumes via a Range
-        # re-request instead of failing the whole read. ``resp.data``
-        # then pulls the (resumable) body to EOF and releases the socket.
+        # Critical: a bounded / offset read (``n > 0`` or ``pos > 0``)
+        # asks for a *slice*, so send an HTTP ``Range`` header and let
+        # the server return just those bytes (206) instead of pulling the
+        # whole object and slicing locally — random-seek reads (Parquet
+        # footers, column chunks, page-cache fills) would otherwise
+        # transfer the entire file per call. The whole-file case
+        # (``pos == 0`` and ``n < 0``) sends no Range so the body streams
+        # resumably from byte zero.
+        if n > 0:
+            range_header = f"bytes={pos}-{pos + n - 1}"
+        elif pos > 0:
+            range_header = f"bytes={pos}-"
+        else:
+            range_header = None
         try:
-            resp = self._fs_request("GET", "files", api_path, preload_content=False)
+            resp = self._fs_request(
+                "GET", "files", api_path,
+                range_header=range_header, preload_content=False,
+            )
         except Exception as exc:
             if _looks_like_not_found(exc):
                 raise FileNotFoundError(self.full_path()) from exc
@@ -1051,39 +1061,50 @@ class VolumePath(DatabricksPath):
         self._raise_for_files_status(resp, api_path)
 
         data = resp.data
+        # The server honoured the Range (206) → ``data`` is already the
+        # requested slice; the total object size comes from
+        # ``Content-Range: bytes <s>-<e>/<total>``. A 200 means the
+        # server ignored the Range (or none was sent) → ``data`` is the
+        # whole object and ``len(data)`` IS the total, so slice locally.
+        total_size = len(data)
+        if range_header is not None and resp.status == 206:
+            content_range = _header(resp.headers, "Content-Range") or ""
+            tail = content_range.rsplit("/", 1)[-1].strip() if "/" in content_range else ""
+            if tail.isdigit():
+                total_size = int(tail)
+        else:
+            if pos:
+                data = data[pos:]
+            if n > 0:
+                data = data[:n]
         logger.debug(
-            "Downloaded volume file %r -> %d bytes (slice pos=%d n=%s)",
-            self,
-            len(data),
-            pos,
-            "EOF" if n < 0 else n,
+            "Read volume file %r -> %d bytes (pos=%d n=%s status=%d total=%d)",
+            self, len(data), pos, "EOF" if n < 0 else n, resp.status, total_size,
         )
 
-        media_type = _media_type_from_headers(resp.headers)
-        mtime = _mtime_from_headers(resp.headers) or time.time()
+        ct = _header(resp.headers, "Content-Type")
+        media_type = MediaType.from_(ct, default=None) if ct else None
+        lm = _header(resp.headers, "Last-Modified")
+        parsed = parse_http_date(lm) if lm else None
+        mtime = parsed.timestamp() if parsed else time.time()
         if not self._stat_cached:
             self._persist_stat_cache(
                 stats=IOStats(
-                    size=len(data),
+                    size=total_size,
                     kind=IOKind.FILE,
                     mtime=mtime,
                     media_type=media_type,
                 )
             )
         else:
-            self._stat_cached.size = len(data)
+            self._stat_cached.size = total_size
             self._stat_cached.mtime = mtime
             if media_type is not None and self._stat_cached.media_type is None:
                 self._stat_cached.media_type = media_type
-            # Re-stamp the TTL — this download IS the freshest size we
-            # could observe; the entry should outlive the original
-            # probe's window from this point on.
+            # Re-stamp the TTL — this read observed the freshest total
+            # size; the entry should outlive the original probe window.
             self._persist_stat_cache(self._stat_cached)
 
-        if pos:
-            data = data[pos:]
-        if n > 0:
-            data = data[:n]
         return memoryview(data)
 
     def _write_stream(
@@ -1236,31 +1257,6 @@ def _header(headers, name: str) -> "str | None":
         if str(key).lower() == target:
             return headers.get(key)
     return None
-
-
-def _media_type_from_headers(headers) -> "MediaType | None":
-    """Resolve a :class:`MediaType` from a Files API response's headers.
-
-    Reads ``Content-Type``; returns ``None`` when absent or when it
-    doesn't map to a known media type — the caller then falls back to
-    URL-extension inference.
-    """
-    mime = _header(headers, "Content-Type")
-    if not mime:
-        return None
-    return MediaType.from_(mime, default=None)
-
-
-def _mtime_from_headers(headers) -> float:
-    """Parse the ``Last-Modified`` HTTP-date header into an epoch float (0.0 if absent)."""
-    raw = _header(headers, "Last-Modified")
-    if not raw:
-        return 0.0
-    try:
-        parsed = parse_http_date(raw)
-    except Exception:
-        return 0.0
-    return float(parsed.timestamp()) if parsed else 0.0
 
 
 def _mtime(info) -> float:

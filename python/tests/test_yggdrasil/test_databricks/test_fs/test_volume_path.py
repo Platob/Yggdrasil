@@ -316,6 +316,87 @@ class TestRead:
         assert workspace.files.download.call_count == 1
 
 
+class TestRangeReads:
+    """Random-seek reads must transfer only the requested slice via an
+    HTTP ``Range`` request — not download the whole object per call.
+    This is the headline optimization over the SDK's Files client, which
+    has no range support."""
+
+    # Position-distinct bytes so a slice uniquely identifies its offset.
+    PAYLOAD = bytes(range(256)) * 8  # 2048 bytes
+
+    def _wire_download(self, workspace):
+        workspace.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: self.PAYLOAD),
+            content_type=None,
+            last_modified=None,
+        )
+
+    def test_bounded_read_fetches_only_the_slice(self, workspace, client, service):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        out = bytes(p._read_mv(16, 100))
+        assert out == self.PAYLOAD[100:116]
+        # Only the 16-byte slice crossed the wire — not the whole object.
+        assert client.files_session.return_value.bytes_served == 16
+
+    def test_bounded_read_caches_true_total_size(self, workspace, client, service):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        p._read_mv(16, 100)
+        # Stat cache reflects the full object size (from Content-Range),
+        # not the 16-byte slice — so ``size`` stays correct after a
+        # partial read.
+        assert p._stat_cached.size == len(self.PAYLOAD)
+
+    def test_open_ended_range_reads_tail(self, workspace, client, service):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        out = bytes(p._read_mv(-1, 2000))
+        assert out == self.PAYLOAD[2000:]
+        assert p._stat_cached.size == len(self.PAYLOAD)
+
+    def test_whole_file_read_sends_no_range(self, workspace, client, service):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        out = bytes(p._read_mv(-1, 0))
+        assert out == self.PAYLOAD
+        # A whole-file read transfers the whole object exactly once.
+        assert client.files_session.return_value.bytes_served == len(self.PAYLOAD)
+
+    def test_random_seeks_transfer_far_less_than_full_object(
+        self, workspace, client, service
+    ):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        offsets = [0, 500, 1900, 1000, 64, 2040]
+        for off in offsets:
+            n = min(8, len(self.PAYLOAD) - off)
+            assert bytes(p._read_mv(n, off)) == self.PAYLOAD[off:off + n]
+        served = client.files_session.return_value.bytes_served
+        # ~6 * 8 bytes — a fraction of one full object download, let alone
+        # the six the old "download everything and slice" path would do.
+        assert served <= 6 * 8
+        assert served < len(self.PAYLOAD)
+
+    def test_server_ignoring_range_falls_back_to_local_slice(self):
+        # If the server returns 200 (ignores Range), VolumePath slices
+        # locally — correct bytes, full size cached, no corruption.
+        c = wire_files_session(MagicMock(), honor_range=False)
+        svc = MagicMock(spec=Volumes)
+        svc.client = c
+        ws = c.workspace_client.return_value
+        ws.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: self.PAYLOAD),
+            content_type=None,
+            last_modified=None,
+        )
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=svc)
+        out = bytes(p._read_mv(16, 100))
+        assert out == self.PAYLOAD[100:116]
+        assert p._stat_cached.size == len(self.PAYLOAD)
+
+
 class TestWrite:
 
     def test_overwrite(self, workspace, client, service) -> None:
