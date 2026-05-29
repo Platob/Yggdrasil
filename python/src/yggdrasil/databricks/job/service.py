@@ -20,6 +20,7 @@ from databricks.sdk.service.jobs import (
     JobAccessControlRequest,
     JobPermissionLevel,
     JobSettings,
+    SubmitTask,
     Task,
 )
 
@@ -169,7 +170,8 @@ def _check_permission(
 class Jobs(DatabricksService):
     """Collection-level Databricks job management.
 
-    Listing, finding, creating, and updating jobs live here.
+    Listing, finding, creating, and updating jobs live here, as does
+    :meth:`submit` for one-time runs that aren't backed by a persisted job.
     Individual job lifecycle operations live on the :class:`Job` resource.
 
     Getter methods accept a positional ``obj`` that can be a :class:`Job`,
@@ -406,6 +408,85 @@ class Jobs(DatabricksService):
     ) -> None:
         job = self.get(obj, job_id=job_id, name=name)
         job.delete()
+
+    # ------------------------------------------------------------------ #
+    # Submit (one-time run, no persisted job)
+    # ------------------------------------------------------------------ #
+
+    def submit(
+        self,
+        *,
+        run_name: str | None = None,
+        tasks: list["SubmitTask | dict"] | None = None,
+        cluster: "Cluster | str | None" = None,
+        timeout_seconds: int | None = None,
+        wait: WaitingConfigArg = False,
+        raise_error: bool = True,
+        **submit_kwargs: Any,
+    ) -> "JobRun":
+        """Submit a one-time run without creating a persisted job.
+
+        Mirrors the SDK ``jobs.submit`` one-shot API: the run executes
+        immediately and is not backed by a saved job definition (so it
+        has a ``run_id`` but no ``job_id``).  Returns an awaitable
+        :class:`JobRun`, exactly like :meth:`Job.run`.
+
+        Tasks are :class:`SubmitTask` (not :class:`Task`) — the SDK uses a
+        distinct task type for one-time runs.  Dicts are coerced.  When a
+        ``cluster`` is given, it backfills ``existing_cluster_id`` on any
+        task that doesn't already pin a cluster.
+
+        Parameters
+        ----------
+        run_name:
+            Display name for the run.
+        tasks:
+            List of :class:`SubmitTask` or dicts.
+        cluster:
+            Default cluster for tasks that don't specify their own.
+        timeout_seconds:
+            Overall run timeout.
+        wait:
+            ``False`` (default) = fire-and-forget; ``True`` = block until
+            terminal; a number = timeout in seconds.
+        raise_error:
+            Raise on terminal failure when waiting.
+        """
+        from .run import JobRun
+
+        sdk = self.client.workspace_client().jobs
+
+        checked_tasks: list[SubmitTask] | None = None
+        if tasks:
+            cid = _resolve_cluster_id(cluster)
+            checked_tasks = []
+            for t in tasks:
+                if isinstance(t, dict):
+                    t = SubmitTask(**t)
+                elif not isinstance(t, SubmitTask):
+                    raise TypeError(
+                        f"Expected SubmitTask or dict, got {type(t).__name__}"
+                    )
+                if cid is not None and t.existing_cluster_id is None and t.new_cluster is None:
+                    t.existing_cluster_id = cid
+                checked_tasks.append(t)
+
+        LOGGER.debug("Submitting one-time run %r", run_name)
+        response = sdk.submit(
+            run_name=run_name,
+            tasks=checked_tasks,
+            timeout_seconds=timeout_seconds,
+            **submit_kwargs,
+        )
+
+        job_run = JobRun(service=JobRuns(client=self.client), run_id=response.run_id)
+
+        LOGGER.info("Submitted one-time run %s (%r)", response.run_id, run_name)
+
+        if wait is not False:
+            job_run.wait(wait=wait, raise_error=raise_error)
+
+        return job_run
 
 
 # ---------------------------------------------------------------------------
