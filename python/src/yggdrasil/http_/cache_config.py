@@ -610,7 +610,7 @@ class CacheConfig:
                     holder.write_arrow_batches((data,), options=opts)
             elif isinstance(data, pa.Table):
                 if data.num_rows > 0:
-                    holder.write_arrow_batches(data.to_batches(), options=opts)
+                    holder.write_arrow_table(data, options=opts)
             else:
                 holder.write_arrow_batches(data, options=opts)
         except Exception:

@@ -33,7 +33,7 @@ from typing import Any, Callable, ClassVar, Dict, Iterable, List, Optional, Type
 
 from databricks.sdk import ClustersAPI
 from databricks.sdk.client_types import ClientType
-from databricks.sdk.errors import DatabricksError
+from databricks.sdk.errors import DatabricksError, InvalidState
 from databricks.sdk.errors.platform import ResourceDoesNotExist
 from databricks.sdk.service._internal import Wait
 from databricks.sdk.service.compute import (
@@ -645,9 +645,13 @@ class Cluster(Singleton, DatabricksResource, URLBased):
             client.start(cluster_id=self.cluster_id)
         except DatabricksError:
             self.wait_for_status(wait=wait)
-            if self.is_running:
+            if self.is_running or self.is_pending:
                 return self
-            client.start(cluster_id=self.cluster_id)
+
+            try:
+                client.start(cluster_id=self.cluster_id)
+            except InvalidState:
+                pass
 
         LOGGER.info("Started cluster %r", self)
         self.wait_for_status(wait=wait)
