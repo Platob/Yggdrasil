@@ -41,7 +41,7 @@ Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 1. **Zero-config decorators** — `@function` infers name, code, dependencies, python version. `@function(auto_env=True)` also creates a matching PyEnv with the right Python version and deps.
 2. **Auto-env creation** — when a function is registered without an explicit environment, the system auto-creates one named `auto_{func_name}` with inferred deps.
 3. **Multi-python** — `uv venv --python 3.11/3.12/3.13` creates isolated envs. Code is replicable across nodes with different system Pythons.
-4. **Auto-install on start** — `ygg node start` auto-registers systemd/launchd boot services so the node survives reboots.
+4. **Opt-in persistence** — `ygg node start` just starts the daemon; pass `--persist` (on `start` / `serve` / `back` / `front`) to also register systemd/launchd boot services (Task Scheduler on Windows) so the node survives reboots. A failed install logs a warning and never aborts the deploy.
 
 ## Principles
 
@@ -168,7 +168,7 @@ The `@function` decorator infers: name, source code, dependencies (AST), python 
 
 ## CLI
 
-`ygg node start` — background daemon (auto-installs boot service)
+`ygg node start` — background daemon (add `--persist` to install the boot/auto-start service)
 `ygg node stop` — stop the daemon
 `ygg node create <name>` — create named node at `~/.node/<name>/`
 `ygg node serve` — foreground server + frontend

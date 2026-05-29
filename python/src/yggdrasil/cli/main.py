@@ -48,6 +48,7 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0).")
     start.add_argument("--port", type=int, default=None, help="Bind port (default: 8100, auto-scans if busy).")
     start.add_argument("--name", default=None, help="Node ID override.")
+    start.add_argument("--persist", action="store_true", default=False, help="Also create/update the boot auto-start service (Task Scheduler on Windows).")
     start.set_defaults(handler=_node_start)
 
     # stop
@@ -333,10 +334,9 @@ def _persist_service(settings, *, no_front: bool = False) -> None:
 # ── handlers ─────────────────────────────────────────────────────
 
 def _node_start(args: argparse.Namespace) -> int:
-    from yggdrasil.cli.style import blue, bold, cyan, dim, green, magenta, orange, out, print_logo, yellow
+    from yggdrasil.cli.style import blue, bold, cyan, dim, green, orange, out, print_logo
     from yggdrasil.node.config import get_settings
     from yggdrasil.node.daemon import spawn_node
-    from yggdrasil.node.service import install_service, is_service_installed
 
     _apply_node_env(args)
     print_logo("YGGNODE")
@@ -354,13 +354,9 @@ def _node_start(args: argparse.Namespace) -> int:
     out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
     out(f"  {cyan('pid')}     {dim(str(pid))}\n")
 
-    if not is_service_installed(settings):
-        out(f"\n  {magenta('install')} registering boot service...\n")
-        ok, msg = install_service(settings, no_front=True)
-        if ok:
-            out(f"  {green('✓')} auto-start on boot enabled\n")
-        else:
-            out(f"  {yellow('skip')} {dim(msg)}\n")
+    # Persisting (auto-start on boot) is opt-in — `start` just starts.
+    if getattr(args, "persist", False):
+        _persist_service(settings, no_front=True)
 
     out(f"\n  {dim('Public access enabled. Stop with:')} {bold('ygg node stop')}\n")
     return 0
