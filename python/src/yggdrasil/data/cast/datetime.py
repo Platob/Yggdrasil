@@ -59,12 +59,15 @@ _FROMTIMESTAMP = _DATETIME.fromtimestamp
 _NOW_TS = time.time
 _ISFINITE = math.isfinite
 
-# Representable bounds for epoch→datetime conversion. A timestamp whose
-# magnitude (or mis-detected unit, e.g. nanoseconds) lands outside year
-# 1–9999 is throttled to the nearest edge rather than raising, so one
-# pathological value never aborts a batch decode.
-_DT_MIN = _DATETIME.min.replace(tzinfo=_UTC)
-_DT_MAX = _DATETIME.max.replace(tzinfo=_UTC)
+# Throttle bounds for epoch→datetime conversion. A timestamp whose
+# magnitude (or mis-detected unit) lands out of range is clamped to the
+# nearest edge rather than raising, so one pathological value never aborts
+# a batch decode. The edges are the span an int64 nanosecond count since
+# the 1970 epoch can address (~1677..2262) — the native domain of
+# Arrow/pandas ``timestamp[ns]`` data — not the wider year 1–9999 limits.
+_EPOCH = _DATETIME(1970, 1, 1, tzinfo=_UTC)
+_DT_MIN = _EPOCH + _TIMEDELTA(microseconds=-(2 ** 63) // 1000)
+_DT_MAX = _EPOCH + _TIMEDELTA(microseconds=(2 ** 63 - 1) // 1000)
 
 _RE_FRACTIONAL_SECONDS = re.compile(r"(\.)(\d+)(?=(?:[+-]\d{2}:?\d{2})?$)")
 _RE_DATE_SLASH = re.compile(r"^(\d{4})/(\d{2})/(\d{2})")

@@ -6,6 +6,7 @@ import datetime as dt
 import pyarrow as pa
 import pytest
 
+from yggdrasil.data.cast.datetime import _DT_MAX
 from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.response import HTTPResponse, RESPONSE_SCHEMA
 from yggdrasil.path.memory import Memory
@@ -353,7 +354,7 @@ class TestArrowProjection:
         # Python's datetime range; reading the batch must not raise
         # OverflowError ("date value out of range"). The raw int64 is
         # recovered and, being irrecoverably out of range, throttled to
-        # the representable edge (datetime.max) rather than dropped.
+        # the int64-nanosecond upper edge (~2262) rather than dropped.
         resp = _make_response(body=b"{}", status_code=200)
         batch = HTTPResponse.values_to_arrow_batch([resp])
         bad = pa.array([9_000_000_000_000_000_000], type=pa.timestamp("us", "UTC"))
@@ -363,7 +364,7 @@ class TestArrowProjection:
         out = list(HTTPResponse.from_arrow_tabular(corrupt))
         assert len(out) == 1
         assert out[0].status_code == 200
-        assert out[0].received_at == dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+        assert out[0].received_at == _DT_MAX
 
     def test_in_range_received_at_round_trips(self) -> None:
         resp = _make_response(status_code=200)
