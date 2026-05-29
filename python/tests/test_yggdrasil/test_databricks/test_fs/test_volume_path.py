@@ -397,6 +397,61 @@ class TestRangeReads:
         assert p._stat_cached.size == len(self.PAYLOAD)
 
 
+class TestOpenedCursor:
+    """Opened (``vp.open("rb")`` + seek/read) vs non-opened reads.
+
+    An opened cursor routes reads through ``_read_mv(n, pos)`` so they
+    become HTTP Range requests, page-quantized by ``page_size``:
+    ``page_size=None`` fetches exact slices, a set page fetches whole
+    pages. Non-opened convenience reads (``read_bytes``) pull the whole
+    object. (Requires the HEAD-stat size to be correct — see the
+    bodyless Content-Length fix.)"""
+
+    PAYLOAD = bytes(range(256)) * 16  # 4096 bytes
+
+    @staticmethod
+    def _store_backed(workspace, blob):
+        workspace.files.download.side_effect = lambda p: SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: blob),
+            content_type=None,
+            last_modified=None,
+        )
+        workspace.files.get_metadata.side_effect = lambda p: SimpleNamespace(
+            content_length=len(blob), content_type=None, last_modified=None,
+        )
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+
+    def test_opened_unpaged_reads_exact_slices(self, workspace, client, service):
+        self._store_backed(workspace, self.PAYLOAD)
+        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service, page_size=None)
+        with p.open("rb") as fh:
+            fh.seek(1000)
+            a = bytes(fh.read(64))
+            fh.seek(3000)
+            b = bytes(fh.read(50))
+        assert a == self.PAYLOAD[1000:1064]
+        assert b == self.PAYLOAD[3000:3050]
+        # Opened + unpaged == exact random access: only touched bytes move.
+        assert client.files_session.return_value.bytes_served == 64 + 50
+
+    def test_opened_paged_fetches_whole_pages(self, workspace, client, service):
+        self._store_backed(workspace, self.PAYLOAD)
+        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service, page_size=256)
+        with p.open("rb") as fh:
+            fh.seek(1000)
+            chunk = bytes(fh.read(10))
+        assert chunk == self.PAYLOAD[1000:1010]
+        # Page-quantized: one ~256B page, not the whole 4096B object.
+        served = client.files_session.return_value.bytes_served
+        assert 0 < served <= 256
+
+    def test_non_opened_read_bytes_pulls_whole_object(self, workspace, client, service):
+        self._store_backed(workspace, self.PAYLOAD)
+        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service)
+        assert bytes(p.read_bytes()) == self.PAYLOAD
+        assert client.files_session.return_value.bytes_served == len(self.PAYLOAD)
+
+
 class TestFormats:
     """How VolumePath behaves under the real format readers/writers
     (Parquet, pickle) over the HTTP transport. A store-backed fake

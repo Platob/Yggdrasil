@@ -145,28 +145,59 @@ class _Service:
         self.client = client
 
 
-def _volume(host: str) -> VolumePath:
-    return VolumePath(
-        "/Volumes/bench/seek/vol/data.bin", service=_Service(_Client(host)),
+def _volume(host: str, page_size) -> VolumePath:
+    vp = VolumePath(
+        "/Volumes/bench/seek/vol/data.bin",
+        service=_Service(_Client(host)),
+        page_size=page_size,
     )
+    vp.invalidate_singleton()
+    return vp
 
 
 # ---------------------------------------------------------------------------
-# Benchmark
+# Read strategies — opened vs non-opened, paged vs unpaged
 # ---------------------------------------------------------------------------
 
 
-def _run_mode(vol: VolumePath, state: _State, offsets, block: int) -> tuple[float, int, int]:
-    state.bytes_served = 0
-    state.requests = 0
-    total = len(state.blob)
-    t0 = time.perf_counter()
+def _direct(host, offsets, block, total):
+    # Lowest-level: VolumePath._read_mv(n, pos) — one Range per read.
+    vp = _volume(host, None)
     for off in offsets:
         n = min(block, total - off)
-        mv = vol._read_mv(n, off)
-        assert len(mv) == n
-    elapsed = time.perf_counter() - t0
-    return elapsed, state.bytes_served, state.requests
+        assert len(vp._read_mv(n, off)) == n
+
+
+def _opened(host, offsets, block, total, page_size):
+    # Open a byte cursor once, seek + read through it (the way a random
+    # reader uses a file handle). Reads route through _read_mv, quantized
+    # to ``page_size`` (None = exact slice).
+    vp = _volume(host, page_size)
+    with vp.open("rb") as fh:
+        for off in offsets:
+            n = min(block, total - off)
+            fh.seek(off)
+            assert len(fh.read(n)) == n
+
+
+def _non_opened_whole(host, offsets, block, total):
+    # Non-opened convenience: each random read re-materialises the whole
+    # object (fresh path so the buffer cache doesn't hide the transfer).
+    for off in offsets:
+        n = min(block, total - off)
+        vp = _volume(host, None)
+        _ = bytes(vp.read_bytes())[off:off + n]
+
+
+def _run(fn, state: _State, repeat: int):
+    times, served = [], 0
+    for _ in range(repeat):
+        state.bytes_served = 0
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+        served = state.bytes_served
+    return min(times), statistics.median(times), served
 
 
 def main() -> None:
@@ -180,48 +211,44 @@ def main() -> None:
 
     state = _State()
     state.blob = random.Random(args.seed).randbytes(args.size_mib * 1024 * 1024)
+    state.honor_range = True
     server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(state))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     host = f"http://127.0.0.1:{server.server_address[1]}"
 
     try:
-        vol = _volume(host)
+        total = len(state.blob)
         rng = random.Random(args.seed + 1)
-        max_off = len(state.blob) - args.block
-        offsets = [rng.randint(0, max_off) for _ in range(args.reads)]
+        offsets = [rng.randint(0, total - args.block) for _ in range(args.reads)]
+        b = args.block
 
-        results: dict[str, list[tuple[float, int, int]]] = {"range": [], "full": []}
-        for mode in ("range", "full"):
-            state.honor_range = mode == "range"
-            for _ in range(args.repeat):
-                results[mode].append(_run_mode(vol, state, offsets, args.block))
+        strategies = [
+            ("direct _read_mv", lambda: _direct(host, offsets, b, total)),
+            ("opened, unpaged", lambda: _opened(host, offsets, b, total, None)),
+            ("opened, 64KiB page", lambda: _opened(host, offsets, b, total, 65536)),
+            ("opened, 4MiB page", lambda: _opened(host, offsets, b, total, 4 << 20)),
+            ("non-opened (whole)", lambda: _non_opened_whole(host, offsets, b, total)),
+        ]
 
         print(
-            f"\nVolumePath random-seek reads — "
-            f"payload={args.size_mib} MiB, block={args.block} B, "
-            f"reads={args.reads}, repeat={args.repeat}\n"
+            f"\nVolumePath random-seek reads — payload={args.size_mib} MiB, "
+            f"block={args.block} B, reads={args.reads}, repeat={args.repeat}\n"
         )
-        header = f"{'mode':<8} {'best (s)':>10} {'median (s)':>12} {'MiB served':>12} {'amplification':>14}"
+        header = f"{'strategy':<22} {'best (s)':>10} {'median (s)':>11} {'MiB served':>11} {'amplification':>14}"
         print(header)
         print("-" * len(header))
         ideal = args.reads * args.block
-        for mode in ("range", "full"):
-            times = [r[0] for r in results[mode]]
-            served = results[mode][0][1]
+        for name, fn in strategies:
+            best, med, served = _run(fn, state, args.repeat)
             print(
-                f"{mode:<8} {min(times):>10.4f} {statistics.median(times):>12.4f} "
-                f"{served / 1024 / 1024:>12.2f} {served / ideal:>13.1f}x"
+                f"{name:<22} {best:>10.4f} {med:>11.4f} "
+                f"{served / 1048576:>11.2f} {served / ideal:>13.1f}x"
             )
-
-        rbest = min(r[0] for r in results["range"])
-        fbest = min(r[0] for r in results["full"])
-        rserved = results["range"][0][1]
-        fserved = results["full"][0][1]
         print(
-            f"\nrange transfers {fserved / max(rserved, 1):.0f}x fewer bytes "
-            f"and is {fbest / max(rbest, 1e-9):.1f}x faster on loopback "
-            f"(the gap widens on a real network where bytes dominate)."
+            "\nOpened + unpaged ≈ exact random access (amplification ~1x). "
+            "A larger page amortises sequential scans but over-reads sparse "
+            "seeks. Non-opened convenience reads pull the whole object. "
+            "On a real network bytes dominate, so the spread widens."
         )
     finally:
         server.shutdown()
