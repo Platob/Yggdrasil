@@ -335,9 +335,13 @@ class HTTPResponseBatch(Tabular):
         # while requests block on the wire — but a single-node cluster shares
         # those cores with the driver process, so we oversubscribe it more
         # gently (×4) than a multi-node cluster whose executors are dedicated
-        # to the scatter (×8).
-        sc = spark.sparkContext
+        # to the scatter (×8). ``spark.sparkContext`` *raises*
+        # JVM_ATTRIBUTE_NOT_SUPPORTED on Spark Connect / Databricks Connect
+        # (it never just returns None), and the status tracker is unavailable
+        # there too — so the whole probe is guarded and falls back to a sane
+        # single-node default.
         try:
+            sc = spark.sparkContext
             n_executors = max(len(sc.statusTracker().getExecutorInfos()) - 1, 0)
             cluster_cores = max(sc.defaultParallelism, 1)
         except Exception:
