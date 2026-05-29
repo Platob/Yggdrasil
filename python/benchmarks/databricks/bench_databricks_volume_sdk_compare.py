@@ -72,8 +72,17 @@ def _make_handler(store: _Store):
 
         def do_PUT(self):  # noqa: N802
             store.calls += 1
-            n = int(self.headers.get("Content-Length", "0"))
-            store.files[self._key()] = self.rfile.read(n) if n else b""
+            # Drain the body in small chunks and discard it. The server
+            # shares this process, so materialising the whole uploaded
+            # body here would land in the same tracemalloc trace as the
+            # client and mask the client-side memory we're measuring.
+            # (Read scenarios are served from a pre-seeded store.)
+            remaining = int(self.headers.get("Content-Length", "0"))
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 256 * 1024))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -216,10 +225,11 @@ def main() -> None:
         vp_pq = _volume(host, pq_path)
         vp_pk = _volume(host, pk_path)
 
-        # Seed the server store via the SDK uploader.
-        sdk.upload(bin_path, io.BytesIO(blob), overwrite=True)
-        sdk.upload(pq_path, io.BytesIO(parquet_bytes), overwrite=True)
-        sdk.upload(pk_path, io.BytesIO(pickle_bytes), overwrite=True)
+        # Seed the read store directly (PUT now drains-and-discards, so
+        # the upload scenario's server side doesn't pollute client memory).
+        store.files[bin_path] = blob
+        store.files[pq_path] = parquet_bytes
+        store.files[pk_path] = pickle_bytes
 
         offsets = [rnd.randint(0, len(blob) - args.block) for _ in range(args.reads)]
 
@@ -306,9 +316,13 @@ def main() -> None:
             "\nbytes/calls/memory are what cost on a real network. "
             "Random + projection: VolumePath ranges only what's needed "
             "(far fewer bytes/memory) at one call per read; the SDK pulls "
-            "the whole object each time. Whole-file reads match. "
-            "(tracemalloc peak is Python-side; the SDK's requests/urllib3 "
-            "C buffers are under-counted, so its real memory is higher.)"
+            "the whole object each time. Whole-file reads match.\n"
+            "Memory caveat: tracemalloc traces Python allocations only. "
+            "ygg buffers (bytearray) are visible; the SDK's io.BytesIO + "
+            "requests/urllib3 buffers are C-level and NOT traced, so the "
+            "SDK memory column reads far lower than its true footprint "
+            "(its upload really holds the ~16 MiB BytesIO). Read the ygg "
+            "column as an absolute (our copies), not a 1:1 ratio to the SDK."
         )
     finally:
         server.shutdown()
