@@ -6,7 +6,7 @@
 // and are decoded here with apache-arrow into a {headers, rows} grid
 // the Office.js layer can drop straight onto a worksheet.
 
-import { tableFromIPC } from "apache-arrow";
+import { DataType, tableFromIPC } from "apache-arrow";
 
 export interface NodeInfo {
   node_id: string;
@@ -30,6 +30,14 @@ export interface Grid {
 }
 
 const EXCEL_PREFIX = "/api/v2/excel";
+
+// Epoch-ms → an Excel-friendly string. Date columns drop the time part;
+// timestamps keep a readable "YYYY-MM-DD HH:MM:SS". Strings (not raw
+// numbers) so the cell shows a date rather than a 13-digit integer.
+function msToIso(ms: number, dateOnly: boolean): string {
+  const iso = new Date(ms).toISOString();
+  return dateOnly ? iso.slice(0, 10) : iso.slice(0, 19).replace("T", " ");
+}
 
 export function normalizeBase(url: string): string {
   return (url || "http://127.0.0.1:8100").replace(/\/+$/, "");
@@ -63,12 +71,26 @@ async function arrowToGrid(res: Response): Promise<Grid> {
   }
   const buf = new Uint8Array(await res.arrayBuffer());
   const table = tableFromIPC(buf);
-  const headers = table.schema.fields.map((f) => f.name);
+  const fields = table.schema.fields;
+  const headers = fields.map((f) => f.name);
+  // Per-column flags so temporal columns don't land in the sheet as raw
+  // epoch-millisecond numbers.
+  const isDate = fields.map((f) => DataType.isDate(f.type));
+  const isTime = fields.map((f) => DataType.isTimestamp(f.type) || DataType.isTime(f.type));
   const rows = table.toArray().map((r: Record<string, unknown>) =>
-    headers.map((h) => {
+    headers.map((h, i) => {
       const v = r[h];
+      if (v == null) return v;
       // Arrow returns BigInt for 64-bit ints; Excel wants Number.
-      return typeof v === "bigint" ? Number(v) : v;
+      if (typeof v === "bigint") {
+        const n = Number(v);
+        return isDate[i] || isTime[i] ? msToIso(n, isDate[i]) : n;
+      }
+      if (isDate[i] || isTime[i]) {
+        const ms = v instanceof Date ? v.getTime() : Number(v);
+        return Number.isFinite(ms) ? msToIso(ms, isDate[i]) : v;
+      }
+      return v;
     })
   );
   return { headers, rows };
