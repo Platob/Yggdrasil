@@ -56,6 +56,7 @@ class _State:
         self.honor_range: bool = True
         self.bytes_served: int = 0
         self.requests: int = 0
+        self.calls: int = 0  # all HTTP requests (GET + HEAD + PUT)
 
 
 def _make_handler(state: _State):
@@ -73,6 +74,7 @@ def _make_handler(state: _State):
             return urlsplit(self.path).path.startswith("/api/2.0/fs/files")
 
         def do_PUT(self):  # noqa: N802
+            state.calls += 1
             length = int(self.headers.get("Content-Length", "0"))
             state.blob = self.rfile.read(length) if length else b""
             self.send_response(204)
@@ -80,6 +82,7 @@ def _make_handler(state: _State):
             self.end_headers()
 
         def do_HEAD(self):  # noqa: N802
+            state.calls += 1
             if not self._path_ok():
                 self.send_response(404)
                 self.end_headers()
@@ -95,6 +98,7 @@ def _make_handler(state: _State):
                 self.end_headers()
                 return
             state.requests += 1
+            state.calls += 1
             blob = state.blob
             rng = self.headers.get("Range")
             if rng and state.honor_range and rng.startswith("bytes="):
@@ -190,14 +194,21 @@ def _non_opened_whole(host, offsets, block, total):
 
 
 def _run(fn, state: _State, repeat: int):
-    times, served = [], 0
+    import tracemalloc
+
+    times, served, calls, peak = [], 0, 0, 0
     for _ in range(repeat):
         state.bytes_served = 0
+        state.calls = 0
+        tracemalloc.start()
         t0 = time.perf_counter()
         fn()
         times.append(time.perf_counter() - t0)
+        peak = max(peak, tracemalloc.get_traced_memory()[1])
+        tracemalloc.stop()
         served = state.bytes_served
-    return min(times), statistics.median(times), served
+        calls = state.calls
+    return min(times), statistics.median(times), served, calls, peak
 
 
 def main() -> None:
@@ -234,21 +245,31 @@ def main() -> None:
             f"\nVolumePath random-seek reads — payload={args.size_mib} MiB, "
             f"block={args.block} B, reads={args.reads}, repeat={args.repeat}\n"
         )
-        header = f"{'strategy':<22} {'best (s)':>10} {'median (s)':>11} {'MiB served':>11} {'amplification':>14}"
+        header = (
+            f"{'strategy':<22} {'best (s)':>9} {'MiB served':>11} {'amp':>6} "
+            f"{'calls':>7} {'peak MiB':>9}"
+        )
         print(header)
         print("-" * len(header))
         ideal = args.reads * args.block
         for name, fn in strategies:
-            best, med, served = _run(fn, state, args.repeat)
+            best, _med, served, calls, peak = _run(fn, state, args.repeat)
             print(
-                f"{name:<22} {best:>10.4f} {med:>11.4f} "
-                f"{served / 1048576:>11.2f} {served / ideal:>13.1f}x"
+                f"{name:<22} {best:>9.4f} {served / 1048576:>11.2f} "
+                f"{served / ideal:>5.0f}x {calls:>7} {peak / 1048576:>9.2f}"
             )
         print(
-            "\nOpened + unpaged ≈ exact random access (amplification ~1x). "
-            "A larger page amortises sequential scans but over-reads sparse "
-            "seeks. Non-opened convenience reads pull the whole object. "
-            "On a real network bytes dominate, so the spread widens."
+            f"\n(reads={args.reads}, block={args.block} B)\n"
+            "What matters on a real network is round-trips (calls) and "
+            "memory, not loopback time:\n"
+            "  - opened+unpaged: fewest bytes & lowest memory, but one call "
+            "per read (latency x calls).\n"
+            "  - larger page: fewer calls (cache coalescing) at the cost of "
+            "bytes + memory per page — better on high-latency links.\n"
+            "  - non-opened (whole): one call but the whole object resident "
+            "in memory and on the wire.\n"
+            "Pick the page grain to trade calls against bytes/memory for "
+            "your access pattern."
         )
     finally:
         server.shutdown()

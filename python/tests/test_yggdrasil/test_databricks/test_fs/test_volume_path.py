@@ -452,6 +452,53 @@ class TestOpenedCursor:
         assert client.files_session.return_value.bytes_served == len(self.PAYLOAD)
 
 
+class TestCallCounts:
+    """Round-trips dominate on a real network, so pin the call count for
+    the common operations — a regression that slips in a hidden HEAD /
+    GET probe (or an RMW download) is caught here."""
+
+    @staticmethod
+    def _methods(client):
+        return [m for m, _ in client.files_session.return_value.calls]
+
+    def test_whole_read_is_a_single_get(self, workspace, client, service):
+        workspace.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: b"hello"),
+            content_type=None,
+            last_modified=None,
+        )
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
+        p.read_bytes()
+        assert self._methods(client) == ["GET"]  # no stat probe
+
+    def test_existing_file_stat_is_a_single_head(self, workspace, client, service):
+        workspace.files.get_metadata.return_value = _file_meta(10)
+        p = VolumePath("/Volumes/c/s/v/x.parquet", service=service)
+        p._stat_uncached()
+        assert self._methods(client) == ["HEAD"]
+
+    def test_overwrite_upload_is_a_single_put(self, workspace, client, service):
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
+        p.write_bytes(b"data", overwrite=True)
+        methods = self._methods(client)
+        assert methods.count("PUT") == 1
+        assert "GET" not in methods  # no read-modify-write download
+
+    def test_random_reads_are_one_ranged_get_each(self, workspace, client, service):
+        workspace.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: bytes(range(256)) * 4),
+            content_type=None,
+            last_modified=None,
+        )
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
+        for off in (0, 100, 500, 900):
+            p._read_mv(16, off)
+        gets = [m for m in self._methods(client) if m == "GET"]
+        assert len(gets) == 4  # one ranged GET per read, no extra probes
+
+
 class TestFormats:
     """How VolumePath behaves under the real format readers/writers
     (Parquet, pickle) over the HTTP transport. A store-backed fake

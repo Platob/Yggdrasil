@@ -442,11 +442,16 @@ class VolumePath(DatabricksPath):
                 )
 
             session = self.client.files_session()
+            # Zero-copy part slicing — a ``memoryview`` slice doesn't copy
+            # the (potentially multi-GiB) payload; each part materialises
+            # only when its PUT body is encoded, so at most ``parallelism``
+            # parts are resident at once instead of all N.
+            payload_view = memoryview(payload)
 
             def _put_part(info: dict) -> "tuple[int, str]":
                 part_number = int(info["part_number"])
                 start = (part_number - 1) * part_size
-                chunk = payload[start:start + part_size]
+                chunk = payload_view[start:start + part_size]
                 headers = {"Content-Type": "application/octet-stream"}
                 for h in info.get("headers") or []:
                     headers[h["name"]] = h["value"]
