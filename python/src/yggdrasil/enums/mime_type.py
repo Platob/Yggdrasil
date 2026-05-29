@@ -743,6 +743,16 @@ class MimeTypes:
             magics=(magic_prefix(b"ARROW1"),),
         )
     )
+    # Arrow IPC *stream* framing — distinct from the file format above
+    # (no ``ARROW1`` header). This is what the node's inter-process /
+    # HTTP transport emits (``application/vnd.apache.arrow.stream``).
+    ARROW_STREAM = MimeType.define(
+        MimeType(
+            "ARROW_STREAM",
+            "application/vnd.apache.arrow.stream",
+            is_tabular=True,
+        )
+    )
     ORC = MimeType.define(
         MimeType(
             "ORC",

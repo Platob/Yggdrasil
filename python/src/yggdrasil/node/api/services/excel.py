@@ -31,7 +31,11 @@ from fastapi.concurrency import run_in_threadpool
 
 from ... import transport
 from ...config import Settings
+from yggdrasil.enums import MimeTypes
+from yggdrasil.enums.media_type import MediaType
 from yggdrasil.exceptions.api import BadRequestError, TimeoutError as APITimeoutError
+from yggdrasil.io.holder import IO
+from yggdrasil.path import Path as YggPath
 from yggdrasil.version import __version__
 from ...exceptions import NotFoundError
 from ..schemas.excel import (
@@ -115,15 +119,19 @@ class ExcelService:
 
     @staticmethod
     def serialize_table(table: pa.Table, fmt: str) -> tuple[bytes, str]:
-        """Encode *table* for the wire in the requested *fmt*."""
+        """Encode *table* for the wire; content types come from MimeTypes.
+
+        Arrow uses the IPC *stream* framing (``MimeTypes.ARROW_STREAM``),
+        which the project's transport owns; Parquet is the Power Query
+        default; JSON is records.
+        """
         if fmt == "arrow":
-            return transport.write_arrow_stream_bytes(table), transport.CONTENT_TYPE_ARROW_STREAM
+            return transport.write_arrow_stream_bytes(table), MimeTypes.ARROW_STREAM.value
         if fmt == "json":
             import json
-            payload = json.dumps(table.to_pylist(), default=str).encode()
-            return payload, "application/json"
+            return json.dumps(table.to_pylist(), default=str).encode(), MimeTypes.JSON.value
         if fmt == "parquet":
-            return transport.write_parquet_bytes(table), transport.CONTENT_TYPE_PARQUET
+            return transport.write_parquet_bytes(table), MimeTypes.PARQUET.value
         raise BadRequestError(
             f"Unknown table format {fmt!r}; expected one of parquet/arrow/json."
         )
@@ -195,27 +203,21 @@ class ExcelService:
         return await run_in_threadpool(partial(self._read_table, path, fmt))
 
     def _read_table(self, path: str, fmt: str | None) -> pa.Table:
+        # ``FsService._resolve`` does the join + traversal guard (stays
+        # under the node root); the yggdrasil Path then owns the IO —
+        # ``as_media`` dispatches parquet/csv/json/arrow by extension (or
+        # the ``source_format`` override) straight to a typed Arrow read.
         resolved = self.fs._resolve(path)
         if not resolved.exists():
             raise NotFoundError(f"File {path!r} not found")
-        kind = (fmt or resolved.suffix.lstrip(".")).lower()
-        data = resolved.read_bytes()
-        if kind in ("parquet", "pq"):
-            return transport.read_parquet_bytes(data)
-        if kind in ("arrow", "ipc"):
-            return transport.read_arrow_stream(data)
-        if kind == "feather":
-            import pyarrow.feather as feather
-            return feather.read_table(pa.BufferReader(data))
-        if kind == "csv":
-            import pyarrow.csv as pacsv
-            return pacsv.read_csv(pa.BufferReader(data))
-        if kind in ("json", "ndjson"):
-            import pyarrow.json as pajson
-            return pajson.read_json(pa.BufferReader(data))
-        raise BadRequestError(
-            f"Don't know how to read {kind!r} as a table (parquet/arrow/csv/json)."
-        )
+        media = MediaType.from_(fmt) if fmt else None
+        try:
+            return YggPath.from_(str(resolved)).as_media(media).read_arrow_table()
+        except (KeyError, NotImplementedError) as exc:
+            raise BadRequestError(
+                f"cannot read {path!r} as a table "
+                f"({fmt or resolved.suffix.lstrip('.') or 'unknown'}): {exc}"
+            )
 
     async def write_table(self, path: str, data: bytes, content_type: str) -> ExcelWriteResponse:
         return await run_in_threadpool(partial(self._write_table, path, data, content_type))
@@ -225,16 +227,14 @@ class ExcelService:
             raise BadRequestError("empty request body — nothing to write")
         ct = (content_type or "").lower()
         try:
-            if "parquet" in ct:
-                table = transport.read_parquet_bytes(data)
-            elif "arrow" in ct:
+            # Arrow stream framing isn't the media layer's IPC *file* leaf,
+            # so it routes through transport; everything else (parquet /
+            # csv / json) decodes through the IO/media layer.
+            if "arrow.stream" in ct:
                 table = transport.read_arrow_stream(data)
-            elif "csv" in ct:
-                import pyarrow.csv as pacsv
-                table = pacsv.read_csv(pa.BufferReader(data))
             else:
-                # Default to parquet — that's what the connector/add-in send.
-                table = transport.read_parquet_bytes(data)
+                src = MediaType.from_(ct, default=None) or MediaType.from_("parquet")
+                table = IO(data).as_media(src).read_arrow_table()
         except BadRequestError:
             raise
         except Exception as exc:
@@ -243,14 +243,11 @@ class ExcelService:
             )
 
         resolved = self.fs._resolve(path)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        suffix = resolved.suffix.lower()
-        if suffix == ".csv":
-            import pyarrow.csv as pacsv
-            pacsv.write_csv(table, str(resolved))
-        else:
-            import pyarrow.parquet as pq
-            pq.write_table(table, str(resolved))
+        # Write through the Path/media layer — extension picks the encoder
+        # (.csv → CSV, else Parquet); parent dirs are created on write.
+        target = MediaType.from_(resolved.suffix.lstrip(".") or "parquet", default=None) \
+            or MediaType.from_("parquet")
+        YggPath.from_(str(resolved)).as_media(target).write_arrow_table(table)
         return ExcelWriteResponse(
             path=path,
             rows=table.num_rows,
