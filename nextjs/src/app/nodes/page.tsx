@@ -3,7 +3,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { NodeCard } from "@/components/NodeCard";
-import { ResourceBar } from "@/components/ResourceBar";
 import {
   getBackend,
   getPeers,

@@ -48,11 +48,20 @@ async def get_card(
         f"{settings.node_id}:{settings.app_version}:{env_count}:{func_count}".encode()
     ).hexdigest()
 
+    # A wildcard bind (0.0.0.0/::) is reachable but not navigable — surface a
+    # clickable URL using the machine hostname, or localhost for loopback.
+    if settings.host in ("0.0.0.0", "::", ""):
+        url_host = platform.node() or "localhost"
+    elif settings.host in ("127.0.0.1", "::1", "localhost"):
+        url_host = "localhost"
+    else:
+        url_host = settings.host
+
     return NodeCard(
         node_id=settings.node_id,
         host=settings.host,
         port=settings.port,
-        url=f"http://{settings.host}:{settings.port}",
+        url=f"http://{url_host}:{settings.port}",
         role=backend.role,
         version=settings.app_version,
         hostname=platform.node(),

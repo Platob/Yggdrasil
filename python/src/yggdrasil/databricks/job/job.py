@@ -140,6 +140,7 @@ class Job(Singleton, DatabricksResource):
 
     @property
     def explore_url(self) -> URL:
+        """Workspace UI URL pointing at this job's page (``/jobs/<id>``)."""
         return self.client.base_url.with_path(f"/jobs/{self.job_id or 'unknown'}")
 
     # ------------------------------------------------------------------ #

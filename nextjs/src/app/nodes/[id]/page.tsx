@@ -1,11 +1,38 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { ResourceBar } from "@/components/ResourceBar";
-import { getBackend, getEnvs, getEnvPackages, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs, setEnvVars, deleteEnvVar } from "@/lib/api";
+import { Sparkline } from "@/components/Sparkline";
+import { getBackend, getEnvs, getEnvPackages, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs, setEnvVars, deleteEnvVar, createBackendStream, cancelRun } from "@/lib/api";
 import type { NodeBackend, NodeCard, PyEnvEntry, PyEnvPackages, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
+
+// Rolling window of live samples for the timeseries charts (~1 min at 1s).
+const MAX_SAMPLES = 90;
+
+// Refresh-rate options for the live stream. 0 = paused.
+const REFRESH_OPTIONS: { label: string; sec: number }[] = [
+  { label: "0.5s", sec: 0.5 },
+  { label: "1s", sec: 1 },
+  { label: "2s", sec: 2 },
+  { label: "5s", sec: 5 },
+  { label: "Paused", sec: 0 },
+];
+
+interface MetricSample {
+  cpu: number;
+  mem: number;
+  disk: number;
+  sentRate: number;   // MB/s
+  recvRate: number;   // MB/s
+  active: number;
+}
+
+function formatRate(mbPerSec: number): string {
+  if (mbPerSec >= 1) return `${mbPerSec.toFixed(1)} MB/s`;
+  return `${(mbPerSec * 1024).toFixed(0)} KB/s`;
+}
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -96,6 +123,15 @@ export default function NodeDetailPage() {
   const [error, setError] = useState(false);
   const [selectedFuncIds, setSelectedFuncIds] = useState<Set<number>>(new Set());
   const [deletingFuncs, setDeletingFuncs] = useState(false);
+
+  // ── Live metrics + refresh control ──────────────────────────────
+  const [refreshSec, setRefreshSec] = useState(1);
+  const [samples, setSamples] = useState<MetricSample[]>([]);
+  const [live, setLive] = useState(false);
+  const [cancellingRuns, setCancellingRuns] = useState<Set<number>>(new Set());
+  // Last raw snapshot, kept in a ref so we can derive network throughput
+  // (cumulative bytes → per-interval rate) without re-subscribing.
+  const lastNetRef = useRef<{ sent: number; recv: number; t: number } | null>(null);
   // Lazily-loaded, per-env library listings (the backend TTL-caches the
   // underlying ``pip list``, so we only fetch on expand). Keyed by env
   // name — the int64 id can't survive JSON.parse in JS losslessly.
@@ -177,6 +213,82 @@ export default function NodeDetailPage() {
     fetchAll();
   }, [fetchAll]);
 
+  // Live backend stream at the chosen cadence: updates the resource bars,
+  // appends to the rolling timeseries, and derives network throughput.
+  // Re-subscribes whenever the refresh rate changes; paused (0) tears down.
+  useEffect(() => {
+    if (refreshSec <= 0) {
+      setLive(false);
+      lastNetRef.current = null;
+      return;
+    }
+    const es = createBackendStream(refreshSec);
+    es.onmessage = (ev) => {
+      let snap: NodeBackend;
+      try {
+        snap = JSON.parse(ev.data) as NodeBackend;
+      } catch {
+        return;
+      }
+      setLive(true);
+      setBackend(snap);
+
+      const mem = snap.memory_total_mb ? (snap.memory_used_mb / snap.memory_total_mb) * 100 : 0;
+      const disk = snap.disk_total_mb ? (snap.disk_used_mb / snap.disk_total_mb) * 100 : 0;
+      const now = Date.now();
+      const prev = lastNetRef.current;
+      let sentRate = 0;
+      let recvRate = 0;
+      if (prev) {
+        const dt = Math.max(0.001, (now - prev.t) / 1000);
+        sentRate = Math.max(0, (snap.network.bytes_sent - prev.sent) / 1048576 / dt);
+        recvRate = Math.max(0, (snap.network.bytes_recv - prev.recv) / 1048576 / dt);
+      }
+      lastNetRef.current = { sent: snap.network.bytes_sent, recv: snap.network.bytes_recv, t: now };
+
+      setSamples((prevS) => {
+        const next = [...prevS, {
+          cpu: snap.cpu_percent,
+          mem,
+          disk,
+          sentRate,
+          recvRate,
+          active: snap.active_runs,
+        }];
+        return next.length > MAX_SAMPLES ? next.slice(next.length - MAX_SAMPLES) : next;
+      });
+    };
+    es.onerror = () => setLive(false);
+    return () => es.close();
+  }, [refreshSec]);
+
+  // Poll the run list at the chosen cadence so the task manager stays live.
+  useEffect(() => {
+    if (refreshSec <= 0) return;
+    const id = setInterval(async () => {
+      try {
+        const res = await getRuns();
+        setRuns(res.runs);
+      } catch { /* transient — keep last good list */ }
+    }, Math.max(1000, refreshSec * 1000));
+    return () => clearInterval(id);
+  }, [refreshSec]);
+
+  const handleCancelRun = useCallback(async (runId: number) => {
+    setCancellingRuns((prev) => new Set(prev).add(runId));
+    try {
+      const res = await cancelRun(runId);
+      setRuns((prev) => prev.map((r) => (r.id === runId ? res.run : r)));
+    } catch { /* surfaced on next poll */ }
+    finally {
+      setCancellingRuns((prev) => {
+        const next = new Set(prev);
+        next.delete(runId);
+        return next;
+      });
+    }
+  }, []);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen">
@@ -234,6 +346,37 @@ export default function NodeDetailPage() {
         <div className="flex items-center gap-3">
           <span className="w-2.5 h-2.5 rounded-full status-online" />
           <h1 className="text-xl font-bold font-mono text-foreground">{nodeId}</h1>
+        </div>
+
+        {/* Live indicator + refresh-rate selector */}
+        <div className="ml-auto flex items-center gap-3">
+          <span className="flex items-center gap-1.5 text-[11px] font-mono text-muted">
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{
+                background: live && refreshSec > 0 ? "var(--emerald)" : "var(--muted)",
+                boxShadow: live && refreshSec > 0 ? "0 0 6px var(--emerald)" : "none",
+                animation: live && refreshSec > 0 ? "pulse-frost 1.5s ease-in-out infinite" : "none",
+              }}
+            />
+            {refreshSec > 0 ? (live ? "live" : "connecting…") : "paused"}
+          </span>
+          <div className="flex items-center gap-0.5 p-0.5 rounded-lg bg-white/[0.03] border border-white/[0.06]">
+            {REFRESH_OPTIONS.map((opt) => {
+              const active = refreshSec === opt.sec;
+              return (
+                <button
+                  key={opt.label}
+                  onClick={() => setRefreshSec(opt.sec)}
+                  className={`px-2 py-1 rounded-md text-[10px] font-mono font-semibold uppercase tracking-wider transition-colors ${
+                    active ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground-dim"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
@@ -311,6 +454,63 @@ export default function NodeDetailPage() {
               color="var(--amber)"
               detail={`${formatBytes(backend.disk_used_mb)} / ${formatBytes(backend.disk_total_mb)}`}
             />
+          </div>
+        </div>
+      )}
+
+      {/* Live timeseries metrics */}
+      {backend && (
+        <div className="glass-card p-5 space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+              </svg>
+              Live Metrics
+            </h2>
+            <span className="text-[10px] text-muted font-mono">
+              {samples.length > 0 ? `${samples.length} samples · ${refreshSec > 0 ? `${refreshSec}s` : "paused"}` : "waiting for stream…"}
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+            <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+              <Sparkline
+                data={samples.map((s) => s.cpu)}
+                color="var(--frost)"
+                max={100}
+                label="CPU"
+                value={`${backend.cpu_percent.toFixed(0)}%`}
+                height={56}
+              />
+            </div>
+            <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+              <Sparkline
+                data={samples.map((s) => s.mem)}
+                color="var(--emerald)"
+                max={100}
+                label="Memory"
+                value={`${memPercent.toFixed(0)}%`}
+                height={56}
+              />
+            </div>
+            <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+              <Sparkline
+                data={samples.map((s) => s.sentRate + s.recvRate)}
+                color="var(--amber)"
+                label="Net I/O"
+                value={samples.length > 0 ? formatRate(samples[samples.length - 1].sentRate + samples[samples.length - 1].recvRate) : "--"}
+                height={56}
+              />
+            </div>
+            <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+              <Sparkline
+                data={samples.map((s) => s.active)}
+                color="var(--frost)"
+                label="Active Runs"
+                value={`${backend.active_runs}`}
+                height={56}
+              />
+            </div>
           </div>
         </div>
       )}
@@ -588,35 +788,60 @@ export default function NodeDetailPage() {
         </div>
       </div>
 
-      {/* Recent Runs */}
+      {/* Task Manager — live run table with cancel controls */}
       {runs.length > 0 && (
         <div className="glass-card p-5 space-y-3">
           <h2 className="text-[10px] font-bold uppercase tracking-widest text-muted flex items-center gap-2">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <polygon points="5 3 19 12 5 21 5 3" />
             </svg>
-            Recent Runs
+            Task Manager
+            {runs.some((r) => r.status === "running" || r.status === "pending") && (
+              <span
+                className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded inline-flex items-center gap-1"
+                style={{ background: "rgba(251,191,36,0.1)", color: "var(--amber)" }}
+              >
+                {runs.filter((r) => r.status === "running" || r.status === "pending").length} active
+              </span>
+            )}
             <span className="ml-auto text-foreground-dim font-mono">{runs.length}</span>
           </h2>
           {/* Table header */}
-          <div className="grid grid-cols-[90px_1fr_90px_100px] gap-3 px-3 py-2 text-[10px] text-muted uppercase tracking-widest font-medium border-b border-white/[0.06]">
+          <div className="grid grid-cols-[90px_1fr_90px_100px_64px] gap-3 px-3 py-2 text-[10px] text-muted uppercase tracking-widest font-medium border-b border-white/[0.06]">
             <span>Status</span>
             <span>Function</span>
             <span className="text-right">Duration</span>
             <span className="text-right">Started</span>
+            <span className="text-right">Action</span>
           </div>
           <div className="space-y-0.5 max-h-72 overflow-y-auto">
             {runs.slice(0, 20).map((run) => {
               const funcName = funcs.find((f) => f.id === run.func_id)?.name ?? `func#${run.func_id}`;
               const isRunning = run.status === "running";
+              const cancellable = run.status === "running" || run.status === "pending";
+              const cancelling = cancellingRuns.has(run.id);
               const progress = run.progress != null ? run.progress : null;
               return (
                 <div key={run.id} className="space-y-0">
-                  <div className="grid grid-cols-[90px_1fr_90px_100px] gap-3 items-center px-3 py-2 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors">
+                  <div className="grid grid-cols-[90px_1fr_90px_100px_64px] gap-3 items-center px-3 py-2 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors">
                     <RunStatusBadge status={run.status} />
                     <span className="text-xs font-mono text-foreground truncate">{funcName}</span>
                     <span className="text-xs font-mono text-muted text-right">{formatDuration(run.duration)}</span>
                     <span className="text-[11px] font-mono text-muted text-right">{timeAgo(run.started_at)}</span>
+                    <div className="flex justify-end">
+                      {cancellable ? (
+                        <button
+                          onClick={() => handleCancelRun(run.id)}
+                          disabled={cancelling}
+                          className="px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider bg-rose/10 text-rose border border-rose/20 hover:bg-rose/20 hover:border-rose/40 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                          title="Cancel this run"
+                        >
+                          {cancelling ? "…" : "Stop"}
+                        </button>
+                      ) : (
+                        <span className="text-[10px] text-muted/40 font-mono">--</span>
+                      )}
+                    </div>
                   </div>
                   {isRunning && (
                     <div className="mx-3 mb-1">

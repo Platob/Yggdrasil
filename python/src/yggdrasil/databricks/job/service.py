@@ -481,7 +481,7 @@ class Jobs(DatabricksService):
 
         job_run = JobRun(service=JobRuns(client=self.client), run_id=response.run_id)
 
-        LOGGER.info("Submitted one-time run %s (%r)", response.run_id, run_name)
+        LOGGER.info("Submitted one-time run %s (%r) — %r", response.run_id, run_name, job_run)
 
         if wait is not False:
             job_run.wait(wait=wait, raise_error=raise_error)

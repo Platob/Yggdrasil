@@ -349,10 +349,13 @@ class PyFuncRunService:
 
         try:
             tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
+            # Inject the call's args/kwargs as ready-to-use Python objects.
+            # The literal embedded here is the single JSON encoding; one
+            # _json.loads turns it back into the original list/dict.
             preamble = (
                 "import json as _json\n"
-                f"_args = _json.loads({json.dumps(json.dumps(args))!r})\n"
-                f"_kwargs = _json.loads({json.dumps(json.dumps(kwargs))!r})\n"
+                f"_args = _json.loads({json.dumps(args)!r})\n"
+                f"_kwargs = _json.loads({json.dumps(kwargs)!r})\n"
             )
             outputs = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
             outputs.close()

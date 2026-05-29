@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import http.client
+import logging
 import warnings
 from dataclasses import MISSING
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Literal, Mapping, MutableMapping, Optional, Tuple
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
 
     from yggdrasil.http_.session import HTTPSession
     from yggdrasil.http_.path import HTTPPath
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -1278,7 +1282,22 @@ class HTTPResponse(IO):  # IO inherits Tabular
         """
         def _arrow_get(name: str) -> Any:
             col = cols.get(name)
-            return col[i].as_py() if col is not None else None
+            if col is None:
+                return None
+            try:
+                return col[i].as_py()
+            except (OverflowError, ValueError):
+                # A corrupt/legacy cache cell can hold a timestamp int64
+                # outside Python's datetime range (year 1–9999); .as_py()
+                # then raises "date value out of range". Don't let one bad
+                # cell kill the whole batch read — treat it as missing. For
+                # received_at this defaults to epoch, so the stale entry is
+                # simply refetched rather than served.
+                LOGGER.warning(
+                    "Dropping unreadable Arrow cell %r (row %d): out-of-range value",
+                    name, i,
+                )
+                return None
 
         return cls._from_get(_arrow_get, normalize=normalize)
 

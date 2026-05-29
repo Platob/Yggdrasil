@@ -348,6 +348,29 @@ class TestArrowProjection:
         expected_names = set(RESPONSE_SCHEMA.to_arrow_schema().names)
         assert set(batch.schema.names) == expected_names
 
+    def test_out_of_range_received_at_does_not_crash_read(self) -> None:
+        # A corrupt/legacy cache cell can hold a timestamp int64 outside
+        # Python's datetime range; reading the batch must not raise
+        # OverflowError ("date value out of range") — the bad cell is
+        # dropped and received_at falls back to epoch (so the entry is
+        # treated as stale and refetched).
+        resp = _make_response(body=b"{}", status_code=200)
+        batch = HTTPResponse.values_to_arrow_batch([resp])
+        bad = pa.array([9_000_000_000_000_000_000], type=pa.timestamp("us", "UTC"))
+        cols = [bad if n == "received_at" else batch.column(n) for n in batch.schema.names]
+        corrupt = pa.RecordBatch.from_arrays(cols, schema=batch.schema)
+
+        out = list(HTTPResponse.from_arrow_tabular(corrupt))
+        assert len(out) == 1
+        assert out[0].status_code == 200
+        assert out[0].received_at == dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+
+    def test_in_range_received_at_round_trips(self) -> None:
+        resp = _make_response(status_code=200)
+        batch = HTTPResponse.values_to_arrow_batch([resp])
+        out = list(HTTPResponse.from_arrow_tabular(batch))
+        assert out[0].received_at == dt.datetime(2025, 1, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
+
 
 # ---------------------------------------------------------------------------
 # TestRepr
