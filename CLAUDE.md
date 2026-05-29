@@ -124,7 +124,7 @@ Core concepts — workstation as remote executor/driver:
 | `/api/v2/fs` | Filesystem CRUD (ls, stat, read, write, delete, move, mkdir, stream, upload, download zip, tree, du, search, grep). `/nodes` lists global-tree roots; every read/write takes `?node=` to proxy to a linked peer |
 | `/api/v2/tabular` | LazyTabular inspect/preview/write — schema + metadata + bounded typed-row preview (JSON `/preview` or Arrow IPC `/preview.arrow`) + bounded in-place edit (`?node=` proxied). Drives the reusable `TabularModal` |
 | `/api/v2/workbook` | ExcelFile (xlsx) surface — `/sheets` (dims), `/read` (windowed sheet → Arrow IPC), `/edit` (surgical cell/range edits preserving formulas + other sheets). `?node=` proxied |
-| `/api/v2/analysis` | polars-over-Arrow analytics — `/aggregate` (group-by/pivot), `/describe` (summary stats), `/finance` (returns, cumulative return, rolling mean + volatility). Bounded by `analysis_max_rows`, `?node=` proxied. Drives the `TabularModal` Analyze panel + `Chart` |
+| `/api/v2/analysis` | polars **lazy**-over-Arrow analytics (scan + projection/predicate/slice pushdown + streaming) — `/aggregate` (group-by/pivot, full-file streamed), `/describe` (summary stats), `/finance` (returns/cum-return/rolling vol), `/series` (adaptive downsample to ~N buckets with mean+min/max envelope + x-zoom window), `/ohlc` (OHLC resample for candlesticks). `?node=` proxied. Drives the `TabularModal` Analyze panel + `Chart` (bar/line/area/candle) |
 | `/api/v2/user` | User identity (`/me`, list, register from peers) |
 | `/api/v2/messenger` | Chat channels + messages + SSE streaming |
 | `/api/v2/replicate` | Export/import/push/pull node assets between nodes |

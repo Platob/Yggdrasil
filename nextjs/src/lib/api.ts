@@ -565,6 +565,52 @@ export function finance(
   });
 }
 
+export interface SeriesResult {
+  column: string;
+  x: (string | number)[];
+  y: (number | null)[];
+  y_min: (number | null)[];
+  y_max: (number | null)[];
+  source_rows: number;
+  sampled: boolean;
+}
+
+// Adaptive downsample: asks the backend for ~`points` buckets over an optional
+// [x_min,x_max] zoom window (predicate-pushed into the lazy scan).
+export function analysisSeries(
+  path: string, column: string,
+  opts: { x?: string; points?: number; x_min?: number; x_max?: number; node?: string } = {},
+): Promise<SeriesResult> {
+  const { node, ...body } = opts;
+  return jsonFetch(`/api/v2/analysis/series${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
+    method: "POST",
+    body: JSON.stringify({ path, column, ...body }),
+  });
+}
+
+export interface OhlcResult {
+  column: string;
+  x: (string | number)[];
+  open: (number | null)[];
+  high: (number | null)[];
+  low: (number | null)[];
+  close: (number | null)[];
+  volume: (number | null)[] | null;
+  bars: number;
+  source_rows: number;
+}
+
+export function analysisOhlc(
+  path: string, column: string,
+  opts: { x?: string; volume?: string; buckets?: number; node?: string } = {},
+): Promise<OhlcResult> {
+  const { node, ...body } = opts;
+  return jsonFetch(`/api/v2/analysis/ohlc${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
+    method: "POST",
+    body: JSON.stringify({ path, column, ...body }),
+  });
+}
+
 // ── Messenger ──────────────────────────────────────────────────────────────
 
 export function getChannels(fresh = false): Promise<{ node_id: string; channels: ChannelInfo[] }> {

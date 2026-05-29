@@ -9,6 +9,10 @@ from ..schemas.analysis import (
     DescribeResult,
     FinanceRequest,
     FinanceResult,
+    OhlcRequest,
+    OhlcResult,
+    SeriesRequest,
+    SeriesResult,
 )
 from ..services.analysis import AnalysisService
 from ..services.network import NetworkService
@@ -54,3 +58,31 @@ async def finance(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/finance", json_body=req.model_dump())
     return await service.finance(req)
+
+
+@router.post("/series", response_model=SeriesResult)
+async def series(
+    req: SeriesRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> SeriesResult:
+    """Adaptive downsample of a numeric series to ~`points` buckets (mean +
+    min/max envelope), with an optional x zoom window pushed into the scan."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/series", json_body=req.model_dump())
+    return await service.series(req)
+
+
+@router.post("/ohlc", response_model=OhlcResult)
+async def ohlc(
+    req: OhlcRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> OhlcResult:
+    """Resample a price series into `buckets` open/high/low/close bars
+    (+ summed volume) for candlestick plotting."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/ohlc", json_body=req.model_dump())
+    return await service.ohlc(req)

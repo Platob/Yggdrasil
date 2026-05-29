@@ -10,7 +10,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.exceptions.api import BadRequestError
-from yggdrasil.node.api.schemas.analysis import AggMeasure, AggregateRequest, FinanceRequest
+from yggdrasil.node.api.schemas.analysis import (
+    AggMeasure, AggregateRequest, FinanceRequest, OhlcRequest, SeriesRequest,
+)
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
 from yggdrasil.node.config import Settings
@@ -59,14 +61,17 @@ class TestAggregate(unittest.TestCase):
                 asyncio.run(_svc(home).aggregate(
                     AggregateRequest(path="t.parquet", measures=[AggMeasure(column="ghost", agg="sum")])))
 
-    def test_truncated_flag(self):
+    def test_streams_full_file_for_correct_totals(self):
+        # Reductions stream the whole parquet (lazy), so the sum is correct over
+        # all rows even past the analysis cap — not a capped partial.
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
             pq.write_table(pa.table({"g": ["a"] * 50, "v": list(range(50))}), str(home / "big.parquet"))
             res = asyncio.run(_svc(home, analysis_max_rows=10).aggregate(
                 AggregateRequest(path="big.parquet", group_by=["g"], measures=[AggMeasure(column="v", agg="sum")])))
-            self.assertTrue(res.truncated)
-            self.assertEqual(res.source_rows, 10)        # capped
+            self.assertFalse(res.truncated)
+            self.assertEqual(res.source_rows, 50)
+            self.assertEqual(res.rows[0][res.columns.index("v_sum")], sum(range(50)))  # 1225, all rows
 
 
 class TestDescribe(unittest.TestCase):
@@ -96,6 +101,52 @@ class TestFinance(unittest.TestCase):
             home = Path(d); _trades(home)
             with self.assertRaises(BadRequestError):
                 asyncio.run(_svc(home).finance(FinanceRequest(path="t.parquet", column="ghost")))
+
+
+class TestSeriesDownsample(unittest.TestCase):
+    def test_downsamples_to_points(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pq.write_table(pa.table({"t": list(range(1000)), "v": [float(i) for i in range(1000)]}),
+                           str(home / "s.parquet"))
+            res = asyncio.run(_svc(home).series(SeriesRequest(path="s.parquet", column="v", x="t", points=100)))
+            self.assertTrue(res.sampled)
+            self.assertEqual(res.source_rows, 1000)
+            self.assertLessEqual(len(res.x), 110)               # ~100 buckets
+            self.assertEqual(len(res.y), len(res.y_min))         # envelope aligned
+
+    def test_zoom_reads_only_range(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pq.write_table(pa.table({"t": list(range(1000)), "v": [float(i) for i in range(1000)]}),
+                           str(home / "s.parquet"))
+            res = asyncio.run(_svc(home).series(
+                SeriesRequest(path="s.parquet", column="v", x="t", points=100, x_min=0, x_max=99)))
+            self.assertEqual(res.source_rows, 100)               # predicate pushdown
+            self.assertFalse(res.sampled)                        # 100 <= points, returned raw
+
+    def test_small_series_not_sampled(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pq.write_table(pa.table({"v": [1.0, 2.0, 3.0]}), str(home / "s.parquet"))
+            res = asyncio.run(_svc(home).series(SeriesRequest(path="s.parquet", column="v", points=800)))
+            self.assertFalse(res.sampled)
+            self.assertEqual(res.y, [1.0, 2.0, 3.0])
+
+
+class TestOhlc(unittest.TestCase):
+    def test_resamples_to_bars(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            # 100 rows, prices ramp; 10 bars
+            pq.write_table(pa.table({"t": list(range(100)), "price": [float(i) for i in range(100)],
+                                     "vol": [1.0] * 100}), str(home / "p.parquet"))
+            res = asyncio.run(_svc(home).ohlc(OhlcRequest(path="p.parquet", column="price", x="t", volume="vol", buckets=10)))
+            self.assertEqual(res.bars, 10)
+            self.assertEqual(res.open[0], 0.0)                   # first price of bucket 0
+            self.assertEqual(res.close[0], 9.0)                  # last price of bucket 0
+            self.assertGreaterEqual(res.high[0], res.low[0])
+            self.assertEqual(res.volume[0], 10.0)                # 10 rows * vol 1
 
 
 if __name__ == "__main__":

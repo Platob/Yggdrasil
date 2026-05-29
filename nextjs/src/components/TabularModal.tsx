@@ -23,13 +23,15 @@ import {
   editWorkbook,
   fsDownloadUrl,
   aggregate,
-  finance,
+  analysisSeries,
+  analysisOhlc,
   type TabularInspect,
   type TabularCell,
   type WorkbookSheet,
   type AggFunc,
   type AggregateResult,
-  type FinanceResult,
+  type SeriesResult,
+  type OhlcResult,
 } from "@/lib/api";
 import { fetchArrowTable } from "@/lib/arrow";
 import Chart, { type ChartType } from "@/components/Chart";
@@ -81,16 +83,21 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const [page, setPage] = useState(0);   // read-only viewport page
   const [total, setTotal] = useState(0); // total data rows (for paging)
 
-  // Analyze mode (pivot + finance + charts)
+  // Analyze mode (pivot + adaptive series + candlesticks)
   const [mode, setMode] = useState<"grid" | "analyze">("grid");
-  const [analyzeKind, setAnalyzeKind] = useState<"pivot" | "finance">("pivot");
+  const [analyzeKind, setAnalyzeKind] = useState<"pivot" | "series" | "candles">("pivot");
   const [groupBy, setGroupBy] = useState("");
   const [measureCol, setMeasureCol] = useState("");
   const [aggFn, setAggFn] = useState<AggFunc>("sum");
   const [chartType, setChartType] = useState<ChartType>("bar");
   const [pivot, setPivot] = useState<AggregateResult | null>(null);
-  const [financeCol, setFinanceCol] = useState("");
-  const [fin, setFin] = useState<FinanceResult | null>(null);
+  const [seriesCol, setSeriesCol] = useState("");   // value/price column
+  const [xCol, setXCol] = useState("");              // optional x/order column
+  const [volCol, setVolCol] = useState("");          // optional volume (candles)
+  const [seriesType, setSeriesType] = useState<ChartType>("area");
+  const [seriesData, setSeriesData] = useState<SeriesResult | null>(null);
+  const [zoom, setZoom] = useState<{ min: number; max: number } | null>(null);
+  const [candles, setCandles] = useState<OhlcResult | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeErr, setAnalyzeErr] = useState<string | null>(null);
 
@@ -102,7 +109,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     // non-numeric dimension) so the Analyze panel is ready to run.
     const nums = t.columns.filter((c) => isNumericType(c.type)).map((c) => c.name);
     const dim = t.columns.find((c) => !isNumericType(c.type))?.name ?? "";
-    if (nums.length) { setMeasureCol((m) => m || nums[0]); setFinanceCol((m) => m || nums[0]); }
+    if (nums.length) { setMeasureCol((m) => m || nums[0]); setSeriesCol((m) => m || nums[0]); }
     setGroupBy((g) => g || dim);
   }, []);
 
@@ -231,18 +238,48 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     }
   };
 
-  const runFinance = async () => {
-    if (!financeCol) return;
+  // Adaptive downsample. Re-fetches ~800 buckets over the current zoom window;
+  // zooming in narrows the range so the backend reads fewer source rows and
+  // returns finer detail (sampled=false once the range fits under the cap).
+  const runSeries = async (z: { min: number; max: number } | null = zoom) => {
+    if (!seriesCol) return;
     setAnalyzing(true); setAnalyzeErr(null);
     try {
-      const res = await finance(path, financeCol, { window: 20, limit: 2000, node });
-      setFin(res);
+      const res = await analysisSeries(path, seriesCol, {
+        x: xCol || undefined, points: 800, x_min: z?.min, x_max: z?.max, node,
+      });
+      setSeriesData(res);
     } catch (e) {
-      setAnalyzeErr(e instanceof Error ? e.message : "finance failed");
+      setAnalyzeErr(e instanceof Error ? e.message : "series failed");
     } finally {
       setAnalyzing(false);
     }
   };
+
+  const runCandles = async () => {
+    if (!seriesCol) return;
+    setAnalyzing(true); setAnalyzeErr(null);
+    try {
+      const res = await analysisOhlc(path, seriesCol, {
+        x: xCol || undefined, volume: volCol || undefined, buckets: 120, node,
+      });
+      setCandles(res);
+    } catch (e) {
+      setAnalyzeErr(e instanceof Error ? e.message : "ohlc failed");
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  // Zoom adjusts the x window from the data's current extent and re-fetches.
+  const xExtent = (): [number, number] | null => {
+    if (!seriesData || !seriesData.x.length) return null;
+    const xs = seriesData.x.map(Number);
+    return [xs[0], xs[xs.length - 1]];
+  };
+  const zoomIn = () => { const e = xExtent(); if (!e) return; const mid = (e[0] + e[1]) / 2, half = (e[1] - e[0]) / 4; const z = { min: mid - half, max: mid + half }; setZoom(z); runSeries(z); };
+  const zoomOut = () => { const e = xExtent(); if (!e) return; const span = e[1] - e[0] || 1; const z = { min: e[0] - span / 2, max: e[1] + span / 2 }; setZoom(z); runSeries(z); };
+  const resetZoom = () => { setZoom(null); runSeries(null); };
 
   const dirty = edited.size > 0;
   const meta: [string, string][] = isWorkbook
@@ -341,16 +378,16 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
           </div>
         )}
 
-        {/* Analyze panel — pivot + finance + charts */}
+        {/* Analyze panel — pivot + adaptive series + candlesticks */}
         {mode === "analyze" && (
           <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30 p-3 space-y-3">
             <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap">
-              {(["pivot", "finance"] as const).map((k) => (
+              {(["pivot", "series", "candles"] as const).map((k) => (
                 <button key={k} onClick={() => setAnalyzeKind(k)}
                   className={`px-2.5 py-1 rounded ${analyzeKind === k ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{k}</button>
               ))}
               <span className="w-px h-4 bg-white/10 mx-1" />
-              {analyzeKind === "pivot" ? (
+              {analyzeKind === "pivot" && (
                 <>
                   <label className="text-muted">group</label>
                   <select value={groupBy} onChange={(e) => setGroupBy(e.target.value)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
@@ -365,42 +402,55 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                     {AGGS.map((a) => <option key={a} value={a}>{a}</option>)}
                   </select>
                   <button onClick={runPivot} disabled={analyzing || !measureCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
-                </>
-              ) : (
-                <>
-                  <label className="text-muted">series</label>
-                  <select value={financeCol} onChange={(e) => setFinanceCol(e.target.value)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
-                    {(numericCols.length ? numericCols : allCols).map((c) => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                  <button onClick={runFinance} disabled={analyzing || !financeCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
+                  <span className="ml-auto flex items-center gap-1">
+                    {(["bar", "line", "area"] as ChartType[]).map((t) => (
+                      <button key={t} onClick={() => setChartType(t)} className={`px-2 py-1 rounded ${chartType === t ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{t}</button>
+                    ))}
+                  </span>
                 </>
               )}
-              {analyzeKind === "pivot" && (
-                <span className="ml-auto flex items-center gap-1">
-                  {(["bar", "line", "area"] as ChartType[]).map((t) => (
-                    <button key={t} onClick={() => setChartType(t)}
-                      className={`px-2 py-1 rounded ${chartType === t ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{t}</button>
-                  ))}
-                </span>
+              {(analyzeKind === "series" || analyzeKind === "candles") && (
+                <>
+                  <label className="text-muted">{analyzeKind === "candles" ? "price" : "series"}</label>
+                  <select value={seriesCol} onChange={(e) => setSeriesCol(e.target.value)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
+                    {(numericCols.length ? numericCols : allCols).map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <label className="text-muted">x</label>
+                  <select value={xCol} onChange={(e) => setXCol(e.target.value)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
+                    <option value="">(index)</option>
+                    {allCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  {analyzeKind === "candles" && (
+                    <>
+                      <label className="text-muted">vol</label>
+                      <select value={volCol} onChange={(e) => setVolCol(e.target.value)} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 outline-none">
+                        <option value="">(none)</option>
+                        {numericCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                    </>
+                  )}
+                  <button onClick={analyzeKind === "series" ? () => { setZoom(null); runSeries(null); } : runCandles} disabled={analyzing || !seriesCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
+                  {analyzeKind === "series" && (
+                    <span className="ml-auto flex items-center gap-1">
+                      {(["area", "line"] as ChartType[]).map((t) => (
+                        <button key={t} onClick={() => setSeriesType(t)} className={`px-2 py-1 rounded ${seriesType === t ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{t}</button>
+                      ))}
+                    </span>
+                  )}
+                </>
               )}
             </div>
 
             {analyzeErr && <div className="text-[11px] text-rose/90 font-mono">{analyzeErr}</div>}
             {analyzing && <div className="text-[11px] text-muted font-mono">computing…</div>}
 
-            {/* Pivot result */}
+            {/* Pivot */}
             {analyzeKind === "pivot" && pivot && !analyzing && (
               <div className="space-y-3">
-                <Chart
-                  type={chartType}
-                  labels={pivot.rows.map((r) => String(r[0]))}
+                <Chart type={chartType} labels={pivot.rows.map((r) => String(r[0]))}
                   values={pivot.rows.map((r) => Number(r[pivot.columns.length - 1]))}
-                  color="var(--emerald)"
-                  yLabel={pivot.columns[pivot.columns.length - 1]}
-                />
-                <div className="text-[10px] text-muted font-mono">
-                  {pivot.group_count} groups · {pivot.source_rows.toLocaleString()} rows{pivot.truncated ? " (capped)" : ""}
-                </div>
+                  color="var(--emerald)" yLabel={pivot.columns[pivot.columns.length - 1]} />
+                <div className="text-[10px] text-muted font-mono">{pivot.group_count} groups · {pivot.source_rows.toLocaleString()} rows streamed</div>
                 <table className="w-full text-[11px] font-mono border-collapse">
                   <thead><tr>{pivot.columns.map((c) => <th key={c} className="px-2 py-1 text-left text-frost/80 border-b border-white/[0.06]">{c}</th>)}</tr></thead>
                   <tbody>
@@ -414,31 +464,39 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
               </div>
             )}
 
-            {/* Finance result */}
-            {analyzeKind === "finance" && fin && !analyzing && (
-              <div className="space-y-3">
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] font-mono">
-                  {[
-                    ["points", String(fin.value.length)],
-                    ["cum return", fin.cum_return.at(-1) != null ? `${(fin.cum_return.at(-1)! * 100).toFixed(2)}%` : "--"],
-                    ["roll vol (20)", fin.roll_vol.at(-1) != null ? `${(fin.roll_vol.at(-1)! * 100).toFixed(2)}%` : "--"],
-                    ["window", String(fin.window)],
-                  ].map(([k, v]) => (
-                    <div key={k} className="rounded bg-white/[0.03] border border-white/[0.06] px-2 py-1.5">
-                      <div className="text-muted/60 uppercase tracking-wider text-[9px]">{k}</div><div className="text-foreground/80">{v}</div>
-                    </div>
-                  ))}
+            {/* Adaptive series + zoom */}
+            {analyzeKind === "series" && seriesData && !analyzing && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 text-[10px] font-mono text-muted">
+                  <button onClick={zoomIn} className="px-2 py-1 rounded border border-white/[0.08] hover:text-foreground">zoom in</button>
+                  <button onClick={zoomOut} className="px-2 py-1 rounded border border-white/[0.08] hover:text-foreground">zoom out</button>
+                  <button onClick={resetZoom} className="px-2 py-1 rounded border border-white/[0.08] hover:text-foreground">reset</button>
+                  <span>
+                    {seriesData.sampled
+                      ? `${seriesData.x.length} buckets of ${seriesData.source_rows.toLocaleString()} rows (downsampled)`
+                      : `${seriesData.x.length} points (raw)`}
+                    {zoom ? ` · zoom [${zoom.min.toFixed(0)}, ${zoom.max.toFixed(0)}]` : ""}
+                  </span>
                 </div>
-                <div className="text-[10px] text-frost/70 font-mono">cumulative return</div>
-                <Chart type="area" labels={fin.index} values={fin.cum_return} color="var(--emerald)" yLabel="cum return" />
-                <div className="text-[10px] text-frost/70 font-mono">{fin.column} + rolling mean</div>
-                <Chart type="line" labels={fin.index} values={fin.value} color="var(--frost)" yLabel={fin.column} />
+                <Chart type={seriesType} labels={seriesData.x} values={seriesData.y}
+                  band={seriesData.sampled ? { min: seriesData.y_min, max: seriesData.y_max } : undefined}
+                  color="var(--emerald)" yLabel={seriesData.column} height={300} />
               </div>
             )}
 
-            {!pivot && !fin && !analyzing && !analyzeErr && (
+            {/* Candlesticks */}
+            {analyzeKind === "candles" && candles && !analyzing && (
+              <div className="space-y-2">
+                <div className="text-[10px] font-mono text-muted">{candles.bars} OHLC bars from {candles.source_rows.toLocaleString()} rows</div>
+                <Chart type="candle" labels={candles.x}
+                  ohlc={{ open: candles.open, high: candles.high, low: candles.low, close: candles.close }}
+                  yLabel={candles.column} height={320} />
+              </div>
+            )}
+
+            {((analyzeKind === "pivot" && !pivot) || (analyzeKind === "series" && !seriesData) || (analyzeKind === "candles" && !candles)) && !analyzing && !analyzeErr && (
               <div className="text-[11px] text-muted font-mono py-8 text-center">
-                Pick {analyzeKind === "pivot" ? "a group + measure" : "a numeric series"} and hit run.
+                Pick a {analyzeKind === "pivot" ? "group + measure" : analyzeKind === "candles" ? "price (+ x / volume)" : "series (+ x)"} and hit run.
               </div>
             )}
           </div>
