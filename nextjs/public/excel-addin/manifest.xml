@@ -1,51 +1,26 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  Yggdrasil for Excel — Office.js task-pane add-in manifest.
-
-  Sideload (Excel desktop, Windows): Insert > Add-ins > My Add-ins >
-  Upload My Add-in > pick this file. The task-pane is served by the node
-  frontend; adjust every https URL below to your frontend origin.
-
-  NOTE: Office requires the SourceLocation to be HTTPS (localhost is
-  exempt for sideloading during development). Serve the frontend over
-  https for non-local use.
--->
 <OfficeApp
   xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
   xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
   xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
   xsi:type="TaskPaneApp">
-
   <Id>2b9d6a1e-9b1a-4c5e-9d3f-7a1ce0fda001</Id>
   <Version>1.0.0.0</Version>
   <ProviderName>Yggdrasil</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="Yggdrasil for Excel" />
-  <Description DefaultValue="Run Python on a Yggdrasil node, read/write remote files, and walk remote filesystems — straight into your sheet." />
+  <Description DefaultValue="Run Python on a Yggdrasil node, read/write remote files, and walk remote filesystems." />
   <IconUrl DefaultValue="http://localhost:3000/favicon.ico" />
   <HighResolutionIconUrl DefaultValue="http://localhost:3000/favicon.ico" />
   <SupportUrl DefaultValue="https://github.com/Platob/Yggdrasil" />
-
-  <Hosts>
-    <Host Name="Workbook" />
-  </Hosts>
-
-  <DefaultSettings>
-    <SourceLocation DefaultValue="http://localhost:3000/excel/taskpane" />
-  </DefaultSettings>
-
+  <Hosts><Host Name="Workbook" /></Hosts>
+  <DefaultSettings><SourceLocation DefaultValue="http://localhost:3000/excel/taskpane" /></DefaultSettings>
   <Permissions>ReadWriteDocument</Permissions>
-
   <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
     <Hosts>
       <Host xsi:type="Workbook">
         <DesktopFormFactor>
-          <GetStarted>
-            <Title resid="Ygg.Title" />
-            <Description resid="Ygg.Desc" />
-            <LearnMoreUrl resid="Ygg.Url" />
-          </GetStarted>
           <ExtensionPoint xsi:type="PrimaryCommandSurface">
             <OfficeTab id="TabHome">
               <Group id="Ygg.Group">
@@ -56,11 +31,7 @@
                     <Title resid="Ygg.Open.Label" />
                     <Description resid="Ygg.Desc" />
                   </Supertip>
-                  <Icon>
-                    <bt:Image size="16" resid="Ygg.Icon" />
-                    <bt:Image size="32" resid="Ygg.Icon" />
-                    <bt:Image size="80" resid="Ygg.Icon" />
-                  </Icon>
+                  <Icon><bt:Image size="16" resid="Ygg.Icon" /><bt:Image size="32" resid="Ygg.Icon" /><bt:Image size="80" resid="Ygg.Icon" /></Icon>
                   <Action xsi:type="ShowTaskpane">
                     <TaskpaneId>YggTaskpane</TaskpaneId>
                     <SourceLocation resid="Ygg.Taskpane.Url" />
@@ -73,15 +44,9 @@
       </Host>
     </Hosts>
     <Resources>
-      <bt:Images>
-        <bt:Image id="Ygg.Icon" DefaultValue="http://localhost:3000/favicon.ico" />
-      </bt:Images>
-      <bt:Urls>
-        <bt:Url id="Ygg.Url" DefaultValue="https://github.com/Platob/Yggdrasil" />
-        <bt:Url id="Ygg.Taskpane.Url" DefaultValue="http://localhost:3000/excel/taskpane" />
-      </bt:Urls>
+      <bt:Images><bt:Image id="Ygg.Icon" DefaultValue="http://localhost:3000/favicon.ico" /></bt:Images>
+      <bt:Urls><bt:Url id="Ygg.Taskpane.Url" DefaultValue="http://localhost:3000/excel/taskpane" /></bt:Urls>
       <bt:ShortStrings>
-        <bt:String id="Ygg.Title" DefaultValue="Yggdrasil for Excel" />
         <bt:String id="Ygg.Group.Label" DefaultValue="Yggdrasil" />
         <bt:String id="Ygg.Open.Label" DefaultValue="Open Yggdrasil" />
       </bt:ShortStrings>

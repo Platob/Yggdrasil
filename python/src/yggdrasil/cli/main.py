@@ -15,6 +15,7 @@ Subcommands::
     ygg node mesh       Live cluster health: this node + every peer
     ygg node call       Run a function by name and print result
     ygg node health     Run health checks on the node
+    ygg node excel      Check Excel service + create/update the add-in manifest
     ygg node create     Create a new named node
     ygg node install    Install node as boot service (systemd/launchd)
     ygg node uninstall  Remove boot service (--purge to delete data)
@@ -106,6 +107,15 @@ def _build_parser() -> argparse.ArgumentParser:
     # health — quick health check
     health_cmd = node_sub.add_parser("health", help="Run health checks on the node.")
     health_cmd.set_defaults(handler=_node_health)
+
+    # excel — check + (re)generate the Excel integration artifacts
+    excel_cmd = node_sub.add_parser(
+        "excel",
+        help="Check the Excel service and create/update the add-in manifest + Power Query connector.",
+    )
+    excel_cmd.add_argument("--check", action="store_true", default=False, help="Only check; don't write files.")
+    excel_cmd.add_argument("--host", default=None, help="Node base URL to check (default: local node).")
+    excel_cmd.set_defaults(handler=_node_excel)
 
     # create
     create = node_sub.add_parser("create", help="Create a new named node (initializes ~/.node/<name>/).")
@@ -351,6 +361,130 @@ def _node_status(args: argparse.Namespace) -> int:
             out(f"    {dim(name)}  {color(state)}\n")
 
     return 0
+
+
+def _node_excel(args: argparse.Namespace) -> int:
+    """Check the Excel service and create/update its integration artifacts.
+
+    1. Probes ``/api/v2/excel/info`` and prints node identity + caps.
+    2. (Re)writes the Office.js add-in ``manifest.xml`` under the
+       frontend's ``public/excel-addin/`` with URLs pinned to the
+       configured frontend port — auto-created if missing.
+    3. Points at the Power Query connector sources + the ``/excel`` page.
+    """
+    import json as _json
+    import urllib.request
+    from pathlib import Path
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.cli.style import blue, bold, cyan, dim, green, orange, out, print_logo, red, yellow
+
+    print_logo("YGGNODE")
+    settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
+
+    base = (args.host or f"http://127.0.0.1:{settings.port}").rstrip("/")
+    front_port = settings.front_port
+
+    # 1. check the Excel service
+    out(f"  {cyan('excel service')}\n")
+    try:
+        with urllib.request.urlopen(f"{base}/api/v2/excel/info", timeout=5) as resp:
+            info = _json.loads(resp.read().decode())
+        out(f"    {green('● online')}  {dim(base)}\n")
+        out(f"    {cyan('node')}     {orange(info.get('node_id', '?'))} {dim('v' + str(info.get('version', '?')))}\n")
+        out(f"    {cyan('formats')}  {', '.join(info.get('table_formats', []))}\n")
+        out(f"    {cyan('caps')}     {', '.join(info.get('capabilities', []))}\n")
+    except Exception as exc:
+        out(f"    {red('● unreachable')}  {dim(str(exc))}\n")
+        out(f"\n  Start the node first: {bold('ygg node serve')}\n")
+
+    # 2. (re)generate the Office add-in manifest
+    front = Path(settings.front_home)
+    manifest = front / "public" / "excel-addin" / "manifest.xml"
+    taskpane = f"http://localhost:{front_port}/excel/taskpane"
+    icon = f"http://localhost:{front_port}/favicon.ico"
+    content = _excel_manifest_xml(taskpane=taskpane, icon=icon)
+
+    out(f"\n  {cyan('office add-in')}\n")
+    if args.check:
+        state = "present" if manifest.exists() else "missing"
+        out(f"    {dim('manifest')}  {yellow(state)} {dim(str(manifest))}\n")
+    else:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        existed = manifest.exists()
+        manifest.write_text(content)
+        out(f"    {green('✓')} {'updated' if existed else 'created'} {dim(str(manifest))}\n")
+        out(f"    {dim('taskpane')}  {blue(taskpane)}\n")
+
+    # 3. Power Query + page pointers
+    out(f"\n  {cyan('power query')}  {dim('powerquery/YggdrasilExcel.pq (paste) · Yggdrasil.pq (.mez)')}\n")
+    out(f"  {cyan('manage')}       {blue(f'http://localhost:{front_port}/excel')}\n")
+    out(f"\n  Sideload: Excel → Insert → Add-ins → Upload My Add-in → manifest.xml\n")
+    return 0
+
+
+def _excel_manifest_xml(*, taskpane: str, icon: str) -> str:
+    """Office task-pane manifest (task-pane + Home-tab ribbon button)
+    with all URLs pinned to this frontend."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+  <Id>2b9d6a1e-9b1a-4c5e-9d3f-7a1ce0fda001</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Yggdrasil</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="Yggdrasil for Excel" />
+  <Description DefaultValue="Run Python on a Yggdrasil node, read/write remote files, and walk remote filesystems." />
+  <IconUrl DefaultValue="{icon}" />
+  <HighResolutionIconUrl DefaultValue="{icon}" />
+  <SupportUrl DefaultValue="https://github.com/Platob/Yggdrasil" />
+  <Hosts><Host Name="Workbook" /></Hosts>
+  <DefaultSettings><SourceLocation DefaultValue="{taskpane}" /></DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Workbook">
+        <DesktopFormFactor>
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="Ygg.Group">
+                <Label resid="Ygg.Group.Label" />
+                <Control xsi:type="Button" id="Ygg.Open">
+                  <Label resid="Ygg.Open.Label" />
+                  <Supertip>
+                    <Title resid="Ygg.Open.Label" />
+                    <Description resid="Ygg.Desc" />
+                  </Supertip>
+                  <Icon><bt:Image size="16" resid="Ygg.Icon" /><bt:Image size="32" resid="Ygg.Icon" /><bt:Image size="80" resid="Ygg.Icon" /></Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>YggTaskpane</TaskpaneId>
+                    <SourceLocation resid="Ygg.Taskpane.Url" />
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images><bt:Image id="Ygg.Icon" DefaultValue="{icon}" /></bt:Images>
+      <bt:Urls><bt:Url id="Ygg.Taskpane.Url" DefaultValue="{taskpane}" /></bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="Ygg.Group.Label" DefaultValue="Yggdrasil" />
+        <bt:String id="Ygg.Open.Label" DefaultValue="Open Yggdrasil" />
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="Ygg.Desc" DefaultValue="Run Python on a node, read/write remote files, and walk remote filesystems into your sheet." />
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>
+"""
 
 
 def _node_create(args: argparse.Namespace) -> int:
