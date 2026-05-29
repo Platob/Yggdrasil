@@ -25,7 +25,7 @@ import type {
   TopologyResponse,
   UserCard,
 } from "./types";
-import { cachedGet, invalidate, TTL } from "./cache";
+import { cachedGet, cachedPost, invalidate, TTL } from "./cache";
 
 // ── Low-level fetch helper ─────────────────────────────────────────────────
 
@@ -523,11 +523,11 @@ export function aggregate(
   measures: { column: string; agg: AggFunc }[],
   node?: string,
   limit = 500,
+  filters: { column: string; op: string; value?: unknown }[] = [],
 ): Promise<AggregateResult> {
-  return jsonFetch(`/api/v2/analysis/aggregate${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
-    method: "POST",
-    body: JSON.stringify({ path, group_by, measures, limit }),
-  });
+  const url = `/api/v2/analysis/aggregate${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, group_by, measures, limit, filters };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
 export interface DescribeResult {
@@ -565,6 +565,10 @@ export function finance(
   });
 }
 
+export interface FilterSpec { column: string; op: string; value?: unknown; }
+export interface CastSpec { column: string; dtype: string; tz?: string; }
+export interface Transform { filters?: FilterSpec[]; casts?: CastSpec[]; columns?: string[]; limit?: number; }
+
 export interface SeriesResult {
   column: string;
   x: (string | number)[];
@@ -576,16 +580,31 @@ export interface SeriesResult {
 }
 
 // Adaptive downsample: asks the backend for ~`points` buckets over an optional
-// [x_min,x_max] zoom window (predicate-pushed into the lazy scan).
+// [x_min,x_max] zoom window (predicate-pushed into the lazy scan). Cached
+// client-side so zooming back to a window is instant + saves a node call.
 export function analysisSeries(
   path: string, column: string,
-  opts: { x?: string; points?: number; x_min?: number; x_max?: number; node?: string } = {},
+  opts: { x?: string; points?: number; x_min?: number; x_max?: number; filters?: FilterSpec[]; node?: string } = {},
 ): Promise<SeriesResult> {
   const { node, ...body } = opts;
-  return jsonFetch(`/api/v2/analysis/series${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
-    method: "POST",
-    body: JSON.stringify({ path, column, ...body }),
-  });
+  const url = `/api/v2/analysis/series${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
+// POST /export: apply the transform (filters + casts incl. tz→UTC + projection)
+// and download the result in any tabular media type.
+export async function downloadExport(path: string, fmt: string, transform: Transform, node?: string): Promise<void> {
+  const url = `/api/v2/analysis/export${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, fmt, transform }) });
+  if (!res.ok) throw new Error(`export failed: HTTP ${res.status}`);
+  const blob = await res.blob();
+  const base = path.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "export";
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${base}.${fmt}`;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 export interface OhlcResult {
@@ -602,13 +621,12 @@ export interface OhlcResult {
 
 export function analysisOhlc(
   path: string, column: string,
-  opts: { x?: string; volume?: string; buckets?: number; node?: string } = {},
+  opts: { x?: string; volume?: string; buckets?: number; filters?: FilterSpec[]; node?: string } = {},
 ): Promise<OhlcResult> {
   const { node, ...body } = opts;
-  return jsonFetch(`/api/v2/analysis/ohlc${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
-    method: "POST",
-    body: JSON.stringify({ path, column, ...body }),
-  });
+  const url = `/api/v2/analysis/ohlc${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
 // ── Messenger ──────────────────────────────────────────────────────────────

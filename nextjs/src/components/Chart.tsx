@@ -12,6 +12,7 @@ interface Props {
   values?: (number | null)[];
   band?: { min: (number | null)[]; max: (number | null)[] }; // line/area envelope
   ohlc?: { open: (number | null)[]; high: (number | null)[]; low: (number | null)[]; close: (number | null)[] };
+  overlay?: (number | null)[];   // e.g. a moving-average line over candles
   height?: number;
   color?: string;
   yLabel?: string;
@@ -20,7 +21,7 @@ interface Props {
 const W = 720;
 const padL = 52, padR = 12, padT = 12, padB = 28;
 
-export default function Chart({ type, labels, values, band, ohlc, height = 220, color = "var(--emerald)", yLabel }: Props) {
+export default function Chart({ type, labels, values, band, ohlc, overlay, height = 220, color = "var(--emerald)", yLabel }: Props) {
   const plotW = W - padL - padR;
   const plotH = height - padT - padB;
 
@@ -28,6 +29,7 @@ export default function Chart({ type, labels, values, band, ohlc, height = 220, 
   const pool: number[] = [];
   if (type === "candle" && ohlc) {
     for (const a of [ohlc.high, ohlc.low, ohlc.open, ohlc.close]) for (const v of a) if (v != null && isFinite(v)) pool.push(v);
+    if (overlay) for (const v of overlay) if (v != null && isFinite(v)) pool.push(v);
   } else if (values) {
     for (const v of values) if (v != null && isFinite(v)) pool.push(v);
     if (band) for (const a of [band.min, band.max]) for (const v of a) if (v != null && isFinite(v)) pool.push(v);
@@ -71,6 +73,12 @@ export default function Chart({ type, labels, values, band, ohlc, height = 220, 
           </g>
         );
       })}
+
+      {/* overlay line (e.g. moving average) over candles */}
+      {type === "candle" && overlay && (() => {
+        const pts = overlay.map((v, i) => (v == null || !isFinite(v) ? null : `${xBand(i)},${y(v)}`)).filter(Boolean) as string[];
+        return pts.length ? <polyline points={pts.join(" ")} fill="none" stroke="var(--amber)" strokeWidth="1.4" strokeOpacity="0.9" /> : null;
+      })()}
 
       {/* bars */}
       {type === "bar" && values?.map((v, i) =>

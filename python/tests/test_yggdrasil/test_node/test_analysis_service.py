@@ -11,7 +11,8 @@ import pyarrow.parquet as pq
 
 from yggdrasil.exceptions.api import BadRequestError
 from yggdrasil.node.api.schemas.analysis import (
-    AggMeasure, AggregateRequest, FinanceRequest, OhlcRequest, SeriesRequest,
+    AggMeasure, AggregateRequest, CastSpec, ExportRequest, FilterSpec,
+    FinanceRequest, OhlcRequest, SeriesRequest, Transform,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
@@ -147,6 +148,61 @@ class TestOhlc(unittest.TestCase):
             self.assertEqual(res.close[0], 9.0)                  # last price of bucket 0
             self.assertGreaterEqual(res.high[0], res.low[0])
             self.assertEqual(res.volume[0], 10.0)                # 10 rows * vol 1
+
+
+class TestFiltersAndExport(unittest.TestCase):
+    def test_aggregate_filter_pushdown(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _trades(home)
+            res = asyncio.run(_svc(home).aggregate(AggregateRequest(
+                path="t.parquet", group_by=["sector"],
+                measures=[AggMeasure(column="price", agg="sum")],
+                filters=[FilterSpec(column="price", op=">=", value=100)])))
+            self.assertEqual(res.source_rows, 3)            # only price>=100 rows
+            by = {r[0]: r[res.columns.index("price_sum")] for r in res.rows}
+            self.assertEqual(by["Tech"], 600.0)             # 100+200+300
+            self.assertNotIn("Energy", by)                  # 50,60 filtered out
+
+    def test_export_csv_with_filter_and_cast(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _trades(home)
+            tmp, name = asyncio.run(_svc(home).export(ExportRequest(
+                path="t.parquet", fmt="csv",
+                transform=Transform(filters=[FilterSpec(column="sector", op="==", value="Tech")],
+                                    casts=[CastSpec(column="price", dtype="int")],
+                                    columns=["sector", "price"]))))
+            try:
+                text = tmp.read_text()
+            finally:
+                tmp.unlink(missing_ok=True)
+            self.assertTrue(name.endswith(".csv"))
+            self.assertIn("Tech", text)
+            self.assertNotIn("Energy", text)               # filtered out
+            self.assertEqual(text.count("\n"), 4)           # header + 3 Tech rows (+trailing)
+
+    def test_export_timezone_to_utc_and_convert(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pq.write_table(pa.table({"ts": ["2024-01-01 12:00:00"], "v": [1]}), str(home / "z.parquet"))
+            tmp, _ = asyncio.run(_svc(home).export(ExportRequest(
+                path="z.parquet", fmt="csv",
+                transform=Transform(casts=[CastSpec(column="ts", dtype="datetime", tz="America/New_York")]))))
+            try:
+                text = tmp.read_text()
+            finally:
+                tmp.unlink(missing_ok=True)
+            self.assertIn("07:00:00", text)                 # 12:00 UTC -> 07:00 EST
+            self.assertIn("-0500", text)
+
+    def test_export_parquet_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _trades(home)
+            tmp, name = asyncio.run(_svc(home).export(ExportRequest(path="t.parquet", fmt="parquet")))
+            try:
+                self.assertTrue(name.endswith(".parquet"))
+                self.assertEqual(pq.read_table(str(tmp)).num_rows, 5)
+            finally:
+                tmp.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

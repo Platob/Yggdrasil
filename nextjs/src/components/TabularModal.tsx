@@ -25,6 +25,7 @@ import {
   aggregate,
   analysisSeries,
   analysisOhlc,
+  downloadExport,
   type TabularInspect,
   type TabularCell,
   type WorkbookSheet,
@@ -32,6 +33,8 @@ import {
   type AggregateResult,
   type SeriesResult,
   type OhlcResult,
+  type FilterSpec,
+  type CastSpec,
 } from "@/lib/api";
 import { fetchArrowTable } from "@/lib/arrow";
 import Chart, { type ChartType } from "@/components/Chart";
@@ -98,19 +101,36 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const [seriesData, setSeriesData] = useState<SeriesResult | null>(null);
   const [zoom, setZoom] = useState<{ min: number; max: number } | null>(null);
   const [candles, setCandles] = useState<OhlcResult | null>(null);
+  const [maWindow, setMaWindow] = useState(20);          // client-side MA overlay
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeErr, setAnalyzeErr] = useState<string | null>(null);
+
+  // Transform (filters + casts incl. tz) — collapsible so it doesn't clutter.
+  const [transformOpen, setTransformOpen] = useState(false);
+  const [filters, setFilters] = useState<FilterSpec[]>([]);
+  const [casts, setCasts] = useState<CastSpec[]>([]);
+  const [dlOpen, setDlOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   const decodeInto = useCallback(async (url: string) => {
     const t = await fetchArrowTable(url);
     setColumns(t.columns);
     setGrid(t.rows.map((r) => r.map((v) => (v === null || v === undefined ? "" : String(v)))));
-    // seed analyze defaults from the schema (first numeric measure, first
-    // non-numeric dimension) so the Analyze panel is ready to run.
+    // Schema-driven pre-fill so OHLC/series are ready without fiddling:
+    //   x        -> a timestamp/date column, else the first integer
+    //   price    -> prefer float/double (decimal), then any numeric
+    //   volume   -> a numeric column named like "vol*"
+    //   group/of -> first non-numeric dimension + first numeric measure
     const nums = t.columns.filter((c) => isNumericType(c.type)).map((c) => c.name);
     const dim = t.columns.find((c) => !isNumericType(c.type))?.name ?? "";
-    if (nums.length) { setMeasureCol((m) => m || nums[0]); setSeriesCol((m) => m || nums[0]); }
+    const temporal = t.columns.find((c) => /date|time/i.test(c.type))?.name;
+    const intCol = t.columns.find((c) => /\bint/i.test(c.type))?.name;
+    const floatCol = t.columns.find((c) => /float|double|decimal/i.test(c.type))?.name;
+    const volCol = t.columns.find((c) => /vol/i.test(c.name) && isNumericType(c.type))?.name;
+    if (nums.length) { setMeasureCol((m) => m || nums[0]); setSeriesCol((m) => m || floatCol || nums[0]); }
     setGroupBy((g) => g || dim);
+    setXCol((x) => x || temporal || intCol || "");
+    setVolCol((v) => v || volCol || "");
   }, []);
 
   // ``dims`` is passed explicitly (never read from `sheets` state) so this
@@ -229,7 +249,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     if (!measureCol) return;
     setAnalyzing(true); setAnalyzeErr(null);
     try {
-      const res = await aggregate(path, groupBy ? [groupBy] : [], [{ column: measureCol, agg: aggFn }], node);
+      const res = await aggregate(path, groupBy ? [groupBy] : [], [{ column: measureCol, agg: aggFn }], node, 500, filters);
       setPivot(res);
     } catch (e) {
       setAnalyzeErr(e instanceof Error ? e.message : "aggregate failed");
@@ -246,7 +266,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     setAnalyzing(true); setAnalyzeErr(null);
     try {
       const res = await analysisSeries(path, seriesCol, {
-        x: xCol || undefined, points: 800, x_min: z?.min, x_max: z?.max, node,
+        x: xCol || undefined, points: 800, x_min: z?.min, x_max: z?.max, filters, node,
       });
       setSeriesData(res);
     } catch (e) {
@@ -261,7 +281,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     setAnalyzing(true); setAnalyzeErr(null);
     try {
       const res = await analysisOhlc(path, seriesCol, {
-        x: xCol || undefined, volume: volCol || undefined, buckets: 120, node,
+        x: xCol || undefined, volume: volCol || undefined, buckets: 120, filters, node,
       });
       setCandles(res);
     } catch (e) {
@@ -280,6 +300,29 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const zoomIn = () => { const e = xExtent(); if (!e) return; const mid = (e[0] + e[1]) / 2, half = (e[1] - e[0]) / 4; const z = { min: mid - half, max: mid + half }; setZoom(z); runSeries(z); };
   const zoomOut = () => { const e = xExtent(); if (!e) return; const span = e[1] - e[0] || 1; const z = { min: e[0] - span / 2, max: e[1] + span / 2 }; setZoom(z); runSeries(z); };
   const resetZoom = () => { setZoom(null); runSeries(null); };
+
+  // Download-as: apply the current filters + casts and write any media type.
+  const exportAs = async (fmt: string) => {
+    setDlOpen(false); setExporting(true); setAnalyzeErr(null);
+    try {
+      await downloadExport(path, fmt, { filters, casts }, node);
+    } catch (e) {
+      setAnalyzeErr(e instanceof Error ? e.message : "export failed");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // Client-side moving average over the candle closes — computed on the client
+  // so the node doesn't recompute it on every overlay toggle.
+  const maLine = candles
+    ? candles.close.map((_, i) => {
+        if (i < maWindow - 1) return null;
+        let s = 0, c = 0;
+        for (let k = i - maWindow + 1; k <= i; k++) { const v = candles.close[k]; if (v != null) { s += v; c++; } }
+        return c ? s / c : null;
+      })
+    : [];
 
   const dirty = edited.size > 0;
   const meta: [string, string][] = isWorkbook
@@ -441,6 +484,51 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
               )}
             </div>
 
+            {/* Transform: filters + casts (collapsible — applies to charts + download) */}
+            <div className="text-[11px] font-mono">
+              <button onClick={() => setTransformOpen((v) => !v)} className="text-muted hover:text-foreground">
+                {transformOpen ? "▾" : "▸"} filters &amp; casts {filters.length + casts.length > 0 ? `(${filters.length + casts.length})` : ""}
+              </button>
+              {transformOpen && (
+                <div className="mt-2 space-y-2 rounded border border-white/[0.06] bg-white/[0.02] p-2">
+                  <div className="text-[10px] text-muted/60 uppercase tracking-wider">filters (rows)</div>
+                  {filters.map((f, i) => (
+                    <div key={i} className="flex items-center gap-1.5">
+                      <select value={f.column} onChange={(e) => setFilters((fs) => fs.map((x, j) => j === i ? { ...x, column: e.target.value } : x))} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1">
+                        {allCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <select value={f.op} onChange={(e) => setFilters((fs) => fs.map((x, j) => j === i ? { ...x, op: e.target.value } : x))} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1">
+                        {["==", "!=", ">", ">=", "<", "<=", "contains", "in", "is_null", "not_null"].map((o) => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                      {!["is_null", "not_null"].includes(f.op) && (
+                        <input value={String(f.value ?? "")} onChange={(e) => { const s = e.target.value; const v = s === "" ? null : (s.trim() !== "" && !isNaN(Number(s)) ? Number(s) : s); setFilters((fs) => fs.map((x, j) => j === i ? { ...x, value: v } : x)); }} placeholder="value" className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 w-28 outline-none" />
+                      )}
+                      <button onClick={() => setFilters((fs) => fs.filter((_, j) => j !== i))} className="text-rose/70 hover:text-rose px-1">✕</button>
+                    </div>
+                  ))}
+                  <button onClick={() => setFilters((fs) => [...fs, { column: allCols[0] ?? "", op: ">", value: 0 }])} className="text-frost/70 hover:text-frost">+ filter</button>
+
+                  <div className="text-[10px] text-muted/60 uppercase tracking-wider pt-1">casts (download)</div>
+                  {casts.map((c, i) => (
+                    <div key={i} className="flex items-center gap-1.5">
+                      <select value={c.column} onChange={(e) => setCasts((cs) => cs.map((x, j) => j === i ? { ...x, column: e.target.value } : x))} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1">
+                        {allCols.map((col) => <option key={col} value={col}>{col}</option>)}
+                      </select>
+                      <span className="text-muted">→</span>
+                      <select value={c.dtype} onChange={(e) => setCasts((cs) => cs.map((x, j) => j === i ? { ...x, dtype: e.target.value } : x))} className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1">
+                        {["int", "double", "float", "bool", "string", "date", "datetime"].map((d) => <option key={d} value={d}>{d}</option>)}
+                      </select>
+                      {c.dtype === "datetime" && (
+                        <input value={c.tz ?? "UTC"} onChange={(e) => setCasts((cs) => cs.map((x, j) => j === i ? { ...x, tz: e.target.value } : x))} placeholder="UTC" className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 w-32 outline-none" title="target timezone (UTC by default)" />
+                      )}
+                      <button onClick={() => setCasts((cs) => cs.filter((_, j) => j !== i))} className="text-rose/70 hover:text-rose px-1">✕</button>
+                    </div>
+                  ))}
+                  <button onClick={() => setCasts((cs) => [...cs, { column: allCols[0] ?? "", dtype: "double" }])} className="text-frost/70 hover:text-frost">+ cast</button>
+                </div>
+              )}
+            </div>
+
             {analyzeErr && <div className="text-[11px] text-rose/90 font-mono">{analyzeErr}</div>}
             {analyzing && <div className="text-[11px] text-muted font-mono">computing…</div>}
 
@@ -484,13 +572,27 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
               </div>
             )}
 
-            {/* Candlesticks */}
+            {/* Candlesticks + client-side MA overlay + volume sub-panel */}
             {analyzeKind === "candles" && candles && !analyzing && (
-              <div className="space-y-2">
-                <div className="text-[10px] font-mono text-muted">{candles.bars} OHLC bars from {candles.source_rows.toLocaleString()} rows</div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-3 text-[10px] font-mono text-muted">
+                  <span>{candles.bars} OHLC bars from {candles.source_rows.toLocaleString()} rows</span>
+                  <label className="flex items-center gap-1 ml-auto">
+                    <span className="text-amber/80">MA</span>
+                    <input type="number" min={1} max={candles.bars} value={maWindow}
+                      onChange={(e) => setMaWindow(Math.max(1, Number(e.target.value) || 1))}
+                      className="w-12 bg-white/[0.04] border border-white/10 rounded px-1 py-0.5 outline-none" />
+                  </label>
+                </div>
                 <Chart type="candle" labels={candles.x}
                   ohlc={{ open: candles.open, high: candles.high, low: candles.low, close: candles.close }}
-                  yLabel={candles.column} height={320} />
+                  overlay={maLine} yLabel={candles.column} height={300} />
+                {candles.volume && (
+                  <>
+                    <div className="text-[10px] text-frost/70 font-mono">volume</div>
+                    <Chart type="bar" labels={candles.x} values={candles.volume} color="var(--frost)" height={90} />
+                  </>
+                )}
               </div>
             )}
 
@@ -580,9 +682,23 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
               >next ›</button>
             </div>
           )}
-          <a href={fsDownloadUrl(path, node)} className="px-4 py-2 rounded-lg text-xs font-semibold bg-frost/10 text-frost border border-frost/20 hover:bg-frost/20">
-            Download
-          </a>
+          <div className="relative">
+            <button onClick={() => setDlOpen((v) => !v)} disabled={exporting}
+              className="px-4 py-2 rounded-lg text-xs font-semibold bg-frost/10 text-frost border border-frost/20 hover:bg-frost/20 disabled:opacity-50">
+              {exporting ? "exporting…" : `Download as ▾${filters.length + casts.length ? ` (${filters.length + casts.length})` : ""}`}
+            </button>
+            {dlOpen && (
+              <div className="absolute bottom-full mb-1 left-0 z-20 glass-card p-1 min-w-36 text-[11px] font-mono">
+                <a href={fsDownloadUrl(path, node)} onClick={() => setDlOpen(false)} className="block px-2 py-1.5 rounded hover:bg-white/[0.05] text-muted hover:text-foreground">raw file</a>
+                <div className="h-px bg-white/10 my-1" />
+                {["csv", "parquet", "json", "ndjson", "arrow", "xlsx"].map((fmt) => (
+                  <button key={fmt} onClick={() => exportAs(fmt)} className="block w-full text-left px-2 py-1.5 rounded hover:bg-emerald/10 text-foreground/80 hover:text-emerald">
+                    {fmt}{filters.length + casts.length ? " · transformed" : ""}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <button onClick={onClose} className="px-4 py-2 rounded-lg text-xs font-medium text-muted hover:text-foreground ml-auto">
             Close
           </button>

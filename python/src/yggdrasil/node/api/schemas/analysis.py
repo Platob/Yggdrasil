@@ -5,6 +5,27 @@ from typing import Any
 from .common import StrictModel
 
 
+class CastSpec(StrictModel):
+    column: str
+    dtype: str               # int|float|double|bool|string|date|datetime
+    tz: str | None = None    # for datetime: target timezone (default UTC)
+
+
+class FilterSpec(StrictModel):
+    column: str
+    op: str                  # ==|!=|>|>=|<|<=|contains|in|is_null|not_null
+    value: Any | None = None
+
+
+class Transform(StrictModel):
+    """Reusable lazy transform: filters (predicate pushdown) + casts (incl.
+    timezone, UTC by default) + projection + row limit."""
+    filters: list[FilterSpec] = []
+    casts: list[CastSpec] = []
+    columns: list[str] | None = None
+    limit: int | None = None
+
+
 class AggMeasure(StrictModel):
     column: str
     agg: str = "sum"  # sum|mean|min|max|count|median|std|var
@@ -14,6 +35,7 @@ class AggregateRequest(StrictModel):
     path: str
     group_by: list[str] = []
     measures: list[AggMeasure]
+    filters: list[FilterSpec] = []
     limit: int = 500          # max result groups returned
     sort_desc: bool = True    # sort by the first measure descending
 
@@ -67,6 +89,7 @@ class SeriesRequest(StrictModel):
     points: int = 800         # target buckets — the grid asks for ~viewport width
     x_min: float | None = None  # zoom window (predicate-pushed into the scan)
     x_max: float | None = None
+    filters: list[FilterSpec] = []
 
 
 class SeriesResult(StrictModel):
@@ -87,6 +110,13 @@ class OhlcRequest(StrictModel):
     x: str | None = None      # order/time column
     volume: str | None = None
     buckets: int = 120
+    filters: list[FilterSpec] = []
+
+
+class ExportRequest(StrictModel):
+    path: str
+    fmt: str = "csv"          # csv|parquet|json|ndjson|arrow|xlsx
+    transform: Transform = Transform()
 
 
 class OhlcResult(StrictModel):

@@ -59,6 +59,22 @@ export async function cachedGet<T>(
   return p as Promise<T>;
 }
 
+// Same coalesce+TTL reuse for POST analytics (keyed by url + body), so
+// re-running the same query or zooming back to a window is served from the
+// client instead of hitting the node again.
+export async function cachedPost<T>(url: string, body: unknown, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+  const key = `${url}|${JSON.stringify(body)}`;
+  const hit = store.get(key);
+  if (hit && hit.expires > Date.now()) return hit.value as T;
+  const pending = inflight.get(key);
+  if (pending) return pending as Promise<T>;
+  const p = fetcher()
+    .then((value) => { store.set(key, { expires: Date.now() + ttlMs, value }); return value; })
+    .finally(() => { inflight.delete(key); });
+  inflight.set(key, p);
+  return p as Promise<T>;
+}
+
 // Drop cached entries whose URL contains any of the given fragments. Call
 // after a mutation so the next read reflects the change immediately, e.g.
 // ``invalidate("pyfunc", "stats")`` after creating a function.

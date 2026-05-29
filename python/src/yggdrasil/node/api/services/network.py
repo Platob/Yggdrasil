@@ -172,6 +172,22 @@ class NetworkService:
             async for chunk in r.aiter_bytes(64 * 1024):
                 yield chunk
 
+    async def proxy_post_stream(
+        self, node_id: str, api_path: str, json_body: Any,
+    ) -> AsyncIterator[bytes]:
+        """POST a JSON body to a peer and stream the byte response (e.g. an
+        export download) back through the local node."""
+        base = self.peer_url(node_id)
+        if base is None:
+            raise APIError(f"Node {node_id!r} is not a linked peer", status_code=404)
+        async with self._client.stream(
+            "POST", f"{base}{api_path}", json=json_body,
+            headers={"X-YGG-Source-Node": self.settings.node_id},
+        ) as r:
+            r.raise_for_status()
+            async for chunk in r.aiter_bytes(64 * 1024):
+                yield chunk
+
     async def fs_proxy_upload(
         self, node_id: str, path: str, body: AsyncIterator[bytes],
     ) -> Any:

@@ -27,12 +27,15 @@ from ..schemas.analysis import (
     AggregateRequest,
     AggregateResult,
     DescribeResult,
+    ExportRequest,
+    FilterSpec,
     FinanceRequest,
     FinanceResult,
     OhlcRequest,
     OhlcResult,
     SeriesRequest,
     SeriesResult,
+    Transform,
 )
 from .fs import FsService
 
@@ -75,6 +78,11 @@ class AnalysisService:
     async def ohlc(self, req: OhlcRequest) -> OhlcResult:
         return await run_in_threadpool(partial(self._ohlc, req))
 
+    async def export(self, req: ExportRequest):
+        """Apply the transform and write the result in `fmt`. Returns
+        (temp_path, download_name) — the caller streams then unlinks it."""
+        return await run_in_threadpool(partial(self._export, req))
+
     # -- lazy scan ----------------------------------------------------------
 
     def _frame(self, path: str) -> pl.LazyFrame:
@@ -99,12 +107,87 @@ class AnalysisService:
         except Exception as exc:
             raise BadRequestError(f"Cannot read {path!r} as a table: {exc}")
 
+    def _apply_filters(self, lf: pl.LazyFrame, filters: list[FilterSpec]) -> pl.LazyFrame:
+        """Push row predicates into the scan."""
+        for f in filters:
+            col = pl.col(f.column)
+            if f.op == "is_null":
+                lf = lf.filter(col.is_null())
+            elif f.op == "not_null":
+                lf = lf.filter(col.is_not_null())
+            elif f.op == "contains":
+                lf = lf.filter(col.cast(pl.Utf8).str.contains(str(f.value), literal=True))
+            elif f.op == "in":
+                vals = f.value if isinstance(f.value, list) else [f.value]
+                lf = lf.filter(col.is_in(vals))
+            elif f.op in ("==", "!=", ">", ">=", "<", "<="):
+                v = f.value
+                cmp = {"==": col == v, "!=": col != v, ">": col > v,
+                       ">=": col >= v, "<": col < v, "<=": col <= v}[f.op]
+                lf = lf.filter(cmp)
+            else:
+                raise BadRequestError(f"unknown filter op {f.op!r}")
+        return lf
+
+    def _apply_transform(self, lf: pl.LazyFrame, t: Transform) -> pl.LazyFrame:
+        lf = self._apply_filters(lf, t.filters)
+        if t.casts:
+            schema = lf.collect_schema()
+            exprs = []
+            for c in t.casts:
+                if c.column not in schema.names():
+                    continue
+                e = pl.col(c.column)
+                d = c.dtype.lower()
+                if d in ("datetime", "date", "timestamp"):
+                    # naive/string/epoch -> datetime, stamped UTC, then converted
+                    # to the target tz (UTC by default).
+                    dtc = e.str.to_datetime(strict=False) if schema[c.column] == pl.Utf8 else e.cast(pl.Datetime, strict=False)
+                    if d == "date":
+                        exprs.append(dtc.dt.date().alias(c.column))
+                    else:
+                        tz = c.tz or "UTC"
+                        dtc = dtc.dt.replace_time_zone("UTC")
+                        if tz != "UTC":
+                            dtc = dtc.dt.convert_time_zone(tz)
+                        exprs.append(dtc.alias(c.column))
+                else:
+                    target = {"int": pl.Int64, "float": pl.Float64, "double": pl.Float64,
+                              "bool": pl.Boolean, "string": pl.Utf8, "str": pl.Utf8}.get(d)
+                    if target is None:
+                        raise BadRequestError(f"unknown cast dtype {c.dtype!r}")
+                    exprs.append(e.cast(target, strict=False).alias(c.column))
+            if exprs:
+                lf = lf.with_columns(exprs)
+        if t.columns:
+            lf = lf.select(t.columns)
+        if t.limit:
+            lf = lf.head(t.limit)
+        return lf
+
+    # -- export -------------------------------------------------------------
+
+    def _export(self, req: ExportRequest):
+        import tempfile
+        from yggdrasil.enums.media_type import MediaType
+        ext = {"arrow": "arrow", "ipc": "arrow"}.get(req.fmt, req.fmt)
+        lf = self._apply_transform(self._frame(req.path), req.transform)
+        table = lf.collect(engine="streaming").to_arrow()
+        base = self.fs._resolve(req.path).stem
+        tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
+        tmp.close()
+        from pathlib import Path as _P
+        media = MediaType.from_(req.fmt, default=None) or MediaType.from_("csv")
+        with YggPath.from_(tmp.name).open("wb", media_type=media) as bio:
+            bio.write_arrow_table(table)
+        return _P(tmp.name), f"{base}.{ext}"
+
     # -- aggregate / pivot --------------------------------------------------
 
     def _aggregate(self, req: AggregateRequest) -> AggregateResult:
         if not req.measures:
             raise BadRequestError("aggregate needs at least one measure")
-        lf = self._frame(req.path)
+        lf = self._apply_filters(self._frame(req.path), req.filters)
         cols = set(lf.collect_schema().names())
         for g in req.group_by:
             if g not in cols:
@@ -205,7 +288,7 @@ class AnalysisService:
     # -- adaptive downsample ------------------------------------------------
 
     def _series(self, req: SeriesRequest) -> SeriesResult:
-        lf = self._frame(req.path)
+        lf = self._apply_filters(self._frame(req.path), req.filters)
         cols = set(lf.collect_schema().names())
         if req.column not in cols:
             raise BadRequestError(f"column {req.column!r} not found")
@@ -261,7 +344,7 @@ class AnalysisService:
     # -- OHLC resampling ----------------------------------------------------
 
     def _ohlc(self, req: OhlcRequest) -> OhlcResult:
-        lf = self._frame(req.path)
+        lf = self._apply_filters(self._frame(req.path), req.filters)
         cols = set(lf.collect_schema().names())
         if req.column not in cols:
             raise BadRequestError(f"column {req.column!r} not found")
