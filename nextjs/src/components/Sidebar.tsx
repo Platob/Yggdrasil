@@ -5,6 +5,12 @@ import { usePathname } from "next/navigation";
 import { YggLogoIcon } from "./YggLogo";
 
 const Icons = {
+  excel: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
+    </svg>
+  ),
   dashboard: (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <rect x="3" y="3" width="7" height="9" rx="1" />
@@ -73,6 +79,7 @@ const NAV_ITEMS = [
   { href: "/dags", label: "DAGs", icon: Icons.dags },
   { href: "/chat", label: "Chat", icon: Icons.chat },
   { href: "/files", label: "Files", icon: Icons.files },
+  { href: "/excel", label: "Excel", icon: Icons.excel },
 ];
 
 export function Sidebar() {

@@ -12,6 +12,7 @@ import type {
   FsEntry,
   HealthResponse,
   Message,
+  ExcelInfo,
   MetricsResponse,
   NodeBackend,
   NodeCard,
@@ -99,6 +100,10 @@ export function getPeers(): Promise<{ node_id: string; peers: NodeMeta[] }> {
 
 export function getEnvs(): Promise<{ node_id: string; envs: PyEnvEntry[] }> {
   return jsonFetch<{ node_id: string; envs: PyEnvEntry[] }>("/api/v2/pyenv");
+}
+
+export function getExcelInfo(): Promise<ExcelInfo> {
+  return jsonFetch<ExcelInfo>("/api/v2/excel/info");
 }
 
 export function getEnvPackages(envName: string): Promise<PyEnvPackages> {

@@ -232,6 +232,16 @@ export interface PyEnvPackages {
   error: string | null;
 }
 
+// ── Excel service ────────────────────────────────────────────────────────
+
+export interface ExcelInfo {
+  node_id: string;
+  node_name: string;
+  version: string;
+  table_formats: string[];
+  capabilities: string[];
+}
+
 // ── PyFunc ─────────────────────────────────────────────────────────────────
 
 export interface PyFuncEntry {
