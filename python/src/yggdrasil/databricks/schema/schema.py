@@ -280,25 +280,34 @@ class UCSchema(DatabricksPath):
         return f"{self.NAMESPACE_PREFIX}{self.catalog_name}/{self.schema_name}"
 
     def _from_url(self, url: URL) -> "DatabricksPath":
+        # ``url.parts`` is 0-indexed (leading ``/`` stripped), so this
+        # schema's own URL (``/<cat>/<sch>``) is two parts. Path-join
+        # navigation follows the volume-family depth model — catalog (1)
+        # → schema (2) → volume (3) → :class:`VolumePath` (4+); the
+        # logical ``schema["tbl"]`` → :class:`Table` surface stays on
+        # ``__getitem__``.
         parts = url.parts
         n = len(parts)
 
         if n <= 1:
-            return self
-        elif n == 2:
-            # /<catalog>
+            # ``/<catalog>`` — walked back up to the parent catalog.
             return self.catalog
-        elif n == 3:
-            # /<catalog>/<schema> — this schema itself
+        if n == 2:
+            # ``/<catalog>/<schema>`` — this schema itself.
             return self
-        elif n == 4:
-            # /<catalog>/<schema>/<table_or_volume>
-            return self.table(parts[3])
-        else:
-            raise ValueError(
-                f"URL {url} has too many parts to resolve against a Schema "
-                f"(got {n}, expected 1-4)."
-            )
+        # Depth ≥ 3 lands inside a volume: ``/<cat>/<sch>/<vol>`` is the
+        # volume, ``/<cat>/<sch>/<vol>/<rest>`` a VolumePath under it.
+        # The join only ever extends this schema's own coordinates, so
+        # anchor on them and let the volume own the volume → VolumePath
+        # leg of the walk.
+        from yggdrasil.databricks.volume.volumes import Volumes
+
+        volume = Volumes(client=self.client).volume(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            volume_name=parts[2],
+        )
+        return volume if n == 3 else volume._from_url(url)
 
     def _stat_uncached(self) -> IOStats:
         infos = self.read_infos(default=None)

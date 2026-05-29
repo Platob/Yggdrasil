@@ -229,25 +229,23 @@ class UCCatalog(DatabricksPath, Singleton):
         )
 
     def _from_url(self, url: URL) -> "DatabricksPath":
+        # ``url.parts`` is 0-indexed with the leading ``/`` stripped, so a
+        # catalog's own URL (``/<cat>``) is a single part. Depth fixes the
+        # volume-family resource a path-join lands on — catalog (1) →
+        # schema (2) → volume (3) → :class:`VolumePath` (4+) — mirroring
+        # the ``/Volumes/...`` depth dispatch the module-level resolver
+        # applies. ``catalog["sch"]`` / ``schema["tbl"]`` stay the logical
+        # (table-oriented) navigation surface; ``/`` is the filesystem one.
         parts = url.parts
         n = len(parts)
 
         if n <= 1:
+            # ``/<catalog>`` (or the bare root) — this catalog itself.
             return self
-        elif n == 2:
-            # /<catalog> — this catalog itself
-            return self
-        elif n == 3:
-            # /<catalog>/<schema>
-            return self.schema(parts[2])
-        elif n == 4:
-            # /<catalog>/<schema>/<volume_or_table> — hand off to the schema
-            return self.schema(parts[2])._from_url(url)
-        else:
-            raise ValueError(
-                f"URL {url} has too many parts to resolve against a Catalog "
-                f"(got {n}, expected 1-4)."
-            )
+        # Depth ≥ 2 carries a schema and possibly more below it — hand off
+        # to the child schema, which owns the schema → volume →
+        # VolumePath leg of the walk.
+        return self.schema(parts[1])._from_url(url)
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         raise NotImplementedError(

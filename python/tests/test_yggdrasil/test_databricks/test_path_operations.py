@@ -640,3 +640,139 @@ class TestSingletonIdentityThroughDispatcher:
             "dbfs+volume:///main/sales/raw/x", service=volumes_service,
         )
         assert a is b
+
+
+# ===========================================================================
+# Path-join navigation — joining a catalog / schema / volume mints the
+# right concrete Databricks instance by depth
+# ===========================================================================
+
+
+class TestJoinPathCreatesCorrectInstances:
+    """``/`` (and :meth:`joinpath`) walk *down* the volume family by
+    depth — catalog → schema → volume → :class:`VolumePath` — minting
+    the right concrete resource at every step.
+
+    This is the filesystem-navigation surface: each appended segment
+    descends one level. It is distinct from the logical
+    ``__getitem__`` surface (``catalog["sch"]`` → :class:`UCSchema`,
+    ``schema["tbl"]`` → :class:`Table`), and from the module-level
+    dispatcher that resolves a whole ``/Volumes/...`` POSIX seed at
+    once — but it must agree with both on the depth → type mapping so
+    ``cat / "sch" / "vol" / "x"`` lands on the same
+    ``catalog_name`` / ``schema_name`` / ``volume_name`` triple a
+    direct ``DatabricksPath("/Volumes/cat/sch/vol/x")`` does.
+    """
+
+    # ── catalog as the join root ──────────────────────────────────────────
+
+    def test_catalog_join_schema_yields_schema(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        sch = cat / "sales"
+        assert isinstance(sch, UCSchema)
+        assert sch.catalog_name == "main"
+        assert sch.schema_name == "sales"
+
+    def test_catalog_join_schema_collapses_onto_getitem(self, catalogs_service):
+        # ``cat / "sales"`` and the logical ``cat["sales"]`` must resolve
+        # to the very same singleton — both spellings address the one
+        # ``main.sales`` schema, so their cached state has to be shared.
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert (cat / "sales") is cat["sales"]
+        assert (cat / "sales") is cat.schema("sales")
+
+    def test_catalog_join_to_volume_depth(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        vol = cat / "sales" / "raw"
+        assert isinstance(vol, Volume)
+        assert vol.catalog_name == "main"
+        assert vol.schema_name == "sales"
+        assert vol.volume_name == "raw"
+
+    def test_catalog_join_to_volume_path_depth(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        leaf = cat / "sales" / "raw" / "data.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/data.parquet"
+
+    def test_catalog_joinpath_multi_segment_to_volume_path(self, catalogs_service):
+        # A single ``joinpath`` with several segments resolves to the
+        # same place as the chained ``/`` form.
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        leaf = cat.joinpath("sales", "raw", "year=2026", "data.parquet")
+        assert isinstance(leaf, VolumePath)
+        assert (
+            leaf.full_path()
+            == "/Volumes/main/sales/raw/year=2026/data.parquet"
+        )
+
+    # ── schema as the join root ───────────────────────────────────────────
+
+    def test_schema_join_volume_yields_volume(self, schemas_service):
+        sch = UCSchema(
+            service=schemas_service,
+            catalog_name="main",
+            schema_name="sales",
+        )
+        vol = sch / "raw"
+        assert isinstance(vol, Volume)
+        assert vol.catalog_name == "main"
+        assert vol.schema_name == "sales"
+        assert vol.volume_name == "raw"
+
+    def test_schema_join_to_volume_path_depth(self, schemas_service):
+        sch = UCSchema(
+            service=schemas_service,
+            catalog_name="main",
+            schema_name="sales",
+        )
+        leaf = sch / "raw" / "sub" / "f.csv"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/sub/f.csv"
+
+    # ── volume as the join root ───────────────────────────────────────────
+
+    def test_volume_join_yields_volume_path(self, volumes_service):
+        vol = Volume(
+            service=volumes_service,
+            catalog_name="main",
+            schema_name="sales",
+            volume_name="raw",
+        )
+        leaf = vol / "data.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/data.parquet"
+
+    def test_volume_join_nested_yields_volume_path(self, volumes_service):
+        vol = Volume(
+            service=volumes_service,
+            catalog_name="main",
+            schema_name="sales",
+            volume_name="raw",
+        )
+        leaf = vol / "a" / "b" / "c.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/a/b/c.parquet"
+
+    # ── agreement with the whole-seed dispatcher ──────────────────────────
+
+    def test_chained_join_matches_dispatcher_address(
+        self, catalogs_service, volumes_service,
+    ):
+        # Walking down from the catalog one segment at a time has to
+        # address the same UC location the dispatcher resolves from the
+        # equivalent POSIX seed — same concrete type, same canonical URL.
+        # (Instance identity isn't asserted: a :class:`VolumePath`
+        # singleton keys on its service object, and the walked path
+        # carries the volume's own service rather than ``volumes_service``.)
+        catalogs_service.client = volumes_service.client
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        walked = cat / "sales" / "raw" / "x.parquet"
+        dispatched = DatabricksPath(
+            "/Volumes/main/sales/raw/x.parquet",
+            service=volumes_service,
+        )
+        assert isinstance(walked, VolumePath)
+        assert type(walked) is type(dispatched)
+        assert walked == dispatched
+        assert walked.full_path() == dispatched.full_path()
