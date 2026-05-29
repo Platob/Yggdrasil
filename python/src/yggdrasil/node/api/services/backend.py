@@ -14,8 +14,18 @@ from ..schemas.backend import GpuInfo, NetworkIO, NodeBackend
 from ..schemas.common import NodeRole
 
 _GPU_QUERY = (
-    "index,name,memory.used,memory.total,utilization.gpu,temperature.gpu"
+    "index,name,memory.used,memory.total,utilization.gpu,temperature.gpu,"
+    "power.draw,power.limit"
 )
+
+
+def _gpu_num(value: str) -> float:
+    """Parse an nvidia-smi numeric field, tolerating ``[N/A]`` /
+    ``[Not Supported]`` (returned for power on some cards) as 0.0."""
+    try:
+        return float(value)
+    except ValueError:
+        return 0.0
 
 
 class BackendService:
@@ -142,10 +152,14 @@ class BackendService:
                 gpus.append(GpuInfo(
                     index=int(parts[0]),
                     name=parts[1],
-                    memory_used_mb=float(parts[2]),
-                    memory_total_mb=float(parts[3]),
-                    utilization_percent=float(parts[4]),
-                    temperature_c=float(parts[5]),
+                    memory_used_mb=_gpu_num(parts[2]),
+                    memory_total_mb=_gpu_num(parts[3]),
+                    utilization_percent=_gpu_num(parts[4]),
+                    temperature_c=_gpu_num(parts[5]),
+                    # Power can be ``[N/A]`` on some cards — tolerate it
+                    # rather than dropping the whole GPU row.
+                    power_draw_w=_gpu_num(parts[6]) if len(parts) > 6 else 0.0,
+                    power_limit_w=_gpu_num(parts[7]) if len(parts) > 7 else 0.0,
                 ))
             except (ValueError, IndexError):
                 continue

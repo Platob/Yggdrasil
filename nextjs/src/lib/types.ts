@@ -43,6 +43,8 @@ export interface GpuInfo {
   memory_total_mb: number;
   utilization_percent: number;
   temperature_c: number;
+  power_draw_w: number;
+  power_limit_w: number;
 }
 
 export interface NetworkIO {

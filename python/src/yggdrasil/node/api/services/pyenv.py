@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import logging
+import os
 import shutil
 import subprocess
 from functools import partial
@@ -14,6 +15,7 @@ import httpx
 from fastapi.concurrency import run_in_threadpool
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.version import VersionInfo
 
 from ...config import Settings
 from ...exceptions import NotFoundError
@@ -201,7 +203,7 @@ class PyEnvService:
     def _collect_packages(self, env_id: int, entry: PyEnvEntry) -> PyEnvPackagesResponse:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         env_path = Path(entry.path)
-        python_bin = env_path / "bin" / "python"
+        python_bin = self._venv_python(env_path)
         python_version = entry.python_version
         packages: list[PyEnvPackage] = []
         error: str | None = None
@@ -213,15 +215,22 @@ class PyEnvService:
                 error=f"interpreter not found at {python_bin}",
             )
 
-        # Resolve the real interpreter version (e.g. ``3.11.9``) rather
-        # than the declared major.minor request (e.g. ``3.11``).
+        # Resolve the real interpreter version (e.g. ``3.11.15``) rather
+        # than the declared major.minor request (e.g. ``3.11``), and
+        # normalize it through the project's :class:`VersionInfo` so the
+        # rendered form is consistent.
         try:
             proc = subprocess.run(
                 [str(python_bin), "-c",
-                 "import sys;print('.'.join(map(str, sys.version_info[:3])))"],
+                 "import sys;print('%d.%d.%d' % sys.version_info[:3])"],
                 check=True, capture_output=True, text=True, timeout=10,
             )
-            python_version = proc.stdout.strip() or python_version
+            raw = proc.stdout.strip()
+            if raw:
+                try:
+                    python_version = str(VersionInfo.from_string(raw))
+                except ValueError:
+                    python_version = raw
         except (subprocess.SubprocessError, OSError):
             pass
 
@@ -247,12 +256,29 @@ class PyEnvService:
             error=error,
         )
 
+    @staticmethod
+    def _venv_python(env_path: Path) -> Path:
+        """Path to the venv interpreter, POSIX *and* Windows.
+
+        ``uv venv`` / stdlib ``venv`` put the interpreter under ``bin/``
+        on POSIX and ``Scripts/`` on Windows. Prefer whichever exists;
+        otherwise fall back to the platform-conventional location so
+        callers building a not-yet-created env still get a sensible path.
+        """
+        windows = env_path / "Scripts" / "python.exe"
+        posix = env_path / "bin" / "python"
+        if windows.exists():
+            return windows
+        if posix.exists():
+            return posix
+        return windows if os.name == "nt" else posix
+
     def get_python_path(self, env_id: int) -> str | None:
         with self._lock:
             entry = self._envs.get(env_id)
         if entry is None or entry.status != "ready":
             return None
-        python = Path(entry.path) / "bin" / "python"
+        python = self._venv_python(Path(entry.path))
         return str(python) if python.exists() else None
 
     # -- replication --------------------------------------------------------
@@ -343,7 +369,7 @@ class PyEnvService:
             self._update_entry(env_id, error=exc.stderr or str(exc))
 
     def _pip_install(self, env_path: Path, packages: list[str], *, uv: str | None) -> None:
-        python_bin = str(env_path / "bin" / "python")
+        python_bin = str(self._venv_python(env_path))
         if uv:
             cmd = [uv, "pip", "install", "--python", python_bin] + packages
         else:

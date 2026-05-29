@@ -148,5 +148,38 @@ class TestPyEnvPackagesCache(unittest.TestCase):
             self.assertIsNotNone(res.error)
 
 
+class TestVenvPythonPath(unittest.TestCase):
+    """The interpreter path must resolve on both POSIX (``bin/python``)
+    and Windows (``Scripts/python.exe``)."""
+
+    def test_prefers_existing_posix_layout(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "bin").mkdir()
+            (root / "bin" / "python").write_text("")
+            self.assertEqual(
+                PyEnvService._venv_python(root), root / "bin" / "python",
+            )
+
+    def test_prefers_existing_windows_layout(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "Scripts").mkdir()
+            (root / "Scripts" / "python.exe").write_text("")
+            self.assertEqual(
+                PyEnvService._venv_python(root), root / "Scripts" / "python.exe",
+            )
+
+    def test_falls_back_to_platform_convention(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)  # neither layout exists yet
+            resolved = PyEnvService._venv_python(root)
+            expected = (
+                root / "Scripts" / "python.exe" if os.name == "nt"
+                else root / "bin" / "python"
+            )
+            self.assertEqual(resolved, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

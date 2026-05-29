@@ -313,11 +313,29 @@ export default function NodeDetailPage() {
                   color="var(--emerald)"
                   detail={`${formatBytes(gpu.memory_used_mb)} / ${formatBytes(gpu.memory_total_mb)}`}
                 />
-                <div className="flex items-center gap-2 text-[11px] text-muted">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z" />
-                  </svg>
-                  {gpu.temperature_c}C
+                {gpu.power_limit_w > 0 && (
+                  <ResourceBar
+                    label="Power"
+                    value={(gpu.power_draw_w / gpu.power_limit_w) * 100}
+                    color="var(--amber)"
+                    detail={`${gpu.power_draw_w.toFixed(0)}W / ${gpu.power_limit_w.toFixed(0)}W`}
+                  />
+                )}
+                <div className="flex items-center gap-4 text-[11px] text-muted">
+                  <span className="flex items-center gap-1.5">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z" />
+                    </svg>
+                    {gpu.temperature_c}C
+                  </span>
+                  {gpu.power_draw_w > 0 && (
+                    <span className="flex items-center gap-1.5">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                      </svg>
+                      {gpu.power_draw_w.toFixed(0)}W
+                    </span>
+                  )}
                 </div>
               </div>
             ))}
