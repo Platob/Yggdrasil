@@ -127,9 +127,17 @@ class TabularService:
         if truncated:
             table = table.slice(0, limit)
 
-        names = table.schema.names
-        records = table.to_pylist()
-        rows = [[_json_safe(rec.get(n)) for n in names] for rec in records]
+        # Build rows column-wise: one to_pylist per column (vectorized) then a
+        # zip-transpose, and skip the per-cell coercion entirely for columns
+        # whose Arrow type is already JSON-safe. Faster than to_pylist's
+        # row-dicts + a blanket per-cell loop, same output.
+        column_values = []
+        for field, column in zip(table.schema, table.columns):
+            values = column.to_pylist()
+            if not _is_json_safe_type(field.type):
+                values = [_json_safe(v) for v in values]
+            column_values.append(values)
+        rows = [list(r) for r in zip(*column_values)] if column_values else []
         return TabularPreview(
             node_id=self.settings.node_id,
             path=path,
@@ -177,6 +185,16 @@ class TabularService:
             columns=table.num_columns,
             bytes_written=resolved.stat().st_size,
         )
+
+
+def _is_json_safe_type(t) -> bool:
+    """True when an Arrow column's values are already JSON-serializable, so the
+    preview can skip per-cell coercion for it."""
+    return (
+        pa.types.is_integer(t) or pa.types.is_floating(t)
+        or pa.types.is_string(t) or pa.types.is_large_string(t)
+        or pa.types.is_boolean(t) or pa.types.is_null(t)
+    )
 
 
 def _json_safe(value):
