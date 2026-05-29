@@ -59,6 +59,16 @@ _FROMTIMESTAMP = _DATETIME.fromtimestamp
 _NOW_TS = time.time
 _ISFINITE = math.isfinite
 
+# Throttle bounds for epoch→datetime conversion. A timestamp whose
+# magnitude (or mis-detected unit) lands out of range is clamped to the
+# nearest edge rather than raising, so one pathological value never aborts
+# a batch decode. The edges are the span an int64 nanosecond count since
+# the 1970 epoch can address (~1677..2262) — the native domain of
+# Arrow/pandas ``timestamp[ns]`` data — not the wider year 1–9999 limits.
+_EPOCH = _DATETIME(1970, 1, 1, tzinfo=_UTC)
+_DT_MIN = _EPOCH + _TIMEDELTA(microseconds=-(2 ** 63) // 1000)
+_DT_MAX = _EPOCH + _TIMEDELTA(microseconds=(2 ** 63 - 1) // 1000)
+
 _RE_FRACTIONAL_SECONDS = re.compile(r"(\.)(\d+)(?=(?:[+-]\d{2}:?\d{2})?$)")
 _RE_DATE_SLASH = re.compile(r"^(\d{4})/(\d{2})/(\d{2})")
 _RE_TZ_NO_COLON = re.compile(r"([+-]\d{2})(\d{2})$")
@@ -449,7 +459,13 @@ def _numeric_timestamp_to_seconds(value: int | float) -> float:
 
 
 def _numeric_to_datetime(value: int | float, opts: Any = None, tz: Any = None) -> dt.datetime:
-    parsed = _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC)
+    seconds = _numeric_timestamp_to_seconds(value)
+    try:
+        parsed = _FROMTIMESTAMP(seconds, tz=_UTC)
+    except (OverflowError, ValueError, OSError):
+        # Out of datetime's year 1–9999 range — throttle to the edge in
+        # the direction of the value instead of raising.
+        parsed = _DT_MAX if seconds > 0.0 else _DT_MIN
     if tz is None and opts is None:
         return parsed
     return _apply_target_tz(parsed, tz=tz, opts=opts)
@@ -457,28 +473,22 @@ def _numeric_to_datetime(value: int | float, opts: Any = None, tz: Any = None) -
 
 @register_converter(int, dt.datetime)
 def int_to_datetime(value: int, opts: Any = None, tz: Any = None) -> dt.datetime:
-    parsed = _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC)
-    if tz is None and opts is None:
-        return parsed
-    return _apply_target_tz(parsed, tz=tz, opts=opts)
+    return _numeric_to_datetime(value, opts=opts, tz=tz)
 
 
 @register_converter(float, dt.datetime)
 def float_to_datetime(value: float, opts: Any = None, tz: Any = None) -> dt.datetime:
-    parsed = _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC)
-    if tz is None and opts is None:
-        return parsed
-    return _apply_target_tz(parsed, tz=tz, opts=opts)
+    return _numeric_to_datetime(value, opts=opts, tz=tz)
 
 
 @register_converter(int, dt.date)
 def int_to_date(value: int, opts: Any = None) -> dt.date:
-    return _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC).date()
+    return _numeric_to_datetime(value).date()
 
 
 @register_converter(float, dt.date)
 def float_to_date(value: float, opts: Any = None) -> dt.date:
-    return _FROMTIMESTAMP(_numeric_timestamp_to_seconds(value), tz=_UTC).date()
+    return _numeric_to_datetime(value).date()
 
 
 @register_converter(int, dt.timedelta)
