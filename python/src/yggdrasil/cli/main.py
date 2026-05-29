@@ -61,6 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
     serve.add_argument("--no-front", action="store_true", default=False, help="Skip launching the frontend.")
     serve.add_argument("--name", default=None, help="Node ID override.")
+    serve.add_argument("--persist", action="store_true", default=False, help="Create/update the boot auto-start service (Task Scheduler on Windows).")
     serve.set_defaults(handler=_node_serve)
 
     # status
@@ -131,12 +132,14 @@ def _build_parser() -> argparse.ArgumentParser:
     back.add_argument("--port", type=int, default=None, help="Bind port (default: 8100).")
     back.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
     back.add_argument("--name", default=None, help="Node ID override.")
+    back.add_argument("--persist", action="store_true", default=False, help="Create/update the boot auto-start service (Task Scheduler on Windows).")
     back.set_defaults(handler=_node_back)
 
     # front
     front = node_sub.add_parser("front", help="Start frontend dev server only.")
     front.add_argument("--port", type=int, default=None, help="Frontend port (default: 3000).")
     front.add_argument("--node-port", type=int, default=None, help="Node API port to proxy to.")
+    front.add_argument("--persist", action="store_true", default=False, help="Create/update the boot auto-start service (Task Scheduler on Windows).")
     front.set_defaults(handler=_node_front)
 
     # run
@@ -305,6 +308,28 @@ def _ensure_nodejs() -> "str | None":
     return npm
 
 
+def _persist_service(settings, *, no_front: bool = False) -> None:
+    """Create/update the boot auto-start service for ``--persist``.
+
+    Idempotent (install_service rewrites the unit/agent/scheduled-task).
+    Best-effort: a failure to install — no systemd, locked-down
+    Task Scheduler, missing privileges — is logged as a warning and does
+    NOT abort the deploy; the foreground process still runs.
+    """
+    from yggdrasil.cli.style import dim, green, out, yellow
+    try:
+        from yggdrasil.node.service import install_service, is_windows
+        ok, msg = install_service(settings, no_front=no_front)
+    except Exception as exc:  # noqa: BLE001 — never fail the deploy on this
+        out(f"  {yellow('warn')}  could not install auto-start service: {dim(str(exc))}\n")
+        return
+    if ok:
+        kind = "scheduled task" if is_windows() else "boot service"
+        out(f"  {green('✓')} persisted ({kind}): {dim(msg)}\n")
+    else:
+        out(f"  {yellow('warn')}  auto-start not installed: {dim(msg)}\n")
+
+
 # ── handlers ─────────────────────────────────────────────────────
 
 def _node_start(args: argparse.Namespace) -> int:
@@ -375,6 +400,9 @@ def _node_serve(args: argparse.Namespace) -> int:
     out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
     out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
     out(f"  {cyan('mode')}    {dim('public — remote access enabled')}\n")
+
+    if getattr(args, "persist", False):
+        _persist_service(settings, no_front=args.no_front)
 
     front_proc = None
     if not args.no_front:
@@ -638,6 +666,9 @@ def _node_back(args: argparse.Namespace) -> int:
     out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
     out(f"  {cyan('mode')}    {dim('backend only')}\n\n")
 
+    if getattr(args, "persist", False):
+        _persist_service(settings, no_front=True)
+
     import uvicorn
     uvicorn.run("yggdrasil.node.app:app", host=host, port=port, reload=args.reload)
     return 0
@@ -652,6 +683,9 @@ def _node_front(args: argparse.Namespace) -> int:
     settings = get_settings()
 
     node_port = args.node_port or settings.port
+    if getattr(args, "persist", False):
+        _persist_service(settings)
+
     proc = _start_frontend(settings, node_port=node_port, front_port=args.port, quiet=False)
     if proc is None:
         return 1
