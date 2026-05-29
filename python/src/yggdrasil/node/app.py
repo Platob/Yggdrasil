@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -69,12 +70,26 @@ from .services import (
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Seed default assets in the background so a fresh node is useful
+        # at once. The env build (uv venv + pip) must not gate readiness,
+        # so we fire-and-forget — functions register near-instantly.
+        if settings.seed_defaults:
+            import asyncio
+            from .api.services.seed import seed_defaults
+            asyncio.create_task(
+                seed_defaults(app.state.pyenv_service, app.state.pyfunc_service)
+            )
+        yield
+
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
         docs_url=settings.docs_url,
         redoc_url=settings.redoc_url,
         openapi_url=settings.openapi_url,
+        lifespan=lifespan,
     )
 
     app.state.settings = settings

@@ -93,6 +93,10 @@ class Settings:
     # listing stays cached before the next ``pip list`` subprocess runs —
     # keeps the UI's per-env package view from flooding the node.
     pyenv_packages_cache_ttl: float = 60.0
+    # Seed a ``default`` PyEnv + starter PyFuncs on startup so a fresh node
+    # is immediately useful. The env builds in the background; functions are
+    # registered instantly and run on the node interpreter until it's ready.
+    seed_defaults: bool = True
 
     @property
     def local_clients(self) -> set[str]:
@@ -165,4 +169,5 @@ def get_settings() -> Settings:
         run_heartbeat_interval=float(os.getenv("YGG_NODE_RUN_HEARTBEAT", "2.0")),
         run_cancel_grace_seconds=float(os.getenv("YGG_NODE_RUN_CANCEL_GRACE", "1.5")),
         pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
+        seed_defaults=_as_bool(os.getenv("YGG_NODE_SEED_DEFAULTS"), True),
     )
