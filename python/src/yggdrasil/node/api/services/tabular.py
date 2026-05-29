@@ -70,17 +70,29 @@ class TabularService:
 
         if is_tabular:
             try:
-                # One bounded read gives us both the schema and whether the
-                # whole file fits — no separate scan, no full load.
-                with YggPath.from_(str(resolved)).open("rb") as bio:
-                    table = bio.read_arrow_table(options=CastOptions(row_limit=cap + 1))
-                columns = [TabularColumn(name=f.name, type=str(f.type)) for f in table.schema]
+                if ext in ("parquet", "pq"):
+                    # Parquet carries schema + exact row count in its footer —
+                    # an O(1) read. No need to pull cap+1 rows just to size the
+                    # file, so even a multi-GB parquet inspects instantly and
+                    # still reports its true row_count.
+                    import pyarrow.parquet as _pq
+                    pf = _pq.ParquetFile(str(resolved))
+                    arrow_schema = pf.schema_arrow
+                    row_count = pf.metadata.num_rows
+                    editable = row_count <= cap
+                else:
+                    # No cheap metadata (csv/json/…): one bounded read gives both
+                    # the schema and whether the whole file fits the editor cap.
+                    with YggPath.from_(str(resolved)).open("rb") as bio:
+                        table = bio.read_arrow_table(options=CastOptions(row_limit=cap + 1))
+                    arrow_schema = table.schema
+                    if table.num_rows <= cap:
+                        row_count = table.num_rows
+                        editable = True
+                columns = [TabularColumn(name=f.name, type=str(f.type)) for f in arrow_schema]
                 schema_hash = hashlib.sha256(
-                    "|".join(f"{f.name}:{f.type}" for f in table.schema).encode()
+                    "|".join(f"{f.name}:{f.type}" for f in arrow_schema).encode()
                 ).hexdigest()[:16]
-                if table.num_rows <= cap:
-                    row_count = table.num_rows
-                    editable = True
             except Exception as exc:  # corrupt / unsupported encoding
                 schema_error = str(exc)
 

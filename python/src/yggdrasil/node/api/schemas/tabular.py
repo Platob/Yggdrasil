@@ -18,8 +18,9 @@ class TabularInspect(StrictModel):
     is_tabular: bool
     columns: list[TabularColumn]
     column_count: int
-    # Exact when the whole file fits under the preview cap; null when it's too
-    # large to count cheaply (in which case the editor stays read-only).
+    # Exact for parquet (read from the footer, free) and for any file that fits
+    # under the preview cap; null only when a non-parquet file is too large to
+    # count cheaply. Editing is gated on `editable`, not on this.
     row_count: int | None = None
     size_bytes: int = 0
     schema_hash: str = ""

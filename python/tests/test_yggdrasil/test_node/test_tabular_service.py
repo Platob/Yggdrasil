@@ -50,8 +50,22 @@ class TestInspect(unittest.TestCase):
             _write_parquet(home, "big.parquet", 50)
             svc = _service(home, tabular_preview_max_rows=10)
             info = asyncio.run(svc.inspect("big.parquet"))
-            self.assertIsNone(info.row_count)   # too big to count cheaply
+            # Parquet footer gives the exact count for free even when too big
+            # to edit — the UI gets the real size, editing is still gated off.
+            self.assertEqual(info.row_count, 50)
             self.assertFalse(info.editable)
+
+    def test_large_csv_reports_unknown_count(self):
+        # CSV has no cheap metadata, so a file over the cap stays count-unknown.
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            import pyarrow.csv as pacsv
+            pacsv.write_csv(pa.table({"id": list(range(50))}), str(home / "big.csv"))
+            svc = _service(home, tabular_preview_max_rows=10)
+            info = asyncio.run(svc.inspect("big.csv"))
+            self.assertIsNone(info.row_count)
+            self.assertFalse(info.editable)
+            self.assertEqual(info.column_count, 1)
 
     def test_non_tabular_extension(self):
         with tempfile.TemporaryDirectory() as d:
