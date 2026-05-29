@@ -31,6 +31,7 @@ from yggdrasil.databricks.path import (
     DatabricksPath,
     TABLE_PATH_PREFIX,
     VOLUME_PATH_PREFIX,
+    _coerce_explore_url,
     _coerce_to_url_str,
     _looks_like_posix,
     _parse_posix,
@@ -1119,3 +1120,135 @@ class TestPathPrefixSurvivesPickle:
         # The state carries the surface so an unpickled handle resolves
         # children the same way.
         assert cat.__getstate__()["path_prefix"] == TABLE_PATH_PREFIX
+
+
+# ===========================================================================
+# Catalog Explorer deep-links — build a path straight from a workspace UI
+# URL (the thing a user copies out of the browser)
+# ===========================================================================
+
+
+_HOST = "https://ws.cloud.databricks.com"
+
+
+class TestCoerceExploreUrl:
+    """:func:`_coerce_explore_url` rewrites a ``/explore/data/...`` UI
+    link into the canonical ``dbfs+<surface>://`` form (host dropped, to
+    match the ``/Volumes/...`` POSIX coercion)."""
+
+    def test_catalog_link(self):
+        out = _coerce_explore_url(URL.from_(f"{_HOST}/explore/data/main"))
+        assert out.scheme == Scheme.DATABRICKS_CATALOG.value
+        assert out.path == "/main"
+        assert not out.host
+
+    def test_schema_link(self):
+        out = _coerce_explore_url(URL.from_(f"{_HOST}/explore/data/main/sales"))
+        assert out.scheme == Scheme.DATABRICKS_SCHEMA.value
+        assert out.path == "/main/sales"
+
+    def test_table_link(self):
+        out = _coerce_explore_url(
+            URL.from_(f"{_HOST}/explore/data/main/sales/orders"),
+        )
+        assert out.scheme == Scheme.DATABRICKS_TABLE.value
+        assert out.path == "/main/sales/orders"
+
+    def test_volume_link(self):
+        out = _coerce_explore_url(
+            URL.from_(f"{_HOST}/explore/data/volumes/main/sales/raw"),
+        )
+        assert out.scheme == Scheme.DATABRICKS_VOLUME.value
+        assert out.path == "/main/sales/raw"
+
+    def test_volume_link_with_volume_path_param(self):
+        # The selected file lives in ``?volumePath=/Volumes/...`` (URL-
+        # encoded in the wild) and wins over the bare volume coordinates.
+        out = _coerce_explore_url(
+            URL.from_(
+                f"{_HOST}/explore/data/volumes/main/sales/raw"
+                "?volumePath=/Volumes/main/sales/raw/dir/file.parquet"
+            ),
+        )
+        assert out.scheme == Scheme.DATABRICKS_VOLUME.value
+        assert out.path == "/main/sales/raw/dir/file.parquet"
+
+    def test_non_explore_url_passes_through(self):
+        assert _coerce_explore_url(URL.from_("dbfs+volume:///main/sales")) is None
+        assert _coerce_explore_url(URL.from_("https://example.com/x")) is None
+
+    def test_string_coercion_routes_through(self):
+        # ``_coerce_to_url_str`` (the shared string normalizer) recognizes
+        # the link too, so every string-input constructor benefits. Both
+        # spellings parse to the same hostless volume URL.
+        coerced = _coerce_to_url_str(
+            f"{_HOST}/explore/data/volumes/main/sales/raw",
+        )
+        assert URL.from_(coerced) == URL.from_("dbfs+volume:///main/sales/raw")
+
+
+class TestBuildFromExploreUrl:
+    """End-to-end: each Explorer link builds the right concrete handle."""
+
+    def test_volume_path_from_explore_url_with_file(self, volumes_service):
+        url = (
+            f"{_HOST}/explore/data/volumes/main/sales/raw"
+            "?volumePath=/Volumes/main/sales/raw/dir/file.parquet"
+        )
+        vp = VolumePath(url, service=volumes_service)
+        assert isinstance(vp, VolumePath)
+        assert vp.full_path() == "/Volumes/main/sales/raw/dir/file.parquet"
+
+    def test_volume_from_explore_url(self, volumes_service):
+        url = f"{_HOST}/explore/data/volumes/main/sales/raw"
+        vol = DatabricksPath.from_(url, service=volumes_service)
+        assert isinstance(vol, Volume)
+        assert (vol.catalog_name, vol.schema_name, vol.volume_name) == (
+            "main", "sales", "raw",
+        )
+
+    def test_catalog_and_schema_from_explore_url(
+        self, catalogs_service, schemas_service,
+    ):
+        cat = DatabricksPath.from_(
+            f"{_HOST}/explore/data/main", service=catalogs_service,
+        )
+        assert isinstance(cat, UCCatalog) and cat.catalog_name == "main"
+        sch = DatabricksPath.from_(
+            f"{_HOST}/explore/data/main/sales", service=schemas_service,
+        )
+        assert isinstance(sch, UCSchema)
+        assert (sch.catalog_name, sch.schema_name) == ("main", "sales")
+
+    def test_explore_url_and_posix_collapse_to_same_singleton(
+        self, volumes_service,
+    ):
+        # The two spellings of one file address the same VolumePath — the
+        # explore link drops its host so the canonical URL key matches.
+        a = VolumePath(
+            "/Volumes/main/sales/raw/dir/file.parquet", service=volumes_service,
+        )
+        b = VolumePath(
+            f"{_HOST}/explore/data/volumes/main/sales/raw"
+            "?volumePath=/Volumes/main/sales/raw/dir/file.parquet",
+            service=volumes_service,
+        )
+        assert a is b
+
+    def test_volume_path_explore_url_round_trips(self, volumes_service):
+        # A VolumePath's own ``explore_url`` rebuilds the same path.
+        vp = VolumePath(
+            "/Volumes/main/sales/raw/dir/file.parquet", service=volumes_service,
+        )
+        rebuilt = VolumePath(vp.explore_url.to_string(), service=volumes_service)
+        assert rebuilt == vp
+        assert rebuilt.full_path() == vp.full_path()
+
+    def test_from_url_classmethod_accepts_explore_link(self, volumes_service):
+        vp = DatabricksPath.from_url(
+            f"{_HOST}/explore/data/volumes/main/sales/raw"
+            "?volumePath=/Volumes/main/sales/raw/f.parquet",
+            service=volumes_service,
+        )
+        assert isinstance(vp, VolumePath)
+        assert vp.full_path() == "/Volumes/main/sales/raw/f.parquet"

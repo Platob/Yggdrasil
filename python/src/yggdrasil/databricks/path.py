@@ -120,16 +120,86 @@ def _parse_posix(value: str) -> Tuple[str, str]:
 
 
 def _coerce_to_url_str(value: Any) -> Any:
-    """Convert a recognized POSIX Databricks path string into a URL.
+    """Convert a recognized Databricks address string into a URL string.
+
+    Handles two human-facing forms:
+
+    - POSIX namespaces — ``/Volumes/...`` / ``/Workspace/...`` /
+      ``/dbfs/...`` → the canonical ``dbfs+<surface>://`` form.
+    - Catalog Explorer deep-links — the ``https://<host>/explore/data/...``
+      URLs a user copies out of the workspace UI (see
+      :func:`_coerce_explore_url`).
 
     Pass-through for anything that doesn't match — :class:`Holder`
     handles the rest of the coercion (URL parsing, holder type
     dispatch).
     """
-    if isinstance(value, str) and _looks_like_posix(value):
+    if not isinstance(value, str):
+        return value
+    if _looks_like_posix(value):
         scheme, path = _parse_posix(value)
         return f"{scheme}://{path}"
+    # ``explore/data`` substring gate keeps the hot path (plain
+    # ``/Volumes/...`` / ``dbfs+...://`` strings) off the URL parser.
+    if "explore/data" in value:
+        try:
+            coerced = _coerce_explore_url(URL.from_(value))
+        except Exception:
+            return value
+        if coerced is not None:
+            return coerced.to_string()
     return value
+
+
+def _coerce_explore_url(u: "URL") -> "Optional[URL]":
+    """Rewrite a Catalog Explorer deep-link into the canonical
+    ``dbfs+<surface>://`` form; return ``None`` for non-explore URLs.
+
+    The workspace UI addresses Unity Catalog assets as
+    ``https://<host>/explore/data/<cat>[/<sch>[/<tbl>]]`` and volumes as
+    ``https://<host>/explore/data/volumes/<cat>/<sch>/<vol>`` — with the
+    deep file path, when a file is selected, carried in a
+    ``?volumePath=/Volumes/...`` query param. These are exactly the URLs
+    a user copies from the browser, so recognizing them lets a
+    :class:`VolumePath` (or any catalog / schema / volume / table
+    handle) be built straight from a Catalog Explorer link.
+
+    The originating ``host`` is intentionally dropped — like the POSIX
+    ``/Volumes/...`` coercion, the canonical form carries no host and
+    the workspace is fixed by the bound service / client. Keeping it
+    would split the singleton (and break ``==``) against the same path
+    spelled the ``/Volumes/...`` way.
+    """
+    path = (u.path or "").strip("/")
+    if path != "explore/data" and not path.startswith("explore/data/"):
+        return None
+    segs = [s for s in path[len("explore/data"):].strip("/").split("/") if s]
+
+    if segs and segs[0].lower() == "volumes":
+        # ``volumePath`` carries the full ``/Volumes/cat/sch/vol/<sub>``
+        # selection — prefer it so a file deep-link round-trips to the
+        # exact VolumePath, falling back to the bare volume coordinates.
+        deep = u.query_dict.get("volumePath")
+        if deep and _looks_like_posix(deep[0]):
+            scheme, sub = _parse_posix(deep[0])
+            return URL(scheme=scheme, path=sub)
+        coords = segs[1:]  # cat / sch / vol
+        return URL(
+            scheme=Scheme.DATABRICKS_VOLUME.value,
+            path="/" + "/".join(coords) if coords else "/",
+        )
+
+    # Table family: ``/explore/data/<cat>[/<sch>[/<tbl>]]`` — depth picks
+    # the surface (catalog / schema / table).
+    n = len(segs)
+    if n == 0:
+        return None
+    scheme = (
+        Scheme.DATABRICKS_CATALOG.value if n == 1
+        else Scheme.DATABRICKS_SCHEMA.value if n == 2
+        else Scheme.DATABRICKS_TABLE.value
+    )
+    return URL(scheme=scheme, path="/" + "/".join(segs))
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +355,13 @@ def _resolve_databricks_subclass(
     if candidate is None:
         return DBFSPath, None
 
+    # A ``URL``-typed Catalog Explorer link (string forms are already
+    # rewritten by :func:`_coerce_to_url_str` above) becomes its
+    # canonical ``dbfs+<surface>://`` shape before scheme dispatch.
+    explore = _coerce_explore_url(candidate)
+    if explore is not None:
+        candidate = explore
+
     candidate = _strip_dbfs_family_prefix(candidate)
     scheme = (candidate.scheme or "").lower()
 
@@ -407,6 +484,12 @@ class DatabricksPath(RemotePath, DatabricksResource):
                 # through to ``id``-based hashing by returning a unique
                 # sentinel.
                 return (cls, object())
+        # Fold a Catalog Explorer link onto the same canonical URL its
+        # ``/Volumes/...`` form keys under, so both spellings intern to
+        # one singleton (string data was already coerced above).
+        explore = _coerce_explore_url(url)
+        if explore is not None:
+            url = explore
         # ``URL`` is hashable (``hash(self.to_string())``) and compares
         # field-by-field — it works as a dict key directly. Drop the
         # ``str(url)`` round trip that the hot parent-walk loop was
@@ -576,6 +659,12 @@ class DatabricksPath(RemotePath, DatabricksResource):
                 data = None
             if url is not None:
                 url = URL.from_(url)
+                # Rewrite a ``URL``-typed Catalog Explorer link into its
+                # canonical ``dbfs+<surface>://`` shape (string forms came
+                # through ``_coerce_to_url_str`` already).
+                explore = _coerce_explore_url(url)
+                if explore is not None:
+                    url = explore
                 url = _strip_dbfs_family_prefix(url)
                 target_scheme = self.scheme
                 if target_scheme is not None:
@@ -631,8 +720,15 @@ class DatabricksPath(RemotePath, DatabricksResource):
 
         Concrete subclasses (DBFSPath / VolumePath / WorkspacePath)
         bypass the dispatcher and forward straight to ``cls(url=url)``.
+        Catalog Explorer deep-links (``https://<host>/explore/data/...``,
+        including a volume's ``?volumePath=`` file selection) are
+        recognized too, so a :class:`VolumePath` can be built straight
+        from a URL copied out of the workspace UI.
         """
         u = URL.from_(url)
+        explore = _coerce_explore_url(u)
+        if explore is not None:
+            u = explore
         if cls is not DatabricksPath:
             return cls(url=u, **kwargs)
 
