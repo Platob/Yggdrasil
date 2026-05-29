@@ -56,6 +56,7 @@ class _Store:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
         self.bytes_served = 0
+        self.calls = 0
 
 
 def _make_handler(store: _Store):
@@ -70,6 +71,7 @@ def _make_handler(store: _Store):
             return urlsplit(self.path).path[len("/api/2.0/fs/files"):]
 
         def do_PUT(self):  # noqa: N802
+            store.calls += 1
             n = int(self.headers.get("Content-Length", "0"))
             store.files[self._key()] = self.rfile.read(n) if n else b""
             self.send_response(204)
@@ -77,6 +79,7 @@ def _make_handler(store: _Store):
             self.end_headers()
 
         def do_HEAD(self):  # noqa: N802
+            store.calls += 1
             blob = store.files.get(self._key())
             if blob is None:
                 self.send_response(404)
@@ -87,6 +90,7 @@ def _make_handler(store: _Store):
             self.end_headers()
 
         def do_GET(self):  # noqa: N802
+            store.calls += 1
             blob = store.files.get(self._key())
             if blob is None:
                 self.send_response(404)
@@ -155,15 +159,22 @@ def _sdk_files(host: str):
 # ---------------------------------------------------------------------------
 
 
-def _best(fn, repeat: int, store: _Store) -> tuple[float, int]:
-    times, served = [], 0
+def _best(fn, repeat: int, store: _Store):
+    import tracemalloc
+
+    times, served, calls, peak = [], 0, 0, 0
     for _ in range(repeat):
         store.bytes_served = 0
+        store.calls = 0
+        tracemalloc.start()
         t0 = time.perf_counter()
         fn()
         times.append(time.perf_counter() - t0)
+        peak = max(peak, tracemalloc.get_traced_memory()[1])
+        tracemalloc.stop()
         served = store.bytes_served
-    return min(times), served
+        calls = store.calls
+    return min(times), served, calls, peak
 
 
 def main() -> None:
@@ -275,21 +286,30 @@ def main() -> None:
             f"\nSDK FilesAPI vs yggdrasil VolumePath — payload={args.size_mib} MiB, "
             f"parquet={len(parquet_bytes) // 1024} KiB ({ncols} cols), repeat={args.repeat}\n"
         )
+        # Lead with the network-relevant axes: bytes on the wire, calls
+        # (round-trips, each a latency hit), and peak resident memory.
+        # ``sdk``/``ygg`` columns are paired so the ratio is read at a glance.
         hdr = (
-            f"{'scenario':<24} {'sdk (s)':>9} {'ygg (s)':>9} {'speedup':>8} "
-            f"{'sdk MiB':>9} {'ygg MiB':>9} {'bytes x':>8}"
+            f"{'scenario':<24} {'MiB sdk':>8} {'MiB ygg':>8} "
+            f"{'calls s':>7} {'calls y':>7} {'memMiB s':>9} {'memMiB y':>9}"
         )
         print(hdr)
         print("-" * len(hdr))
         for name, sdk_fn, ygg_fn in scenarios:
-            st, sb = _best(sdk_fn, args.repeat, store)
-            yt, yb = _best(ygg_fn, args.repeat, store)
-            speed = st / yt if yt else float("inf")
-            byte_x = sb / yb if yb else float("inf")
+            _st, sb, sc, sm = _best(sdk_fn, args.repeat, store)
+            _yt, yb, yc, ym = _best(ygg_fn, args.repeat, store)
             print(
-                f"{name:<24} {st:>9.4f} {yt:>9.4f} {speed:>7.1f}x "
-                f"{sb / 1048576:>9.2f} {yb / 1048576:>9.2f} {byte_x:>7.0f}x"
+                f"{name:<24} {sb / 1048576:>8.2f} {yb / 1048576:>8.2f} "
+                f"{sc:>7} {yc:>7} {sm / 1048576:>9.2f} {ym / 1048576:>9.2f}"
             )
+        print(
+            "\nbytes/calls/memory are what cost on a real network. "
+            "Random + projection: VolumePath ranges only what's needed "
+            "(far fewer bytes/memory) at one call per read; the SDK pulls "
+            "the whole object each time. Whole-file reads match. "
+            "(tracemalloc peak is Python-side; the SDK's requests/urllib3 "
+            "C buffers are under-counted, so its real memory is higher.)"
+        )
     finally:
         server.shutdown()
         server.server_close()
