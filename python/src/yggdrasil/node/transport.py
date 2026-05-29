@@ -6,9 +6,13 @@ from typing import Any, Iterator
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
+from yggdrasil.enums import MimeTypes
+
 LOGGER = logging.getLogger(__name__)
 
-CONTENT_TYPE_ARROW_STREAM = "application/vnd.apache.arrow.stream"
+# Canonical content types come from the project's MimeType registry so
+# the wire labels stay in one place (Arrow stream framing, Parquet).
+CONTENT_TYPE_ARROW_STREAM = MimeTypes.ARROW_STREAM.value
 CONTENT_TYPE_PICKLE = "application/x-yggdrasil-pickle"
 
 _ARROW_TABULAR_TYPES = (pa.Table, pa.RecordBatch)
@@ -98,6 +102,31 @@ def write_arrow_stream_bytes(table: pa.Table) -> bytes:
 def read_arrow_stream(data: bytes) -> pa.Table:
     reader = ipc.open_stream(data)
     return reader.read_all()
+
+
+# -- Parquet transport (Power Query reads this natively) -------------------
+
+CONTENT_TYPE_PARQUET = MimeTypes.PARQUET.value
+
+
+def write_parquet_bytes(table: pa.Table, *, compression: str = "snappy") -> bytes:
+    """Serialize a table to a Parquet file in memory.
+
+    Parquet is the lingua franca for Excel / Power BI: M reads it
+    natively via ``Parquet.Document`` with full type fidelity, so the
+    Excel-facing endpoints hand back Parquet by default.
+    """
+    import pyarrow.parquet as pq
+
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink, compression=compression)
+    return sink.getvalue().to_pybytes()
+
+
+def read_parquet_bytes(data: bytes) -> pa.Table:
+    import pyarrow.parquet as pq
+
+    return pq.read_table(pa.BufferReader(data))
 
 
 # -- Pickle transport (compressed) -----------------------------------------

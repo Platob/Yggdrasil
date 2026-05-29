@@ -47,7 +47,13 @@ from yggdrasil.url import URL
 from .resource import DatabricksResource
 from .service import DatabricksService
 
-__all__ = ["DatabricksPath"]
+__all__ = [
+    "DatabricksPath",
+    "VOLUME_PATH_PREFIX",
+    "TABLE_PATH_PREFIX",
+    "DEFAULT_PATH_PREFIX",
+    "resolve_path_prefix",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -114,16 +120,158 @@ def _parse_posix(value: str) -> Tuple[str, str]:
 
 
 def _coerce_to_url_str(value: Any) -> Any:
-    """Convert a recognized POSIX Databricks path string into a URL.
+    """Convert a recognized Databricks address string into a URL string.
+
+    Handles two human-facing forms:
+
+    - POSIX namespaces — ``/Volumes/...`` / ``/Workspace/...`` /
+      ``/dbfs/...`` → the canonical ``dbfs+<surface>://`` form.
+    - Catalog Explorer deep-links — the ``https://<host>/explore/data/...``
+      URLs a user copies out of the workspace UI (see
+      :func:`_coerce_explore_url`).
 
     Pass-through for anything that doesn't match — :class:`Holder`
     handles the rest of the coercion (URL parsing, holder type
     dispatch).
     """
-    if isinstance(value, str) and _looks_like_posix(value):
+    if not isinstance(value, str):
+        return value
+    if _looks_like_posix(value):
         scheme, path = _parse_posix(value)
         return f"{scheme}://{path}"
+    # ``explore/data`` substring gate keeps the hot path (plain
+    # ``/Volumes/...`` / ``dbfs+...://`` strings) off the URL parser.
+    if "explore/data" in value:
+        try:
+            coerced = _coerce_explore_url(URL.from_(value))
+        except Exception:
+            return value
+        if coerced is not None:
+            return coerced.to_string()
     return value
+
+
+def _coerce_explore_url(u: "URL") -> "Optional[URL]":
+    """Rewrite a Catalog Explorer deep-link into the canonical
+    ``dbfs+<surface>://`` form; return ``None`` for non-explore URLs.
+
+    The workspace UI addresses Unity Catalog assets as
+    ``https://<host>/explore/data/<cat>[/<sch>[/<tbl>]]`` and volumes as
+    ``https://<host>/explore/data/volumes/<cat>/<sch>/<vol>`` — with the
+    deep file path, when a file is selected, carried in a
+    ``?volumePath=/Volumes/...`` query param. These are exactly the URLs
+    a user copies from the browser, so recognizing them lets a
+    :class:`VolumePath` (or any catalog / schema / volume / table
+    handle) be built straight from a Catalog Explorer link.
+
+    The originating ``host`` is intentionally dropped — like the POSIX
+    ``/Volumes/...`` coercion, the canonical form carries no host and
+    the workspace is fixed by the bound service / client. Keeping it
+    would split the singleton (and break ``==``) against the same path
+    spelled the ``/Volumes/...`` way.
+    """
+    path = (u.path or "").strip("/")
+    if path != "explore/data" and not path.startswith("explore/data/"):
+        return None
+    segs = [s for s in path[len("explore/data"):].strip("/").split("/") if s]
+
+    if segs and segs[0].lower() == "volumes":
+        # ``volumePath`` carries the full ``/Volumes/cat/sch/vol/<sub>``
+        # selection — prefer it so a file deep-link round-trips to the
+        # exact VolumePath, falling back to the bare volume coordinates.
+        deep = u.query_dict.get("volumePath")
+        if deep and _looks_like_posix(deep[0]):
+            scheme, sub = _parse_posix(deep[0])
+            return URL(scheme=scheme, path=sub)
+        coords = segs[1:]  # cat / sch / vol
+        return URL(
+            scheme=Scheme.DATABRICKS_VOLUME.value,
+            path="/" + "/".join(coords) if coords else "/",
+        )
+
+    # Table family: ``/explore/data/<cat>[/<sch>[/<tbl>]]`` — depth picks
+    # the surface (catalog / schema / table).
+    n = len(segs)
+    if n == 0:
+        return None
+    scheme = (
+        Scheme.DATABRICKS_CATALOG.value if n == 1
+        else Scheme.DATABRICKS_SCHEMA.value if n == 2
+        else Scheme.DATABRICKS_TABLE.value
+    )
+    return URL(scheme=scheme, path="/" + "/".join(segs))
+
+
+# ---------------------------------------------------------------------------
+# Catalog / schema child-navigation surface ("path prefix")
+# ---------------------------------------------------------------------------
+
+# A :class:`UCCatalog` / :class:`UCSchema` can stand for more than one
+# navigation surface: the same ``main.sales`` schema is reached both as
+# a *volume* container (``/Volumes/main/sales/<vol>``) and a *table*
+# container (``main.sales.<tbl>``). ``path_prefix`` records which one a
+# given handle represents so a ``/`` path-join descends into the right
+# child type instead of guessing — ``/Volumes/`` → :class:`Volume` (then
+# :class:`VolumePath`), ``/Tables/`` → :class:`Table`.
+VOLUME_PATH_PREFIX = "/Volumes/"
+TABLE_PATH_PREFIX = "/Tables/"
+
+#: Default surface when none is supplied or derivable — the volume
+#: filesystem, the dominant ``/`` target.
+DEFAULT_PATH_PREFIX = VOLUME_PATH_PREFIX
+
+#: Canonical ``dbfs+<surface>`` scheme a handle was addressed under →
+#: the child-navigation prefix it implies. Schemes not listed fall back
+#: to :data:`DEFAULT_PATH_PREFIX`.
+_SCHEME_PATH_PREFIX: dict[str, str] = {
+    Scheme.DATABRICKS_VOLUME.value: VOLUME_PATH_PREFIX,
+    Scheme.DATABRICKS_TABLE.value: TABLE_PATH_PREFIX,
+}
+
+
+def resolve_path_prefix(
+    path_prefix: "str | None" = None,
+    url: "URL | None" = None,
+) -> str:
+    """Resolve the child-navigation prefix a catalog / schema carries.
+
+    Explicit *path_prefix* wins. Otherwise derive it from the scheme of
+    *url* (``dbfs+volume`` → ``/Volumes/``, ``dbfs+table`` → ``/Tables/``),
+    falling back to :data:`DEFAULT_PATH_PREFIX`. Both the singleton key
+    and ``__init__`` route through this one resolver so they can never
+    disagree on identity.
+    """
+    if path_prefix:
+        return path_prefix
+    if url is not None:
+        scheme = (getattr(url, "scheme", "") or "").lower()
+        prefix = _SCHEME_PATH_PREFIX.get(scheme)
+        if prefix:
+            return prefix
+    return DEFAULT_PATH_PREFIX
+
+
+def _relative_join_parts(segments: "tuple[Any, ...]") -> list[str]:
+    """Flatten join *segments* into clean, relative path components.
+
+    Splits every segment on ``/`` (so a single multi-part string like
+    ``"a/b/c"`` expands to three components), drops empty pieces
+    (trailing / duplicate slashes) and ``.`` self-references, and — by
+    treating every piece as relative — strips the leading-slash
+    "absolute reset" that :class:`pathlib`/:class:`URL` joins honour. A
+    Databricks path is anchored in a namespace it must not escape, so a
+    join always *extends* it. ``..`` is left as a literal component —
+    like :meth:`URL.joinpath`, the join stays syntactic and does not
+    resolve parent references.
+    """
+    parts: list[str] = []
+    for seg in segments:
+        if seg is None:
+            continue
+        for piece in str(seg).split("/"):
+            if piece and piece != ".":
+                parts.append(piece)
+    return parts
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +354,13 @@ def _resolve_databricks_subclass(
 
     if candidate is None:
         return DBFSPath, None
+
+    # A ``URL``-typed Catalog Explorer link (string forms are already
+    # rewritten by :func:`_coerce_to_url_str` above) becomes its
+    # canonical ``dbfs+<surface>://`` shape before scheme dispatch.
+    explore = _coerce_explore_url(candidate)
+    if explore is not None:
+        candidate = explore
 
     candidate = _strip_dbfs_family_prefix(candidate)
     scheme = (candidate.scheme or "").lower()
@@ -329,6 +484,12 @@ class DatabricksPath(RemotePath, DatabricksResource):
                 # through to ``id``-based hashing by returning a unique
                 # sentinel.
                 return (cls, object())
+        # Fold a Catalog Explorer link onto the same canonical URL its
+        # ``/Volumes/...`` form keys under, so both spellings intern to
+        # one singleton (string data was already coerced above).
+        explore = _coerce_explore_url(url)
+        if explore is not None:
+            url = explore
         # ``URL`` is hashable (``hash(self.to_string())``) and compares
         # field-by-field — it works as a dict key directly. Drop the
         # ``str(url)`` round trip that the hot parent-walk loop was
@@ -498,6 +659,12 @@ class DatabricksPath(RemotePath, DatabricksResource):
                 data = None
             if url is not None:
                 url = URL.from_(url)
+                # Rewrite a ``URL``-typed Catalog Explorer link into its
+                # canonical ``dbfs+<surface>://`` shape (string forms came
+                # through ``_coerce_to_url_str`` already).
+                explore = _coerce_explore_url(url)
+                if explore is not None:
+                    url = explore
                 url = _strip_dbfs_family_prefix(url)
                 target_scheme = self.scheme
                 if target_scheme is not None:
@@ -553,8 +720,15 @@ class DatabricksPath(RemotePath, DatabricksResource):
 
         Concrete subclasses (DBFSPath / VolumePath / WorkspacePath)
         bypass the dispatcher and forward straight to ``cls(url=url)``.
+        Catalog Explorer deep-links (``https://<host>/explore/data/...``,
+        including a volume's ``?volumePath=`` file selection) are
+        recognized too, so a :class:`VolumePath` can be built straight
+        from a URL copied out of the workspace UI.
         """
         u = URL.from_(url)
+        explore = _coerce_explore_url(u)
+        if explore is not None:
+            u = explore
         if cls is not DatabricksPath:
             return cls(url=u, **kwargs)
 
@@ -674,6 +848,32 @@ class DatabricksPath(RemotePath, DatabricksResource):
             service=self.service,
             retry_sleep=self._retry_sleep,
         )
+
+    def joinpath(self, *segments: Any) -> "DatabricksPath":
+        """Join *segments* onto this path, always *extending* it.
+
+        The bare :class:`Holder` join follows pathlib semantics, where a
+        segment with a leading ``/`` resets to an absolute path and a
+        trailing / duplicate slash leaves an empty component. A
+        Databricks path is anchored in a namespace it must not escape,
+        and the logical handles (:class:`UCCatalog` / :class:`UCSchema`
+        / :class:`Volume`) pick the child type from the path's segment
+        *count* — so every join goes through
+        :func:`_relative_join_parts` first. A single multi-part string
+        (``"a/b/c"``), several segments, embedded / trailing / duplicate
+        slashes, and ``.`` components all flatten into clean relative
+        components, so ``cat / "sales/raw"`` reliably reaches the volume
+        and ``cat / "sales/raw/"`` doesn't over-count into a VolumePath.
+        """
+        if self._url is None:
+            raise ValueError(
+                f"{type(self).__name__} has no URL — joinpath is only "
+                "defined for URL-shaped paths."
+            )
+        parts = _relative_join_parts(segments)
+        if not parts:
+            return self._from_url(self._url)
+        return self._from_url(self._url.joinpath(*parts))
 
     # ==================================================================
     # Pickling — Singleton-style, filtering transient stat-cache slots

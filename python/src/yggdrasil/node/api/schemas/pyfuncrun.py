@@ -14,6 +14,9 @@ class PyFuncRunCreate(StrictModel):
     kwargs: dict[str, Any] = Field(default_factory=dict)
     timeout: float | None = None
     max_memory_mb: int | None = None
+    # Extra environment variables for this run, layered over the node
+    # environment and the env's own stored vars (these win).
+    env_vars: dict[str, str] = Field(default_factory=dict)
 
 
 class PyFuncRunEntry(StrictModel):

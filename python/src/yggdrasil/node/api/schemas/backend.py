@@ -14,6 +14,8 @@ class GpuInfo(StrictModel):
     memory_total_mb: float = 0.0
     utilization_percent: float = 0.0
     temperature_c: float = 0.0
+    power_draw_w: float = 0.0
+    power_limit_w: float = 0.0
 
 
 class NetworkIO(StrictModel):

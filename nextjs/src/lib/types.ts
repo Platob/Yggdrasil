@@ -43,6 +43,8 @@ export interface GpuInfo {
   memory_total_mb: number;
   utilization_percent: number;
   temperature_c: number;
+  power_draw_w: number;
+  power_limit_w: number;
 }
 
 export interface NetworkIO {
@@ -213,6 +215,38 @@ export interface PyEnvEntry {
   content_hash: string;
   replicated_at: string | null;
   replicated_from: string | null;
+  env_vars: Record<string, string>;
+}
+
+export interface PyEnvEnvVars {
+  env_id: number;
+  name: string;
+  env_vars: Record<string, string>;
+}
+
+export interface PyEnvPackage {
+  name: string;
+  version: string;
+}
+
+export interface PyEnvPackages {
+  env_id: number;
+  name: string;
+  python_version: string;
+  package_count: number;
+  packages: PyEnvPackage[];
+  cached_at: string;
+  error: string | null;
+}
+
+// ── Excel service ────────────────────────────────────────────────────────
+
+export interface ExcelInfo {
+  node_id: string;
+  node_name: string;
+  version: string;
+  table_formats: string[];
+  capabilities: string[];
 }
 
 // ── PyFunc ─────────────────────────────────────────────────────────────────

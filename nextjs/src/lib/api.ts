@@ -12,11 +12,14 @@ import type {
   FsEntry,
   HealthResponse,
   Message,
+  ExcelInfo,
   MetricsResponse,
   NodeBackend,
   NodeCard,
   NodeMeta,
   PyEnvEntry,
+  PyEnvEnvVars,
+  PyEnvPackages,
   PyFuncEntry,
   PyFuncRunEntry,
   TopologyResponse,
@@ -98,6 +101,34 @@ export function getPeers(): Promise<{ node_id: string; peers: NodeMeta[] }> {
 
 export function getEnvs(): Promise<{ node_id: string; envs: PyEnvEntry[] }> {
   return jsonFetch<{ node_id: string; envs: PyEnvEntry[] }>("/api/v2/pyenv");
+}
+
+export function getExcelInfo(): Promise<ExcelInfo> {
+  return jsonFetch<ExcelInfo>("/api/v2/excel/info");
+}
+
+export function setEnvVars(
+  envName: string,
+  env_vars: Record<string, string>,
+  replace = false,
+): Promise<PyEnvEnvVars> {
+  return jsonFetch<PyEnvEnvVars>(`/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/env`, {
+    method: "PUT",
+    body: JSON.stringify({ env_vars, replace }),
+  });
+}
+
+export function deleteEnvVar(envName: string, key: string): Promise<PyEnvEnvVars> {
+  return jsonFetch<PyEnvEnvVars>(
+    `/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/env/${encodeURIComponent(key)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function getEnvPackages(envName: string): Promise<PyEnvPackages> {
+  // Keyed by name (not the int64 id, which JSON.parse can't round-trip
+  // losslessly in JS). Server-side TTL-cached, so polling is cheap.
+  return jsonFetch<PyEnvPackages>(`/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/packages`);
 }
 
 // ── PyFunc ─────────────────────────────────────────────────────────────────

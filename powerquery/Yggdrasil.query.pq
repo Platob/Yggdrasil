@@ -1,76 +1,50 @@
 /**
- * Yggdrasil.query.pq - Test queries
+ * Yggdrasil.query.pq - Test queries for the .mez connector
  *
- * For Power BI (with .mez installed):
- *   Uncomment any Test block below.
+ * For Power BI (with .mez installed): uncomment any Test block below.
+ * For Excel (no .mez): paste YggdrasilExcel.pq into the Advanced Editor.
  *
- * For Excel (no .mez):
- *   Use YggdrasilExcel.pq instead - paste it into the Advanced Editor.
- *
- * The Yggdrasil FastAPI service must be running on localhost:8000.
+ * A Yggdrasil node must be running (default http://127.0.0.1:8100).
  */
 
-// ---- Test 1: Health check ----
+// ---- Test 1: Node info ----
 let
-    Health = Yggdrasil.Health()
+    Info = Yggdrasil.Info()
 in
-    Health;
+    Info;
 
-// ---- Test 2: Execute Python code ----
+// ---- Test 2: Run Python -> table ----
 // let
 //     Result = Yggdrasil.Execute(
-//         "import pyarrow as pa#(lf)df = pa.table({'id': [1,2,3], 'value': [10.5, 20.3, 30.1]})",
-//         [Packages = {"pyarrow"}, DfName = "df"]
+//         "import pandas as pd#(lf)df = pd.DataFrame({'id':[1,2,3], 'value':[10.5,20.3,30.1]})",
+//         [Packages = {"pandas"}, DfName = "df"]
 //     )
 // in
 //     Result;
 
-// ---- Test 3: Execute with max rows ----
+// ---- Test 3: Run Python with row cap, in a named PyEnv ----
 // let
 //     Result = Yggdrasil.Execute(
 //         "import pyarrow as pa#(lf)df = pa.table({'x': list(range(1000))})",
-//         [Packages = {"pyarrow"}, MaxRows = 10]
+//         [Env = "ml-env", MaxRows = 10]
 //     )
 // in
 //     Result;
 
-// ---- Test 4: Prepare (cached) ----
+// ---- Test 4: Read a remote file as a typed table ----
 // let
-//     Result = Yggdrasil.Prepare(
-//         "import pyarrow as pa#(lf)df = pa.table({'a': [1,2,3], 'b': ['x','y','z']})",
-//         [Packages = {"pyarrow"}, ForceRefresh = false]
-//     )
+//     Result = Yggdrasil.ReadFile("data/sales.parquet")
 // in
 //     Result;
 
-// ---- Test 5: Databricks SQL ----
+// ---- Test 5: Walk the remote filesystem (drill-down) ----
 // let
-//     Result = Yggdrasil.DatabricksSQL(
-//         "SELECT * FROM main.default.my_table LIMIT 100",
-//         [CacheTtl = 300, ForceRefresh = false]
-//     )
+//     Nav = Yggdrasil.Files()
 // in
-//     Result;
+//     Nav;
 
-// ---- Test 6: Databricks SQL with connection options ----
-// let
-//     Result = Yggdrasil.DatabricksSQL(
-//         "SELECT id, name, amount FROM main.analytics.transactions LIMIT 50",
-//         [
-//             CatalogName   = "main",
-//             SchemaName    = "analytics",
-//             WarehouseName = "Starter Warehouse",
-//             MaxRows       = 50,
-//             CacheTtl      = 600,
-//             ForceRefresh  = false
-//         ]
-//     )
-// in
-//     Result;
-
-// ---- Test 7: Navigation table ----
+// ---- Test 6: Full navigation entry point ----
 // let
 //     Nav = Yggdrasil.Contents()
 // in
 //     Nav;
-

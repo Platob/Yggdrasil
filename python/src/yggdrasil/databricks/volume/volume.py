@@ -207,21 +207,27 @@ class Volume(DatabricksPath):
         return self.volume_name
 
     def _from_url(self, url: URL) -> "DatabricksPath":
-        parts = url.parts
+        # ``url.parts`` is 0-indexed (leading ``/`` stripped), so this
+        # volume's own URL (``/<cat>/<sch>/<vol>``) is three parts.
+        # Path-join navigation follows the volume-family depth model —
+        # catalog (1) → schema (2) → volume (3) → :class:`VolumePath`
+        # (4+).
+        # Drop empty components (trailing / duplicate slashes) so the
+        # depth count reflects real segments however the URL was built.
+        parts = [p for p in url.parts if p]
         n = len(parts)
 
         if n <= 1:
-            return self
-        elif n == 2:
+            # ``/<catalog>`` — up to the parent catalog.
             return self.catalog
-        elif n == 3:
-            c, s = parts[1:3]
-            return self.service.schemas.schema(catalog_name=c, schema_name=s)
-        elif n == 4:
-            c, s, v = parts[1:4]
-            return self.service.volume(catalog_name=c, schema_name=s, volume_name=v)
-        else:
-            raise ValueError(f"URL {url} has too many parts to resolve against a Volume (got {n}, expected 1-4).")
+        if n == 2:
+            # ``/<catalog>/<schema>`` — up to the parent schema.
+            return self.schema
+        if n == 3:
+            # ``/<catalog>/<schema>/<volume>`` — this volume itself.
+            return self
+        # Depth ≥ 4 — a file or directory under this volume.
+        return self.path("/".join(parts[3:]))
 
     def __str__(self) -> str:
         return self.full_name()

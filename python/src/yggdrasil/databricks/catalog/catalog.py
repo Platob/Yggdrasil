@@ -36,7 +36,7 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.databricks.path import DatabricksPath
+from yggdrasil.databricks.path import DatabricksPath, resolve_path_prefix
 from yggdrasil.url import URL
 from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
@@ -59,10 +59,16 @@ logger = logging.getLogger(__name__)
 class UCCatalog(DatabricksPath, Singleton):
     """A single Unity Catalog catalog — lifecycle, schema navigation, tags.
 
-    Identity is ``(client, catalog_name)``: two callers asking for
-    the same catalog under the same client collapse onto one
-    instance via the :class:`Singleton` cache, so the cached
-    :class:`CatalogInfo` and tag state are shared.
+    Identity is ``(client, catalog_name, path_prefix)``: two callers
+    asking for the same catalog *on the same navigation surface* under
+    the same client collapse onto one instance via the
+    :class:`Singleton` cache, so the cached :class:`CatalogInfo` and
+    tag state are shared. :attr:`path_prefix` records that surface —
+    ``/Volumes/`` for a volume catalog (schemas descend into
+    :class:`Volume` / :class:`VolumePath`) or ``/Tables/`` for a table
+    catalog (schemas descend into :class:`Table`) — so a ``/``
+    path-join mints the right child type instead of guessing. It is
+    inherited by every schema this catalog mints.
 
     URL-addressable through :class:`DatabricksPath` under
     :attr:`Scheme.DATABRICKS_CATALOG` (``dbfs+catalog://``); the
@@ -91,6 +97,8 @@ class UCCatalog(DatabricksPath, Singleton):
         service: "Catalogs | None" = None,
         *,
         catalog_name: str | None = None,
+        path_prefix: str | None = None,
+        url: URL | None = None,
         **_kwargs: Any,
     ) -> Any:
         # Key on the bound :class:`DatabricksClient` *instance*, not on
@@ -100,12 +108,18 @@ class UCCatalog(DatabricksPath, Singleton):
         # ``Catalog`` instances. ``DatabricksClient`` is itself a
         # :class:`Singleton`, so reusing the same client gives a
         # stable, hashable identity.
+        #
+        # ``path_prefix`` joins the key so a *volume* view and a *table*
+        # view of the same ``main`` catalog stay distinct handles — each
+        # descends into its own child type. It is resolved the same way
+        # ``__init__`` will (explicit value, else derived from the URL
+        # scheme, else the default) so the two never key differently.
         client = None
         try:
             client = service.client if service is not None else None
         except Exception:
             client = None
-        return (cls, client, catalog_name)
+        return (cls, client, catalog_name, resolve_path_prefix(path_prefix, url))
 
     def __new__(
         cls,
@@ -137,7 +151,12 @@ class UCCatalog(DatabricksPath, Singleton):
         if singleton_ttl is ...:
             return _allocate()
 
-        key = cls._singleton_key(service, catalog_name=catalog_name)
+        key = cls._singleton_key(
+            service,
+            catalog_name=catalog_name,
+            path_prefix=kwargs.get("path_prefix"),
+            url=kwargs.get("url"),
+        )
         ttl_arg = (
             float(singleton_ttl)
             if isinstance(singleton_ttl, int) and not isinstance(singleton_ttl, bool)
@@ -166,6 +185,7 @@ class UCCatalog(DatabricksPath, Singleton):
         infos: CatalogInfo | None = None,
         infos_fetched_at: float | None = None,
         url: URL | None = None,
+        path_prefix: str | None = None,
         singleton_ttl: "int | None" = ...,
     ):
         # ``singleton_ttl`` is consumed by ``__new__``; accept it here
@@ -178,6 +198,12 @@ class UCCatalog(DatabricksPath, Singleton):
         # ``_infos`` / fetch timestamp don't get reset under the caller.
         if getattr(self, "_initialized", False):
             return
+
+        # Resolve the child-navigation surface from the *incoming* url
+        # (before it's rebuilt below into the catalog's own
+        # ``dbfs+catalog://`` form, which would erase the originating
+        # scheme). Keep it in lock-step with ``_singleton_key``.
+        resolved_prefix = resolve_path_prefix(path_prefix, url)
 
         if service is None:
             from .catalogs import Catalogs
@@ -199,6 +225,7 @@ class UCCatalog(DatabricksPath, Singleton):
         super().__init__(url=url, service=service)
         self.service = service
         self.catalog_name = catalog_name
+        self.path_prefix = resolved_prefix
         self._infos_ttl = infos_ttl or 1800.0
         self._infos = infos
         self._infos_fetched_at = infos_fetched_at
@@ -229,25 +256,25 @@ class UCCatalog(DatabricksPath, Singleton):
         )
 
     def _from_url(self, url: URL) -> "DatabricksPath":
-        parts = url.parts
+        # ``url.parts`` is 0-indexed with the leading ``/`` stripped, so a
+        # catalog's own URL (``/<cat>``) is a single part. Depth fixes the
+        # volume-family resource a path-join lands on — catalog (1) →
+        # schema (2) → volume (3) → :class:`VolumePath` (4+) — mirroring
+        # the ``/Volumes/...`` depth dispatch the module-level resolver
+        # applies. ``catalog["sch"]`` / ``schema["tbl"]`` stay the logical
+        # (table-oriented) navigation surface; ``/`` is the filesystem one.
+        # Drop empty components (trailing / duplicate slashes) so the
+        # depth count reflects real segments however the URL was built.
+        parts = [p for p in url.parts if p]
         n = len(parts)
 
         if n <= 1:
+            # ``/<catalog>`` (or the bare root) — this catalog itself.
             return self
-        elif n == 2:
-            # /<catalog> — this catalog itself
-            return self
-        elif n == 3:
-            # /<catalog>/<schema>
-            return self.schema(parts[2])
-        elif n == 4:
-            # /<catalog>/<schema>/<volume_or_table> — hand off to the schema
-            return self.schema(parts[2])._from_url(url)
-        else:
-            raise ValueError(
-                f"URL {url} has too many parts to resolve against a Catalog "
-                f"(got {n}, expected 1-4)."
-            )
+        # Depth ≥ 2 carries a schema and possibly more below it — hand off
+        # to the child schema, which owns the schema → volume →
+        # VolumePath leg of the walk.
+        return self.schema(parts[1])._from_url(url)
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         raise NotImplementedError(
@@ -341,6 +368,12 @@ class UCCatalog(DatabricksPath, Singleton):
                 if u.host else DatabricksClient.current()
             )
             service = Catalogs(client=client)
+        # ``__init__`` rebuilds the URL into the catalog's own
+        # ``dbfs+catalog://`` form, erasing the originating scheme — so
+        # capture the child-navigation surface (``dbfs+volume`` →
+        # volume catalog, ``dbfs+table`` → table catalog) here while the
+        # source scheme is still visible.
+        kwargs.setdefault("path_prefix", resolve_path_prefix(url=u))
         return cls(service=service, catalog_name=catalog_name, **kwargs)
 
     # ── DatabricksResource compatibility ──────────────────────────────────────
@@ -475,6 +508,7 @@ class UCCatalog(DatabricksPath, Singleton):
             service=self.service,
             catalog_name=self.catalog_name,
             schema_name=name,
+            path_prefix=self.path_prefix,
         )
 
     def schemas(self) -> Iterator["UCSchema"]:
@@ -486,6 +520,7 @@ class UCCatalog(DatabricksPath, Singleton):
                 service=self.service,
                 catalog_name=self.catalog_name,
                 schema_name=info.name,
+                path_prefix=self.path_prefix,
             )
             object.__setattr__(s, "_infos", info)
             object.__setattr__(s, "_infos_fetched_at", time.time())

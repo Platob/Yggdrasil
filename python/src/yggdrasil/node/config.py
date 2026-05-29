@@ -8,6 +8,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from yggdrasil.version import __version__
+
 _NODE_ID_FILE = ".ygg_node_id"
 
 
@@ -62,7 +64,8 @@ def _default_front_home() -> Path:
 @dataclass(frozen=True, slots=True)
 class Settings:
     app_name: str = "yggdrasil-node"
-    app_version: str = "0.1.1"
+    # Single source of truth: the yggdrasil package version.
+    app_version: str = __version__
     host: str = "0.0.0.0"
     port: int = 8100
     front_port: int = 3000
@@ -86,6 +89,10 @@ class Settings:
     max_log_lines_per_stream: int = 1000
     run_heartbeat_interval: float = 2.0
     run_cancel_grace_seconds: float = 1.5
+    # Seconds a PyEnv's resolved interpreter version + installed-library
+    # listing stays cached before the next ``pip list`` subprocess runs —
+    # keeps the UI's per-env package view from flooding the node.
+    pyenv_packages_cache_ttl: float = 60.0
 
     @property
     def local_clients(self) -> set[str]:
@@ -129,7 +136,7 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
 def get_settings() -> Settings:
     return Settings(
         app_name=os.getenv("YGG_NODE_APP_NAME", "yggdrasil-node"),
-        app_version=os.getenv("YGG_NODE_APP_VERSION", "0.1.0"),
+        app_version=os.getenv("YGG_NODE_APP_VERSION", __version__),
         host=os.getenv("YGG_NODE_HOST", "0.0.0.0"),
         port=int(os.getenv("YGG_NODE_PORT", "8100")),
         front_port=int(os.getenv("YGG_NODE_FRONT_PORT", "3000")),
@@ -157,4 +164,5 @@ def get_settings() -> Settings:
         max_log_lines_per_stream=int(os.getenv("YGG_NODE_MAX_LOG_LINES", "1000")),
         run_heartbeat_interval=float(os.getenv("YGG_NODE_RUN_HEARTBEAT", "2.0")),
         run_cancel_grace_seconds=float(os.getenv("YGG_NODE_RUN_CANCEL_GRACE", "1.5")),
+        pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
     )

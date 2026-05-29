@@ -115,11 +115,14 @@ class PyFuncRunService:
             else self.settings.max_python_timeout
         )
 
+        # Env vars: the env's stored vars first, the run's own on top.
+        run_env_vars = {**self._pyenv.env_vars_for(env_id), **req.env_vars}
+
         runtime.task = asyncio.create_task(
             self._supervise(
                 run_id, func.code, env_python,
                 list(req.args), dict(req.kwargs),
-                effective_timeout, req.max_memory_mb,
+                effective_timeout, req.max_memory_mb, run_env_vars,
             ),
             name=f"pyfuncrun-{run_id}",
         )
@@ -328,6 +331,7 @@ class PyFuncRunService:
         kwargs: dict[str, Any],
         timeout: float,
         max_memory_mb: int | None,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         runtime = self._runtimes.get(run_id)
         if runtime is None:
@@ -359,6 +363,10 @@ class PyFuncRunService:
             outputs_path = Path(outputs.name)
 
             env = os.environ.copy()
+            # Caller / env-supplied variables (the ygg-reserved keys below
+            # always win so the run harness stays consistent).
+            if extra_env:
+                env.update({str(k): str(v) for k, v in extra_env.items()})
             env["YGG_RUNTIME_VERSION"] = self.settings.app_version
             env["YGG_NODE_ID"] = self.settings.node_id
             env["YGG_NODE_PORT"] = str(self.settings.port)

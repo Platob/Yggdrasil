@@ -15,10 +15,14 @@ async def get_env(
         default=None,
         description="Comma-separated list of env var names. Omit for all.",
     ),
+    include_system: bool = Query(
+        default=False,
+        description="Include OS/shell/runtime plumbing vars (PATH, HOME, …) in the full listing.",
+    ),
     service: EnvService = Depends(get_env_service),
 ) -> EnvGetResponse:
     parsed_keys = [k.strip() for k in keys.split(",") if k.strip()] if keys else None
-    return await service.get_env(parsed_keys)
+    return await service.get_env(parsed_keys, include_system=include_system)
 
 
 @router.post("", response_model=EnvSetResponse)

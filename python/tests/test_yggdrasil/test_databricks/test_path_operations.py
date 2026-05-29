@@ -29,11 +29,16 @@ from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 from yggdrasil.databricks.path import (
     DatabricksPath,
+    TABLE_PATH_PREFIX,
+    VOLUME_PATH_PREFIX,
+    _coerce_explore_url,
     _coerce_to_url_str,
     _looks_like_posix,
     _parse_posix,
+    _relative_join_parts,
     _resolve_databricks_subclass,
     _strip_dbfs_family_prefix,
+    resolve_path_prefix,
 )
 from yggdrasil.databricks.schema.schema import UCSchema
 from yggdrasil.databricks.schema.schemas import Schemas
@@ -640,3 +645,610 @@ class TestSingletonIdentityThroughDispatcher:
             "dbfs+volume:///main/sales/raw/x", service=volumes_service,
         )
         assert a is b
+
+
+# ===========================================================================
+# Path-join navigation — joining a catalog / schema / volume mints the
+# right concrete Databricks instance by depth
+# ===========================================================================
+
+
+class TestJoinPathCreatesCorrectInstances:
+    """``/`` (and :meth:`joinpath`) walk *down* the volume family by
+    depth — catalog → schema → volume → :class:`VolumePath` — minting
+    the right concrete resource at every step.
+
+    This is the filesystem-navigation surface: each appended segment
+    descends one level. It is distinct from the logical
+    ``__getitem__`` surface (``catalog["sch"]`` → :class:`UCSchema`,
+    ``schema["tbl"]`` → :class:`Table`), and from the module-level
+    dispatcher that resolves a whole ``/Volumes/...`` POSIX seed at
+    once — but it must agree with both on the depth → type mapping so
+    ``cat / "sch" / "vol" / "x"`` lands on the same
+    ``catalog_name`` / ``schema_name`` / ``volume_name`` triple a
+    direct ``DatabricksPath("/Volumes/cat/sch/vol/x")`` does.
+    """
+
+    # ── catalog as the join root ──────────────────────────────────────────
+
+    def test_catalog_join_schema_yields_schema(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        sch = cat / "sales"
+        assert isinstance(sch, UCSchema)
+        assert sch.catalog_name == "main"
+        assert sch.schema_name == "sales"
+
+    def test_catalog_join_schema_collapses_onto_getitem(self, catalogs_service):
+        # ``cat / "sales"`` and the logical ``cat["sales"]`` must resolve
+        # to the very same singleton — both spellings address the one
+        # ``main.sales`` schema, so their cached state has to be shared.
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert (cat / "sales") is cat["sales"]
+        assert (cat / "sales") is cat.schema("sales")
+
+    def test_catalog_join_to_volume_depth(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        vol = cat / "sales" / "raw"
+        assert isinstance(vol, Volume)
+        assert vol.catalog_name == "main"
+        assert vol.schema_name == "sales"
+        assert vol.volume_name == "raw"
+
+    def test_catalog_join_to_volume_path_depth(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        leaf = cat / "sales" / "raw" / "data.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/data.parquet"
+
+    def test_catalog_joinpath_multi_segment_to_volume_path(self, catalogs_service):
+        # A single ``joinpath`` with several segments resolves to the
+        # same place as the chained ``/`` form.
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        leaf = cat.joinpath("sales", "raw", "year=2026", "data.parquet")
+        assert isinstance(leaf, VolumePath)
+        assert (
+            leaf.full_path()
+            == "/Volumes/main/sales/raw/year=2026/data.parquet"
+        )
+
+    # ── schema as the join root ───────────────────────────────────────────
+
+    def test_schema_join_volume_yields_volume(self, schemas_service):
+        sch = UCSchema(
+            service=schemas_service,
+            catalog_name="main",
+            schema_name="sales",
+        )
+        vol = sch / "raw"
+        assert isinstance(vol, Volume)
+        assert vol.catalog_name == "main"
+        assert vol.schema_name == "sales"
+        assert vol.volume_name == "raw"
+
+    def test_schema_join_to_volume_path_depth(self, schemas_service):
+        sch = UCSchema(
+            service=schemas_service,
+            catalog_name="main",
+            schema_name="sales",
+        )
+        leaf = sch / "raw" / "sub" / "f.csv"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/sub/f.csv"
+
+    # ── volume as the join root ───────────────────────────────────────────
+
+    def test_volume_join_yields_volume_path(self, volumes_service):
+        vol = Volume(
+            service=volumes_service,
+            catalog_name="main",
+            schema_name="sales",
+            volume_name="raw",
+        )
+        leaf = vol / "data.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/data.parquet"
+
+    def test_volume_join_nested_yields_volume_path(self, volumes_service):
+        vol = Volume(
+            service=volumes_service,
+            catalog_name="main",
+            schema_name="sales",
+            volume_name="raw",
+        )
+        leaf = vol / "a" / "b" / "c.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/a/b/c.parquet"
+
+    # ── agreement with the whole-seed dispatcher ──────────────────────────
+
+    def test_chained_join_matches_dispatcher_address(
+        self, catalogs_service, volumes_service,
+    ):
+        # Walking down from the catalog one segment at a time has to
+        # address the same UC location the dispatcher resolves from the
+        # equivalent POSIX seed — same concrete type, same canonical URL.
+        # (Instance identity isn't asserted: a :class:`VolumePath`
+        # singleton keys on its service object, and the walked path
+        # carries the volume's own service rather than ``volumes_service``.)
+        catalogs_service.client = volumes_service.client
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        walked = cat / "sales" / "raw" / "x.parquet"
+        dispatched = DatabricksPath(
+            "/Volumes/main/sales/raw/x.parquet",
+            service=volumes_service,
+        )
+        assert isinstance(walked, VolumePath)
+        assert type(walked) is type(dispatched)
+        assert walked == dispatched
+        assert walked.full_path() == dispatched.full_path()
+
+
+# ===========================================================================
+# path_prefix — the catalog/schema "navigation surface" that tells a
+# path-join which child type to mint (instead of guessing)
+# ===========================================================================
+
+
+class TestPathPrefixResolver:
+    """:func:`resolve_path_prefix` is the single source of truth both the
+    singleton key and ``__init__`` use, so they can never disagree."""
+
+    def test_explicit_prefix_wins(self):
+        assert resolve_path_prefix(TABLE_PATH_PREFIX) == TABLE_PATH_PREFIX
+        assert resolve_path_prefix(VOLUME_PATH_PREFIX) == VOLUME_PATH_PREFIX
+
+    def test_derives_volume_from_volume_scheme(self):
+        assert (
+            resolve_path_prefix(url=URL.from_("dbfs+volume:///c/s"))
+            == VOLUME_PATH_PREFIX
+        )
+
+    def test_derives_table_from_table_scheme(self):
+        assert (
+            resolve_path_prefix(url=URL.from_("dbfs+table:///c/s/t"))
+            == TABLE_PATH_PREFIX
+        )
+
+    def test_defaults_to_volume_for_unmapped_scheme(self):
+        # ``dbfs+catalog`` / ``dbfs+schema`` are a handle's *own* scheme;
+        # they say nothing about the child surface, so the volume
+        # filesystem (the dominant ``/`` target) is the default.
+        assert resolve_path_prefix(url=URL.from_("dbfs+catalog:///c")) == (
+            VOLUME_PATH_PREFIX
+        )
+        assert resolve_path_prefix() == VOLUME_PATH_PREFIX
+
+
+class TestPathPrefixOnCatalogAndSchema:
+    """The catalog records its navigation surface and hands it down to
+    every schema it mints, so the schema knows its child type up front."""
+
+    def test_catalog_defaults_to_volume_surface(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert cat.path_prefix == VOLUME_PATH_PREFIX
+
+    def test_catalog_accepts_table_surface(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        assert cat.path_prefix == TABLE_PATH_PREFIX
+
+    def test_prefix_propagates_to_schema_via_navigation(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        # Every way of reaching a child schema carries the surface down.
+        assert cat.schema("sales").path_prefix == TABLE_PATH_PREFIX
+        assert cat["sales"].path_prefix == TABLE_PATH_PREFIX
+        assert (cat / "sales").path_prefix == TABLE_PATH_PREFIX
+
+    def test_schema_catalog_round_trip_preserves_prefix(self, schemas_service):
+        sch = UCSchema(
+            service=schemas_service,
+            catalog_name="main",
+            schema_name="sales",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        # Up to the catalog and back down must land on the same surface.
+        assert sch.catalog.path_prefix == TABLE_PATH_PREFIX
+
+    def test_volume_and_table_surfaces_are_distinct_singletons(
+        self, catalogs_service,
+    ):
+        vol_cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        tbl_cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        # Same name + client, different surface → different handles, each
+        # with its own cached infos / child resolution.
+        assert vol_cat is not tbl_cat
+        assert vol_cat.path_prefix != tbl_cat.path_prefix
+        # ...but two volume-surface handles still collapse.
+        assert vol_cat is UCCatalog(
+            service=catalogs_service, catalog_name="main",
+        )
+
+
+class TestPathPrefixDrivesChildType:
+    """The whole point: a path-join resolves to the child type the
+    surface dictates — volume catalogs descend into Volumes /
+    VolumePaths, table catalogs into Tables — no guessing."""
+
+    def test_volume_catalog_join_yields_volume_then_path(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert isinstance(cat / "sales" / "raw", Volume)
+        assert isinstance(cat / "sales" / "raw" / "f.parquet", VolumePath)
+
+    def test_table_catalog_join_yields_table(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        leaf = cat / "sales" / "orders"
+        assert isinstance(leaf, Table)
+        assert leaf.catalog_name == "main"
+        assert leaf.schema_name == "sales"
+        assert leaf.table_name == "orders"
+
+    def test_table_catalog_join_past_table_raises(self, catalogs_service):
+        # A table is a leaf, not a path-navigable container; a single
+        # multi-segment join that descends past one fails loudly rather
+        # than fabricating a nonsensical resource.
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        with pytest.raises(ValueError):
+            cat.joinpath("sales", "orders", "oops")
+
+    def test_from_url_volume_scheme_makes_volume_catalog(self, catalogs_service):
+        cat = UCCatalog.from_url(
+            "dbfs+volume:///main", service=catalogs_service,
+        )
+        assert cat.path_prefix == VOLUME_PATH_PREFIX
+
+    def test_from_url_schema_table_scheme_makes_table_schema(
+        self, schemas_service,
+    ):
+        sch = UCSchema.from_url(
+            "dbfs+table:///main/sales", service=schemas_service,
+        )
+        assert sch.path_prefix == TABLE_PATH_PREFIX
+        assert isinstance(sch / "orders", Table)
+
+
+# ===========================================================================
+# Multi-part path strings in a join — a join must always *extend* the
+# handle (never reset / over-count) so the depth-based type stays right
+# ===========================================================================
+
+
+class TestRelativeJoinParts:
+    """:func:`_relative_join_parts` flattens whatever a caller passes to
+    ``/`` / ``joinpath`` into clean, relative components."""
+
+    def test_single_multipart_string_splits(self):
+        assert _relative_join_parts(("a/b/c",)) == ["a", "b", "c"]
+
+    def test_multiple_segments_flatten(self):
+        assert _relative_join_parts(("a", "b/c", "d")) == ["a", "b", "c", "d"]
+
+    def test_leading_slash_is_relative_not_absolute(self):
+        # The leading-slash "absolute reset" is stripped — a Databricks
+        # path must not be able to escape its namespace via a join.
+        assert _relative_join_parts(("/a/b",)) == ["a", "b"]
+
+    def test_trailing_and_duplicate_slashes_drop_empties(self):
+        assert _relative_join_parts(("a/b/",)) == ["a", "b"]
+        assert _relative_join_parts(("a//b",)) == ["a", "b"]
+
+    def test_dot_components_dropped_dotdot_kept(self):
+        assert _relative_join_parts(("a/./b",)) == ["a", "b"]
+        assert _relative_join_parts(("a/../b",)) == ["a", "..", "b"]
+
+    def test_empty_and_none_yield_nothing(self):
+        assert _relative_join_parts(("",)) == []
+        assert _relative_join_parts((None,)) == []
+
+
+class TestMultiPartJoinResolvesCorrectType:
+    """A multi-part string descends exactly as the chained ``/`` form
+    does — same depth, same concrete type — for every join root."""
+
+    def test_catalog_multipart_to_volume(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert isinstance(cat / "sales/raw", Volume)
+
+    def test_catalog_multipart_to_volume_path(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        leaf = cat / "sales/raw/year=2026/data.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/year=2026/data.parquet"
+
+    def test_multipart_string_matches_chained_form(self, catalogs_service):
+        # ``cat / "sales/raw"`` and ``cat / "sales" / "raw"`` are the same
+        # UC location — and, sharing a service, the same singleton.
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert (cat / "sales/raw") is (cat / "sales" / "raw")
+
+    def test_multi_arg_joinpath_matches_chained_form(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert cat.joinpath("sales", "raw") is (cat / "sales" / "raw")
+
+    def test_schema_multipart_to_volume_path(self, schemas_service):
+        sch = UCSchema(
+            service=schemas_service, catalog_name="main", schema_name="sales",
+        )
+        leaf = sch / "raw/sub/f.csv"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/sub/f.csv"
+
+    def test_volume_multipart_to_volume_path(self, volumes_service):
+        vol = Volume(
+            service=volumes_service,
+            catalog_name="main",
+            schema_name="sales",
+            volume_name="raw",
+        )
+        leaf = vol / "a/b/c.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/a/b/c.parquet"
+
+
+class TestJoinExtendsNeverResets:
+    """The edge cases that used to mis-resolve: a leading slash dropped
+    the handle's identity, a trailing slash over-counted into a deeper
+    type. A join now always extends the fixed coordinates."""
+
+    def test_leading_slash_still_extends_catalog(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        vol = cat / "/sales/raw"
+        assert isinstance(vol, Volume)
+        assert vol.full_path() == "/Volumes/main/sales/raw"
+
+    def test_trailing_slash_does_not_overcount(self, catalogs_service):
+        # ``"sales/raw/"`` is still the volume (depth 3), not a
+        # zero-length child path beneath it.
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert isinstance(cat / "sales/raw/", Volume)
+
+    def test_duplicate_slashes_collapse(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert isinstance(cat / "sales//raw", Volume)
+
+    def test_empty_join_returns_same_handle(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert cat / "" is cat
+
+    def test_volume_path_join_stays_in_namespace(self, volumes_service):
+        # A leading slash on a VolumePath join must not reset to an
+        # absolute path that escapes the volume root.
+        vp = VolumePath(
+            "/Volumes/main/sales/raw/dir",
+            service=volumes_service,
+        )
+        joined = vp / "/escape/attempt"
+        assert isinstance(joined, VolumePath)
+        assert joined.full_path() == "/Volumes/main/sales/raw/dir/escape/attempt"
+
+    def test_table_catalog_multipart_to_table(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        assert isinstance(cat / "sales/orders", Table)
+
+
+class TestByteShapedPathJoins:
+    """The same extend-don't-reset / multi-part rules apply to the
+    byte-shaped surfaces (DBFS / Workspace / VolumePath), which all
+    inherit :meth:`DatabricksPath.joinpath`."""
+
+    def test_dbfs_multipart_join(self):
+        from yggdrasil.databricks.fs.service import DBFSService
+        svc = MagicMock(spec=DBFSService)
+        p = DBFSPath("/dbfs/tmp/dir", service=svc)
+        assert (p / "a/b/c").full_path() == "/dbfs/tmp/dir/a/b/c"
+
+    def test_dbfs_leading_slash_stays_in_namespace(self):
+        from yggdrasil.databricks.fs.service import DBFSService
+        svc = MagicMock(spec=DBFSService)
+        p = DBFSPath("/dbfs/tmp/dir", service=svc)
+        # A leading slash must extend, not reset to ``/abs`` (which would
+        # escape the DBFS root).
+        assert (p / "/abs/x").full_path() == "/dbfs/tmp/dir/abs/x"
+
+    def test_workspace_multipart_join(self):
+        svc = MagicMock(spec=WorkspacePath._SERVICE_CLASS)
+        p = WorkspacePath("/Workspace/Users/me", service=svc)
+        assert (p / "proj/nb").full_path() == "/Workspace/Users/me/proj/nb"
+
+    def test_volume_path_multipart_and_trailing_slash(self, volumes_service):
+        vp = VolumePath("/Volumes/main/sales/raw/dir", service=volumes_service)
+        assert (vp / "a/b/").full_path() == "/Volumes/main/sales/raw/dir/a/b"
+
+
+class TestVolumePathNavigationStillWorks:
+    """Regression: the ``joinpath`` override must not disturb the
+    ``Volume.path`` factory or the ``with_name`` / ``with_suffix``
+    helpers that lean on parent + join."""
+
+    def test_volume_join_matches_volume_path_factory(self, volumes_service):
+        vol = Volume(
+            service=volumes_service,
+            catalog_name="main",
+            schema_name="sales",
+            volume_name="raw",
+        )
+        # ``vol / "x/y.parquet"`` and ``vol.path("x/y.parquet")`` are the
+        # same VolumePath singleton.
+        assert (vol / "x/y.parquet") is vol.path("x/y.parquet")
+
+    def test_with_name_and_suffix_on_volume_path(self, volumes_service):
+        vp = VolumePath(
+            "/Volumes/main/sales/raw/dir/file.csv",
+            service=volumes_service,
+        )
+        assert vp.with_name("other.txt").full_path() == (
+            "/Volumes/main/sales/raw/dir/other.txt"
+        )
+        assert vp.with_suffix(".parquet").full_path() == (
+            "/Volumes/main/sales/raw/dir/file.parquet"
+        )
+
+
+class TestPathPrefixSurvivesPickle:
+    """The navigation surface is plain instance state — it must round-
+    trip through pickling like the rest of the resource."""
+
+    def test_table_catalog_pickle_round_trip(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        assert "path_prefix" in cat.__getstate__()
+        # The state carries the surface so an unpickled handle resolves
+        # children the same way.
+        assert cat.__getstate__()["path_prefix"] == TABLE_PATH_PREFIX
+
+
+# ===========================================================================
+# Catalog Explorer deep-links — build a path straight from a workspace UI
+# URL (the thing a user copies out of the browser)
+# ===========================================================================
+
+
+_HOST = "https://ws.cloud.databricks.com"
+
+
+class TestCoerceExploreUrl:
+    """:func:`_coerce_explore_url` rewrites a ``/explore/data/...`` UI
+    link into the canonical ``dbfs+<surface>://`` form (host dropped, to
+    match the ``/Volumes/...`` POSIX coercion)."""
+
+    def test_catalog_link(self):
+        out = _coerce_explore_url(URL.from_(f"{_HOST}/explore/data/main"))
+        assert out.scheme == Scheme.DATABRICKS_CATALOG.value
+        assert out.path == "/main"
+        assert not out.host
+
+    def test_schema_link(self):
+        out = _coerce_explore_url(URL.from_(f"{_HOST}/explore/data/main/sales"))
+        assert out.scheme == Scheme.DATABRICKS_SCHEMA.value
+        assert out.path == "/main/sales"
+
+    def test_table_link(self):
+        out = _coerce_explore_url(
+            URL.from_(f"{_HOST}/explore/data/main/sales/orders"),
+        )
+        assert out.scheme == Scheme.DATABRICKS_TABLE.value
+        assert out.path == "/main/sales/orders"
+
+    def test_volume_link(self):
+        out = _coerce_explore_url(
+            URL.from_(f"{_HOST}/explore/data/volumes/main/sales/raw"),
+        )
+        assert out.scheme == Scheme.DATABRICKS_VOLUME.value
+        assert out.path == "/main/sales/raw"
+
+    def test_volume_link_with_volume_path_param(self):
+        # The selected file lives in ``?volumePath=/Volumes/...`` (URL-
+        # encoded in the wild) and wins over the bare volume coordinates.
+        out = _coerce_explore_url(
+            URL.from_(
+                f"{_HOST}/explore/data/volumes/main/sales/raw"
+                "?volumePath=/Volumes/main/sales/raw/dir/file.parquet"
+            ),
+        )
+        assert out.scheme == Scheme.DATABRICKS_VOLUME.value
+        assert out.path == "/main/sales/raw/dir/file.parquet"
+
+    def test_non_explore_url_passes_through(self):
+        assert _coerce_explore_url(URL.from_("dbfs+volume:///main/sales")) is None
+        assert _coerce_explore_url(URL.from_("https://example.com/x")) is None
+
+    def test_string_coercion_routes_through(self):
+        # ``_coerce_to_url_str`` (the shared string normalizer) recognizes
+        # the link too, so every string-input constructor benefits. Both
+        # spellings parse to the same hostless volume URL.
+        coerced = _coerce_to_url_str(
+            f"{_HOST}/explore/data/volumes/main/sales/raw",
+        )
+        assert URL.from_(coerced) == URL.from_("dbfs+volume:///main/sales/raw")
+
+
+class TestBuildFromExploreUrl:
+    """End-to-end: each Explorer link builds the right concrete handle."""
+
+    def test_volume_path_from_explore_url_with_file(self, volumes_service):
+        url = (
+            f"{_HOST}/explore/data/volumes/main/sales/raw"
+            "?volumePath=/Volumes/main/sales/raw/dir/file.parquet"
+        )
+        vp = VolumePath(url, service=volumes_service)
+        assert isinstance(vp, VolumePath)
+        assert vp.full_path() == "/Volumes/main/sales/raw/dir/file.parquet"
+
+    def test_volume_from_explore_url(self, volumes_service):
+        url = f"{_HOST}/explore/data/volumes/main/sales/raw"
+        vol = DatabricksPath.from_(url, service=volumes_service)
+        assert isinstance(vol, Volume)
+        assert (vol.catalog_name, vol.schema_name, vol.volume_name) == (
+            "main", "sales", "raw",
+        )
+
+    def test_catalog_and_schema_from_explore_url(
+        self, catalogs_service, schemas_service,
+    ):
+        cat = DatabricksPath.from_(
+            f"{_HOST}/explore/data/main", service=catalogs_service,
+        )
+        assert isinstance(cat, UCCatalog) and cat.catalog_name == "main"
+        sch = DatabricksPath.from_(
+            f"{_HOST}/explore/data/main/sales", service=schemas_service,
+        )
+        assert isinstance(sch, UCSchema)
+        assert (sch.catalog_name, sch.schema_name) == ("main", "sales")
+
+    def test_explore_url_and_posix_collapse_to_same_singleton(
+        self, volumes_service,
+    ):
+        # The two spellings of one file address the same VolumePath — the
+        # explore link drops its host so the canonical URL key matches.
+        a = VolumePath(
+            "/Volumes/main/sales/raw/dir/file.parquet", service=volumes_service,
+        )
+        b = VolumePath(
+            f"{_HOST}/explore/data/volumes/main/sales/raw"
+            "?volumePath=/Volumes/main/sales/raw/dir/file.parquet",
+            service=volumes_service,
+        )
+        assert a is b
+
+    def test_volume_path_explore_url_round_trips(self, volumes_service):
+        # A VolumePath's own ``explore_url`` rebuilds the same path.
+        vp = VolumePath(
+            "/Volumes/main/sales/raw/dir/file.parquet", service=volumes_service,
+        )
+        rebuilt = VolumePath(vp.explore_url.to_string(), service=volumes_service)
+        assert rebuilt == vp
+        assert rebuilt.full_path() == vp.full_path()
+
+    def test_from_url_classmethod_accepts_explore_link(self, volumes_service):
+        vp = DatabricksPath.from_url(
+            f"{_HOST}/explore/data/volumes/main/sales/raw"
+            "?volumePath=/Volumes/main/sales/raw/f.parquet",
+            service=volumes_service,
+        )
+        assert isinstance(vp, VolumePath)
+        assert vp.full_path() == "/Volumes/main/sales/raw/f.parquet"

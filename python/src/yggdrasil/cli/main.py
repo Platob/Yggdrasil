@@ -15,6 +15,7 @@ Subcommands::
     ygg node mesh       Live cluster health: this node + every peer
     ygg node call       Run a function by name and print result
     ygg node health     Run health checks on the node
+    ygg node excel      Check Excel service + create/update the add-in manifest
     ygg node create     Create a new named node
     ygg node install    Install node as boot service (systemd/launchd)
     ygg node uninstall  Remove boot service (--purge to delete data)
@@ -60,6 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
     serve.add_argument("--no-front", action="store_true", default=False, help="Skip launching the frontend.")
     serve.add_argument("--name", default=None, help="Node ID override.")
+    serve.add_argument("--persist", action="store_true", default=False, help="Create/update the boot auto-start service (Task Scheduler on Windows).")
     serve.set_defaults(handler=_node_serve)
 
     # status
@@ -107,6 +109,16 @@ def _build_parser() -> argparse.ArgumentParser:
     health_cmd = node_sub.add_parser("health", help="Run health checks on the node.")
     health_cmd.set_defaults(handler=_node_health)
 
+    # excel — check + (re)generate the Excel integration artifacts
+    excel_cmd = node_sub.add_parser(
+        "excel",
+        help="Check the Excel service and create/update the add-in manifest + Power Query connector.",
+    )
+    excel_cmd.add_argument("--check", action="store_true", default=False, help="Only check; don't write files.")
+    excel_cmd.add_argument("--host", default=None, help="Node base URL to check (default: local node).")
+    excel_cmd.add_argument("--install", action="store_true", default=False, help="Sideload the add-in into Excel's trusted folder (where supported).")
+    excel_cmd.set_defaults(handler=_node_excel)
+
     # create
     create = node_sub.add_parser("create", help="Create a new named node (initializes ~/.node/<name>/).")
     create.add_argument("name", help="Node name/ID.")
@@ -120,12 +132,14 @@ def _build_parser() -> argparse.ArgumentParser:
     back.add_argument("--port", type=int, default=None, help="Bind port (default: 8100).")
     back.add_argument("--reload", action="store_true", default=False, help="Enable auto-reload.")
     back.add_argument("--name", default=None, help="Node ID override.")
+    back.add_argument("--persist", action="store_true", default=False, help="Create/update the boot auto-start service (Task Scheduler on Windows).")
     back.set_defaults(handler=_node_back)
 
     # front
     front = node_sub.add_parser("front", help="Start frontend dev server only.")
     front.add_argument("--port", type=int, default=None, help="Frontend port (default: 3000).")
     front.add_argument("--node-port", type=int, default=None, help="Node API port to proxy to.")
+    front.add_argument("--persist", action="store_true", default=False, help="Create/update the boot auto-start service (Task Scheduler on Windows).")
     front.set_defaults(handler=_node_front)
 
     # run
@@ -203,8 +217,11 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None, 
 
     npm = shutil.which("npm")
     if npm is None:
+        npm = _ensure_nodejs()
+    if npm is None:
         from yggdrasil.cli.style import dim, out, yellow
-        out(f"  {yellow('skip')}  npm not found — install Node.js to serve the frontend\n")
+        out(f"  {yellow('skip')}  Node.js/npm unavailable and auto-install failed — "
+            f"install Node.js to serve the frontend\n")
         return None
 
     if not (front_home / "node_modules").exists():
@@ -234,6 +251,83 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None, 
     from yggdrasil.cli.style import bold, cyan, out
     out(f"  {cyan('front')} {bold(f'http://0.0.0.0:{port}')}\n")
     return proc
+
+
+def _ensure_nodejs() -> "str | None":
+    """Best-effort: make ``npm`` available, auto-installing Node.js via the
+    platform package manager when missing. Returns the npm path or None.
+
+    Tries one manager per platform (Homebrew on macOS; apt/dnf/yum on
+    Linux; winget/choco on Windows). Anything else — no manager, no
+    privileges, network blocked — falls through to None and the caller
+    prints install guidance.
+    """
+    import platform
+    import shutil
+    import subprocess
+    from yggdrasil.cli.style import dim, green, out, yellow
+
+    npm = shutil.which("npm")
+    if npm:
+        return npm
+
+    system = platform.system()
+    # (probe binary, install argv) candidates, first available wins.
+    candidates: list[tuple[str, list[str]]] = []
+    if system == "Darwin":
+        candidates = [("brew", ["brew", "install", "node"])]
+    elif system == "Windows":
+        candidates = [
+            ("winget", ["winget", "install", "-e", "--id", "OpenJS.NodeJS", "--silent"]),
+            ("choco", ["choco", "install", "nodejs", "-y"]),
+        ]
+    else:  # Linux / other POSIX
+        if shutil.which("apt-get"):
+            candidates = [("apt-get", ["sudo", "apt-get", "install", "-y", "nodejs", "npm"])]
+        elif shutil.which("dnf"):
+            candidates = [("dnf", ["sudo", "dnf", "install", "-y", "nodejs"])]
+        elif shutil.which("yum"):
+            candidates = [("yum", ["sudo", "yum", "install", "-y", "nodejs"])]
+
+    mgr = next(((m, cmd) for m, cmd in candidates if shutil.which(m)), None)
+    if mgr is None:
+        out(f"  {yellow('!')} Node.js missing and no known package manager found "
+            f"({dim('install from https://nodejs.org')})\n")
+        return None
+
+    name, cmd = mgr
+    out(f"  {yellow('…')} Node.js missing — attempting install via {name}\n")
+    try:
+        subprocess.run(cmd, check=True, timeout=600)
+    except Exception as exc:  # noqa: BLE001 — best-effort, report and bail
+        out(f"  {yellow('!')} auto-install via {name} failed: {dim(str(exc))}\n")
+        return None
+    npm = shutil.which("npm")
+    if npm:
+        out(f"  {green('✓')} Node.js installed\n")
+    return npm
+
+
+def _persist_service(settings, *, no_front: bool = False) -> None:
+    """Create/update the boot auto-start service for ``--persist``.
+
+    Idempotent (install_service rewrites the unit/agent/scheduled-task).
+    Best-effort: a failure to install — no systemd, locked-down
+    Task Scheduler, missing privileges — is logged as a warning and does
+    NOT abort the deploy; the foreground process still runs.
+    """
+    from yggdrasil.cli.style import dim, green, out, yellow
+    try:
+        from yggdrasil.node.service import install_service, is_windows
+        ok, msg = install_service(settings, no_front=no_front)
+    except Exception as exc:  # noqa: BLE001 — never fail the deploy on this
+        out(f"  {yellow('warn')}  could not install auto-start service: {dim(str(exc))}\n")
+        return
+    if ok:
+        kind = "scheduled task" if is_windows() else "boot service"
+        out(f"  {green('✓')} persisted ({kind}): {dim(msg)}\n")
+    else:
+        out(f"  {yellow('warn')}  auto-start not installed: {dim(msg)}\n")
 
 
 # ── handlers ─────────────────────────────────────────────────────
@@ -307,6 +401,9 @@ def _node_serve(args: argparse.Namespace) -> int:
     out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
     out(f"  {cyan('mode')}    {dim('public — remote access enabled')}\n")
 
+    if getattr(args, "persist", False):
+        _persist_service(settings, no_front=args.no_front)
+
     front_proc = None
     if not args.no_front:
         front_proc = _start_frontend(settings, node_port=port)
@@ -351,6 +448,162 @@ def _node_status(args: argparse.Namespace) -> int:
             out(f"    {dim(name)}  {color(state)}\n")
 
     return 0
+
+
+def _node_excel(args: argparse.Namespace) -> int:
+    """Check the Excel service and create/update its integration artifacts.
+
+    1. Probes ``/api/v2/excel/info`` and prints node identity + caps.
+    2. (Re)writes the Office.js add-in ``manifest.xml`` under the
+       frontend's ``public/excel-addin/`` with URLs pinned to the
+       configured frontend port — auto-created if missing.
+    3. Points at the Power Query connector sources + the ``/excel`` page.
+    """
+    import json as _json
+    import urllib.request
+    from pathlib import Path
+    from yggdrasil.node.config import get_settings
+    from yggdrasil.cli.style import blue, bold, cyan, dim, green, orange, out, print_logo, red, yellow
+
+    print_logo("YGGNODE")
+    settings = get_settings()
+    out(f"  {dim(f'v{settings.app_version}')}\n\n")
+
+    base = (args.host or f"http://127.0.0.1:{settings.port}").rstrip("/")
+    front_port = settings.front_port
+
+    # 1. check the Excel service
+    out(f"  {cyan('excel service')}\n")
+    try:
+        with urllib.request.urlopen(f"{base}/api/v2/excel/info", timeout=5) as resp:
+            info = _json.loads(resp.read().decode())
+        out(f"    {green('● online')}  {dim(base)}\n")
+        out(f"    {cyan('node')}     {orange(info.get('node_id', '?'))} {dim('v' + str(info.get('version', '?')))}\n")
+        out(f"    {cyan('formats')}  {', '.join(info.get('table_formats', []))}\n")
+        out(f"    {cyan('caps')}     {', '.join(info.get('capabilities', []))}\n")
+    except Exception as exc:
+        out(f"    {red('● unreachable')}  {dim(str(exc))}\n")
+        out(f"\n  Start the node first: {bold('ygg node serve')}\n")
+
+    # 2. (re)generate the Office add-in manifest
+    front = Path(settings.front_home)
+    manifest = front / "public" / "excel-addin" / "manifest.xml"
+    taskpane = f"http://localhost:{front_port}/excel/taskpane"
+    icon = f"http://localhost:{front_port}/favicon.ico"
+    content = _excel_manifest_xml(taskpane=taskpane, icon=icon)
+
+    out(f"\n  {cyan('office add-in')}\n")
+    if args.check:
+        state = "present" if manifest.exists() else "missing"
+        out(f"    {dim('manifest')}  {yellow(state)} {dim(str(manifest))}\n")
+    else:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        existed = manifest.exists()
+        manifest.write_text(content)
+        out(f"    {green('✓')} {'updated' if existed else 'created'} {dim(str(manifest))}\n")
+        out(f"    {dim('taskpane')}  {blue(taskpane)}\n")
+
+    # 3. deploy prerequisites — Node.js (frontend hosts the task-pane)
+    import platform
+    import shutil
+    node = shutil.which("node")
+    npm = shutil.which("npm")
+    out(f"\n  {cyan('node.js')}\n")
+    if node and npm:
+        out(f"    {green('✓')} node {dim(node)}\n")
+    else:
+        out(f"    {yellow('!')} not found — run {bold('ygg node serve')} to auto-install, "
+            f"or get it from {dim('https://nodejs.org')}\n")
+
+    # 4. direct add-in install into Excel's trusted sideload folder
+    system = platform.system()
+    if system == "Darwin":
+        wef = Path.home() / "Library" / "Containers" / "com.microsoft.Excel" / "Data" / "Documents" / "wef"
+        out(f"\n  {cyan('sideload')}    {dim('macOS trusted folder available')}\n")
+        if args.install and not args.check:
+            wef.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(manifest, wef / "yggdrasil.manifest.xml")
+            out(f"    {green('✓')} installed → {dim(str(wef / 'yggdrasil.manifest.xml'))}\n")
+            out(f"    {dim('Restart Excel; find it under Insert → Add-ins → Developer Add-ins.')}\n")
+        else:
+            out(f"    {dim('run with --install to copy the manifest there')}\n")
+    elif system == "Windows":
+        out(f"\n  {cyan('sideload')}    {dim('Windows needs a shared-folder trusted catalog')}\n")
+        out(f"    {dim('Share the manifest folder, then File → Options → Trust Center → Trusted Add-in Catalogs.')}\n")
+        if args.install:
+            out(f"    {yellow('!')} direct install unsupported on Windows (catalog is registry-based)\n")
+    else:
+        out(f"\n  {cyan('sideload')}    {dim('Excel desktop not present on this OS; use Upload My Add-in on Win/Mac')}\n")
+
+    # 5. Power Query + page pointers
+    out(f"\n  {cyan('power query')}  {dim('powerquery/YggdrasilExcel.pq (paste) · Yggdrasil.pq (.mez)')}\n")
+    out(f"  {cyan('manage')}       {blue(f'http://localhost:{front_port}/excel')}\n")
+    out(f"\n  Manual sideload: Excel → Insert → Add-ins → Upload My Add-in → manifest.xml\n")
+    return 0
+
+
+def _excel_manifest_xml(*, taskpane: str, icon: str) -> str:
+    """Office task-pane manifest (task-pane + Home-tab ribbon button)
+    with all URLs pinned to this frontend."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+  <Id>2b9d6a1e-9b1a-4c5e-9d3f-7a1ce0fda001</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Yggdrasil</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="Yggdrasil for Excel" />
+  <Description DefaultValue="Run Python on a Yggdrasil node, read/write remote files, and walk remote filesystems." />
+  <IconUrl DefaultValue="{icon}" />
+  <HighResolutionIconUrl DefaultValue="{icon}" />
+  <SupportUrl DefaultValue="https://github.com/Platob/Yggdrasil" />
+  <Hosts><Host Name="Workbook" /></Hosts>
+  <DefaultSettings><SourceLocation DefaultValue="{taskpane}" /></DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Workbook">
+        <DesktopFormFactor>
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="Ygg.Group">
+                <Label resid="Ygg.Group.Label" />
+                <Control xsi:type="Button" id="Ygg.Open">
+                  <Label resid="Ygg.Open.Label" />
+                  <Supertip>
+                    <Title resid="Ygg.Open.Label" />
+                    <Description resid="Ygg.Desc" />
+                  </Supertip>
+                  <Icon><bt:Image size="16" resid="Ygg.Icon" /><bt:Image size="32" resid="Ygg.Icon" /><bt:Image size="80" resid="Ygg.Icon" /></Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>YggTaskpane</TaskpaneId>
+                    <SourceLocation resid="Ygg.Taskpane.Url" />
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images><bt:Image id="Ygg.Icon" DefaultValue="{icon}" /></bt:Images>
+      <bt:Urls><bt:Url id="Ygg.Taskpane.Url" DefaultValue="{taskpane}" /></bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="Ygg.Group.Label" DefaultValue="Yggdrasil" />
+        <bt:String id="Ygg.Open.Label" DefaultValue="Open Yggdrasil" />
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="Ygg.Desc" DefaultValue="Run Python on a node, read/write remote files, and walk remote filesystems into your sheet." />
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>
+"""
 
 
 def _node_create(args: argparse.Namespace) -> int:
@@ -413,6 +666,9 @@ def _node_back(args: argparse.Namespace) -> int:
     out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
     out(f"  {cyan('mode')}    {dim('backend only')}\n\n")
 
+    if getattr(args, "persist", False):
+        _persist_service(settings, no_front=True)
+
     import uvicorn
     uvicorn.run("yggdrasil.node.app:app", host=host, port=port, reload=args.reload)
     return 0
@@ -427,6 +683,9 @@ def _node_front(args: argparse.Namespace) -> int:
     settings = get_settings()
 
     node_port = args.node_port or settings.port
+    if getattr(args, "persist", False):
+        _persist_service(settings)
+
     proc = _start_frontend(settings, node_port=node_port, front_port=args.port, quiet=False)
     if proc is None:
         return 1

@@ -9,7 +9,10 @@ from ..deps import get_pyenv_service, get_pyfunc_service, get_pyfuncrun_service
 from ..schemas.common import StrictModel
 from ..schemas.pyenv import (
     PyEnvCreate,
+    PyEnvEnvVarsResponse,
+    PyEnvEnvVarsUpdate,
     PyEnvListResponse,
+    PyEnvPackagesResponse,
     PyEnvResponse,
     PyEnvUpdate,
 )
@@ -44,6 +47,93 @@ async def get_env(
 ) -> PyEnvResponse:
     entry = await service.get(env_id)
     return PyEnvResponse(env=entry)
+
+
+@router.get("/by-name/{name}/packages", response_model=PyEnvPackagesResponse)
+async def list_env_packages_by_name(
+    name: str,
+    refresh: bool = False,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvPackagesResponse:
+    """Like :func:`list_env_packages`, keyed by the env's (unique) name.
+
+    PyEnvs are upserted by name, so the name is a stable string id — the
+    web UI uses this route because the int64 ``env_id`` can't survive a
+    JavaScript ``JSON.parse`` losslessly.
+    """
+    return await service.packages_by_name(name, refresh=refresh)
+
+
+@router.get("/{env_id}/packages", response_model=PyEnvPackagesResponse)
+async def list_env_packages(
+    env_id: int,
+    refresh: bool = False,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvPackagesResponse:
+    """Resolved interpreter version + libraries installed in the env's venv.
+
+    TTL-cached server-side, so polling this for a live view won't flood
+    the node with ``pip list`` subprocesses. ``?refresh=true`` forces a
+    fresh read.
+    """
+    return await service.packages(env_id, refresh=refresh)
+
+
+@router.get("/by-name/{name}/env", response_model=PyEnvEnvVarsResponse)
+async def get_env_vars_by_name(
+    name: str,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    """Env vars by env name (the web UI uses this — int64 ids don't
+    survive JSON.parse losslessly)."""
+    return await service.get_env_vars_by_name(name)
+
+
+@router.put("/by-name/{name}/env", response_model=PyEnvEnvVarsResponse)
+async def set_env_vars_by_name(
+    name: str,
+    req: PyEnvEnvVarsUpdate,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    return await service.set_env_vars_by_name(name, req.env_vars, replace=req.replace)
+
+
+@router.delete("/by-name/{name}/env/{key}", response_model=PyEnvEnvVarsResponse)
+async def delete_env_var_by_name(
+    name: str,
+    key: str,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    return await service.delete_env_var_by_name(name, key)
+
+
+@router.get("/{env_id}/env", response_model=PyEnvEnvVarsResponse)
+async def get_env_vars(
+    env_id: int,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    """Environment variables stored on this env (applied to every run)."""
+    return await service.get_env_vars(env_id)
+
+
+@router.put("/{env_id}/env", response_model=PyEnvEnvVarsResponse)
+async def set_env_vars(
+    env_id: int,
+    req: PyEnvEnvVarsUpdate,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    """Merge (default) or replace (``replace=true``) this env's variables."""
+    return await service.set_env_vars(env_id, req.env_vars, replace=req.replace)
+
+
+@router.delete("/{env_id}/env/{key}", response_model=PyEnvEnvVarsResponse)
+async def delete_env_var(
+    env_id: int,
+    key: str,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    """Remove a single environment variable from this env."""
+    return await service.delete_env_var(env_id, key)
 
 
 @router.head("/{env_id}")

@@ -4,8 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { ResourceBar } from "@/components/ResourceBar";
-import { getBackend, getEnvs, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs } from "@/lib/api";
-import type { NodeBackend, NodeCard, PyEnvEntry, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
+import { getBackend, getEnvs, getEnvPackages, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs, setEnvVars, deleteEnvVar } from "@/lib/api";
+import type { NodeBackend, NodeCard, PyEnvEntry, PyEnvPackages, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -96,6 +96,55 @@ export default function NodeDetailPage() {
   const [error, setError] = useState(false);
   const [selectedFuncIds, setSelectedFuncIds] = useState<Set<number>>(new Set());
   const [deletingFuncs, setDeletingFuncs] = useState(false);
+  // Lazily-loaded, per-env library listings (the backend TTL-caches the
+  // underlying ``pip list``, so we only fetch on expand). Keyed by env
+  // name — the int64 id can't survive JSON.parse in JS losslessly.
+  const [expandedEnvName, setExpandedEnvName] = useState<string | null>(null);
+  const [envPackages, setEnvPackages] = useState<Record<string, PyEnvPackages>>({});
+  const [loadingEnvPkgs, setLoadingEnvPkgs] = useState(false);
+
+  // env-var editing: draft {key,val} per env name
+  const [evDraft, setEvDraft] = useState<Record<string, { k: string; v: string }>>({});
+
+  const applyEnvVars = useCallback((name: string, env_vars: Record<string, string>) => {
+    setEnvs((prev) => prev.map((e) => (e.name === name ? { ...e, env_vars } : e)));
+  }, []);
+
+  const addEnvVar = useCallback(async (name: string) => {
+    const d = evDraft[name];
+    if (!d || !d.k.trim()) return;
+    try {
+      const res = await setEnvVars(name, { [d.k.trim()]: d.v });
+      applyEnvVars(name, res.env_vars);
+      setEvDraft((prev) => ({ ...prev, [name]: { k: "", v: "" } }));
+    } catch { /* surfaced by status elsewhere */ }
+  }, [evDraft, applyEnvVars]);
+
+  const removeEnvVar = useCallback(async (name: string, key: string) => {
+    try {
+      const res = await deleteEnvVar(name, key);
+      applyEnvVars(name, res.env_vars);
+    } catch { /* ignore */ }
+  }, [applyEnvVars]);
+
+  const toggleEnv = useCallback(async (envName: string) => {
+    if (expandedEnvName === envName) {
+      setExpandedEnvName(null);
+      return;
+    }
+    setExpandedEnvName(envName);
+    if (!envPackages[envName]) {
+      setLoadingEnvPkgs(true);
+      try {
+        const pkgs = await getEnvPackages(envName);
+        setEnvPackages((prev) => ({ ...prev, [envName]: pkgs }));
+      } catch {
+        /* leave unset; UI shows nothing extra */
+      } finally {
+        setLoadingEnvPkgs(false);
+      }
+    }
+  }, [expandedEnvName, envPackages]);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -288,11 +337,29 @@ export default function NodeDetailPage() {
                   color="var(--emerald)"
                   detail={`${formatBytes(gpu.memory_used_mb)} / ${formatBytes(gpu.memory_total_mb)}`}
                 />
-                <div className="flex items-center gap-2 text-[11px] text-muted">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z" />
-                  </svg>
-                  {gpu.temperature_c}C
+                {gpu.power_limit_w > 0 && (
+                  <ResourceBar
+                    label="Power"
+                    value={(gpu.power_draw_w / gpu.power_limit_w) * 100}
+                    color="var(--amber)"
+                    detail={`${gpu.power_draw_w.toFixed(0)}W / ${gpu.power_limit_w.toFixed(0)}W`}
+                  />
+                )}
+                <div className="flex items-center gap-4 text-[11px] text-muted">
+                  <span className="flex items-center gap-1.5">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z" />
+                    </svg>
+                    {gpu.temperature_c}C
+                  </span>
+                  {gpu.power_draw_w > 0 && (
+                    <span className="flex items-center gap-1.5">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                      </svg>
+                      {gpu.power_draw_w.toFixed(0)}W
+                    </span>
+                  )}
                 </div>
               </div>
             ))}
@@ -422,31 +489,100 @@ export default function NodeDetailPage() {
             <p className="text-xs text-muted/60 italic py-4">No environments created</p>
           ) : (
             <div className="space-y-2 max-h-72 overflow-y-auto">
-              {envs.map((env) => (
+              {envs.map((env) => {
+                const expanded = expandedEnvName === env.name;
+                const pkgs = envPackages[env.name];
+                return (
                 <div
                   key={env.id}
                   className="px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04]"
                 >
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-mono font-medium text-foreground">{env.name}</span>
-                    <span
-                      className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
-                      style={{
-                        background: env.status === "ready" ? "rgba(52,211,153,0.1)" : env.status === "error" ? "rgba(244,63,94,0.1)" : "rgba(251,191,36,0.1)",
-                        color: env.status === "ready" ? "var(--emerald)" : env.status === "error" ? "var(--rose)" : "var(--amber)",
-                      }}
-                    >
-                      {env.status}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2 mt-1 text-[10px] text-muted font-mono">
-                    <span>Python {env.python_version}</span>
-                    {env.dependencies.length > 0 && (
-                      <span>{env.dependencies.length} deps</span>
-                    )}
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => toggleEnv(env.name)}
+                    className="w-full text-left"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono font-medium text-foreground flex items-center gap-1.5">
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-muted transition-transform" style={{ transform: expanded ? "rotate(90deg)" : "none" }}>
+                          <polyline points="9 18 15 12 9 6" />
+                        </svg>
+                        {env.name}
+                      </span>
+                      <span
+                        className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
+                        style={{
+                          background: env.status === "ready" ? "rgba(52,211,153,0.1)" : env.status === "error" ? "rgba(244,63,94,0.1)" : "rgba(251,191,36,0.1)",
+                          color: env.status === "ready" ? "var(--emerald)" : env.status === "error" ? "var(--rose)" : "var(--amber)",
+                        }}
+                      >
+                        {env.status}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 mt-1 text-[10px] text-muted font-mono">
+                      <span>Python {pkgs?.python_version ?? env.python_version}</span>
+                      <span>·</span>
+                      <span>{pkgs ? `${pkgs.package_count} libraries` : `${env.dependencies.length} deps`}</span>
+                    </div>
+                  </button>
+                  {expanded && (
+                    <div className="mt-2 pt-2 border-t border-white/[0.06]">
+                      {loadingEnvPkgs && !pkgs ? (
+                        <p className="text-[10px] text-muted/60 italic py-1">Loading libraries…</p>
+                      ) : pkgs && pkgs.error ? (
+                        <p className="text-[10px] text-[var(--rose)] font-mono py-1">{pkgs.error}</p>
+                      ) : pkgs && pkgs.packages.length > 0 ? (
+                        <div className="space-y-0.5 max-h-44 overflow-y-auto">
+                          {pkgs.packages.map((p) => (
+                            <div key={p.name} className="flex items-center justify-between text-[10px] font-mono">
+                              <span className="text-foreground-dim">{p.name}</span>
+                              <span className="text-muted">{p.version}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[10px] text-muted/60 italic py-1">No libraries installed</p>
+                      )}
+
+                      {/* Environment variables */}
+                      <div className="mt-3 pt-2 border-t border-white/[0.06]">
+                        <p className="text-[9px] font-bold uppercase tracking-widest text-muted mb-1.5">Env vars</p>
+                        {Object.keys(env.env_vars ?? {}).length === 0 ? (
+                          <p className="text-[10px] text-muted/60 italic">None set</p>
+                        ) : (
+                          <div className="space-y-0.5 mb-1.5">
+                            {Object.entries(env.env_vars).map(([k, v]) => (
+                              <div key={k} className="flex items-center justify-between text-[10px] font-mono group">
+                                <span className="text-foreground-dim">{k}</span>
+                                <span className="flex items-center gap-2">
+                                  <span className="text-muted truncate max-w-[120px]" title={v}>{v}</span>
+                                  <button className="text-[var(--rose)] opacity-60 hover:opacity-100" onClick={() => removeEnvVar(env.name, k)} title="remove">✕</button>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <div className="flex items-center gap-1">
+                          <input
+                            className="flex-1 min-w-0 bg-white/[0.03] border border-white/[0.06] rounded px-1.5 py-1 text-[10px] font-mono"
+                            placeholder="KEY"
+                            value={evDraft[env.name]?.k ?? ""}
+                            onChange={(e) => setEvDraft((p) => ({ ...p, [env.name]: { k: e.target.value, v: p[env.name]?.v ?? "" } }))}
+                          />
+                          <input
+                            className="flex-1 min-w-0 bg-white/[0.03] border border-white/[0.06] rounded px-1.5 py-1 text-[10px] font-mono"
+                            placeholder="value"
+                            value={evDraft[env.name]?.v ?? ""}
+                            onChange={(e) => setEvDraft((p) => ({ ...p, [env.name]: { k: p[env.name]?.k ?? "", v: e.target.value } }))}
+                          />
+                          <button className="text-[10px] px-2 py-1 rounded bg-white/[0.05] border border-white/[0.08] hover:bg-white/[0.1]" onClick={() => addEnvVar(env.name)}>add</button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

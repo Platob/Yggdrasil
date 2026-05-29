@@ -1,44 +1,40 @@
 # Yggdrasil Power Query Connector
 
-Connect **Excel** and **Power BI** to the Yggdrasil FastAPI service (`yggdrasil.fastapi.routers.excel`). Run Python on the server, get a typed Power Query table back. Includes a server-side cache for repeated refreshes.
+Connect **Excel** and **Power BI** to a Yggdrasil **node** and pull data
+straight from it — run Python, read remote files, and walk the node's
+filesystem. Results come back as **Parquet** and are decoded natively
+with Power Query's `Parquet.Document`, so columns arrive fully typed.
 
 | File | For | How to use |
 |---|---|---|
-| `YggdrasilExcel.pq` | Excel | Paste into Advanced Editor — no install |
-| `Yggdrasil.mez`     | Power BI Desktop | Custom connector via Get Data |
+| `YggdrasilExcel.pq` | Excel | Paste into the Advanced Editor — no install |
+| `Yggdrasil.mez`     | Power BI Desktop | Custom connector via **Get Data** |
+
+> Targets the node Excel service at `/api/v2/excel` (default
+> `http://127.0.0.1:8100`). Writing data back to the node is the job of
+> the **Office.js add-in** (`nextjs` `/excel`), since Power Query is a
+> read/ingest surface.
 
 ---
 
-## Functions exposed
+## Functions
 
 | Function | What it does |
 |---|---|
-| `Yggdrasil.Execute` | Run Python code, return a DataFrame as a Power Query table |
-| `Yggdrasil.Prepare` | Run Python code with server-side parquet caching |
-| `Yggdrasil.DatabricksSQL` | Execute SQL on Databricks, return a typed table (server-side cached) |
-| `Yggdrasil.Health` | Check service health |
-| `Yggdrasil.Contents` | Navigation table entry point (Power BI only) |
+| `Yggdrasil.Info` | Node identity + capability card |
+| `Yggdrasil.Execute` | Run a Python snippet, return the named dataframe as a table |
+| `Yggdrasil.ReadFile` | Read a remote file (parquet/csv/json/arrow) as a typed table |
+| `Yggdrasil.Files` | Browse the node filesystem as a drill-down navigation table |
+| `Yggdrasil.Contents` | Navigation entry point (Power BI **Get Data**) |
 
 ---
 
-## Step 0 — start the FastAPI service
+## Step 0 — start a node
 
 ```bash
-pip install "ygg[api]"
-python -m yggdrasil.fastapi.main     # or: ygg-api
+pip install "ygg[node]"
+ygg node serve         # node API on http://127.0.0.1:8100
 ```
-
-By default the service listens on `http://127.0.0.1:8000`. Override with the env vars below.
-
-| Env var | Default | Description |
-|---|---|---|
-| `YGG_FASTAPI_HOST`         | `127.0.0.1`   | API host |
-| `YGG_FASTAPI_PORT`         | `8000`        | API port |
-| `YGG_FASTAPI_API_PREFIX`   | `/api`        | API route prefix |
-| `YGG_FASTAPI_PYTHON_PREFIX`| `/python`     | Python router prefix |
-| `YGG_FASTAPI_EXCEL_PREFIX` | `/excel`      | Excel router prefix |
-| `YGG_FASTAPI_DATABRICKS_CACHE_MAX_SIZE`    | `128` | Max cached Databricks SQL results |
-| `YGG_FASTAPI_DATABRICKS_CACHE_DEFAULT_TTL` | `300` | Default TTL (seconds) |
 
 ---
 
@@ -46,156 +42,65 @@ By default the service listens on `http://127.0.0.1:8000`. Override with the env
 
 1. **Data > Get Data > From Other Sources > Blank Query**
 2. **Advanced Editor**, paste `YggdrasilExcel.pq`
-3. Replace the trailing `in Yggdrasil` with one of the patterns below.
+3. Replace the trailing `in Yggdrasil` with a call:
 
-### Run a Python snippet
+### Run a Python snippet → table
 
 ```powerquery-m
 in Yggdrasil[Execute](
-    "import pyarrow as pa#(lf)df = pa.table({'x': [1,2,3], 'y': ['a','b','c']})",
-    [Packages = {"pyarrow"}, DfName = "df"]
+    "import pandas as pd#(lf)df = pd.DataFrame({'x':[1,2,3], 'y':['a','b','c']})",
+    [Packages = {"pandas"}]
 )
 ```
 
-### Reuse Yggdrasil as a saved query
-
-Save the module as a query named `Yggdrasil`, then reference it:
+### Run inside a named PyEnv, capped rows
 
 ```powerquery-m
-let
-    Ygg    = Yggdrasil,
-    Result = Ygg[Execute](
-        "import pyarrow as pa#(lf)df = pa.table({'x': list(range(100))})",
-        [Packages = {"pyarrow"}, MaxRows = 10]
-    )
-in
-    Result
-```
-
-### Cached snippet (`Prepare`)
-
-```powerquery-m
-let
-    Ygg    = Yggdrasil,
-    Source = Ygg[Prepare](
-        "import polars as pl#(lf)df = pl.DataFrame({'a': [1,2,3]})",
-        [Packages = {"polars"}, ForceRefresh = false]
-    )
-in
-    Source
-```
-
-### Databricks SQL from Excel
-
-Server-side cached so refreshing your sheet doesn't re-hit your warehouse:
-
-```powerquery-m
-in Yggdrasil[DatabricksSQL](
-    "SELECT * FROM main.default.my_table LIMIT 100"
+in Yggdrasil[Execute](
+    "import polars as pl#(lf)df = pl.DataFrame({'n': list(range(1000))})",
+    [Env = "ml-env", MaxRows = 100]
 )
 ```
 
-With explicit connection + cache options:
+### Read a remote file as a typed table
 
 ```powerquery-m
-let
-    Ygg = Yggdrasil,
-    Result = Ygg[DatabricksSQL](
-        "SELECT id, name, amount FROM main.analytics.transactions WHERE amount > 0",
-        [
-            CatalogName   = "main",
-            SchemaName    = "analytics",
-            WarehouseName = "Starter Warehouse",
-            MaxRows       = 500,
-            CacheTtl      = 600,
-            ForceRefresh  = false
-        ]
-    )
-in
-    Result
+in Yggdrasil[ReadFile]("data/sales.parquet")
 ```
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `Host` | text | `null` | Databricks workspace URL (env default if null) |
-| `Token` | text | `null` | Personal Access Token (env default if null) |
-| `CatalogName` | text | `null` | Unity Catalog name |
-| `SchemaName` | text | `null` | Schema / database name |
-| `WarehouseId` | text | `null` | SQL warehouse ID |
-| `WarehouseName` | text | `null` | SQL warehouse name (alternative to ID) |
-| `DfName` | text | `"df"` | Payload name |
-| `MaxRows` | number | `null` | Limit returned rows |
-| `CacheTtl` | number | `null` | Cache lifetime in seconds (`null` → server default 300 s) |
-| `ForceRefresh` | logical | `false` | Bypass the cache and re-execute |
+### Walk the remote filesystem
+
+```powerquery-m
+in Yggdrasil[Files]()        // drill into folders; files load as tables
+```
+
+### Options
+
+`Execute` options record: `Env` (PyEnv name), `DfName` (default `"df"`),
+`Packages` (list, lazily `pip`-installed), `MaxRows`, `Timeout`.
+`ReadFile` options: `SourceFormat` (override parse; default by extension).
 
 ---
 
 ## Power BI Desktop — install the `.mez`
 
-### One-line install (PowerShell)
-
 ```powershell
-# From a local clone
+# from a local clone
 .\install.ps1 -Target PowerBI
-
-# Or directly from GitHub (no clone needed)
+# or straight from GitHub
 .\install.ps1 -Source GitHub -Target PowerBI
 ```
 
-| Parameter | Values | Default | Description |
-|---|---|---|---|
-| `-Source` | `Local`, `GitHub` | `Local` | Where to get the connector sources |
-| `-Target` | `PowerBI`, `Excel`, `Both` | `Both` | Which app to install for |
-| `-Branch` | any branch | `main` | GitHub branch (only with `-Source GitHub`) |
-| `-Repo`   | `owner/repo` | `Platob/Yggdrasil` | GitHub repo (only with `-Source GitHub`) |
-
-### Manual install
-
-1. `.\build.ps1` to produce `Yggdrasil.mez`.
-2. Copy to `%USERPROFILE%\Documents\Power BI Desktop\Custom Connectors\`.
-3. **File > Options > Security > Data Extensions** → *Allow any extension to load without validation or warning*.
-4. Restart Power BI. Connector appears under **Get Data > Other > Yggdrasil (Beta)**.
-
-### Power BI M usage
-
-Run a Python snippet:
+Manual: `.\build.ps1` → copy `Yggdrasil.mez` to
+`%USERPROFILE%\Documents\Power BI Desktop\Custom Connectors\` → enable
+**File > Options > Security > Data Extensions → Allow any extension** →
+restart. Appears under **Get Data > Other > Yggdrasil (Beta)**.
 
 ```powerquery-m
 let
     Source = Yggdrasil.Execute(
-        "import pyarrow as pa#(lf)df = pa.table({'x': [1,2,3], 'y': ['a','b','c']})",
-        [Packages = {"pyarrow"}, DfName = "df"]
-    )
-in
-    Source
-```
-
-Cached snippet (returns a manifest record):
-
-```powerquery-m
-let
-    Source = Yggdrasil.Prepare(
-        "import pyarrow as pa#(lf)df = pa.table({'x': [1,2,3]})",
-        [Packages = {"pyarrow"}, ForceRefresh = false]
-    )
-in
-    Source
-```
-
-Databricks SQL → typed table (server-side cached):
-
-```powerquery-m
-let
-    Source = Yggdrasil.DatabricksSQL(
-        "SELECT id, name, amount FROM main.analytics.transactions LIMIT 100",
-        [
-            CatalogName   = "main",
-            SchemaName    = "analytics",
-            WarehouseName = "Starter Warehouse",
-            MaxRows       = 100,
-            CacheTtl      = 300,
-            ForceRefresh  = false
-        ]
+        "import pandas as pd#(lf)df = pd.DataFrame({'x':[1,2,3]})",
+        [Packages = {"pandas"}]
     )
 in
     Source
@@ -203,12 +108,25 @@ in
 
 ---
 
+## Transport
+
+Tabular endpoints accept `?format=parquet|arrow|json`. The connector
+always requests `parquet` and reads it with `Parquet.Document` — full
+type fidelity, no row-by-row JSON. (The Office.js add-in uses `arrow`,
+decoded by apache-arrow in JS.)
+
+---
+
 ## Troubleshooting
 
-- **Refresh hangs / 503**: confirm the FastAPI service is running on the expected port (`Yggdrasil.Health(...)` returns the build info).
-- **`No module named 'pyarrow'`**: list every package you import in the `Packages = {...}` option so the server installs them lazily.
-- **Databricks 401/403**: ensure `Host` + `Token` are set (option, env, or `~/.databrickscfg` profile) and the warehouse exists.
-- **Stale results in Power BI**: pass `ForceRefresh = true` on the next refresh, or shorten `CacheTtl`.
+- **Refresh hangs / connection refused**: confirm the node is up —
+  `Yggdrasil.Info()` returns the node card.
+- **`No module named X`**: list every imported package in
+  `Packages = {...}` so the node installs it before running.
+- **`snippet did not define 'df'`**: name your result `df` (or pass
+  `DfName`).
+- **Cross-machine**: pass the node URL as the last argument, e.g.
+  `Yggdrasil[Execute](code, [], "http://other-host:8100")`.
 
 ---
 

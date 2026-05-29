@@ -13,6 +13,7 @@ from .api.routers import (
     backend_router as v2_backend_router,
     card_router as v2_card_router,
     dag_router as v2_dag_router,
+    excel_router as v2_excel_router,
     fs_router as v2_fs_router,
     messenger_router as v2_messenger_router,
     network_router as v2_network_router,
@@ -107,6 +108,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     audit = AuditLog(settings)
     app.state.audit = audit
 
+    from .api.services.excel import ExcelService
+
     v2_fs = FsService(settings)
     pyenv = PyEnvService(settings, audit=audit)
     pyfunc = PyFuncService(settings, audit=audit)
@@ -121,6 +124,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     replicate = ReplicateService(settings, pyenv, pyfunc, v2_dag)
     user_svc = UserService(settings)
     v2_messenger = V2MessengerService(settings)
+    excel = ExcelService(settings, fs=v2_fs, pyenv=pyenv)
 
     app.state.fs_service = v2_fs
     app.state.pyenv_service = pyenv
@@ -133,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.replicate_service = replicate
     app.state.user_service = user_svc
     app.state.v2_messenger_service = v2_messenger
+    app.state.excel_service = excel
 
     @app.middleware("http")
     async def local_only_middleware(request: Request, call_next):
@@ -332,6 +337,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(v2_fs_router, prefix=f"{prefix}/v2/fs")
     app.include_router(v2_user_router, prefix=f"{prefix}/v2/user")
     app.include_router(v2_messenger_router, prefix=f"{prefix}/v2/messenger")
+    app.include_router(v2_excel_router, prefix=f"{prefix}/v2/excel")
 
     @app.get(f"{prefix}/v2/audit")
     async def get_audit(limit: int = 100):

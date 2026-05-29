@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import logging
+import os
 import shutil
 import subprocess
 from functools import partial
@@ -14,6 +15,7 @@ import httpx
 from fastapi.concurrency import run_in_threadpool
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.version import VersionInfo
 
 from ...config import Settings
 from ...exceptions import NotFoundError
@@ -21,7 +23,10 @@ from ...ids import make_id
 from ..schemas.pyenv import (
     PyEnvCreate,
     PyEnvEntry,
+    PyEnvEnvVarsResponse,
     PyEnvListResponse,
+    PyEnvPackage,
+    PyEnvPackagesResponse,
     PyEnvResponse,
     PyEnvUpdate,
 )
@@ -41,6 +46,12 @@ class PyEnvService:
         self._envs_root = settings.node_home / "envs"
         self._envs_root.mkdir(parents=True, exist_ok=True)
         self._audit = audit
+        # Resolved python version + installed-library listing per env,
+        # TTL-cached so repeated UI polls don't re-spawn ``pip list``.
+        self._packages_cache: ExpiringDict[int, PyEnvPackagesResponse] = ExpiringDict(
+            default_ttl=settings.pyenv_packages_cache_ttl,
+            max_size=settings.max_environments,
+        )
 
     async def _run(self, fn, /, *args, **kwargs):
         return await run_in_threadpool(partial(fn, *args, **kwargs))
@@ -84,6 +95,7 @@ class PyEnvService:
             name=req.name,
             python_version=req.python_version,
             dependencies=list(req.dependencies),
+            env_vars=dict(req.env_vars),
             path=str(env_path),
             status="creating",
             created_at=now,
@@ -126,6 +138,8 @@ class PyEnvService:
         updates: dict = {"updated_at": now}
         if req.name is not None:
             updates["name"] = req.name
+        if req.env_vars is not None:
+            updates["env_vars"] = dict(req.env_vars)
         hash_name = updates.get("name", entry.name)
         hash_deps = list(entry.dependencies)
         updates["content_hash"] = hashlib.sha256(
@@ -151,6 +165,7 @@ class PyEnvService:
                 self._name_to_id.pop(entry.name, None)
         if entry is None:
             raise NotFoundError(f"PyEnv {env_id!r} not found")
+        self._packages_cache.pop(env_id, None)
         env_path = self._envs_root / str(env_id)
         if env_path.exists():
             shutil.rmtree(env_path, ignore_errors=True)
@@ -158,12 +173,189 @@ class PyEnvService:
             self._audit.log("delete", "pyenv", env_id, detail=f"name={entry.name}")
         return PyEnvResponse(env=entry)
 
+    async def packages(self, env_id: int, *, refresh: bool = False) -> PyEnvPackagesResponse:
+        """Resolved interpreter version + libraries installed in the env.
+
+        Served from a TTL cache (``pyenv_packages_cache_ttl``): the
+        expensive ``uv pip list`` / ``pip list`` subprocess only re-runs
+        once the cached listing expires, so a dashboard polling every few
+        seconds doesn't spawn a process per request. Pass ``refresh=True``
+        to force a fresh read (e.g. right after an install).
+        """
+        entry = await self.get(env_id)  # raises NotFoundError if missing
+        if not refresh:
+            cached = self._packages_cache.get(env_id)
+            if cached is not None:
+                return cached
+        result = await self._run(self._collect_packages, env_id, entry)
+        self._packages_cache.set(env_id, result)
+        return result
+
+    async def packages_by_name(self, name: str, *, refresh: bool = False) -> PyEnvPackagesResponse:
+        """Name-keyed variant of :meth:`packages`.
+
+        PyEnvs are upserted by name, so the name is a stable string
+        identifier — handy for clients (the web UI) that can't carry the
+        int64 ``env_id`` losslessly through JSON.
+        """
+        with self._lock:
+            env_id = self._name_to_id.get(name)
+        if env_id is None:
+            raise NotFoundError(f"PyEnv {name!r} not found")
+        return await self.packages(env_id, refresh=refresh)
+
+    def _collect_packages(self, env_id: int, entry: PyEnvEntry) -> PyEnvPackagesResponse:
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        env_path = Path(entry.path)
+        python_bin = self._venv_python(env_path)
+        python_version = entry.python_version
+        packages: list[PyEnvPackage] = []
+        error: str | None = None
+
+        if not python_bin.exists():
+            return PyEnvPackagesResponse(
+                env_id=env_id, name=entry.name, python_version=python_version,
+                package_count=0, packages=[], cached_at=now,
+                error=f"interpreter not found at {python_bin}",
+            )
+
+        # Resolve the real interpreter version (e.g. ``3.11.15``) rather
+        # than the declared major.minor request (e.g. ``3.11``), and
+        # normalize it through the project's :class:`VersionInfo` so the
+        # rendered form is consistent.
+        try:
+            proc = subprocess.run(
+                [str(python_bin), "-c",
+                 "import sys;print('%d.%d.%d' % sys.version_info[:3])"],
+                check=True, capture_output=True, text=True, timeout=10,
+            )
+            raw = proc.stdout.strip()
+            if raw:
+                try:
+                    python_version = str(VersionInfo.from_string(raw))
+                except ValueError:
+                    python_version = raw
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+        uv = shutil.which("uv")
+        try:
+            if uv:
+                cmd = [uv, "pip", "list", "--python", str(python_bin), "--format", "json"]
+            else:
+                cmd = [str(python_bin), "-m", "pip", "list", "--format", "json"]
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
+            import json
+            for item in json.loads(proc.stdout or "[]"):
+                packages.append(PyEnvPackage(name=item["name"], version=item["version"]))
+            packages.sort(key=lambda p: p.name.lower())
+        except subprocess.CalledProcessError as exc:
+            error = (exc.stderr or str(exc)).strip()
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            error = str(exc)
+
+        return PyEnvPackagesResponse(
+            env_id=env_id, name=entry.name, python_version=python_version,
+            package_count=len(packages), packages=packages, cached_at=now,
+            error=error,
+        )
+
+    @staticmethod
+    def _venv_python(env_path: Path) -> Path:
+        """Path to the venv interpreter, POSIX *and* Windows.
+
+        ``uv venv`` / stdlib ``venv`` put the interpreter under ``bin/``
+        on POSIX and ``Scripts/`` on Windows. Prefer whichever exists;
+        otherwise fall back to the platform-conventional location so
+        callers building a not-yet-created env still get a sensible path.
+        """
+        windows = env_path / "Scripts" / "python.exe"
+        posix = env_path / "bin" / "python"
+        if windows.exists():
+            return windows
+        if posix.exists():
+            return posix
+        return windows if os.name == "nt" else posix
+
+    def python_path_by_name(self, name: str) -> str | None:
+        """Resolve a ready env's interpreter path by env name (or None)."""
+        with self._lock:
+            env_id = self._name_to_id.get(name)
+        return self.get_python_path(env_id) if env_id is not None else None
+
+    # -- environment variables ---------------------------------------------
+
+    def env_vars_for(self, env_id: int | None) -> dict[str, str]:
+        """The env's stored variables (empty dict if missing/unset)."""
+        if env_id is None:
+            return {}
+        with self._lock:
+            entry = self._envs.get(env_id)
+        return dict(entry.env_vars) if entry is not None else {}
+
+    def env_vars_for_name(self, name: str | None) -> dict[str, str]:
+        if not name:
+            return {}
+        with self._lock:
+            env_id = self._name_to_id.get(name)
+        return self.env_vars_for(env_id)
+
+    async def get_env_vars(self, env_id: int) -> "PyEnvEnvVarsResponse":
+        entry = await self.get(env_id)
+        return PyEnvEnvVarsResponse(env_id=env_id, name=entry.name, env_vars=dict(entry.env_vars))
+
+    async def set_env_vars(
+        self, env_id: int, env_vars: dict[str, str], *, replace: bool = False,
+    ) -> "PyEnvEnvVarsResponse":
+        """Replace the whole map, or merge the given keys over the existing."""
+        entry = await self.get(env_id)
+        merged = {str(k): str(v) for k, v in env_vars.items()} if replace \
+            else {**entry.env_vars, **{str(k): str(v) for k, v in env_vars.items()}}
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        with self._lock:
+            current = self._envs.get(env_id, entry)
+            self._envs[env_id] = current.model_copy(update={"env_vars": merged, "updated_at": now})
+        if self._audit is not None:
+            self._audit.log("update", "pyenv", env_id, detail="env_vars")
+        return PyEnvEnvVarsResponse(env_id=env_id, name=entry.name, env_vars=merged)
+
+    def _id_for_name(self, name: str) -> int:
+        with self._lock:
+            env_id = self._name_to_id.get(name)
+        if env_id is None:
+            raise NotFoundError(f"PyEnv {name!r} not found")
+        return env_id
+
+    async def get_env_vars_by_name(self, name: str) -> "PyEnvEnvVarsResponse":
+        return await self.get_env_vars(self._id_for_name(name))
+
+    async def set_env_vars_by_name(
+        self, name: str, env_vars: dict[str, str], *, replace: bool = False,
+    ) -> "PyEnvEnvVarsResponse":
+        return await self.set_env_vars(self._id_for_name(name), env_vars, replace=replace)
+
+    async def delete_env_var_by_name(self, name: str, key: str) -> "PyEnvEnvVarsResponse":
+        return await self.delete_env_var(self._id_for_name(name), key)
+
+    async def delete_env_var(self, env_id: int, key: str) -> "PyEnvEnvVarsResponse":
+        entry = await self.get(env_id)
+        if key not in entry.env_vars:
+            raise NotFoundError(f"env var {key!r} not set on PyEnv {env_id!r}")
+        remaining = {k: v for k, v in entry.env_vars.items() if k != key}
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        with self._lock:
+            current = self._envs.get(env_id, entry)
+            self._envs[env_id] = current.model_copy(update={"env_vars": remaining, "updated_at": now})
+        if self._audit is not None:
+            self._audit.log("update", "pyenv", env_id, detail=f"env_vars-={key}")
+        return PyEnvEnvVarsResponse(env_id=env_id, name=entry.name, env_vars=remaining)
+
     def get_python_path(self, env_id: int) -> str | None:
         with self._lock:
             entry = self._envs.get(env_id)
         if entry is None or entry.status != "ready":
             return None
-        python = Path(entry.path) / "bin" / "python"
+        python = self._venv_python(Path(entry.path))
         return str(python) if python.exists() else None
 
     # -- replication --------------------------------------------------------
@@ -220,6 +412,9 @@ class PyEnvService:
             if dependencies:
                 self._pip_install(env_path, dependencies, uv=uv)
             self._update_entry(env_id, status="ready")
+            # Env is now on disk with its packages — drop any stale
+            # (empty / interpreter-not-found) cached listing.
+            self._packages_cache.pop(env_id, None)
         except subprocess.CalledProcessError as exc:
             self._update_entry(env_id, status="failed", error=exc.stderr or str(exc))
         except Exception as exc:
@@ -232,6 +427,9 @@ class PyEnvService:
             return
         env_path = Path(entry.path)
         uv = shutil.which("uv")
+        # The installed set is about to change either way — invalidate the
+        # cached library listing so the next ``packages()`` re-collects.
+        self._packages_cache.pop(env_id, None)
         try:
             self._pip_install(env_path, packages, uv=uv)
             now = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -248,7 +446,7 @@ class PyEnvService:
             self._update_entry(env_id, error=exc.stderr or str(exc))
 
     def _pip_install(self, env_path: Path, packages: list[str], *, uv: str | None) -> None:
-        python_bin = str(env_path / "bin" / "python")
+        python_bin = str(self._venv_python(env_path))
         if uv:
             cmd = [uv, "pip", "install", "--python", python_bin] + packages
         else:
