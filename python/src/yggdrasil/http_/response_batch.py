@@ -314,15 +314,18 @@ class HTTPResponseBatch(Tabular):
     ) -> int:
         """Number of partitions to scatter *n_misses* HTTP requests into.
 
-        HTTP fan-out is I/O-bound, so we oversubscribe the cluster's cores to
-        keep sockets busy while requests block on the wire. A single-node
-        cluster (``n_executors == 0``: everything runs on the driver in local
-        mode) shares those cores with the driver process, so it oversubscribes
-        more gently (×4) than a multi-node cluster whose executors are
-        dedicated to the scatter (×8). The result is clamped to ``n_misses``
-        (never more partitions than requests) and floored at 1.
+        Each Spark task already multiplexes its slice of requests across the
+        session's own thread pool (``_send_partition`` calls ``send_many``), so
+        the per-socket I/O concurrency is handled *inside* a partition — we do
+        NOT need extra partitions to keep the wire busy. We therefore target
+        roughly one partition per task slot (``defaultParallelism`` ≈ total
+        cores): a single-node cluster (``n_executors == 0``, local mode) gets
+        exactly one partition per core, and a multi-node cluster gets a light
+        ×2 so the scheduler can rebalance stragglers across machines. The
+        result is clamped to ``n_misses`` (never more partitions than requests)
+        and floored at 1.
         """
-        oversubscribe = 4 if n_executors == 0 else 8
+        oversubscribe = 1 if n_executors == 0 else 2
         return max(1, min(n_misses, max(cluster_cores, 1) * oversubscribe))
 
     def _spark_scatter(

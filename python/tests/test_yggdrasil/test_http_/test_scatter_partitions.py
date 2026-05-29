@@ -13,13 +13,15 @@ _count = HTTPResponseBatch._scatter_partition_count
 
 class TestScatterPartitionCount:
 
-    def test_single_node_oversubscribes_cores_by_4(self):
-        # n_executors == 0 → single node → ×4 oversubscription, clamped by misses.
-        assert _count(1000, 8, 0) == 32
+    def test_single_node_one_partition_per_core(self):
+        # n_executors == 0 → single node → one partition per task slot.
+        # In-partition threads handle the I/O concurrency, so no oversubscribe.
+        assert _count(1000, 8, 0) == 8
 
-    def test_multi_node_oversubscribes_cores_by_8(self):
-        # n_executors > 0 → multi node → ×8 oversubscription.
-        assert _count(1000, 8, 4) == 64
+    def test_multi_node_light_2x_for_straggler_rebalance(self):
+        # n_executors > 0 → multi node → light ×2 so the scheduler can
+        # rebalance stragglers across machines.
+        assert _count(1000, 8, 4) == 16
 
     def test_multi_node_uses_more_partitions_than_single_node(self):
         # Same cores, dedicated executors → strictly more partitions.
@@ -41,4 +43,4 @@ class TestScatterPartitionCount:
 
     def test_fallback_default_single_node(self):
         # Mirrors the probe's except-branch defaults (cores=8, executors=0).
-        assert _count(1000, 8, 0) == 32
+        assert _count(1000, 8, 0) == 8
