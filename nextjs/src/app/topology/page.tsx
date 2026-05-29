@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { getTopology } from "@/lib/api";
 import type { TopologyResponse, TopologyNode } from "@/lib/types";
@@ -223,7 +223,10 @@ export default function TopologyPage() {
                     <td className="px-2 py-2 font-mono text-muted">
                       {node.host}:{node.port}
                     </td>
-                    <td className="px-2 py-2 text-right font-mono" style={{ color: cpuC }}>
+                    <td
+                      className="px-2 py-2 text-right font-mono"
+                      style={{ color: cpuC, textShadow: node.cpu_percent >= 50 ? `0 0 8px ${loadGlow(node.cpu_percent)}` : "none" }}
+                    >
                       {node.cpu_percent.toFixed(1)}
                     </td>
                     <td className="px-2 py-2 text-right font-mono" style={{ color: memC }}>

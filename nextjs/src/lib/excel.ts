@@ -158,11 +158,11 @@ function sheetName(base: string, taken: string[]): string {
 
 // Drop a grid onto a fresh worksheet and autofit.
 export async function gridToNewSheet(grid: Grid, name: string): Promise<void> {
-  await Excel.run(async (ctx: any) => {
+  await Excel.run(async (ctx: OfficeAny) => {
     const sheets = ctx.workbook.worksheets;
     sheets.load("items/name");
     await ctx.sync();
-    const taken = (sheets.items ?? []).map((s: any) => s.name as string);
+    const taken = (sheets.items ?? []).map((s: OfficeAny) => s.name as string);
     const sheet = sheets.add(sheetName(name, taken));
     const nRows = grid.rows.length + 1;
     const nCols = Math.max(grid.headers.length, 1);
@@ -178,7 +178,7 @@ export async function gridToNewSheet(grid: Grid, name: string): Promise<void> {
 // Read the active worksheet's used range into a grid (first row = headers).
 // Tolerates an empty sheet (getUsedRange throws otherwise).
 export async function activeSheetToGrid(): Promise<Grid> {
-  return Excel.run(async (ctx: any) => {
+  return Excel.run(async (ctx: OfficeAny) => {
     const range = ctx.workbook.worksheets.getActiveWorksheet().getUsedRangeOrNullObject();
     range.load(["values", "isNullObject"]);
     await ctx.sync();

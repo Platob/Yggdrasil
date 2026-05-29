@@ -77,7 +77,7 @@ export default function TaskPane() {
     } catch (e) {
       setStatus({ kind: "err", msg: String((e as Error).message) });
     }
-  }, [base, code, env, packages]);
+  }, [base, code, env, packages, envVars]);
 
   const browse = useCallback(async (path: string) => {
     setStatus({ kind: "busy", msg: "Listing…" });

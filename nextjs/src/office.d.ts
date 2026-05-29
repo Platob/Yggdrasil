@@ -1,9 +1,17 @@
 // Minimal ambient declarations for the Office.js globals the Excel
 // task-pane uses. Office.js is loaded at runtime from Microsoft's CDN
 // (see the taskpane page); we don't bundle @types/office-js, so the
-// surface is typed loosely as `any` — enough to keep tsc happy.
+// surface is typed loosely as `any` — enough to keep tsc happy. The loose
+// typing is deliberate here, so silence the rule for this shim file only.
+/* eslint-disable @typescript-eslint/no-explicit-any */
 declare const Office: any;
 declare const Excel: any;
+
+// Explicit alias for the loose Office.js callback contexts (e.g. the
+// `ctx` in `Excel.run`). Annotating with this — rather than leaving the
+// param untyped — keeps tsc's noImplicitAny happy without sprinkling the
+// `any` keyword (and its lint error) across the call sites.
+type OfficeAny = any;
 
 interface Window {
   Office?: any;
