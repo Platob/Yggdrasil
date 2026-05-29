@@ -319,6 +319,24 @@ class PyEnvService:
             self._audit.log("update", "pyenv", env_id, detail="env_vars")
         return PyEnvEnvVarsResponse(env_id=env_id, name=entry.name, env_vars=merged)
 
+    def _id_for_name(self, name: str) -> int:
+        with self._lock:
+            env_id = self._name_to_id.get(name)
+        if env_id is None:
+            raise NotFoundError(f"PyEnv {name!r} not found")
+        return env_id
+
+    async def get_env_vars_by_name(self, name: str) -> "PyEnvEnvVarsResponse":
+        return await self.get_env_vars(self._id_for_name(name))
+
+    async def set_env_vars_by_name(
+        self, name: str, env_vars: dict[str, str], *, replace: bool = False,
+    ) -> "PyEnvEnvVarsResponse":
+        return await self.set_env_vars(self._id_for_name(name), env_vars, replace=replace)
+
+    async def delete_env_var_by_name(self, name: str, key: str) -> "PyEnvEnvVarsResponse":
+        return await self.delete_env_var(self._id_for_name(name), key)
+
     async def delete_env_var(self, env_id: int, key: str) -> "PyEnvEnvVarsResponse":
         entry = await self.get(env_id)
         if key not in entry.env_vars:

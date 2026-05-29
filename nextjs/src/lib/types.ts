@@ -215,6 +215,13 @@ export interface PyEnvEntry {
   content_hash: string;
   replicated_at: string | null;
   replicated_from: string | null;
+  env_vars: Record<string, string>;
+}
+
+export interface PyEnvEnvVars {
+  env_id: number;
+  name: string;
+  env_vars: Record<string, string>;
 }
 
 export interface PyEnvPackage {

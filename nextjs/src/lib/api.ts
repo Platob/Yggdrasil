@@ -18,6 +18,7 @@ import type {
   NodeCard,
   NodeMeta,
   PyEnvEntry,
+  PyEnvEnvVars,
   PyEnvPackages,
   PyFuncEntry,
   PyFuncRunEntry,
@@ -104,6 +105,24 @@ export function getEnvs(): Promise<{ node_id: string; envs: PyEnvEntry[] }> {
 
 export function getExcelInfo(): Promise<ExcelInfo> {
   return jsonFetch<ExcelInfo>("/api/v2/excel/info");
+}
+
+export function setEnvVars(
+  envName: string,
+  env_vars: Record<string, string>,
+  replace = false,
+): Promise<PyEnvEnvVars> {
+  return jsonFetch<PyEnvEnvVars>(`/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/env`, {
+    method: "PUT",
+    body: JSON.stringify({ env_vars, replace }),
+  });
+}
+
+export function deleteEnvVar(envName: string, key: string): Promise<PyEnvEnvVars> {
+  return jsonFetch<PyEnvEnvVars>(
+    `/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/env/${encodeURIComponent(key)}`,
+    { method: "DELETE" },
+  );
 }
 
 export function getEnvPackages(envName: string): Promise<PyEnvPackages> {

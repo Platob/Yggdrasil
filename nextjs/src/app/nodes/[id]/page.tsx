@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { ResourceBar } from "@/components/ResourceBar";
-import { getBackend, getEnvs, getEnvPackages, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs } from "@/lib/api";
+import { getBackend, getEnvs, getEnvPackages, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs, setEnvVars, deleteEnvVar } from "@/lib/api";
 import type { NodeBackend, NodeCard, PyEnvEntry, PyEnvPackages, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
 
 function formatUptime(seconds: number): string {
@@ -102,6 +102,30 @@ export default function NodeDetailPage() {
   const [expandedEnvName, setExpandedEnvName] = useState<string | null>(null);
   const [envPackages, setEnvPackages] = useState<Record<string, PyEnvPackages>>({});
   const [loadingEnvPkgs, setLoadingEnvPkgs] = useState(false);
+
+  // env-var editing: draft {key,val} per env name
+  const [evDraft, setEvDraft] = useState<Record<string, { k: string; v: string }>>({});
+
+  const applyEnvVars = useCallback((name: string, env_vars: Record<string, string>) => {
+    setEnvs((prev) => prev.map((e) => (e.name === name ? { ...e, env_vars } : e)));
+  }, []);
+
+  const addEnvVar = useCallback(async (name: string) => {
+    const d = evDraft[name];
+    if (!d || !d.k.trim()) return;
+    try {
+      const res = await setEnvVars(name, { [d.k.trim()]: d.v });
+      applyEnvVars(name, res.env_vars);
+      setEvDraft((prev) => ({ ...prev, [name]: { k: "", v: "" } }));
+    } catch { /* surfaced by status elsewhere */ }
+  }, [evDraft, applyEnvVars]);
+
+  const removeEnvVar = useCallback(async (name: string, key: string) => {
+    try {
+      const res = await deleteEnvVar(name, key);
+      applyEnvVars(name, res.env_vars);
+    } catch { /* ignore */ }
+  }, [applyEnvVars]);
 
   const toggleEnv = useCallback(async (envName: string) => {
     if (expandedEnvName === envName) {
@@ -519,6 +543,41 @@ export default function NodeDetailPage() {
                       ) : (
                         <p className="text-[10px] text-muted/60 italic py-1">No libraries installed</p>
                       )}
+
+                      {/* Environment variables */}
+                      <div className="mt-3 pt-2 border-t border-white/[0.06]">
+                        <p className="text-[9px] font-bold uppercase tracking-widest text-muted mb-1.5">Env vars</p>
+                        {Object.keys(env.env_vars ?? {}).length === 0 ? (
+                          <p className="text-[10px] text-muted/60 italic">None set</p>
+                        ) : (
+                          <div className="space-y-0.5 mb-1.5">
+                            {Object.entries(env.env_vars).map(([k, v]) => (
+                              <div key={k} className="flex items-center justify-between text-[10px] font-mono group">
+                                <span className="text-foreground-dim">{k}</span>
+                                <span className="flex items-center gap-2">
+                                  <span className="text-muted truncate max-w-[120px]" title={v}>{v}</span>
+                                  <button className="text-[var(--rose)] opacity-60 hover:opacity-100" onClick={() => removeEnvVar(env.name, k)} title="remove">✕</button>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <div className="flex items-center gap-1">
+                          <input
+                            className="flex-1 min-w-0 bg-white/[0.03] border border-white/[0.06] rounded px-1.5 py-1 text-[10px] font-mono"
+                            placeholder="KEY"
+                            value={evDraft[env.name]?.k ?? ""}
+                            onChange={(e) => setEvDraft((p) => ({ ...p, [env.name]: { k: e.target.value, v: p[env.name]?.v ?? "" } }))}
+                          />
+                          <input
+                            className="flex-1 min-w-0 bg-white/[0.03] border border-white/[0.06] rounded px-1.5 py-1 text-[10px] font-mono"
+                            placeholder="value"
+                            value={evDraft[env.name]?.v ?? ""}
+                            onChange={(e) => setEvDraft((p) => ({ ...p, [env.name]: { k: p[env.name]?.k ?? "", v: e.target.value } }))}
+                          />
+                          <button className="text-[10px] px-2 py-1 rounded bg-white/[0.05] border border-white/[0.08] hover:bg-white/[0.1]" onClick={() => addEnvVar(env.name)}>add</button>
+                        </div>
+                      </div>
                     </div>
                   )}
                 </div>

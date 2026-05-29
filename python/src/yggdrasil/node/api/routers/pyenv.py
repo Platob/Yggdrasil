@@ -79,6 +79,34 @@ async def list_env_packages(
     return await service.packages(env_id, refresh=refresh)
 
 
+@router.get("/by-name/{name}/env", response_model=PyEnvEnvVarsResponse)
+async def get_env_vars_by_name(
+    name: str,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    """Env vars by env name (the web UI uses this — int64 ids don't
+    survive JSON.parse losslessly)."""
+    return await service.get_env_vars_by_name(name)
+
+
+@router.put("/by-name/{name}/env", response_model=PyEnvEnvVarsResponse)
+async def set_env_vars_by_name(
+    name: str,
+    req: PyEnvEnvVarsUpdate,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    return await service.set_env_vars_by_name(name, req.env_vars, replace=req.replace)
+
+
+@router.delete("/by-name/{name}/env/{key}", response_model=PyEnvEnvVarsResponse)
+async def delete_env_var_by_name(
+    name: str,
+    key: str,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    return await service.delete_env_var_by_name(name, key)
+
+
 @router.get("/{env_id}/env", response_model=PyEnvEnvVarsResponse)
 async def get_env_vars(
     env_id: int,
