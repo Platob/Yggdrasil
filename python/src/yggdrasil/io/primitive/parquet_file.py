@@ -234,7 +234,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         # the whole object. A plain full read keeps the single-GET
         # snapshot (one big read beats many ranged round trips).
         holder = getattr(self, "_parent", None)
-        ranged = options.target is not None and hasattr(holder, "arrow_random_access_file")
+        ranged = options.target is not None and getattr(holder, "SUPPORTS_RANGED_RANDOM_ACCESS", False)
         try:
             stream_ctx = holder.arrow_random_access_file() if ranged else self.arrow_input_stream()
             stream = stream_ctx.__enter__()
@@ -279,7 +279,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         # otherwise snapshot the whole object in one GET. See
         # :meth:`_read_arrow_batches` for the rationale.
         holder = getattr(self, "_parent", None)
-        ranged = options.target is not None and hasattr(holder, "arrow_random_access_file")
+        ranged = options.target is not None and getattr(holder, "SUPPORTS_RANGED_RANDOM_ACCESS", False)
         try:
             ctx = holder.arrow_random_access_file() if ranged else self.arrow_input_stream()
             with ctx as v:

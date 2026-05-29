@@ -407,8 +407,21 @@ class Memory(IO):
             # the same zero padding at half the peak. Incremental appends
             # (cur > 0) keep the amortized in-place ``extend``.
             self._buf = bytearray(new_cap)
-        else:
+            return
+        try:
             self._buf.extend(b"\x00" * (new_cap - cur))
+        except BufferError:
+            # A zero-copy reader (e.g. ``arrow_input_stream``) holds a
+            # memoryview into this buffer, which locks it against
+            # in-place resize. Copy-on-write: grow into a fresh buffer,
+            # leaving the old one intact for the exporter. This is
+            # exactly the read-modify-write shape (append / upsert reads
+            # the pre-write bytes through the view while the writer
+            # builds the new object), so the reader keeps the old data
+            # and the writer's bytes land in the new buffer.
+            new_buf = bytearray(new_cap)
+            new_buf[:cur] = self._buf
+            self._buf = new_buf
 
     def truncate(self, n: int) -> int:
         if n < 0:

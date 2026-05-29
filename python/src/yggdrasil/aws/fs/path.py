@@ -120,6 +120,21 @@ class S3Path(RemotePath):
     #: URL schemes accepted on input; always normalized to ``s3``.
     _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = frozenset({"s3", "s3a", "s3n"})
 
+    # ``_read_mv`` range-reads via ``GetObject`` Range, so Parquet
+    # projection pulls the footer + projected chunks only (inherited
+    # :meth:`RemotePath.arrow_random_access_file`).
+    SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True
+
+    # At / above ``MULTIPART_THRESHOLD`` an upload runs through boto3's
+    # managed transfer (``upload_fileobj`` + :class:`TransferConfig`),
+    # which splits the object into ``MULTIPART_CHUNKSIZE`` parts uploaded
+    # by up to ``MULTIPART_CONCURRENCY`` threads — past the 5 GiB
+    # single-PUT ceiling and faster on large objects. Below it, a single
+    # ``put_object`` (no extra copy). Tunable per instance / subclass.
+    MULTIPART_THRESHOLD: ClassVar[int] = 100 * 1024 * 1024
+    MULTIPART_CHUNKSIZE: ClassVar[int] = 16 * 1024 * 1024
+    MULTIPART_CONCURRENCY: ClassVar[int] = 8
+
     # ==================================================================
     # Singleton key
     # ==================================================================
@@ -667,12 +682,37 @@ class S3Path(RemotePath):
     def _upload(self, content: bytes) -> int:
         size = len(content)
         LOGGER.debug("Writing S3 object %r (bytes=%d)", self, size)
-        self._call(
-            self.client.put_object,
-            Bucket=self.bucket,
-            Key=self.key,
-            Body=content,
-        )
+        if size >= self.MULTIPART_THRESHOLD:
+            # Managed multipart: boto3 splits into MULTIPART_CHUNKSIZE
+            # parts and uploads up to MULTIPART_CONCURRENCY in parallel,
+            # also lifting the 5 GiB single-PUT cap. ``upload_fileobj``
+            # streams the BytesIO in chunk-sized reads, so peak transfer
+            # memory is bounded by chunksize × concurrency rather than
+            # another full copy.
+            import io as _io
+
+            from boto3.s3.transfer import TransferConfig
+
+            config = TransferConfig(
+                multipart_threshold=self.MULTIPART_THRESHOLD,
+                multipart_chunksize=self.MULTIPART_CHUNKSIZE,
+                max_concurrency=self.MULTIPART_CONCURRENCY,
+                use_threads=True,
+            )
+            self._call(
+                self.client.upload_fileobj,
+                _io.BytesIO(content),
+                self.bucket,
+                self.key,
+                Config=config,
+            )
+        else:
+            self._call(
+                self.client.put_object,
+                Bucket=self.bucket,
+                Key=self.key,
+                Body=content,
+            )
         LOGGER.info("Wrote S3 object %r (bytes=%d)", self, size)
         self._persist_stat_cache(
             IOStats(

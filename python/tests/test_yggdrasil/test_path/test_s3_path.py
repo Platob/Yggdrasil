@@ -326,3 +326,99 @@ class TestS3PathSingleton:
             singleton_ttl=300,
         )
         assert a is not b
+
+
+# ---------------------------------------------------------------------------
+# TestS3MultipartUpload — large objects route through boto3 managed transfer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(_RealS3Path is None, reason="boto3 / S3Path not available")
+class TestS3MultipartUpload:
+    """Mirror of VolumePath's multipart: a large upload runs through
+    boto3's parallel managed transfer; a small one stays a single PUT."""
+
+    @staticmethod
+    def _real_with_mock_client():
+        from unittest.mock import MagicMock
+
+        svc = MagicMock()
+        client = MagicMock()
+        svc.boto_client = client
+        p = _RealS3Path(url=URL.from_("s3://bucket/obj.bin"), service=svc,
+                        singleton_ttl=False)
+        return p, client
+
+    def test_small_upload_uses_put_object(self):
+        p, client = self._real_with_mock_client()
+        p._upload(b"small payload")
+        client.put_object.assert_called_once()
+        client.upload_fileobj.assert_not_called()
+
+    def test_large_upload_uses_managed_multipart(self, monkeypatch):
+        from boto3.s3.transfer import TransferConfig
+
+        p, client = self._real_with_mock_client()
+        monkeypatch.setattr(type(p), "MULTIPART_THRESHOLD", 1024)
+        monkeypatch.setattr(type(p), "MULTIPART_CHUNKSIZE", 256)
+        monkeypatch.setattr(type(p), "MULTIPART_CONCURRENCY", 4)
+
+        p._upload(b"x" * 4096)
+
+        client.upload_fileobj.assert_called_once()
+        client.put_object.assert_not_called()
+        args, kwargs = client.upload_fileobj.call_args
+        # (fileobj, bucket, key, Config=TransferConfig)
+        assert args[1] == "bucket"
+        assert args[2] == "obj.bin"
+        config = kwargs["Config"]
+        assert isinstance(config, TransferConfig)
+        assert config.multipart_chunksize == 256
+        assert config.max_request_concurrency == 4
+
+
+# ---------------------------------------------------------------------------
+# TestRangedProjection — shared RemotePath.arrow_random_access_file
+# ---------------------------------------------------------------------------
+
+
+class TestRangedProjection:
+    """A ranged-capable backend (SUPPORTS_RANGED_RANDOM_ACCESS) projects
+    Parquet columns through bounded reads, not a whole-object snapshot —
+    the same mechanism VolumePath uses, exercised here over the stub."""
+
+    def test_column_projection_uses_bounded_ranged_reads(self):
+        import io as _io
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        class _RangedStub(_StubS3Path):
+            SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True
+            reads: ClassVar[list] = []
+
+            def _read_mv(self, n: int, pos: int) -> memoryview:
+                type(self).reads.append((n, pos))
+                return super()._read_mv(n, pos)
+
+        table = pa.table(
+            {f"c{i}": pa.array(range(5000), type=pa.int64()) for i in range(8)}
+        )
+        sink = _io.BytesIO()
+        pq.write_table(table, sink, row_group_size=500)
+        _RangedStub._STORAGE["b/wide.parquet"] = sink.getvalue()
+        _RangedStub.reads.clear()
+
+        p = _RangedStub(url=URL.from_("s3://b/wide.parquet"), singleton_ttl=False)
+        got = ParquetFile(holder=p, owns_holder=False).read_arrow_table(
+            target=pa.schema([("c3", pa.int64())]),
+        )
+        assert got.column_names == ["c3"]
+        assert got.num_rows == 5000
+        assert got.column("c3").to_pylist()[:3] == [0, 1, 2]
+        # Ranged: the reader seeked to footer + column chunks (several
+        # bounded reads), not one whole-object snapshot.
+        assert len(_RangedStub.reads) >= 2
+        assert all(n != -1 for (n, _pos) in _RangedStub.reads)

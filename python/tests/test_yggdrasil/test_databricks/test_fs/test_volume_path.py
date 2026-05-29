@@ -1927,7 +1927,7 @@ class TestS3ServiceArrowFilesystem:
             session_token="tok",
             region="us-east-1",
         )
-        service = S3Service(service=service)
+        service = S3Service(client=client)
         fs = service.arrow_filesystem()
         assert isinstance(fs, pafs.S3FileSystem)
 
@@ -1943,7 +1943,7 @@ class TestS3ServiceArrowFilesystem:
             secret_access_key="secret",
             region="us-east-1",
         )
-        service = S3Service(service=service)
+        service = S3Service(client=client)
         # The override region should land on the pyarrow filesystem;
         # there isn't a public reader on S3FileSystem for the region,
         # but constructing without error is sufficient signal.

@@ -54,7 +54,6 @@ path runs unchanged.
 
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
 import io
 import json
@@ -187,6 +186,11 @@ class VolumePath(DatabricksPath):
     MULTIPART_PART_SIZE: ClassVar[int] = 16 * 1024 * 1024
     MULTIPART_MAX_PARTS: ClassVar[int] = 1000
     MULTIPART_PARALLELISM: ClassVar[int] = 8
+
+    # ``_read_mv`` range-reads via the Files API, so Parquet projection
+    # can pull the footer + projected chunks only (see
+    # :meth:`RemotePath.arrow_random_access_file`).
+    SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True
 
     # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
@@ -1278,27 +1282,6 @@ class VolumePath(DatabricksPath):
 
         return memoryview(data)
 
-    @contextlib.contextmanager
-    def arrow_random_access_file(self):
-        """Yield a pyarrow random-access file backed by ranged ``_read_mv``.
-
-        Lets pyarrow readers seek and pull only the bytes they touch —
-        a Parquet column / row-group projection fetches the footer plus
-        the projected chunks over HTTP Range, instead of snapshotting
-        the whole object the way :meth:`arrow_input_stream` does.
-        :class:`ParquetFile` reaches for this (duck-typed) when a column
-        projection is bound; a full read still snapshots.
-        """
-        import pyarrow as pa
-
-        handle = pa.PythonFile(
-            _VolumeRandomAccessReader(self, int(self.size)), mode="r",
-        )
-        try:
-            yield handle
-        finally:
-            handle.close()
-
     def _write_stream(
         self,
         src: Any,
@@ -1436,66 +1419,6 @@ class VolumePath(DatabricksPath):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class _VolumeRandomAccessReader:
-    """Seekable binary reader over a :class:`VolumePath`'s ranged ``_read_mv``.
-
-    Wrapped in :class:`pyarrow.PythonFile` so pyarrow issues HTTP Range
-    reads for the bytes it actually touches (a Parquet footer + projected
-    column chunks) instead of downloading the whole object. Read-only;
-    bounded by the path's known size so a seek-to-end resolves without a
-    fetch.
-    """
-
-    __slots__ = ("_holder", "_size", "_pos")
-
-    def __init__(self, holder: "VolumePath", size: int) -> None:
-        self._holder = holder
-        self._size = size
-        self._pos = 0
-
-    def readable(self) -> bool:
-        return True
-
-    def writable(self) -> bool:
-        return False
-
-    def seekable(self) -> bool:
-        return True
-
-    @property
-    def closed(self) -> bool:
-        return False
-
-    def tell(self) -> int:
-        return self._pos
-
-    def seek(self, offset: int, whence: int = 0) -> int:
-        if whence == 0:
-            self._pos = offset
-        elif whence == 1:
-            self._pos += offset
-        else:
-            self._pos = self._size + offset
-        return self._pos
-
-    def read(self, n: int = -1) -> bytes:
-        if n is None or n < 0:
-            data = bytes(self._holder._read_mv(-1, self._pos))
-        else:
-            remaining = self._size - self._pos
-            if n == 0 or remaining <= 0:
-                return b""
-            data = bytes(self._holder._read_mv(min(n, remaining), self._pos))
-        self._pos += len(data)
-        return data
-
-    def flush(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
 
 
 def _header(headers, name: str) -> "str | None":
