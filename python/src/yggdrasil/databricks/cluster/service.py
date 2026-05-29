@@ -559,9 +559,9 @@ class Clusters(DatabricksService):
         cnt, limit = 0, limit or float("inf")
 
         if sources is ...:
-            sources = [ClusterSource.API]
+            sources = [ClusterSource.API, ClusterSource.UI]
 
-        filter_by = ListClustersFilterBy(cluster_sources=sources) if name else None
+        filter_by = ListClustersFilterBy(cluster_sources=sources)
 
         for details in client.list(filter_by=filter_by):
             if name:
