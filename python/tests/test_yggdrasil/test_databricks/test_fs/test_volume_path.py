@@ -1,4 +1,18 @@
-"""Mock-driven tests for :class:`VolumePath`."""
+"""Mock-driven tests for :class:`VolumePath`.
+
+:class:`VolumePath` now issues Databricks Files-API traffic over
+yggdrasil's own :class:`HTTPSession` (``/api/2.0/fs/files`` /
+``/api/2.0/fs/directories``) instead of the SDK's ``workspace.files``
+client. To keep this unit suite focused on :class:`VolumePath`'s own
+logic — URL building, status → exception translation, pagination,
+parent auto-creation — without standing up a real workspace, the
+``client`` fixture wires a :class:`_FakeFilesSession` that translates
+each Files-API HTTP call back onto the same ``workspace.files``
+MagicMock the tests already configure. Real wire retry / stream-resume
+lives in the :class:`HTTPSession` tests; :class:`TestTransportResilience`
+exercises the volume ↔ session integration against a real session with
+a stubbed socket layer.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +25,12 @@ import pytest
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.volume.volumes import Volumes
 from yggdrasil.io.io_stats import IOKind
+from yggdrasil.url import URL
+
+from tests.test_yggdrasil.test_databricks._files_fake import (
+    FakeResp as _FakeResp,
+    wire_files_session,
+)
 
 
 class NotFound(Exception):
@@ -60,7 +80,11 @@ def reset_volume_info_cache():
 
 @pytest.fixture
 def client():
-    return MagicMock()
+    # Files-API transport seam — ``VolumePath`` reaches the workspace
+    # over ``client.files_session().fetch`` with an Authorization header
+    # from ``client.files_authorization()``, against ``client.base_url``.
+    # The fake session translates each call back onto ``workspace.files``.
+    return wire_files_session(MagicMock())
 
 
 @pytest.fixture
@@ -313,11 +337,8 @@ class TestWrite:
     def test_stream_input_routes_through_upload(
         self, workspace, client, service
     ) -> None:
-        """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
-        :class:`IO[bytes]` and lands on one ``files.upload`` call."""
+        """A caller-supplied ``BinaryIO`` lands on one ``PUT /files`` upload."""
         import io
-
-        from yggdrasil.io.base import IO as _IO
 
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
@@ -326,44 +347,34 @@ class TestWrite:
         p.write_bytes(stream)
 
         kwargs = workspace.files.upload.call_args.kwargs
-        # SDK sees the yggdrasil IO[bytes] wrapper; one upload, no
-        # chunked RMW loop.
-        assert isinstance(kwargs["contents"], _IO)
+        # The whole stream is read into a replayable byte body and PUT
+        # once — no chunked RMW loop, no per-attempt rewind dance.
+        assert isinstance(kwargs["contents"], io.BytesIO)
+        assert kwargs["contents"].getvalue() == b"streamed-payload"
         assert workspace.files.upload.call_count == 1
 
-    def test_stream_input_seeks_to_origin_on_retry(
+    def test_stream_input_read_into_replayable_body(
         self, workspace, client, service
     ) -> None:
-        """Transient ``files.upload`` failures must rewind a stream input."""
-        import io
-        from unittest.mock import patch
+        """A stream is drained into bytes up front so a transport-layer
+        replay PUTs the full body, not an empty tail.
 
-        from databricks.sdk.errors import InternalError
+        The seek-on-retry dance the SDK path needed is gone: the body is
+        already bytes by the time it reaches the wire, so the
+        :class:`HTTPSession`'s own retry/resume replays it verbatim.
+        """
+        import io
 
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
 
-        seen: list[bytes] = []
-        calls = {"n": 0}
+        VolumePath("/Volumes/c/s/v/x", service=service).write_bytes(
+            io.BytesIO(b"abcdef"),
+        )
 
-        def upload_side_effect(**kwargs: object) -> None:
-            calls["n"] += 1
-            stream = kwargs["contents"]
-            stream.read()  # type: ignore[union-attr]
-            if calls["n"] == 1:
-                raise InternalError("flaky")
-            stream.seek(0)
-            seen.append(stream.read())  # type: ignore[union-attr]
-
-        workspace.files.upload.side_effect = upload_side_effect
-
-        with patch("yggdrasil.path._retry.time.sleep"):
-            VolumePath("/Volumes/c/s/v/x", service=service).write_bytes(
-                io.BytesIO(b"abcdef"),
-            )
-
-        assert calls["n"] == 2
-        assert seen == [b"abcdef"]
+        assert workspace.files.upload.call_count == 1
+        sent = workspace.files.upload.call_args.kwargs["contents"]
+        assert sent.getvalue() == b"abcdef"
 
     def test_pwrite_does_rmw(self, workspace, client, service) -> None:
         workspace.files.get_metadata.return_value = _file_meta(5)
@@ -719,6 +730,14 @@ class TestVolumeAutoCreate:
     (``create_directory`` on the parent) and only blind-create the
     catalog / schema / managed volume when that fails NotFound."""
 
+    @pytest.fixture(autouse=True)
+    def _missing_stat(self, workspace):
+        # These cases write brand-new files; the pre-write stat probe
+        # must read MISSING so the flow proceeds to the upload whose
+        # parent auto-creation they exercise.
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+
     def test_only_subdir_missing_skips_volume_create(
         self, workspace, client, service
     ) -> None:
@@ -946,42 +965,86 @@ class TestVolumeAutoCreate:
         self, workspace, client, service
     ) -> None:
         # Path too shallow to address a volume — auto-create can't help,
-        # so the original error must surface.
+        # so the error must surface. (The Files API 404 surfaces as
+        # FileNotFoundError now that the transport is plain HTTP.)
         workspace.files.upload.side_effect = NotFound("does not exist")
         p = VolumePath("/Volumes/onlycat", service=service)
-        with pytest.raises(NotFound):
+        with pytest.raises(FileNotFoundError):
             p.write_bytes(b"x")
         workspace.volumes.create.assert_not_called()
 
 
-class TestRetryPolicy:
+class TestTransportResilience:
+    """Reads / writes now flow over yggdrasil's :class:`HTTPSession`, which
+    owns the transient-retry + resume-on-disconnect policy the SDK's Files
+    client handled poorly. Verify the volume ↔ session integration against
+    a *real* session with the socket send stubbed."""
 
-    @pytest.fixture
-    def sleeps(self):
-        recorded: list[float] = []
-        return recorded, recorded.append
+    def test_read_survives_transient_ssl_eof(self, client, service) -> None:
+        # A mid-flight ``UNEXPECTED_EOF`` on the first wire send must be
+        # retried by the session and the read must still complete — the
+        # exact failure the SDK Files client mishandles.
+        import datetime as _dt
+        import ssl
 
-    def test_internal_error_retries(self, workspace, client, service, sleeps) -> None:
-        recorded, spy = sleeps
-        attempts = [InternalError(), InternalError(), _file_meta(3)]
+        from yggdrasil.http_ import HTTPSession
+        from yggdrasil.http_.response import HTTPResponse
 
-        def get_metadata(path):
-            r = attempts.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
+        host = "https://resilience-probe.databricks.com"
+        client.base_url = URL.from_(host)
+        client.files_authorization.return_value = "Bearer t"
+        session = HTTPSession(base_url=host, verify=False)
+        client.files_session.return_value = session
 
-        workspace.files.get_metadata.side_effect = get_metadata
-        # Leaf carries ``.`` so the file-first heuristic routes the
-        # InternalError-then-success sequence through
-        # ``get_metadata`` rather than ``get_directory_metadata``.
-        p = VolumePath(
-            "/Volumes/c/s/v/x.bin",
-            service=service,
-            retry_sleep=spy,
-        )
-        assert p.size == 3
-        assert recorded == [1.0, 1.0]
+        calls = {"n": 0}
+
+        def fake_send_once(*, request, **_kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ssl.SSLError(
+                    "EOF occurred in violation of protocol (_ssl.c:1, "
+                    "UNEXPECTED_EOF)"
+                )
+            return HTTPResponse(
+                request=request,
+                status_code=200,
+                headers={},
+                tags={},
+                buffer=b"hello",
+                received_at=_dt.datetime.now(_dt.timezone.utc),
+            )
+
+        session._send_once = fake_send_once
+
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
+        assert p.read_bytes() == b"hello"
+        # First attempt raised the transient EOF; the session retried and
+        # the second attempt delivered the body.
+        assert calls["n"] == 2
+
+    def test_server_error_surfaces_after_session_retries(
+        self, client, service
+    ) -> None:
+        # When the workspace keeps returning 503, the session exhausts its
+        # retries and the volume op fails loudly rather than silently
+        # returning empty data.
+        host = "https://error-probe.databricks.com"
+        client.base_url = URL.from_(host)
+        client.files_authorization.return_value = "Bearer t"
+
+        class _ErrSession:
+            def fetch(self, *a, **k):
+                return _FakeResp(
+                    503,
+                    headers={"Content-Type": "application/json"},
+                    json_data={"message": "upstream unavailable"},
+                )
+
+        client.files_session.return_value = _ErrSession()
+
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
+        with pytest.raises(OSError, match="503"):
+            p.read_bytes()
 
 
 # ---------------------------------------------------------------------------

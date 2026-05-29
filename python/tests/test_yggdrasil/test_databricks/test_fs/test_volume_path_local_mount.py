@@ -26,6 +26,8 @@ from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.volume.volumes import Volumes
 from yggdrasil.io.io_stats import IOKind
 
+from tests.test_yggdrasil.test_databricks._files_fake import wire_files_session
+
 
 @pytest.fixture(autouse=True)
 def reset_volume_path_caches():
@@ -62,7 +64,9 @@ def fake_volume_root(tmp_path, monkeypatch):
 
 @pytest.fixture
 def service():
-    client = MagicMock()
+    # Wire the Files-API HTTP seam so the off-cluster fallback tests
+    # route through the fake session; on-cluster tests never touch it.
+    client = wire_files_session(MagicMock())
     svc = MagicMock(spec=Volumes)
     svc.client = client
     return svc

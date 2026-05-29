@@ -1,18 +1,26 @@
 """:class:`VolumePath` — Databricks Unity Catalog Volume via Files API.
 
 Volumes carry a Unity Catalog hierarchy (catalog → schema → volume →
-path) and are the SQL engine's preferred staging surface. Reads /
-writes go through ``workspace.files.*``: ``download``, ``upload``,
-``list_directory_contents``, ``create_directory``, ``delete``.
+path) and are the SQL engine's preferred staging surface. Off-cluster,
+reads / writes go through the Databricks **Files REST API** —
+``/api/2.0/fs/files{path}`` for files and
+``/api/2.0/fs/directories{path}`` for directories — issued over
+yggdrasil's own :class:`~yggdrasil.http_.HTTPSession` (see
+:meth:`DatabricksClient.files_session`) rather than the SDK's
+``workspace.files`` client. The session brings a keep-alive connection
+pool, status-aware 429 / 5xx retry, and — through the
+:class:`~yggdrasil.http_.stream.HTTPStream` response body —
+resume-on-disconnect for the SSL ``UNEXPECTED_EOF`` / connection-reset
+failures the SDK's Files client handles poorly. Auth still flows through
+the SDK Config, so every credential type keeps working.
 
 The :class:`Holder` byte primitives map onto these:
 
-- :meth:`_read_mv` — ``files.download`` returns a streaming body;
-  we slice into the requested range. (Files API doesn't expose
-  range reads.)
-- :meth:`_write_mv` — read-modify-rewrite via ``files.upload``.
-- :meth:`truncate` — ``files.upload`` of the head N bytes.
-- :meth:`_clear` — ``files.delete``.
+- :meth:`_read_mv` — ``GET /files`` streams the body through
+  :class:`HTTPStream`; we slice into the requested range.
+- :meth:`_write_mv` — read-modify-rewrite via ``PUT /files``.
+- :meth:`truncate` — ``PUT /files`` of the head N bytes.
+- :meth:`_clear` — ``DELETE /files``.
 
 The catalog-management surface (grants, volume metadata, staging
 factories) lives in dedicated modules; this class covers the
@@ -54,7 +62,9 @@ import re
 import stat as _stat
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
+from urllib.parse import quote
 
 from databricks.sdk.errors import PermissionDenied
 
@@ -226,6 +236,128 @@ class VolumePath(DatabricksPath):
         return self.full_path()
 
     # ==================================================================
+    # Files REST API transport
+    # ==================================================================
+    #
+    # Off-cluster, every volume operation is a Databricks Files REST call
+    # issued through yggdrasil's own :class:`HTTPSession` instead of the
+    # SDK's ``workspace.files`` client — keep-alive pooling, tiered
+    # 429/5xx retry, and resume-on-disconnect streaming, with auth still
+    # vended by the SDK Config. ``kind`` selects the endpoint family:
+    # ``"files"`` (``/api/2.0/fs/files{path}``) or ``"directories"``
+    # (``/api/2.0/fs/directories{path}``).
+
+    def _fs_request(
+        self,
+        method: str,
+        kind: str,
+        api_path: str,
+        *,
+        params: "dict[str, str] | None" = None,
+        body: Any = None,
+        preload_content: bool = True,
+    ) -> Any:
+        """Issue one Files-API request; return the raw :class:`HTTPResponse`.
+
+        Status translation is the caller's job — see
+        :meth:`_raise_for_files_status`. The session retries transient
+        wire failures (429 / 5xx / SSL EOF) internally before this
+        returns.
+        """
+        url = self.client.base_url.with_path(
+            f"/api/2.0/fs/{kind}{quote(api_path, safe='/')}"
+        )
+        if params:
+            for key, value in params.items():
+                url = url.add_param(key=key, value=value)
+        return self.client.files_session().fetch(
+            method,
+            url,
+            headers={"Authorization": self.client.files_authorization()},
+            body=body,
+            preload_content=preload_content,
+        )
+
+    def _raise_for_files_status(self, resp: Any, api_path: str) -> None:
+        """Translate a non-2xx Files-API response into the right exception.
+
+        Maps the wire status onto the exception *shapes* the recovery /
+        classification helpers key on: 404 → :class:`FileNotFoundError`
+        (carrying the server message so :func:`_looks_like_volume_not_found`
+        still fires), 401/403 → SDK :class:`PermissionDenied`, 409 →
+        :class:`FileExistsError`, everything else → :class:`OSError`.
+        2xx/3xx return cleanly.
+        """
+        if resp.ok:
+            return
+        status = resp.status
+        message = None
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                message = payload.get("message")
+        except Exception:
+            message = None
+        if not message:
+            try:
+                message = resp.text
+            except Exception:
+                message = ""
+        detail = (message or "").strip() or f"Files API {status} for {api_path}"
+        if status == 404:
+            raise FileNotFoundError(detail)
+        if status in (401, 403):
+            raise PermissionDenied(detail)
+        if status == 409:
+            raise FileExistsError(detail)
+        raise OSError(f"Files API {status} for {api_path}: {detail}")
+
+    def _head_meta(self, kind: str, api_path: str) -> Any:
+        """``HEAD`` probe — the response on 2xx, ``None`` otherwise.
+
+        Mirrors the old ``files.get_metadata`` /
+        ``get_directory_metadata`` SDK probes whose every failure
+        (NotFound, permission, transient) collapsed to "treat as absent"
+        at the :meth:`_stat_uncached` call site.
+        """
+        try:
+            resp = self._fs_request("HEAD", kind, api_path)
+        except Exception:
+            return None
+        return resp if resp.ok else None
+
+    def _list_directory(self, api_path: str) -> Iterator[Any]:
+        """Yield directory entries, following ``next_page_token`` pagination.
+
+        Each entry is a :class:`SimpleNamespace` carrying the Files-API
+        fields (``path`` / ``name`` / ``is_directory`` / ``file_size`` /
+        ``last_modified``) so the attribute-based consumers
+        (:meth:`_ls`, :func:`_mtime`) read it unchanged. The SDK's
+        ``list_directory_contents`` auto-paginated; this restores that.
+        """
+        page_token: "str | None" = None
+        while True:
+            params = {"page_token": page_token} if page_token else None
+            resp = self._fs_request("GET", "directories", api_path, params=params)
+            self._raise_for_files_status(resp, api_path)
+            payload = resp.json() or {}
+            for entry in payload.get("contents") or []:
+                yield SimpleNamespace(**entry)
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                return
+
+    def _create_directory(self, api_path: str) -> None:
+        """``PUT /directories`` — idempotent create (parents auto-materialised)."""
+        resp = self._fs_request("PUT", "directories", api_path)
+        self._raise_for_files_status(resp, api_path)
+
+    def _delete_path(self, kind: str, api_path: str) -> None:
+        """``DELETE`` a file / directory — raises FileNotFoundError on 404."""
+        resp = self._fs_request("DELETE", kind, api_path)
+        self._raise_for_files_status(resp, api_path)
+
+    # ==================================================================
     # Stat
     # ==================================================================
 
@@ -264,60 +396,44 @@ class VolumePath(DatabricksPath):
                     size=int(st.st_size),
                     mtime=st.st_mtime,
                 )
-        files = self.client.workspace_client().files
-        # Heuristic: a leaf with a ``.`` is almost always a file
-        # (``foo.parquet`` / ``part-….json``); a bare leaf is almost
-        # always a directory (``/Volumes/cat/sch/vol``,
-        # ``/Volumes/cat/sch/vol/tmp``). Probe that side first so the
-        # common case is one Files-API round trip instead of two.
-        # The 0.6.21 ``get_volume_status`` used the same heuristic;
-        # the rewrite dropped it and silently doubled stat latency
-        # for every directory probe.
+        # Off-cluster: probe via the Files REST API. Heuristic: a leaf
+        # with a ``.`` is almost always a file (``foo.parquet`` /
+        # ``part-….json``); a bare leaf is almost always a directory
+        # (``/Volumes/cat/sch/vol``, ``/Volumes/cat/sch/vol/tmp``). Probe
+        # that side first so the common case is one ``HEAD`` round trip
+        # instead of two.
         file_first = "." in (self.url.path or "").rsplit("/", 1)[-1]
         if file_first:
-            first_probe, first_kind = files.get_metadata, IOKind.FILE
-            second_probe, second_kind = files.get_directory_metadata, IOKind.DIRECTORY
+            probes = (("files", IOKind.FILE), ("directories", IOKind.DIRECTORY))
         else:
-            first_probe, first_kind = files.get_directory_metadata, IOKind.DIRECTORY
-            second_probe, second_kind = files.get_metadata, IOKind.FILE
-        try:
-            info = self._call(first_probe, api_path)
-        except Exception:
-            info = None
-        if info is not None:
-            if first_kind is IOKind.FILE:
+            probes = (("directories", IOKind.DIRECTORY), ("files", IOKind.FILE))
+        for kind, io_kind in probes:
+            resp = self._head_meta(kind, api_path)
+            if resp is None:
+                continue
+            if io_kind is IOKind.FILE:
                 return IOStats(
                     kind=IOKind.FILE,
-                    size=int(getattr(info, "content_length", 0) or 0),
-                    mtime=_mtime(info),
-                    media_type=_media_type_from_response(info),
+                    size=int(_header(resp.headers, "Content-Length") or 0),
+                    mtime=_mtime_from_headers(resp.headers),
+                    media_type=_media_type_from_headers(resp.headers),
                 )
-            return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=_mtime(info))
-        try:
-            info = self._call(second_probe, api_path)
-        except Exception:
-            info = None
-        if info is not None:
-            if second_kind is IOKind.FILE:
-                return IOStats(
-                    kind=IOKind.FILE,
-                    size=int(getattr(info, "content_length", 0) or 0),
-                    mtime=_mtime(info),
-                    media_type=_media_type_from_response(info),
-                )
-            return IOStats(kind=IOKind.DIRECTORY, size=0, mtime=_mtime(info))
-        # Implicit-directory fallback. ``files.upload`` to a brand-new
+            return IOStats(
+                kind=IOKind.DIRECTORY,
+                size=0,
+                mtime=_mtime_from_headers(resp.headers),
+            )
+        # Implicit-directory fallback. A ``PUT /files`` to a brand-new
         # ``/Volumes/<...>/parent/file.bin`` silently materialises the
-        # file without creating an explicit ``parent`` entry, so
-        # ``get_directory_metadata(parent)`` returns NotFound even
-        # though listing the path enumerates ``file.bin``. Without
-        # this probe, ``remove(parent, recursive=True, missing_ok=False)``
-        # raises ``FileNotFoundError`` against a parent that the caller
-        # just wrote into. One extra round trip pays for the negative
-        # case only — both metadata probes already missed.
+        # file without creating an explicit ``parent`` entry, so a
+        # ``HEAD /directories/parent`` returns 404 even though listing
+        # the path enumerates ``file.bin``. Without this probe,
+        # ``remove(parent, recursive=True, missing_ok=False)`` raises
+        # ``FileNotFoundError`` against a parent the caller just wrote
+        # into. One extra round trip pays for the negative case only —
+        # both metadata probes already missed.
         try:
-            entries = self._call(files.list_directory_contents, api_path)
-            first = next(iter(entries), None)
+            first = next(iter(self._list_directory(api_path)), None)
         except Exception:
             first = None
         if first is not None:
@@ -566,27 +682,27 @@ class VolumePath(DatabricksPath):
                 scan_root, yielded, recursive,
             )
             return
-        files = self.client.workspace_client().files
-        try:
-            entries = self._call(files.list_directory_contents, self.api_path)
-        except PermissionDenied as e:
-            logger.warning(
-                "Permission denied listing volume directory %r: %r",
-                self,
-                e,
-            )
-            return
-        except Exception:
-            return
-        if logger.isEnabledFor(logging.DEBUG):
-            entries = list(entries)
-            logger.debug(
-                "Listing volume directory %r -> %d entries (recursive=%s)",
-                self,
-                len(entries),
-                recursive,
-            )
-        for info in entries:
+        # Off-cluster: list via the paginated Files REST API. Only the
+        # listing fetch (``next(entries)``) is guarded — child
+        # construction / recursion errors propagate so a bug there isn't
+        # silently swallowed into an empty directory.
+        entries = self._list_directory(self.api_path)
+        while True:
+            try:
+                info = next(entries)
+            except StopIteration:
+                return
+            except PermissionDenied as e:
+                logger.warning(
+                    "Permission denied listing volume directory %r: %r",
+                    self,
+                    e,
+                )
+                return
+            except FileNotFoundError:
+                return
+            except Exception:
+                return
             child_path = getattr(info, "path", None)
             if not child_path:
                 continue
@@ -658,10 +774,7 @@ class VolumePath(DatabricksPath):
 
         if has_subdir and not volume_missing:
             try:
-                self._call(
-                    self.client.workspace_client().files.create_directory,
-                    parent.api_path,
-                )
+                self._create_directory(parent.api_path)
                 return True
             except Exception as inner:
                 if _looks_like_already_exists(inner):
@@ -675,10 +788,7 @@ class VolumePath(DatabricksPath):
 
         if has_subdir:
             try:
-                self._call(
-                    self.client.workspace_client().files.create_directory,
-                    parent.api_path,
-                )
+                self._create_directory(parent.api_path)
             except Exception as inner:
                 if not _looks_like_already_exists(inner):
                     raise
@@ -749,10 +859,7 @@ class VolumePath(DatabricksPath):
             logger.debug("mkdir via kernel mount: %r", api_path)
             return
         try:
-            self._call_ensuring_parents(
-                self.client.workspace_client().files.create_directory,
-                self.api_path,
-            )
+            self._call_ensuring_parents(self._create_directory, self.api_path)
             logger.info(
                 "Created volume directory %r (parents=%s)",
                 self,
@@ -780,7 +887,7 @@ class VolumePath(DatabricksPath):
             self.invalidate_singleton()
             return
         try:
-            self._call(self.client.workspace_client().files.delete, self.api_path)
+            self._delete_path("files", self.api_path)
         except Exception:
             if not missing_ok:
                 raise
@@ -876,17 +983,12 @@ class VolumePath(DatabricksPath):
 
         if wait:
             try:
-                self._call(
-                    self.client.workspace_client().files.delete_directory, self.api_path
-                )
+                self._delete_path("directories", self.api_path)
             except Exception:
                 if not missing_ok:
                     raise
         else:
-            Job.make(
-                self.client.workspace_client().files.delete_directory,
-                self.api_path,
-            )
+            Job.make(self._delete_path, "directories", self.api_path)
         self.invalidate_singleton()
 
     # ==================================================================
@@ -933,20 +1035,22 @@ class VolumePath(DatabricksPath):
                     except OSError:
                         pass
                 return memoryview(data)
+        api_path = self.api_path
+        # Stream the body through :class:`HTTPStream` (preload off) so a
+        # mid-flight SSL EOF / connection reset resumes via a Range
+        # re-request instead of failing the whole read. ``resp.data``
+        # then pulls the (resumable) body to EOF and releases the socket.
         try:
-            response = self._call(
-                self.client.workspace_client().files.download, self.api_path
-            )
+            resp = self._fs_request("GET", "files", api_path, preload_content=False)
         except Exception as exc:
             if _looks_like_not_found(exc):
                 raise FileNotFoundError(self.full_path()) from exc
             raise
+        if resp.status == 404:
+            raise FileNotFoundError(self.full_path())
+        self._raise_for_files_status(resp, api_path)
 
-        body = getattr(response, "contents", None) or response
-        try:
-            data = body.read()
-        except AttributeError:
-            data = bytes(body)
+        data = resp.data
         logger.debug(
             "Downloaded volume file %r -> %d bytes (slice pos=%d n=%s)",
             self,
@@ -955,16 +1059,8 @@ class VolumePath(DatabricksPath):
             "EOF" if n < 0 else n,
         )
 
-        media_type = _media_type_from_response(response)
-        try:
-            mtime = (
-                parse_http_date(response.last_modified)
-                if response.last_modified
-                else None
-            )
-        except Exception:
-            mtime = None
-        mtime = mtime.timestamp() if mtime else time.time()
+        media_type = _media_type_from_headers(resp.headers)
+        mtime = _mtime_from_headers(resp.headers) or time.time()
         if not self._stat_cached:
             self._persist_stat_cache(
                 stats=IOStats(
@@ -1003,8 +1099,8 @@ class VolumePath(DatabricksPath):
         The Files API does whole-object PUTs only, so a chunked
         :meth:`Holder._write_stream` would issue one RMW per
         chunk. Hand the live :class:`IO[bytes]` to :meth:`_upload`
-        which does seek-on-retry around a single ``files.upload``
-        call. ``size>=0`` (capped read) or non-zero ``offset``
+        which does a single ``PUT /files``.
+        ``size>=0`` (capped read) or non-zero ``offset``
         fall back to the chunked base path because the API can't
         splice at a range. ``batch_size`` only matters for that
         fallback — the atomic upload doesn't chunk.
@@ -1014,18 +1110,16 @@ class VolumePath(DatabricksPath):
         return self._upload(src)
 
     def _upload(self, content: Any) -> int:
-        """Upload *content* through ``files.upload`` with retry semantics.
+        """Upload *content* via ``PUT /api/2.0/fs/files`` (overwrite).
 
-        Accepts either a bytes-like payload or a seekable binary
-        stream. ``FilesExt.upload`` requires a ``BinaryIO`` — it
-        probes ``contents.seekable()`` — so bytes-like payloads are
-        wrapped in a fresh :class:`io.BytesIO` per attempt, and
-        seekable streams are rewound to origin on every retry so
-        transient-error / parent-recovery re-tries PUT the full
-        body, not an empty tail.
+        Accepts either a bytes-like payload or a binary stream. The
+        whole object is read into bytes up front so the
+        :class:`HTTPSession`'s transient-error retry and the
+        parent-recovery re-try both replay the identical body from
+        offset zero — the bytes are inherently seekable, so there's no
+        stream rewind dance.
 
-        Returns the byte count when known (bytes-like input) or
-        ``-1`` when the input is a stream of unknown length.
+        Returns the uploaded byte count.
         """
         size = len(content) if hasattr(content, "__len__") else -1
         logger.debug(
@@ -1075,68 +1169,45 @@ class VolumePath(DatabricksPath):
                         mtime=time.time())
             )
             return int(max(size, -1))
-        upload = self.client.workspace_client().files.upload
-
-        if hasattr(content, "seek"):
-            stream = content
-            try:
-                pos = content.tell()
-                if size == -1:
-                    content.seek(0, io.SEEK_END)
-                    size = content.tell()
-                    content.seek(pos, io.SEEK_SET)
-            except Exception:
-                pos = 0
-
-            def _do_upload() -> None:
-                stream.seek(pos)
-                upload(file_path=api_path, contents=stream, overwrite=True)
-
-        else:
-            # ``FilesExt.upload`` calls ``contents.seekable()`` — wrap
-            # raw bytes in a fresh ``IO`` each attempt so retries
-            # always PUT the full body from offset zero.
-            payload = bytes(content)
-
-            def _do_upload() -> None:
-                upload(
-                    file_path=api_path,
-                    contents=io.BytesIO(payload),
-                    overwrite=True,
-                )
-
-        self._call_ensuring_parents(_do_upload)
-        if size < 0 and hasattr(content, "seek"):
-            try:
-                content.seek(0, io.SEEK_END)
-                size = content.tell()
-            except Exception:
-                pass
-        committed = None
-        if size >= 0:
-            if hasattr(content, "read"):
+        # Off-cluster: PUT the whole object through the Files REST API.
+        # Read the source fully into bytes so transient / parent-recovery
+        # retries replay the same body verbatim.
+        if hasattr(content, "read"):
+            if hasattr(content, "seek"):
                 try:
                     content.seek(0)
-                    committed = content.read()
                 except Exception:
                     pass
+            payload = content.read()
+            if isinstance(payload, str):
+                payload = payload.encode()
             else:
-                committed = bytes(content)
-            self._persist_stat_cache(
-                IOStats(
-                    size=size,
-                    kind=IOKind.FILE,
-                    mtime=time.time(),
-                    media_type=self.media_type,
-                )
+                payload = bytes(payload)
+        else:
+            payload = bytes(content)
+        size = len(payload)
+
+        def _do_upload() -> None:
+            resp = self._fs_request(
+                "PUT",
+                "files",
+                api_path,
+                params={"overwrite": "true"},
+                body=payload,
             )
-            logger.info("Uploaded volume file %r (size=%d)", self, size)
-        else:
-            logger.info("Uploaded volume file %r (size=stream)", self)
-        if committed is not None:
-            self._cache_after_upload(committed, len(committed))
-        else:
-            self._buffered_size = None
+            self._raise_for_files_status(resp, api_path)
+
+        self._call_ensuring_parents(_do_upload)
+        self._persist_stat_cache(
+            IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            )
+        )
+        logger.info("Uploaded volume file %r (size=%d)", self, size)
+        self._cache_after_upload(payload, size)
         return size
 
     def _clear(self) -> None:
@@ -1148,20 +1219,48 @@ class VolumePath(DatabricksPath):
 # ---------------------------------------------------------------------------
 
 
-def _media_type_from_response(info) -> "MediaType | None":
-    """Resolve a :class:`MediaType` from a Files API response.
+def _header(headers, name: str) -> "str | None":
+    """Case-insensitive single-header lookup.
 
-    The SDK surfaces the object's MIME type as ``content_type``
-    (download responses) or via the metadata payload. Returns
-    ``None`` when the field is absent or doesn't map to a known
-    media type — the caller falls back to URL-extension inference.
+    :class:`HTTPHeaders.get` is case-sensitive, but a server can return
+    any casing — scan once for a case-folded match after the cheap
+    direct hit misses.
     """
-    if info is None:
+    if headers is None:
         return None
-    mime = getattr(info, "content_type", None) or getattr(info, "mime_type", None)
+    value = headers.get(name)
+    if value is not None:
+        return value
+    target = name.lower()
+    for key in headers.keys():
+        if str(key).lower() == target:
+            return headers.get(key)
+    return None
+
+
+def _media_type_from_headers(headers) -> "MediaType | None":
+    """Resolve a :class:`MediaType` from a Files API response's headers.
+
+    Reads ``Content-Type``; returns ``None`` when absent or when it
+    doesn't map to a known media type — the caller then falls back to
+    URL-extension inference.
+    """
+    mime = _header(headers, "Content-Type")
     if not mime:
         return None
     return MediaType.from_(mime, default=None)
+
+
+def _mtime_from_headers(headers) -> float:
+    """Parse the ``Last-Modified`` HTTP-date header into an epoch float (0.0 if absent)."""
+    raw = _header(headers, "Last-Modified")
+    if not raw:
+        return 0.0
+    try:
+        parsed = parse_http_date(raw)
+    except Exception:
+        return 0.0
+    return float(parsed.timestamp()) if parsed else 0.0
 
 
 def _mtime(info) -> float:
