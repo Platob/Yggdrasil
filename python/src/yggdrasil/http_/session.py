@@ -93,6 +93,7 @@ from yggdrasil.http_.cache_config import CacheConfig
 from yggdrasil.http_.send_config import DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.url import URL
 
+from .user_agents import random_user_agent
 from .exceptions import (
     InsecureRequestWarning,
     LocationParseError,
@@ -1227,10 +1228,16 @@ class HTTPSession(Session):
                 if "CERTIFICATE_VERIFY_FAILED" in msg and self.verify is not False:
                     LOGGER.warning(
                         "SSL certificate verification failed for %s — "
-                        "retrying with verify=False: %s",
+                        "dropping proxy + retrying with verify=False: %s",
                         current_request.url, msg,
                     )
                     self.verify = False
+                    self.proxy = None
+                    self.no_proxy = None
+                    for var in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                                "https_proxy", "http_proxy", "all_proxy"):
+                        os.environ.pop(var, None)
+                    _ProxyEnv.reset()
                     self.clear_connections()
                     continue
                 raise SSLError(msg) from exc
@@ -1287,6 +1294,10 @@ class HTTPSession(Session):
                 response.release_conn()
                 next_retries.sleep(response=response)
                 retries = next_retries
+                if response.status == 429:
+                    rotated_headers = HTTPHeaders(current_request.headers)
+                    rotated_headers["User-Agent"] = random_user_agent()
+                    current_request = current_request.copy(headers=rotated_headers)
                 continue
 
             return response

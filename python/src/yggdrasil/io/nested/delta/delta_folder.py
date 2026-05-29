@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import decimal
+import logging
 import os
 import random
 import time
@@ -47,6 +48,8 @@ if TYPE_CHECKING:
     from yggdrasil.execution.expr import Predicate
 
 __all__ = ["ConcurrentDeltaCommitError", "DeltaFolder", "DeltaOptions"]
+
+logger = logging.getLogger(__name__)
 
 
 class ConcurrentDeltaCommitError(RuntimeError):
@@ -164,7 +167,14 @@ class DeltaFolder(Folder):
             mode=Mode.READ_ONLY,
         )
 
+        target_field_names = (
+            set(target_schema.names) if target_schema is not None else None
+        )
         for add in snap.prune_files(prune_values=prune):
+            logger.debug(
+                "DeltaFolder read: AddFile path=%s size=%d dv=%s",
+                add.path, add.size, add.deletion_vector,
+            )
             dv = decode_deletion_vector(add.deletion_vector, table_root=self.path,
                                         sidecar_cache=sidecar_cache)
             leaf = ParquetFile(holder=snap.resolve(add), owns_holder=False)
@@ -172,6 +182,31 @@ class DeltaFolder(Folder):
             try:
                 with leaf as opened:
                     for batch in opened._read_arrow_batches(leaf_opts):
+                        # Databricks DBR auto-enables row tracking on
+                        # DV tables, which both stamps internal
+                        # ``_row-id-col-<uuid>`` /
+                        # ``_row-commit-version-col-<uuid>`` columns
+                        # onto post-feature AddFiles AND flips the
+                        # nullability metadata on existing columns
+                        # across files. Project to the table's
+                        # canonical schema names AND re-wrap each
+                        # batch with ``target_schema``'s field
+                        # metadata so ``pa.Table.from_batches`` can
+                        # concatenate cleanly across heterogeneous
+                        # files.
+                        if (target_schema is not None
+                                and batch.schema != target_schema):
+                            present = [
+                                n for n in target_schema.names
+                                if n in batch.schema.names
+                            ]
+                            if present:
+                                batch = pa.record_batch(
+                                    [batch.column(n) for n in present],
+                                    schema=pa.schema([
+                                        target_schema.field(n) for n in present
+                                    ]),
+                                )
                         masked = mask_batch_with_dv(batch, dv, base_offset=base_offset)
                         base_offset += batch.num_rows
                         if masked.num_rows == 0:
@@ -264,12 +299,7 @@ class DeltaFolder(Folder):
             actions.extend(new_adds)
             if options.txn_app_id is not None and options.txn_version is not None:
                 actions.append(Txn(app_id=options.txn_app_id, version=int(options.txn_version)))
-            actions.append(CommitInfo(payload={
-                "timestamp": int(time.time() * 1000), "operation": str(options.operation or "WRITE"),
-                "operationParameters": {"mode": action.name.lower()},
-                "engineInfo": str(options.engine_info or "yggdrasil"),
-                "isBlindAppend": action is Mode.APPEND,
-            }))
+            actions.append(self._build_commit_info(options=options, mode=action))
             return actions
 
         self._with_commit_retry(build_actions=build, cleanup=None,
@@ -330,11 +360,11 @@ class DeltaFolder(Folder):
             actions.extend(incoming_adds)
             if options.txn_app_id is not None and options.txn_version is not None:
                 actions.append(Txn(app_id=options.txn_app_id, version=int(options.txn_version)))
-            actions.append(CommitInfo(payload={
-                "timestamp": int(time.time() * 1000), "operation": str(options.operation or "WRITE"),
-                "operationParameters": {"mode": "upsert"},
-                "engineInfo": str(options.engine_info or "yggdrasil"), "isBlindAppend": False,
-            }))
+            actions.append(self._build_commit_info(
+                options=options, mode=Mode.APPEND,
+                operation_parameters={"mode": "upsert"},
+                is_blind_append=False,
+            ))
             return actions
 
         def cleanup() -> None:
@@ -462,6 +492,44 @@ class DeltaFolder(Folder):
                 stats=_collect_stats(payload_batches) if getattr(options, "collect_stats", True) else None,
             )
 
+    def _build_commit_info(
+        self,
+        *,
+        options: "DeltaOptions",
+        mode: "Mode",
+        operation: "str | None" = None,
+        operation_parameters: "dict[str, Any] | None" = None,
+        is_blind_append: "bool | None" = None,
+    ) -> CommitInfo:
+        """Build a :class:`CommitInfo` action from the active options + mode.
+
+        Centralizes the payload shape the three commit sites
+        (write / upsert / delete) used to build inline so callers and
+        tests have a single helper to reach for. ``operation`` /
+        ``engineInfo`` / ``timestamp`` come from *options* and the
+        process clock; ``operationParameters.mode`` and
+        ``isBlindAppend`` derive from *mode* unless overridden.
+
+        The explicit *operation* argument wins over ``options.operation``
+        so callers that always want a fixed label (e.g. the DELETE
+        retain path) don't need to mutate the returned payload.
+        """
+        params = operation_parameters
+        if params is None:
+            params = {"mode": mode.name.lower()}
+        if is_blind_append is None:
+            is_blind_append = mode is Mode.APPEND
+        op_label = operation if operation is not None else (
+            str(options.operation or "WRITE")
+        )
+        return CommitInfo(payload={
+            "timestamp": int(time.time() * 1000),
+            "operation": op_label,
+            "operationParameters": params,
+            "engineInfo": str(options.engine_info or "yggdrasil"),
+            "isBlindAppend": bool(is_blind_append),
+        })
+
     def _commit_atomic(self, version: int, actions: "Iterable[DeltaAction]") -> None:
         self._log.log_path.mkdir(parents=True, exist_ok=True)
         commit_path = self._log.log_path / format_commit_name(version)
@@ -546,9 +614,12 @@ class DeltaFolder(Folder):
                     reader_features=sorted({*(snap.protocol.reader_features or []), "deletionVectors"}),
                     writer_features=sorted({*(snap.protocol.writer_features or []), "deletionVectors"})))
 
-        new_actions.append(CommitInfo(payload={"timestamp": ts, "operation": "DELETE",
-                                               "engineInfo": str(options.engine_info or "yggdrasil"),
-                                               "isBlindAppend": False}))
+        new_actions.append(self._build_commit_info(
+            options=options, mode=Mode.OVERWRITE,
+            operation="DELETE",
+            operation_parameters={},
+            is_blind_append=False,
+        ))
         next_version = snap.version + 1
         self._commit_atomic(next_version, new_actions)
         self._log.extend_listing(format_commit_name(next_version))
@@ -679,7 +750,11 @@ class DeltaFolder(Folder):
     def iter_children(self) -> "Iterator":
         snap = self.snapshot()
         for add in snap.active_files.values():
-            yield self.adopt_child(ParquetFile(holder=snap.resolve(add), owns_holder=False))
+            yield ParquetFile(
+                holder=snap.resolve(add),
+                owns_holder=False,
+                tabular_parent=self,
+            )
 
 
 # ---------------------------------------------------------------------------

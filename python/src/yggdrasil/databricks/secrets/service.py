@@ -161,7 +161,7 @@ class Secrets(DatabricksService):
                 secret.scope.update(permissions=permissions)
             return secret
 
-        LOGGER.debug("Creating secret %r", secret)
+        LOGGER.debug("Updating secret value %r", secret)
 
         api = self.client.workspace_client().secrets
 
@@ -189,7 +189,7 @@ class Secrets(DatabricksService):
             else:
                 raise
 
-        LOGGER.info("Created secret %r", secret)
+        LOGGER.info("Updated secret value %r", secret)
 
         if permissions:
             secret.scope.update(permissions=permissions)

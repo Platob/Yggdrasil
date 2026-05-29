@@ -325,7 +325,6 @@ class VectorSearchEndpoint(DatabricksResource):
         self._details = self.api.get_endpoint(endpoint_name=self.endpoint_name)
         return self
 
-    @property
     def exists(self) -> bool:
         """``True`` when the endpoint exists in the workspace."""
         from databricks.sdk.errors import NotFound
@@ -446,7 +445,7 @@ class VectorSearchEndpoint(DatabricksResource):
         wait: WaitingConfigArg = None,
     ) -> "VectorSearchEndpoint":
         """Create this endpoint when missing, otherwise return ``self``."""
-        if self.exists:
+        if self.exists():
             return self
         return self.create(
             endpoint_type=endpoint_type,
@@ -607,7 +606,6 @@ class VectorSearchIndex(DatabricksResource):
         self._endpoint_name = info.endpoint_name or self._endpoint_name
         return self
 
-    @property
     def exists(self) -> bool:
         from databricks.sdk.errors import NotFound
 

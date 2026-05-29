@@ -170,7 +170,7 @@ class _SQLIntegrationBase(DatabricksIntegrationCase):
         caller asked for: we read ``.exists`` and only call
         ``ensure_created`` when the answer is no.
         """
-        if not table.exists:
+        if not table.exists():
             table.ensure_created(definition)
         return table
 
@@ -184,12 +184,12 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
 
     def test_catalog_and_schema_exist(self) -> None:
         catalog = self.engine.catalogs.catalog(self.catalog_name)
-        self.assertTrue(catalog.exists)
+        self.assertTrue(catalog.exists())
 
         schema = self.engine.schemas.schema(
             f"{self.catalog_name}.{self.schema_name}"
         )
-        self.assertTrue(schema.exists)
+        self.assertTrue(schema.exists())
 
     # ------------------------------------------------------------------
     # Engine.execute — basic query
@@ -255,13 +255,13 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
 
     def test_engine_create_table_auto_creates_managed_table(self) -> None:
         table = self._unique_table("create", seed=False)
-        self.assertFalse(table.exists)
+        self.assertFalse(table.exists())
 
         created = self.engine.create_table(
             self._sample_schema(),
             full_name=table.full_name(),
         )
-        self.assertTrue(created.exists)
+        self.assertTrue(created.exists())
 
         # Idempotent: a second create_table call with missing_ok=True
         # (the engine default) must not raise.
@@ -269,7 +269,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
             self._sample_schema(),
             full_name=table.full_name(),
         )
-        self.assertTrue(again.exists)
+        self.assertTrue(again.exists())
 
         vol = table.staging_volume
         vp = table.staging_folder(temporary=False)
@@ -288,12 +288,12 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
     def test_table_ensure_created_is_idempotent(self) -> None:
         table = self._unique_table("ensure")
         table.ensure_created(self._sample_schema())
-        self.assertTrue(table.exists)
+        self.assertTrue(table.exists())
 
         # Second call is a no-op (or schema-merge no-op) on an existing
         # table with the same definition.
         table.ensure_created(self._sample_schema())
-        self.assertTrue(table.exists)
+        self.assertTrue(table.exists())
 
     # ------------------------------------------------------------------
     # Table.insert / Engine.insert_into — auto-create on miss, then read back
@@ -341,12 +341,12 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
     def test_table_delete_drops_then_missing(self) -> None:
         table = self._unique_table("delete")
         table.ensure_created(self._sample_schema())
-        self.assertTrue(table.exists)
+        self.assertTrue(table.exists())
 
         table.delete()
         # Re-resolve through the service so we don't read a stale cached
         # ``_infos`` from the in-memory handle that just dropped itself.
-        self.assertFalse(self.engine.table(table.full_name()).exists)
+        self.assertFalse(self.engine.table(table.full_name()).exists())
 
     # ------------------------------------------------------------------
     # external_data — the generic ExternalStatementData binding

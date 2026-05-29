@@ -44,7 +44,7 @@ with p.open("rb") as f:
 ## Directory operations
 
 ```python
-p.exists                           # bool (stat-cached)
+p.exists()                           # bool (stat-cached)
 p.is_dir()
 p.is_file()
 p.size                             # file size in bytes

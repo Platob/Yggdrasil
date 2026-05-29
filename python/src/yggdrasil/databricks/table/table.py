@@ -39,7 +39,6 @@ from databricks.sdk.service.catalog import (
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
-from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema as DataSchema, Schema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
@@ -55,16 +54,16 @@ from yggdrasil.databricks.sql.sql_utils import (
 )
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.url import URL
-from yggdrasil.io.holder import IO
-from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.path import Path
-from yggdrasil.io.primitive import ParquetFile
-from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.execution.expr import (
     Predicate,
 )
 from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
+from yggdrasil.io.holder import IO
+from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.io.tabular import Tabular, O
+from yggdrasil.path import Path
+from yggdrasil.url import URL
 
 from ..fs import VolumePath
 from ..volume import Volume
@@ -303,6 +302,27 @@ def _build_match_condition(
     if extra_predicates:
         clauses.extend(p for p in extra_predicates if p)
     return " AND ".join(clauses)
+
+
+def _coalesce_predicate(
+    cast_options: "CastOptions | None",
+    predicate: "Predicate | None",
+) -> "CastOptions":
+    """Fold *predicate* into :attr:`CastOptions.predicate`.
+
+    Used at insert-method boundaries so callers can pass a top-level
+    ``predicate=`` kwarg without juggling :class:`CastOptions`
+    manually. When both the kwarg and ``cast_options.predicate`` carry
+    a value, they're combined with ``&`` (logical AND) so the
+    downstream SQL prune and source-row filter both see the merged
+    expression.
+    """
+    opts = CastOptions.check(options=cast_options)
+    if predicate is None:
+        return opts
+    if opts.predicate is None:
+        return opts.copy(predicate=predicate)
+    return opts.copy(predicate=opts.predicate & predicate)
 
 
 def _build_where_predicates(
@@ -934,15 +954,8 @@ class Table(DatabricksPath):
     volume slot are shared across views into the same UC resource.
     """
 
-    # Per-class singleton cache — keeps Table singletons separated
-    # from :class:`UCCatalog`, :class:`UCSchema`, :class:`Volume`,
-    # and the rest of the project's :class:`Singleton` users. No
-    # companion lock — :class:`ExpiringDict.get_or_set` is GIL-atomic.
+    NAMESPACE_PREFIX: ClassVar[str] = "/Tables/"
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
-    # Cache every Table under the singleton convention; the cached
-    # ``TableInfo`` / columns / staging-volume slot are worth keeping
-    # for the process lifetime so navigation through
-    # ``schema['<table>']`` doesn't keep refetching.
     _SINGLETON_TTL: ClassVar[Any] = None
 
     @classmethod
@@ -1019,13 +1032,44 @@ class Table(DatabricksPath):
 
         return cls._INSTANCES.get_or_set(key, _build, ttl=ttl_arg)
 
+    @property
+    def parent(self):
+        return self.schema
+
+    @property
+    def parents(self) -> "Iterator[DatabricksPath]":
+        yield self.schema
+        yield self.catalog
+
     def _stat_uncached(self) -> IOStats:
+        infos = self.read_infos(default=None)
+        kind = IOKind.MISSING if infos is None else IOKind.DIRECTORY
+
         return IOStats(
-            size=0,
-            mtime=0,
-            kind=IOKind.DIRECTORY if self.exists else IOKind.MISSING,
+            kind=kind,
             media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_TABLE
         )
+
+    def _from_url(self, url: URL) -> "DatabricksPath":
+        parts = url.parts
+        n = len(parts)
+
+        if n <= 1:
+            return self
+        elif n == 2:
+            # /<catalog>
+            return self.catalog
+        elif n == 3:
+            # /<catalog>/<schema>
+            return self.schema
+        elif n == 4:
+            # /<catalog>/<schema>/<table> — this table itself
+            return self
+        else:
+            raise ValueError(
+                f"URL {url} has too many parts to resolve against a Table "
+                f"(got {n}, expected 1-4)."
+            )
 
     def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
         raise NotImplementedError("Table is a read-only resource")
@@ -1035,7 +1079,7 @@ class Table(DatabricksPath):
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents, exist_ok
-        if not self.exists:
+        if not self.exists():
             raise NotImplementedError("Table is a read-only resource")
 
     def _ls(
@@ -1055,7 +1099,7 @@ class Table(DatabricksPath):
         self.delete(wait=wait, missing_ok=missing_ok)
 
     def full_path(self) -> str:
-        return self.full_name()
+        return f"{self.NAMESPACE_PREFIX}{self.catalog_name}/{self.schema_name}/{self.table_name}"
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_TABLE
 
@@ -1349,7 +1393,7 @@ class Table(DatabricksPath):
         try:
             execution = self.sql.execute(query)
         except Exception:
-            if not self.exists and options.target:
+            if not self.exists() and options.target:
                 self.create(options.target)
                 s: pa.Schema = options.target.to_arrow_schema()
                 yield pa.RecordBatch.from_pylist([], schema=s)
@@ -1376,7 +1420,7 @@ class Table(DatabricksPath):
             zorder_by=options.zorder_by,
             optimize_after_merge=options.optimize_after_merge,
             vacuum_hours=options.vacuum_hours,
-            where=options.predicate,
+            predicate=options.predicate,
             retry=options.retry,
             return_data=options.return_data,
             safe_merge=options.safe_merge,
@@ -1389,7 +1433,7 @@ class Table(DatabricksPath):
         try:
             execution = self.sql.execute(query)
         except Exception:
-            if not self.exists and options.target:
+            if not self.exists() and options.target:
                 self.create(options.target)
                 s: pa.Schema = options.target.to_spark_schema()
                 return options.get_spark_session(
@@ -1505,6 +1549,40 @@ class Table(DatabricksPath):
             *args,
             **kwargs
         )
+
+    def lazy(
+        self,
+        sql: str | PreparedStatement | None = None,
+        **kwargs,
+    ) -> "Tabular":
+        """Return a deferred :class:`Tabular` for *sql* against this table.
+
+        When *sql* is provided, submits the query via
+        :attr:`sql.execute` and returns the resulting
+        :class:`StatementResult` — itself a :class:`Tabular`. The
+        warehouse executes the query eagerly so the result handle is
+        ready, but the rows aren't materialised until the caller
+        invokes a Tabular hook (``read_arrow_table`` /
+        ``read_arrow_batches`` / ``read_pandas_frame`` …)::
+
+            handle = tbl.lazy(sql="SELECT id, val FROM {self} WHERE id > 5")
+            arrow = handle.read_arrow_table()
+
+        ``{self}`` in the query string is substituted with the
+        backtick-quoted full name of this table — saves the caller
+        from concatenating ``tbl.full_name(safe=True)`` into every
+        query. When no ``{self}`` placeholder is present, the SQL
+        flows through verbatim.
+
+        Calling ``lazy()`` with ``sql=None`` returns the table itself
+        (already a :class:`Tabular`) so callers that want to chain on
+        the table's own data hand back the same object.
+        """
+        if sql is None:
+            return self
+        if isinstance(sql, str) and "{self}" in sql:
+            sql = sql.format(self=self.full_name(safe=True))
+        return self.sql.execute(statement=sql, **kwargs)
     
     @property
     def catalog(self) -> "UCCatalog":
@@ -1597,7 +1675,6 @@ class Table(DatabricksPath):
     # Databricks SDK — lazy-loaded properties
     # =========================================================================
 
-    @property
     def exists(self) -> bool:
         try:
             _ = self.infos
@@ -1629,6 +1706,28 @@ class Table(DatabricksPath):
             len(self._columns), getattr(infos, "table_type", None),
         )
         return infos
+
+    def read_infos(self, default: Any = ...):
+        """Basic :class:`TableInfo` — TTL-cached."""
+        if self._infos is not None and self._is_fresh(self._infos_fetched_at):
+            return self._infos
+
+        info = self.client.tables.find_table_remote(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+            table_name=self.table_name,
+            default=None
+        )
+
+        if info is None:
+            if default is ...:
+                raise NotFound(
+                    f"Volume {self.full_name(safe=True)} not found"
+                )
+            return None
+
+        self._store_infos(info)
+        return info
 
     @property
     def infos(self) -> TableInfo:
@@ -2027,7 +2126,7 @@ class Table(DatabricksPath):
         if data_source_format is None:
             data_source_format = DataSourceFormat.DELTA if table_type == TableType.MANAGED else DataSourceFormat.PARQUET
 
-        if self.exists:
+        if self.exists():
             data_source_format = self.infos.data_source_format
 
             if mode == Mode.OVERWRITE and data_source_format == DataSourceFormat.DELTA:
@@ -2088,7 +2187,7 @@ class Table(DatabricksPath):
         enable_deletion_vectors: bool | None = None,
         target_file_size: int | None = None,
         column_mapping_mode: str | None = None,
-        auto_tag: bool = True,
+        auto_tag: bool = False,
         record_ygg_properties: bool = True,
     ) -> "Table":
         schema_info = DataSchema.from_any(description)
@@ -2443,7 +2542,7 @@ class Table(DatabricksPath):
         columns + storage + properties — so the behaviour ends up
         symmetric with :meth:`sql_create`.
         """
-        if missing_ok and self.exists:
+        if missing_ok and self.exists():
             return self
 
         schema_info = DataSchema.from_any(definition).autotag()
@@ -3082,7 +3181,7 @@ class Table(DatabricksPath):
         vacuum_hours: int | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         spark_options: Optional[Dict[str, Any]] = None,
-        where: Predicate | None = None,
+        predicate: Predicate | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3105,6 +3204,9 @@ class Table(DatabricksPath):
         :class:`StatementResult` from :meth:`sql_insert` — for
         downstream chaining without re-querying the target.
         """
+        # Fold the top-level predicate into cast_options so the
+        # downstream backends read a single source of truth.
+        cast_options = _coalesce_predicate(cast_options, predicate)
         common = dict(
             mode=mode,
             match_by=match_by,
@@ -3114,7 +3216,6 @@ class Table(DatabricksPath):
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            where=where,
             retry=retry,
             return_data=return_data,
             safe_merge=safe_merge,
@@ -3216,7 +3317,7 @@ class Table(DatabricksPath):
         zorder_by: Optional[list[str]] = None,
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
-        where: Predicate | None = None,
+        predicate: Predicate | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3241,15 +3342,17 @@ class Table(DatabricksPath):
         """
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
+        cast_options = _coalesce_predicate(cast_options, predicate)
+
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert(
                 data,
                 mode=mode,
+                cast_options=cast_options,
                 match_by=match_by, update_column_names=update_column_names,
                 wait=wait, raise_error=raise_error,
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
-                where=where,
                 retry=retry,
                 return_data=return_data,
             )
@@ -3276,7 +3379,9 @@ class Table(DatabricksPath):
         if return_data:
             output_data = staging.read_arrow_table()
 
-        prune_predicates = _build_where_predicates(where, target_alias="T")
+        prune_predicates = _build_where_predicates(
+            cast_options.predicate, target_alias="T",
+        )
 
         columns = list(existing_schema.field_names())
         # Plain column projection — the staged Parquet was already
@@ -3324,13 +3429,6 @@ class Table(DatabricksPath):
 
         prepared = _prepare_batch(sql_texts)
 
-        logger.debug(
-            "Arrow insert into table %r (mode=%s, match_by=%s, "
-            "statements=%d, retry=%s)",
-            target_location, mode_enum.name, match_by, len(prepared),
-            retry_active,
-        )
-
         batch = self.sql.execute_many(
             statements=prepared,
             wait=wait,
@@ -3360,7 +3458,7 @@ class Table(DatabricksPath):
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         spark_options: Optional[Dict[str, Any]] = None,
-        where: Predicate | None = None,
+        predicate: Predicate | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
@@ -3380,15 +3478,17 @@ class Table(DatabricksPath):
         the materialised source DataFrame — handy for chaining
         downstream transforms without re-querying the target.
         """
+        cast_options = _coalesce_predicate(cast_options, predicate)
+
         if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
             return self.sql_insert(
                 data,
                 mode=mode,
+                cast_options=cast_options,
                 match_by=match_by, update_column_names=update_column_names,
                 wait=wait, raise_error=raise_error,
                 zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
-                where=where,
                 spark_session=spark_session,
                 retry=retry,
                 return_data=return_data,
@@ -3417,7 +3517,9 @@ class Table(DatabricksPath):
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
-        prune_predicates = _build_where_predicates(where, target_alias="T")
+        prune_predicates = _build_where_predicates(
+            cast_options.predicate, target_alias="T",
+        )
 
         # Spark fast path for keyed APPEND under ``safe_merge=True``
         # (see :func:`_spark_filter_existing_keys`). Catalyst's
@@ -3554,7 +3656,7 @@ class Table(DatabricksPath):
         optimize_after_merge: bool = False,
         vacuum_hours: int | None = None,
         spark_session: Optional["pyspark.sql.SparkSession"] = None,
-        where: Predicate | None = None,
+        predicate: Predicate | None = None,
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
@@ -3577,13 +3679,13 @@ class Table(DatabricksPath):
         cached one) so callers can stream the same rows the warehouse
         just inserted.
         """
+        cast_options = _coalesce_predicate(cast_options, predicate)
         common = dict(
             mode=mode,
             match_by=match_by, update_column_names=update_column_names,
             wait=wait, raise_error=raise_error,
             zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
-            where=where,
             retry=retry,
         )
 
@@ -3634,7 +3736,6 @@ class Table(DatabricksPath):
         zorder_by: Optional[list[str]],
         optimize_after_merge: bool,
         vacuum_hours: int | None,
-        where: Predicate | None,
         retry: Optional[WaitingConfigArg] = None,
     ) -> "StatementBatch | None":
         """Warehouse fallback for :meth:`sql_insert`."""
@@ -3649,7 +3750,7 @@ class Table(DatabricksPath):
         if mode_enum == Mode.OVERWRITE and not match_by:
             self.delete(wait=True, missing_ok=True, delete_staging=False)
 
-        if not self.exists:
+        if not self.exists():
             target_field = cast_options.target
             if target_field is not None:
                 self.create(
@@ -3680,7 +3781,9 @@ class Table(DatabricksPath):
             f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS {quote_ident('raw_src')}"
         )
 
-        prune_predicates = _build_where_predicates(where, target_alias="T")
+        prune_predicates = _build_where_predicates(
+            cast_options.predicate, target_alias="T",
+        )
         sql_texts = _build_dml_statements(
             target_location=target_location,
             source_sql=source_sql,
@@ -3752,29 +3855,35 @@ class Table(DatabricksPath):
 
         return infos.storage_location
 
-    def storage_location(
-        self,
-        operation: "TableOperation | ModeLike | None" = None,
-    ) -> "Path":
-        """Return the table's backing storage location as an addressable :class:`Path`.
+    def storage_location(self) -> str | None:
+        """Return the raw storage-location URL string for this table, or
+        ``None`` when the table has no resolvable metadata.
 
-        ``operation`` accepts a :class:`TableOperation`, a :class:`Mode`,
-        a :class:`Mode`-like string (``"read"``, ``"overwrite"``,
-        ``"append"``, …), or ``None``.
-
-        Resolution:
-
-        - ``None`` (the default) picks ``READ`` for managed tables
-          (Unity Catalog only ever vends read creds for those) and
-          ``READ_WRITE`` for external tables.
-        - A :class:`TableOperation` is used as-is.
-        - A :class:`Mode` / string is mapped to ``READ`` for read-only
-          modes and ``READ_WRITE`` otherwise; managed tables still
-          collapse to ``READ`` because Unity Catalog will refuse
-          to vend write credentials for them.
+        For a Delta table this is the cloud-object root that contains
+        the parquet data files plus the ``_delta_log`` directory.
+        :meth:`storage_path` wraps the same URL in an
+        :class:`AWSClient`-backed Path so callers can ``iterdir()`` /
+        ``read_bytes()`` it directly.
         """
-        op = _resolve_table_operation(operation, self.infos.table_type)
-        return self.aws(operation=op).s3.path(self.infos.storage_location)
+        infos = self.read_infos(default=None)
+
+        if infos is None:
+            return None
+
+        return infos.storage_location
+
+    def storage_path(self) -> "Path | None":
+        """Return the table's backing storage as an addressable :class:`Path`.
+
+        For a Delta table, ``tbl.storage_path()`` yields a Path that
+        contains the parquet data files plus the ``_delta_log``
+        transaction directory — ``list(tbl.storage_path().iterdir())``
+        is the natural way to inspect the on-disk layout.
+        """
+        location = self.storage_location()
+        if location is None:
+            return None
+        return self.aws().s3.path(location)
 
     def aws(
         self,

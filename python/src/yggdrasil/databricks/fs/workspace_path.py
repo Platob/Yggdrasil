@@ -1,17 +1,32 @@
 """:class:`WorkspacePath` — ``/Workspace/...`` via the Workspace API.
 
 Workspace objects (notebooks, files, directories) are managed
-through ``workspace.workspace.*``. There's no FUSE counterpart;
-every read / write is SDK-mediated.
+through ``workspace.workspace.*``: ``download``, ``upload``,
+``list``, ``mkdirs``, ``delete``, ``get_status``.
 
 The Workspace API has a single download / upload pair (no range
 reads, no positional writes), so the byte primitives map onto a
 read-modify-rewrite scheme.
+
+Cluster-mount fast path
+-----------------------
+
+Inside a Databricks runtime (DBR 13+) the workspace tree is mounted
+as a FUSE filesystem at ``/Workspace/...``. Read / stat / listdir
+calls against workspace **files** (``.py``, ``.txt``, ``.whl``, …)
+go through the kernel mount, which is dramatically faster than the
+Workspace REST API. Notebooks aren't backed by simple files; reads
+that need their notebook source still go through ``workspace.download``.
+The probe lives in :func:`_workspace_mount_available` and is gated on
+``DatabricksClient.is_in_databricks_environment()`` AND
+``os.path.isdir("/Workspace")``.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import stat as _stat
 import time
 from typing import Any, ClassVar, Iterator
 
@@ -35,6 +50,55 @@ logger = logging.getLogger(__name__)
 # client; cleared implicitly when the client is garbage-collected
 # (the next caller gets a fresh ``id`` from the allocator).
 _USER_NAME_CACHE: dict[int, str] = {}
+
+
+# ---------------------------------------------------------------------------
+# Local /Workspace FUSE mount fast path
+# ---------------------------------------------------------------------------
+
+_LOCAL_WS_MOUNT_PROBED: bool = False
+_LOCAL_WS_MOUNT_AVAILABLE: bool = False
+
+
+def _workspace_mount_available() -> bool:
+    """``True`` when ``/Workspace/...`` is reachable via the kernel mount.
+
+    Conjunction of "this process runs inside a Databricks runtime" and
+    "``/Workspace`` exists on disk". Cached process-wide after the
+    first probe; the result is logged once at INFO so an operator can
+    see whether WorkspacePath is hitting the FUSE mount or paying
+    Workspace-API round trips.
+    """
+    global _LOCAL_WS_MOUNT_PROBED, _LOCAL_WS_MOUNT_AVAILABLE
+    if _LOCAL_WS_MOUNT_PROBED:
+        return _LOCAL_WS_MOUNT_AVAILABLE
+    try:
+        from yggdrasil.databricks.client import DatabricksClient
+        in_runtime = DatabricksClient.is_in_databricks_environment()
+    except Exception:
+        in_runtime = False
+    has_mount = bool(in_runtime) and os.path.isdir("/Workspace")
+    _LOCAL_WS_MOUNT_AVAILABLE = has_mount
+    _LOCAL_WS_MOUNT_PROBED = True
+    if has_mount:
+        logger.info(
+            "WorkspacePath: /Workspace kernel mount detected — "
+            "short-circuiting stat/read/ls/mkdir/remove off the Workspace API.",
+        )
+    else:
+        logger.debug(
+            "WorkspacePath: /Workspace kernel mount unavailable "
+            "(in_runtime=%s, /Workspace exists=%s) — routing through Workspace API.",
+            in_runtime, os.path.isdir("/Workspace"),
+        )
+    return _LOCAL_WS_MOUNT_AVAILABLE
+
+
+def _reset_workspace_mount_probe() -> None:
+    """Test hook — drop the cached probe result."""
+    global _LOCAL_WS_MOUNT_PROBED, _LOCAL_WS_MOUNT_AVAILABLE
+    _LOCAL_WS_MOUNT_PROBED = False
+    _LOCAL_WS_MOUNT_AVAILABLE = False
 
 
 class WorkspacePath(DatabricksPath):
@@ -125,10 +189,44 @@ class WorkspacePath(DatabricksPath):
     # ==================================================================
 
     def _stat_uncached(self) -> IOStats:
+        api_path = self.api_path
+        if _workspace_mount_available():
+            try:
+                st = os.stat(api_path)
+            except FileNotFoundError:
+                logger.debug(
+                    "stat via /Workspace mount: %r -> MISSING", api_path,
+                )
+                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
+            except OSError as exc:
+                logger.debug(
+                    "stat via /Workspace mount: %r -> OSError %r, "
+                    "falling back to Workspace API", api_path, exc,
+                )
+            else:
+                if _stat.S_ISDIR(st.st_mode):
+                    logger.debug(
+                        "stat via /Workspace mount: %r -> DIRECTORY",
+                        api_path,
+                    )
+                    return IOStats(
+                        kind=IOKind.DIRECTORY,
+                        size=0,
+                        mtime=st.st_mtime,
+                    )
+                logger.debug(
+                    "stat via /Workspace mount: %r -> FILE size=%d",
+                    api_path, st.st_size,
+                )
+                return IOStats(
+                    kind=IOKind.FILE,
+                    size=int(st.st_size),
+                    mtime=st.st_mtime,
+                )
         try:
             info = self._call(
                 self.client.workspace_client().workspace.get_status,
-                self.api_path,
+                api_path,
             )
         except Exception:
             return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
@@ -159,6 +257,58 @@ class WorkspacePath(DatabricksPath):
         *,
         singleton_ttl: Any = False,
     ) -> Iterator["WorkspacePath"]:
+        if _workspace_mount_available():
+            scan_root = self.api_path
+            logical_root = self.full_path().rstrip("/")
+            try:
+                scan = os.scandir(scan_root)
+            except FileNotFoundError:
+                logger.debug(
+                    "ls via /Workspace mount: %r -> not found", scan_root,
+                )
+                return
+            except (NotADirectoryError, PermissionError) as exc:
+                logger.warning(
+                    "Cannot scan workspace directory %r: %r", self, exc,
+                )
+                return
+            yielded = 0
+            with scan as it:
+                for entry in it:
+                    child_logical = f"{logical_root}/{entry.name}"
+                    child = type(self)(
+                        child_logical,
+                        service=self.service,
+                        singleton_ttl=singleton_ttl,
+                    )
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        is_dir = _stat.S_ISDIR(st.st_mode)
+                        child._persist_stat_cache(
+                            IOStats(
+                                kind=(
+                                    IOKind.DIRECTORY
+                                    if is_dir
+                                    else IOKind.FILE
+                                ),
+                                size=0 if is_dir else int(st.st_size),
+                                mtime=st.st_mtime,
+                            )
+                        )
+                    except OSError:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    yielded += 1
+                    yield child
+                    if recursive and is_dir:
+                        yield from child._ls(
+                            recursive=True,
+                            singleton_ttl=singleton_ttl,
+                        )
+            logger.debug(
+                "ls via /Workspace mount: %r -> %d entries (recursive=%s)",
+                scan_root, yielded, recursive,
+            )
+            return
         try:
             entries = list(
                 self._call(self.client.workspace_client().workspace.list, self.api_path)
@@ -214,8 +364,24 @@ class WorkspacePath(DatabricksPath):
     # ==================================================================
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
+        logger.debug(
+            "Creating workspace directory %r (parents=%s, exist_ok=%s)",
+            self, parents, exist_ok,
+        )
+        if _workspace_mount_available():
+            api_path = self.api_path
+            try:
+                if parents:
+                    os.makedirs(api_path, exist_ok=exist_ok)
+                else:
+                    os.mkdir(api_path)
+            except FileExistsError:
+                if not exist_ok:
+                    raise
+            self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
+            logger.debug("mkdir via /Workspace mount: %r", api_path)
+            return
         del parents
-        logger.debug("Creating workspace directory %r", self)
         try:
             self._call(self.client.workspace_client().workspace.mkdirs, self.api_path)
         except Exception as exc:
@@ -235,7 +401,20 @@ class WorkspacePath(DatabricksPath):
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
-        logger.debug("Deleting workspace file %r", self)
+        logger.debug(
+            "Deleting workspace file %r (missing_ok=%s)", self, missing_ok,
+        )
+        if _workspace_mount_available():
+            try:
+                os.remove(self.api_path)
+                logger.debug("rm via /Workspace mount: %r", self.api_path)
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+            except IsADirectoryError:
+                raise
+            self.invalidate_singleton()
+            return
         try:
             self._call(
                 self.client.workspace_client().workspace.delete,
@@ -255,10 +434,26 @@ class WorkspacePath(DatabricksPath):
     ) -> None:
         del wait
         logger.debug(
-            "Deleting workspace directory %r (recursive=%s)",
-            self,
-            recursive,
+            "Deleting workspace directory %r (recursive=%s, missing_ok=%s)",
+            self, recursive, missing_ok,
         )
+        if _workspace_mount_available():
+            import shutil
+            api_path = self.api_path
+            try:
+                if recursive:
+                    shutil.rmtree(api_path)
+                else:
+                    os.rmdir(api_path)
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+            self.invalidate_singleton()
+            logger.debug(
+                "rmdir via /Workspace mount: %r (recursive=%s)",
+                api_path, recursive,
+            )
+            return
         try:
             self._call(
                 self.client.workspace_client().workspace.delete,
@@ -277,6 +472,48 @@ class WorkspacePath(DatabricksPath):
     def _read_mv(self, n: int, pos: int) -> memoryview:
         if n == 0:
             return memoryview(b"")
+        # Cluster fast path — read off the FUSE mount when available.
+        # Workspace files (.whl, .txt, .py, …) are exposed as regular
+        # files on disk; notebooks are exposed as their source/IPython
+        # representation, matching what ``workspace.download(format=AUTO)``
+        # returns. Any OSError falls through to the Workspace API.
+        if _workspace_mount_available():
+            api_path = self.api_path
+            try:
+                with open(api_path, "rb") as fh:
+                    if pos:
+                        fh.seek(pos)
+                    data = fh.read() if n < 0 else fh.read(n)
+            except FileNotFoundError as exc:
+                logger.debug(
+                    "read via /Workspace mount: %r -> NOT FOUND", api_path,
+                )
+                raise FileNotFoundError(self.full_path()) from exc
+            except OSError as exc:
+                logger.debug(
+                    "read via /Workspace mount: %r -> OSError %r, "
+                    "falling back to Workspace API",
+                    api_path, exc,
+                )
+            else:
+                logger.debug(
+                    "read via /Workspace mount: %r -> %d bytes "
+                    "(pos=%d, n=%s)",
+                    api_path, len(data), pos, "EOF" if n < 0 else n,
+                )
+                if not self._stat_cached:
+                    try:
+                        st = os.stat(api_path)
+                        self._persist_stat_cache(
+                            IOStats(
+                                size=int(st.st_size),
+                                kind=IOKind.FILE,
+                                mtime=st.st_mtime,
+                            )
+                        )
+                    except OSError:
+                        pass
+                return memoryview(data)
         try:
             # ``format`` defaults to ``ExportFormat.SOURCE`` in the SDK,
             # which routes through the notebook export path and returns

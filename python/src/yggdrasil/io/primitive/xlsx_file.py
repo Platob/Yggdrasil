@@ -360,8 +360,8 @@ class XLSXFile(IO[bytes, XlsxOptions]):
         :meth:`collect_schema`, …) or a byte-level op.
         """
         for name in self.list_sheets():
-            yield self.adopt_child(
-                XLSXSheetFile(sheet_name=name, xlsx_parent=self)
+            yield XLSXSheetFile(
+                sheet_name=name, xlsx_parent=self, tabular_parent=self,
             )
 
     def child(self, sheet_name: str) -> XLSXSheetFile:
@@ -376,8 +376,8 @@ class XLSXFile(IO[bytes, XlsxOptions]):
                 f"No sheet named {sheet_name!r} in {self!r}. "
                 f"Available: {sheets!r}."
             )
-        return self.adopt_child(
-            XLSXSheetFile(sheet_name=sheet_name, xlsx_parent=self)
+        return XLSXSheetFile(
+            sheet_name=sheet_name, xlsx_parent=self, tabular_parent=self,
         )
 
     # ==================================================================

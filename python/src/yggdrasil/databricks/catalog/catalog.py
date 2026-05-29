@@ -72,6 +72,8 @@ class UCCatalog(DatabricksPath, Singleton):
 
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_CATALOG
 
+    NAMESPACE_PREFIX: ClassVar[Optional[str]] = "/Catalogs/"
+
     # Per-class singleton cache so this surface stays separated from
     # :class:`UCSchema`, :class:`UCTable`, :class:`Volume`, and the
     # rest of the project's :class:`Singleton` users. No companion
@@ -215,18 +217,37 @@ class UCCatalog(DatabricksPath, Singleton):
         return 0
 
     def full_path(self) -> str:
-        return self.full_name()
-
-    def _stat(self) -> IOStats:
-        return self._stat_uncached()
+        return f"/{self.catalog_name}"
 
     def _stat_uncached(self) -> IOStats:
+        infos = self.read_infos(default=None)
+        kind = IOKind.MISSING if infos is None else IOKind.DIRECTORY
+
         return IOStats(
-            size=0,
-            mtime=0.0,
-            kind=IOKind.DIRECTORY if self.exists else IOKind.MISSING,
+            kind=kind,
             media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_CATALOG,
         )
+
+    def _from_url(self, url: URL) -> "DatabricksPath":
+        parts = url.parts
+        n = len(parts)
+
+        if n <= 1:
+            return self
+        elif n == 2:
+            # /<catalog> — this catalog itself
+            return self
+        elif n == 3:
+            # /<catalog>/<schema>
+            return self.schema(parts[2])
+        elif n == 4:
+            # /<catalog>/<schema>/<volume_or_table> — hand off to the schema
+            return self.schema(parts[2])._from_url(url)
+        else:
+            raise ValueError(
+                f"URL {url} has too many parts to resolve against a Catalog "
+                f"(got {n}, expected 1-4)."
+            )
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         raise NotImplementedError(
@@ -251,18 +272,28 @@ class UCCatalog(DatabricksPath, Singleton):
             f"{type(self).__name__} is a logical Unity Catalog resource."
         )
 
+    @property
+    def parent(self) -> "IO | None":
+        return self
+
+    @property
+    def parents(self) -> "Iterator[IO]":
+        return
+
     def _ls(
         self,
         recursive: bool = False,
         *,
         singleton_ttl: Any = False,
     ) -> Iterator["Path"]:
-        del recursive, singleton_ttl
-        return iter(())
+        for schema in self.schemas():
+            if recursive:
+                yield from schema.ls(recursive=recursive, singleton_ttl=singleton_ttl)
+            else:
+                yield schema
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
-        del parents
-        self.ensure_created() if exist_ok else self.create(missing_ok=False)
+        self.create(missing_ok=True)
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         self.delete(wait=wait, raise_error=not missing_ok)
@@ -379,8 +410,7 @@ class UCCatalog(DatabricksPath, Singleton):
 
     # ── infos / existence ─────────────────────────────────────────────────────
 
-    @property
-    def infos(self) -> CatalogInfo:
+    def read_infos(self, default: Any = ...):
         """CatalogInfo — local cache first (TTL-guarded), then remote on miss."""
         now = time.time()
 
@@ -394,13 +424,24 @@ class UCCatalog(DatabricksPath, Singleton):
             )
 
         logger.debug("Fetching catalog info for %r from remote", self)
-        infos = self.client.workspace_client().catalogs.get(self.catalog_name)
+        try:
+            infos = self.client.workspace_client().catalogs.get(self.catalog_name)
+        except Exception:
+            if default is ...:
+                raise
+
+            logger.warning(f"Catalog {self.catalog_name!r} not found", exc_info=True)
+            return default
+
         logger.info("Fetched catalog info for %r from remote", self)
         object.__setattr__(self, "_infos", infos)
         object.__setattr__(self, "_infos_fetched_at", now)
-        return self._infos
+        return infos
 
     @property
+    def infos(self) -> CatalogInfo:
+        return self.read_infos()
+
     def exists(self) -> bool:
         """``True`` if this catalog is reachable via the Unity Catalog API."""
         try:
@@ -536,7 +577,7 @@ class UCCatalog(DatabricksPath, Singleton):
         storage_root: str | None = None,
     ) -> "UCCatalog":
         """Create this catalog if it does not already exist, then return ``self``."""
-        if not self.exists:
+        if not self.exists():
             self.create(
                 comment=comment,
                 properties=properties,

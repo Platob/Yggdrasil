@@ -261,7 +261,8 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         threads in one shot — meaningfully faster on multi-column
         tables than streaming batch-by-batch and re-stitching on the
         Python side. ``options.target`` still drives the projection
-        pushdown via :meth:`_projection_columns`.
+        pushdown via :meth:`_projection_columns`; ``options.row_limit``
+        is applied after the read so the slice still wins.
         """
         if self.size_known and self.size == 0:
             return super()._read_arrow_table(options)
@@ -277,7 +278,10 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         except (FileNotFoundError, pa.ArrowInvalid):
             return super()._read_arrow_table(options)
         table = options.cast_arrow_table(table)
-        return options.apply_post_read_table(table)
+        table = options.apply_post_read_table(table)
+        if options.row_limit is not None and table.num_rows > options.row_limit:
+            table = table.slice(0, options.row_limit)
+        return table
 
     # ==================================================================
     # Write path
@@ -423,6 +427,58 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                         casted = write_options.cast_arrow_batch(batch)
                         if casted.num_rows > 0:
                             writer.write_batch(casted, row_group_size=options.row_group_size)
+
+    def _write_arrow_table(self, table: pa.Table, options: ParquetOptions) -> None:
+        """Write *table* directly via ``pq.write_table``.
+
+        Bypasses the base ``_write_arrow_table`` →
+        ``table.to_batches()`` → ``_write_arrow_batches`` round trip
+        when the effective action is "replace the buffer wholesale"
+        — ``pq.write_table`` lays out row groups internally with no
+        per-batch Python dispatch, so a 1M-row table costs one
+        C-level call instead of N ``writer.write_batch`` hops.
+
+        The fast path runs when *either*:
+
+        - The mode is explicitly ``OVERWRITE`` / ``TRUNCATE``, OR
+        - The buffer is empty (an OVERWRITE wins regardless of the
+          caller's nominal mode — ``APPEND`` to empty *is* an
+          ``OVERWRITE``, and ``IGNORE`` / ``ERROR_IF_EXISTS`` on
+          empty also reduce to plain write).
+
+        Every other shape (merge against existing rows, guarded
+        ``IGNORE`` / ``ERROR_IF_EXISTS`` on non-empty) falls through
+        to ``_write_arrow_batches`` where the read-modify-rewrite /
+        size-check + raise / skip logic already lives.
+        """
+        mode = options.mode
+        has_existing = (
+            not self.holder_is_overwrite
+            and self.size_known
+            and self.size > 0
+        )
+        truly_overwrite = (
+            mode in (Mode.OVERWRITE, Mode.TRUNCATE)
+            or not has_existing
+        )
+        if not truly_overwrite:
+            return self._write_arrow_batches(iter(table.to_batches()), options)
+
+        casted = options.cast_arrow_table(table)
+        write_options = options.check_source(casted.schema)
+        schema = write_options.merged.to_arrow_schema()
+        if casted.schema != schema:
+            casted = casted.cast(schema)
+        with self.arrow_output_stream() as sink:
+            with pq.ParquetWriter(
+                sink,
+                schema,
+                compression=options.compression,
+                compression_level=options.compression_level,
+                use_dictionary=options.use_dictionary,
+                write_statistics=options.write_statistics,
+            ) as writer:
+                writer.write_table(casted, row_group_size=options.row_group_size)
 
     # ==================================================================
     # Pandas — tag each index level as a Field, set_index() on read

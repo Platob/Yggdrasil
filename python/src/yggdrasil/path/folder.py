@@ -182,7 +182,7 @@ class Folder(Path):
     leaking across long-running workers.
     """
 
-    mime_type: ClassVar[MimeTypes] = MimeTypes.FOLDER
+    mime_type: ClassVar[MimeTypes] = MimeTypes.DIRECTORY
 
     __slots__ = (
         "path",
@@ -323,10 +323,10 @@ class Folder(Path):
         # we built earlier. Bail out so the cached state stays warm.
         if getattr(self, "_initialized", False):
             if tabular_parent is not None:
-                # Late parent linkage from ``adopt_child`` — record it
-                # so the schema / free_cols walk can find an
-                # already-warm ancestor without overwriting cleaned
-                # caches.
+                # Singleton re-entry from a different ancestor: record
+                # the new parent so the schema / free_cols walk can
+                # find an already-warm ancestor without overwriting
+                # cleaned caches.
                 self.tabular_parent = tabular_parent
             return
 
@@ -775,13 +775,14 @@ class Folder(Path):
                 continue
 
             if is_dir:
-                yield self.adopt_child(type(self)(path=entry))
+                yield type(self)(path=entry, tabular_parent=self)
                 continue
 
             child = self._leaf_for(entry)
             if child is None:
                 continue
-            yield self.adopt_child(child)
+            child.tabular_parent = self
+            yield child
 
     def partition_columns(
         self,
@@ -881,13 +882,14 @@ class Folder(Path):
                     # child so the walker still descends, but don't
                     # seed any partition KV — the predicate prune
                     # falls back to the row-level filter for it.
-                    yield self.adopt_child(type(self)(path=entry))
+                    yield type(self)(path=entry, tabular_parent=self)
                 continue
 
             child = self._leaf_for(entry)
             if child is None:
                 continue
-            yield self.adopt_child(child)
+            child.tabular_parent = self
+            yield child
 
     def _iter_partition_candidates(
         self,
@@ -953,7 +955,7 @@ class Folder(Path):
         naturally.
         """
         del column, value  # Parsed by :attr:`static_values` from path.
-        return self.adopt_child(type(self)(path=path))
+        return type(self)(path=path, tabular_parent=self)
 
     def _accepted_partition_values(
         self,
@@ -1087,10 +1089,14 @@ class Folder(Path):
         child_path = self.path / name
         cls = IO.class_for_media_type(opts.child_media_type, default=None)
         if cls is None:
-            leaf: "Tabular" = IO(holder=child_path, owns_holder=False)
+            leaf: "Tabular" = IO(
+                holder=child_path, owns_holder=False, tabular_parent=self,
+            )
         else:
-            leaf = cls(holder=child_path, owns_holder=False)
-        return self.adopt_child(leaf)
+            leaf = cls(
+                holder=child_path, owns_holder=False, tabular_parent=self,
+            )
+        return leaf
 
     # ==================================================================
     # Tabular hooks — derived from children
@@ -1578,8 +1584,10 @@ class Folder(Path):
                 if subset.num_rows == 0:
                     continue
                 encoded = hive_encode(value)
-                child = type(self)(path=self.path / f"{head}={encoded}")
-                self.adopt_child(child)
+                child = type(self)(
+                    path=self.path / f"{head}={encoded}",
+                    tabular_parent=self,
+                )
                 child._write_arrow_batches(
                     iter(subset.to_batches()), child_options,
                 )

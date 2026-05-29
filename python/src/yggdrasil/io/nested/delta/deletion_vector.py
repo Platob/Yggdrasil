@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import logging
 import struct
 import uuid as _uuid
 from typing import TYPE_CHECKING, Iterable, Optional, Set
@@ -13,6 +14,8 @@ from yggdrasil.io.nested.delta.protocol import DeletionVectorDescriptor
 if TYPE_CHECKING:
     import pyarrow as pa
     from yggdrasil.path import Path
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DeletionVector", "DeletionVectorDescriptor",
@@ -102,11 +105,23 @@ def _decode_payload(payload: bytes) -> Set[int]:
 # Encode
 # ---------------------------------------------------------------------------
 
+def _encode_simple_payload(row_ids: Iterable[int]) -> bytes:
+    """Encode *row_ids* as the simple-list deletion-vector envelope.
+
+    Layout: ``<I magic><Q count><Q row>...``. Always emits the
+    simple-list envelope regardless of cardinality — readers from
+    other engines (delta-rs, Spark) only need to support this
+    shape to consume our DVs at small / medium row counts.
+    """
+    rows = sorted(set(int(r) for r in row_ids))
+    return (struct.pack("<I", _MAGIC_SIMPLE) + struct.pack("<Q", len(rows))
+            + b"".join(struct.pack("<Q", r) for r in rows))
+
+
 def _encode_dv_payload(row_ids: Iterable[int]) -> bytes:
     rows = sorted(set(int(r) for r in row_ids))
     if len(rows) <= _ROARING_THRESHOLD:
-        return (struct.pack("<I", _MAGIC_SIMPLE) + struct.pack("<Q", len(rows))
-                + b"".join(struct.pack("<Q", r) for r in rows))
+        return _encode_simple_payload(rows)
 
     # Roaring64 envelope: group by high 32 bits, encode each as portable Roaring
     chunks: dict[int, list[int]] = {}
@@ -195,26 +210,74 @@ def decode_deletion_vector(
     if storage == "p":
         sidecar_path = table_root / raw_path
     else:
-        uid = raw_path
-        if uid and not (uid[0].isalnum() and uid[0] not in "ghijklmnopqrstuvwxyz"):
-            uid = uid[1:]
-        sidecar_path = table_root / f"deletion_vector_{uid}.bin"
+        # storage == "u": pathOrInlineDv encodes the DV file UUID.
+        # Two shapes flow through here:
+        # - Yggdrasil's writer: 32-char lowercase hex UUID
+        #   stored verbatim. On disk: deletion_vector_<hex>.bin.
+        #   Detected by exact 32-hex shape so a Z85 string can't be
+        #   mis-routed.
+        # - Delta spec: <random-prefix><Z85-encoded-UUID> where the
+        #   trailing 20 chars are the Z85 UUID and the leading 0-2
+        #   chars are a random prefix distributing files across
+        #   subdirectories. On disk:
+        #   <prefix>/deletion_vector_<canonical-UUID>.bin.
+        if (len(raw_path) == 32
+                and all("0" <= c <= "9" or "a" <= c <= "f" for c in raw_path)):
+            sidecar_path = table_root / f"deletion_vector_{raw_path}.bin"
+        elif len(raw_path) >= 20:
+            try:
+                uuid_str = str(_uuid.UUID(bytes=base64.b85decode(
+                    raw_path[-20:].encode("ascii").translate(_Z85_TO_B85),
+                )))
+            except Exception:
+                return DeletionVector(descriptor=descriptor)
+            prefix = raw_path[:-20]
+            leaf = f"deletion_vector_{uuid_str}.bin"
+            sidecar_path = (
+                table_root / prefix / leaf if prefix else table_root / leaf
+            )
+        else:
+            return DeletionVector(descriptor=descriptor)
 
     offset = int(descriptor.offset or 0)
     size = int(descriptor.size_in_bytes or 0)
+    logger.debug(
+        "decode_deletion_vector: storage=%s pathOrInline=%r offset=%d "
+        "size=%d -> sidecar=%s",
+        storage, raw_path, offset, size, sidecar_path,
+    )
     cache_key = f"{sidecar_path.full_path()}|{offset}|{size}"
     cached = sidecar_cache.get(cache_key) if sidecar_cache is not None else None
     if cached is None:
         try:
             with sidecar_path.open("rb") as bio:
                 bio.seek(offset); raw = bio.read(size + 8)
-            if raw and len(raw) >= 4:
-                fs = struct.unpack(">I", raw[:4])[0]
-                cached = bytes(raw[4:4 + fs]) if 0 < fs <= size else bytes(raw[:size])
-            else: cached = b""
-        except Exception: cached = b""
+            # File layout per Delta protocol:
+            #   <4 bytes BE size header><size bytes payload><4 bytes BE CRC>
+            # The previous code took ``raw[:size]`` when the BE size
+            # header didn't fit ``0 < fs <= size`` (which it never does
+            # — the header value is size+4 for CRC), folding the header
+            # into the payload and truncating the actual DV bytes. Slice
+            # off the header and take exactly ``size`` bytes of payload.
+            if size > 0 and len(raw) >= 4 + size:
+                cached = bytes(raw[4:4 + size])
+            else:
+                cached = b""
+                logger.warning(
+                    "DV sidecar short read: path=%s size=%d got=%d bytes",
+                    sidecar_path, size, len(raw),
+                )
+        except Exception as exc:
+            logger.warning(
+                "DV sidecar read failed: path=%s -> %r", sidecar_path, exc,
+            )
+            cached = b""
         if sidecar_cache is not None: sidecar_cache[cache_key] = cached
-    return DeletionVector(descriptor=descriptor, deleted_rows=_decode_payload(cached))
+    rows = _decode_payload(cached)
+    logger.debug(
+        "DV decoded: %d deleted rows from %s", len(rows), sidecar_path,
+    )
+    return DeletionVector(descriptor=descriptor, deleted_rows=rows)
 
 
 def mask_batch_with_dv(batch: "pa.RecordBatch", dv: Optional[DeletionVector], *,

@@ -53,7 +53,7 @@ dbc.ai            # vector search
 
 ```python
 tbl = dbc.tables["main.default.orders"]
-tbl.exists
+tbl.exists()
 tbl.ensure_created(schema=schema)
 tbl.read_info()
 tbl.delete()

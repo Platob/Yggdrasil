@@ -258,19 +258,18 @@ class Volumes(DatabricksService):
             storage_location=storage_location,
             volume_type=volume_type,
         )
+
         try:
             return volume.create(**create_kwargs, missing_ok=missing_ok)
         except Exception as exc:
             if not _looks_like_not_found(exc):
                 raise
-            # Schema (or catalog) is missing — create the parents
-            # directly (without recursing through ``volume.create``)
-            # and retry the volume create exactly once.
             _ensure_parents_for(
                 self.client.workspace_client(),
                 catalog_name=volume.catalog_name,
                 schema_name=volume.schema_name,
             )
+
         return volume.create(**create_kwargs, missing_ok=True)
 
     # ── remote fetch ──────────────────────────────────────────────────────────
