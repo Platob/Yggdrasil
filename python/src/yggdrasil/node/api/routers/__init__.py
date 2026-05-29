@@ -9,11 +9,13 @@ from .pyfuncrun import router as pyfuncrun_router
 from .replicate import router as replicate_router
 from .user import router as user_router
 from .messenger import router as messenger_router
+from .excel import router as excel_router
 
 __all__ = [
     "backend_router",
     "card_router",
     "dag_router",
+    "excel_router",
     "fs_router",
     "messenger_router",
     "network_router",

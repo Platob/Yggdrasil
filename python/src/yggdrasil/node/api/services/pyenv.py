@@ -273,6 +273,12 @@ class PyEnvService:
             return posix
         return windows if os.name == "nt" else posix
 
+    def python_path_by_name(self, name: str) -> str | None:
+        """Resolve a ready env's interpreter path by env name (or None)."""
+        with self._lock:
+            env_id = self._name_to_id.get(name)
+        return self.get_python_path(env_id) if env_id is not None else None
+
     def get_python_path(self, env_id: int) -> str | None:
         with self._lock:
             entry = self._envs.get(env_id)
