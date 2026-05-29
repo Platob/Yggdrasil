@@ -306,6 +306,25 @@ class HTTPResponseBatch(Tabular):
         self.new_tabular = result_df
         cfg.write_responses_tabular(write_data, session=self._session)
 
+    @staticmethod
+    def _scatter_partition_count(
+        n_misses: int,
+        cluster_cores: int,
+        n_executors: int,
+    ) -> int:
+        """Number of partitions to scatter *n_misses* HTTP requests into.
+
+        HTTP fan-out is I/O-bound, so we oversubscribe the cluster's cores to
+        keep sockets busy while requests block on the wire. A single-node
+        cluster (``n_executors == 0``: everything runs on the driver in local
+        mode) shares those cores with the driver process, so it oversubscribes
+        more gently (×4) than a multi-node cluster whose executors are
+        dedicated to the scatter (×8). The result is clamped to ``n_misses``
+        (never more partitions than requests) and floored at 1.
+        """
+        oversubscribe = 4 if n_executors == 0 else 8
+        return max(1, min(n_misses, max(cluster_cores, 1) * oversubscribe))
+
     def _spark_scatter(
         self,
         misses: "list[HTTPRequest]",
@@ -326,19 +345,14 @@ class HTTPResponseBatch(Tabular):
             [HTTPRequest.values_to_arrow_batch(misses)]
         )
 
-        # Size the scatter against the cluster's real CPU rather than a flat
-        # multiple of defaultParallelism. ``getExecutorInfos()`` returns one
-        # entry per live executor PLUS the driver, so the executor count is
-        # ``len(infos) - 1``; a single-node / local cluster runs everything on
-        # the driver in local mode and reports no separate executors. HTTP
-        # fan-out is I/O-bound, so we oversubscribe cores to keep sockets busy
-        # while requests block on the wire — but a single-node cluster shares
-        # those cores with the driver process, so we oversubscribe it more
-        # gently (×4) than a multi-node cluster whose executors are dedicated
-        # to the scatter (×8). ``spark.sparkContext`` *raises*
-        # JVM_ATTRIBUTE_NOT_SUPPORTED on Spark Connect / Databricks Connect
-        # (it never just returns None), and the status tracker is unavailable
-        # there too — so the whole probe is guarded and falls back to a sane
+        # Probe the cluster's real CPU + node topology to size the scatter.
+        # ``getExecutorInfos()`` returns one entry per live executor PLUS the
+        # driver, so the executor count is ``len(infos) - 1``; a single-node /
+        # local cluster runs everything on the driver in local mode and reports
+        # no separate executors. ``spark.sparkContext`` *raises*
+        # JVM_ATTRIBUTE_NOT_SUPPORTED on Spark Connect / Databricks Connect (it
+        # never just returns None), and the status tracker is unavailable there
+        # too — so the whole probe is guarded and falls back to a sane
         # single-node default.
         try:
             sc = spark.sparkContext
@@ -347,13 +361,12 @@ class HTTPResponseBatch(Tabular):
         except Exception:
             n_executors = 0
             cluster_cores = 8
-        single_node = n_executors == 0
-        n_parts = max(1, min(len(misses), cluster_cores * (4 if single_node else 8)))
+        n_parts = self._scatter_partition_count(len(misses), cluster_cores, n_executors)
         LOGGER.info(
             "Scattering %d miss(es) across %d Spark partition(s) "
             "(%s cluster, cores=%d, executors=%d)",
             len(misses), n_parts,
-            "single-node" if single_node else "multi-node",
+            "single-node" if n_executors == 0 else "multi-node",
             cluster_cores, n_executors,
         )
         request_df = spark.createDataFrame(
