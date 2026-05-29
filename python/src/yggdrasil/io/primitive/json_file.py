@@ -156,7 +156,14 @@ class JSONFile(IO[bytes, JsonOptions]):
         """
         v.seek(0)
         data = v.read()
-        parsed = json.loads(data.decode(options.encoding))
+        # ``json.loads`` parses ``bytes`` directly (auto-detecting the
+        # UTF family per RFC 4627), so skip the intermediate ``decode()``
+        # str — a full extra copy of the payload — for the common UTF-8
+        # case. Non-UTF encodings still decode explicitly.
+        if (options.encoding or "utf-8").lower().replace("-", "") in ("utf8", "utf16", "utf32"):
+            parsed = json.loads(data)
+        else:
+            parsed = json.loads(data.decode(options.encoding))
         if isinstance(parsed, list):
             if parsed:
                 yield options.cast_arrow_batch(
