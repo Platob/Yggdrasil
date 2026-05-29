@@ -520,6 +520,35 @@ class TestFormats:
         got = ParquetFile(holder=p, owns_holder=False).read_arrow_table()
         assert got.equals(table)
 
+    def test_parquet_projection_ranges_only_the_subset(self, workspace, client, service):
+        # A column projection (bound target) over the ranged-capable
+        # VolumePath reads the footer + just the projected column chunks
+        # via HTTP Range — a fraction of the whole object.
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        store = self._store_backed(workspace)
+        ncols = 16
+        table = pa.table(
+            {f"c{i}": pa.array(range(20000), type=pa.int64()) for i in range(ncols)}
+        )
+        sink = io.BytesIO()
+        pq.write_table(table, sink, row_group_size=2000)
+        store["blob"] = sink.getvalue()
+        full = len(store["blob"])
+
+        p = VolumePath("/Volumes/c/s/v/wide.parquet", service=service)
+        target = pa.schema([("c3", pa.int64())])
+        got = ParquetFile(holder=p, owns_holder=False).read_arrow_table(target=target)
+        assert got.column_names == ["c3"]
+        assert got.num_rows == 20000
+        assert got.column("c3").to_pylist()[:3] == [0, 1, 2]
+        # Ranged: only footer + the c3 chunks crossed the wire (~1/16th
+        # of the columns), nowhere near the whole object.
+        served = client.files_session.return_value.bytes_served
+        assert 0 < served < full // 4
+
     def test_format_read_snapshots_whole_object(self, workspace, client, service):
         # The format readers go through ``arrow_input_stream``, which
         # snapshots a remote holder (one whole-object GET) before handing

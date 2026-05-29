@@ -79,6 +79,14 @@ class RemotePath(Path):
     # below a certain threshold) can pin their own default here.
     DEFAULT_BUFFER_SIZE: ClassVar["int | None"] = _DEFAULT_BUFFER_SIZE
 
+    # Above this committed size, :meth:`_cache_after_upload` skips
+    # pouring the just-written payload into the page cache: it would
+    # double the memory for bytes unlikely to be re-read immediately,
+    # and any later read fetches the page from the backend on demand
+    # (ranged, where supported). Small writes still warm the cache for a
+    # cheap read-after-write.
+    MAX_CACHE_AFTER_UPLOAD_BYTES: ClassVar[int] = 8 * 1024 * 1024
+
     # Activate the :class:`Singleton` cache: 5-minute default TTL,
     # bounded at 10 000 entries as defence-in-depth against
     # accidental cardinality explosions.
@@ -364,6 +372,13 @@ class RemotePath(Path):
         self._dirty_pages.clear()
         if self._page_size is None or size == 0:
             return
+        # Large payload: drop any stale pages and skip the per-page copy.
+        # ``_buffered_size`` keeps ``size`` authoritative; a later read of
+        # an un-cached page falls through to ``_fetch_page`` →
+        # ``_read_mv`` (ranged), so this stays correct — just uncached.
+        if size > self.MAX_CACHE_AFTER_UPLOAD_BYTES:
+            self._ensure_pages().clear()
+            return
         page_size = self._page_size
         pages = self._ensure_pages()
         pages.clear()
@@ -455,6 +470,23 @@ class RemotePath(Path):
             if cursor:
                 self._pos = offset
             return 0
+        # Whole-object overwrite outside a buffered ``with`` block: the
+        # paged path would copy ``data`` into page buffers and ``flush``
+        # would copy them straight back out for the upload. Skip both
+        # round trips and stream the payload to the backend once — the
+        # same end state ``flush`` produces (_upload + _cache_after_upload),
+        # minus two large copies. Inside an acquire we keep buffering so
+        # successive writes still coalesce.
+        if overwrite and offset == 0 and not self._acquired:
+            payload = bytes(data)
+            self._upload(payload)
+            self._cache_after_upload(payload, n)
+            if update_stat:
+                self._touch_stat(size=n)
+            if cursor:
+                self._pos = n
+            return n
+
         new_total = end if overwrite else max(total, end)
         self._paged_write(memoryview(data), offset)
         if overwrite and new_total < total:

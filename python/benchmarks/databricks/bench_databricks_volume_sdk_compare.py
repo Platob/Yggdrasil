@@ -238,14 +238,23 @@ def main() -> None:
             pq.read_table(pa.BufferReader(data))
 
         def ygg_parquet_full():
-            # yggdrasil's ParquetFile reads through ``arrow_input_stream``,
-            # which *snapshots* a remote holder (downloads the whole
-            # object) before handing pyarrow a BufferReader — so this is
-            # whole-object parity with the SDK, NOT a ranged read. The
-            # Range win lands on raw partial reads (random scenario), not
-            # the format reader. Making column projection range-backed is
-            # a follow-up (see module/PR notes).
+            # Full read (no projection): both snapshot the whole object —
+            # one big GET beats many ranged round trips. Parity with SDK.
             ParquetFile(holder=vp_pq, owns_holder=False).read_arrow_table()
+
+        proj_target = pa.schema([("c7", pa.int64())])
+
+        def sdk_parquet_proj():
+            # SDK has no partial read — pull the whole file, then project.
+            data = sdk.download(pq_path).contents.read()
+            pq.read_table(pa.BufferReader(data), columns=["c7"])
+
+        def ygg_parquet_proj():
+            # Bound target → ranged random-access: footer + the c7 column
+            # chunks only, over HTTP Range.
+            ParquetFile(holder=vp_pq, owns_holder=False).read_arrow_table(
+                target=proj_target,
+            )
 
         def sdk_pickle():
             assert pickle.loads(sdk.download(pk_path).contents.read()) == obj
@@ -258,6 +267,7 @@ def main() -> None:
             (f"random {args.reads}x{args.block}B", sdk_random, ygg_random),
             ("upload 16MiB", sdk_upload, ygg_upload),
             ("parquet full read", sdk_parquet_full, ygg_parquet_full),
+            ("parquet 1-col project", sdk_parquet_proj, ygg_parquet_proj),
             ("pickle roundtrip", sdk_pickle, ygg_pickle),
         ]
 
