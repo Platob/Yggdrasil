@@ -311,6 +311,8 @@ class HTTPResponseBatch(Tabular):
         n_misses: int,
         cluster_cores: int,
         n_executors: int,
+        max_executors: int = 0,
+        executor_cores: int = 0,
     ) -> int:
         """Number of partitions to scatter *n_misses* HTTP requests into.
 
@@ -318,15 +320,32 @@ class HTTPResponseBatch(Tabular):
         session's own thread pool (``_send_partition`` calls ``send_many``), so
         the per-socket I/O concurrency is handled *inside* a partition — we do
         NOT need extra partitions to keep the wire busy. We therefore target
-        roughly one partition per task slot (``defaultParallelism`` ≈ total
-        cores): a single-node cluster (``n_executors == 0``, local mode) gets
-        exactly one partition per core, and a multi-node cluster gets a light
-        ×2 so the scheduler can rebalance stragglers across machines. The
-        result is clamped to ``n_misses`` (never more partitions than requests)
-        and floored at 1.
+        roughly one partition per task slot rather than oversubscribing.
+
+        Autoscaling is the wrinkle: ``cluster_cores`` (``defaultParallelism``)
+        only reflects the executors *currently registered*, which on an
+        autoscaling cluster lags the configured maximum — and is 0 right after
+        launch before any worker has joined. When the cluster advertises a
+        ``max_executors`` and per-``executor_cores`` count, we size against
+        that ceiling (``max_executors * executor_cores``) so a scatter that
+        triggers a scale-up still lands enough partitions to use the eventual
+        capacity instead of collapsing onto the few warm executors.
+
+        Node topology then picks the factor: a single-node cluster (no live
+        executors *and* no configured workers — local mode on the driver) gets
+        exactly one partition per core; a multi-node cluster gets a light ×2 so
+        the scheduler can rebalance stragglers across machines. A cluster with
+        ``max_executors > 0`` counts as multi-node even before its workers
+        register, so an autoscaling-from-zero scatter isn't mis-sized as
+        single-node. The result is clamped to ``n_misses`` (never more
+        partitions than requests) and floored at 1.
         """
-        oversubscribe = 1 if n_executors == 0 else 2
-        return max(1, min(n_misses, max(cluster_cores, 1) * oversubscribe))
+        target_cores = cluster_cores
+        if max_executors > 0 and executor_cores > 0:
+            target_cores = max(target_cores, max_executors * executor_cores)
+        single_node = n_executors == 0 and max_executors == 0
+        oversubscribe = 1 if single_node else 2
+        return max(1, min(n_misses, max(target_cores, 1) * oversubscribe))
 
     def _spark_scatter(
         self,
@@ -364,13 +383,39 @@ class HTTPResponseBatch(Tabular):
         except Exception:
             n_executors = 0
             cluster_cores = 8
-        n_parts = self._scatter_partition_count(len(misses), cluster_cores, n_executors)
+
+        # Autoscaling ceiling — read from Spark conf (available on Spark
+        # Connect, unlike sparkContext): Databricks autoscaling tags first,
+        # then generic dynamic-allocation, then per-executor core count. These
+        # let ``_scatter_partition_count`` size against the cluster's *max*
+        # capacity instead of the executors that happen to be warm right now.
+        def _conf_int(*keys: str) -> int:
+            for key in keys:
+                try:
+                    raw = spark.conf.get(key, None)
+                except Exception:
+                    raw = None
+                if raw:
+                    try:
+                        return int(raw)
+                    except (TypeError, ValueError):
+                        continue
+            return 0
+
+        max_executors = _conf_int(
+            "spark.databricks.clusterUsageTags.clusterMaxWorkers",
+            "spark.dynamicAllocation.maxExecutors",
+        )
+        executor_cores = _conf_int("spark.executor.cores")
+        n_parts = self._scatter_partition_count(
+            len(misses), cluster_cores, n_executors, max_executors, executor_cores,
+        )
         LOGGER.info(
             "Scattering %d miss(es) across %d Spark partition(s) "
-            "(%s cluster, cores=%d, executors=%d)",
+            "(%s cluster, cores=%d, executors=%d, max_workers=%d, exec_cores=%d)",
             len(misses), n_parts,
-            "single-node" if n_executors == 0 else "multi-node",
-            cluster_cores, n_executors,
+            "single-node" if n_executors == 0 and max_executors == 0 else "multi-node",
+            cluster_cores, n_executors, max_executors, executor_cores,
         )
         request_df = spark.createDataFrame(
             request_table,

@@ -44,3 +44,29 @@ class TestScatterPartitionCount:
     def test_fallback_default_single_node(self):
         # Mirrors the probe's except-branch defaults (cores=8, executors=0).
         assert _count(1000, 8, 0) == 8
+
+    # -- autoscaling / max workers ------------------------------------------
+
+    def test_autoscaling_sizes_against_max_capacity(self):
+        # Only 1 worker (4 cores) warm now, but the cluster can scale to 10
+        # workers × 4 cores = 40. Size against the ceiling, ×2 multi-node = 80.
+        assert _count(1000, 4, 1, max_executors=10, executor_cores=4) == 80
+
+    def test_autoscaling_from_zero_treated_as_multi_node(self):
+        # No executors registered yet, but max_workers > 0 → multi-node, sized
+        # against the ceiling (8 × 4 = 32) at ×2 = 64, not the single-node ×1.
+        assert _count(1000, 1, 0, max_executors=8, executor_cores=4) == 64
+
+    def test_max_capacity_below_current_keeps_current(self):
+        # If the live defaultParallelism already exceeds the computed ceiling
+        # (stale/partial conf), never shrink below current cores.
+        assert _count(1000, 64, 8, max_executors=2, executor_cores=4) == 128
+
+    def test_max_workers_without_executor_cores_ignored_for_sizing(self):
+        # Can't compute a ceiling without per-executor cores, so fall back to
+        # current cores — but max_workers > 0 still marks it multi-node (×2).
+        assert _count(1000, 8, 0, max_executors=4, executor_cores=0) == 16
+
+    def test_single_node_unaffected_by_zero_max(self):
+        # Explicit zero max workers keeps the single-node ×1 factor.
+        assert _count(1000, 8, 0, max_executors=0, executor_cores=0) == 8
