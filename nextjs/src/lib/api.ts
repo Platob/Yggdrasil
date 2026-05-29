@@ -85,10 +85,10 @@ export function getBackend(): Promise<{ backend: NodeBackend }> {
   return jsonFetch<{ backend: NodeBackend }>("/api/v2/backend");
 }
 
-// SSE: emits NodeBackend snapshots every ~1s. The handler reads
-// `event.data` as JSON.
-export function createBackendStream(): EventSource {
-  return new EventSource("/api/v2/backend/stream");
+// SSE: emits NodeBackend snapshots. ``intervalSec`` sets the cadence
+// (backend clamps to [0.25, 30]); the handler reads `event.data` as JSON.
+export function createBackendStream(intervalSec = 1): EventSource {
+  return new EventSource(`/api/v2/backend/stream?interval=${intervalSec}`);
 }
 
 // ── Network / peers ────────────────────────────────────────────────────────
@@ -188,6 +188,14 @@ export async function runFuncByName(
 
 export function getRuns(): Promise<{ node_id: string; runs: PyFuncRunEntry[] }> {
   return jsonFetch<{ node_id: string; runs: PyFuncRunEntry[] }>("/api/v2/pyfuncrun");
+}
+
+export function cancelRun(runId: number): Promise<{ run: PyFuncRunEntry }> {
+  return jsonFetch<{ run: PyFuncRunEntry }>(`/api/v2/pyfuncrun/${runId}/cancel`, { method: "POST" });
+}
+
+export function deleteRun(runId: number): Promise<{ run: PyFuncRunEntry }> {
+  return jsonFetch<{ run: PyFuncRunEntry }>(`/api/v2/pyfuncrun/${runId}`, { method: "DELETE" });
 }
 
 // ── DAG ────────────────────────────────────────────────────────────────────
