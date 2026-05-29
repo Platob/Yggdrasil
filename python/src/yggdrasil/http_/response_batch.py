@@ -326,14 +326,31 @@ class HTTPResponseBatch(Tabular):
             [HTTPRequest.values_to_arrow_batch(misses)]
         )
 
+        # Size the scatter against the cluster's real CPU rather than a flat
+        # multiple of defaultParallelism. ``getExecutorInfos()`` returns one
+        # entry per live executor PLUS the driver, so the executor count is
+        # ``len(infos) - 1``; a single-node / local cluster runs everything on
+        # the driver in local mode and reports no separate executors. HTTP
+        # fan-out is I/O-bound, so we oversubscribe cores to keep sockets busy
+        # while requests block on the wire — but a single-node cluster shares
+        # those cores with the driver process, so we oversubscribe it more
+        # gently (×4) than a multi-node cluster whose executors are dedicated
+        # to the scatter (×8).
+        sc = spark.sparkContext
         try:
-            default_par = max(spark.sparkContext.defaultParallelism, 1)
+            n_executors = max(len(sc.statusTracker().getExecutorInfos()) - 1, 0)
+            cluster_cores = max(sc.defaultParallelism, 1)
         except Exception:
-            default_par = 8
-        n_parts = max(1, min(len(misses), default_par * 8))
+            n_executors = 0
+            cluster_cores = 8
+        single_node = n_executors == 0
+        n_parts = max(1, min(len(misses), cluster_cores * (4 if single_node else 8)))
         LOGGER.info(
-            "Scattering %d miss(es) across %d Spark partition(s)",
+            "Scattering %d miss(es) across %d Spark partition(s) "
+            "(%s cluster, cores=%d, executors=%d)",
             len(misses), n_parts,
+            "single-node" if single_node else "multi-node",
+            cluster_cores, n_executors,
         )
         request_df = spark.createDataFrame(
             request_table,
