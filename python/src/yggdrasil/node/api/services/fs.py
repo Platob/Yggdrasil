@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import AsyncIterator
@@ -75,13 +76,29 @@ class FsService:
         if not resolved.is_dir():
             raise ForbiddenError(f"Path is not a directory: {path!r}")
 
-        entries = [
-            self._entry(child)
-            for child in sorted(
-                resolved.iterdir(),
-                key=lambda p: (not p.is_dir(), p.name.lower()),
-            )
-        ]
+        # os.scandir caches each entry's type (one readdir, no per-child stat
+        # for is_dir) and hands back a stat with a single syscall — versus
+        # iterdir()+_entry which stat'd every child 3-4×. This is the hot path
+        # behind the lazy global-fs tree, so the difference is felt on expand.
+        root_str = str(self._root.resolve())
+        entries: list[FsEntry] = []
+        with os.scandir(resolved) as it:
+            for de in it:
+                try:
+                    is_dir = de.is_dir()
+                    st = de.stat()
+                except OSError:
+                    continue
+                entries.append(FsEntry(
+                    path=os.path.relpath(de.path, root_str),
+                    name=de.name,
+                    is_dir=is_dir,
+                    size=0 if is_dir else st.st_size,
+                    modified_at=dt.datetime.fromtimestamp(
+                        st.st_mtime, tz=dt.timezone.utc
+                    ).isoformat(),
+                ))
+        entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
 
         try:
             display = str(resolved.relative_to(self._root))

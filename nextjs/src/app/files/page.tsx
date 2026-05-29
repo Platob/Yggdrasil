@@ -11,6 +11,7 @@ import {
   deleteFsPath,
   writeFsFile,
   uploadFsFile,
+  mkdirFs,
   isTabularName,
   type FsNodeRoot,
 } from "@/lib/api";
@@ -198,24 +199,13 @@ export default function FilesPage() {
     });
   }, [ensureLoaded]);
 
-  // ── Drag & drop folder upload ───────────────────────────────
-  const handleDrop = useCallback(async (node: string, basePath: string, e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragKey(null);
-    const items = Array.from(e.dataTransfer.items)
-      .map((it) => (it.webkitGetAsEntry ? (it.webkitGetAsEntry() as unknown as FsDropEntry | null) : null))
-      .filter((x): x is FsDropEntry => x !== null);
-    let files: { file: File; relPath: string }[] = [];
-    if (items.length) {
-      for (const it of items) files.push(...(await gatherDropped(it, "")));
-    } else {
-      files = Array.from(e.dataTransfer.files).map((f) => ({ file: f, relPath: f.name }));
-    }
+  // Upload a set of {file, relPath} into basePath on a node, with a progress
+  // toast and bounded concurrency. Shared by drag-drop and the Upload button.
+  const runUpload = useCallback(async (
+    node: string, basePath: string, files: { file: File; relPath: string }[],
+  ) => {
     if (!files.length) return;
-
     setUpload({ label: `${node === selfNodeId ? "local" : node} ${basePath || "/"}`, done: 0, total: files.length });
-    // Bounded concurrency so a big folder doesn't open hundreds of sockets.
     let idx = 0;
     const worker = async () => {
       while (idx < files.length) {
@@ -230,6 +220,55 @@ export default function FilesPage() {
     setExpanded((s) => new Set(s).add(dirKey(node, basePath)));
     await ensureLoaded(node, basePath, true);
   }, [ensureLoaded, selfNodeId]);
+
+  const handleDrop = useCallback(async (node: string, basePath: string, e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragKey(null);
+    const items = Array.from(e.dataTransfer.items)
+      .map((it) => (it.webkitGetAsEntry ? (it.webkitGetAsEntry() as unknown as FsDropEntry | null) : null))
+      .filter((x): x is FsDropEntry => x !== null);
+    let files: { file: File; relPath: string }[] = [];
+    if (items.length) {
+      for (const it of items) files.push(...(await gatherDropped(it, "")));
+    } else {
+      files = Array.from(e.dataTransfer.files).map((f) => ({ file: f, relPath: f.name }));
+    }
+    await runUpload(node, basePath, files);
+  }, [runUpload]);
+
+  // Delete a file or whole folder straight from the tree, then refresh parent.
+  const deleteEntry = useCallback(async (node: string, entry: FsEntry, parentPath: string) => {
+    if (!confirm(`Delete ${entry.is_dir ? "folder" : "file"} ${entry.path}?`)) return;
+    try {
+      await deleteFsPath(entry.path, node);
+      await ensureLoaded(node, parentPath, true);
+    } catch { /* tree shows last good state */ }
+  }, [ensureLoaded]);
+
+  const newFolder = useCallback(async (node: string, basePath: string) => {
+    const name = prompt("New folder name");
+    if (!name) return;
+    try {
+      await mkdirFs(basePath ? `${basePath}/${name}` : name, node);
+      setExpanded((s) => new Set(s).add(dirKey(node, basePath)));
+      await ensureLoaded(node, basePath, true);
+    } catch { /* ignore */ }
+  }, [ensureLoaded]);
+
+  // Hidden <input> drives the Upload button; the pending target says where to.
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadTargetRef = useRef<{ node: string; path: string }>({ node: "", path: "" });
+  const pickUpload = (node: string, basePath: string) => {
+    uploadTargetRef.current = { node, path: basePath };
+    uploadInputRef.current?.click();
+  };
+  const onUploadPicked = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const list = Array.from(e.target.files ?? []).map((f) => ({ file: f, relPath: f.name }));
+    const { node, path } = uploadTargetRef.current;
+    e.target.value = "";
+    runUpload(node, path, list);
+  };
 
   // ── File open / preview ─────────────────────────────────────
   const openFile = useCallback(async (node: string, entry: FsEntry) => {
@@ -367,6 +406,18 @@ export default function FilesPage() {
                 <span className="text-[10px] font-mono text-muted/70 opacity-0 group-hover:opacity-100">
                   {entry.is_dir ? "" : formatSize(entry.size)}
                 </span>
+                {entry.is_dir && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); pickUpload(node, entry.path); }}
+                    className="opacity-0 group-hover:opacity-100 text-emerald/60 hover:text-emerald"
+                    title="Upload into folder"
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                      <polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+                    </svg>
+                  </button>
+                )}
                 <a
                   href={fsDownloadUrl(entry.path, node)}
                   onClick={(e) => e.stopPropagation()}
@@ -378,6 +429,16 @@ export default function FilesPage() {
                     <polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
                   </svg>
                 </a>
+                <button
+                  onClick={(e) => { e.stopPropagation(); deleteEntry(node, entry, path); }}
+                  className="opacity-0 group-hover:opacity-100 text-rose/60 hover:text-rose"
+                  title={entry.is_dir ? "Delete folder" : "Delete file"}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" />
+                  </svg>
+                </button>
               </div>
               {entry.is_dir && renderDir(node, entry.path, depth + 1)}
             </div>
@@ -446,9 +507,22 @@ export default function FilesPage() {
                       </span>
                     )}
                   </div>
-                  <span className="text-[10px] uppercase tracking-wider text-muted/60 font-mono">
-                    {n.self ? "self" : "peer"}
-                  </span>
+                  <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      onClick={() => newFolder(n.node_id, "")}
+                      className="px-2 py-1 rounded text-[10px] font-mono text-frost/70 hover:text-frost hover:bg-frost/10 border border-white/[0.06]"
+                      title="New folder at root"
+                    >
+                      + folder
+                    </button>
+                    <button
+                      onClick={() => pickUpload(n.node_id, "")}
+                      className="px-2 py-1 rounded text-[10px] font-mono text-emerald/80 hover:text-emerald hover:bg-emerald/10 border border-emerald/15"
+                      title="Upload files to root"
+                    >
+                      ↑ upload
+                    </button>
+                  </div>
                 </div>
                 {renderDir(n.node_id, "", 0)}
               </div>
@@ -459,6 +533,9 @@ export default function FilesPage() {
           )}
         </div>
       )}
+
+      {/* Hidden picker for the Upload buttons (drag-drop handles folders) */}
+      <input ref={uploadInputRef} type="file" multiple className="hidden" onChange={onUploadPicked} />
 
       {/* Upload progress toast */}
       {upload && (
