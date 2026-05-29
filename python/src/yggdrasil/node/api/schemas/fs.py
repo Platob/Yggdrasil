@@ -22,6 +22,9 @@ class FsReadResponse(StrictModel):
     content: str
     encoding: str = "utf-8"
     size: int = 0
+    # True when ``size`` exceeds the read cap and ``content`` holds only the
+    # leading slice. Consumers should fetch /fs/stream for the whole file.
+    truncated: bool = False
 
 
 class FsWriteRequest(StrictModel):

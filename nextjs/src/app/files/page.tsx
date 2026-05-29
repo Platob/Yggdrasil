@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
   getFsListing,
-  getFsContent,
+  getFsRead,
   getFsTail,
   createFsWatchStream,
   grepFs,
@@ -114,6 +114,7 @@ export default function FilesPage() {
   const [error, setError] = useState(false);
   const [selectedFile, setSelectedFile] = useState<FsEntry | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
+  const [fileTruncated, setFileTruncated] = useState(false);
   const [loadingContent, setLoadingContent] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("preview");
   const [tailLines, setTailLines] = useState<string[]>([]);
@@ -178,14 +179,16 @@ export default function FilesPage() {
   const openFile = async (entry: FsEntry) => {
     setSelectedFile(entry);
     setFileContent(null);
+    setFileTruncated(false);
     setTailLines([]);
     setViewMode("preview");
     setTailLive(false);
     if (isTextViewable(entry)) {
       setLoadingContent(true);
       try {
-        const content = await getFsContent(entry.path);
-        setFileContent(content);
+        const res = await getFsRead(entry.path);
+        setFileContent(res.encoding === "base64" ? "[binary file — use Download]" : res.content);
+        setFileTruncated(res.truncated);
       } catch {
         setFileContent(null);
       } finally {
@@ -532,6 +535,12 @@ export default function FilesPage() {
                     tail -f
                   </button>
                 </div>
+                {fileTruncated && (
+                  <div className="px-3 py-1.5 border-b border-amber/15 bg-amber/[0.06] text-[10px] font-mono text-amber/90">
+                    Preview truncated — showing the first {formatSize(fileContent?.length ?? 0)} of{" "}
+                    {formatSize(selectedFile.size)}. Use Download for the full file.
+                  </div>
+                )}
                 <pre className="overflow-auto p-4 text-xs font-mono text-foreground/80 leading-relaxed max-h-[50vh] whitespace-pre-wrap break-words">
                   {fileContent}
                 </pre>

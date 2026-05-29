@@ -275,13 +275,12 @@ export function getFsListing(
   return jsonFetch<{ node_id: string; path: string; entries: FsEntry[] }>(url);
 }
 
-// Returns just the file content as a string (the route also returns encoding/size
-// but the legacy file viewer only ever reads `.content`).
-export async function getFsContent(path: string): Promise<string> {
-  const res = await jsonFetch<{ path: string; content: string; encoding: string; size: number }>(
-    `/api/v2/fs/read?path=${encodeURIComponent(path)}`,
-  );
-  return res.content;
+// Reads a bounded preview of a file. The backend caps how much it pulls into
+// memory and sets `truncated` when the file is larger than the returned slice.
+export function getFsRead(
+  path: string,
+): Promise<{ path: string; content: string; encoding: string; size: number; truncated: boolean }> {
+  return jsonFetch(`/api/v2/fs/read?path=${encodeURIComponent(path)}`);
 }
 
 export function getFsTail(path: string, n = 200): Promise<{ path: string; lines: string[] }> {

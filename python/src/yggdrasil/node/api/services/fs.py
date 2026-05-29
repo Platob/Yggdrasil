@@ -96,26 +96,52 @@ class FsService:
             entries=entries,
         )
 
-    async def read(self, path: str) -> FsReadResponse:
+    async def read(self, path: str, *, max_bytes: int | None = None) -> FsReadResponse:
         resolved = self._resolve(path)
         if not resolved.exists():
             raise NotFoundError(f"File not found: {path!r}")
         if resolved.is_dir():
             raise ForbiddenError(f"Cannot read a directory as a file: {path!r}")
 
+        # Bound the read: never pull more than the cap into memory just to
+        # preview. A caller may ask for a smaller window but not a larger one.
+        cap = self.settings.max_read_bytes if max_bytes is None else max_bytes
+        cap = max(1, min(cap, self.settings.max_read_bytes))
+        full_size = resolved.stat().st_size
+        # Read cap+1 so we can tell the file was longer without loading it all.
+        with open(resolved, "rb") as fh:
+            raw = fh.read(cap + 1)
+        truncated = len(raw) > cap
+        if truncated:
+            raw = raw[:cap]
+
         try:
-            content = resolved.read_text(encoding="utf-8")
+            content = raw.decode("utf-8")
             encoding = "utf-8"
-        except (UnicodeDecodeError, ValueError):
-            content = base64.b64encode(resolved.read_bytes()).decode("ascii")
-            encoding = "base64"
+        except UnicodeDecodeError:
+            # A clean truncation can split a trailing multibyte char; drop up
+            # to 3 trailing bytes and retry before deciding the file is binary.
+            text: str | None = None
+            if truncated:
+                for back in (1, 2, 3):
+                    try:
+                        text = raw[:-back].decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+            if text is not None:
+                content, encoding = text, "utf-8"
+            else:
+                content = base64.b64encode(raw).decode("ascii")
+                encoding = "base64"
 
         rel = str(resolved.relative_to(self._root))
         return FsReadResponse(
             path=rel,
             content=content,
             encoding=encoding,
-            size=resolved.stat().st_size,
+            size=full_size,
+            truncated=truncated,
         )
 
     async def write(self, req: FsWriteRequest) -> FsEntry:

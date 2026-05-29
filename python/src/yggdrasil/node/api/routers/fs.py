@@ -36,9 +36,10 @@ async def stat_path(
 @router.get("/read", response_model=FsReadResponse)
 async def read_file(
     path: str,
+    max_bytes: int | None = None,
     service: FsService = Depends(get_fs_service),
 ) -> FsReadResponse:
-    return await service.read(path)
+    return await service.read(path, max_bytes=max_bytes)
 
 
 @router.post("/write", response_model=FsEntry)
@@ -260,11 +261,16 @@ async def disk_usage(path: str = "", service: FsService = Depends(get_fs_service
     total_size = 0
     file_count = 0
     dir_count = 0
+    truncated = False
     if root.is_file():
         total_size = root.stat().st_size
         file_count = 1
     else:
+        cap = service.settings.du_max_entries
         for p in root.rglob("*"):
+            if file_count + dir_count >= cap:
+                truncated = True
+                break
             try:
                 if p.is_file():
                     total_size += p.stat().st_size
@@ -279,4 +285,5 @@ async def disk_usage(path: str = "", service: FsService = Depends(get_fs_service
         "total_size_mb": round(total_size / 1024 / 1024, 2),
         "file_count": file_count,
         "dir_count": dir_count,
+        "truncated": truncated,
     }
