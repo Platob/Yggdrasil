@@ -160,6 +160,8 @@ class TableEntry(StrictModel):
     comment: str = ""
     columns: list[ColumnSpec] = Field(default_factory=list)
     statistics: TableStatistics = Field(default_factory=TableStatistics)
+    # Node ids that hold a local replica of this table's data.
+    replicas: list[str] = Field(default_factory=list)
     properties: dict[str, str] = Field(default_factory=dict)
     created_at: str
     updated_at: str
@@ -206,6 +208,10 @@ class SqlRequest(StrictModel):
     node: str | None = None
     # Row cap for the JSON grid response.
     limit: int | None = None
+    # When set (an npfs:// NodePath URL), the executing node writes the Arrow
+    # result there instead of streaming it back — lets a remote node stage the
+    # output near whoever asked for it.
+    staging_path: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -234,3 +240,64 @@ class ExplainResult(StrictModel):
     plan_sql: str
     referenced_tables: list[str]
     statement: str
+
+
+class StagedResult(StrictModel):
+    node_id: str
+    staging_path: str
+    columns: list[SqlColumn]
+    row_count: int
+    bytes: int
+    elapsed_ms: float
+
+
+# -- replication ------------------------------------------------------------
+
+class ReplicateRequest(StrictModel):
+    catalog: str
+    schema_: str = Field(alias="schema")
+    table: str
+    # Target node id to replicate to.
+    target: str
+    # "metadata": register the table on the target (shared fs / same source).
+    # "data": copy the data file to the target's staging, then register it there.
+    mode: str = "data"
+
+    model_config = {"populate_by_name": True}
+
+
+class TablePayload(StrictModel):
+    """Self-contained table registration for cross-node import."""
+    catalog: str
+    schema_: str = Field(alias="schema")
+    table: TableEntry
+    catalog_dialect: str = "postgres"
+
+    model_config = {"populate_by_name": True}
+
+
+class ReplicateResult(StrictModel):
+    source_node: str
+    target_node: str
+    full_name: str
+    mode: str
+    bytes_copied: int = 0
+    target_source_url: str = ""
+
+
+# -- operation log ----------------------------------------------------------
+
+class OpLogEntry(StrictModel):
+    ts: str
+    op: str
+    user: str = ""
+    node: str = ""
+    statement: str = ""
+    rows: int | None = None
+    detail: str = ""
+
+
+class OpLogResponse(StrictModel):
+    node_id: str
+    asset: str
+    entries: list[OpLogEntry]

@@ -162,6 +162,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lambda: pyfuncrun.total_count,
     )
     network = NetworkService(settings, backend)
+    app.state.saga_service.bind_network(network)
     v2_dag = V2DagService(settings, pyfuncrun, network_service=network, backend_service=backend)
     replicate = ReplicateService(settings, pyenv, pyfunc, v2_dag)
     user_svc = UserService(settings)

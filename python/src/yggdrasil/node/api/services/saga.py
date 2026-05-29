@@ -1,11 +1,13 @@
 """Saga — distributed data catalog service.
 
-A metadata-only layer: catalogs/schemas/tables are JSON records persisted under
-``~/.node/{id}/saga/store.json``; the table *data* stays on the filesystem. SQL
-runs through the repo's existing plan engine (``parse_sql`` → ``execute_plan``)
-over the registered tables and raw file URLs, and results come back as Arrow IPC
-— streamed straight from memory when small, spilled to ``spill_root`` and
-streamed off disk when heavy.
+A metadata layer: catalogs/schemas/tables are JSON records persisted in the
+managed store at ``~/.saga/{node_id}/store.json`` (off the network filesystem);
+the table *data* stays on the shared filesystem. SQL runs through the repo's
+existing plan engine (``parse_sql`` → ``execute_plan``) over registered tables
+and raw file URLs, and results come back as Arrow IPC — streamed from memory
+when small, spilled to ``tmp`` and streamed off disk when heavy, or written to
+a remote staging NodePath. Tables replicate (metadata or data) to peers, and
+every mutation/query is logged per-asset on compressed Arrow IPC.
 """
 from __future__ import annotations
 
@@ -15,21 +17,19 @@ import math
 import os
 import tempfile
 import time
+from functools import partial
 from threading import Lock
 from typing import Any
 
-import pyarrow as pa
 from fastapi.concurrency import run_in_threadpool
 
 from yggdrasil.enums.dialect import Dialect
 from yggdrasil.io.tabular.base import Tabular, is_tabular_source
 from yggdrasil.plan.execute import execute_plan
-from yggdrasil.plan.nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
+from yggdrasil.plan.nodes import InsertNode, MergeNode, PlanNode, SelectNode
 from yggdrasil.plan.ops import (
-    CTE,
     JoinClause,
     LateralViewItem,
-    SetOp,
     SubqueryRef,
     TableRef,
     ValuesRef,
@@ -37,7 +37,7 @@ from yggdrasil.plan.ops import (
 from yggdrasil.plan.sql_parser import parse_sql
 
 from ...config import Settings
-from ... import transport
+from ... import scratch, transport
 from yggdrasil.exceptions.api import BadRequestError, ConflictError, NotFoundError
 from ..schemas.saga import (
     CatalogCreate,
@@ -54,16 +54,23 @@ from ..schemas.saga import (
     SchemaListResponse,
     SchemaResponse,
     SchemaUpdate,
+    OpLogEntry,
+    OpLogResponse,
+    ReplicateRequest,
+    ReplicateResult,
+    StagedResult,
     SqlColumn,
     SqlRequest,
     SqlResult,
     TableCreate,
     TableEntry,
     TableListResponse,
+    TablePayload,
     TableResponse,
     TableStatistics,
     TableUpdate,
 )
+from .saga_log import OpLog
 from ...ids import make_id
 
 _TABULAR_EXTS = {"parquet", "pq", "csv", "tsv", "ndjson", "json", "arrow", "feather", "ipc", "xlsx"}
@@ -99,7 +106,26 @@ class SagaService:
         self._catalogs: dict[int, CatalogEntry] = {}
         self._schemas: dict[int, SchemaEntry] = {}
         self._tables: dict[int, TableEntry] = {}
+        self._log = OpLog(settings.saga_log_root)
+        self._network = None  # bound after construction; enables replication
+        try:
+            from yggdrasil.environ.userinfo import UserInfo
+            self._user = UserInfo.current().key
+        except Exception:
+            self._user = ""
         self._load()
+
+    def bind_network(self, network) -> None:
+        """Wire the peer mesh in (set after construction to avoid a cycle)."""
+        self._network = network
+
+    def _record(self, asset: str, op: str, *, statement: str = "",
+                rows: int | None = None, detail: str = "") -> None:
+        try:
+            self._log.append(asset, op, user=self._user, node=self.settings.node_id,
+                             statement=statement, rows=rows, detail=detail)
+        except Exception:
+            pass  # logging must never break the operation
 
     # -- persistence --------------------------------------------------------
 
@@ -366,6 +392,8 @@ class SagaService:
             })
             self._tables[entry.id] = entry
             self._save()
+        self._record(full, "update" if existing else "register",
+                     detail=f"{entry.table_type} {entry.source_url}")
         # Infer outside the lock — the scan can touch the filesystem.
         if req.infer and not req.node:
             try:
@@ -420,7 +448,16 @@ class SagaService:
                 raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
             self._tables.pop(t.id, None)
             self._save()
-            return TableResponse(table=t)
+        # Dropping the table purges its operation log — no orphan history.
+        self._log.purge(t.full_name)
+        return TableResponse(table=t)
+
+    async def read_log(self, catalog: str, schema: str, name: str, *, limit: int = 200) -> OpLogResponse:
+        full = f"{catalog}.{schema}.{name}"
+        table = await run_in_threadpool(partial(self._log.read, full, limit=limit))
+        entries = [OpLogEntry(**{k: _json_safe(v) for k, v in row.items()})
+                   for row in table.to_pylist()]
+        return OpLogResponse(node_id=self.settings.node_id, asset=full, entries=entries)
 
     # -- statistics / schema inference --------------------------------------
 
@@ -687,11 +724,20 @@ class SagaService:
             plan_sql = node.to_sql(dialect=dialect)
         except Exception:
             plan_sql = ""
+        ref_names = sorted({self._qualify(r, req.catalog, req.schema_) for r in refs})
+        # One log row per touched *registered* asset — queries against raw URLs
+        # aren't catalog assets, so they don't accrue history.
+        with self._lock:
+            known = {t.full_name for t in self._tables.values()}
+        for asset in ref_names:
+            if asset in known:
+                self._record(asset, "query", statement=req.sql, rows=table.num_rows,
+                             detail=f"{round(elapsed, 1)}ms")
         return SqlResult(
             node_id=self.settings.node_id, columns=cols, rows=rows,
             row_count=table.num_rows, truncated=truncated,
             elapsed_ms=round(elapsed, 2), plan_sql=plan_sql,
-            referenced_tables=sorted({self._qualify(r, req.catalog, req.schema_) for r in refs}),
+            referenced_tables=ref_names,
         )
 
     def explain(self, req: SqlRequest) -> ExplainResult:
@@ -729,10 +775,12 @@ class SagaService:
             batches = table.to_batches(max_chunksize=65536)
             return transport.iter_arrow_ipc_stream(iter(batches), table.schema), None
 
-        # Spill: write batch-by-batch to a temp IPC file, then stream from disk.
-        self.settings.spill_root.mkdir(parents=True, exist_ok=True)
-        fd, spill = tempfile.mkstemp(dir=self.settings.spill_root, suffix=".arrows")
-        os.close(fd)
+        # Spill: write batch-by-batch to a self-describing tmp IPC file, then
+        # stream from disk. The name carries its own expiry so the janitor
+        # reclaims it even if the stream is abandoned mid-flight.
+        spill = str(scratch.new_path(
+            self.settings.tmp_root, "tmp", ttl_seconds=self.settings.tmp_ttl,
+            suffix="saga-spill.arrows"))
         transport.write_arrow_ipc_file(spill, iter(table.to_batches(max_chunksize=65536)), table.schema)
 
         def _cleanup() -> None:
@@ -770,6 +818,149 @@ class SagaService:
                 infer=req.infer,
             ))
         return await self.list_tables(req.catalog, req.schema_)
+
+    # -- staging (remote result placement) ----------------------------------
+
+    async def stage_result(self, req: SqlRequest) -> StagedResult:
+        return await run_in_threadpool(self._stage_result, req)
+
+    def _stage_result(self, req: SqlRequest) -> StagedResult:
+        """Run the query and write the Arrow result to ``req.staging_path``.
+
+        The staging path is a NodePath URL (``npfs://host:port/stg-…`` or local).
+        Lets the node that holds the data compute the result and park it next to
+        whoever asked, instead of streaming bytes back through this node.
+        """
+        if not req.staging_path:
+            raise BadRequestError("staging_path is required")
+        node, dialect, refs = self.plan_for(req)
+        tables = self._build_tables(refs, req.catalog, req.schema_)
+        t0 = time.perf_counter()
+        try:
+            table = execute_plan(node, tables).read_arrow_table()
+        except (BadRequestError, NotFoundError):
+            raise
+        except Exception as exc:
+            raise BadRequestError(f"query failed: {exc}")
+        data = transport.write_arrow_stream_bytes(table)
+        written = self._stage_write(req.staging_path, data)
+        return StagedResult(
+            node_id=self.settings.node_id, staging_path=written,
+            columns=[SqlColumn(name=f.name, dtype=str(f.type)) for f in table.schema],
+            row_count=table.num_rows, bytes=len(data),
+            elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+        )
+
+    def _stage_write(self, staging_path: str, data: bytes) -> str:
+        """Write Arrow bytes to a staging NodePath; return where they landed.
+
+        A remote ``npfs://host:port/path`` goes through the peer's fs API. A
+        local or scheme-less path is resolved against *this* node's files root
+        (NodePath's own local rooting uses the process-global settings, which
+        isn't what an injected-settings node wants)."""
+        if staging_path.startswith("npfs://") and not staging_path.startswith("npfs:///"):
+            from yggdrasil.node.path import NodePath
+            dest = NodePath.from_url(staging_path)
+            if not dest.is_local:
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                dest.write_bytes(data)
+                return staging_path
+            rest = staging_path.split("://", 1)[1]
+            rel = rest.split("/", 1)[1] if "/" in rest else ""
+        else:
+            rel = staging_path.split("://", 1)[1] if "://" in staging_path else staging_path
+        target = (self.settings.files_root / rel.lstrip("/")).resolve()
+        if not str(target).startswith(str(self.settings.files_root.resolve())):
+            raise BadRequestError("staging_path escapes the node files root")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return str(target)
+
+    # -- replication --------------------------------------------------------
+
+    def export_payload(self, catalog: str, schema: str, table: str) -> TablePayload:
+        with self._lock:
+            cat = self._require_catalog(catalog)
+            self._require_schema(catalog, schema)
+            t = self._table_by_name(catalog, schema, table)
+            if t is None:
+                raise NotFoundError(f"Table {catalog}.{schema}.{table!r} not found")
+            return TablePayload(catalog=catalog, schema=schema, table=t,
+                                catalog_dialect=cat.dialect)
+
+    async def import_payload(self, payload: TablePayload) -> TableResponse:
+        """Register a table (and its catalog/schema) received from a peer."""
+        if self._catalog_by_name(payload.catalog) is None:
+            await self.create_catalog(CatalogCreate(name=payload.catalog,
+                                                    dialect=payload.catalog_dialect))
+        if self._schema_by_name(payload.catalog, payload.schema_) is None:
+            await self.create_schema(payload.catalog, SchemaCreate(name=payload.schema_))
+        t = payload.table
+        return await self.create_table(payload.catalog, payload.schema_, TableCreate(
+            name=t.name, source_url=t.source_url, node=t.node,
+            table_type=t.table_type, format=t.format, comment=t.comment,
+            columns=list(t.columns), infer=False, properties=dict(t.properties),
+        ))
+
+    async def replicate(self, req: ReplicateRequest) -> ReplicateResult:
+        """Replicate a table's metadata (and optionally data) onto a peer.
+
+        ``metadata`` re-registers the table on the target pointing at the same
+        source (use when the filesystem is shared). ``data`` copies the file to
+        the target's replica area first, so the target reads it locally.
+        """
+        if self._network is None:
+            raise BadRequestError("peer network not available on this node")
+        payload = self.export_payload(req.catalog, req.schema_, req.table)
+        target_http = self._network.peer_url(req.target)
+        if target_http is None:
+            raise BadRequestError(f"target {req.target!r} is not a linked peer")
+        full = payload.table.full_name
+        bytes_copied = 0
+        target_source_url = payload.table.source_url
+
+        if req.mode == "data":
+            from pathlib import Path as _P
+
+            from yggdrasil.node.path import NodePath
+            local = self._resolve_path(payload.table.source_url)
+            data = _P(local).read_bytes()
+            safe = full.replace(".", "_")
+            ext = payload.table.format or "bin"
+            target_source_url = f"saga-replicas/{safe}.{ext}"
+            dest = NodePath(f"data/files/{target_source_url}", node_url=target_http)
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            dest.write_bytes(data)
+            bytes_copied = len(data)
+            payload = payload.model_copy(update={
+                "table": payload.table.model_copy(update={
+                    "source_url": target_source_url, "node": None}),
+            })
+        elif req.mode != "metadata":
+            raise BadRequestError(f"unknown replicate mode {req.mode!r}")
+
+        await self._network.proxy_json(req.target, "POST", "/api/v2/saga/import",
+                                       json_body=payload.model_dump(by_alias=True))
+        with self._lock:
+            cur = self._tables.get(payload.table.id) or self._table_by_name(
+                req.catalog, req.schema_, req.table)
+            if cur is not None and req.target not in cur.replicas:
+                self._tables[cur.id] = cur.model_copy(update={
+                    "replicas": sorted(set(cur.replicas) | {req.target}),
+                    "updated_at": _now()})
+                self._save()
+        self._record(full, "replicate", detail=f"-> {req.target} ({req.mode}, {bytes_copied}B)")
+        return ReplicateResult(
+            source_node=self.settings.node_id, target_node=req.target,
+            full_name=full, mode=req.mode, bytes_copied=bytes_copied,
+            target_source_url=target_source_url,
+        )
 
 
 def _as_int(v: Any) -> int | None:

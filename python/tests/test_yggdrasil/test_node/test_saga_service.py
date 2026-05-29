@@ -23,7 +23,8 @@ from yggdrasil.node.daemon import cleanup_tmp
 
 
 def _settings(home: Path, **kw) -> Settings:
-    return Settings(node_id="t", node_home=home, front_home=home, **kw)
+    return Settings(node_id="t", node_home=home, saga_home=home / ".saga",
+                    front_home=home, **kw)
 
 
 def _svc(home: Path, **kw) -> SagaService:
@@ -201,19 +202,119 @@ class TestPersistence(unittest.TestCase):
             self.assertEqual(tables.tables[0].name, "trades")
 
 
+class TestOpLog(unittest.TestCase):
+    def test_register_query_and_drop_logging(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); svc = _svc(home); src = _trades(svc.settings)
+            _seed(svc, src)
+            asyncio.run(svc.execute_sql(SqlRequest(sql="SELECT * FROM main.market.trades")))
+            log = asyncio.run(svc.read_log("main", "market", "trades"))
+            ops = [e.op for e in log.entries]
+            self.assertIn("register", ops)
+            self.assertIn("query", ops)
+            q = next(e for e in log.entries if e.op == "query")
+            self.assertEqual(q.rows, 5)
+            self.assertTrue(q.user is not None)
+            # Drop purges the log.
+            asyncio.run(svc.delete_table("main", "market", "trades"))
+            after = asyncio.run(svc.read_log("main", "market", "trades"))
+            self.assertEqual(after.entries, [])
+
+
+class _LoopNetwork:
+    """Minimal NetworkService stand-in that routes proxy_json to a peer service."""
+    def __init__(self, self_id: str, peer_id: str, peer_svc):
+        self._self_id = self_id
+        self._peer_id = peer_id
+        self._peer = peer_svc
+
+    def peer_url(self, node_id):
+        return None if node_id == self._self_id else f"http://{node_id}"
+
+    async def proxy_json(self, node_id, method, api_path, *, params=None, json_body=None):
+        from yggdrasil.node.api.schemas.saga import TablePayload
+        if api_path.endswith("/import"):
+            return (await self._peer.import_payload(TablePayload.model_validate(json_body))).model_dump(by_alias=True)
+        raise AssertionError(f"unexpected proxy call {api_path}")
+
+
+class TestReplication(unittest.TestCase):
+    def test_metadata_replication_registers_on_peer(self):
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            a = SagaService(_settings(Path(d1)))
+            b = SagaService(_settings(Path(d2)))
+            src = _trades(a.settings)
+            _seed(a, src)
+            a.bind_network(_LoopNetwork(a.settings.node_id, "peerB", b))
+            from yggdrasil.node.api.schemas.saga import ReplicateRequest
+            res = asyncio.run(a.replicate(ReplicateRequest(
+                catalog="main", schema="market", table="trades", target="peerB", mode="metadata")))
+            self.assertEqual(res.target_node, "peerB")
+            # Peer now has the catalog/schema/table.
+            tb = asyncio.run(b.get_table("main", "market", "trades"))
+            self.assertEqual(tb.table.full_name, "main.market.trades")
+            # Source records the replica.
+            ta = asyncio.run(a.get_table("main", "market", "trades"))
+            self.assertIn("peerB", ta.table.replicas)
+
+    def test_export_import_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            a = SagaService(_settings(Path(d1)))
+            b = SagaService(_settings(Path(d2)))
+            _seed(a, _trades(a.settings))
+            payload = a.export_payload("main", "market", "trades")
+            asyncio.run(b.import_payload(payload))
+            self.assertEqual(asyncio.run(b.list_catalogs()).catalogs[0].name, "main")
+
+
+class TestStaging(unittest.TestCase):
+    def test_stage_result_to_local_nodepath(self):
+        import pyarrow.ipc as _ipc
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); svc = _svc(home); src = _trades(svc.settings)
+            _seed(svc, src)
+            # A scheme-less staging path resolves under the node files root.
+            res = asyncio.run(svc.stage_result(SqlRequest(
+                sql="SELECT sym, px FROM main.market.trades WHERE px > 11",
+                staging_path="stg-out.arrows")))
+            self.assertEqual(res.row_count, 3)
+            out = svc.settings.files_root / "stg-out.arrows"
+            self.assertTrue(out.exists())
+            table = _ipc.open_stream(out.read_bytes()).read_all()
+            self.assertEqual(table.num_rows, 3)
+
+
 class TestTmpJanitor(unittest.TestCase):
-    def test_reclaims_stale_files(self):
+    def test_reclaims_by_name_encoded_expiry(self):
+        from yggdrasil.node import scratch
         with tempfile.TemporaryDirectory() as d:
             s = _settings(Path(d), tmp_ttl=100)
             s.tmp_root.mkdir(parents=True, exist_ok=True)
-            s.spill_root.mkdir(parents=True, exist_ok=True)
-            stale = s.tmp_root / "old.tmp"; stale.write_text("x")
-            os.utime(stale, (time.time() - 99999, time.time() - 99999))
-            fresh = s.tmp_root / "new.tmp"; fresh.write_text("y")
+            now = scratch.now_ms()
+            # end_ms in the past → expired; in the future → kept.
+            expired = s.tmp_root / f"tmp-{now - 200000}-{now - 100000}-spill.arrows"
+            expired.write_text("x")
+            fresh = s.tmp_root / f"tmp-{now}-{now + 100000}-spill.arrows"
+            fresh.write_text("y")
+            # Foreign file with no encoded expiry → mtime fallback (tmp_ttl=100s).
+            foreign = s.tmp_root / "legacy.tmp"; foreign.write_text("z")
+            os.utime(foreign, (time.time() - 99999, time.time() - 99999))
             removed = cleanup_tmp(s)
-            self.assertGreaterEqual(removed, 1)
-            self.assertFalse(stale.exists())
+            self.assertGreaterEqual(removed, 2)
+            self.assertFalse(expired.exists())
             self.assertTrue(fresh.exists())
+            self.assertFalse(foreign.exists())
+
+    def test_stg_is_name_only(self):
+        from yggdrasil.node import scratch
+        with tempfile.TemporaryDirectory() as d:
+            s = _settings(Path(d))
+            s.stg_root.mkdir(parents=True, exist_ok=True)
+            # A foreign file in stg is persistent — no fallback TTL there.
+            keep = s.stg_root / "result.arrows"; keep.write_text("x")
+            os.utime(keep, (time.time() - 9_999_999, time.time() - 9_999_999))
+            cleanup_tmp(s)
+            self.assertTrue(keep.exists())
 
 
 if __name__ == "__main__":

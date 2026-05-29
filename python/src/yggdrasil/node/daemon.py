@@ -20,7 +20,6 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Callable
 
 from yggdrasil.node.config import Settings, _find_open_port, get_settings
@@ -34,45 +33,28 @@ _PORT_FILE = "node.port"
 def ensure_directories(settings: Settings) -> None:
     for d in (settings.node_home, settings.data_root, settings.cache_root,
               settings.spill_root, settings.logs_root, settings.tmp_root,
-              settings.saga_root):
+              settings.stg_root, settings.saga_root, settings.saga_data_root,
+              settings.saga_log_root):
         d.mkdir(parents=True, exist_ok=True)
 
 
 def cleanup_tmp(settings: Settings) -> int:
-    """Delete tmp/spill entries older than ``tmp_ttl`` seconds.
+    """Reclaim expired scratch entries from ``tmp/``, ``stg/`` and ``spill/``.
 
-    Sweeps the node's scratch folders — ``files/tmp`` (uploads, SQL spill
-    files) and ``spill`` (ArrowTabular overflow) — reclaiming anything whose
-    mtime is past the TTL. Empty leftover directories are pruned too. Returns
-    the number of filesystem entries removed.
+    Entries are named ``{prefix}-{start_ms}-{end_ms}-{suffix}`` so expiry is
+    read from the filename (no per-entry stat). ``tmp`` uses ``tmp_ttl`` as the
+    fallback for any foreign files; ``stg`` is name-only (persistent staging);
+    legacy ``spill`` files fall back to ``tmp_ttl`` by mtime. Returns the count
+    removed.
     """
-    cutoff = time.time() - max(1, settings.tmp_ttl)
-    removed = 0
-    for root in (settings.tmp_root, settings.spill_root):
-        if not root.exists():
-            continue
-        # Walk bottom-up so a directory is visited after its children and can be
-        # removed once emptied.
-        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-            d = Path(dirpath)
-            for name in filenames:
-                f = d / name
-                try:
-                    if f.stat().st_mtime < cutoff:
-                        f.unlink(missing_ok=True)
-                        removed += 1
-                except OSError:
-                    continue
-            if d != root:
-                try:
-                    next(d.iterdir())
-                except StopIteration:
-                    d.rmdir()
-                    removed += 1
-                except OSError:
-                    continue
+    from . import scratch
+
+    now = scratch.now_ms()
+    removed = scratch.sweep(settings.tmp_root, now=now, fallback_ttl_seconds=settings.tmp_ttl)
+    removed += scratch.sweep(settings.stg_root, now=now)
+    removed += scratch.sweep(settings.spill_root, now=now, fallback_ttl_seconds=settings.tmp_ttl)
     if removed:
-        LOGGER.info("tmp janitor reclaimed %d entries (ttl=%ds)", removed, settings.tmp_ttl)
+        LOGGER.info("scratch janitor reclaimed %d entries", removed)
     return removed
 
 

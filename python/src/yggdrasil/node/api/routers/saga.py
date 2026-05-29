@@ -17,14 +17,19 @@ from ..schemas.saga import (
     CatalogUpdate,
     DiscoverRequest,
     ExplainResult,
+    OpLogResponse,
+    ReplicateRequest,
+    ReplicateResult,
     SchemaCreate,
     SchemaListResponse,
     SchemaResponse,
     SchemaUpdate,
+    StagedResult,
     SqlRequest,
     SqlResult,
     TableCreate,
     TableListResponse,
+    TablePayload,
     TableResponse,
     TableUpdate,
 )
@@ -159,9 +164,33 @@ async def refresh_table(catalog: str, schema: str, name: str,
     return TableResponse(table=entry)
 
 
+@router.get("/catalog/{catalog}/schema/{schema}/table/{name}/log", response_model=OpLogResponse)
+async def read_table_log(catalog: str, schema: str, name: str, limit: int = 200,
+                         node: str | None = None,
+                         saga: SagaService = Depends(get_saga_service),
+                         network: NetworkService = Depends(get_network_service)):
+    remote = await _remote(network, saga, node,
+                           f"/catalog/{catalog}/schema/{schema}/table/{name}/log",
+                           params={"limit": limit})
+    return remote if remote is not None else await saga.read_log(catalog, schema, name, limit=limit)
+
+
 @router.post("/discover", response_model=TableListResponse)
 async def discover(req: DiscoverRequest, saga: SagaService = Depends(get_saga_service)):
     return await saga.discover(req)
+
+
+# -- replication ------------------------------------------------------------
+
+@router.post("/import", response_model=TableResponse)
+async def import_table(payload: TablePayload, saga: SagaService = Depends(get_saga_service)):
+    """Register a table pushed from a peer (the replication receive side)."""
+    return await saga.import_payload(payload)
+
+
+@router.post("/replicate", response_model=ReplicateResult)
+async def replicate(req: ReplicateRequest, saga: SagaService = Depends(get_saga_service)):
+    return await saga.replicate(req)
 
 
 # -- SQL editor -------------------------------------------------------------
@@ -174,8 +203,26 @@ async def run_sql(req: SqlRequest,
     if target:
         body = req.model_dump(by_alias=True)
         body["node"] = None  # peer runs it locally
-        return await network.proxy_json(target, "POST", "/api/v2/saga/sql", json_body=body)
+        try:
+            return await network.proxy_json(target, "POST", "/api/v2/saga/sql", json_body=body)
+        except Exception:
+            # Connection to the chosen node failed — fall back to running here
+            # (works when the fs is shared); otherwise the local run surfaces a
+            # clear "table lives on node X" error.
+            req = req.model_copy(update={"node": None})
     return await saga.execute_sql(req)
+
+
+@router.post("/sql.stage", response_model=StagedResult)
+async def stage_sql(req: SqlRequest, saga: SagaService = Depends(get_saga_service),
+                    network: NetworkService = Depends(get_network_service)):
+    """Run where the data lives and write the Arrow result to ``staging_path``."""
+    target = saga.compute_node(req)
+    if target:
+        body = req.model_dump(by_alias=True)
+        body["node"] = None
+        return await network.proxy_json(target, "POST", "/api/v2/saga/sql.stage", json_body=body)
+    return await saga.stage_result(req)
 
 
 @router.post("/explain", response_model=ExplainResult)

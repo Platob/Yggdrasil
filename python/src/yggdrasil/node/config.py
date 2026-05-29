@@ -43,6 +43,12 @@ def _node_home() -> Path:
     return Path.home() / ".node" / _stable_node_id()
 
 
+def _saga_home() -> Path:
+    # Managed Saga metadata + data lives outside ~/.node so it is NOT exposed
+    # through the node filesystem API (which is rooted at node_home).
+    return Path.home() / ".saga" / _stable_node_id()
+
+
 def _find_open_port(start: int = 8100, end: int = 8200) -> int:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -75,6 +81,7 @@ class Settings:
     api_prefix: str = "/api"
     node_id: str = field(default_factory=_stable_node_id)
     node_home: Path = field(default_factory=_node_home)
+    saga_home: Path = field(default_factory=_saga_home)
     front_home: Path = field(default_factory=_default_front_home)
     max_cmd_timeout: float = 300.0
     max_python_timeout: float = 600.0
@@ -111,11 +118,14 @@ class Settings:
     # is immediately useful. The env builds in the background; functions are
     # registered instantly and run on the node interpreter until it's ready.
     seed_defaults: bool = True
-    # Seconds a file in the node ``tmp``/``spill`` folders survives before the
-    # background janitor reclaims it. SQL spill files and scratch downloads are
-    # transient; a day is generous enough to outlive any single run.
+    # Default lifetime baked into a ``tmp/`` scratch entry's self-describing
+    # name. SQL spill and download staging are transient; a day outlives any
+    # single run. Foreign (un-named) tmp files fall back to this as an mtime TTL.
     tmp_ttl: int = 86_400
-    # Cadence (seconds) of the tmp/spill janitor loop. Independent of tmp_ttl so
+    # Default lifetime for ``stg/`` staging entries — results a remote node
+    # parked here for in-flight work. Far longer than tmp; swept rarely.
+    stg_ttl: int = 7 * 86_400
+    # Cadence (seconds) of the scratch janitor loop. Independent of the TTLs so
     # a short TTL still can't busy-loop the sweep.
     tmp_cleanup_interval: float = 3600.0
     # Default SQL dialect the Saga editor parses with when a request / catalog
@@ -162,11 +172,24 @@ class Settings:
 
     @property
     def tmp_root(self) -> Path:
-        return self.files_root / "tmp"
+        return self.node_home / "tmp"
+
+    @property
+    def stg_root(self) -> Path:
+        return self.node_home / "stg"
 
     @property
     def saga_root(self) -> Path:
-        return self.node_home / "saga"
+        """Managed Saga metadata directory (under ~/.saga, off the network fs)."""
+        return self.saga_home
+
+    @property
+    def saga_data_root(self) -> Path:
+        return self.saga_home / "data"
+
+    @property
+    def saga_log_root(self) -> Path:
+        return self.saga_home / "logs"
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -191,6 +214,9 @@ def get_settings() -> Settings:
         node_home=Path(
             os.getenv("YGG_NODE_HOME", str(_node_home()))
         ).expanduser().resolve(),
+        saga_home=Path(
+            os.getenv("YGG_NODE_SAGA_HOME", str(_saga_home()))
+        ).expanduser().resolve(),
         front_home=Path(
             os.getenv("YGG_NODE_FRONT_HOME", str(_default_front_home()))
         ).expanduser().resolve(),
@@ -213,6 +239,7 @@ def get_settings() -> Settings:
         pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
         seed_defaults=_as_bool(os.getenv("YGG_NODE_SEED_DEFAULTS"), True),
         tmp_ttl=int(os.getenv("YGG_NODE_TMP_TTL", str(86_400))),
+        stg_ttl=int(os.getenv("YGG_NODE_STG_TTL", str(7 * 86_400))),
         tmp_cleanup_interval=float(os.getenv("YGG_NODE_TMP_CLEANUP_INTERVAL", "3600")),
         saga_default_dialect=os.getenv("YGG_NODE_SAGA_DIALECT", "postgres"),
         saga_sql_preview_rows=int(os.getenv("YGG_NODE_SAGA_PREVIEW_ROWS", "10000")),
