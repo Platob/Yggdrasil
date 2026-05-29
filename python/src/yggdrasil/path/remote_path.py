@@ -46,6 +46,66 @@ _DEFAULT_BUFFER_SIZE: int = 4 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
+class _RangedArrowReader:
+    """Seekable binary reader over a holder's ranged ``_read_mv``.
+
+    Wrapped in :class:`pyarrow.PythonFile` so pyarrow issues range reads
+    for the bytes it actually touches (a Parquet footer + projected
+    column chunks) instead of downloading the whole object. Read-only;
+    bounded by the path's known size so a seek-to-end resolves without a
+    fetch. Used by :meth:`RemotePath.arrow_random_access_file`.
+    """
+
+    __slots__ = ("_holder", "_size", "_pos")
+
+    def __init__(self, holder: "RemotePath", size: int) -> None:
+        self._holder = holder
+        self._size = size
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return True
+
+    @property
+    def closed(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = offset
+        elif whence == 1:
+            self._pos += offset
+        else:
+            self._pos = self._size + offset
+        return self._pos
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            data = bytes(self._holder._read_mv(-1, self._pos))
+        else:
+            remaining = self._size - self._pos
+            if n == 0 or remaining <= 0:
+                return b""
+            data = bytes(self._holder._read_mv(min(n, remaining), self._pos))
+        self._pos += len(data)
+        return data
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
 class RemotePath(Path):
     """Abstract :class:`Holder` for network-backed backends.
 
@@ -78,6 +138,24 @@ class RemotePath(Path):
     # block size (e.g. an SDK that only supports whole-object PUTs
     # below a certain threshold) can pin their own default here.
     DEFAULT_BUFFER_SIZE: ClassVar["int | None"] = _DEFAULT_BUFFER_SIZE
+
+    # Above this committed size, :meth:`_cache_after_upload` skips
+    # pouring the just-written payload into the page cache: it would
+    # double the memory for bytes unlikely to be re-read immediately,
+    # and any later read fetches the page from the backend on demand
+    # (ranged, where supported). Small writes still warm the cache for a
+    # cheap read-after-write.
+    MAX_CACHE_AFTER_UPLOAD_BYTES: ClassVar[int] = 8 * 1024 * 1024
+
+    # Backends whose :meth:`_read_mv` genuinely range-reads (only the
+    # requested window crosses the wire — S3 GetObject Range, the
+    # Volumes Files API Range) set this so :class:`ParquetFile` can hand
+    # pyarrow a ranged random-access file for column / row-group
+    # projection (footer + projected chunks only) instead of
+    # snapshotting the whole object. Backends that download the whole
+    # object per read (Workspace) or chunk awkwardly (DBFS) leave it
+    # False so projection keeps the single-GET snapshot.
+    SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = False
 
     # Activate the :class:`Singleton` cache: 5-minute default TTL,
     # bounded at 10 000 entries as defence-in-depth against
@@ -364,6 +442,13 @@ class RemotePath(Path):
         self._dirty_pages.clear()
         if self._page_size is None or size == 0:
             return
+        # Large payload: drop any stale pages and skip the per-page copy.
+        # ``_buffered_size`` keeps ``size`` authoritative; a later read of
+        # an un-cached page falls through to ``_fetch_page`` →
+        # ``_read_mv`` (ranged), so this stays correct — just uncached.
+        if size > self.MAX_CACHE_AFTER_UPLOAD_BYTES:
+            self._ensure_pages().clear()
+            return
         page_size = self._page_size
         pages = self._ensure_pages()
         pages.clear()
@@ -375,6 +460,34 @@ class RemotePath(Path):
             buf = bytearray(page_size)
             buf[: len(chunk)] = chunk
             pages.set(idx, Memory.from_bytearray(buf, size=len(chunk)))
+
+    def arrow_random_access_file(self):
+        """Yield a pyarrow random-access file backed by ranged ``_read_mv``.
+
+        Lets pyarrow readers seek and pull only the bytes they touch — a
+        Parquet column / row-group projection fetches the footer plus the
+        projected chunks, instead of snapshotting the whole object the
+        way :meth:`arrow_input_stream` does. :class:`ParquetFile` reaches
+        for this when a projection is bound and the backend advertises
+        :attr:`SUPPORTS_RANGED_RANDOM_ACCESS` (S3, Volumes); a full read
+        still snapshots. Generic over any holder via ``_read_mv`` +
+        ``size``.
+        """
+        import contextlib
+
+        import pyarrow as pa
+
+        @contextlib.contextmanager
+        def _ctx():
+            handle = pa.PythonFile(
+                _RangedArrowReader(self, int(self.size)), mode="r",
+            )
+            try:
+                yield handle
+            finally:
+                handle.close()
+
+        return _ctx()
 
     def read_mv(
         self,
@@ -455,6 +568,23 @@ class RemotePath(Path):
             if cursor:
                 self._pos = offset
             return 0
+        # Whole-object overwrite outside a buffered ``with`` block: the
+        # paged path would copy ``data`` into page buffers and ``flush``
+        # would copy them straight back out for the upload. Skip both
+        # round trips and stream the payload to the backend once — the
+        # same end state ``flush`` produces (_upload + _cache_after_upload),
+        # minus two large copies. Inside an acquire we keep buffering so
+        # successive writes still coalesce.
+        if overwrite and offset == 0 and not self._acquired:
+            payload = bytes(data)
+            self._upload(payload)
+            self._cache_after_upload(payload, n)
+            if update_stat:
+                self._touch_stat(size=n)
+            if cursor:
+                self._pos = n
+            return n
+
         new_total = end if overwrite else max(total, end)
         self._paged_write(memoryview(data), offset)
         if overwrite and new_total < total:

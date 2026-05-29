@@ -400,3 +400,36 @@ class TestRepr:
         assert "200" in r1
         assert "500" in r2
         assert r1 != r2
+
+
+# ---------------------------------------------------------------------------
+# TestBodylessContentLength — HEAD / 204 / 304 must keep the wire size
+# ---------------------------------------------------------------------------
+
+
+class TestBodylessContentLength:
+    """A bodyless response (HEAD / 204 / 304) carries the would-be-GET
+    ``Content-Length`` with an empty body — media normalization must not
+    sync it to the 0-byte buffer, or every HEAD-based stat / size probe
+    reads 0 (regression: VolumePath.size and HTTPPath.stat returned 0)."""
+
+    def test_head_preserves_wire_content_length(self) -> None:
+        req = _make_request(method="HEAD")
+        resp = _make_response(
+            body=b"", status_code=200, headers={"Content-Length": "12345"}, request=req,
+        )
+        assert resp.headers.get("Content-Length") == "12345"
+        # Accessing media_type re-runs the normalization — must not reset it.
+        _ = resp.media_type
+        assert resp.headers.get("Content-Length") == "12345"
+
+    def test_get_syncs_content_length_to_body(self) -> None:
+        # The normal (bodyful) path is unchanged: the header tracks the body.
+        resp = _make_response(body=b"hello", status_code=200)
+        assert resp.headers.get("Content-Length") == "5"
+
+    def test_204_preserves_declared_content_length(self) -> None:
+        resp = _make_response(
+            body=b"", status_code=204, headers={"Content-Length": "777"},
+        )
+        assert resp.headers.get("Content-Length") == "777"

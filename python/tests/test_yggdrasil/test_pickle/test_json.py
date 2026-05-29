@@ -197,3 +197,56 @@ def test_dump_dataclass_to_file():
     buf.seek(0)
     obj = load(buf)
     assert obj == {"name": "foo", "value": 42}
+
+
+# ---------------------------------------------------------------------------
+# memoryview / zero-copy input — orjson parses views natively; the module
+# must not copy them to bytes, and the fallback / safe paths must still
+# work on a view (IO hands these from read_mv / read_buffer).
+# ---------------------------------------------------------------------------
+
+
+def test_loads_memoryview_list():
+    assert loads(memoryview(b'[{"a":1},{"b":2}]')) == [{"a": 1}, {"b": 2}]
+
+
+def test_loads_memoryview_over_mutable_bytearray():
+    # A view over a mutable bytearray (what Memory.read_mv returns).
+    buf = bytearray(b'{"x": 42}')
+    assert loads(memoryview(buf)) == {"x": 42}
+
+
+def test_loads_memoryview_slice_nonzero_offset():
+    # read_buffer() can hand back a slice into a larger buffer; orjson
+    # must parse from the view's start, not the backing's.
+    backing = bytearray(b'PADPAD[{"v":7}]')
+    view = memoryview(backing)[6:]
+    assert loads(view) == [{"v": 7}]
+
+
+def test_loads_memoryview_latin1_fallback():
+    # Non-UTF-8 view → orjson rejects → stdlib decode(encoding) fallback.
+    raw = memoryview('{"s": "café"}'.encode("latin-1"))
+    assert loads(raw, encoding="latin-1") == {"s": "café"}
+
+
+def test_loads_memoryview_errors_replace_on_bad_utf8():
+    raw = memoryview(b'{"s": "a\xffb"}')
+    assert loads(raw, errors="replace")["s"].startswith("a")
+
+
+def test_loads_memoryview_safe_false_restores_types():
+    # The restore walk runs on the parsed result, so it behaves the same
+    # whether the input was bytes or a memoryview view.
+    from datetime import datetime
+
+    out = loads(memoryview(b'{"d": "2024-01-02T03:04:05"}'), safe=False)
+    assert out["d"] == datetime(2024, 1, 2, 3, 4, 5)
+    assert loads(
+        memoryview(b'{"d": "2024-01-02T03:04:05"}'), safe=False
+    ) == loads(b'{"d": "2024-01-02T03:04:05"}', safe=False)
+
+
+def test_loads_memoryview_matches_bytes():
+    payload = b'[{"id": 1, "x": 1.5, "label": "row"}]'
+    assert loads(memoryview(payload)) == loads(payload)

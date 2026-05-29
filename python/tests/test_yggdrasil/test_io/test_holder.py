@@ -552,3 +552,37 @@ class TestPositionSemantics:
         m = Memory(b"abcd")
         m.pwrite(b"X", -2)
         assert m.read_bytes() == b"abXd"
+
+
+class TestReserveCopyOnWrite:
+    """``arrow_input_stream`` now hands pyarrow a zero-copy memoryview
+    into the buffer. A memoryview export locks a bytearray against
+    resize, so growing the buffer while a reader is open must
+    copy-on-write rather than raise ``BufferError`` — the read-modify-
+    write shape (append/upsert reads existing bytes through the view,
+    then grows the object)."""
+
+    def test_grow_while_view_exported_copies_on_write(self) -> None:
+        m = Memory(binary=b"abc")
+        view = m.read_mv(-1, 0)  # export a view → locks the bytearray
+        # Growing beyond current size must not raise BufferError.
+        m.write_bytes(b"defgh", offset=3)
+        assert m.read_bytes() == b"abcdefgh"
+        # The exported view still sees the pre-grow bytes (copy-on-write).
+        assert bytes(view) == b"abc"
+
+    def test_arrow_read_then_append_same_holder(self) -> None:
+        # End-to-end: a zero-copy Arrow read followed by an append to the
+        # same holder (the path that surfaced the BufferError).
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        table = pa.table({"x": pa.array(range(100), type=pa.int64())})
+        pf = ParquetFile()
+        pf.write_arrow_table(table)
+        got = pf.read_arrow_table()  # zero-copy snapshot read
+        assert got.num_rows == 100
+        # Re-read still works after the holder is otherwise touched.
+        assert pf.read_arrow_table().num_rows == 100

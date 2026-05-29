@@ -20,6 +20,8 @@ from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.databricks.fs import DBFSPath, VolumePath
 from yggdrasil.databricks.fs.service import DBFSService
 from yggdrasil.databricks.volume.volumes import Volumes
+
+from tests.test_yggdrasil.test_databricks._files_fake import wire_files_session
 from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.primitive.csv_file import CSVFile
 from yggdrasil.io.primitive.ndjson_file import NDJSONFile
@@ -49,7 +51,9 @@ def _dbfs_service(client: MagicMock) -> MagicMock:
 def _volumes_service(client: MagicMock) -> MagicMock:
     """Mock :class:`Volumes` service whose ``client`` is *client*."""
     svc = MagicMock(spec=Volumes)
-    svc.client = client
+    # ``VolumePath`` file ops route over the Files-API HTTP seam; wire a
+    # fake session that translates back onto ``workspace.files``.
+    svc.client = wire_files_session(client)
     return svc
 
 

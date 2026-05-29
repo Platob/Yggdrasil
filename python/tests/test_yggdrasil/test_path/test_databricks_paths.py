@@ -21,6 +21,10 @@ from yggdrasil.databricks.volume.volumes import Volumes  # noqa: E402
 from yggdrasil.databricks.workspaces.service import Workspaces  # noqa: E402
 from yggdrasil.path.remote_path import RemotePath  # noqa: E402
 
+from tests.test_yggdrasil.test_databricks._files_fake import (  # noqa: E402
+    wire_files_session,
+)
+
 
 # ---------------------------------------------------------------------------
 # Stub helpers
@@ -29,7 +33,9 @@ from yggdrasil.path.remote_path import RemotePath  # noqa: E402
 
 def _volumes_service(client: MagicMock | None = None) -> MagicMock:
     svc = MagicMock(spec=Volumes)
-    svc.client = client or MagicMock()
+    # ``VolumePath`` file ops route over the Files-API HTTP seam; wire a
+    # fake session that translates back onto ``workspace.files``.
+    svc.client = wire_files_session(client or MagicMock())
     return svc
 
 

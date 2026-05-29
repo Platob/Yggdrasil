@@ -239,6 +239,7 @@ class _ArrowInputStreamContext:
         self._parent = parent
         self._stream: "pa.NativeFile | None" = None
         self._scratch: "IO | None" = None
+        self._mv: "memoryview | None" = None
 
     def __enter__(self) -> "pa.NativeFile":
         parent = self._parent
@@ -257,7 +258,17 @@ class _ArrowInputStreamContext:
                         # the file was deleted under us; fall back to
                         # the bytes snapshot path rather than escalate.
                         self._stream = None
-            self._stream = pa.BufferReader(parent.to_bytes())
+            # Zero-copy snapshot: wrap the buffer's memoryview in a
+            # pyarrow Buffer instead of ``to_bytes()``, which would copy
+            # the whole payload into an intermediate ``bytes`` that
+            # pyarrow then re-reads. ``read_mv(-1, 0)`` is a view into the
+            # backing bytearray (and pyarrow keeps it alive for the
+            # reader's lifetime), so a full Parquet / Arrow read goes
+            # straight from the existing buffer into Arrow with no
+            # intermediate full-object copy. Held on ``self`` so the
+            # view outlives this method.
+            self._mv = parent.read_mv(-1, 0)
+            self._stream = pa.BufferReader(pa.py_buffer(self._mv))
             return self._stream
 
         # Codec path — decompress through the codec's streaming
@@ -279,6 +290,8 @@ class _ArrowInputStreamContext:
             except Exception:
                 pass
             self._scratch = None
+        # Release the zero-copy view after the reader is closed.
+        self._mv = None
 
 
 class _ArrowOutputStreamContext:
