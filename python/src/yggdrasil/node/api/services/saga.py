@@ -1,0 +1,799 @@
+"""Saga — distributed data catalog service.
+
+A metadata-only layer: catalogs/schemas/tables are JSON records persisted under
+``~/.node/{id}/saga/store.json``; the table *data* stays on the filesystem. SQL
+runs through the repo's existing plan engine (``parse_sql`` → ``execute_plan``)
+over the registered tables and raw file URLs, and results come back as Arrow IPC
+— streamed straight from memory when small, spilled to ``spill_root`` and
+streamed off disk when heavy.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import math
+import os
+import tempfile
+import time
+from threading import Lock
+from typing import Any
+
+import pyarrow as pa
+from fastapi.concurrency import run_in_threadpool
+
+from yggdrasil.enums.dialect import Dialect
+from yggdrasil.io.tabular.base import Tabular, is_tabular_source
+from yggdrasil.plan.execute import execute_plan
+from yggdrasil.plan.nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
+from yggdrasil.plan.ops import (
+    CTE,
+    JoinClause,
+    LateralViewItem,
+    SetOp,
+    SubqueryRef,
+    TableRef,
+    ValuesRef,
+)
+from yggdrasil.plan.sql_parser import parse_sql
+
+from ...config import Settings
+from ... import transport
+from yggdrasil.exceptions.api import BadRequestError, ConflictError, NotFoundError
+from ..schemas.saga import (
+    CatalogCreate,
+    CatalogEntry,
+    CatalogListResponse,
+    CatalogResponse,
+    CatalogUpdate,
+    ColumnSpec,
+    ColumnStat,
+    DiscoverRequest,
+    ExplainResult,
+    SchemaCreate,
+    SchemaEntry,
+    SchemaListResponse,
+    SchemaResponse,
+    SchemaUpdate,
+    SqlColumn,
+    SqlRequest,
+    SqlResult,
+    TableCreate,
+    TableEntry,
+    TableListResponse,
+    TableResponse,
+    TableStatistics,
+    TableUpdate,
+)
+from ...ids import make_id
+
+_TABULAR_EXTS = {"parquet", "pq", "csv", "tsv", "ndjson", "json", "arrow", "feather", "ipc", "xlsx"}
+_DIALECTS = {d.value for d in Dialect}
+
+
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _json_safe(v: Any) -> Any:
+    """A scalar safe to drop into a JSON response (NaN/inf → None, exotic → str)."""
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, (dt.datetime, dt.date, dt.time)):
+        return v.isoformat()
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", "replace")
+    return str(v)
+
+
+class SagaService:
+    """Catalog/schema/table registry + SQL executor for one node."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._root = settings.saga_root
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._store = self._root / "store.json"
+        self._lock = Lock()
+        self._catalogs: dict[int, CatalogEntry] = {}
+        self._schemas: dict[int, SchemaEntry] = {}
+        self._tables: dict[int, TableEntry] = {}
+        self._load()
+
+    # -- persistence --------------------------------------------------------
+
+    def _load(self) -> None:
+        if not self._store.exists():
+            return
+        try:
+            doc = json.loads(self._store.read_text())
+        except (OSError, ValueError):
+            return
+        for c in doc.get("catalogs", []):
+            try:
+                e = CatalogEntry.model_validate(c)
+                self._catalogs[e.id] = e
+            except Exception:
+                continue
+        for s in doc.get("schemas", []):
+            try:
+                e = SchemaEntry.model_validate(s)
+                self._schemas[e.id] = e
+            except Exception:
+                continue
+        for t in doc.get("tables", []):
+            try:
+                e = TableEntry.model_validate(t)
+                self._tables[e.id] = e
+            except Exception:
+                continue
+
+    def _save(self) -> None:
+        """Atomic write: dump to a temp file in the same dir, then rename."""
+        doc = {
+            "catalogs": [c.model_dump() for c in self._catalogs.values()],
+            "schemas": [s.model_dump() for s in self._schemas.values()],
+            "tables": [t.model_dump(by_alias=True) for t in self._tables.values()],
+        }
+        fd, tmp = tempfile.mkstemp(dir=self._root, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(doc, fh)
+            os.replace(tmp, self._store)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    # -- internal lookups (assume lock held) --------------------------------
+
+    def _catalog_by_name(self, name: str) -> CatalogEntry | None:
+        for c in self._catalogs.values():
+            if c.name == name:
+                return c
+        return None
+
+    def _schema_by_name(self, catalog: str, name: str) -> SchemaEntry | None:
+        for s in self._schemas.values():
+            if s.catalog == catalog and s.name == name:
+                return s
+        return None
+
+    def _table_by_name(self, catalog: str, schema: str, name: str) -> TableEntry | None:
+        full = f"{catalog}.{schema}.{name}"
+        for t in self._tables.values():
+            if t.full_name == full:
+                return t
+        return None
+
+    def _require_catalog(self, name: str) -> CatalogEntry:
+        c = self._catalog_by_name(name)
+        if c is None:
+            raise NotFoundError(f"Catalog {name!r} not found")
+        return c
+
+    def _require_schema(self, catalog: str, name: str) -> SchemaEntry:
+        s = self._schema_by_name(catalog, name)
+        if s is None:
+            raise NotFoundError(f"Schema {catalog}.{name!r} not found")
+        return s
+
+    def _enrich_catalog(self, c: CatalogEntry) -> CatalogEntry:
+        n = sum(1 for s in self._schemas.values() if s.catalog == c.name)
+        return c.model_copy(update={"schema_count": n})
+
+    def _enrich_schema(self, s: SchemaEntry) -> SchemaEntry:
+        n = sum(1 for t in self._tables.values()
+                if t.catalog == s.catalog and t.schema_name == s.name)
+        return s.model_copy(update={"table_count": n})
+
+    # -- catalog CRUD -------------------------------------------------------
+
+    async def create_catalog(self, req: CatalogCreate) -> CatalogResponse:
+        with self._lock:
+            existing = self._catalog_by_name(req.name)
+            now = _now()
+            if existing:
+                upd = {"updated_at": now}
+                if req.comment:
+                    upd["comment"] = req.comment
+                if req.owner:
+                    upd["owner"] = req.owner
+                if req.dialect:
+                    upd["dialect"] = req.dialect
+                if req.storage_location is not None:
+                    upd["storage_location"] = req.storage_location
+                if req.properties:
+                    upd["properties"] = {**existing.properties, **req.properties}
+                entry = existing.model_copy(update=upd)
+                self._catalogs[entry.id] = entry
+                self._save()
+                return CatalogResponse(catalog=self._enrich_catalog(entry))
+            cid = make_id(req.name)
+            entry = CatalogEntry(
+                id=cid,
+                name=req.name,
+                comment=req.comment,
+                owner=req.owner,
+                dialect=(req.dialect or self.settings.saga_default_dialect),
+                storage_location=(req.storage_location or f"saga/{req.name}"),
+                node_id=self.settings.node_id,
+                properties=dict(req.properties),
+                created_at=now,
+                updated_at=now,
+            )
+            self._catalogs[cid] = entry
+            self._save()
+            return CatalogResponse(catalog=self._enrich_catalog(entry))
+
+    async def list_catalogs(self) -> CatalogListResponse:
+        with self._lock:
+            items = [self._enrich_catalog(c) for c in self._catalogs.values()]
+        items.sort(key=lambda c: c.name)
+        return CatalogListResponse(node_id=self.settings.node_id, catalogs=items)
+
+    async def get_catalog(self, name: str) -> CatalogResponse:
+        with self._lock:
+            return CatalogResponse(catalog=self._enrich_catalog(self._require_catalog(name)))
+
+    async def update_catalog(self, name: str, req: CatalogUpdate) -> CatalogResponse:
+        with self._lock:
+            c = self._require_catalog(name)
+            upd: dict[str, Any] = {"updated_at": _now()}
+            for f in ("comment", "owner", "dialect", "storage_location"):
+                v = getattr(req, f)
+                if v is not None:
+                    upd[f] = v
+            if req.properties is not None:
+                upd["properties"] = dict(req.properties)
+            entry = c.model_copy(update=upd)
+            self._catalogs[entry.id] = entry
+            self._save()
+            return CatalogResponse(catalog=self._enrich_catalog(entry))
+
+    async def delete_catalog(self, name: str, *, cascade: bool = False) -> CatalogResponse:
+        with self._lock:
+            c = self._require_catalog(name)
+            child_schemas = [s for s in self._schemas.values() if s.catalog == name]
+            child_tables = [t for t in self._tables.values() if t.catalog == name]
+            if (child_schemas or child_tables) and not cascade:
+                raise ConflictError(
+                    f"Catalog {name!r} is not empty ({len(child_schemas)} schemas, "
+                    f"{len(child_tables)} tables). Pass cascade=true to drop it."
+                )
+            for s in child_schemas:
+                self._schemas.pop(s.id, None)
+            for t in child_tables:
+                self._tables.pop(t.id, None)
+            self._catalogs.pop(c.id, None)
+            self._save()
+            return CatalogResponse(catalog=c)
+
+    # -- schema CRUD --------------------------------------------------------
+
+    async def create_schema(self, catalog: str, req: SchemaCreate) -> SchemaResponse:
+        with self._lock:
+            self._require_catalog(catalog)
+            now = _now()
+            existing = self._schema_by_name(catalog, req.name)
+            if existing:
+                upd: dict[str, Any] = {"updated_at": now}
+                if req.comment:
+                    upd["comment"] = req.comment
+                if req.properties:
+                    upd["properties"] = {**existing.properties, **req.properties}
+                entry = existing.model_copy(update=upd)
+                self._schemas[entry.id] = entry
+                self._save()
+                return SchemaResponse(schema=self._enrich_schema(entry))
+            full = f"{catalog}.{req.name}"
+            sid = make_id(full)
+            entry = SchemaEntry(
+                id=sid, catalog=catalog, name=req.name, full_name=full,
+                comment=req.comment, properties=dict(req.properties),
+                created_at=now, updated_at=now,
+            )
+            self._schemas[sid] = entry
+            self._save()
+            return SchemaResponse(schema=self._enrich_schema(entry))
+
+    async def list_schemas(self, catalog: str) -> SchemaListResponse:
+        with self._lock:
+            self._require_catalog(catalog)
+            items = [self._enrich_schema(s) for s in self._schemas.values()
+                     if s.catalog == catalog]
+        items.sort(key=lambda s: s.name)
+        return SchemaListResponse(node_id=self.settings.node_id, catalog=catalog, schemas=items)
+
+    async def get_schema(self, catalog: str, name: str) -> SchemaResponse:
+        with self._lock:
+            return SchemaResponse(schema=self._enrich_schema(self._require_schema(catalog, name)))
+
+    async def update_schema(self, catalog: str, name: str, req: SchemaUpdate) -> SchemaResponse:
+        with self._lock:
+            s = self._require_schema(catalog, name)
+            upd: dict[str, Any] = {"updated_at": _now()}
+            if req.comment is not None:
+                upd["comment"] = req.comment
+            if req.properties is not None:
+                upd["properties"] = dict(req.properties)
+            entry = s.model_copy(update=upd)
+            self._schemas[entry.id] = entry
+            self._save()
+            return SchemaResponse(schema=self._enrich_schema(entry))
+
+    async def delete_schema(self, catalog: str, name: str, *, cascade: bool = False) -> SchemaResponse:
+        with self._lock:
+            s = self._require_schema(catalog, name)
+            child_tables = [t for t in self._tables.values()
+                            if t.catalog == catalog and t.schema_name == name]
+            if child_tables and not cascade:
+                raise ConflictError(
+                    f"Schema {catalog}.{name!r} has {len(child_tables)} tables. "
+                    "Pass cascade=true to drop it."
+                )
+            for t in child_tables:
+                self._tables.pop(t.id, None)
+            self._schemas.pop(s.id, None)
+            self._save()
+            return SchemaResponse(schema=s)
+
+    # -- table CRUD ---------------------------------------------------------
+
+    async def create_table(self, catalog: str, schema: str, req: TableCreate) -> TableResponse:
+        with self._lock:
+            self._require_schema(catalog, schema)
+            now = _now()
+            full = f"{catalog}.{schema}.{req.name}"
+            fmt = req.format or (req.source_url.rsplit(".", 1)[-1].lower() if "." in req.source_url else "")
+            existing = self._table_by_name(catalog, schema, req.name)
+            base = existing or TableEntry(
+                id=make_id(full), catalog=catalog, schema=schema, name=req.name,
+                full_name=full, created_at=now, updated_at=now,
+            )
+            entry = base.model_copy(update={
+                "source_url": req.source_url,
+                "node": req.node,
+                "table_type": req.table_type,
+                "format": fmt,
+                "comment": req.comment or base.comment,
+                "columns": list(req.columns) if req.columns else base.columns,
+                "properties": {**base.properties, **req.properties},
+                "updated_at": now,
+            })
+            self._tables[entry.id] = entry
+            self._save()
+        # Infer outside the lock — the scan can touch the filesystem.
+        if req.infer and not req.node:
+            try:
+                entry = await self.refresh_table(catalog, schema, req.name)
+                return TableResponse(table=entry)
+            except Exception:
+                pass
+        return TableResponse(table=entry)
+
+    async def list_tables(self, catalog: str, schema: str) -> TableListResponse:
+        with self._lock:
+            self._require_schema(catalog, schema)
+            items = [t for t in self._tables.values()
+                     if t.catalog == catalog and t.schema_name == schema]
+        items.sort(key=lambda t: t.name)
+        return TableListResponse(
+            node_id=self.settings.node_id, catalog=catalog, schema=schema, tables=items,
+        )
+
+    async def get_table(self, catalog: str, schema: str, name: str) -> TableResponse:
+        with self._lock:
+            t = self._table_by_name(catalog, schema, name)
+            if t is None:
+                raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
+            return TableResponse(table=t)
+
+    async def update_table(self, catalog: str, schema: str, name: str, req: TableUpdate) -> TableResponse:
+        with self._lock:
+            t = self._table_by_name(catalog, schema, name)
+            if t is None:
+                raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
+            upd: dict[str, Any] = {"updated_at": _now()}
+            for f in ("source_url", "node", "table_type", "comment"):
+                v = getattr(req, f)
+                if v is not None:
+                    upd[f] = v
+            if req.format is not None:
+                upd["format"] = req.format
+            if req.columns is not None:
+                upd["columns"] = list(req.columns)
+            if req.properties is not None:
+                upd["properties"] = dict(req.properties)
+            entry = t.model_copy(update=upd)
+            self._tables[entry.id] = entry
+            self._save()
+            return TableResponse(table=entry)
+
+    async def delete_table(self, catalog: str, schema: str, name: str) -> TableResponse:
+        with self._lock:
+            t = self._table_by_name(catalog, schema, name)
+            if t is None:
+                raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
+            self._tables.pop(t.id, None)
+            self._save()
+            return TableResponse(table=t)
+
+    # -- statistics / schema inference --------------------------------------
+
+    def _resolve_path(self, source_url: str) -> str:
+        """Map a stored source_url to something Tabular.from_ can open.
+
+        URLs (anything with ``://``) pass through. Relative/absolute local
+        paths are resolved under the node files root with traversal guard.
+        """
+        if "://" in source_url:
+            return source_url
+        from pathlib import Path as _P
+        p = _P(source_url)
+        if p.is_absolute():
+            return str(p)
+        root = self.settings.files_root
+        resolved = (root / source_url).resolve()
+        if not str(resolved).startswith(str(root.resolve())):
+            raise BadRequestError("source_url escapes the node files root")
+        return str(resolved)
+
+    async def refresh_table(self, catalog: str, schema: str, name: str) -> TableEntry:
+        with self._lock:
+            t = self._table_by_name(catalog, schema, name)
+            if t is None:
+                raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
+            source = self._resolve_path(t.source_url)
+        cols, stats = await run_in_threadpool(self._infer, source)
+        with self._lock:
+            cur = self._tables.get(t.id, t)
+            entry = cur.model_copy(update={
+                "columns": cols or cur.columns,
+                "statistics": stats,
+                "updated_at": _now(),
+            })
+            self._tables[entry.id] = entry
+            self._save()
+            return entry
+
+    def _infer(self, source: str) -> tuple[list[ColumnSpec], TableStatistics]:
+        """Read schema + bounded statistics from a tabular source.
+
+        parquet/csv/ndjson scan lazily (cheap row counts from parquet
+        metadata); everything else falls back to a single bounded Arrow read.
+        Per-column null/min/max/distinct come from one streaming pass.
+        """
+        import polars as pl
+
+        size_bytes: int | None = None
+        try:
+            if "://" not in source:
+                size_bytes = os.path.getsize(source)
+        except OSError:
+            pass
+
+        ext = source.rsplit(".", 1)[-1].lower() if "." in source else ""
+        try:
+            if ext in ("parquet", "pq"):
+                lf = pl.scan_parquet(source)
+            elif ext in ("csv", "tsv"):
+                lf = pl.scan_csv(source, separator="\t" if ext == "tsv" else ",")
+            elif ext == "ndjson":
+                lf = pl.scan_ndjson(source)
+            else:
+                tab = Tabular.from_(source).read_arrow_table()
+                lf = pl.from_arrow(tab).lazy()
+        except Exception as exc:
+            raise BadRequestError(f"Cannot read {source!r} as a table: {exc}")
+
+        schema = lf.collect_schema()
+        columns = [
+            ColumnSpec(name=n, dtype=_pl_dtype_name(d), nullable=True)
+            for n, d in schema.items()
+        ]
+        names = list(schema.names())
+        try:
+            row_count = lf.select(pl.len()).collect(engine="streaming").item()
+        except Exception:
+            row_count = None
+
+        col_stats: list[ColumnStat] = []
+        if names:
+            exprs = []
+            for n in names:
+                c = pl.col(n)
+                exprs.append(c.null_count().alias(f"{n}|n"))
+                exprs.append(c.n_unique().alias(f"{n}|d"))
+                if schema[n].is_numeric() or schema[n] in (pl.Date, pl.Datetime):
+                    exprs.append(c.min().alias(f"{n}|mn"))
+                    exprs.append(c.max().alias(f"{n}|mx"))
+            try:
+                row = lf.select(exprs).collect(engine="streaming")
+                for n in names:
+                    col_stats.append(ColumnStat(
+                        column=n,
+                        null_count=_as_int(row[f"{n}|n"][0]) if f"{n}|n" in row.columns else None,
+                        distinct_count=_as_int(row[f"{n}|d"][0]) if f"{n}|d" in row.columns else None,
+                        min=_json_safe(row[f"{n}|mn"][0]) if f"{n}|mn" in row.columns else None,
+                        max=_json_safe(row[f"{n}|mx"][0]) if f"{n}|mx" in row.columns else None,
+                    ))
+            except Exception:
+                col_stats = []
+
+        return columns, TableStatistics(
+            row_count=row_count, size_bytes=size_bytes,
+            columns=col_stats, computed_at=_now(),
+        )
+
+    # -- SQL execution ------------------------------------------------------
+
+    def _resolve_dialect(self, name: str | None) -> Dialect:
+        raw = (name or self.settings.saga_default_dialect or "postgres").lower()
+        if raw not in _DIALECTS:
+            raise BadRequestError(f"unknown dialect {raw!r}; one of {sorted(_DIALECTS)}")
+        return Dialect(raw)
+
+    def _qualify(self, ref: TableRef, catalog: str | None, schema: str | None) -> str:
+        parts = [p for p in (ref.catalog or catalog, ref.schema or schema, ref.name) if p]
+        return ".".join(parts)
+
+    def _collect_refs(self, node: Any, out: list[TableRef]) -> None:
+        """Walk a plan/from-item tree collecting every TableRef."""
+        if node is None:
+            return
+        if isinstance(node, TableRef):
+            out.append(node)
+        elif isinstance(node, SubqueryRef):
+            self._collect_refs(node.plan, out)
+        elif isinstance(node, JoinClause):
+            self._collect_refs(node.left, out)
+            self._collect_refs(node.right, out)
+        elif isinstance(node, LateralViewItem):
+            pass
+        elif isinstance(node, ValuesRef):
+            pass
+        elif isinstance(node, SelectNode):
+            for cte in (node.ctes or []):
+                self._collect_refs(getattr(cte, "plan", None), out)
+            self._collect_refs(node.from_clause, out)
+            for sop in (node.set_ops or []):
+                self._collect_refs(getattr(sop, "plan", None), out)
+        elif isinstance(node, (InsertNode, MergeNode)):
+            self._collect_refs(node.target, out)
+            self._collect_refs(node.source, out)
+        elif hasattr(node, "to_plan_node"):  # SelectPlan inside a CTE/subquery
+            try:
+                self._collect_refs(node.to_plan_node(), out)
+            except Exception:
+                pass
+
+    def plan_for(self, req: SqlRequest) -> tuple[PlanNode, Dialect, list[TableRef]]:
+        if not req.sql or not req.sql.strip():
+            raise BadRequestError("empty SQL statement")
+        dialect = self._resolve_dialect(req.dialect)
+        try:
+            node = parse_sql(req.sql, dialect=dialect)
+        except (ValueError, NotImplementedError) as exc:
+            raise BadRequestError(f"SQL parse error: {exc}")
+        refs: list[TableRef] = []
+        self._collect_refs(node, refs)
+        return node, dialect, refs
+
+    def compute_node(self, req: SqlRequest) -> str | None:
+        """Which node should run this query — explicit, else where the data is.
+
+        Returns ``None`` for the local node. If the referenced *registered*
+        tables all live on a single peer, the query follows the data there;
+        mixing peers (or a peer + local) needs an explicit ``node``.
+        """
+        if req.node:
+            return None if req.node == self.settings.node_id else req.node
+        _, _, refs = self.plan_for(req)
+        nodes: set[str] = set()
+        with self._lock:
+            for ref in refs:
+                full = self._qualify(ref, req.catalog, req.schema_)
+                t = self._tables.get(make_id(full))
+                t = t if (t and t.full_name == full) else next(
+                    (x for x in self._tables.values() if x.full_name == full), None)
+                if t and t.node and t.node != self.settings.node_id:
+                    nodes.add(t.node)
+                elif t:
+                    nodes.add(self.settings.node_id)
+        remote = {n for n in nodes if n != self.settings.node_id}
+        if len(remote) == 1 and self.settings.node_id not in nodes:
+            return next(iter(remote))
+        if len(remote) > 1:
+            raise BadRequestError(
+                "query spans tables on multiple nodes; pass an explicit node= to "
+                "pick where it runs"
+            )
+        return None
+
+    def _build_tables(self, refs: list[TableRef], catalog: str | None,
+                      schema: str | None) -> dict[str, Tabular]:
+        """Resolve referenced table names to concrete Tabular sources."""
+        tables: dict[str, Tabular] = {}
+        with self._lock:
+            registry = {t.full_name: t for t in self._tables.values()}
+        for ref in refs:
+            full = self._qualify(ref, catalog, schema)
+            reg = registry.get(full)
+            if reg is None and ref.name in registry:  # bare name already qualified
+                reg = registry[ref.name]
+            if reg is not None:
+                if reg.node and reg.node != self.settings.node_id:
+                    raise BadRequestError(
+                        f"table {full!r} lives on node {reg.node!r}; run the query "
+                        "with node= set to that node"
+                    )
+                src = self._resolve_path(reg.source_url)
+                tab = Tabular.from_(src, default=None)
+                if tab is None:
+                    raise BadRequestError(f"cannot open source for table {full!r}")
+                # Register under every name shape the executor might look up.
+                tables[full] = tab
+                tables[reg.name] = tab
+                if reg.schema_name:
+                    tables[f"{reg.schema_name}.{reg.name}"] = tab
+                continue
+            # Unregistered but path-shaped (a slash or a tabular extension):
+            # resolve it under the node files root so `SELECT * FROM
+            # 'data/x.parquet'` reads from the node, not the process CWD.
+            cand = ref.name
+            ext = cand.rsplit(".", 1)[-1].lower() if "." in cand else ""
+            looks_like_path = ("/" in cand or "\\" in cand or ext in _TABULAR_EXTS)
+            if looks_like_path and is_tabular_source(cand):
+                tab = Tabular.from_(self._resolve_path(cand), default=None)
+                if tab is not None:
+                    tables[cand] = tab
+            # Anything else falls through to the executor's own resolution.
+        return tables
+
+    async def execute_sql(self, req: SqlRequest) -> SqlResult:
+        return await run_in_threadpool(self._execute_sql, req)
+
+    def _execute_sql(self, req: SqlRequest) -> SqlResult:
+        node, dialect, refs = self.plan_for(req)
+        limit = req.limit if req.limit and req.limit > 0 else self.settings.saga_sql_preview_rows
+        # Bound the work: push a preview LIMIT into a LIMIT-less top SELECT so
+        # the executor slices at the source instead of materialising everything.
+        if isinstance(node, SelectNode) and node.limit is None:
+            node.limit = limit + 1
+        tables = self._build_tables(refs, req.catalog, req.schema_)
+        t0 = time.perf_counter()
+        try:
+            result = execute_plan(node, tables)
+            table = result.read_arrow_table()
+        except (BadRequestError, NotFoundError):
+            raise
+        except Exception as exc:
+            raise BadRequestError(f"query failed: {exc}")
+        elapsed = (time.perf_counter() - t0) * 1000.0
+
+        truncated = table.num_rows > limit
+        if truncated:
+            table = table.slice(0, limit)
+        cols = [SqlColumn(name=f.name, dtype=str(f.type)) for f in table.schema]
+        pydict = table.to_pydict()
+        col_data = [pydict[c.name] for c in cols]
+        rows = [[_json_safe(col_data[ci][ri]) for ci in range(len(cols))]
+                for ri in range(table.num_rows)]
+        try:
+            plan_sql = node.to_sql(dialect=dialect)
+        except Exception:
+            plan_sql = ""
+        return SqlResult(
+            node_id=self.settings.node_id, columns=cols, rows=rows,
+            row_count=table.num_rows, truncated=truncated,
+            elapsed_ms=round(elapsed, 2), plan_sql=plan_sql,
+            referenced_tables=sorted({self._qualify(r, req.catalog, req.schema_) for r in refs}),
+        )
+
+    def explain(self, req: SqlRequest) -> ExplainResult:
+        node, dialect, refs = self.plan_for(req)
+        try:
+            plan_sql = node.to_sql(dialect=dialect)
+        except Exception:
+            plan_sql = ""
+        return ExplainResult(
+            node_id=self.settings.node_id, dialect=dialect.value,
+            plan=repr(node), plan_sql=plan_sql,
+            referenced_tables=sorted({self._qualify(r, req.catalog, req.schema_) for r in refs}),
+            statement=req.sql,
+        )
+
+    def execute_sql_arrow(self, req: SqlRequest):
+        """Run the query and return (iterator-of-ipc-bytes, cleanup-callable).
+
+        Small results stream straight from the in-memory Arrow buffer. Heavy
+        results (> ``saga_result_spill_rows``) spill to an Arrow IPC file under
+        ``spill_root`` and stream off disk, so the encoded result never sits
+        whole in memory.
+        """
+        node, dialect, refs = self.plan_for(req)
+        tables = self._build_tables(refs, req.catalog, req.schema_)
+        try:
+            result = execute_plan(node, tables)
+            table = result.read_arrow_table()
+        except (BadRequestError, NotFoundError):
+            raise
+        except Exception as exc:
+            raise BadRequestError(f"query failed: {exc}")
+
+        if table.num_rows <= self.settings.saga_result_spill_rows:
+            batches = table.to_batches(max_chunksize=65536)
+            return transport.iter_arrow_ipc_stream(iter(batches), table.schema), None
+
+        # Spill: write batch-by-batch to a temp IPC file, then stream from disk.
+        self.settings.spill_root.mkdir(parents=True, exist_ok=True)
+        fd, spill = tempfile.mkstemp(dir=self.settings.spill_root, suffix=".arrows")
+        os.close(fd)
+        transport.write_arrow_ipc_file(spill, iter(table.to_batches(max_chunksize=65536)), table.schema)
+
+        def _cleanup() -> None:
+            try:
+                os.unlink(spill)
+            except OSError:
+                pass
+
+        return transport.iter_file_chunks(spill), _cleanup
+
+    # -- discovery ----------------------------------------------------------
+
+    async def discover(self, req: DiscoverRequest) -> TableListResponse:
+        """Scan a folder under the node files root and register tabular files."""
+        from pathlib import Path as _P
+
+        root = self.settings.files_root
+        base = (root / req.path.lstrip("/")).resolve() if req.path else root
+        if not str(base).startswith(str(root.resolve())):
+            raise BadRequestError("path escapes the node files root")
+        if not base.exists() or not base.is_dir():
+            raise NotFoundError(f"directory not found: {req.path!r}")
+
+        found: list[_P] = []
+        it = base.rglob("*") if req.recursive else base.iterdir()
+        for p in it:
+            if p.is_file() and p.suffix.lstrip(".").lower() in _TABULAR_EXTS:
+                found.append(p)
+
+        for p in found:
+            rel = str(p.relative_to(root))
+            name = p.stem
+            await self.create_table(req.catalog, req.schema_, TableCreate(
+                name=name, source_url=rel, node=req.node, table_type="EXTERNAL",
+                infer=req.infer,
+            ))
+        return await self.list_tables(req.catalog, req.schema_)
+
+
+def _as_int(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pl_dtype_name(d: Any) -> str:
+    """Compact, stable name for a polars dtype."""
+    import polars as pl
+
+    if d == pl.Utf8:
+        return "string"
+    if d in (pl.Float32, pl.Float64):
+        return "double"
+    if d == pl.Boolean:
+        return "bool"
+    if d == pl.Date:
+        return "date"
+    if isinstance(d, pl.Datetime) or d == pl.Datetime:
+        return "datetime"
+    if d in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+             pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+        return "int"
+    return str(d).lower()

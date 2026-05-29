@@ -220,6 +220,22 @@ class SelectPlan(ExecutionPlan[O]):
                 and self._ctes is None and self._offset is None)
 
     @property
+    def is_schema_preserving(self) -> bool:
+        """True iff the plan can't reshape the source's column set/types.
+
+        Filter, limit, offset and order-by only drop or reorder rows; the
+        output schema is identical to the source. Anything that projects,
+        aggregates, joins, unions, resamples or casts can change it. Callers
+        (e.g. :meth:`LazyTabular._collect_schema`) use this to skip a full
+        plan execution when they only need column names/types.
+        """
+        return (self._select is None and self._drop is None
+                and not self._joins and not self._unions
+                and self._unique_by is None and self._resample is None
+                and self._cast_options is None and self._group_by is None
+                and self._ctes is None)
+
+    @property
     def source(self) -> "Tabular | None": return self._source
     @property
     def columns(self) -> list[str] | None: return self._select

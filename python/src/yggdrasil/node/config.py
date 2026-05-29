@@ -111,6 +111,22 @@ class Settings:
     # is immediately useful. The env builds in the background; functions are
     # registered instantly and run on the node interpreter until it's ready.
     seed_defaults: bool = True
+    # Seconds a file in the node ``tmp``/``spill`` folders survives before the
+    # background janitor reclaims it. SQL spill files and scratch downloads are
+    # transient; a day is generous enough to outlive any single run.
+    tmp_ttl: int = 86_400
+    # Cadence (seconds) of the tmp/spill janitor loop. Independent of tmp_ttl so
+    # a short TTL still can't busy-loop the sweep.
+    tmp_cleanup_interval: float = 3600.0
+    # Default SQL dialect the Saga editor parses with when a request / catalog
+    # doesn't pin one. Postgres is the most familiar lingua franca.
+    saga_default_dialect: str = "postgres"
+    # Rows a Saga SQL run returns to the JSON editor grid before flagging the
+    # result truncated — keeps the interactive editor snappy.
+    saga_sql_preview_rows: int = 10_000
+    # Result rows above which a Saga Arrow-IPC response spills to a temp file
+    # under spill_root and streams from disk instead of buffering in memory.
+    saga_result_spill_rows: int = 250_000
 
     @property
     def local_clients(self) -> set[str]:
@@ -143,6 +159,14 @@ class Settings:
     @property
     def spill_root(self) -> Path:
         return self.node_home / "spill"
+
+    @property
+    def tmp_root(self) -> Path:
+        return self.files_root / "tmp"
+
+    @property
+    def saga_root(self) -> Path:
+        return self.node_home / "saga"
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -188,4 +212,9 @@ def get_settings() -> Settings:
         analysis_max_rows=int(os.getenv("YGG_NODE_ANALYSIS_MAX_ROWS", "200000")),
         pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
         seed_defaults=_as_bool(os.getenv("YGG_NODE_SEED_DEFAULTS"), True),
+        tmp_ttl=int(os.getenv("YGG_NODE_TMP_TTL", str(86_400))),
+        tmp_cleanup_interval=float(os.getenv("YGG_NODE_TMP_CLEANUP_INTERVAL", "3600")),
+        saga_default_dialect=os.getenv("YGG_NODE_SAGA_DIALECT", "postgres"),
+        saga_sql_preview_rows=int(os.getenv("YGG_NODE_SAGA_PREVIEW_ROWS", "10000")),
+        saga_result_spill_rows=int(os.getenv("YGG_NODE_SAGA_SPILL_ROWS", "250000")),
     )

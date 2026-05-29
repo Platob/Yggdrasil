@@ -23,6 +23,10 @@ from .api.routers import (
     pyfuncrun_router as v2_pyfuncrun_router,
     replicate_router as v2_replicate_router,
     user_router as v2_user_router,
+    tabular_router as v2_tabular_router,
+    analysis_router as v2_analysis_router,
+    workbook_router as v2_workbook_router,
+    saga_router as v2_saga_router,
 )
 from .api.services.audit import AuditLog
 from .api.services.backend import BackendService
@@ -35,6 +39,9 @@ from .api.services.pyfuncrun import PyFuncRunService
 from .api.services.messenger import MessengerService as V2MessengerService
 from .api.services.replicate import ReplicateService
 from .api.services.user import UserService
+from .api.services.tabular import TabularService
+from .api.services.analysis import AnalysisService
+from .api.services.saga import SagaService
 from .routers import (
     call_router,
     cmd_router,
@@ -72,16 +79,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        import asyncio
+
         # Seed default assets in the background so a fresh node is useful
         # at once. The env build (uv venv + pip) must not gate readiness,
         # so we fire-and-forget — functions register near-instantly.
         if settings.seed_defaults:
-            import asyncio
             from .api.services.seed import seed_defaults
             asyncio.create_task(
                 seed_defaults(app.state.pyenv_service, app.state.pyfunc_service)
             )
-        yield
+
+        # tmp/spill janitor: reclaim scratch files (SQL spill, uploads, Arrow
+        # overflow) older than tmp_ttl, every tmp_cleanup_interval seconds.
+        async def _tmp_janitor() -> None:
+            from .daemon import cleanup_tmp
+            while True:
+                try:
+                    await asyncio.to_thread(cleanup_tmp, settings)
+                except Exception:  # never let the janitor kill the loop
+                    pass
+                await asyncio.sleep(max(60.0, settings.tmp_cleanup_interval))
+
+        janitor = asyncio.create_task(_tmp_janitor())
+        try:
+            yield
+        finally:
+            janitor.cancel()
 
     app = FastAPI(
         title=settings.app_name,
@@ -126,6 +150,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from .api.services.excel import ExcelService
 
     v2_fs = FsService(settings)
+    app.state.tabular_service = TabularService(settings, fs=v2_fs)
+    app.state.analysis_service = AnalysisService(settings, fs=v2_fs)
+    app.state.saga_service = SagaService(settings)
     pyenv = PyEnvService(settings, audit=audit)
     pyfunc = PyFuncService(settings, audit=audit)
     pyfuncrun = PyFuncRunService(settings, pyenv, pyfunc)
@@ -350,6 +377,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(v2_network_router, prefix=f"{prefix}/v2/network")
     app.include_router(v2_replicate_router, prefix=f"{prefix}/v2/replicate")
     app.include_router(v2_fs_router, prefix=f"{prefix}/v2/fs")
+    app.include_router(v2_tabular_router, prefix=f"{prefix}/v2/tabular")
+    app.include_router(v2_analysis_router, prefix=f"{prefix}/v2/analysis")
+    app.include_router(v2_workbook_router, prefix=f"{prefix}/v2/workbook")
+    app.include_router(v2_saga_router, prefix=f"{prefix}/v2/saga")
     app.include_router(v2_user_router, prefix=f"{prefix}/v2/user")
     app.include_router(v2_messenger_router, prefix=f"{prefix}/v2/messenger")
     app.include_router(v2_excel_router, prefix=f"{prefix}/v2/excel")

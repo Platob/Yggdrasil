@@ -48,8 +48,13 @@ class LazyTabular(Tabular[O], Generic[O]):
         raise TypeError("LazyTabular is read-only.")
 
     def _collect_schema(self, options: O) -> "Schema":
-        # Bypass any cached schema on the source — the plan's projections
-        # / joins reshape the schema in ways the source can't anticipate.
+        # Fast path: filter/limit/offset/order-by can't reshape the column
+        # set or types, so read the schema straight off the source and skip
+        # materialising the whole plan just to learn the columns.
+        if self._plan.is_schema_preserving:
+            return self._source.collect_schema(options)
+        # Otherwise the plan's projections / joins / aggregations reshape the
+        # schema in ways the source can't anticipate — execute to find out.
         return self._plan.execute(self._source).collect_schema(options)
 
     # -- Autonomous-plan helpers ---------------------------------------------

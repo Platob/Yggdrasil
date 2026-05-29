@@ -33,8 +33,47 @@ _PORT_FILE = "node.port"
 
 def ensure_directories(settings: Settings) -> None:
     for d in (settings.node_home, settings.data_root, settings.cache_root,
-              settings.spill_root, settings.logs_root):
+              settings.spill_root, settings.logs_root, settings.tmp_root,
+              settings.saga_root):
         d.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_tmp(settings: Settings) -> int:
+    """Delete tmp/spill entries older than ``tmp_ttl`` seconds.
+
+    Sweeps the node's scratch folders — ``files/tmp`` (uploads, SQL spill
+    files) and ``spill`` (ArrowTabular overflow) — reclaiming anything whose
+    mtime is past the TTL. Empty leftover directories are pruned too. Returns
+    the number of filesystem entries removed.
+    """
+    cutoff = time.time() - max(1, settings.tmp_ttl)
+    removed = 0
+    for root in (settings.tmp_root, settings.spill_root):
+        if not root.exists():
+            continue
+        # Walk bottom-up so a directory is visited after its children and can be
+        # removed once emptied.
+        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+            d = Path(dirpath)
+            for name in filenames:
+                f = d / name
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+                        removed += 1
+                except OSError:
+                    continue
+            if d != root:
+                try:
+                    next(d.iterdir())
+                except StopIteration:
+                    d.rmdir()
+                    removed += 1
+                except OSError:
+                    continue
+    if removed:
+        LOGGER.info("tmp janitor reclaimed %d entries (ttl=%ds)", removed, settings.tmp_ttl)
+    return removed
 
 
 def cleanup_old_logs(settings: Settings) -> int:
