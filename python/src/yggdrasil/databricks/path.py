@@ -190,8 +190,9 @@ def _relative_join_parts(segments: "tuple[Any, ...]") -> list[str]:
     treating every piece as relative — strips the leading-slash
     "absolute reset" that :class:`pathlib`/:class:`URL` joins honour. A
     Databricks path is anchored in a namespace it must not escape, so a
-    join always *extends* it; ``..`` is left intact (the URL layer keeps
-    it syntactic) for callers that genuinely want to walk up.
+    join always *extends* it. ``..`` is left as a literal component —
+    like :meth:`URL.joinpath`, the join stays syntactic and does not
+    resolve parent references.
     """
     parts: list[str] = []
     for seg in segments:

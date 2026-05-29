@@ -1045,3 +1045,77 @@ class TestJoinExtendsNeverResets:
             path_prefix=TABLE_PATH_PREFIX,
         )
         assert isinstance(cat / "sales/orders", Table)
+
+
+class TestByteShapedPathJoins:
+    """The same extend-don't-reset / multi-part rules apply to the
+    byte-shaped surfaces (DBFS / Workspace / VolumePath), which all
+    inherit :meth:`DatabricksPath.joinpath`."""
+
+    def test_dbfs_multipart_join(self):
+        from yggdrasil.databricks.fs.service import DBFSService
+        svc = MagicMock(spec=DBFSService)
+        p = DBFSPath("/dbfs/tmp/dir", service=svc)
+        assert (p / "a/b/c").full_path() == "/dbfs/tmp/dir/a/b/c"
+
+    def test_dbfs_leading_slash_stays_in_namespace(self):
+        from yggdrasil.databricks.fs.service import DBFSService
+        svc = MagicMock(spec=DBFSService)
+        p = DBFSPath("/dbfs/tmp/dir", service=svc)
+        # A leading slash must extend, not reset to ``/abs`` (which would
+        # escape the DBFS root).
+        assert (p / "/abs/x").full_path() == "/dbfs/tmp/dir/abs/x"
+
+    def test_workspace_multipart_join(self):
+        svc = MagicMock(spec=WorkspacePath._SERVICE_CLASS)
+        p = WorkspacePath("/Workspace/Users/me", service=svc)
+        assert (p / "proj/nb").full_path() == "/Workspace/Users/me/proj/nb"
+
+    def test_volume_path_multipart_and_trailing_slash(self, volumes_service):
+        vp = VolumePath("/Volumes/main/sales/raw/dir", service=volumes_service)
+        assert (vp / "a/b/").full_path() == "/Volumes/main/sales/raw/dir/a/b"
+
+
+class TestVolumePathNavigationStillWorks:
+    """Regression: the ``joinpath`` override must not disturb the
+    ``Volume.path`` factory or the ``with_name`` / ``with_suffix``
+    helpers that lean on parent + join."""
+
+    def test_volume_join_matches_volume_path_factory(self, volumes_service):
+        vol = Volume(
+            service=volumes_service,
+            catalog_name="main",
+            schema_name="sales",
+            volume_name="raw",
+        )
+        # ``vol / "x/y.parquet"`` and ``vol.path("x/y.parquet")`` are the
+        # same VolumePath singleton.
+        assert (vol / "x/y.parquet") is vol.path("x/y.parquet")
+
+    def test_with_name_and_suffix_on_volume_path(self, volumes_service):
+        vp = VolumePath(
+            "/Volumes/main/sales/raw/dir/file.csv",
+            service=volumes_service,
+        )
+        assert vp.with_name("other.txt").full_path() == (
+            "/Volumes/main/sales/raw/dir/other.txt"
+        )
+        assert vp.with_suffix(".parquet").full_path() == (
+            "/Volumes/main/sales/raw/dir/file.parquet"
+        )
+
+
+class TestPathPrefixSurvivesPickle:
+    """The navigation surface is plain instance state — it must round-
+    trip through pickling like the rest of the resource."""
+
+    def test_table_catalog_pickle_round_trip(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        assert "path_prefix" in cat.__getstate__()
+        # The state carries the surface so an unpickled handle resolves
+        # children the same way.
+        assert cat.__getstate__()["path_prefix"] == TABLE_PATH_PREFIX
