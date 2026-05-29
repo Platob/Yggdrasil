@@ -57,6 +57,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import io
+import json
 import logging
 import os
 import re
@@ -176,6 +177,17 @@ class VolumePath(DatabricksPath):
     scheme: ClassVar[Scheme] = Scheme.DATABRICKS_VOLUME
     NAMESPACE_PREFIX: ClassVar[str] = "/Volumes/"
 
+    # Multipart upload tuning. At / above ``MULTIPART_MIN_SIZE`` an upload
+    # runs as concurrent presigned parts (see :meth:`_try_multipart_upload`)
+    # instead of one whole-object PUT — faster on large objects and past
+    # the Files-API 5 GiB single-PUT ceiling. ``PART_SIZE`` is the target
+    # part grain, raised as needed so the part count stays under
+    # ``MAX_PARTS``. Tunable per instance / subclass.
+    MULTIPART_MIN_SIZE: ClassVar[int] = 100 * 1024 * 1024
+    MULTIPART_PART_SIZE: ClassVar[int] = 16 * 1024 * 1024
+    MULTIPART_MAX_PARTS: ClassVar[int] = 1000
+    MULTIPART_PARALLELISM: ClassVar[int] = 8
+
     # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
     # import cycle.
@@ -256,6 +268,7 @@ class VolumePath(DatabricksPath):
         *,
         params: "dict[str, str] | None" = None,
         body: Any = None,
+        json_body: Any = None,
         range_header: "str | None" = None,
         preload_content: bool = True,
     ) -> Any:
@@ -265,7 +278,9 @@ class VolumePath(DatabricksPath):
         :meth:`_raise_for_files_status`. The session retries transient
         wire failures (429 / 5xx / SSL EOF) internally before this
         returns; an open *range_header* (``bytes=<off>-``) resumes
-        mid-stream from the last received byte.
+        mid-stream from the last received byte. *json_body* JSON-encodes
+        a mapping and stamps ``Content-Type: application/json`` (used by
+        the multipart coordination calls).
         """
         url = self.client.base_url.with_path(
             f"/api/2.0/fs/{kind}{quote(api_path, safe='/')}"
@@ -276,6 +291,9 @@ class VolumePath(DatabricksPath):
         headers = {"Authorization": self.client.files_authorization()}
         if range_header is not None:
             headers["Range"] = range_header
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(json_body).encode()
         return self.client.files_session().fetch(
             method,
             url,
@@ -348,6 +366,153 @@ class VolumePath(DatabricksPath):
         """``DELETE`` a file / directory — raises FileNotFoundError on 404."""
         resp = self._fs_request("DELETE", kind, api_path)
         self._raise_for_files_status(resp, api_path)
+
+    # ==================================================================
+    # Multipart upload (parallel) — mirrors the SDK's FilesExt protocol
+    # ==================================================================
+    #
+    # ``initiate-upload`` → ``create-upload-part-urls`` → parallel PUTs to
+    # the presigned cloud-storage URLs (each returns an ETag) →
+    # ``complete-upload``; ``create-abort-upload-url`` + DELETE on failure.
+    # The coordination calls hit the workspace with our auth; the part
+    # PUTs go straight to cloud storage and carry no Databricks auth (the
+    # presigned URL self-authorizes). Lets large uploads run concurrent
+    # parts and lifts the 5 GiB single-PUT ceiling.
+
+    def _fs_coordination_post(self, endpoint: str, body: dict) -> dict:
+        """``POST /api/2.0/fs/<endpoint>`` with auth + JSON body → parsed JSON."""
+        url = self.client.base_url.with_path(f"/api/2.0/fs/{endpoint}")
+        resp = self.client.files_session().fetch(
+            "POST",
+            url,
+            headers={
+                "Authorization": self.client.files_authorization(),
+                "Content-Type": "application/json",
+            },
+            body=json.dumps(body).encode(),
+            preload_content=True,
+        )
+        self._raise_for_files_status(resp, endpoint)
+        return resp.json() or {}
+
+    def _try_multipart_upload(self, api_path: str, payload: bytes) -> bool:
+        """Upload *payload* in concurrent parts. Returns ``True`` on success.
+
+        Returns ``False`` (so the caller falls back to a single PUT) when
+        the workspace doesn't support multipart — the ``initiate-upload``
+        probe fails or yields no session token. A failure *after* a
+        successful initiate aborts the session and re-raises (the bytes
+        never half-land).
+        """
+        resp = self._fs_request(
+            "POST", "files", api_path,
+            params={"action": "initiate-upload", "overwrite": "true"},
+        )
+        if not resp.ok:
+            logger.info(
+                "Multipart unsupported for %r (initiate %s) — single PUT.",
+                self, resp.status,
+            )
+            return False
+        token = ((resp.json() or {}).get("multipart_upload") or {}).get("session_token")
+        if not token:
+            return False
+
+        size = len(payload)
+        part_size = max(self.MULTIPART_PART_SIZE, -(-size // self.MULTIPART_MAX_PARTS))
+        n_parts = -(-size // part_size)
+        expire = (
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            part_urls = self._fs_coordination_post(
+                "create-upload-part-urls",
+                {
+                    "path": api_path,
+                    "session_token": token,
+                    "start_part_number": 1,
+                    "count": n_parts,
+                    "expire_time": expire,
+                },
+            ).get("upload_part_urls") or []
+            if len(part_urls) < n_parts:
+                raise OSError(
+                    f"Multipart: server returned {len(part_urls)} part URLs "
+                    f"for {n_parts} parts ({api_path})."
+                )
+
+            session = self.client.files_session()
+
+            def _put_part(info: dict) -> "tuple[int, str]":
+                part_number = int(info["part_number"])
+                start = (part_number - 1) * part_size
+                chunk = payload[start:start + part_size]
+                headers = {"Content-Type": "application/octet-stream"}
+                for h in info.get("headers") or []:
+                    headers[h["name"]] = h["value"]
+                # No Authorization — the presigned URL self-authorizes.
+                r = session.fetch("PUT", info["url"], headers=headers, body=chunk)
+                try:
+                    if r.status not in (200, 201):
+                        raise OSError(
+                            f"Multipart part {part_number} failed: HTTP "
+                            f"{r.status} ({api_path})."
+                        )
+                    etag = _header(r.headers, "ETag") or ""
+                finally:
+                    # Return the socket to the pool — parts reuse it.
+                    r.drain_conn()
+                    r.release_conn()
+                return part_number, etag
+
+            etags: "dict[int, str]" = {}
+            workers = min(self.MULTIPART_PARALLELISM, n_parts)
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="volume-multipart",
+            ) as pool:
+                for part_number, etag in pool.map(_put_part, part_urls[:n_parts]):
+                    etags[part_number] = etag
+
+            complete = self._fs_request(
+                "POST", "files", api_path,
+                params={
+                    "action": "complete-upload",
+                    "upload_type": "multipart",
+                    "session_token": token,
+                },
+                json_body={
+                    "parts": [
+                        {"part_number": pn, "etag": etags[pn]}
+                        for pn in sorted(etags)
+                    ]
+                },
+            )
+            self._raise_for_files_status(complete, api_path)
+        except Exception:
+            self._multipart_abort(api_path, token, expire)
+            raise
+        logger.info(
+            "Uploaded volume file %r via multipart (%d bytes, %d parts).",
+            self, size, n_parts,
+        )
+        return True
+
+    def _multipart_abort(self, api_path: str, token: str, expire: str) -> None:
+        """Best-effort abort so a failed multipart leaves no orphan session."""
+        try:
+            info = self._fs_coordination_post(
+                "create-abort-upload-url",
+                {"path": api_path, "session_token": token, "expire_time": expire},
+            ).get("abort_upload_url") or {}
+            url = info.get("url")
+            if not url:
+                return
+            headers = {}
+            for h in info.get("headers") or []:
+                headers[h["name"]] = h["value"]
+            self.client.files_session().fetch("DELETE", url, headers=headers, body=b"")
+        except Exception as exc:  # noqa: BLE001 — abort is best-effort
+            logger.warning("Multipart abort failed for %r: %r", self, exc)
 
     # ==================================================================
     # Stat
@@ -1230,17 +1395,24 @@ class VolumePath(DatabricksPath):
             payload = bytes(content)
         size = len(payload)
 
-        def _do_upload() -> None:
-            resp = self._fs_request(
-                "PUT",
-                "files",
-                api_path,
-                params={"overwrite": "true"},
-                body=payload,
-            )
-            self._raise_for_files_status(resp, api_path)
+        # Large objects: run concurrent presigned parts (and lift the
+        # 5 GiB single-PUT cap). Falls back to a single PUT when the
+        # workspace doesn't support multipart.
+        if size >= self.MULTIPART_MIN_SIZE and self._try_multipart_upload(api_path, payload):
+            pass
+        else:
+            def _do_upload() -> None:
+                resp = self._fs_request(
+                    "PUT",
+                    "files",
+                    api_path,
+                    params={"overwrite": "true"},
+                    body=payload,
+                )
+                self._raise_for_files_status(resp, api_path)
 
-        self._call_ensuring_parents(_do_upload)
+            self._call_ensuring_parents(_do_upload)
+            logger.info("Uploaded volume file %r (size=%d)", self, size)
         self._persist_stat_cache(
             IOStats(
                 size=size,
@@ -1249,7 +1421,6 @@ class VolumePath(DatabricksPath):
                 media_type=self.media_type,
             )
         )
-        logger.info("Uploaded volume file %r (size=%d)", self, size)
         self._cache_after_upload(payload, size)
         return size
 
