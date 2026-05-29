@@ -2,8 +2,10 @@
 
 Exercises the production wiring end-to-end against the mocked SDK boundary:
 task coercion (dict → SubmitTask), default-cluster backfill, and that the
-returned handle is an awaitable :class:`JobRun` with a ``run_id`` but no
-``job_id`` (one-time runs are not backed by a persisted job).
+returned handle is an awaitable :class:`JobRun` carrying the run's
+``run_id`` and ``run_page_url`` — fetched right after submission so logs
+deep-link to the run page rather than the vanity-host jobs list.  One-time
+runs are not backed by a persisted job, so the handle has no ``job_id``.
 """
 from __future__ import annotations
 
@@ -19,6 +21,12 @@ class TestJobsSubmit(DatabricksTestCase):
         super().setUp()
         JobRun._INSTANCES.clear()
         self.workspace_client.jobs.submit.return_value.run_id = 555
+        # submit() fetches the run right after submission so the handle
+        # carries its canonical run_page_url for repr/logs.
+        got = self.workspace_client.jobs.get_run.return_value
+        got.run_id = 555
+        got.job_id = None
+        got.run_page_url = "https://dbc-test.cloud.databricks.com/jobs/900/runs/555"
 
     def tearDown(self) -> None:
         JobRun._INSTANCES.clear()
@@ -36,9 +44,14 @@ class TestJobsSubmit(DatabricksTestCase):
             ],
         )
         self.workspace_client.jobs.submit.assert_called_once()
+        self.workspace_client.jobs.get_run.assert_called_once_with(run_id=555)
         self.assertIsInstance(run, JobRun)
         self.assertEqual(run.run_id, 555)
         self.assertIsNone(run.job_id)
+        self.assertEqual(
+            run.explore_url.to_string(),
+            "https://dbc-test.cloud.databricks.com/jobs/900/runs/555",
+        )
 
     def test_submit_coerces_dict_tasks(self):
         self.client.jobs.submit(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from databricks.sdk.service.compute import (
     ClusterDetails,
+    ClusterSource,
     Library,
     LibraryFullStatus,
     LibraryInstallStatus,
@@ -287,4 +288,63 @@ class TestEditableDetailsPoolFields(DatabricksTestCase):
         self.assertTrue(
             dicts_equal(current_edit, desired_edit, keys=_EDIT_ARG_NAMES),
             "Update should be skipped when only pool-managed fields differ",
+        )
+
+
+# ------------------------------------------------------------------ #
+# Clusters.list / find_cluster — cluster-source filtering
+# ------------------------------------------------------------------ #
+
+class TestClusterSourceFilter(DatabricksTestCase):
+    """``Clusters.list`` / ``find_cluster`` always apply a source filter."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.clusters_api.list.return_value = []
+
+    def test_list_applies_source_filter_without_name(self):
+        # Previously the filter was only built when a name was given, so an
+        # unnamed list silently ignored sources and returned every source.
+        list(self.clusters.list())
+        _, kwargs = self.clusters_api.list.call_args
+        filter_by = kwargs["filter_by"]
+        self.assertIsNotNone(filter_by)
+        self.assertEqual(
+            filter_by.cluster_sources, [ClusterSource.API, ClusterSource.UI]
+        )
+
+    def test_list_default_sources_include_ui(self):
+        list(self.clusters.list(name="etl"))
+        _, kwargs = self.clusters_api.list.call_args
+        self.assertEqual(
+            kwargs["filter_by"].cluster_sources,
+            [ClusterSource.API, ClusterSource.UI],
+        )
+
+    def test_list_honors_explicit_sources(self):
+        list(self.clusters.list(sources=[ClusterSource.JOB]))
+        _, kwargs = self.clusters_api.list.call_args
+        self.assertEqual(kwargs["filter_by"].cluster_sources, [ClusterSource.JOB])
+
+    def test_find_cluster_list_scan_defaults_to_api_and_ui(self):
+        # No cached id + lookup by name → falls through to the list scan,
+        # which must default sources to [API, UI] so UI clusters are found.
+        details = ClusterDetails(
+            cluster_id="0303-000000-ccc33333",
+            cluster_name="ui-made-cluster",
+            state=State.RUNNING,
+        )
+        self.clusters_api.list.return_value = [details]
+        # find_cluster compares against ``cluster.details.cluster_name``,
+        # which lazily re-fetches via clusters.get — return the same record.
+        self.clusters_api.get.return_value = details
+
+        found = self.clusters.find_cluster(cluster_name="ui-made-cluster")
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found.cluster_id, "0303-000000-ccc33333")
+        _, kwargs = self.clusters_api.list.call_args
+        self.assertEqual(
+            kwargs["filter_by"].cluster_sources,
+            [ClusterSource.API, ClusterSource.UI],
         )

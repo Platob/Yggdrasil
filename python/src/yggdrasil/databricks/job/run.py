@@ -171,10 +171,16 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
     def explore_url(self) -> URL:
         """Workspace UI URL for this run (``/jobs/<job_id>/runs/<run_id>``).
 
-        Falls back to the jobs list page when the owning ``job_id`` or the
-        ``run_id`` isn't known yet (e.g. a handle built from a run id before
-        its first :meth:`refresh`).
+        Prefers the SDK-provided ``run_page_url`` when run details are
+        already loaded — it carries the canonical workspace host and the
+        owning ``job_id`` even for one-time submitted runs that have no
+        job id of their own.  Otherwise the URL is built from the client
+        host, falling back to the jobs list page when ``job_id`` isn't
+        known yet (e.g. a handle built from a run id before its first
+        :meth:`refresh`).
         """
+        if self._details is not None and self._details.run_page_url:
+            return URL.from_str(self._details.run_page_url)
         if self.job_id and self.run_id:
             return self.client.base_url.with_path(f"/jobs/{self.job_id}/runs/{self.run_id}")
         return self.client.base_url.with_path("/jobs")

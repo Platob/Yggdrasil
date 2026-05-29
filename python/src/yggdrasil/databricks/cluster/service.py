@@ -348,7 +348,7 @@ class Clusters(DatabricksService):
         found = self.find_cluster(
             cluster_id=cluster_id,
             cluster_name=cluster_name,
-            sources=[ClusterSource.API],
+            sources=[ClusterSource.API, ClusterSource.UI],
             raise_error=False,
         )
 
@@ -465,7 +465,7 @@ class Clusters(DatabricksService):
                 "Ensure that you have the rights to do it."
             ) from e
 
-        instance = Cluster(service=self).set_details(details=details)
+        instance = Cluster(service=self, cluster_id=details.cluster_id, cluster_name=details.cluster_name).set_details(details=details)
 
         LOGGER.info("Created cluster %r", instance)
 
@@ -559,18 +559,18 @@ class Clusters(DatabricksService):
         cnt, limit = 0, limit or float("inf")
 
         if sources is ...:
-            sources = [ClusterSource.API]
+            sources = [ClusterSource.API, ClusterSource.UI]
 
-        filter_by = ListClustersFilterBy(cluster_sources=sources) if name else None
+        filter_by = ListClustersFilterBy(cluster_sources=sources)
 
         for details in client.list(filter_by=filter_by):
             if name:
                 if name == details.cluster_name:
-                    cluster = Cluster(service=self).set_details(details=details)
+                    cluster = Cluster(service=self, cluster_id=details.cluster_id, cluster_name=details.cluster_name).set_details(details=details)
                     yield cluster
                     cnt += 1
             else:
-                cluster = Cluster(service=self).set_details(details=details)
+                cluster = Cluster(service=self, cluster_id=details.cluster_id, cluster_name=details.cluster_name).set_details(details=details)
 
                 yield cluster
                 cnt += 1

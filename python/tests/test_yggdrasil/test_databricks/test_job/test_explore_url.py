@@ -6,6 +6,8 @@ the fallbacks for partially-known ids.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from yggdrasil.databricks.job.job import Job
@@ -87,6 +89,14 @@ class TestJobRunExploreUrl:
 
     def test_missing_run_id_falls_back_to_jobs_list(self):
         assert _make_run(run_id=None, job_id=123).explore_url.to_string() == f"{_HOST}/jobs"
+
+    def test_prefers_run_page_url_from_details(self):
+        # A one-time submitted run has no job_id of its own; the SDK
+        # run_page_url (canonical host + ids) is the only deep-link.
+        page = "https://dbc-82edd6f4.cloud.databricks.com/jobs/900/runs/456"
+        run = _make_run(run_id=456, job_id=None)
+        run._details = SimpleNamespace(run_page_url=page)
+        assert run.explore_url.to_string() == page
 
     def test_returns_url_instance(self):
         assert isinstance(_make_run().explore_url, URL)
