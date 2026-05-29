@@ -197,8 +197,22 @@ def _apply_node_env(args: argparse.Namespace) -> None:
 
 def _ensure_node_running() -> str:
     try:
-        from yggdrasil.node.daemon import spawn_node
-        _, port = spawn_node()
+        from yggdrasil.node.daemon import _is_node_running, spawn_node
+        from yggdrasil.node.config import get_settings
+
+        settings = get_settings()
+        # Already up? Skip the spinner entirely — keep fast commands fast.
+        running, _, port = _is_node_running(settings)
+        if running:
+            return f"http://127.0.0.1:{port}"
+
+        from yggdrasil.cli.style import Spinner
+        with Spinner("no local node running — auto-starting one...", color="33") as sp:
+            def _progress(elapsed: float, is_ready: bool) -> None:
+                if not is_ready:
+                    sp.update(f"auto-starting node... {elapsed:0.0f}s")
+            _, port = spawn_node(settings, on_progress=_progress)
+            sp.stop()
         return f"http://127.0.0.1:{port}"
     except Exception:
         return "http://127.0.0.1:8100"
@@ -333,7 +347,7 @@ def _persist_service(settings, *, no_front: bool = False) -> None:
 # ── handlers ─────────────────────────────────────────────────────
 
 def _node_start(args: argparse.Namespace) -> int:
-    from yggdrasil.cli.style import blue, bold, cyan, dim, green, magenta, orange, out, print_logo, yellow
+    from yggdrasil.cli.style import Spinner, blue, bold, cyan, dim, green, magenta, orange, out, print_logo, yellow
     from yggdrasil.node.config import get_settings
     from yggdrasil.node.daemon import spawn_node
     from yggdrasil.node.service import install_service, is_service_installed
@@ -345,10 +359,22 @@ def _node_start(args: argparse.Namespace) -> int:
 
     host = getattr(args, "host", "0.0.0.0")
 
-    out(f"  starting node...\n")
-    pid, port = spawn_node(settings, host=host)
+    # spawn_node can take 10–20s on a cold boot (FastAPI + pyarrow imports);
+    # drive a live spinner off its progress callback so the wait is visible.
+    ready = {"ok": False}
+    with Spinner("starting node — importing app & binding port...", color="33") as sp:
+        def _progress(elapsed: float, is_ready: bool) -> None:
+            ready["ok"] = is_ready
+            if not is_ready:
+                sp.update(f"waiting for node to come online... {elapsed:0.0f}s")
+        pid, port = spawn_node(settings, host=host, on_progress=_progress)
+        sp.stop()
 
-    out(f"  {green('✓')} node running\n")
+    if ready["ok"]:
+        out(f"  {green('✓')} node running\n")
+    else:
+        out(f"  {yellow('!')} node spawned but not responding yet — "
+            f"tail logs with {bold('ygg node logs -f')}\n")
     out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
     out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
     out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
@@ -463,7 +489,7 @@ def _node_excel(args: argparse.Namespace) -> int:
     import urllib.request
     from pathlib import Path
     from yggdrasil.node.config import get_settings
-    from yggdrasil.cli.style import blue, bold, cyan, dim, green, orange, out, print_logo, red, yellow
+    from yggdrasil.cli.style import Spinner, blue, bold, cyan, dim, green, orange, out, print_logo, red, yellow
 
     print_logo("YGGNODE")
     settings = get_settings()
@@ -472,11 +498,13 @@ def _node_excel(args: argparse.Namespace) -> int:
     base = (args.host or f"http://127.0.0.1:{settings.port}").rstrip("/")
     front_port = settings.front_port
 
-    # 1. check the Excel service
+    # 1. check the Excel service — show a spinner so a cold endpoint (the node
+    #    lazily imports pyarrow on first hit) doesn't look like a freeze.
     out(f"  {cyan('excel service')}\n")
     try:
-        with urllib.request.urlopen(f"{base}/api/v2/excel/info", timeout=5) as resp:
-            info = _json.loads(resp.read().decode())
+        with Spinner(f"probing {base}/api/v2/excel/info ...", color="33"):
+            with urllib.request.urlopen(f"{base}/api/v2/excel/info", timeout=10) as resp:
+                info = _json.loads(resp.read().decode())
         out(f"    {green('● online')}  {dim(base)}\n")
         out(f"    {cyan('node')}     {orange(info.get('node_id', '?'))} {dim('v' + str(info.get('version', '?')))}\n")
         out(f"    {cyan('formats')}  {', '.join(info.get('table_formats', []))}\n")

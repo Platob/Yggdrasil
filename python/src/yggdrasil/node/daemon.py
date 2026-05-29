@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 from yggdrasil.node.config import Settings, _find_open_port, get_settings
 
@@ -105,10 +106,24 @@ def get_node_url(settings: Settings | None = None) -> str:
     return f"http://127.0.0.1:{settings.port}"
 
 
-def spawn_node(settings: Settings | None = None, *, host: str = "0.0.0.0") -> tuple[int, int]:
+def spawn_node(
+    settings: Settings | None = None,
+    *,
+    host: str = "0.0.0.0",
+    ready_timeout: float | None = None,
+    on_progress: Callable[[float, bool], None] | None = None,
+) -> tuple[int, int]:
     """Ensure a node is running. Returns (pid, port).
 
     Defaults to public binding (0.0.0.0) with remote access enabled.
+
+    Cold-booting the server imports FastAPI, pyarrow and the whole app,
+    which can take well over 6s on Windows — so we wait up to
+    ``ready_timeout`` seconds (default ``YGG_NODE_BOOT_TIMEOUT`` env or 30s)
+    for the port to accept connections, and bail early if the child
+    process dies during startup. ``on_progress(elapsed, ready)`` is called
+    each poll tick (and once at the end) so callers can render a live
+    spinner instead of hanging silently.
     """
     settings = settings or get_settings()
     ensure_directories(settings)
@@ -147,13 +162,43 @@ def spawn_node(settings: Settings | None = None, *, host: str = "0.0.0.0") -> tu
             **popen_kwargs,
         )
 
-    for _ in range(30):
-        time.sleep(0.2)
+    budget = ready_timeout if ready_timeout is not None else float(
+        os.getenv("YGG_NODE_BOOT_TIMEOUT", "30")
+    )
+    start = time.monotonic()
+    deadline = start + budget
+    ready = False
+    while time.monotonic() < deadline:
         if _is_port_open("127.0.0.1", port):
+            ready = True
             break
+        # Child crashed during import/startup — stop waiting the full
+        # budget for a port that will never open.
+        if proc.poll() is not None:
+            LOGGER.error(
+                "Node process exited during startup (code=%s); see %s",
+                proc.returncode, log_file,
+            )
+            break
+        if on_progress is not None:
+            on_progress(time.monotonic() - start, False)
+        time.sleep(0.25)
+
+    elapsed = time.monotonic() - start
+    if on_progress is not None:
+        on_progress(elapsed, ready)
 
     _write_pid(settings, proc.pid, port)
-    LOGGER.info("Spawned node (pid=%d, port=%d, log=%s)", proc.pid, port, log_file)
+    if ready:
+        LOGGER.info(
+            "Spawned node ready (pid=%d, port=%d) in %.1fs, log=%s",
+            proc.pid, port, elapsed, log_file,
+        )
+    else:
+        LOGGER.warning(
+            "Spawned node (pid=%d, port=%d) not responding after %.1fs; check %s",
+            proc.pid, port, elapsed, log_file,
+        )
     return proc.pid, port
 
 
