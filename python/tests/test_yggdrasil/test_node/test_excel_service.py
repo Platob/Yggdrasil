@@ -109,18 +109,6 @@ class TestRunPython(unittest.TestCase):
             )))
             self.assertEqual(table.column("v").to_pylist(), ["hello-env"])
 
-    def test_builtin_accessors_are_injected(self):
-        with tempfile.TemporaryDirectory() as d:
-            svc = _service(Path(d))
-            # Referencing `databricks` / `spark` must not raise NameError —
-            # they're prebuilt (None here, since neither backend is live).
-            table = asyncio.run(svc.run_python(ExcelQueryRequest(
-                code="df = {'db': [databricks is None], 'sp': [spark is None]}",
-            )))
-            self.assertEqual(table.num_rows, 1)
-            self.assertIn("db", table.column_names)
-            self.assertIn("sp", table.column_names)
-
     def test_empty_dataframe(self):
         with tempfile.TemporaryDirectory() as d:
             svc = _service(Path(d))

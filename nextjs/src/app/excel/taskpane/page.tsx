@@ -26,7 +26,6 @@ export default function TaskPane() {
 
   // run-python state
   const [code, setCode] = useState(
-    "# prebuilt: `databricks` (DatabricksClient.current()), `spark` (active session)\n" +
     "import pandas as pd\ndf = pd.DataFrame({'x': [1, 2, 3], 'y': ['a', 'b', 'c']})",
   );
   const [env, setEnv] = useState("");

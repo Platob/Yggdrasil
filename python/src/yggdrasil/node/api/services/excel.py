@@ -60,24 +60,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 out_path, df_name, max_rows, code_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-
-# Prebuilt accessors handed to the snippet, each guarded so a missing /
-# unconfigured backend just leaves the name as None rather than failing
-# the whole run. The snippet can use `databricks` and `spark` directly.
-init_globals = {"databricks": None, "spark": None}
-try:
-    from yggdrasil.databricks import DatabricksClient
-    init_globals["databricks"] = DatabricksClient.current()
-except Exception:
-    pass
-try:
-    from pyspark.sql import SparkSession
-    # Bind only an already-active session — never spin a cluster up here.
-    init_globals["spark"] = SparkSession.getActiveSession()
-except Exception:
-    pass
-
-ns = runpy.run_path(code_path, init_globals=init_globals)
+ns = runpy.run_path(code_path)
 if df_name not in ns:
     sys.stderr.write("snippet did not define %r" % df_name)
     sys.exit(3)

@@ -8,6 +8,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from yggdrasil.version import __version__
+
 _NODE_ID_FILE = ".ygg_node_id"
 
 
@@ -62,7 +64,8 @@ def _default_front_home() -> Path:
 @dataclass(frozen=True, slots=True)
 class Settings:
     app_name: str = "yggdrasil-node"
-    app_version: str = "0.1.1"
+    # Single source of truth: the yggdrasil package version.
+    app_version: str = __version__
     host: str = "0.0.0.0"
     port: int = 8100
     front_port: int = 3000
@@ -133,7 +136,7 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
 def get_settings() -> Settings:
     return Settings(
         app_name=os.getenv("YGG_NODE_APP_NAME", "yggdrasil-node"),
-        app_version=os.getenv("YGG_NODE_APP_VERSION", "0.1.0"),
+        app_version=os.getenv("YGG_NODE_APP_VERSION", __version__),
         host=os.getenv("YGG_NODE_HOST", "0.0.0.0"),
         port=int(os.getenv("YGG_NODE_PORT", "8100")),
         front_port=int(os.getenv("YGG_NODE_FRONT_PORT", "3000")),
