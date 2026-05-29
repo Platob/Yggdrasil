@@ -67,9 +67,3 @@ export function invalidate(...fragments: string[]): void {
     if (fragments.some((f) => key.includes(f))) store.delete(key);
   }
 }
-
-// Nuke the whole cache — used by page-level "Refresh" buttons that mean
-// "give me everything fresh".
-export function invalidateAll(): void {
-  store.clear();
-}

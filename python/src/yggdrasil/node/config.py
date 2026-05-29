@@ -96,6 +96,10 @@ class Settings:
     # visits before it stops and reports a partial result — keeps a scan of a
     # huge tree bounded in both time and memory.
     du_max_entries: int = 200_000
+    # Rows the tabular preview reads. A file at or under this count is read
+    # whole, so the bounded in-place editor can safely save it back; bigger
+    # files stay read-only previews.
+    tabular_preview_max_rows: int = 2000
     # Seconds a PyEnv's resolved interpreter version + installed-library
     # listing stays cached before the next ``pip list`` subprocess runs —
     # keeps the UI's per-env package view from flooding the node.
@@ -177,6 +181,7 @@ def get_settings() -> Settings:
         run_cancel_grace_seconds=float(os.getenv("YGG_NODE_RUN_CANCEL_GRACE", "1.5")),
         max_read_bytes=int(os.getenv("YGG_NODE_MAX_READ_BYTES", str(4 * 1024 * 1024))),
         du_max_entries=int(os.getenv("YGG_NODE_DU_MAX_ENTRIES", "200000")),
+        tabular_preview_max_rows=int(os.getenv("YGG_NODE_TABULAR_PREVIEW_ROWS", "2000")),
         pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
         seed_defaults=_as_bool(os.getenv("YGG_NODE_SEED_DEFAULTS"), True),
     )

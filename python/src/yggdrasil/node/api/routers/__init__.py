@@ -7,6 +7,7 @@ from .pyenv import router as pyenv_router
 from .pyfunc import router as pyfunc_router
 from .pyfuncrun import router as pyfuncrun_router
 from .replicate import router as replicate_router
+from .tabular import router as tabular_router
 from .user import router as user_router
 from .messenger import router as messenger_router
 from .excel import router as excel_router
@@ -23,5 +24,6 @@ __all__ = [
     "pyfunc_router",
     "pyfuncrun_router",
     "replicate_router",
+    "tabular_router",
     "user_router",
 ]

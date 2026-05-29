@@ -11,9 +11,11 @@ import {
   deleteFsPath,
   writeFsFile,
   uploadFsFile,
+  isTabularName,
   type FsNodeRoot,
 } from "@/lib/api";
 import type { FsEntry } from "@/lib/types";
+import TabularModal from "@/components/TabularModal";
 
 // ── Helpers ───────────────────────────────────────────────────
 function formatSize(bytes: number): string {
@@ -63,10 +65,10 @@ function dirFirst(a: FsEntry, b: FsEntry): number {
 
 const dirKey = (node: string, path: string) => `${node}::${path}`;
 
-function FileIcon({ entry, open }: { entry: FsEntry; open?: boolean }) {
+function FileIcon({ entry }: { entry: FsEntry }) {
   if (entry.is_dir) {
     return (
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--amber)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ transform: open ? "rotate(0deg)" : "none" }}>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--amber)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
         <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
       </svg>
     );
@@ -129,7 +131,10 @@ export default function FilesPage() {
   const [dragKey, setDragKey] = useState<string | null>(null);
   const [upload, setUpload] = useState<{ label: string; done: number; total: number } | null>(null);
 
-  // Selected file + preview modal
+  // Tabular files open the dedicated (reusable) tabular editor instead.
+  const [tabular, setTabular] = useState<{ node: string; entry: FsEntry } | null>(null);
+
+  // Selected file + text preview modal
   const [selected, setSelected] = useState<{ node: string; entry: FsEntry } | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
   const [fileTruncated, setFileTruncated] = useState(false);
@@ -228,6 +233,10 @@ export default function FilesPage() {
 
   // ── File open / preview ─────────────────────────────────────
   const openFile = useCallback(async (node: string, entry: FsEntry) => {
+    if (isTabularName(entry.name)) {
+      setTabular({ node, entry });
+      return;
+    }
     setSelected({ node, entry });
     setFileContent(null);
     setFileTruncated(false);
@@ -351,7 +360,7 @@ export default function FilesPage() {
                     <polyline points="9 18 15 12 9 6" />
                   </svg>
                 ) : <span className="w-[10px]" />}
-                <FileIcon entry={entry} open={childOpen} />
+                <FileIcon entry={entry} />
                 <span className={`text-[13px] truncate flex-1 ${entry.is_dir ? "text-foreground/90" : "text-foreground/70"}`}>
                   {entry.name}
                 </span>
@@ -462,6 +471,17 @@ export default function FilesPage() {
             <div className="h-full bg-emerald transition-all" style={{ width: `${(upload.done / upload.total) * 100}%` }} />
           </div>
         </div>
+      )}
+
+      {/* Tabular editor (reusable component) */}
+      {tabular && (
+        <TabularModal
+          node={tabular.node}
+          nodeLabel={tabular.node === selfNodeId ? "local" : tabular.node}
+          path={tabular.entry.path}
+          name={tabular.entry.name}
+          onClose={() => setTabular(null)}
+        />
       )}
 
       {/* File preview / edit modal */}

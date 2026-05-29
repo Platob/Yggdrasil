@@ -414,6 +414,61 @@ export function grepFs(
   });
 }
 
+// ── Tabular ──────────────────────────────────────────────────────────────
+export interface TabularColumn { name: string; type: string; }
+
+export interface TabularInspect {
+  node_id: string;
+  path: string;
+  source_url: string;
+  media_type: string;
+  is_tabular: boolean;
+  columns: TabularColumn[];
+  column_count: number;
+  row_count: number | null;
+  size_bytes: number;
+  schema_hash: string;
+  editable: boolean;
+  schema_error: string | null;
+}
+
+export type TabularCell = string | number | boolean | null;
+
+export interface TabularPreview {
+  node_id: string;
+  path: string;
+  columns: TabularColumn[];
+  rows: TabularCell[][];
+  row_count: number;
+  limit: number;
+  truncated: boolean;
+}
+
+const TABULAR_EXTS = new Set(["csv", "parquet", "pq", "json", "ndjson", "arrow", "feather", "xlsx", "xls"]);
+export function isTabularName(name: string): boolean {
+  const idx = name.lastIndexOf(".");
+  return idx >= 0 && TABULAR_EXTS.has(name.slice(idx + 1).toLowerCase());
+}
+
+export function getTabularInspect(path: string, node?: string): Promise<TabularInspect> {
+  return jsonFetch(`/api/v2/tabular/inspect?path=${encodeURIComponent(path)}${nodeParam(node)}`);
+}
+
+export function getTabularPreview(path: string, limit = 100, node?: string): Promise<TabularPreview> {
+  return jsonFetch(`/api/v2/tabular/preview?path=${encodeURIComponent(path)}&limit=${limit}${nodeParam(node)}`);
+}
+
+export async function writeTabular(
+  path: string, columns: string[], rows: TabularCell[][], node?: string, fmt?: string,
+): Promise<{ path: string; rows: number; columns: number; bytes_written: number }> {
+  const res = await jsonFetch<{ path: string; rows: number; columns: number; bytes_written: number }>(
+    `/api/v2/tabular/write${node ? `?node=${encodeURIComponent(node)}` : ""}`,
+    { method: "POST", body: JSON.stringify({ path, columns, rows, fmt: fmt ?? null }) },
+  );
+  invalidate("fs/ls", "tabular");
+  return res;
+}
+
 // ── Messenger ──────────────────────────────────────────────────────────────
 
 export function getChannels(fresh = false): Promise<{ node_id: string; channels: ChannelInfo[] }> {

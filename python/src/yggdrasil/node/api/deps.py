@@ -9,6 +9,7 @@ from .services.pyenv import PyEnvService
 from .services.pyfunc import PyFuncService
 from .services.pyfuncrun import PyFuncRunService
 from .services.fs import FsService
+from .services.tabular import TabularService
 from .services.replicate import ReplicateService
 from .services.user import UserService
 from .services.messenger import MessengerService as V2MessengerService
@@ -17,6 +18,10 @@ from .services.excel import ExcelService
 
 def get_fs_service(request: Request) -> FsService:
     return request.app.state.fs_service
+
+
+def get_tabular_service(request: Request) -> TabularService:
+    return request.app.state.tabular_service
 
 
 def get_pyenv_service(request: Request) -> PyEnvService:

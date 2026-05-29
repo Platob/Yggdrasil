@@ -131,24 +131,25 @@ class NetworkService:
             return None
         return f"http://{peer.host}:{peer.port}"
 
-    async def fs_proxy_json(
-        self, node_id: str, method: str, suffix: str,
+    async def proxy_json(
+        self, node_id: str, method: str, api_path: str,
         *, params: dict | None = None, json_body: Any = None,
     ) -> Any:
-        """Forward a /fs JSON call to ``node_id`` and return its parsed body."""
+        """Forward a JSON API call to ``node_id`` and return its parsed body.
+        ``api_path`` is the full path under the peer (e.g. ``/api/v2/fs/ls``)."""
         base = self.peer_url(node_id)
         if base is None:
             raise APIError(f"Node {node_id!r} is not a linked peer", status_code=404)
         try:
             resp = await self._client.request(
-                method, f"{base}/api/v2/fs{suffix}",
+                method, f"{base}{api_path}",
                 params=params, json=json_body,
                 headers={"X-YGG-Source-Node": self.settings.node_id},
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text or str(exc)
-            raise APIError(f"Peer {node_id} fs error: {detail}", status_code=exc.response.status_code) from exc
+            raise APIError(f"Peer {node_id} error: {detail}", status_code=exc.response.status_code) from exc
         except httpx.HTTPError as exc:
             raise APIError(f"Peer {node_id} unreachable: {exc}", status_code=502) from exc
         if resp.status_code == 204 or not resp.content:

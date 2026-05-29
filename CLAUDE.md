@@ -122,6 +122,7 @@ Core concepts — workstation as remote executor/driver:
 | `/api/v2/backend` | Node metrics snapshot + `/history` + `/stream` SSE |
 | `/api/v2/network` | Self info + `/register` + `/peers` + `/role` + `/dispatch` + `/arrow` + `/ping` |
 | `/api/v2/fs` | Filesystem CRUD (ls, stat, read, write, delete, move, mkdir, stream, upload, download zip, tree, du, search, grep). `/nodes` lists global-tree roots; every read/write takes `?node=` to proxy to a linked peer |
+| `/api/v2/tabular` | LazyTabular inspect/preview/write — schema + metadata + bounded typed-row preview + bounded in-place edit (`?node=` proxied). Drives the reusable `TabularModal` |
 | `/api/v2/user` | User identity (`/me`, list, register from peers) |
 | `/api/v2/messenger` | Chat channels + messages + SSE streaming |
 | `/api/v2/replicate` | Export/import/push/pull node assets between nodes |

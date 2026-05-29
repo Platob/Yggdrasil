@@ -27,7 +27,7 @@ async def _remote(
     locally. Raises if ``node`` is set but not a linked peer."""
     if not node or node == service.settings.node_id:
         return None
-    return await network.fs_proxy_json(node, method, suffix, params=params, json_body=json_body)
+    return await network.proxy_json(node, method, f"/api/v2/fs{suffix}", params=params, json_body=json_body)
 
 
 @router.get("/nodes")
