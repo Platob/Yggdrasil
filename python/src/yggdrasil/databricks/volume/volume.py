@@ -212,7 +212,9 @@ class Volume(DatabricksPath):
         # Path-join navigation follows the volume-family depth model —
         # catalog (1) → schema (2) → volume (3) → :class:`VolumePath`
         # (4+).
-        parts = url.parts
+        # Drop empty components (trailing / duplicate slashes) so the
+        # depth count reflects real segments however the URL was built.
+        parts = [p for p in url.parts if p]
         n = len(parts)
 
         if n <= 1:

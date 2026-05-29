@@ -181,6 +181,28 @@ def resolve_path_prefix(
     return DEFAULT_PATH_PREFIX
 
 
+def _relative_join_parts(segments: "tuple[Any, ...]") -> list[str]:
+    """Flatten join *segments* into clean, relative path components.
+
+    Splits every segment on ``/`` (so a single multi-part string like
+    ``"a/b/c"`` expands to three components), drops empty pieces
+    (trailing / duplicate slashes) and ``.`` self-references, and — by
+    treating every piece as relative — strips the leading-slash
+    "absolute reset" that :class:`pathlib`/:class:`URL` joins honour. A
+    Databricks path is anchored in a namespace it must not escape, so a
+    join always *extends* it; ``..`` is left intact (the URL layer keeps
+    it syntactic) for callers that genuinely want to walk up.
+    """
+    parts: list[str] = []
+    for seg in segments:
+        if seg is None:
+            continue
+        for piece in str(seg).split("/"):
+            if piece and piece != ".":
+                parts.append(piece)
+    return parts
+
+
 # ---------------------------------------------------------------------------
 # Subclass dispatch — shared by ``__new__`` / ``from_`` / ``from_url``
 # ---------------------------------------------------------------------------
@@ -729,6 +751,32 @@ class DatabricksPath(RemotePath, DatabricksResource):
             service=self.service,
             retry_sleep=self._retry_sleep,
         )
+
+    def joinpath(self, *segments: Any) -> "DatabricksPath":
+        """Join *segments* onto this path, always *extending* it.
+
+        The bare :class:`Holder` join follows pathlib semantics, where a
+        segment with a leading ``/`` resets to an absolute path and a
+        trailing / duplicate slash leaves an empty component. A
+        Databricks path is anchored in a namespace it must not escape,
+        and the logical handles (:class:`UCCatalog` / :class:`UCSchema`
+        / :class:`Volume`) pick the child type from the path's segment
+        *count* — so every join goes through
+        :func:`_relative_join_parts` first. A single multi-part string
+        (``"a/b/c"``), several segments, embedded / trailing / duplicate
+        slashes, and ``.`` components all flatten into clean relative
+        components, so ``cat / "sales/raw"`` reliably reaches the volume
+        and ``cat / "sales/raw/"`` doesn't over-count into a VolumePath.
+        """
+        if self._url is None:
+            raise ValueError(
+                f"{type(self).__name__} has no URL — joinpath is only "
+                "defined for URL-shaped paths."
+            )
+        parts = _relative_join_parts(segments)
+        if not parts:
+            return self._from_url(self._url)
+        return self._from_url(self._url.joinpath(*parts))
 
     # ==================================================================
     # Pickling — Singleton-style, filtering transient stat-cache slots

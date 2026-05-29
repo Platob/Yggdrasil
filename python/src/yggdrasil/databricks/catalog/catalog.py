@@ -263,7 +263,9 @@ class UCCatalog(DatabricksPath, Singleton):
         # the ``/Volumes/...`` depth dispatch the module-level resolver
         # applies. ``catalog["sch"]`` / ``schema["tbl"]`` stay the logical
         # (table-oriented) navigation surface; ``/`` is the filesystem one.
-        parts = url.parts
+        # Drop empty components (trailing / duplicate slashes) so the
+        # depth count reflects real segments however the URL was built.
+        parts = [p for p in url.parts if p]
         n = len(parts)
 
         if n <= 1:

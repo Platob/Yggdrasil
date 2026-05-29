@@ -34,6 +34,7 @@ from yggdrasil.databricks.path import (
     _coerce_to_url_str,
     _looks_like_posix,
     _parse_posix,
+    _relative_join_parts,
     _resolve_databricks_subclass,
     _strip_dbfs_family_prefix,
     resolve_path_prefix,
@@ -921,3 +922,126 @@ class TestPathPrefixDrivesChildType:
         )
         assert sch.path_prefix == TABLE_PATH_PREFIX
         assert isinstance(sch / "orders", Table)
+
+
+# ===========================================================================
+# Multi-part path strings in a join — a join must always *extend* the
+# handle (never reset / over-count) so the depth-based type stays right
+# ===========================================================================
+
+
+class TestRelativeJoinParts:
+    """:func:`_relative_join_parts` flattens whatever a caller passes to
+    ``/`` / ``joinpath`` into clean, relative components."""
+
+    def test_single_multipart_string_splits(self):
+        assert _relative_join_parts(("a/b/c",)) == ["a", "b", "c"]
+
+    def test_multiple_segments_flatten(self):
+        assert _relative_join_parts(("a", "b/c", "d")) == ["a", "b", "c", "d"]
+
+    def test_leading_slash_is_relative_not_absolute(self):
+        # The leading-slash "absolute reset" is stripped — a Databricks
+        # path must not be able to escape its namespace via a join.
+        assert _relative_join_parts(("/a/b",)) == ["a", "b"]
+
+    def test_trailing_and_duplicate_slashes_drop_empties(self):
+        assert _relative_join_parts(("a/b/",)) == ["a", "b"]
+        assert _relative_join_parts(("a//b",)) == ["a", "b"]
+
+    def test_dot_components_dropped_dotdot_kept(self):
+        assert _relative_join_parts(("a/./b",)) == ["a", "b"]
+        assert _relative_join_parts(("a/../b",)) == ["a", "..", "b"]
+
+    def test_empty_and_none_yield_nothing(self):
+        assert _relative_join_parts(("",)) == []
+        assert _relative_join_parts((None,)) == []
+
+
+class TestMultiPartJoinResolvesCorrectType:
+    """A multi-part string descends exactly as the chained ``/`` form
+    does — same depth, same concrete type — for every join root."""
+
+    def test_catalog_multipart_to_volume(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert isinstance(cat / "sales/raw", Volume)
+
+    def test_catalog_multipart_to_volume_path(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        leaf = cat / "sales/raw/year=2026/data.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/year=2026/data.parquet"
+
+    def test_multipart_string_matches_chained_form(self, catalogs_service):
+        # ``cat / "sales/raw"`` and ``cat / "sales" / "raw"`` are the same
+        # UC location — and, sharing a service, the same singleton.
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert (cat / "sales/raw") is (cat / "sales" / "raw")
+
+    def test_multi_arg_joinpath_matches_chained_form(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert cat.joinpath("sales", "raw") is (cat / "sales" / "raw")
+
+    def test_schema_multipart_to_volume_path(self, schemas_service):
+        sch = UCSchema(
+            service=schemas_service, catalog_name="main", schema_name="sales",
+        )
+        leaf = sch / "raw/sub/f.csv"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/sub/f.csv"
+
+    def test_volume_multipart_to_volume_path(self, volumes_service):
+        vol = Volume(
+            service=volumes_service,
+            catalog_name="main",
+            schema_name="sales",
+            volume_name="raw",
+        )
+        leaf = vol / "a/b/c.parquet"
+        assert isinstance(leaf, VolumePath)
+        assert leaf.full_path() == "/Volumes/main/sales/raw/a/b/c.parquet"
+
+
+class TestJoinExtendsNeverResets:
+    """The edge cases that used to mis-resolve: a leading slash dropped
+    the handle's identity, a trailing slash over-counted into a deeper
+    type. A join now always extends the fixed coordinates."""
+
+    def test_leading_slash_still_extends_catalog(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        vol = cat / "/sales/raw"
+        assert isinstance(vol, Volume)
+        assert vol.full_path() == "/Volumes/main/sales/raw"
+
+    def test_trailing_slash_does_not_overcount(self, catalogs_service):
+        # ``"sales/raw/"`` is still the volume (depth 3), not a
+        # zero-length child path beneath it.
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert isinstance(cat / "sales/raw/", Volume)
+
+    def test_duplicate_slashes_collapse(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert isinstance(cat / "sales//raw", Volume)
+
+    def test_empty_join_returns_same_handle(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert cat / "" is cat
+
+    def test_volume_path_join_stays_in_namespace(self, volumes_service):
+        # A leading slash on a VolumePath join must not reset to an
+        # absolute path that escapes the volume root.
+        vp = VolumePath(
+            "/Volumes/main/sales/raw/dir",
+            service=volumes_service,
+        )
+        joined = vp / "/escape/attempt"
+        assert isinstance(joined, VolumePath)
+        assert joined.full_path() == "/Volumes/main/sales/raw/dir/escape/attempt"
+
+    def test_table_catalog_multipart_to_table(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        assert isinstance(cat / "sales/orders", Table)

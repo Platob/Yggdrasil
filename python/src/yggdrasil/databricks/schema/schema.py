@@ -318,7 +318,9 @@ class UCSchema(DatabricksPath):
         # → schema (2) → volume (3) → :class:`VolumePath` (4+); the
         # logical ``schema["tbl"]`` → :class:`Table` surface stays on
         # ``__getitem__``.
-        parts = url.parts
+        # Drop empty components (trailing / duplicate slashes) so the
+        # depth count reflects real segments however the URL was built.
+        parts = [p for p in url.parts if p]
         n = len(parts)
 
         if n <= 1:
