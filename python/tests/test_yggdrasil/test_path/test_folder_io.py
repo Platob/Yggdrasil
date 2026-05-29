@@ -5,6 +5,7 @@ import os
 import pathlib
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 
 from yggdrasil.enums import Mode
@@ -221,6 +222,102 @@ class TestFolderMultiFormat:
         out = fp.read_arrow_table()
         assert out.num_rows == 5
         assert sorted(out.column("v").to_pylist()) == [1, 2, 3, 4, 5]
+
+
+# ===================================================================
+# TestFolderSchemaDrift — part files whose schema drifted across writes
+# ===================================================================
+
+
+def _drift_a() -> pa.RecordBatch:
+    # Older layout: binary body, proper timestamp.
+    return pa.record_batch(
+        [
+            pa.array([1, 2], pa.int64()),
+            pa.array([b"a", b"b"], pa.binary()),
+            pa.array([1_000, 2_000], pa.timestamp("us", "UTC")),
+        ],
+        names=["id", "body", "ts"],
+    )
+
+
+def _drift_b() -> pa.RecordBatch:
+    # Newer layout: large_binary body, legacy int64 timestamp.
+    return pa.record_batch(
+        [
+            pa.array([3, 4], pa.int64()),
+            pa.array([b"c", b"d"], pa.large_binary()),
+            pa.array([3_000, 4_000], pa.int64()),
+        ],
+        names=["id", "body", "ts"],
+    )
+
+
+class TestFolderSchemaDrift:
+    """Heterogeneous part files (binary↔large_binary, int64↔timestamp).
+
+    Cached folders can end up with part files written under different
+    schema revisions. ``pa.Table.from_batches`` and the IPC writer both
+    demand byte-identical schemas; reads and merge-upserts must survive
+    the drift rather than crash the whole batch.
+    """
+
+    def test_read_across_drifted_part_files(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        fp = Folder(path=str(tmp_path / "drift"))
+        opts = FolderOptions(mode=Mode.APPEND)
+        fp.write_arrow_batches([_drift_a()], options=opts)
+        fp.write_arrow_batches([_drift_b()], options=opts)
+
+        # Sanity: the two parts really did land with distinct schemas.
+        raw = list(fp._read_arrow_batches(fp.options_class()()))
+        body_types = {str(b.schema.field("body").type) for b in raw}
+        assert body_types == {"binary", "large_binary"}
+
+        out = fp.read_arrow_table()
+        assert out.num_rows == 4
+        assert sorted(out.column("id").to_pylist()) == [1, 2, 3, 4]
+
+    def test_upsert_against_drifted_existing_part(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        fp = Folder(path=str(tmp_path / "merge"))
+        opts = FolderOptions(mode=Mode.UPSERT, match_by=["id"])
+        fp.write_arrow_batches([_drift_a()], options=opts)
+        # Second part has a different schema; the merge rewrite chains
+        # both into one part file and must not blow up the IPC writer.
+        fp.write_arrow_batches([_drift_b()], options=opts)
+
+        update = pa.record_batch(
+            [
+                pa.array([1], pa.int64()),
+                pa.array([b"A"], pa.large_binary()),
+                pa.array([9_000], pa.int64()),
+            ],
+            names=["id", "body", "ts"],
+        )
+        fp.write_arrow_batches([update], options=opts)
+
+        out = fp.read_arrow_table().sort_by("id")
+        assert out.column("id").to_pylist() == [1, 2, 3, 4]
+        row = out.filter(pc.equal(out.column("id"), 1))
+        assert row.column("body").to_pylist() == [b"A"]
+
+    def test_batch_reader_across_drifted_part_files(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        # RecordBatchReader.from_batches validates each batch against
+        # the declared schema as it's pulled; drifted parts must be
+        # conformed so iteration doesn't raise mid-stream.
+        fp = Folder(path=str(tmp_path / "drift"))
+        opts = FolderOptions(mode=Mode.APPEND)
+        fp.write_arrow_batches([_drift_a()], options=opts)
+        fp.write_arrow_batches([_drift_b()], options=opts)
+
+        reader = fp.read_arrow_batch_reader()
+        rows = sum(b.num_rows for b in reader)
+        assert rows == 4
 
 
 # ===================================================================

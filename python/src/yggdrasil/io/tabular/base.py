@@ -1155,7 +1155,21 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
                 or Schema.empty()
             )
             return schema.to_arrow_schema().empty_table()
-        table = pa.Table.from_batches(batches)
+        try:
+            table = pa.Table.from_batches(batches)
+        except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
+            # Part files under this tabular drifted in schema across
+            # writes (e.g. a legacy ``binary`` body vs the current
+            # ``large_binary``, or an ``int64`` timestamp column vs a
+            # proper ``timestamp``). from_batches demands identical
+            # schemas — reconcile by conforming every batch to the
+            # first one's schema before combining; ``cast_arrow_table``
+            # below then projects + casts to the resolved target.
+            from yggdrasil.arrow.cast import conform_arrow_batch
+            target = batches[0].schema
+            table = pa.Table.from_batches(
+                [conform_arrow_batch(b, target) for b in batches]
+            )
         table = options.cast_arrow_table(table)
         table = options.apply_post_read_table(table)
         if options.row_limit is not None and table.num_rows > options.row_limit:
@@ -1177,8 +1191,17 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             stream = (cast(batch) for batch in stream)
         stream = options.resample_arrow_batches(stream)
         stream = options.dedup_arrow_batches(stream)
+        # ``RecordBatchReader.from_batches`` validates every batch
+        # against the declared schema as it's pulled, so a drifted part
+        # file (legacy ``binary`` body, ``int64`` timestamp, …) would
+        # raise mid-iteration when no target cast normalized it above.
+        # Conform each batch to the declared schema — a zero-copy
+        # passthrough when it already matches, so the cast path stays free.
+        from yggdrasil.arrow.cast import conform_arrow_batch
+        arrow_schema = schema.to_arrow_schema()
+        stream = (conform_arrow_batch(b, arrow_schema) for b in stream)
         return pa.RecordBatchReader.from_batches(
-            schema.to_arrow_schema(),
+            arrow_schema,
             stream,
         )
 

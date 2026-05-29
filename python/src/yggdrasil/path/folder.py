@@ -1274,10 +1274,20 @@ class Folder(Path):
                     "Caching %d batch(es) / %d row(s) for partition %r",
                     len(accumulated), total, cache_key,
                 )
+                try:
+                    cached_table = pa.Table.from_batches(accumulated)
+                except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
+                    # Part files inside this partition drifted in schema
+                    # (binary vs large_binary, int64 vs timestamp, …) —
+                    # conform each to the first batch's schema so the
+                    # cached table assembles cleanly.
+                    from yggdrasil.arrow.cast import conform_arrow_batch
+                    target = accumulated[0].schema
+                    cached_table = pa.Table.from_batches(
+                        [conform_arrow_batch(b, target) for b in accumulated]
+                    )
                 self._PARTITION_DATA_CACHE.set(
-                    cache_key, (pa.Table.from_batches(accumulated)
-                                 .combine_chunks()
-                                 .to_batches()),
+                    cache_key, cached_table.combine_chunks().to_batches(),
                 )
             else:
                 self._PARTITION_DATA_CACHE.set(cache_key, ())
@@ -1750,7 +1760,20 @@ class Folder(Path):
         # only delete them after the rewrite has succeeded.
         old_files = self._tabular_files()
 
-        merged_iter = _chain_iter(survivors_existing, iter(incoming))
+        # Existing parts can have drifted in schema across writes
+        # (legacy ``binary`` body vs the current ``large_binary``, an
+        # ``int64`` timestamp vs a ``timestamp``). The rewrite drains
+        # survivors + incoming into one part file whose IPC writer is
+        # pinned to the first batch's schema, so a mismatched survivor
+        # would blow up mid-stream. Conform every survivor to the
+        # incoming (canonical) schema first; matching batches pass
+        # through untouched.
+        from yggdrasil.arrow.cast import conform_arrow_batch
+        target_schema = incoming[0].schema
+        survivors_conformed = (
+            conform_arrow_batch(b, target_schema) for b in survivors_existing
+        )
+        merged_iter = _chain_iter(survivors_conformed, iter(incoming))
         self._write_parts(merged_iter, options)
 
         for f in old_files:
@@ -2137,6 +2160,25 @@ class Folder(Path):
 
             try:
                 merged = pa.concat_tables(tables, promote_options="default")
+            except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
+                # Part files in this group drifted in schema across
+                # writes (binary vs large_binary, int64 vs timestamp,
+                # …). concat can't promote those incompatibilities —
+                # conform every part to the first one's schema, then
+                # the compaction rewrites the group under one schema.
+                # (``ArrowTypeError`` subclasses ``TypeError``, so this
+                # clause must precede the pyarrow<14 ``TypeError`` compat
+                # branch below or it would swallow the drift case.)
+                from yggdrasil.arrow.cast import conform_arrow_batch
+                target = tables[0].schema
+                merged = pa.Table.from_batches(
+                    [
+                        conform_arrow_batch(b, target)
+                        for t in tables
+                        for b in t.to_batches()
+                    ],
+                    schema=target,
+                )
             except TypeError:
                 # pyarrow < 14 had no ``promote_options`` kwarg.
                 merged = pa.concat_tables(tables, promote=True)
