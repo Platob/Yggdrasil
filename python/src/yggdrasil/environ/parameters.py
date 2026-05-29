@@ -290,10 +290,18 @@ class SystemParameters(MappingABC):
             # CSV split for iterable target types — Databricks multiselect
             # widgets and ``--names=a,b,c`` argv tokens hand back one string
             # the cast registry would reject (it bans ``str`` → ``list``).
-            # Filter the ``**all**`` placeholder dbutils emits when nothing
-            # is selected.
+            # Drop the ``**all**`` placeholder dbutils emits when nothing is
+            # selected, and drop empty parts: an unselected multiselect / a
+            # bare ``--content_ids=`` hands back ``""``, whose ``split(",")``
+            # is ``[""]`` — left in, that single empty token casts to a
+            # spurious element (``tuple[int, ...]`` → ``(0,)``) instead of the
+            # empty collection the caller meant.
             if isinstance(raw, str) and self._is_iterable_type(type_):
-                raw = [part for part in raw.split(",") if part != ALL_VALUES_TAG]
+                raw = [
+                    part
+                    for part in (p.strip() for p in raw.split(","))
+                    if part and part != ALL_VALUES_TAG
+                ]
             try:
                 result = convert(raw, type_)
             except Exception as exc:

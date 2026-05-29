@@ -516,6 +516,40 @@ class TestIterableCasting:
         # CSV-split heuristic — the raw value passes through.
         assert cfg.csv == "a,b,c"
 
+    def test_empty_string_source_is_empty_tuple_not_zero(self) -> None:
+        # An unselected multiselect / bare ``--content_ids=`` hands back "",
+        # whose split(",") is [""]. Left in, that empty token would cast to a
+        # spurious element — ``tuple[int, ...]`` → ``(0,)``. It must collapse
+        # to the empty collection instead.
+        class Config(SystemParameters):
+            content_ids: tuple[int, ...] = ()
+
+        assert Config({"content_ids": ""}, argv=None, dbutils=None).content_ids == ()
+        assert Config(argv=["--content_ids="], dbutils=None).content_ids == ()
+
+    def test_whitespace_only_source_is_empty(self) -> None:
+        class Config(SystemParameters):
+            names: list[str] = []
+
+        assert Config({"names": "   "}, argv=None, dbutils=None).names == []
+
+    def test_empty_parts_dropped_and_stripped(self) -> None:
+        class Config(SystemParameters):
+            ports: tuple[int, ...] = ()
+
+        # Trailing comma + internal blank + surrounding spaces.
+        cfg = Config({"ports": "80, ,443,"}, argv=None, dbutils=None)
+        assert cfg.ports == (80, 443)
+
+    def test_unset_iterable_keeps_default(self) -> None:
+        class Config(SystemParameters):
+            content_ids: tuple[int, ...] = ()
+            tags: set[str] = {"a"}
+
+        cfg = Config(argv=None, dbutils=None)
+        assert cfg.content_ids == ()
+        assert cfg.tags == {"a"}
+
 
 # ============================================================================
 # Widget surface (init_widgets / init_job / from_environment)
