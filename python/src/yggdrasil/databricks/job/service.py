@@ -479,9 +479,18 @@ class Jobs(DatabricksService):
             **submit_kwargs,
         )
 
-        job_run = JobRun(service=JobRuns(client=self.client), run_id=response.run_id)
+        # Fetch the run so the handle carries job_id + run_page_url; this
+        # makes repr/explore_url resolve to the canonical run page rather
+        # than the vanity-host jobs list.
+        raw = sdk.get_run(run_id=response.run_id)
+        job_run = JobRun(
+            service=JobRuns(client=self.client),
+            run_id=raw.run_id,
+            job_id=raw.job_id,
+            details=raw,
+        )
 
-        LOGGER.info("Submitted one-time run %s (%r) — %r", response.run_id, run_name, job_run)
+        LOGGER.info("Submitted one-time run %s (%r) — %r", raw.run_id, run_name, job_run)
 
         if wait is not False:
             job_run.wait(wait=wait, raise_error=raise_error)
