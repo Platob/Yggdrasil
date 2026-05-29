@@ -582,3 +582,45 @@ class TestOptimize:
         fp.optimize()
         after = sorted(fp.read_arrow_table().column("v").to_pylist())
         assert before == after == [1, 2, 3, 4]
+
+    def test_optimize_compacts_drifted_part_files(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        # Compaction concats the group into one table; part files that
+        # drifted in schema across writes (binary vs large_binary,
+        # int64 vs timestamp) can't be promoted by concat_tables and
+        # must be conformed first rather than crashing the pass.
+        root = tmp_path / "drift"
+        fp = Folder(path=str(root))
+        opts = FolderOptions(mode=Mode.APPEND)
+        fp.write_arrow_batches(
+            [
+                pa.record_batch(
+                    [
+                        pa.array([1], pa.int64()),
+                        pa.array([b"a"], pa.binary()),
+                        pa.array([1_000], pa.timestamp("us", "UTC")),
+                    ],
+                    names=["id", "body", "ts"],
+                )
+            ],
+            options=opts,
+        )
+        fp.write_arrow_batches(
+            [
+                pa.record_batch(
+                    [
+                        pa.array([2], pa.int64()),
+                        pa.array([b"b"], pa.large_binary()),
+                        pa.array([2_000], pa.int64()),
+                    ],
+                    names=["id", "body", "ts"],
+                )
+            ],
+            options=opts,
+        )
+
+        compacted = fp.optimize()
+        assert compacted >= 1
+        out = fp.read_arrow_table()
+        assert sorted(out.column("id").to_pylist()) == [1, 2]

@@ -304,6 +304,21 @@ class TestFolderSchemaDrift:
         row = out.filter(pc.equal(out.column("id"), 1))
         assert row.column("body").to_pylist() == [b"A"]
 
+    def test_batch_reader_across_drifted_part_files(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        # RecordBatchReader.from_batches validates each batch against
+        # the declared schema as it's pulled; drifted parts must be
+        # conformed so iteration doesn't raise mid-stream.
+        fp = Folder(path=str(tmp_path / "drift"))
+        opts = FolderOptions(mode=Mode.APPEND)
+        fp.write_arrow_batches([_drift_a()], options=opts)
+        fp.write_arrow_batches([_drift_b()], options=opts)
+
+        reader = fp.read_arrow_batch_reader()
+        rows = sum(b.num_rows for b in reader)
+        assert rows == 4
+
 
 # ===================================================================
 # TestFolderPredicate

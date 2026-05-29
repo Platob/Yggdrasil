@@ -2160,6 +2160,25 @@ class Folder(Path):
 
             try:
                 merged = pa.concat_tables(tables, promote_options="default")
+            except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
+                # Part files in this group drifted in schema across
+                # writes (binary vs large_binary, int64 vs timestamp,
+                # …). concat can't promote those incompatibilities —
+                # conform every part to the first one's schema, then
+                # the compaction rewrites the group under one schema.
+                # (``ArrowTypeError`` subclasses ``TypeError``, so this
+                # clause must precede the pyarrow<14 ``TypeError`` compat
+                # branch below or it would swallow the drift case.)
+                from yggdrasil.arrow.cast import conform_arrow_batch
+                target = tables[0].schema
+                merged = pa.Table.from_batches(
+                    [
+                        conform_arrow_batch(b, target)
+                        for t in tables
+                        for b in t.to_batches()
+                    ],
+                    schema=target,
+                )
             except TypeError:
                 # pyarrow < 14 had no ``promote_options`` kwarg.
                 merged = pa.concat_tables(tables, promote=True)

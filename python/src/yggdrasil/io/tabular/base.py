@@ -1191,8 +1191,17 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             stream = (cast(batch) for batch in stream)
         stream = options.resample_arrow_batches(stream)
         stream = options.dedup_arrow_batches(stream)
+        # ``RecordBatchReader.from_batches`` validates every batch
+        # against the declared schema as it's pulled, so a drifted part
+        # file (legacy ``binary`` body, ``int64`` timestamp, …) would
+        # raise mid-iteration when no target cast normalized it above.
+        # Conform each batch to the declared schema — a zero-copy
+        # passthrough when it already matches, so the cast path stays free.
+        from yggdrasil.arrow.cast import conform_arrow_batch
+        arrow_schema = schema.to_arrow_schema()
+        stream = (conform_arrow_batch(b, arrow_schema) for b in stream)
         return pa.RecordBatchReader.from_batches(
-            schema.to_arrow_schema(),
+            arrow_schema,
             stream,
         )
 
