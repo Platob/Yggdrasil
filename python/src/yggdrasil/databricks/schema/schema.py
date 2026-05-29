@@ -41,7 +41,11 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
-from yggdrasil.databricks.path import DatabricksPath
+from yggdrasil.databricks.path import (
+    DatabricksPath,
+    TABLE_PATH_PREFIX,
+    resolve_path_prefix,
+)
 from yggdrasil.url import URL
 from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
@@ -112,10 +116,15 @@ def _normalize_privileges(
 class UCSchema(DatabricksPath):
     """A single Unity Catalog schema — lifecycle, table navigation, tags.
 
-    Identity is ``(client, catalog_name, schema_name)``: two callers
-    asking for the same schema under the same client collapse onto
-    one instance via the :class:`Singleton` cache, so the cached
-    :class:`SchemaInfo` and tag state are shared.
+    Identity is ``(client, catalog_name, schema_name, path_prefix)``:
+    two callers asking for the same schema *on the same navigation
+    surface* under the same client collapse onto one instance via the
+    :class:`Singleton` cache, so the cached :class:`SchemaInfo` and
+    tag state are shared. :attr:`path_prefix` (inherited from the
+    parent catalog) fixes what a ``/`` path-join descends into —
+    ``/Volumes/`` → :class:`Volume` (then :class:`VolumePath`),
+    ``/Tables/`` → :class:`Table` — so the child type is known up
+    front rather than guessed.
 
     URL-addressable through :class:`DatabricksPath` under
     :attr:`Scheme.DATABRICKS_SCHEMA` (``dbfs+schema://``); the
@@ -137,6 +146,9 @@ class UCSchema(DatabricksPath):
         service: "Schemas | None" = None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
+        *,
+        path_prefix: str | None = None,
+        url: URL | None = None,
         **_kwargs: Any,
     ) -> Any:
         # Key on the bound :class:`DatabricksClient` *instance*, not
@@ -157,7 +169,16 @@ class UCSchema(DatabricksPath):
             catalog_name = getattr(service, "catalog_name", None)
         if schema_name is None and service is not None:
             schema_name = getattr(service, "schema_name", None)
-        return (cls, client, catalog_name, schema_name)
+        # ``path_prefix`` keeps a volume-surface and a table-surface view
+        # of the same schema distinct — each resolves its children to a
+        # different type. Resolved exactly as ``__init__`` will.
+        return (
+            cls,
+            client,
+            catalog_name,
+            schema_name,
+            resolve_path_prefix(path_prefix, url),
+        )
 
     def __new__(
         cls,
@@ -186,7 +207,11 @@ class UCSchema(DatabricksPath):
             return _allocate()
 
         key = cls._singleton_key(
-            service, catalog_name=catalog_name, schema_name=schema_name,
+            service,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            path_prefix=kwargs.get("path_prefix"),
+            url=kwargs.get("url"),
         )
         ttl_arg = (
             float(singleton_ttl)
@@ -214,6 +239,7 @@ class UCSchema(DatabricksPath):
         infos: SchemaInfo | None = None,
         infos_fetched_at: float | None = None,
         url: URL | None = None,
+        path_prefix: str | None = None,
         singleton_ttl: "int | None" = ...,
     ):
         # ``singleton_ttl`` is consumed by ``__new__``; accept it here
@@ -227,6 +253,11 @@ class UCSchema(DatabricksPath):
         # the caller.
         if getattr(self, "_initialized", False):
             return
+
+        # Resolve the child-navigation surface from the *incoming* url
+        # before it's rebuilt below into this schema's own
+        # ``dbfs+schema://`` form. Lock-step with ``_singleton_key``.
+        resolved_prefix = resolve_path_prefix(path_prefix, url)
 
         if service is None:
             from .schemas import Schemas
@@ -253,6 +284,7 @@ class UCSchema(DatabricksPath):
         self.service = service
         self.catalog_name = catalog_name
         self.schema_name = schema_name
+        self.path_prefix = resolved_prefix
         self._infos_ttl = infos_ttl
         self._infos = infos
         self._infos_fetched_at = infos_fetched_at
@@ -295,11 +327,27 @@ class UCSchema(DatabricksPath):
         if n == 2:
             # ``/<catalog>/<schema>`` — this schema itself.
             return self
-        # Depth ≥ 3 lands inside a volume: ``/<cat>/<sch>/<vol>`` is the
-        # volume, ``/<cat>/<sch>/<vol>/<rest>`` a VolumePath under it.
-        # The join only ever extends this schema's own coordinates, so
-        # anchor on them and let the volume own the volume → VolumePath
-        # leg of the walk.
+        # Depth ≥ 3 names a child of the schema. Its type is fixed by
+        # this schema's navigation surface (:attr:`path_prefix`) — not
+        # guessed: a table catalog descends into a :class:`Table`, a
+        # volume catalog into a :class:`Volume` (then a VolumePath).
+        if self.path_prefix == TABLE_PATH_PREFIX:
+            if n == 3:
+                from yggdrasil.databricks.table.tables import Tables
+
+                return Tables(client=self.client).table(
+                    catalog_name=self.catalog_name,
+                    schema_name=self.schema_name,
+                    table_name=parts[2],
+                )
+            raise ValueError(
+                f"URL {url} descends {n} segments under a table catalog; "
+                f"tables are leaves, not path-navigable containers. Use a "
+                f"volume catalog (path_prefix='/Volumes/') for file paths."
+            )
+        # Volume surface — the join only ever extends this schema's own
+        # coordinates, so anchor on them and let the volume own the
+        # volume → VolumePath leg of the walk.
         from yggdrasil.databricks.volume.volumes import Volumes
 
         volume = Volumes(client=self.client).volume(
@@ -399,6 +447,9 @@ class UCSchema(DatabricksPath):
                 if u.host else DatabricksClient.current()
             )
             service = Schemas(client=client)
+        # Capture the child-navigation surface from the source scheme
+        # before ``__init__`` rebuilds the URL into ``dbfs+schema://``.
+        kwargs.setdefault("path_prefix", resolve_path_prefix(url=u))
         return cls(
             service=service,
             catalog_name=catalog_name,
@@ -551,9 +602,18 @@ class UCSchema(DatabricksPath):
 
     @property
     def catalog(self) -> "UCCatalog":
-        """Navigate up to the parent :class:`UCCatalog`."""
+        """Navigate up to the parent :class:`UCCatalog`.
+
+        The parent inherits this schema's :attr:`path_prefix` so a
+        round-trip up-then-down (``schema.catalog / schema_name``) lands
+        back on the same surface — and the same singleton.
+        """
         from yggdrasil.databricks.catalog.catalog import UCCatalog as _Catalog
-        return _Catalog(service=self.service, catalog_name=self.catalog_name)
+        return _Catalog(
+            service=self.service,
+            catalog_name=self.catalog_name,
+            path_prefix=self.path_prefix,
+        )
 
     def table(self, name: str) -> "Table":
         """Return a :class:`Table` within this schema.

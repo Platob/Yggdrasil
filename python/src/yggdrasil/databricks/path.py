@@ -47,7 +47,13 @@ from yggdrasil.url import URL
 from .resource import DatabricksResource
 from .service import DatabricksService
 
-__all__ = ["DatabricksPath"]
+__all__ = [
+    "DatabricksPath",
+    "VOLUME_PATH_PREFIX",
+    "TABLE_PATH_PREFIX",
+    "DEFAULT_PATH_PREFIX",
+    "resolve_path_prefix",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +130,55 @@ def _coerce_to_url_str(value: Any) -> Any:
         scheme, path = _parse_posix(value)
         return f"{scheme}://{path}"
     return value
+
+
+# ---------------------------------------------------------------------------
+# Catalog / schema child-navigation surface ("path prefix")
+# ---------------------------------------------------------------------------
+
+# A :class:`UCCatalog` / :class:`UCSchema` can stand for more than one
+# navigation surface: the same ``main.sales`` schema is reached both as
+# a *volume* container (``/Volumes/main/sales/<vol>``) and a *table*
+# container (``main.sales.<tbl>``). ``path_prefix`` records which one a
+# given handle represents so a ``/`` path-join descends into the right
+# child type instead of guessing — ``/Volumes/`` → :class:`Volume` (then
+# :class:`VolumePath`), ``/Tables/`` → :class:`Table`.
+VOLUME_PATH_PREFIX = "/Volumes/"
+TABLE_PATH_PREFIX = "/Tables/"
+
+#: Default surface when none is supplied or derivable — the volume
+#: filesystem, the dominant ``/`` target.
+DEFAULT_PATH_PREFIX = VOLUME_PATH_PREFIX
+
+#: Canonical ``dbfs+<surface>`` scheme a handle was addressed under →
+#: the child-navigation prefix it implies. Schemes not listed fall back
+#: to :data:`DEFAULT_PATH_PREFIX`.
+_SCHEME_PATH_PREFIX: dict[str, str] = {
+    Scheme.DATABRICKS_VOLUME.value: VOLUME_PATH_PREFIX,
+    Scheme.DATABRICKS_TABLE.value: TABLE_PATH_PREFIX,
+}
+
+
+def resolve_path_prefix(
+    path_prefix: "str | None" = None,
+    url: "URL | None" = None,
+) -> str:
+    """Resolve the child-navigation prefix a catalog / schema carries.
+
+    Explicit *path_prefix* wins. Otherwise derive it from the scheme of
+    *url* (``dbfs+volume`` → ``/Volumes/``, ``dbfs+table`` → ``/Tables/``),
+    falling back to :data:`DEFAULT_PATH_PREFIX`. Both the singleton key
+    and ``__init__`` route through this one resolver so they can never
+    disagree on identity.
+    """
+    if path_prefix:
+        return path_prefix
+    if url is not None:
+        scheme = (getattr(url, "scheme", "") or "").lower()
+        prefix = _SCHEME_PATH_PREFIX.get(scheme)
+        if prefix:
+            return prefix
+    return DEFAULT_PATH_PREFIX
 
 
 # ---------------------------------------------------------------------------

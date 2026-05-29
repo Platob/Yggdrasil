@@ -29,11 +29,14 @@ from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 from yggdrasil.databricks.path import (
     DatabricksPath,
+    TABLE_PATH_PREFIX,
+    VOLUME_PATH_PREFIX,
     _coerce_to_url_str,
     _looks_like_posix,
     _parse_posix,
     _resolve_databricks_subclass,
     _strip_dbfs_family_prefix,
+    resolve_path_prefix,
 )
 from yggdrasil.databricks.schema.schema import UCSchema
 from yggdrasil.databricks.schema.schemas import Schemas
@@ -776,3 +779,145 @@ class TestJoinPathCreatesCorrectInstances:
         assert type(walked) is type(dispatched)
         assert walked == dispatched
         assert walked.full_path() == dispatched.full_path()
+
+
+# ===========================================================================
+# path_prefix — the catalog/schema "navigation surface" that tells a
+# path-join which child type to mint (instead of guessing)
+# ===========================================================================
+
+
+class TestPathPrefixResolver:
+    """:func:`resolve_path_prefix` is the single source of truth both the
+    singleton key and ``__init__`` use, so they can never disagree."""
+
+    def test_explicit_prefix_wins(self):
+        assert resolve_path_prefix(TABLE_PATH_PREFIX) == TABLE_PATH_PREFIX
+        assert resolve_path_prefix(VOLUME_PATH_PREFIX) == VOLUME_PATH_PREFIX
+
+    def test_derives_volume_from_volume_scheme(self):
+        assert (
+            resolve_path_prefix(url=URL.from_("dbfs+volume:///c/s"))
+            == VOLUME_PATH_PREFIX
+        )
+
+    def test_derives_table_from_table_scheme(self):
+        assert (
+            resolve_path_prefix(url=URL.from_("dbfs+table:///c/s/t"))
+            == TABLE_PATH_PREFIX
+        )
+
+    def test_defaults_to_volume_for_unmapped_scheme(self):
+        # ``dbfs+catalog`` / ``dbfs+schema`` are a handle's *own* scheme;
+        # they say nothing about the child surface, so the volume
+        # filesystem (the dominant ``/`` target) is the default.
+        assert resolve_path_prefix(url=URL.from_("dbfs+catalog:///c")) == (
+            VOLUME_PATH_PREFIX
+        )
+        assert resolve_path_prefix() == VOLUME_PATH_PREFIX
+
+
+class TestPathPrefixOnCatalogAndSchema:
+    """The catalog records its navigation surface and hands it down to
+    every schema it mints, so the schema knows its child type up front."""
+
+    def test_catalog_defaults_to_volume_surface(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert cat.path_prefix == VOLUME_PATH_PREFIX
+
+    def test_catalog_accepts_table_surface(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        assert cat.path_prefix == TABLE_PATH_PREFIX
+
+    def test_prefix_propagates_to_schema_via_navigation(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        # Every way of reaching a child schema carries the surface down.
+        assert cat.schema("sales").path_prefix == TABLE_PATH_PREFIX
+        assert cat["sales"].path_prefix == TABLE_PATH_PREFIX
+        assert (cat / "sales").path_prefix == TABLE_PATH_PREFIX
+
+    def test_schema_catalog_round_trip_preserves_prefix(self, schemas_service):
+        sch = UCSchema(
+            service=schemas_service,
+            catalog_name="main",
+            schema_name="sales",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        # Up to the catalog and back down must land on the same surface.
+        assert sch.catalog.path_prefix == TABLE_PATH_PREFIX
+
+    def test_volume_and_table_surfaces_are_distinct_singletons(
+        self, catalogs_service,
+    ):
+        vol_cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        tbl_cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        # Same name + client, different surface → different handles, each
+        # with its own cached infos / child resolution.
+        assert vol_cat is not tbl_cat
+        assert vol_cat.path_prefix != tbl_cat.path_prefix
+        # ...but two volume-surface handles still collapse.
+        assert vol_cat is UCCatalog(
+            service=catalogs_service, catalog_name="main",
+        )
+
+
+class TestPathPrefixDrivesChildType:
+    """The whole point: a path-join resolves to the child type the
+    surface dictates — volume catalogs descend into Volumes /
+    VolumePaths, table catalogs into Tables — no guessing."""
+
+    def test_volume_catalog_join_yields_volume_then_path(self, catalogs_service):
+        cat = UCCatalog(service=catalogs_service, catalog_name="main")
+        assert isinstance(cat / "sales" / "raw", Volume)
+        assert isinstance(cat / "sales" / "raw" / "f.parquet", VolumePath)
+
+    def test_table_catalog_join_yields_table(self, catalogs_service):
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        leaf = cat / "sales" / "orders"
+        assert isinstance(leaf, Table)
+        assert leaf.catalog_name == "main"
+        assert leaf.schema_name == "sales"
+        assert leaf.table_name == "orders"
+
+    def test_table_catalog_join_past_table_raises(self, catalogs_service):
+        # A table is a leaf, not a path-navigable container; a single
+        # multi-segment join that descends past one fails loudly rather
+        # than fabricating a nonsensical resource.
+        cat = UCCatalog(
+            service=catalogs_service,
+            catalog_name="main",
+            path_prefix=TABLE_PATH_PREFIX,
+        )
+        with pytest.raises(ValueError):
+            cat.joinpath("sales", "orders", "oops")
+
+    def test_from_url_volume_scheme_makes_volume_catalog(self, catalogs_service):
+        cat = UCCatalog.from_url(
+            "dbfs+volume:///main", service=catalogs_service,
+        )
+        assert cat.path_prefix == VOLUME_PATH_PREFIX
+
+    def test_from_url_schema_table_scheme_makes_table_schema(
+        self, schemas_service,
+    ):
+        sch = UCSchema.from_url(
+            "dbfs+table:///main/sales", service=schemas_service,
+        )
+        assert sch.path_prefix == TABLE_PATH_PREFIX
+        assert isinstance(sch / "orders", Table)
