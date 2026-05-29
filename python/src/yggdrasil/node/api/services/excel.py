@@ -31,7 +31,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from ... import transport
 from ...config import Settings
-from yggdrasil.exceptions.api import BadRequestError
+from yggdrasil.exceptions.api import BadRequestError, TimeoutError as APITimeoutError
 from yggdrasil.version import __version__
 from ...exceptions import NotFoundError
 from ..schemas.excel import (
@@ -156,11 +156,14 @@ class ExcelService:
                 self._pip_install(python_bin, req.packages)
 
             timeout = req.timeout or self.settings.max_python_timeout
-            proc = subprocess.run(
-                [python_bin, "-c", _DRIVER, str(out_file), req.df_name,
-                 str(req.max_rows or 0), str(code_file)],
-                capture_output=True, text=True, timeout=timeout,
-            )
+            try:
+                proc = subprocess.run(
+                    [python_bin, "-c", _DRIVER, str(out_file), req.df_name,
+                     str(req.max_rows or 0), str(code_file)],
+                    capture_output=True, text=True, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                raise APITimeoutError(f"snippet exceeded its {timeout:g}s timeout")
             if proc.returncode != 0:
                 raise BadRequestError(
                     (proc.stderr or proc.stdout or "snippet failed").strip()
@@ -177,7 +180,10 @@ class ExcelService:
             [uv, "pip", "install", "--python", python_bin, *packages]
             if uv else [python_bin, "-m", "pip", "install", *packages]
         )
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            raise APITimeoutError("package install exceeded its 600s timeout")
         if proc.returncode != 0:
             raise BadRequestError(
                 f"package install failed: {(proc.stderr or proc.stdout).strip()}"
@@ -196,8 +202,11 @@ class ExcelService:
         data = resolved.read_bytes()
         if kind in ("parquet", "pq"):
             return transport.read_parquet_bytes(data)
-        if kind in ("arrow", "ipc", "feather"):
+        if kind in ("arrow", "ipc"):
             return transport.read_arrow_stream(data)
+        if kind == "feather":
+            import pyarrow.feather as feather
+            return feather.read_table(pa.BufferReader(data))
         if kind == "csv":
             import pyarrow.csv as pacsv
             return pacsv.read_csv(pa.BufferReader(data))
@@ -212,17 +221,26 @@ class ExcelService:
         return await run_in_threadpool(partial(self._write_table, path, data, content_type))
 
     def _write_table(self, path: str, data: bytes, content_type: str) -> ExcelWriteResponse:
+        if not data:
+            raise BadRequestError("empty request body — nothing to write")
         ct = (content_type or "").lower()
-        if "parquet" in ct:
-            table = transport.read_parquet_bytes(data)
-        elif "arrow" in ct:
-            table = transport.read_arrow_stream(data)
-        elif "csv" in ct:
-            import pyarrow.csv as pacsv
-            table = pacsv.read_csv(pa.BufferReader(data))
-        else:
-            # Default to parquet — that's what the connector/add-in send.
-            table = transport.read_parquet_bytes(data)
+        try:
+            if "parquet" in ct:
+                table = transport.read_parquet_bytes(data)
+            elif "arrow" in ct:
+                table = transport.read_arrow_stream(data)
+            elif "csv" in ct:
+                import pyarrow.csv as pacsv
+                table = pacsv.read_csv(pa.BufferReader(data))
+            else:
+                # Default to parquet — that's what the connector/add-in send.
+                table = transport.read_parquet_bytes(data)
+        except BadRequestError:
+            raise
+        except Exception as exc:
+            raise BadRequestError(
+                f"could not parse uploaded table (content-type {ct or 'unknown'!r}): {exc}"
+            )
 
         resolved = self.fs._resolve(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)

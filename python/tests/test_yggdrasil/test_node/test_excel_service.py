@@ -15,7 +15,8 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from yggdrasil.exceptions.api import BadRequestError
+from yggdrasil.exceptions.api import BadRequestError, ForbiddenError
+from yggdrasil.exceptions.api import TimeoutError as APITimeoutError
 from yggdrasil.node.api.schemas.excel import ExcelQueryRequest
 from yggdrasil.node.api.services.excel import ExcelService
 from yggdrasil.node.api.services.fs import FsService
@@ -87,6 +88,27 @@ class TestRunPython(unittest.TestCase):
                     code="df = {'x': [1]}", env="nope",
                 )))
 
+    def test_timeout_raises_clean_408(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _service(Path(d))
+            with self.assertRaises(APITimeoutError) as ctx:
+                asyncio.run(svc.run_python(ExcelQueryRequest(
+                    code="import time\nwhile True: time.sleep(1)\ndf = {'x': [1]}",
+                    timeout=1,
+                )))
+            # Clean message, no leaked driver command line.
+            self.assertIn("timeout", str(ctx.exception).lower())
+            self.assertNotIn("runpy", str(ctx.exception))
+
+    def test_empty_dataframe(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _service(Path(d))
+            table = asyncio.run(svc.run_python(ExcelQueryRequest(
+                code="import pandas as pd\ndf = pd.DataFrame({'a': []})",
+            )))
+            self.assertEqual(table.num_rows, 0)
+            self.assertIn("a", table.column_names)
+
 
 class TestSerializeFormats(unittest.TestCase):
     def setUp(self):
@@ -109,6 +131,18 @@ class TestSerializeFormats(unittest.TestCase):
         self.assertEqual(
             json.loads(body), [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}],
         )
+
+    def test_json_serializes_temporal_as_strings(self):
+        import datetime as dt
+        import json
+        t = pa.table({
+            "d": [dt.date(2026, 1, 2)],
+            "ts": [dt.datetime(2026, 1, 2, 3, 4, 5)],
+        })
+        body, _ = ExcelService.serialize_table(t, "json")
+        row = json.loads(body)[0]
+        self.assertEqual(row["d"], "2026-01-02")
+        self.assertTrue(row["ts"].startswith("2026-01-02"))
 
     def test_unknown_format_raises(self):
         with self.assertRaises(BadRequestError):
@@ -134,6 +168,19 @@ class TestFileTable(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(NotFoundError):
                 asyncio.run(_service(Path(d)).read_table("nope.parquet"))
+
+    def test_read_path_traversal_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ForbiddenError):
+                asyncio.run(_service(Path(d)).read_table("../../etc/passwd"))
+
+    def test_write_path_traversal_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            body = transport.write_parquet_bytes(pa.table({"k": [1]}))
+            with self.assertRaises(ForbiddenError):
+                asyncio.run(_service(Path(d)).write_table(
+                    "../escape.parquet", body, transport.CONTENT_TYPE_PARQUET,
+                ))
 
     def test_write_parquet_round_trips(self):
         with tempfile.TemporaryDirectory() as d:

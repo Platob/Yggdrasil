@@ -97,6 +97,10 @@ export default function TaskPane() {
     setStatus({ kind: "busy", msg: "Saving sheet…" });
     try {
       const grid = await activeSheetToGrid();
+      if (grid.headers.length === 0) {
+        setStatus({ kind: "err", msg: "Active sheet is empty — nothing to save." });
+        return;
+      }
       const res = await writeFileCsv(base, writePath, grid);
       setStatus({ kind: "ok", msg: `Saved ${res.rows} rows → ${writePath}` });
     } catch (e) {

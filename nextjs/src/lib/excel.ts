@@ -114,31 +114,46 @@ export async function writeFileCsv(base: string, path: string, grid: Grid): Prom
 
 // ── Office.js worksheet bridge ──────────────────────────────────────────
 
+// Sanitize + uniquify a worksheet name (Excel: <=31 chars, no \ / ? * [ ] :,
+// and `add` throws on a duplicate name).
+function sheetName(base: string, taken: string[]): string {
+  const clean = (base.replace(/[\\/?*[\]:]/g, "_").trim() || "Yggdrasil").slice(0, 31);
+  if (!taken.includes(clean)) return clean;
+  for (let i = 2; i < 1000; i++) {
+    const suffix = ` (${i})`;
+    const candidate = clean.slice(0, 31 - suffix.length) + suffix;
+    if (!taken.includes(candidate)) return candidate;
+  }
+  return clean.slice(0, 27) + " " + String(Date.now()).slice(-3);
+}
+
 // Drop a grid onto a fresh worksheet and autofit.
 export async function gridToNewSheet(grid: Grid, name: string): Promise<void> {
   await Excel.run(async (ctx: any) => {
-    const safe = name.replace(/[\\/?*[\]:]/g, "_").slice(0, 31) || "Yggdrasil";
     const sheets = ctx.workbook.worksheets;
-    const sheet = sheets.add(safe);
+    sheets.load("items/name");
+    await ctx.sync();
+    const taken = (sheets.items ?? []).map((s: any) => s.name as string);
+    const sheet = sheets.add(sheetName(name, taken));
     const nRows = grid.rows.length + 1;
-    const nCols = grid.headers.length || 1;
-    const values = [grid.headers, ...grid.rows];
-    if (nRows > 0 && nCols > 0) {
-      const range = sheet.getRangeByIndexes(0, 0, nRows, nCols);
-      range.values = values as unknown[][];
-      sheet.getUsedRange().format.autofitColumns();
-    }
+    const nCols = Math.max(grid.headers.length, 1);
+    const values = [grid.headers.length ? grid.headers : [""], ...grid.rows];
+    const range = sheet.getRangeByIndexes(0, 0, nRows, nCols);
+    range.values = values as unknown[][];
+    sheet.getUsedRange().format.autofitColumns();
     sheet.activate();
     await ctx.sync();
   });
 }
 
 // Read the active worksheet's used range into a grid (first row = headers).
+// Tolerates an empty sheet (getUsedRange throws otherwise).
 export async function activeSheetToGrid(): Promise<Grid> {
   return Excel.run(async (ctx: any) => {
-    const range = ctx.workbook.worksheets.getActiveWorksheet().getUsedRange();
-    range.load("values");
+    const range = ctx.workbook.worksheets.getActiveWorksheet().getUsedRangeOrNullObject();
+    range.load(["values", "isNullObject"]);
     await ctx.sync();
+    if (range.isNullObject) return { headers: [], rows: [] };
     const values: unknown[][] = range.values ?? [];
     if (values.length === 0) return { headers: [], rows: [] };
     const [headers, ...rows] = values;
