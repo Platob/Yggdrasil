@@ -481,21 +481,7 @@ class Jobs(DatabricksService):
 
         job_run = JobRun(service=JobRuns(client=self.client), run_id=response.run_id)
 
-        # The submit response only carries run_id, so explore_url would fall
-        # back to the jobs list. Resolve the owning (ephemeral) job id once so
-        # the logged link is a real run deep-link — best-effort, never fatal.
-        try:
-            job_run.refresh()
-        except Exception:  # noqa: BLE001 — log enrichment only
-            LOGGER.debug(
-                "Could not resolve job_id for run %s; explore_url falls back to /jobs",
-                response.run_id, exc_info=True,
-            )
-
-        LOGGER.info(
-            "Submitted one-time run %s (%r) — %s",
-            response.run_id, run_name, job_run.explore_url,
-        )
+        LOGGER.info("Submitted one-time run %s (%r) — %r", response.run_id, run_name, job_run)
 
         if wait is not False:
             job_run.wait(wait=wait, raise_error=raise_error)
