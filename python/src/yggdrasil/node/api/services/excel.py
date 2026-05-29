@@ -180,12 +180,14 @@ class ExcelService:
             if req.packages:
                 self._pip_install(python_bin, req.packages)
 
-            # Run env = the node's environment with the caller's extra
-            # vars layered on top (str-coerced; they arrive as strings).
+            # Run env = node environment + the PyEnv's stored vars + the
+            # request's own vars (request wins). None when nothing extra.
+            stored = self.pyenv.env_vars_for_name(req.env) if req.env else {}
+            extra = {**stored, **{str(k): str(v) for k, v in req.env_vars.items()}}
             run_env = None
-            if req.env_vars:
+            if extra:
                 import os
-                run_env = {**os.environ, **{str(k): str(v) for k, v in req.env_vars.items()}}
+                run_env = {**os.environ, **extra}
 
             timeout = req.timeout or self.settings.max_python_timeout
             try:

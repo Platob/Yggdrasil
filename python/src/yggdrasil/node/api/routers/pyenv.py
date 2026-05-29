@@ -9,6 +9,8 @@ from ..deps import get_pyenv_service, get_pyfunc_service, get_pyfuncrun_service
 from ..schemas.common import StrictModel
 from ..schemas.pyenv import (
     PyEnvCreate,
+    PyEnvEnvVarsResponse,
+    PyEnvEnvVarsUpdate,
     PyEnvListResponse,
     PyEnvPackagesResponse,
     PyEnvResponse,
@@ -75,6 +77,35 @@ async def list_env_packages(
     fresh read.
     """
     return await service.packages(env_id, refresh=refresh)
+
+
+@router.get("/{env_id}/env", response_model=PyEnvEnvVarsResponse)
+async def get_env_vars(
+    env_id: int,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    """Environment variables stored on this env (applied to every run)."""
+    return await service.get_env_vars(env_id)
+
+
+@router.put("/{env_id}/env", response_model=PyEnvEnvVarsResponse)
+async def set_env_vars(
+    env_id: int,
+    req: PyEnvEnvVarsUpdate,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    """Merge (default) or replace (``replace=true``) this env's variables."""
+    return await service.set_env_vars(env_id, req.env_vars, replace=req.replace)
+
+
+@router.delete("/{env_id}/env/{key}", response_model=PyEnvEnvVarsResponse)
+async def delete_env_var(
+    env_id: int,
+    key: str,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvEnvVarsResponse:
+    """Remove a single environment variable from this env."""
+    return await service.delete_env_var(env_id, key)
 
 
 @router.head("/{env_id}")

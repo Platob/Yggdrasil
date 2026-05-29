@@ -9,11 +9,13 @@ class PyEnvCreate(StrictModel):
     name: str
     python_version: str = "3.11"
     dependencies: list[str] = Field(default_factory=list)
+    env_vars: dict[str, str] = Field(default_factory=dict)
 
 
 class PyEnvUpdate(StrictModel):
     name: str | None = None
     dependencies: list[str] | None = None
+    env_vars: dict[str, str] | None = None
 
 
 class PyEnvEntry(StrictModel):
@@ -21,6 +23,9 @@ class PyEnvEntry(StrictModel):
     name: str
     python_version: str
     dependencies: list[str] = Field(default_factory=list)
+    # Environment variables applied to every run in this env (merged
+    # over the node environment). Config, not part of the content hash.
+    env_vars: dict[str, str] = Field(default_factory=dict)
     path: str
     status: str = "pending"
     created_at: str
@@ -30,6 +35,19 @@ class PyEnvEntry(StrictModel):
     content_hash: str = ""
     replicated_at: str | None = None
     replicated_from: str | None = None
+
+
+class PyEnvEnvVarsUpdate(StrictModel):
+    """Set environment variables on a PyEnv. ``replace`` swaps the whole
+    map; otherwise the given keys are merged over the existing ones."""
+    env_vars: dict[str, str] = Field(default_factory=dict)
+    replace: bool = False
+
+
+class PyEnvEnvVarsResponse(StrictModel):
+    env_id: int
+    name: str
+    env_vars: dict[str, str] = Field(default_factory=dict)
 
 
 class PyEnvResponse(StrictModel):

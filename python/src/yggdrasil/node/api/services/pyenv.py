@@ -23,6 +23,7 @@ from ...ids import make_id
 from ..schemas.pyenv import (
     PyEnvCreate,
     PyEnvEntry,
+    PyEnvEnvVarsResponse,
     PyEnvListResponse,
     PyEnvPackage,
     PyEnvPackagesResponse,
@@ -94,6 +95,7 @@ class PyEnvService:
             name=req.name,
             python_version=req.python_version,
             dependencies=list(req.dependencies),
+            env_vars=dict(req.env_vars),
             path=str(env_path),
             status="creating",
             created_at=now,
@@ -136,6 +138,8 @@ class PyEnvService:
         updates: dict = {"updated_at": now}
         if req.name is not None:
             updates["name"] = req.name
+        if req.env_vars is not None:
+            updates["env_vars"] = dict(req.env_vars)
         hash_name = updates.get("name", entry.name)
         hash_deps = list(entry.dependencies)
         updates["content_hash"] = hashlib.sha256(
@@ -278,6 +282,55 @@ class PyEnvService:
         with self._lock:
             env_id = self._name_to_id.get(name)
         return self.get_python_path(env_id) if env_id is not None else None
+
+    # -- environment variables ---------------------------------------------
+
+    def env_vars_for(self, env_id: int | None) -> dict[str, str]:
+        """The env's stored variables (empty dict if missing/unset)."""
+        if env_id is None:
+            return {}
+        with self._lock:
+            entry = self._envs.get(env_id)
+        return dict(entry.env_vars) if entry is not None else {}
+
+    def env_vars_for_name(self, name: str | None) -> dict[str, str]:
+        if not name:
+            return {}
+        with self._lock:
+            env_id = self._name_to_id.get(name)
+        return self.env_vars_for(env_id)
+
+    async def get_env_vars(self, env_id: int) -> "PyEnvEnvVarsResponse":
+        entry = await self.get(env_id)
+        return PyEnvEnvVarsResponse(env_id=env_id, name=entry.name, env_vars=dict(entry.env_vars))
+
+    async def set_env_vars(
+        self, env_id: int, env_vars: dict[str, str], *, replace: bool = False,
+    ) -> "PyEnvEnvVarsResponse":
+        """Replace the whole map, or merge the given keys over the existing."""
+        entry = await self.get(env_id)
+        merged = {str(k): str(v) for k, v in env_vars.items()} if replace \
+            else {**entry.env_vars, **{str(k): str(v) for k, v in env_vars.items()}}
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        with self._lock:
+            current = self._envs.get(env_id, entry)
+            self._envs[env_id] = current.model_copy(update={"env_vars": merged, "updated_at": now})
+        if self._audit is not None:
+            self._audit.log("update", "pyenv", env_id, detail="env_vars")
+        return PyEnvEnvVarsResponse(env_id=env_id, name=entry.name, env_vars=merged)
+
+    async def delete_env_var(self, env_id: int, key: str) -> "PyEnvEnvVarsResponse":
+        entry = await self.get(env_id)
+        if key not in entry.env_vars:
+            raise NotFoundError(f"env var {key!r} not set on PyEnv {env_id!r}")
+        remaining = {k: v for k, v in entry.env_vars.items() if k != key}
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        with self._lock:
+            current = self._envs.get(env_id, entry)
+            self._envs[env_id] = current.model_copy(update={"env_vars": remaining, "updated_at": now})
+        if self._audit is not None:
+            self._audit.log("update", "pyenv", env_id, detail=f"env_vars-={key}")
+        return PyEnvEnvVarsResponse(env_id=env_id, name=entry.name, env_vars=remaining)
 
     def get_python_path(self, env_id: int) -> str | None:
         with self._lock:
