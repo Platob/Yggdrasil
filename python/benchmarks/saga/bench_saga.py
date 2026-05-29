@@ -59,7 +59,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as d:
         home = Path(d)
         svc = _svc(home)
-        data = home / "data" / "files" / "data"
+        data = home / "data"
         data.mkdir(parents=True, exist_ok=True)
         src = data / "trades.parquet"
         print(f"generating {args.rows:,}-row parquet …")

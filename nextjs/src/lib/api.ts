@@ -678,6 +678,7 @@ export interface TableEntry {
   id: number; catalog: string; schema: string; name: string; full_name: string;
   table_type: string; format: string; source_url: string; node: string | null;
   comment: string; columns: ColumnSpec[]; statistics: TableStatistics;
+  replicas: string[];
   properties: Record<string, string>; created_at: string; updated_at: string;
 }
 export interface SqlColumn { name: string; dtype: string; }
@@ -750,6 +751,27 @@ export function runSql(body: { sql: string; dialect?: string; catalog?: string; 
 
 export function explainSql(body: { sql: string; dialect?: string; catalog?: string; schema?: string }): Promise<ExplainResult> {
   return jsonFetch<ExplainResult>("/api/v2/saga/explain", { method: "POST", body: JSON.stringify(body) });
+}
+
+export interface OpLogEntry {
+  ts: string; op: string; user: string; node: string;
+  statement: string; rows: number | null; detail: string;
+}
+
+export function getTableLog(catalog: string, schema: string, name: string, node?: string, limit = 100): Promise<{ node_id: string; asset: string; entries: OpLogEntry[] }> {
+  const q = `limit=${limit}${node ? `&node=${encodeURIComponent(node)}` : ""}`;
+  return jsonFetch(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}/log?${q}`);
+}
+
+export interface ReplicateResult {
+  source_node: string; target_node: string; full_name: string;
+  mode: string; bytes_copied: number; target_source_url: string;
+}
+
+export async function replicateTable(body: { catalog: string; schema: string; table: string; target: string; mode: "metadata" | "data" }): Promise<ReplicateResult> {
+  const r = await jsonFetch<ReplicateResult>("/api/v2/saga/replicate", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
 }
 
 // ── Messenger ──────────────────────────────────────────────────────────────

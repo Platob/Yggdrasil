@@ -15,12 +15,16 @@ import {
   discoverTables,
   runSql,
   explainSql,
+  getTableLog,
+  replicateTable,
   type CatalogEntry,
   type SchemaEntry,
   type TableEntry,
   type SqlResult,
   type ExplainResult,
+  type OpLogEntry,
 } from "@/lib/api";
+import TabularModal from "@/components/TabularModal";
 
 const DIALECTS = ["postgres", "sqlite", "mysql", "databricks"];
 
@@ -44,6 +48,8 @@ export default function SagaPage() {
   const [schemas, setSchemas] = useState<Record<string, SchemaEntry[]>>({});
   const [tables, setTables] = useState<Record<string, TableEntry[]>>({});
   const [detail, setDetail] = useState<TableEntry | null>(null);
+  const [log, setLog] = useState<OpLogEntry[] | null>(null);
+  const [preview, setPreview] = useState<{ path: string; name: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [treeErr, setTreeErr] = useState("");
 
@@ -160,7 +166,28 @@ export default function SagaPage() {
     try {
       const r = await getTable(cat, schema, name, node);
       setDetail(r.table);
+      setLog(null);
     } catch (e) { setTreeErr(String(e)); }
+  };
+
+  const loadLog = async (t: TableEntry) => {
+    try {
+      const r = await getTableLog(t.catalog, t.schema, t.name, node);
+      setLog(r.entries);
+    } catch (e) { setTreeErr(String(e)); }
+  };
+
+  const onReplicate = async (t: TableEntry) => {
+    const target = window.prompt("Replicate to which node id?");
+    if (!target) return;
+    const mode = window.confirm("Copy the data file too? OK = data, Cancel = metadata only")
+      ? "data" : "metadata";
+    setBusy(true);
+    try {
+      const r = await replicateTable({ catalog: t.catalog, schema: t.schema, table: t.name, target: target.trim(), mode });
+      window.alert(`Replicated ${r.full_name} → ${r.target_node} (${r.mode}, ${r.bytes_copied} B)`);
+      await onRefreshTable(t);
+    } catch (e) { setTreeErr(String(e)); } finally { setBusy(false); }
   };
 
   const onRefreshTable = async (t: TableEntry) => {
@@ -310,17 +337,22 @@ export default function SagaPage() {
             <div className="mt-3 pt-3 border-t border-white/[0.08]">
               <div className="flex items-center justify-between mb-1">
                 <span className="text-xs font-medium text-emerald truncate">{detail.full_name}</span>
-                <div className="flex gap-1.5">
-                  <button onClick={() => onRefreshTable(detail)} disabled={busy}
-                    className="text-[11px] text-frost/80 hover:text-frost">refresh</button>
-                  <button onClick={() => insertRef(detail.full_name)} className="text-[11px] text-amber/80 hover:text-amber">insert</button>
-                  <button onClick={() => setDetail(null)} className="text-[11px] text-muted hover:text-foreground">close</button>
-                </div>
+                <button onClick={() => { setDetail(null); setLog(null); }} className="text-[11px] text-muted hover:text-foreground">close</button>
               </div>
-              <div className="flex gap-3 text-[11px] text-foreground-dim mb-1.5 font-mono">
+              <div className="flex flex-wrap gap-2 mb-1.5 text-[11px]">
+                <button onClick={() => setPreview({ path: detail.source_url, name: detail.name })}
+                  className="text-frost/80 hover:text-frost">preview data</button>
+                <button onClick={() => insertRef(detail.full_name)} className="text-amber/80 hover:text-amber">insert</button>
+                <button onClick={() => onRefreshTable(detail)} disabled={busy} className="text-frost/80 hover:text-frost">refresh stats</button>
+                <button onClick={() => onReplicate(detail)} disabled={busy} className="text-emerald/80 hover:text-emerald">replicate</button>
+                <button onClick={() => loadLog(detail)} className="text-foreground-dim hover:text-foreground">history</button>
+              </div>
+              <div className="flex flex-wrap gap-3 text-[11px] text-foreground-dim mb-1.5 font-mono">
                 <span>{detail.statistics.row_count ?? "?"} rows</span>
                 <span>{fmtBytes(detail.statistics.size_bytes)}</span>
-                <span className="truncate">{detail.source_url}</span>
+                <span className={chip}>{detail.table_type}</span>
+                {detail.replicas.length > 0 && <span className="text-emerald/80">⧉ {detail.replicas.length} replica(s)</span>}
+                <span className="truncate max-w-full">{detail.source_url}</span>
               </div>
               <div className="space-y-0.5 max-h-48 overflow-auto">
                 {detail.columns.map((col) => {
@@ -338,6 +370,22 @@ export default function SagaPage() {
                   );
                 })}
               </div>
+              {log && (
+                <div className="mt-2 pt-2 border-t border-white/[0.06]">
+                  <div className="text-[11px] uppercase tracking-wide text-muted mb-1">History</div>
+                  <div className="space-y-0.5 max-h-40 overflow-auto">
+                    {log.length === 0 && <div className="text-[11px] text-muted">no operations logged</div>}
+                    {log.map((e, i) => (
+                      <div key={i} className="text-[11px] font-mono flex gap-2" title={e.statement}>
+                        <span className="text-muted w-[88px] shrink-0 truncate">{e.ts.slice(5, 19).replace("T", " ")}</span>
+                        <span className="text-frost/80 w-16 shrink-0">{e.op}</span>
+                        <span className="text-foreground-dim truncate flex-1">{e.statement || e.detail}</span>
+                        {e.rows != null && <span className="text-muted">{e.rows}r</span>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -449,6 +497,16 @@ export default function SagaPage() {
           </div>
         </div>
       </div>
+
+      {preview && (
+        <TabularModal
+          node={node}
+          nodeLabel={node ?? "local"}
+          path={preview.path}
+          name={preview.name}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }

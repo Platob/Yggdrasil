@@ -464,8 +464,10 @@ class SagaService:
     def _resolve_path(self, source_url: str) -> str:
         """Map a stored source_url to something Tabular.from_ can open.
 
-        URLs (anything with ``://``) pass through. Relative/absolute local
-        paths are resolved under the node files root with traversal guard.
+        URLs (anything with ``://``) pass through. Relative paths are resolved
+        against the node home — the same rooting the ``/fs`` and ``/tabular``
+        APIs use — so a file's browser path, its ``source_url`` and its preview
+        path are all the same string (no translation needed by the UI).
         """
         if "://" in source_url:
             return source_url
@@ -473,10 +475,10 @@ class SagaService:
         p = _P(source_url)
         if p.is_absolute():
             return str(p)
-        root = self.settings.files_root
+        root = self.settings.node_home
         resolved = (root / source_url).resolve()
         if not str(resolved).startswith(str(root.resolve())):
-            raise BadRequestError("source_url escapes the node files root")
+            raise BadRequestError("source_url escapes the node home")
         return str(resolved)
 
     async def refresh_table(self, catalog: str, schema: str, name: str) -> TableEntry:
@@ -794,13 +796,18 @@ class SagaService:
     # -- discovery ----------------------------------------------------------
 
     async def discover(self, req: DiscoverRequest) -> TableListResponse:
-        """Scan a folder under the node files root and register tabular files."""
+        """Scan a folder under the node home and register tabular files.
+
+        ``path`` is node-home-relative (same as the /fs browser); registered
+        ``source_url`` values are too, so they open directly in the SQL engine
+        and the tabular preview alike.
+        """
         from pathlib import Path as _P
 
-        root = self.settings.files_root
+        root = self.settings.node_home
         base = (root / req.path.lstrip("/")).resolve() if req.path else root
         if not str(base).startswith(str(root.resolve())):
-            raise BadRequestError("path escapes the node files root")
+            raise BadRequestError("path escapes the node home")
         if not base.exists() or not base.is_dir():
             raise NotFoundError(f"directory not found: {req.path!r}")
 
@@ -930,8 +937,9 @@ class SagaService:
             data = _P(local).read_bytes()
             safe = full.replace(".", "_")
             ext = payload.table.format or "bin"
+            # node-home-relative, matching _resolve_path's rooting on the target.
             target_source_url = f"saga-replicas/{safe}.{ext}"
-            dest = NodePath(f"data/files/{target_source_url}", node_url=target_http)
+            dest = NodePath(target_source_url, node_url=target_http)
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
             except Exception:

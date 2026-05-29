@@ -13,6 +13,9 @@ import {
   uploadFsFile,
   mkdirFs,
   isTabularName,
+  createCatalog,
+  createSchema,
+  createTable,
   type FsNodeRoot,
 } from "@/lib/api";
 import type { FsEntry } from "@/lib/types";
@@ -261,6 +264,26 @@ export default function FilesPage() {
     } catch { /* tree shows last good state */ }
   }, [ensureLoaded]);
 
+  // Register a tabular file as a Saga external table — creates the catalog /
+  // schema on demand. source_url is the node-home-relative path, exactly the
+  // rooting Saga uses, so the new table opens in the SQL editor immediately.
+  const registerSaga = useCallback(async (node: string, entry: FsEntry) => {
+    const fq = prompt("Register as catalog.schema.table", `main.default.${entry.name.split(".")[0]}`);
+    if (!fq) return;
+    const parts = fq.split(".");
+    if (parts.length !== 3) { alert("Use the form catalog.schema.table"); return; }
+    const [catalog, schema, table] = parts.map((s) => s.trim());
+    try {
+      await createCatalog({ name: catalog });
+      await createSchema(catalog, { name: schema });
+      await createTable(catalog, schema, {
+        name: table, source_url: entry.path,
+        node: node === selfNodeId ? undefined : node,
+      });
+      alert(`Registered ${catalog}.${schema}.${table} → Saga`);
+    } catch (e) { alert(String(e)); }
+  }, [selfNodeId]);
+
   const newFolder = useCallback(async (node: string, basePath: string) => {
     const name = prompt("New folder name");
     if (!name) return;
@@ -430,6 +453,18 @@ export default function FilesPage() {
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
                       <polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+                    </svg>
+                  </button>
+                )}
+                {!entry.is_dir && isTabularName(entry.name) && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); registerSaga(node, entry); }}
+                    className="opacity-0 group-hover:opacity-100 text-emerald/60 hover:text-emerald"
+                    title="Register in Saga catalog"
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <ellipse cx="12" cy="5" rx="8" ry="3" />
+                      <path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6" />
                     </svg>
                   </button>
                 )}

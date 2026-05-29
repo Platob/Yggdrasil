@@ -32,7 +32,8 @@ def _svc(home: Path, **kw) -> SagaService:
 
 
 def _trades(s: Settings, name: str = "trades.parquet") -> str:
-    d = s.files_root / "data"
+    # source_url is node-home-relative (same rooting as /fs and /tabular).
+    d = s.node_home / "data"
     d.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({
         "sym": ["A", "B", "A", "B", "A"],
