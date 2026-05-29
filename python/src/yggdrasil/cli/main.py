@@ -195,6 +195,24 @@ def _apply_node_env(args: argparse.Namespace) -> None:
     os.environ["YGG_NODE_ALLOW_REMOTE"] = "1"
 
 
+def _display_url(host: str, port: int, *, scheme: str = "http", path: str = "") -> str:
+    """A *clickable* URL for terminal output.
+
+    A wildcard bind (``0.0.0.0`` / ``::``) is reachable but not navigable —
+    clicking ``http://0.0.0.0:8100`` does nothing. Substitute the machine
+    hostname so the link works from this box and across the LAN; collapse the
+    loopback addresses to ``localhost``. Any concrete host is kept as-is.
+    """
+    import socket
+    if host in ("0.0.0.0", "::", ""):
+        display = socket.gethostname() or "localhost"
+    elif host in ("127.0.0.1", "::1", "localhost"):
+        display = "localhost"
+    else:
+        display = host
+    return f"{scheme}://{display}:{port}{path}"
+
+
 def _ensure_node_running() -> str:
     try:
         from yggdrasil.node.daemon import _is_node_running, spawn_node
@@ -263,7 +281,7 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None, 
     )
 
     from yggdrasil.cli.style import bold, cyan, out
-    out(f"  {cyan('front')} {bold(f'http://0.0.0.0:{port}')}\n")
+    out(f"  {cyan('front')} {bold(_display_url('0.0.0.0', port))}\n")
     return proc
 
 
@@ -376,7 +394,8 @@ def _node_start(args: argparse.Namespace) -> int:
         out(f"  {yellow('!')} node spawned but not responding yet — "
             f"tail logs with {bold('ygg node logs -f')}\n")
     out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
-    out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
+    out(f"  {cyan('bind')}    {dim(f'{host}:{port}')}\n")
+    out(f"  {cyan('url')}     {green(_display_url(host, port))}\n")
     out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
     out(f"  {cyan('pid')}     {dim(str(pid))}\n")
 
@@ -424,7 +443,8 @@ def _node_serve(args: argparse.Namespace) -> int:
 
     out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
     out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
-    out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
+    out(f"  {cyan('bind')}    {dim(f'{host}:{port}')}\n")
+    out(f"  {cyan('url')}     {green(_display_url(host, port))}\n")
     out(f"  {cyan('mode')}    {dim('public — remote access enabled')}\n")
 
     if getattr(args, "persist", False):
@@ -461,7 +481,7 @@ def _node_status(args: argparse.Namespace) -> int:
     out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
     if running:
         out(f"  {cyan('status')}  {green('● running')} {dim(f'pid={pid}')}\n")
-        out(f"  {cyan('url')}     {green(f'http://0.0.0.0:{port}')}\n")
+        out(f"  {cyan('url')}     {green(_display_url('0.0.0.0', port))}\n")
     else:
         out(f"  {cyan('status')}  {red('● stopped')}\n")
         out(f"\n  Start with: {bold('ygg node start')}\n")
@@ -663,7 +683,7 @@ def _node_create(args: argparse.Namespace) -> int:
 
     if args.start:
         pid, port = spawn_node(settings, host="0.0.0.0")
-        out(f"  {green('✓')} running on {green(f'0.0.0.0:{port}')} {dim(f'pid={pid}')}\n")
+        out(f"  {green('✓')} running on {green(_display_url('0.0.0.0', port))} {dim(f'pid={pid}')}\n")
         ok, msg = install_service(settings, no_front=True)
         if ok:
             out(f"  {green('✓')} {magenta('boot service')} installed\n")
@@ -691,7 +711,8 @@ def _node_back(args: argparse.Namespace) -> int:
 
     out(f"  {cyan('node')}    {orange(settings.node_id)}\n")
     out(f"  {cyan('home')}    {blue(str(settings.node_home))}\n")
-    out(f"  {cyan('bind')}    {green(f'{host}:{port}')}\n")
+    out(f"  {cyan('bind')}    {dim(f'{host}:{port}')}\n")
+    out(f"  {cyan('url')}     {green(_display_url(host, port))}\n")
     out(f"  {cyan('mode')}    {dim('backend only')}\n\n")
 
     if getattr(args, "persist", False):
