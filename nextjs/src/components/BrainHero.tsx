@@ -13,14 +13,18 @@ const COLOR_EMERALD = "#34d399";
 const COLOR_AMBER = "#fbbf24";
 const COLOR_ROSE = "#f43f5e";
 
-// Hero scene scale — bigger than BrainMesh: more interneurons, deeper camera
-const PEER_RADIUS = 3;
-const INTERNEURON_INNER = 1.5;
-const INTERNEURON_OUTER = 3.8;
-const INTERNEURON_COUNT = 60; // richer "neural density" vs 40 in BrainMesh
-const MAX_TOTAL_CELLS = 140;
-const MAX_AXONS = 220;
-const DUST_PARTICLES = 500; // ambient background dust
+// Hero scene scale. Only real nodes are drawn as cells/synapses — no synthetic
+// interneurons. A node's interaction intensity (cpu + active runs) pulls it
+// CLOSER to the central soma; idle nodes drift to the outer shell.
+const PEER_NEAR = 1.6;   // shell for the busiest nodes
+const PEER_FAR = 3.7;    // shell for idle nodes
+const MAX_PEERS = 48;    // cap displayed peers so a big mesh doesn't flood
+const DUST_PARTICLES = 500; // ambient background dust (atmosphere, not nodes)
+
+// Interaction intensity in [0,1] from cpu load + active runs.
+function intensityOf(cpu: number, activeRuns: number): number {
+  return Math.min(1, (cpu + activeRuns * 25) / 100);
+}
 
 // CPU-load coloring — same mapping the SVG topology view uses
 function loadColorHex(cpu: number): string {
@@ -65,144 +69,53 @@ function buildBrainScene(nodes: TopologyNode[]): { cells: Cell[]; axons: Axon[] 
 
   const cells: Cell[] = [];
   const selfNode = nodes.find((n) => n.self);
-  const peers = nodes.filter((n) => !n.self);
 
-  // Central soma — slightly bigger than BrainMesh for hero impact
-  if (selfNode) {
-    const activation = Math.min(1, (selfNode.cpu_percent + selfNode.active_runs * 25) / 100);
-    cells.push({
-      id: selfNode.node_id,
-      position: new THREE.Vector3(0, 0, 0),
-      radius: 0.32,
-      color: COLOR_FROST,
-      type: "self",
-      activation,
-    });
-  } else {
-    cells.push({
-      id: "self-placeholder",
-      position: new THREE.Vector3(0, 0, 0),
-      radius: 0.3,
-      color: COLOR_FROST,
-      type: "self",
-      activation: 0.5,
-    });
-  }
+  // Central soma
+  cells.push({
+    id: selfNode?.node_id ?? "self-placeholder",
+    position: new THREE.Vector3(0, 0, 0),
+    radius: 0.32,
+    color: COLOR_FROST,
+    type: "self",
+    activation: selfNode ? intensityOf(selfNode.cpu_percent, selfNode.active_runs) : 0.5,
+  });
 
-  // Peers — fibonacci sphere distribution on shell of PEER_RADIUS
-  const peerCount = Math.min(peers.length, MAX_TOTAL_CELLS - INTERNEURON_COUNT - 1);
-  const phi = Math.PI * (3 - Math.sqrt(5)); // golden angle
+  // Real peers only — ranked by interaction intensity, capped, and placed on a
+  // shell whose radius shrinks with intensity (busy nodes sit nearer the core).
+  const ranked = nodes
+    .filter((n) => !n.self)
+    .map((p) => ({ p, intensity: intensityOf(p.cpu_percent, p.active_runs) }))
+    .sort((a, b) => b.intensity - a.intensity)
+    .slice(0, MAX_PEERS);
+  const peerCount = ranked.length;
+  const phi = Math.PI * (3 - Math.sqrt(5)); // golden angle → even directions
   for (let i = 0; i < peerCount; i++) {
-    const peer = peers[i];
+    const { p, intensity } = ranked[i];
     const y = 1 - (i / Math.max(1, peerCount - 1)) * 2;
     const r = Math.sqrt(1 - y * y);
     const theta = phi * i;
-    const x = Math.cos(theta) * r;
-    const z = Math.sin(theta) * r;
-    const activation = Math.min(1, (peer.cpu_percent + peer.active_runs * 20) / 100);
+    const shell = PEER_FAR - intensity * (PEER_FAR - PEER_NEAR);
     cells.push({
-      id: peer.node_id,
-      position: new THREE.Vector3(x * PEER_RADIUS, y * PEER_RADIUS, z * PEER_RADIUS),
-      radius: 0.17 + Math.min(0.06, peer.active_runs * 0.015),
-      color: loadColorHex(peer.cpu_percent),
+      id: p.node_id,
+      position: new THREE.Vector3(Math.cos(theta) * r * shell, y * shell, Math.sin(theta) * r * shell),
+      radius: 0.16 + intensity * 0.12,
+      color: loadColorHex(p.cpu_percent),
       type: "peer",
-      activation,
+      activation: intensity,
     });
   }
 
-  // Synthetic interneurons — fills the brain with dim density (60 cells)
-  const remaining = Math.min(INTERNEURON_COUNT, MAX_TOTAL_CELLS - cells.length);
-  for (let i = 0; i < remaining; i++) {
-    const u = rand();
-    const v = rand();
-    const cellTheta = 2 * Math.PI * u;
-    const cellPhi = Math.acos(2 * v - 1);
-    const radius = INTERNEURON_INNER + rand() * (INTERNEURON_OUTER - INTERNEURON_INNER);
-    const x = radius * Math.sin(cellPhi) * Math.cos(cellTheta);
-    const y = radius * Math.sin(cellPhi) * Math.sin(cellTheta);
-    const z = radius * Math.cos(cellPhi);
-    cells.push({
-      id: `interneuron-${i}`,
-      position: new THREE.Vector3(x, y, z),
-      radius: 0.05 + rand() * 0.05,
-      color: rand() > 0.85 ? COLOR_EMERALD : COLOR_FROST,
-      type: "interneuron",
-      activation: 0.1 + rand() * 0.3,
-    });
-  }
-
-  // ── Axons ────────────────────────────────────────────────────────────
+  // ── Axons — one real synapse per peer → self; busier links pulse faster ──
   const axons: Axon[] = [];
-  const selfIdx = 0;
-  const interneuronStart = 1 + peerCount;
-
-  // Every peer → self (always visible, even with zero peers nothing happens)
   for (let i = 1; i <= peerCount; i++) {
     const fromCell = cells[i];
-    const toCell = cells[selfIdx];
-    const curve = makeOrganicCurve(fromCell.position, toCell.position, rand);
     axons.push({
       from: i,
-      to: selfIdx,
-      curve,
+      to: 0,
+      curve: makeOrganicCurve(fromCell.position, cells[0].position, rand),
       color: fromCell.color,
       pulseOffset: rand() * 4,
-      pulseDuration: 3 + rand() * 2, // slower than BrainMesh — ambient feel
-    });
-  }
-
-  // Each peer → ~3 nearest interneurons — sprinkles signal paths through density
-  for (let i = 1; i <= peerCount && axons.length < MAX_AXONS; i++) {
-    const peerCell = cells[i];
-    const dists: Array<{ idx: number; d: number }> = [];
-    for (let j = interneuronStart; j < cells.length; j++) {
-      dists.push({ idx: j, d: peerCell.position.distanceTo(cells[j].position) });
-    }
-    dists.sort((a, b) => a.d - b.d);
-    for (let k = 0; k < Math.min(3, dists.length) && axons.length < MAX_AXONS; k++) {
-      const targetIdx = dists[k].idx;
-      const curve = makeOrganicCurve(peerCell.position, cells[targetIdx].position, rand);
-      axons.push({
-        from: i,
-        to: targetIdx,
-        curve,
-        color: peerCell.color,
-        pulseOffset: rand() * 4,
-        pulseDuration: 3 + rand() * 2,
-      });
-    }
-  }
-
-  // Cross-links from interneurons → self so dim cells participate in pulsing.
-  // Hero scene gets more of these (24 vs BrainMesh's 12) for richer activity.
-  const crossLinks = Math.min(24, cells.length - interneuronStart, MAX_AXONS - axons.length);
-  for (let k = 0; k < crossLinks; k++) {
-    const idx = interneuronStart + Math.floor(rand() * (cells.length - interneuronStart));
-    const curve = makeOrganicCurve(cells[idx].position, cells[selfIdx].position, rand);
-    axons.push({
-      from: idx,
-      to: selfIdx,
-      curve,
-      color: COLOR_FROST,
-      pulseOffset: rand() * 5,
-      pulseDuration: 3.5 + rand() * 1.5,
-    });
-  }
-
-  // Interneuron ↔ interneuron — extra ambient sparks unique to the hero scene
-  const ambientLinks = Math.min(20, MAX_AXONS - axons.length);
-  for (let k = 0; k < ambientLinks; k++) {
-    const a = interneuronStart + Math.floor(rand() * (cells.length - interneuronStart));
-    const b = interneuronStart + Math.floor(rand() * (cells.length - interneuronStart));
-    if (a === b) continue;
-    const curve = makeOrganicCurve(cells[a].position, cells[b].position, rand);
-    axons.push({
-      from: a,
-      to: b,
-      curve,
-      color: COLOR_FROST,
-      pulseOffset: rand() * 5,
-      pulseDuration: 4 + rand() * 1.5,
+      pulseDuration: 4 - fromCell.activation * 2, // active = faster signal
     });
   }
 
