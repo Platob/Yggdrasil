@@ -155,13 +155,12 @@ class JSONFile(IO[bytes, JsonOptions]):
         object that straddled pyarrow's block boundary).
         """
         v.seek(0)
-        # The orjson-backed module parses bytes (and the requested
-        # encoding) directly — no intermediate ``decode()`` str copy.
-        # ``safe=True`` is the plain orjson parse (no type-restoring
-        # walk): we want the raw parsed values and let Arrow infer types
-        # in ``from_pylist``.
+        # ``read_buffer()`` is a zero-copy pyarrow Buffer over the
+        # stream; orjson parses the memoryview directly, so the read
+        # input never copies (no ``read()`` bytes, no ``decode()`` str).
+        # Arrow infers types from the raw parsed values in ``from_pylist``.
         parsed = json_module.loads(
-            v.read(), encoding=options.encoding, safe=True,
+            memoryview(v.read_buffer()), encoding=options.encoding,
         )
         if isinstance(parsed, list):
             if parsed:
