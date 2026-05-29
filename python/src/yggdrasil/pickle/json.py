@@ -327,7 +327,11 @@ def loads(
             obj = _json.loads(s)
     else:
         try:
-            obj = orjson.loads(bytes(s) if isinstance(s, memoryview) else s)
+            # orjson parses bytes / bytearray / memoryview natively — pass
+            # a memoryview straight through (zero-copy) instead of
+            # materializing ``bytes(s)``, so callers can hand us a view
+            # over an existing buffer (e.g. an IO holder's ``read_mv``).
+            obj = orjson.loads(s)
         except orjson.JSONDecodeError:
             # orjson rejects malformed UTF-8 outright; fall back to
             # stdlib so caller-controlled ``errors=`` still applies.

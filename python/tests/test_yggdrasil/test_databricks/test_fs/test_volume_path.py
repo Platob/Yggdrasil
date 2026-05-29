@@ -1,4 +1,18 @@
-"""Mock-driven tests for :class:`VolumePath`."""
+"""Mock-driven tests for :class:`VolumePath`.
+
+:class:`VolumePath` now issues Databricks Files-API traffic over
+yggdrasil's own :class:`HTTPSession` (``/api/2.0/fs/files`` /
+``/api/2.0/fs/directories``) instead of the SDK's ``workspace.files``
+client. To keep this unit suite focused on :class:`VolumePath`'s own
+logic — URL building, status → exception translation, pagination,
+parent auto-creation — without standing up a real workspace, the
+``client`` fixture wires a :class:`_FakeFilesSession` that translates
+each Files-API HTTP call back onto the same ``workspace.files``
+MagicMock the tests already configure. Real wire retry / stream-resume
+lives in the :class:`HTTPSession` tests; :class:`TestTransportResilience`
+exercises the volume ↔ session integration against a real session with
+a stubbed socket layer.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +25,12 @@ import pytest
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.volume.volumes import Volumes
 from yggdrasil.io.io_stats import IOKind
+from yggdrasil.url import URL
+
+from tests.test_yggdrasil.test_databricks._files_fake import (
+    FakeResp as _FakeResp,
+    wire_files_session,
+)
 
 
 class NotFound(Exception):
@@ -60,7 +80,11 @@ def reset_volume_info_cache():
 
 @pytest.fixture
 def client():
-    return MagicMock()
+    # Files-API transport seam — ``VolumePath`` reaches the workspace
+    # over ``client.files_session().fetch`` with an Authorization header
+    # from ``client.files_authorization()``, against ``client.base_url``.
+    # The fake session translates each call back onto ``workspace.files``.
+    return wire_files_session(MagicMock())
 
 
 @pytest.fixture
@@ -292,6 +316,320 @@ class TestRead:
         assert workspace.files.download.call_count == 1
 
 
+class TestRangeReads:
+    """Random-seek reads must transfer only the requested slice via an
+    HTTP ``Range`` request — not download the whole object per call.
+    This is the headline optimization over the SDK's Files client, which
+    has no range support."""
+
+    # Position-distinct bytes so a slice uniquely identifies its offset.
+    PAYLOAD = bytes(range(256)) * 8  # 2048 bytes
+
+    def _wire_download(self, workspace):
+        workspace.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: self.PAYLOAD),
+            content_type=None,
+            last_modified=None,
+        )
+
+    def test_bounded_read_fetches_only_the_slice(self, workspace, client, service):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        out = bytes(p._read_mv(16, 100))
+        assert out == self.PAYLOAD[100:116]
+        # Only the 16-byte slice crossed the wire — not the whole object.
+        assert client.files_session.return_value.bytes_served == 16
+
+    def test_bounded_read_caches_true_total_size(self, workspace, client, service):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        p._read_mv(16, 100)
+        # Stat cache reflects the full object size (from Content-Range),
+        # not the 16-byte slice — so ``size`` stays correct after a
+        # partial read.
+        assert p._stat_cached.size == len(self.PAYLOAD)
+
+    def test_open_ended_range_reads_tail(self, workspace, client, service):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        out = bytes(p._read_mv(-1, 2000))
+        assert out == self.PAYLOAD[2000:]
+        assert p._stat_cached.size == len(self.PAYLOAD)
+
+    def test_whole_file_read_sends_no_range(self, workspace, client, service):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        out = bytes(p._read_mv(-1, 0))
+        assert out == self.PAYLOAD
+        # A whole-file read transfers the whole object exactly once.
+        assert client.files_session.return_value.bytes_served == len(self.PAYLOAD)
+
+    def test_random_seeks_transfer_far_less_than_full_object(
+        self, workspace, client, service
+    ):
+        self._wire_download(workspace)
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=service)
+        offsets = [0, 500, 1900, 1000, 64, 2040]
+        for off in offsets:
+            n = min(8, len(self.PAYLOAD) - off)
+            assert bytes(p._read_mv(n, off)) == self.PAYLOAD[off:off + n]
+        served = client.files_session.return_value.bytes_served
+        # ~6 * 8 bytes — a fraction of one full object download, let alone
+        # the six the old "download everything and slice" path would do.
+        assert served <= 6 * 8
+        assert served < len(self.PAYLOAD)
+
+    def test_server_ignoring_range_falls_back_to_local_slice(self):
+        # If the server returns 200 (ignores Range), VolumePath slices
+        # locally — correct bytes, full size cached, no corruption.
+        c = wire_files_session(MagicMock(), honor_range=False)
+        svc = MagicMock(spec=Volumes)
+        svc.client = c
+        ws = c.workspace_client.return_value
+        ws.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: self.PAYLOAD),
+            content_type=None,
+            last_modified=None,
+        )
+        p = VolumePath("/Volumes/c/s/v/big.bin", service=svc)
+        out = bytes(p._read_mv(16, 100))
+        assert out == self.PAYLOAD[100:116]
+        assert p._stat_cached.size == len(self.PAYLOAD)
+
+
+class TestOpenedCursor:
+    """Opened (``vp.open("rb")`` + seek/read) vs non-opened reads.
+
+    An opened cursor routes reads through ``_read_mv(n, pos)`` so they
+    become HTTP Range requests, page-quantized by ``page_size``:
+    ``page_size=None`` fetches exact slices, a set page fetches whole
+    pages. Non-opened convenience reads (``read_bytes``) pull the whole
+    object. (Requires the HEAD-stat size to be correct — see the
+    bodyless Content-Length fix.)"""
+
+    PAYLOAD = bytes(range(256)) * 16  # 4096 bytes
+
+    @staticmethod
+    def _store_backed(workspace, blob):
+        workspace.files.download.side_effect = lambda p: SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: blob),
+            content_type=None,
+            last_modified=None,
+        )
+        workspace.files.get_metadata.side_effect = lambda p: SimpleNamespace(
+            content_length=len(blob), content_type=None, last_modified=None,
+        )
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+
+    def test_opened_unpaged_reads_exact_slices(self, workspace, client, service):
+        self._store_backed(workspace, self.PAYLOAD)
+        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service, page_size=None)
+        with p.open("rb") as fh:
+            fh.seek(1000)
+            a = bytes(fh.read(64))
+            fh.seek(3000)
+            b = bytes(fh.read(50))
+        assert a == self.PAYLOAD[1000:1064]
+        assert b == self.PAYLOAD[3000:3050]
+        # Opened + unpaged == exact random access: only touched bytes move.
+        assert client.files_session.return_value.bytes_served == 64 + 50
+
+    def test_opened_paged_fetches_whole_pages(self, workspace, client, service):
+        self._store_backed(workspace, self.PAYLOAD)
+        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service, page_size=256)
+        with p.open("rb") as fh:
+            fh.seek(1000)
+            chunk = bytes(fh.read(10))
+        assert chunk == self.PAYLOAD[1000:1010]
+        # Page-quantized: one ~256B page, not the whole 4096B object.
+        served = client.files_session.return_value.bytes_served
+        assert 0 < served <= 256
+
+    def test_non_opened_read_bytes_pulls_whole_object(self, workspace, client, service):
+        self._store_backed(workspace, self.PAYLOAD)
+        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service)
+        assert bytes(p.read_bytes()) == self.PAYLOAD
+        assert client.files_session.return_value.bytes_served == len(self.PAYLOAD)
+
+
+class TestCallCounts:
+    """Round-trips dominate on a real network, so pin the call count for
+    the common operations — a regression that slips in a hidden HEAD /
+    GET probe (or an RMW download) is caught here."""
+
+    @staticmethod
+    def _methods(client):
+        return [m for m, _ in client.files_session.return_value.calls]
+
+    def test_whole_read_is_a_single_get(self, workspace, client, service):
+        workspace.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: b"hello"),
+            content_type=None,
+            last_modified=None,
+        )
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
+        p.read_bytes()
+        assert self._methods(client) == ["GET"]  # no stat probe
+
+    def test_existing_file_stat_is_a_single_head(self, workspace, client, service):
+        workspace.files.get_metadata.return_value = _file_meta(10)
+        p = VolumePath("/Volumes/c/s/v/x.parquet", service=service)
+        p._stat_uncached()
+        assert self._methods(client) == ["HEAD"]
+
+    def test_overwrite_upload_is_a_single_put(self, workspace, client, service):
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
+        p.write_bytes(b"data", overwrite=True)
+        methods = self._methods(client)
+        assert methods.count("PUT") == 1
+        assert "GET" not in methods  # no read-modify-write download
+
+    def test_random_reads_are_one_ranged_get_each(self, workspace, client, service):
+        workspace.files.download.return_value = SimpleNamespace(
+            contents=SimpleNamespace(read=lambda: bytes(range(256)) * 4),
+            content_type=None,
+            last_modified=None,
+        )
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
+        for off in (0, 100, 500, 900):
+            p._read_mv(16, off)
+        gets = [m for m in self._methods(client) if m == "GET"]
+        assert len(gets) == 4  # one ranged GET per read, no extra probes
+
+
+class TestFormats:
+    """How VolumePath behaves under the real format readers/writers
+    (Parquet, pickle) over the HTTP transport. A store-backed fake
+    round-trips bytes through ``workspace.files`` so write→read goes the
+    whole way through ``_upload`` / ``_read_mv``."""
+
+    @staticmethod
+    def _store_backed(workspace):
+        """Wire ``workspace.files`` to a single in-memory blob store."""
+        store: dict[str, bytes] = {}
+
+        def _upload(*, file_path, contents, overwrite):
+            store["blob"] = contents.read()
+
+        def _download(path):
+            if "blob" not in store:
+                raise NotFound(path)
+            return SimpleNamespace(
+                contents=SimpleNamespace(read=lambda: store["blob"]),
+                content_type=None,
+                last_modified=None,
+            )
+
+        def _get_metadata(path):
+            if "blob" not in store:
+                raise NotFound(path)
+            return SimpleNamespace(
+                content_length=len(store["blob"]),
+                content_type=None,
+                last_modified=None,
+            )
+
+        workspace.files.upload.side_effect = _upload
+        workspace.files.download.side_effect = _download
+        workspace.files.get_metadata.side_effect = _get_metadata
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        return store
+
+    def test_parquet_write_read_roundtrip(self, workspace, client, service):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        self._store_backed(workspace)
+        table = pa.table({"id": pa.array(range(1000), type=pa.int64()),
+                          "name": pa.array([f"r{i}" for i in range(1000)])})
+        sink = io.BytesIO()
+        pq.write_table(table, sink)
+        p = VolumePath("/Volumes/c/s/v/data.parquet", service=service)
+        p.write_bytes(sink.getvalue(), overwrite=True)
+
+        got = pq.read_table(io.BytesIO(bytes(p.read_bytes())))
+        assert got.equals(table)
+
+    def test_parquetfile_reader_over_volume(self, workspace, client, service):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        store = self._store_backed(workspace)
+        table = pa.table({"x": pa.array(range(500), type=pa.int64())})
+        sink = io.BytesIO()
+        pq.write_table(table, sink)
+        store["blob"] = sink.getvalue()
+
+        p = VolumePath("/Volumes/c/s/v/data.parquet", service=service)
+        got = ParquetFile(holder=p, owns_holder=False).read_arrow_table()
+        assert got.equals(table)
+
+    def test_parquet_projection_ranges_only_the_subset(self, workspace, client, service):
+        # A column projection (bound target) over the ranged-capable
+        # VolumePath reads the footer + just the projected column chunks
+        # via HTTP Range — a fraction of the whole object.
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        store = self._store_backed(workspace)
+        ncols = 16
+        table = pa.table(
+            {f"c{i}": pa.array(range(20000), type=pa.int64()) for i in range(ncols)}
+        )
+        sink = io.BytesIO()
+        pq.write_table(table, sink, row_group_size=2000)
+        store["blob"] = sink.getvalue()
+        full = len(store["blob"])
+
+        p = VolumePath("/Volumes/c/s/v/wide.parquet", service=service)
+        target = pa.schema([("c3", pa.int64())])
+        got = ParquetFile(holder=p, owns_holder=False).read_arrow_table(target=target)
+        assert got.column_names == ["c3"]
+        assert got.num_rows == 20000
+        assert got.column("c3").to_pylist()[:3] == [0, 1, 2]
+        # Ranged: only footer + the c3 chunks crossed the wire (~1/16th
+        # of the columns), nowhere near the whole object.
+        served = client.files_session.return_value.bytes_served
+        assert 0 < served < full // 4
+
+    def test_format_read_snapshots_whole_object(self, workspace, client, service):
+        # The format readers go through ``arrow_input_stream``, which
+        # snapshots a remote holder (one whole-object GET) before handing
+        # pyarrow a BufferReader — so a Parquet read transfers the entire
+        # file, NOT a ranged projection. This anchors that behaviour: the
+        # Range optimization lands on raw partial reads, and making
+        # column projection range-backed would flip this assertion.
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        store = self._store_backed(workspace)
+        table = pa.table({f"c{i}": pa.array(range(2000), type=pa.int64())
+                          for i in range(8)})
+        sink = io.BytesIO()
+        pq.write_table(table, sink, row_group_size=200)
+        store["blob"] = sink.getvalue()
+
+        p = VolumePath("/Volumes/c/s/v/wide.parquet", service=service)
+        ParquetFile(holder=p, owns_holder=False).read_arrow_table()
+        # Whole object pulled (snapshot), not a sub-range.
+        assert client.files_session.return_value.bytes_served >= len(store["blob"])
+
+    def test_pickle_roundtrip(self, workspace, client, service):
+        import pickle
+
+        self._store_backed(workspace)
+        obj = {"ids": list(range(2000)), "label": "x" * 500, "nested": {"a": [1, 2]}}
+        p = VolumePath("/Volumes/c/s/v/obj.pkl", service=service)
+        p.write_bytes(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),
+                      overwrite=True)
+        assert pickle.loads(bytes(p.read_bytes())) == obj
+
+
 class TestWrite:
 
     def test_overwrite(self, workspace, client, service) -> None:
@@ -313,11 +651,8 @@ class TestWrite:
     def test_stream_input_routes_through_upload(
         self, workspace, client, service
     ) -> None:
-        """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
-        :class:`IO[bytes]` and lands on one ``files.upload`` call."""
+        """A caller-supplied ``BinaryIO`` lands on one ``PUT /files`` upload."""
         import io
-
-        from yggdrasil.io.base import IO as _IO
 
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
@@ -326,44 +661,34 @@ class TestWrite:
         p.write_bytes(stream)
 
         kwargs = workspace.files.upload.call_args.kwargs
-        # SDK sees the yggdrasil IO[bytes] wrapper; one upload, no
-        # chunked RMW loop.
-        assert isinstance(kwargs["contents"], _IO)
+        # The whole stream is read into a replayable byte body and PUT
+        # once — no chunked RMW loop, no per-attempt rewind dance.
+        assert isinstance(kwargs["contents"], io.BytesIO)
+        assert kwargs["contents"].getvalue() == b"streamed-payload"
         assert workspace.files.upload.call_count == 1
 
-    def test_stream_input_seeks_to_origin_on_retry(
+    def test_stream_input_read_into_replayable_body(
         self, workspace, client, service
     ) -> None:
-        """Transient ``files.upload`` failures must rewind a stream input."""
-        import io
-        from unittest.mock import patch
+        """A stream is drained into bytes up front so a transport-layer
+        replay PUTs the full body, not an empty tail.
 
-        from databricks.sdk.errors import InternalError
+        The seek-on-retry dance the SDK path needed is gone: the body is
+        already bytes by the time it reaches the wire, so the
+        :class:`HTTPSession`'s own retry/resume replays it verbatim.
+        """
+        import io
 
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
 
-        seen: list[bytes] = []
-        calls = {"n": 0}
+        VolumePath("/Volumes/c/s/v/x", service=service).write_bytes(
+            io.BytesIO(b"abcdef"),
+        )
 
-        def upload_side_effect(**kwargs: object) -> None:
-            calls["n"] += 1
-            stream = kwargs["contents"]
-            stream.read()  # type: ignore[union-attr]
-            if calls["n"] == 1:
-                raise InternalError("flaky")
-            stream.seek(0)
-            seen.append(stream.read())  # type: ignore[union-attr]
-
-        workspace.files.upload.side_effect = upload_side_effect
-
-        with patch("yggdrasil.path._retry.time.sleep"):
-            VolumePath("/Volumes/c/s/v/x", service=service).write_bytes(
-                io.BytesIO(b"abcdef"),
-            )
-
-        assert calls["n"] == 2
-        assert seen == [b"abcdef"]
+        assert workspace.files.upload.call_count == 1
+        sent = workspace.files.upload.call_args.kwargs["contents"]
+        assert sent.getvalue() == b"abcdef"
 
     def test_pwrite_does_rmw(self, workspace, client, service) -> None:
         workspace.files.get_metadata.return_value = _file_meta(5)
@@ -719,6 +1044,14 @@ class TestVolumeAutoCreate:
     (``create_directory`` on the parent) and only blind-create the
     catalog / schema / managed volume when that fails NotFound."""
 
+    @pytest.fixture(autouse=True)
+    def _missing_stat(self, workspace):
+        # These cases write brand-new files; the pre-write stat probe
+        # must read MISSING so the flow proceeds to the upload whose
+        # parent auto-creation they exercise.
+        workspace.files.get_metadata.side_effect = NotFound()
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+
     def test_only_subdir_missing_skips_volume_create(
         self, workspace, client, service
     ) -> None:
@@ -946,42 +1279,86 @@ class TestVolumeAutoCreate:
         self, workspace, client, service
     ) -> None:
         # Path too shallow to address a volume — auto-create can't help,
-        # so the original error must surface.
+        # so the error must surface. (The Files API 404 surfaces as
+        # FileNotFoundError now that the transport is plain HTTP.)
         workspace.files.upload.side_effect = NotFound("does not exist")
         p = VolumePath("/Volumes/onlycat", service=service)
-        with pytest.raises(NotFound):
+        with pytest.raises(FileNotFoundError):
             p.write_bytes(b"x")
         workspace.volumes.create.assert_not_called()
 
 
-class TestRetryPolicy:
+class TestTransportResilience:
+    """Reads / writes now flow over yggdrasil's :class:`HTTPSession`, which
+    owns the transient-retry + resume-on-disconnect policy the SDK's Files
+    client handled poorly. Verify the volume ↔ session integration against
+    a *real* session with the socket send stubbed."""
 
-    @pytest.fixture
-    def sleeps(self):
-        recorded: list[float] = []
-        return recorded, recorded.append
+    def test_read_survives_transient_ssl_eof(self, client, service) -> None:
+        # A mid-flight ``UNEXPECTED_EOF`` on the first wire send must be
+        # retried by the session and the read must still complete — the
+        # exact failure the SDK Files client mishandles.
+        import datetime as _dt
+        import ssl
 
-    def test_internal_error_retries(self, workspace, client, service, sleeps) -> None:
-        recorded, spy = sleeps
-        attempts = [InternalError(), InternalError(), _file_meta(3)]
+        from yggdrasil.http_ import HTTPSession
+        from yggdrasil.http_.response import HTTPResponse
 
-        def get_metadata(path):
-            r = attempts.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
+        host = "https://resilience-probe.databricks.com"
+        client.base_url = URL.from_(host)
+        client.files_authorization.return_value = "Bearer t"
+        session = HTTPSession(base_url=host, verify=False)
+        client.files_session.return_value = session
 
-        workspace.files.get_metadata.side_effect = get_metadata
-        # Leaf carries ``.`` so the file-first heuristic routes the
-        # InternalError-then-success sequence through
-        # ``get_metadata`` rather than ``get_directory_metadata``.
-        p = VolumePath(
-            "/Volumes/c/s/v/x.bin",
-            service=service,
-            retry_sleep=spy,
-        )
-        assert p.size == 3
-        assert recorded == [1.0, 1.0]
+        calls = {"n": 0}
+
+        def fake_send_once(*, request, **_kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ssl.SSLError(
+                    "EOF occurred in violation of protocol (_ssl.c:1, "
+                    "UNEXPECTED_EOF)"
+                )
+            return HTTPResponse(
+                request=request,
+                status_code=200,
+                headers={},
+                tags={},
+                buffer=b"hello",
+                received_at=_dt.datetime.now(_dt.timezone.utc),
+            )
+
+        session._send_once = fake_send_once
+
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
+        assert p.read_bytes() == b"hello"
+        # First attempt raised the transient EOF; the session retried and
+        # the second attempt delivered the body.
+        assert calls["n"] == 2
+
+    def test_server_error_surfaces_after_session_retries(
+        self, client, service
+    ) -> None:
+        # When the workspace keeps returning 503, the session exhausts its
+        # retries and the volume op fails loudly rather than silently
+        # returning empty data.
+        host = "https://error-probe.databricks.com"
+        client.base_url = URL.from_(host)
+        client.files_authorization.return_value = "Bearer t"
+
+        class _ErrSession:
+            def fetch(self, *a, **k):
+                return _FakeResp(
+                    503,
+                    headers={"Content-Type": "application/json"},
+                    json_data={"message": "upstream unavailable"},
+                )
+
+        client.files_session.return_value = _ErrSession()
+
+        p = VolumePath("/Volumes/c/s/v/x", service=service)
+        with pytest.raises(OSError, match="503"):
+            p.read_bytes()
 
 
 # ---------------------------------------------------------------------------
@@ -1550,7 +1927,7 @@ class TestS3ServiceArrowFilesystem:
             session_token="tok",
             region="us-east-1",
         )
-        service = S3Service(service=service)
+        service = S3Service(client=client)
         fs = service.arrow_filesystem()
         assert isinstance(fs, pafs.S3FileSystem)
 
@@ -1566,7 +1943,7 @@ class TestS3ServiceArrowFilesystem:
             secret_access_key="secret",
             region="us-east-1",
         )
-        service = S3Service(service=service)
+        service = S3Service(client=client)
         # The override region should land on the pyarrow filesystem;
         # there isn't a public reader on S3FileSystem for the region,
         # but constructing without error is sufficient signal.

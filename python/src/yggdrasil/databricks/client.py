@@ -1032,6 +1032,42 @@ class DatabricksClient(Singleton, URLBased):
             object.__setattr__(self, "_account_client", DAC(config=self.account_config))
         return self._account_client
 
+    def files_session(self) -> "HTTPSession":
+        """Authenticated :class:`HTTPSession` bound to this workspace host.
+
+        Volume / Files-API traffic routes through yggdrasil's own HTTP
+        transport instead of the SDK's ``requests``-based client: the
+        :class:`HTTPSession` owns a per-host keep-alive connection pool,
+        status-aware tiered retry (429 / 5xx with backoff), and — via the
+        :class:`HTTPStream` response body — transparent resume-on-disconnect
+        for SSL ``UNEXPECTED_EOF`` / connection-reset mid-download, the
+        failure modes the SDK's Files client handles poorly.
+
+        :class:`HTTPSession` is itself a process-wide singleton keyed by
+        ``(base_url, verify, …)``, so repeated calls collapse onto one
+        shared pool. ``skip_verify`` flows through to ``verify=False``.
+        """
+        from yggdrasil.http_ import HTTPSession
+
+        return HTTPSession(base_url=self.base_url, verify=not self.skip_verify)
+
+    def files_authorization(self) -> str:
+        """Fresh ``Authorization`` header value for Files-API requests.
+
+        Delegates to the SDK Config's auth flow
+        (:meth:`databricks.sdk.config.Config.authenticate`) so every
+        supported credential type — PAT, OAuth M2M, Azure SP, GCP — and the
+        SDK's own token-refresh caching apply unchanged; only the wire
+        transport is ours. Raises when the resolved auth produces no bearer
+        header (e.g. a misconfigured profile)."""
+        header = self.workspace_config.authenticate().get("Authorization")
+        if not header:
+            raise ValueError(
+                "Databricks auth produced no Authorization header for "
+                f"{self.host!r}; check credentials / profile."
+            )
+        return header
+
     def get_workspace_id(self) -> int:
         if self.workspace_id:
             return self.workspace_id

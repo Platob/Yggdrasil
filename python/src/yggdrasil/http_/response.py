@@ -195,6 +195,8 @@ def _media_type_from_headers(
 def _ensure_media_headers(
     headers: MutableMapping[str, str],
     body: Holder,
+    *,
+    sync_content_length: bool = True,
 ) -> MediaType:
     declared_type = _parse_content_type(headers)
     declared_encoding = _parse_content_encoding(headers)
@@ -218,7 +220,13 @@ def _ensure_media_headers(
     if not declared_encoding and media.codec is not None:
         headers["Content-Encoding"] = media.codec.name
 
-    headers["Content-Length"] = str(body.size)
+    # ``Content-Length`` normally tracks the body. For a bodyless
+    # response (HEAD / 204 / 304) the wire header describes the
+    # would-be-GET resource size while the body is empty by protocol —
+    # syncing to ``body.size`` (0) would erase the size a stat probe
+    # needs, so only fill it in when absent.
+    if sync_content_length or _get_header(headers, "Content-Length") is None:
+        headers["Content-Length"] = str(body.size)
 
     if body.media_type is None and not media.mime_type.is_any_bytes:
         try:
@@ -747,7 +755,10 @@ class HTTPResponse(IO):  # IO inherits Tabular
             self.headers = {}
         return self._cached(
             "media_type",
-            lambda: _ensure_media_headers(self.headers, self.buffer),
+            lambda: _ensure_media_headers(
+                self.headers, self.buffer,
+                sync_content_length=not getattr(self, "_bodyless", False),
+            ),
         )
 
     @media_type.setter
@@ -1460,7 +1471,15 @@ class HTTPResponse(IO):  # IO inherits Tabular
         self._receiver: UserInfo | None = (
             _coerce_userinfo(receiver) if receiver is not None else _default_sender()
         )
-        media = _ensure_media_headers(self.headers, self.buffer)
+        # A HEAD / 204 / 304 response is bodyless by protocol — its
+        # wire ``Content-Length`` describes the resource, not the empty
+        # buffer, so don't let media normalization sync it to 0 (that
+        # would break HEAD-based stat / size probes).
+        method = (getattr(request, "method", "") or "").upper()
+        self._bodyless: bool = method == "HEAD" or int(status_code) in (204, 304)
+        media = _ensure_media_headers(
+            self.headers, self.buffer, sync_content_length=not self._bodyless,
+        )
         self._session: "HTTPSession | None" = None
         self._cache: dict[str, Any] = {}
         self._cache_token: tuple = ()
@@ -1666,9 +1685,15 @@ class HTTPResponse(IO):  # IO inherits Tabular
         if preload_content:
             buffer.read_mv(-1, 0)
             resp.release_conn()
-            actual = str(buffer.size)
-            if resp.headers.get("Content-Length") != actual:
-                resp.headers["Content-Length"] = actual
+            # A HEAD response carries the would-be-GET ``Content-Length``
+            # with an empty body by protocol — don't clobber it with the
+            # 0-byte body size (that breaks size/stat probes). For every
+            # other method the body IS the payload, so reconcile the
+            # header with the decoded length.
+            if request.method.upper() != "HEAD":
+                actual = str(buffer.size)
+                if resp.headers.get("Content-Length") != actual:
+                    resp.headers["Content-Length"] = actual
 
         return resp
 

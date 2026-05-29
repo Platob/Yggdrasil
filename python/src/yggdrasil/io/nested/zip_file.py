@@ -768,10 +768,12 @@ class ZipFile(IO):
                                             break
                                         dst_entry.write(chunk)
                         dst_zf.writestr(options.entry_name, entry_payload)
-            scratch_bytes = scratch.to_bytes()
             self.seek(0)
             self.truncate(0)
-            self.write_bytes(scratch_bytes)
+            # Zero-copy view of the rebuilt archive (scratch is a
+            # separate holder); ``write_bytes`` copies it once into
+            # ``self`` rather than ``to_bytes`` copying a second time.
+            self.write_bytes(scratch.read_mv(-1, 0))
             return
 
         self.seek(0)
@@ -858,10 +860,11 @@ class ZipFile(IO):
                                             break
                                         dst_entry.write(chunk)
                         dst_zf.writestr(entry_name, payload)
-            scratch_bytes = scratch.to_bytes()
             self.seek(0)
             self.truncate(0)
-            self.write_bytes(scratch_bytes)
+            # Zero-copy view of the rebuilt archive — one copy into
+            # ``self`` instead of an extra ``to_bytes`` snapshot.
+            self.write_bytes(scratch.read_mv(-1, 0))
 
 
 # ---------------------------------------------------------------------------

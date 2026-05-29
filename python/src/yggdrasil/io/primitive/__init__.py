@@ -21,8 +21,10 @@ from .csv_file import CSVFile
 from .json_file import JSONFile
 from .ndjson_file import NDJSONFile
 from .xlsx_file import XLSXFile
+from .pickle_file import PickleFile
 
 __all__ = [
     'ArrowIPCFile',
     'ParquetFile', 'CSVFile', 'JSONFile', 'NDJSONFile', 'XLSXFile',
+    'PickleFile',
 ]

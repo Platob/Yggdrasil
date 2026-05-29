@@ -228,14 +228,21 @@ class ParquetFile(IO[bytes, ParquetOptions]):
             return
 
         batch_size = int(options.row_size or 65536)
+        # Column projection over a backend that can range-read (e.g.
+        # VolumePath / S3) seeks to the footer + just the projected
+        # column chunks — fetch only those bytes instead of snapshotting
+        # the whole object. A plain full read keeps the single-GET
+        # snapshot (one big read beats many ranged round trips).
+        holder = getattr(self, "_parent", None)
+        ranged = options.target is not None and getattr(holder, "SUPPORTS_RANGED_RANDOM_ACCESS", False)
         try:
-            stream_ctx = self.arrow_input_stream()
+            stream_ctx = holder.arrow_random_access_file() if ranged else self.arrow_input_stream()
             stream = stream_ctx.__enter__()
         except FileNotFoundError:
             return
         try:
             try:
-                pf = pq.ParquetFile(stream)
+                pf = pq.ParquetFile(stream, pre_buffer=ranged)
             except pa.ArrowInvalid:
                 # Empty or truncated payload — same end state as the
                 # ``size == 0`` short-circuit on the in-memory path.
@@ -267,9 +274,16 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         if self.size_known and self.size == 0:
             return super()._read_arrow_table(options)
 
+        # Range-read the footer + projected column chunks when a target
+        # projection is bound and the backend supports random access;
+        # otherwise snapshot the whole object in one GET. See
+        # :meth:`_read_arrow_batches` for the rationale.
+        holder = getattr(self, "_parent", None)
+        ranged = options.target is not None and getattr(holder, "SUPPORTS_RANGED_RANDOM_ACCESS", False)
         try:
-            with self.arrow_input_stream() as v:
-                with pq.ParquetFile(v) as pf:
+            ctx = holder.arrow_random_access_file() if ranged else self.arrow_input_stream()
+            with ctx as v:
+                with pq.ParquetFile(v, pre_buffer=ranged) as pf:
                     columns = self._projection_columns(options, pf.schema_arrow.names)
                     table = pf.read(
                         columns=columns,

@@ -395,7 +395,33 @@ class Memory(IO):
             self._spill_to_disk(target_capacity=new_cap)
             return
 
-        self._buf.extend(b"\x00" * (new_cap - cur))
+        if cur == 0:
+            # Growing from empty (a fresh buffer seeded from a full
+            # payload — request bodies, ``Memory(binary=...)``, a read
+            # into memory): allocate the zeroed target in one shot. The
+            # general ``extend(b"\x00" * delta)`` below builds a separate
+            # delta-sized zero temporary that the imminent write
+            # immediately overwrites — wasted, and it doubles peak memory
+            # for the common whole-buffer write. There's no existing data
+            # to preserve here, so a single ``bytearray(new_cap)`` gives
+            # the same zero padding at half the peak. Incremental appends
+            # (cur > 0) keep the amortized in-place ``extend``.
+            self._buf = bytearray(new_cap)
+            return
+        try:
+            self._buf.extend(b"\x00" * (new_cap - cur))
+        except BufferError:
+            # A zero-copy reader (e.g. ``arrow_input_stream``) holds a
+            # memoryview into this buffer, which locks it against
+            # in-place resize. Copy-on-write: grow into a fresh buffer,
+            # leaving the old one intact for the exporter. This is
+            # exactly the read-modify-write shape (append / upsert reads
+            # the pre-write bytes through the view while the writer
+            # builds the new object), so the reader keeps the old data
+            # and the writer's bytes land in the new buffer.
+            new_buf = bytearray(new_cap)
+            new_buf[:cur] = self._buf
+            self._buf = new_buf
 
     def truncate(self, n: int) -> int:
         if n < 0:
