@@ -95,6 +95,12 @@ const Icons = {
       <circle cx="12" cy="12" r="1" fill="currentColor" />
     </svg>
   ),
+  functions: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 4h4a3 3 0 013 3M7 12h7" />
+      <path d="M11 4c-2 0-3 1.2-3 4v8c0 2.8-1 4-3 4" />
+    </svg>
+  ),
 };
 
 const NAV_ITEMS = [
@@ -103,6 +109,7 @@ const NAV_ITEMS = [
   { href: "/metrics", label: "Metrics", icon: Icons.metrics },
   { href: "/nodes", label: "Nodes", icon: Icons.nodes },
   { href: "/topology", label: "Topology", icon: Icons.topology },
+  { href: "/functions", label: "Functions", icon: Icons.functions },
   { href: "/dags", label: "DAGs", icon: Icons.dags },
   { href: "/chat", label: "Chat", icon: Icons.chat },
   { href: "/files", label: "Files", icon: Icons.files },

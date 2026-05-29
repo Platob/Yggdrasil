@@ -104,6 +104,22 @@ export function getEnvs(fresh = false): Promise<{ node_id: string; envs: PyEnvEn
   return cachedGet<{ node_id: string; envs: PyEnvEntry[] }>("/api/v2/pyenv", TTL.DEFINITION, jsonFetch, fresh);
 }
 
+export async function createEnv(
+  name: string, python_version: string, dependencies: string[],
+): Promise<{ env: PyEnvEntry }> {
+  const res = await jsonFetch<{ env: PyEnvEntry }>("/api/v2/pyenv", {
+    method: "POST",
+    body: JSON.stringify({ name, python_version, dependencies, env_vars: {} }),
+  });
+  invalidate("pyenv");
+  return res;
+}
+
+export async function deleteEnv(id: number): Promise<void> {
+  await jsonFetch(`/api/v2/pyenv/${id}`, { method: "DELETE" });
+  invalidate("pyenv");
+}
+
 export function getExcelInfo(): Promise<ExcelInfo> {
   return cachedGet<ExcelInfo>("/api/v2/excel/info", TTL.DEFINITION, jsonFetch);
 }
@@ -160,6 +176,11 @@ export async function createFunc(input: CreateFuncInput): Promise<{ func: PyFunc
   });
   invalidate("pyfunc", "stats", "metrics");
   return res;
+}
+
+export async function deleteFunc(id: number): Promise<void> {
+  await jsonFetch(`/api/v2/pyfunc/${id}`, { method: "DELETE" });
+  invalidate("pyfunc", "stats", "metrics");
 }
 
 export async function bulkDeleteFuncs(

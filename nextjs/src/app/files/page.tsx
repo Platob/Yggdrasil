@@ -126,6 +126,7 @@ export default function FilesPage() {
   // Lazy tree state, lifted so refresh / mutation can target one directory
   // without remounting (and losing) the rest of the expanded tree.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [history, setHistory] = useState<string[]>([]);   // expand/collapse trail
   const [children, setChildren] = useState<Record<string, FsEntry[]>>({});
   const [loadingKeys, setLoadingKeys] = useState<Set<string>>(new Set());
   const [errorKeys, setErrorKeys] = useState<Set<string>>(new Set());
@@ -185,19 +186,33 @@ export default function FilesPage() {
     }
   }, []);
 
-  const toggleDir = useCallback((node: string, path: string) => {
+  const toggleDir = useCallback((node: string, path: string, record = true) => {
     const k = dirKey(node, path);
     setExpanded((s) => {
       const n = new Set(s);
-      if (n.has(k)) {
-        n.delete(k);
-      } else {
-        n.add(k);
-        ensureLoaded(node, path);
-      }
+      if (n.has(k)) n.delete(k);
+      else { n.add(k); ensureLoaded(node, path); }
       return n;
     });
+    if (record) setHistory((h) => [...h.slice(-49), k]);
   }, [ensureLoaded]);
+
+  // Previous-action handling: Back reverts the last expand/collapse; Collapse
+  // all clears the tree. Keeps discovery from being a one-way trip.
+  const back = () => {
+    if (!history.length) return;
+    const k = history[history.length - 1];
+    const idx = k.indexOf("::");
+    const node = k.slice(0, idx), path = k.slice(idx + 2);
+    setExpanded((s) => {
+      const n = new Set(s);
+      if (n.has(k)) n.delete(k);
+      else { n.add(k); ensureLoaded(node, path); }
+      return n;
+    });
+    setHistory((h) => h.slice(0, -1));
+  };
+  const collapseAll = () => { setExpanded(new Set()); setHistory([]); };
 
   // Upload a set of {file, relPath} into basePath on a node, with a progress
   // toast and bounded concurrency. Shared by drag-drop and the Upload button.
@@ -458,15 +473,34 @@ export default function FilesPage() {
             Global filesystem across linked nodes — expand a node to stream its memory lazily, drag a folder in to replicate it.
           </p>
         </div>
-        <button
-          onClick={() => fetchNodes(true)}
-          className="px-3 py-1.5 rounded-lg text-xs font-medium text-frost/70 hover:text-frost bg-frost/5 hover:bg-frost/10 border border-frost/10 hover:border-frost/20 transition-all"
-        >
-          <svg className="inline-block mr-1.5 -mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-            <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
-          </svg>
-          Refresh nodes
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={back}
+            disabled={history.length === 0}
+            title="Undo last expand/collapse"
+            className="px-3 py-1.5 rounded-lg text-xs font-medium text-foreground-dim hover:text-foreground bg-white/[0.03] border border-white/[0.06] disabled:opacity-30"
+          >
+            <svg className="inline-block mr-1 -mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="15 18 9 12 15 6" /></svg>
+            Back{history.length ? ` (${history.length})` : ""}
+          </button>
+          <button
+            onClick={collapseAll}
+            disabled={expanded.size === 0}
+            title="Collapse all"
+            className="px-3 py-1.5 rounded-lg text-xs font-medium text-foreground-dim hover:text-foreground bg-white/[0.03] border border-white/[0.06] disabled:opacity-30"
+          >
+            Collapse all
+          </button>
+          <button
+            onClick={() => fetchNodes(true)}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium text-frost/70 hover:text-frost bg-frost/5 hover:bg-frost/10 border border-frost/10 hover:border-frost/20 transition-all"
+          >
+            <svg className="inline-block mr-1.5 -mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10" />
+            </svg>
+            Refresh nodes
+          </button>
+        </div>
       </div>
 
       {/* Node roots */}
