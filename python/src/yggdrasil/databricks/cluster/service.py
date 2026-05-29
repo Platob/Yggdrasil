@@ -348,7 +348,7 @@ class Clusters(DatabricksService):
         found = self.find_cluster(
             cluster_id=cluster_id,
             cluster_name=cluster_name,
-            sources=[ClusterSource.API],
+            sources=[ClusterSource.API, ClusterSource.UI],
             raise_error=False,
         )
 
