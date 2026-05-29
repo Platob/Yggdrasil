@@ -35,6 +35,7 @@ from yggdrasil.arrow.cast import (
     cast_arrow_record_batch_reader,
     cast_arrow_scalar,
     cast_arrow_tabular,
+    conform_arrow_batch,
     get_arrow_nbytes,
     rechunk_arrow_batches,
 )
@@ -539,6 +540,71 @@ class TestCastArrowTabular(ArrowTestCase):
         target = Schema.from_arrow(self.pa.schema([self.pa.field("a", self.pa.int32())]))
         out = cast_arrow_tabular(t, CastOptions(target=target))
         self.assertEqual(out.schema.field("a").type, self.pa.int32())
+
+
+class TestConformArrowBatch(ArrowTestCase):
+    """``conform_arrow_batch`` — reshape a drifted batch to a target schema."""
+
+    def test_identity_passthrough_when_schema_matches(self) -> None:
+        rb = self.record_batch({"a": [1, 2, 3]})
+        out = conform_arrow_batch(rb, rb.schema)
+        self.assertIs(out, rb)
+
+    def test_casts_drifted_types(self) -> None:
+        # binary -> large_binary and int64 -> timestamp are exactly the
+        # cache-file drift this helper exists to reconcile.
+        rb = self.pa.record_batch(
+            [
+                self.pa.array([b"x"], type=self.pa.binary()),
+                self.pa.array([10], type=self.pa.int64()),
+            ],
+            names=["body", "ts"],
+        )
+        target = self.pa.schema([
+            self.pa.field("body", self.pa.large_binary()),
+            self.pa.field("ts", self.pa.timestamp("us", "UTC")),
+        ])
+        out = conform_arrow_batch(rb, target)
+        self.assertTrue(out.schema.equals(target))
+        self.assertEqual(out.column("body").to_pylist(), [b"x"])
+
+    def test_missing_column_materialised_null(self) -> None:
+        rb = self.record_batch({"a": [1, 2]})
+        target = self.pa.schema([
+            self.pa.field("a", self.pa.int64()),
+            self.pa.field("b", self.pa.int64()),
+        ])
+        out = conform_arrow_batch(rb, target)
+        self.assertEqual(out.column("b").to_pylist(), [None, None])
+
+    def test_extra_column_dropped_and_reordered(self) -> None:
+        rb = self.pa.record_batch(
+            [self.pa.array([9]), self.pa.array([1]), self.pa.array([2])],
+            names=["extra", "b", "a"],
+        )
+        target = self.pa.schema([
+            self.pa.field("a", self.pa.int64()),
+            self.pa.field("b", self.pa.int64()),
+        ])
+        out = conform_arrow_batch(rb, target)
+        self.assertEqual(out.schema.names, ["a", "b"])
+        self.assertEqual(out.column("a").to_pylist(), [2])
+
+    def test_drifted_batches_assemble_into_one_table(self) -> None:
+        # The end the helper serves: from_batches across drifted schemas.
+        a = self.pa.record_batch(
+            [self.pa.array([b"a"], type=self.pa.binary())], names=["body"]
+        )
+        b = self.pa.record_batch(
+            [self.pa.array([b"b"], type=self.pa.large_binary())], names=["body"]
+        )
+        with self.assertRaises((self.pa.lib.ArrowInvalid, self.pa.lib.ArrowTypeError)):
+            self.pa.Table.from_batches([a, b])
+        target = a.schema
+        table = self.pa.Table.from_batches(
+            [conform_arrow_batch(x, target) for x in (a, b)]
+        )
+        self.assertEqual(table.num_rows, 2)
 
 
 class TestCastArrowRecordBatchReader(ArrowTestCase):

@@ -79,6 +79,7 @@ __all__ = [
     "cast_arrow_scalar",
     "cast_arrow_tabular",
     "cast_arrow_record_batch_reader",
+    "conform_arrow_batch",
     "default_arrow_scalar",
     "rechunk_arrow_batches",
     "rechunk_arrow_table",
@@ -1092,6 +1093,40 @@ def cast_arrow_tabular(
 ) -> Union[pa.Table, pa.RecordBatch]:
     """Cast pyarrow Table/RecordBatch with skip-cast on schema match."""
     return CastOptions.check(options).cast_arrow(data)
+
+
+def conform_arrow_batch(
+    batch: pa.RecordBatch, schema: pa.Schema,
+) -> pa.RecordBatch:
+    """Return *batch* reshaped to exactly *schema* — columns, order, types.
+
+    Reconciles a batch read off disk with a canonical arrow *schema*:
+    columns are selected and reordered by name (missing ones materialised
+    as all-null, extras dropped) and each is cast to the target type.
+
+    Part files can drift in type across writes — a legacy ``binary`` body
+    vs the current ``large_binary``, an ``int64`` ``received_at`` vs a
+    ``timestamp`` — but ``pa.Table.from_batches`` and the IPC writer both
+    demand byte-identical schemas. Casting every batch through here before
+    they're combined lets heterogeneous parts read and merge as one
+    stream. Returns the batch untouched when it already matches, so the
+    common (no-drift) path stays zero-copy.
+    """
+    if batch.schema.equals(schema):
+        return batch
+    existing = {
+        name: batch.column(i)
+        for i, name in enumerate(batch.schema.names)
+    }
+    arrays = []
+    for field in schema:
+        arr = existing.get(field.name)
+        if arr is None:
+            arr = pa.nulls(batch.num_rows, type=field.type)
+        elif not arr.type.equals(field.type):
+            arr = arr.cast(field.type)
+        arrays.append(arr)
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
 @register_converter(pa.RecordBatchReader, pa.RecordBatchReader)

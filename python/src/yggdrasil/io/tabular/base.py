@@ -1155,7 +1155,21 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
                 or Schema.empty()
             )
             return schema.to_arrow_schema().empty_table()
-        table = pa.Table.from_batches(batches)
+        try:
+            table = pa.Table.from_batches(batches)
+        except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
+            # Part files under this tabular drifted in schema across
+            # writes (e.g. a legacy ``binary`` body vs the current
+            # ``large_binary``, or an ``int64`` timestamp column vs a
+            # proper ``timestamp``). from_batches demands identical
+            # schemas — reconcile by conforming every batch to the
+            # first one's schema before combining; ``cast_arrow_table``
+            # below then projects + casts to the resolved target.
+            from yggdrasil.arrow.cast import conform_arrow_batch
+            target = batches[0].schema
+            table = pa.Table.from_batches(
+                [conform_arrow_batch(b, target) for b in batches]
+            )
         table = options.cast_arrow_table(table)
         table = options.apply_post_read_table(table)
         if options.row_limit is not None and table.num_rows > options.row_limit:
