@@ -108,7 +108,8 @@ let
                 df_name   = Record.FieldOrDefault(Opts, "DfName", "df"),
                 packages  = Record.FieldOrDefault(Opts, "Packages", {}),
                 max_rows  = Record.FieldOrDefault(Opts, "MaxRows", null),
-                timeout   = Record.FieldOrDefault(Opts, "Timeout", null)
+                timeout   = Record.FieldOrDefault(Opts, "Timeout", null),
+                env_vars  = Record.FieldOrDefault(Opts, "EnvVars", [])
             ]
         in
             PostParquet(BaseOr(baseUrl), ApiPrefix & "/python", Body),

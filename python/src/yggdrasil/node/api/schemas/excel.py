@@ -35,6 +35,10 @@ class ExcelQueryRequest(StrictModel):
     packages: list[str] = Field(default_factory=list)
     max_rows: int | None = None
     timeout: float | None = None
+    # Extra environment variables for the run (merged over the node's
+    # own environment) — e.g. secrets / connection settings the snippet
+    # needs without baking them into the code.
+    env_vars: dict[str, str] = Field(default_factory=dict)
 
 
 class ExcelWriteResponse(StrictModel):

@@ -653,6 +653,13 @@ class Path(IO, os.PathLike, ABC):
     def as_media(self, media_type: "Any" = None) -> "Any":
         """Wrap this path in the format leaf for its media type.
 
+        .. deprecated::
+            Use :meth:`open` with a ``media_type`` instead —
+            ``path.open(media_type=...)`` already dispatches to the
+            right format leaf and gives a properly acquired cursor with
+            lifecycle handling. ``as_media`` returns an un-acquired leaf
+            and is kept only for callers that haven't migrated.
+
         Resolution: explicit ``media_type`` first, else the holder's
         :class:`MediaType` (path extension, magic-byte sniff, or
         content-type header). The resolved class is looked up in the
@@ -662,6 +669,14 @@ class Path(IO, os.PathLike, ABC):
         Raises :class:`KeyError` when the path's media type isn't
         registered as a tabular format.
         """
+        import warnings
+
+        warnings.warn(
+            "Path.as_media() is deprecated; use open(media_type=...) which "
+            "dispatches to the format leaf and manages the cursor lifecycle.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return IO.for_holder(self, media_type=media_type)
 
     # ==================================================================

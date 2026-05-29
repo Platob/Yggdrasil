@@ -60,7 +60,24 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 out_path, df_name, max_rows, code_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-ns = runpy.run_path(code_path)
+
+# Prebuilt accessors handed to the snippet, each guarded so a missing /
+# unconfigured backend just leaves the name as None rather than failing
+# the whole run. The snippet can use `databricks` and `spark` directly.
+init_globals = {"databricks": None, "spark": None}
+try:
+    from yggdrasil.databricks import DatabricksClient
+    init_globals["databricks"] = DatabricksClient.current()
+except Exception:
+    pass
+try:
+    from pyspark.sql import SparkSession
+    # Bind only an already-active session — never spin a cluster up here.
+    init_globals["spark"] = SparkSession.getActiveSession()
+except Exception:
+    pass
+
+ns = runpy.run_path(code_path, init_globals=init_globals)
 if df_name not in ns:
     sys.stderr.write("snippet did not define %r" % df_name)
     sys.exit(3)
@@ -163,12 +180,19 @@ class ExcelService:
             if req.packages:
                 self._pip_install(python_bin, req.packages)
 
+            # Run env = the node's environment with the caller's extra
+            # vars layered on top (str-coerced; they arrive as strings).
+            run_env = None
+            if req.env_vars:
+                import os
+                run_env = {**os.environ, **{str(k): str(v) for k, v in req.env_vars.items()}}
+
             timeout = req.timeout or self.settings.max_python_timeout
             try:
                 proc = subprocess.run(
                     [python_bin, "-c", _DRIVER, str(out_file), req.df_name,
                      str(req.max_rows or 0), str(code_file)],
-                    capture_output=True, text=True, timeout=timeout,
+                    capture_output=True, text=True, timeout=timeout, env=run_env,
                 )
             except subprocess.TimeoutExpired:
                 raise APITimeoutError(f"snippet exceeded its {timeout:g}s timeout")
@@ -212,7 +236,8 @@ class ExcelService:
             raise NotFoundError(f"File {path!r} not found")
         media = MediaType.from_(fmt) if fmt else None
         try:
-            return YggPath.from_(str(resolved)).as_media(media).read_arrow_table()
+            with YggPath.from_(str(resolved)).open("rb", media_type=media) as bio:
+                return bio.read_arrow_table()
         except (KeyError, NotImplementedError) as exc:
             raise BadRequestError(
                 f"cannot read {path!r} as a table "
@@ -234,7 +259,8 @@ class ExcelService:
                 table = transport.read_arrow_stream(data)
             else:
                 src = MediaType.from_(ct, default=None) or MediaType.from_("parquet")
-                table = IO(data).as_media(src).read_arrow_table()
+                with IO(data).open("rb", media_type=src) as bio:
+                    table = bio.read_arrow_table()
         except BadRequestError:
             raise
         except Exception as exc:
@@ -247,7 +273,8 @@ class ExcelService:
         # (.csv → CSV, else Parquet); parent dirs are created on write.
         target = MediaType.from_(resolved.suffix.lstrip(".") or "parquet", default=None) \
             or MediaType.from_("parquet")
-        YggPath.from_(str(resolved)).as_media(target).write_arrow_table(table)
+        with YggPath.from_(str(resolved)).open("wb", media_type=target) as bio:
+            bio.write_arrow_table(table)
         return ExcelWriteResponse(
             path=path,
             rows=table.num_rows,

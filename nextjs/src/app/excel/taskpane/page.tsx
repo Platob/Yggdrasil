@@ -26,10 +26,12 @@ export default function TaskPane() {
 
   // run-python state
   const [code, setCode] = useState(
+    "# prebuilt: `databricks` (DatabricksClient.current()), `spark` (active session)\n" +
     "import pandas as pd\ndf = pd.DataFrame({'x': [1, 2, 3], 'y': ['a', 'b', 'c']})",
   );
   const [env, setEnv] = useState("");
   const [packages, setPackages] = useState("");
+  const [envVars, setEnvVars] = useState("");
 
   // files state
   const [cwd, setCwd] = useState("");
@@ -59,10 +61,17 @@ export default function TaskPane() {
   const doRun = useCallback(async () => {
     setStatus({ kind: "busy", msg: "Running…" });
     try {
+      // env vars: "KEY=val, KEY2=val2"
+      const env_vars: Record<string, string> = {};
+      for (const pair of envVars.split(",").map((p) => p.trim()).filter(Boolean)) {
+        const eq = pair.indexOf("=");
+        if (eq > 0) env_vars[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+      }
       const grid = await runPython(base, {
         code,
         env: env.trim() || null,
         packages: packages.split(",").map((p) => p.trim()).filter(Boolean),
+        env_vars,
       });
       await gridToNewSheet(grid, "Ygg Result");
       setStatus({ kind: "ok", msg: `Wrote ${grid.rows.length} rows × ${grid.headers.length} cols` });
@@ -143,6 +152,7 @@ export default function TaskPane() {
           <textarea style={S.code} value={code} onChange={(e) => setCode(e.target.value)} rows={8} />
           <input style={S.input} value={env} onChange={(e) => setEnv(e.target.value)} placeholder="PyEnv name (optional)" />
           <input style={S.input} value={packages} onChange={(e) => setPackages(e.target.value)} placeholder="packages, comma-separated (optional)" />
+          <input style={S.input} value={envVars} onChange={(e) => setEnvVars(e.target.value)} placeholder="env vars: KEY=val, KEY2=val2 (optional)" />
           <button style={S.btnWide} onClick={doRun}>Run → new sheet</button>
         </div>
       )}

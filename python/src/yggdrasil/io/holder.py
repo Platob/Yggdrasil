@@ -3406,6 +3406,12 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     def as_media(self, media_type: Any = None) -> "IO":
         """Return a typed Tabular leaf bound to this buffer's holder.
 
+        .. deprecated::
+            Use :meth:`open` with a ``media_type`` instead —
+            ``holder.open(media_type=...)`` dispatches to the same
+            format leaf and returns an acquired cursor. ``as_media`` is
+            retained for callers that haven't migrated.
+
         Resolution: explicit *media_type* wins; otherwise the buffer's
         stamped media type is used. The leaf borrows the same backing
         storage so durable bytes are shared without a copy. When
@@ -3415,6 +3421,14 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         Raises :class:`KeyError` when no media type can be resolved or
         the resolved type has no registered Tabular leaf.
         """
+        import warnings
+
+        warnings.warn(
+            "IO.as_media() is deprecated; use open(media_type=...) which "
+            "dispatches to the format leaf and returns an acquired cursor.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         mt = (
             MediaType.from_(media_type, default=None)
             if media_type is not None

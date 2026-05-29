@@ -76,7 +76,14 @@ async function arrowToGrid(res: Response): Promise<Grid> {
 
 export async function runPython(
   base: string,
-  body: { code: string; env?: string | null; df_name?: string; packages?: string[]; max_rows?: number | null },
+  body: {
+    code: string;
+    env?: string | null;
+    df_name?: string;
+    packages?: string[];
+    max_rows?: number | null;
+    env_vars?: Record<string, string>;
+  },
 ): Promise<Grid> {
   const res = await fetch(`${normalizeBase(base)}${EXCEL_PREFIX}/python?format=arrow`, {
     method: "POST",

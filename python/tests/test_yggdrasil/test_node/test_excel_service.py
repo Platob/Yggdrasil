@@ -100,6 +100,27 @@ class TestRunPython(unittest.TestCase):
             self.assertIn("timeout", str(ctx.exception).lower())
             self.assertNotIn("runpy", str(ctx.exception))
 
+    def test_env_vars_passed_to_snippet(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _service(Path(d))
+            table = asyncio.run(svc.run_python(ExcelQueryRequest(
+                code="import os\ndf = {'v': [os.environ.get('YGG_EXCEL_TEST', 'missing')]}",
+                env_vars={"YGG_EXCEL_TEST": "hello-env"},
+            )))
+            self.assertEqual(table.column("v").to_pylist(), ["hello-env"])
+
+    def test_builtin_accessors_are_injected(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _service(Path(d))
+            # Referencing `databricks` / `spark` must not raise NameError —
+            # they're prebuilt (None here, since neither backend is live).
+            table = asyncio.run(svc.run_python(ExcelQueryRequest(
+                code="df = {'db': [databricks is None], 'sp': [spark is None]}",
+            )))
+            self.assertEqual(table.num_rows, 1)
+            self.assertIn("db", table.column_names)
+            self.assertIn("sp", table.column_names)
+
     def test_empty_dataframe(self):
         with tempfile.TemporaryDirectory() as d:
             svc = _service(Path(d))
