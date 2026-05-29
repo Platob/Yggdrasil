@@ -1358,7 +1358,13 @@ class HTTPSession(Session):
                 proxy = self._resolve_proxy_for(scheme, host)
                 if proxy:
                     send_headers.update(self._proxy_auth_headers(proxy))
-            body = request.buffer.to_bytes() if request.buffer is not None else None
+            # Zero-copy body: hand http.client a memoryview into the
+            # buffer rather than ``to_bytes()`` (which copies the whole
+            # body). ``sock.sendall`` accepts a memoryview, so a large
+            # PUT — or each multipart part — no longer doubles in memory
+            # on the way to the wire. Re-read per attempt so retries on a
+            # fresh socket still send the full body.
+            body = request.buffer.read_mv(-1, 0) if request.buffer is not None else None
             if body is not None and "Content-Length" not in send_headers:
                 send_headers["Content-Length"] = str(len(body))
             conn.request(request.method, request_path, body=body, headers=send_headers)
