@@ -215,6 +215,21 @@ export interface PyEnvEntry {
   replicated_from: string | null;
 }
 
+export interface PyEnvPackage {
+  name: string;
+  version: string;
+}
+
+export interface PyEnvPackages {
+  env_id: number;
+  name: string;
+  python_version: string;
+  package_count: number;
+  packages: PyEnvPackage[];
+  cached_at: string;
+  error: string | null;
+}
+
 // ── PyFunc ─────────────────────────────────────────────────────────────────
 
 export interface PyFuncEntry {

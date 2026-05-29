@@ -4,8 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { ResourceBar } from "@/components/ResourceBar";
-import { getBackend, getEnvs, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs } from "@/lib/api";
-import type { NodeBackend, NodeCard, PyEnvEntry, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
+import { getBackend, getEnvs, getEnvPackages, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs } from "@/lib/api";
+import type { NodeBackend, NodeCard, PyEnvEntry, PyEnvPackages, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -96,6 +96,31 @@ export default function NodeDetailPage() {
   const [error, setError] = useState(false);
   const [selectedFuncIds, setSelectedFuncIds] = useState<Set<number>>(new Set());
   const [deletingFuncs, setDeletingFuncs] = useState(false);
+  // Lazily-loaded, per-env library listings (the backend TTL-caches the
+  // underlying ``pip list``, so we only fetch on expand). Keyed by env
+  // name — the int64 id can't survive JSON.parse in JS losslessly.
+  const [expandedEnvName, setExpandedEnvName] = useState<string | null>(null);
+  const [envPackages, setEnvPackages] = useState<Record<string, PyEnvPackages>>({});
+  const [loadingEnvPkgs, setLoadingEnvPkgs] = useState(false);
+
+  const toggleEnv = useCallback(async (envName: string) => {
+    if (expandedEnvName === envName) {
+      setExpandedEnvName(null);
+      return;
+    }
+    setExpandedEnvName(envName);
+    if (!envPackages[envName]) {
+      setLoadingEnvPkgs(true);
+      try {
+        const pkgs = await getEnvPackages(envName);
+        setEnvPackages((prev) => ({ ...prev, [envName]: pkgs }));
+      } catch {
+        /* leave unset; UI shows nothing extra */
+      } finally {
+        setLoadingEnvPkgs(false);
+      }
+    }
+  }, [expandedEnvName, envPackages]);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -422,31 +447,65 @@ export default function NodeDetailPage() {
             <p className="text-xs text-muted/60 italic py-4">No environments created</p>
           ) : (
             <div className="space-y-2 max-h-72 overflow-y-auto">
-              {envs.map((env) => (
+              {envs.map((env) => {
+                const expanded = expandedEnvName === env.name;
+                const pkgs = envPackages[env.name];
+                return (
                 <div
                   key={env.id}
                   className="px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04]"
                 >
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-mono font-medium text-foreground">{env.name}</span>
-                    <span
-                      className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
-                      style={{
-                        background: env.status === "ready" ? "rgba(52,211,153,0.1)" : env.status === "error" ? "rgba(244,63,94,0.1)" : "rgba(251,191,36,0.1)",
-                        color: env.status === "ready" ? "var(--emerald)" : env.status === "error" ? "var(--rose)" : "var(--amber)",
-                      }}
-                    >
-                      {env.status}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2 mt-1 text-[10px] text-muted font-mono">
-                    <span>Python {env.python_version}</span>
-                    {env.dependencies.length > 0 && (
-                      <span>{env.dependencies.length} deps</span>
-                    )}
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => toggleEnv(env.name)}
+                    className="w-full text-left"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono font-medium text-foreground flex items-center gap-1.5">
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-muted transition-transform" style={{ transform: expanded ? "rotate(90deg)" : "none" }}>
+                          <polyline points="9 18 15 12 9 6" />
+                        </svg>
+                        {env.name}
+                      </span>
+                      <span
+                        className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded"
+                        style={{
+                          background: env.status === "ready" ? "rgba(52,211,153,0.1)" : env.status === "error" ? "rgba(244,63,94,0.1)" : "rgba(251,191,36,0.1)",
+                          color: env.status === "ready" ? "var(--emerald)" : env.status === "error" ? "var(--rose)" : "var(--amber)",
+                        }}
+                      >
+                        {env.status}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 mt-1 text-[10px] text-muted font-mono">
+                      <span>Python {pkgs?.python_version ?? env.python_version}</span>
+                      <span>·</span>
+                      <span>{pkgs ? `${pkgs.package_count} libraries` : `${env.dependencies.length} deps`}</span>
+                    </div>
+                  </button>
+                  {expanded && (
+                    <div className="mt-2 pt-2 border-t border-white/[0.06]">
+                      {loadingEnvPkgs && !pkgs ? (
+                        <p className="text-[10px] text-muted/60 italic py-1">Loading libraries…</p>
+                      ) : pkgs && pkgs.error ? (
+                        <p className="text-[10px] text-[var(--rose)] font-mono py-1">{pkgs.error}</p>
+                      ) : pkgs && pkgs.packages.length > 0 ? (
+                        <div className="space-y-0.5 max-h-44 overflow-y-auto">
+                          {pkgs.packages.map((p) => (
+                            <div key={p.name} className="flex items-center justify-between text-[10px] font-mono">
+                              <span className="text-foreground-dim">{p.name}</span>
+                              <span className="text-muted">{p.version}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[10px] text-muted/60 italic py-1">No libraries installed</p>
+                      )}
+                    </div>
+                  )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

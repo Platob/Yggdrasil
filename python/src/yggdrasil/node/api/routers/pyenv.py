@@ -10,6 +10,7 @@ from ..schemas.common import StrictModel
 from ..schemas.pyenv import (
     PyEnvCreate,
     PyEnvListResponse,
+    PyEnvPackagesResponse,
     PyEnvResponse,
     PyEnvUpdate,
 )
@@ -44,6 +45,36 @@ async def get_env(
 ) -> PyEnvResponse:
     entry = await service.get(env_id)
     return PyEnvResponse(env=entry)
+
+
+@router.get("/by-name/{name}/packages", response_model=PyEnvPackagesResponse)
+async def list_env_packages_by_name(
+    name: str,
+    refresh: bool = False,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvPackagesResponse:
+    """Like :func:`list_env_packages`, keyed by the env's (unique) name.
+
+    PyEnvs are upserted by name, so the name is a stable string id — the
+    web UI uses this route because the int64 ``env_id`` can't survive a
+    JavaScript ``JSON.parse`` losslessly.
+    """
+    return await service.packages_by_name(name, refresh=refresh)
+
+
+@router.get("/{env_id}/packages", response_model=PyEnvPackagesResponse)
+async def list_env_packages(
+    env_id: int,
+    refresh: bool = False,
+    service: PyEnvService = Depends(get_pyenv_service),
+) -> PyEnvPackagesResponse:
+    """Resolved interpreter version + libraries installed in the env's venv.
+
+    TTL-cached server-side, so polling this for a live view won't flood
+    the node with ``pip list`` subprocesses. ``?refresh=true`` forces a
+    fresh read.
+    """
+    return await service.packages(env_id, refresh=refresh)
 
 
 @router.head("/{env_id}")

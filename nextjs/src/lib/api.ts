@@ -17,6 +17,7 @@ import type {
   NodeCard,
   NodeMeta,
   PyEnvEntry,
+  PyEnvPackages,
   PyFuncEntry,
   PyFuncRunEntry,
   TopologyResponse,
@@ -98,6 +99,12 @@ export function getPeers(): Promise<{ node_id: string; peers: NodeMeta[] }> {
 
 export function getEnvs(): Promise<{ node_id: string; envs: PyEnvEntry[] }> {
   return jsonFetch<{ node_id: string; envs: PyEnvEntry[] }>("/api/v2/pyenv");
+}
+
+export function getEnvPackages(envName: string): Promise<PyEnvPackages> {
+  // Keyed by name (not the int64 id, which JSON.parse can't round-trip
+  // losslessly in JS). Server-side TTL-cached, so polling is cheap.
+  return jsonFetch<PyEnvPackages>(`/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/packages`);
 }
 
 // ── PyFunc ─────────────────────────────────────────────────────────────────

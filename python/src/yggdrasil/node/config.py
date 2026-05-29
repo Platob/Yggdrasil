@@ -86,6 +86,10 @@ class Settings:
     max_log_lines_per_stream: int = 1000
     run_heartbeat_interval: float = 2.0
     run_cancel_grace_seconds: float = 1.5
+    # Seconds a PyEnv's resolved interpreter version + installed-library
+    # listing stays cached before the next ``pip list`` subprocess runs —
+    # keeps the UI's per-env package view from flooding the node.
+    pyenv_packages_cache_ttl: float = 60.0
 
     @property
     def local_clients(self) -> set[str]:
@@ -157,4 +161,5 @@ def get_settings() -> Settings:
         max_log_lines_per_stream=int(os.getenv("YGG_NODE_MAX_LOG_LINES", "1000")),
         run_heartbeat_interval=float(os.getenv("YGG_NODE_RUN_HEARTBEAT", "2.0")),
         run_cancel_grace_seconds=float(os.getenv("YGG_NODE_RUN_CANCEL_GRACE", "1.5")),
+        pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
     )
