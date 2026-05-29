@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import itertools
 from decimal import Decimal
 from functools import partial
 
@@ -159,16 +160,21 @@ class TabularService:
             raise BadRequestError("No columns to write")
 
         resolved = self.fs._resolve(req.path)
+        # Transpose the row-major edit grid to columns in one pass (zip_longest
+        # pads ragged rows with None) rather than re-scanning the rows once per
+        # column.
+        columns_data = list(itertools.zip_longest(*req.rows, fillvalue=None))
         table = pa.table({
-            col: pa.array([row[i] if i < len(row) else None for row in req.rows])
+            col: pa.array(columns_data[i]) if i < len(columns_data) else pa.array([None] * len(req.rows))
             for i, col in enumerate(req.columns)
         })
         # Best-effort: cast back to the file's existing column types so a
         # round-trip through the string-cell editor keeps ints as ints etc.
+        # The footer schema is enough — no need to read a row for it.
         if resolved.exists():
             try:
                 with YggPath.from_(str(resolved)).open("rb") as bio:
-                    orig = bio.read_arrow_table(options=CastOptions(row_limit=1)).schema
+                    orig = bio.collect_schema().to_arrow_schema()
                 table = table.cast(orig)
             except Exception:
                 pass
