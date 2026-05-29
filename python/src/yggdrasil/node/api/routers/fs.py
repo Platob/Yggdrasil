@@ -58,12 +58,15 @@ async def list_nodes(
 @router.get("/ls", response_model=FsListResponse)
 async def list_directory(
     path: str = "",
+    offset: int = 0,
+    limit: int | None = None,
     node: str | None = None,
     service: FsService = Depends(get_fs_service),
     network: NetworkService = Depends(get_network_service),
 ) -> FsListResponse:
-    remote = await _remote(network, service, node, "/ls", params={"path": path})
-    return remote if remote is not None else await service.ls(path)
+    params = {"path": path, "offset": offset, **({"limit": limit} if limit is not None else {})}
+    remote = await _remote(network, service, node, "/ls", params=params)
+    return remote if remote is not None else await service.ls(path, offset=offset, limit=limit)
 
 
 @router.get("/stat", response_model=FsEntry)
@@ -81,15 +84,16 @@ async def stat_path(
 async def read_file(
     path: str,
     max_bytes: int | None = None,
+    offset: int = 0,
     node: str | None = None,
     service: FsService = Depends(get_fs_service),
     network: NetworkService = Depends(get_network_service),
 ) -> FsReadResponse:
     remote = await _remote(
         network, service, node, "/read",
-        params={"path": path, **({"max_bytes": max_bytes} if max_bytes else {})},
+        params={"path": path, "offset": offset, **({"max_bytes": max_bytes} if max_bytes else {})},
     )
-    return remote if remote is not None else await service.read(path, max_bytes=max_bytes)
+    return remote if remote is not None else await service.read(path, max_bytes=max_bytes, offset=offset)
 
 
 @router.post("/write", response_model=FsEntry)

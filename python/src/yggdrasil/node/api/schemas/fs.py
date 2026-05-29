@@ -15,6 +15,9 @@ class FsListResponse(StrictModel):
     node_id: str
     path: str
     entries: list[FsEntry]
+    # Paging: total entries in the directory, and the window this page covers.
+    total: int = 0
+    offset: int = 0
 
 
 class FsReadResponse(StrictModel):
@@ -22,8 +25,9 @@ class FsReadResponse(StrictModel):
     content: str
     encoding: str = "utf-8"
     size: int = 0
-    # True when ``size`` exceeds the read cap and ``content`` holds only the
-    # leading slice. Consumers should fetch /fs/stream for the whole file.
+    # Byte offset this window starts at (for ranged reads).
+    offset: int = 0
+    # True when there are more bytes after this window (offset+len < size).
     truncated: bool = False
 
 

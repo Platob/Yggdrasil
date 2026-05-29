@@ -470,8 +470,9 @@ export async function writeTabular(
 }
 
 // Arrow IPC preview URL — fetched + decoded by lib/arrow.fetchArrowTable.
-export function tabularPreviewArrowUrl(path: string, limit = 200, node?: string): string {
-  return `/api/v2/tabular/preview.arrow?path=${encodeURIComponent(path)}&limit=${limit}${nodeParam(node)}`;
+// ``offset`` reads a row page so the grid can stream windows of a large table.
+export function tabularPreviewArrowUrl(path: string, limit = 200, offset = 0, node?: string): string {
+  return `/api/v2/tabular/preview.arrow?path=${encodeURIComponent(path)}&limit=${limit}&offset=${offset}${nodeParam(node)}`;
 }
 
 export function isWorkbookName(name: string): boolean {
@@ -486,10 +487,11 @@ export function getWorkbookSheets(path: string, node?: string): Promise<{ node_i
 }
 
 export function workbookReadArrowUrl(
-  path: string, sheet: string, opts: { n_rows?: number; node?: string } = {},
+  path: string, sheet: string, opts: { n_rows?: number; skip_rows?: number; node?: string } = {},
 ): string {
   const n = opts.n_rows ? `&n_rows=${opts.n_rows}` : "";
-  return `/api/v2/workbook/read?path=${encodeURIComponent(path)}&sheet=${encodeURIComponent(sheet)}${n}${nodeParam(opts.node)}`;
+  const s = opts.skip_rows ? `&skip_rows=${opts.skip_rows}` : "";
+  return `/api/v2/workbook/read?path=${encodeURIComponent(path)}&sheet=${encodeURIComponent(sheet)}${n}${s}${nodeParam(opts.node)}`;
 }
 
 // Surgical cell edits (1-based) — preserves formulas/formatting/other sheets.

@@ -29,6 +29,7 @@ import {
 import { fetchArrowTable } from "@/lib/arrow";
 
 const EDIT_CAP = 2000; // rows we'll load into an editable grid
+const PAGE = 100;      // row page size for read-only viewports
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -68,6 +69,8 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const [edited, setEdited] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [page, setPage] = useState(0);   // read-only viewport page
+  const [total, setTotal] = useState(0); // total data rows (for paging)
 
   const decodeInto = useCallback(async (url: string) => {
     const t = await fetchArrowTable(url);
@@ -88,7 +91,11 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
       const dataRows = dim ? Math.max(0, dim.rows - 1) : 0;
       const editable = dataRows <= EDIT_CAP;
       setReadOnly(!editable);
-      await decodeInto(workbookReadArrowUrl(path, sheet, { n_rows: editable ? undefined : EDIT_CAP, node }));
+      setTotal(dataRows);
+      setPage(0);
+      // Editable sheets load whole (so a save covers every row); large sheets
+      // stream the first page and page from there.
+      await decodeInto(workbookReadArrowUrl(path, sheet, editable ? { node } : { n_rows: PAGE, skip_rows: 0, node }));
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to read sheet");
     } finally {
@@ -114,8 +121,10 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
         setInfo(meta);
         if (meta.schema_error) { setError(meta.schema_error); return; }
         setReadOnly(!meta.editable);
-        const limit = meta.editable && meta.row_count ? meta.row_count : 200;
-        await decodeInto(tabularPreviewArrowUrl(path, limit, node));
+        setTotal(meta.row_count ?? 0);
+        setPage(0);
+        const limit = meta.editable && meta.row_count ? meta.row_count : PAGE;
+        await decodeInto(tabularPreviewArrowUrl(path, limit, 0, node));
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to read table");
@@ -127,6 +136,25 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   useEffect(() => { load(); }, [load]);
 
   const switchSheet = (sheet: string) => { setActiveSheet(sheet); loadSheet(sheet, sheets); };
+
+  // Stream a read-only viewport page (Arrow window) without reloading metadata.
+  const goToPage = useCallback(async (p: number) => {
+    if (p < 0 || p * PAGE >= total) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const offset = p * PAGE;
+      const url = isWorkbook
+        ? workbookReadArrowUrl(path, activeSheet, { n_rows: PAGE, skip_rows: offset, node })
+        : tabularPreviewArrowUrl(path, PAGE, offset, node);
+      await decodeInto(url);
+      setPage(p);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "failed to load page");
+    } finally {
+      setLoading(false);
+    }
+  }, [isWorkbook, path, activeSheet, node, total, decodeInto]);
 
   const setCell = (r: number, c: number, value: string) => {
     setGrid((g) => { const next = g.map((row) => row.slice()); next[r][c] = value; return next; });
@@ -270,7 +298,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
               <tbody>
                 {grid.map((row, ri) => (
                   <tr key={ri} className="hover:bg-white/[0.02]">
-                    <td className="px-2 py-1 text-right text-muted/40 border-b border-white/[0.03] select-none">{ri}</td>
+                    <td className="px-2 py-1 text-right text-muted/40 border-b border-white/[0.03] select-none">{readOnly ? page * PAGE + ri : ri}</td>
                     {row.map((cell, ci) => (
                       <td key={ci} className="border-b border-white/[0.03] p-0">
                         {readOnly ? (
@@ -304,6 +332,23 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
             </button>
           )}
           {dirty && <span className="text-[10px] text-amber/80 font-mono">unsaved edits</span>}
+          {readOnly && total > PAGE && (
+            <div className="flex items-center gap-2 text-[10px] font-mono text-muted">
+              <button
+                onClick={() => goToPage(page - 1)}
+                disabled={page === 0 || loading}
+                className="px-2 py-1 rounded border border-white/[0.08] hover:text-foreground disabled:opacity-30"
+              >‹ prev</button>
+              <span className="text-foreground/70">
+                rows {page * PAGE + 1}–{Math.min((page + 1) * PAGE, total)} of {total}
+              </span>
+              <button
+                onClick={() => goToPage(page + 1)}
+                disabled={(page + 1) * PAGE >= total || loading}
+                className="px-2 py-1 rounded border border-white/[0.08] hover:text-foreground disabled:opacity-30"
+              >next ›</button>
+            </div>
+          )}
           <a href={fsDownloadUrl(path, node)} className="px-4 py-2 rounded-lg text-xs font-semibold bg-frost/10 text-frost border border-frost/20 hover:bg-frost/20">
             Download
           </a>

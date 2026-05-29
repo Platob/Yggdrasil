@@ -44,30 +44,33 @@ class TabularService:
     async def inspect(self, path: str) -> TabularInspect:
         return await run_in_threadpool(partial(self._inspect, path))
 
-    async def preview(self, path: str, limit: int) -> TabularPreview:
-        return await run_in_threadpool(partial(self._preview, path, limit))
+    async def preview(self, path: str, limit: int, offset: int = 0) -> TabularPreview:
+        return await run_in_threadpool(partial(self._preview, path, limit, offset))
 
     async def write(self, req: TabularWriteRequest) -> TabularWriteResponse:
         return await run_in_threadpool(partial(self._write, req))
 
     # -- Arrow IPC preview --------------------------------------------------
 
-    async def preview_arrow(self, path: str, limit: int) -> bytes:
-        """Bounded preview as an Arrow IPC stream — no JSON/Python row
-        materialization. The frontend decodes columns directly."""
-        return await run_in_threadpool(partial(self._preview_arrow, path, limit))
+    async def preview_arrow(self, path: str, limit: int, offset: int = 0) -> bytes:
+        """Bounded, paged preview as an Arrow IPC stream — no JSON/Python row
+        materialization. ``offset`` reads a row window so the grid can page."""
+        return await run_in_threadpool(partial(self._preview_arrow, path, limit, offset))
 
-    def _preview_arrow(self, path: str, limit: int) -> bytes:
+    def _preview_arrow(self, path: str, limit: int, offset: int = 0) -> bytes:
         from ... import transport
         resolved = self.fs._resolve(path)
         if not resolved.exists() or resolved.is_dir():
             raise NotFoundError(f"File not found: {path!r}")
         limit = max(1, min(limit, self.settings.tabular_preview_max_rows))
+        offset = max(0, offset)
         try:
             with YggPath.from_(str(resolved)).open("rb") as bio:
-                table = bio.read_arrow_table(options=CastOptions(row_limit=limit))
+                table = bio.read_arrow_table(options=CastOptions(row_limit=offset + limit))
         except Exception as exc:
             raise BadRequestError(f"Cannot read {path!r} as a table: {exc}")
+        if offset:
+            table = table.slice(offset, limit)
         return transport.write_arrow_stream_bytes(table)
 
     # -- Workbook (xlsx) ----------------------------------------------------
@@ -183,21 +186,21 @@ class TabularService:
             schema_error=schema_error,
         )
 
-    def _preview(self, path: str, limit: int) -> TabularPreview:
+    def _preview(self, path: str, limit: int, offset: int = 0) -> TabularPreview:
         resolved = self.fs._resolve(path)
         if not resolved.exists() or resolved.is_dir():
             raise NotFoundError(f"File not found: {path!r}")
         limit = max(1, min(limit, self.settings.tabular_preview_max_rows))
+        offset = max(0, offset)
 
         try:
             with YggPath.from_(str(resolved)).open("rb") as bio:
-                table = bio.read_arrow_table(options=CastOptions(row_limit=limit + 1))
+                table = bio.read_arrow_table(options=CastOptions(row_limit=offset + limit + 1))
         except Exception as exc:
             raise BadRequestError(f"Cannot read {path!r} as a table: {exc}")
 
-        truncated = table.num_rows > limit
-        if truncated:
-            table = table.slice(0, limit)
+        truncated = table.num_rows > offset + limit
+        table = table.slice(offset, limit)
 
         # Build rows column-wise: one to_pylist per column (vectorized) then a
         # zip-transpose, and skip the per-cell coercion entirely for columns

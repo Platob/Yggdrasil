@@ -69,7 +69,7 @@ class FsService:
             raise NotFoundError(f"Path not found: {path!r}")
         return self._entry(resolved)
 
-    async def ls(self, path: str = "") -> FsListResponse:
+    async def ls(self, path: str = "", *, offset: int = 0, limit: int | None = None) -> FsListResponse:
         resolved = self._resolve(path)
         if not resolved.exists():
             raise NotFoundError(f"Directory not found: {path!r}")
@@ -77,11 +77,12 @@ class FsService:
             raise ForbiddenError(f"Path is not a directory: {path!r}")
 
         # os.scandir caches each entry's type (one readdir, no per-child stat
-        # for is_dir) and hands back a stat with a single syscall — versus
-        # iterdir()+_entry which stat'd every child 3-4×. This is the hot path
-        # behind the lazy global-fs tree, so the difference is felt on expand.
+        # for is_dir) and hands back a stat with a single syscall. Collect raw
+        # tuples, sort, then build FsEntry pydantic models for ONLY the
+        # requested page — a 100k-entry directory pages without constructing
+        # 100k models.
         root_str = str(self._root.resolve())
-        entries: list[FsEntry] = []
+        raw: list[tuple[bool, str, str, int, float]] = []
         with os.scandir(resolved) as it:
             for de in it:
                 try:
@@ -89,16 +90,20 @@ class FsService:
                     st = de.stat()
                 except OSError:
                     continue
-                entries.append(FsEntry(
-                    path=os.path.relpath(de.path, root_str),
-                    name=de.name,
-                    is_dir=is_dir,
-                    size=0 if is_dir else st.st_size,
-                    modified_at=dt.datetime.fromtimestamp(
-                        st.st_mtime, tz=dt.timezone.utc
-                    ).isoformat(),
+                raw.append((
+                    is_dir, de.name, os.path.relpath(de.path, root_str),
+                    0 if is_dir else st.st_size, st.st_mtime,
                 ))
-        entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
+        raw.sort(key=lambda r: (not r[0], r[1].lower()))
+        total = len(raw)
+        window = raw[offset:offset + limit] if limit is not None else raw[offset:]
+        entries = [
+            FsEntry(
+                path=rel, name=name, is_dir=is_dir, size=size,
+                modified_at=dt.datetime.fromtimestamp(mtime, tz=dt.timezone.utc).isoformat(),
+            )
+            for (is_dir, name, rel, size, mtime) in window
+        ]
 
         try:
             display = str(resolved.relative_to(self._root))
@@ -111,9 +116,11 @@ class FsService:
             node_id=self.settings.node_id,
             path=display,
             entries=entries,
+            total=total,
+            offset=offset,
         )
 
-    async def read(self, path: str, *, max_bytes: int | None = None) -> FsReadResponse:
+    async def read(self, path: str, *, max_bytes: int | None = None, offset: int = 0) -> FsReadResponse:
         resolved = self._resolve(path)
         if not resolved.exists():
             raise NotFoundError(f"File not found: {path!r}")
@@ -121,16 +128,20 @@ class FsService:
             raise ForbiddenError(f"Cannot read a directory as a file: {path!r}")
 
         # Bound the read: never pull more than the cap into memory just to
-        # preview. A caller may ask for a smaller window but not a larger one.
+        # preview. A caller may ask for a smaller window but not a larger one,
+        # and ``offset`` reads a byte range so a remote NodePath can page.
         cap = self.settings.max_read_bytes if max_bytes is None else max_bytes
         cap = max(1, min(cap, self.settings.max_read_bytes))
+        offset = max(0, offset)
         full_size = resolved.stat().st_size
-        # Read cap+1 so we can tell the file was longer without loading it all.
+        # Read cap+1 so we can tell there's more without loading it all.
         with open(resolved, "rb") as fh:
+            if offset:
+                fh.seek(offset)
             raw = fh.read(cap + 1)
-        truncated = len(raw) > cap
-        if truncated:
+        if len(raw) > cap:
             raw = raw[:cap]
+        truncated = offset + len(raw) < full_size
 
         try:
             content = raw.decode("utf-8")
@@ -158,6 +169,7 @@ class FsService:
             content=content,
             encoding=encoding,
             size=full_size,
+            offset=offset,
             truncated=truncated,
         )
 

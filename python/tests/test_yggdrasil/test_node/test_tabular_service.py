@@ -87,6 +87,21 @@ class TestPreview(unittest.TestCase):
             self.assertTrue(prev.truncated)
             self.assertEqual(prev.rows[0], [0, "n0"])
 
+    def test_offset_pages_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            _write_parquet(home, "data.parquet", 30)
+            svc = _service(home)
+            p0 = asyncio.run(svc.preview("data.parquet", limit=10, offset=0))
+            p1 = asyncio.run(svc.preview("data.parquet", limit=10, offset=10))
+            self.assertEqual(p0.rows[0][0], 0)        # first page starts at id 0
+            self.assertEqual(p1.rows[0][0], 10)       # second page starts at id 10
+            self.assertEqual(len(p1.rows), 10)
+            self.assertTrue(p1.truncated)             # more after rows 10–19
+            last = asyncio.run(svc.preview("data.parquet", limit=10, offset=25))
+            self.assertEqual(len(last.rows), 5)
+            self.assertFalse(last.truncated)
+
     def test_limit_clamped_to_cap(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)

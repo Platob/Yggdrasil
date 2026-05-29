@@ -28,30 +28,32 @@ async def inspect(
 async def preview(
     path: str,
     limit: int = 100,
+    offset: int = 0,
     node: str | None = None,
     service: TabularService = Depends(get_tabular_service),
     network: NetworkService = Depends(get_network_service),
 ) -> TabularPreview:
     if node and node != service.settings.node_id:
-        return await network.proxy_json(node, "GET", "/api/v2/tabular/preview", params={"path": path, "limit": limit})
-    return await service.preview(path, limit)
+        return await network.proxy_json(node, "GET", "/api/v2/tabular/preview", params={"path": path, "limit": limit, "offset": offset})
+    return await service.preview(path, limit, offset)
 
 
 @router.get("/preview.arrow")
 async def preview_arrow(
     path: str,
     limit: int = 200,
+    offset: int = 0,
     node: str | None = None,
     service: TabularService = Depends(get_tabular_service),
     network: NetworkService = Depends(get_network_service),
 ) -> Response:
-    """Bounded preview as an Arrow IPC stream — the fast wire for the grid."""
+    """Bounded, paged preview as an Arrow IPC stream — the fast wire for the grid."""
     if node and node != service.settings.node_id:
         return StreamingResponse(
-            network.proxy_stream(node, "/api/v2/tabular/preview.arrow", {"path": path, "limit": limit}),
+            network.proxy_stream(node, "/api/v2/tabular/preview.arrow", {"path": path, "limit": limit, "offset": offset}),
             media_type=CONTENT_TYPE_ARROW_STREAM,
         )
-    data = await service.preview_arrow(path, limit)
+    data = await service.preview_arrow(path, limit, offset)
     return Response(content=data, media_type=CONTENT_TYPE_ARROW_STREAM)
 
 
