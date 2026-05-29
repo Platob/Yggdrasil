@@ -51,3 +51,36 @@ class TabularWriteResponse(StrictModel):
     rows: int
     columns: int
     bytes_written: int
+
+
+# -- Workbook (xlsx) ---------------------------------------------------------
+
+class WorkbookSheet(StrictModel):
+    name: str
+    rows: int
+    cols: int
+    visible: bool = True
+
+
+class WorkbookSheets(StrictModel):
+    node_id: str
+    path: str
+    sheets: list[WorkbookSheet]
+
+
+class WorkbookEditRequest(StrictModel):
+    path: str
+    sheet: str
+    create: bool = False
+    # A batch of (row, col, value) cell edits (1-based)...
+    cells: list[tuple[int, int, Any]] | None = None
+    # ...or a rectangular block written from (start_row, start_col) (1-based).
+    start_row: int | None = None
+    start_col: int | None = None
+    values: list[list[Any]] | None = None
+
+
+class WorkbookEditResponse(StrictModel):
+    path: str
+    sheet: str
+    cells_written: int

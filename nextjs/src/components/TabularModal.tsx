@@ -1,29 +1,50 @@
 "use client";
 
-// Standalone, reusable tabular viewer/editor. Given any node + path it loads
-// the schema + a bounded row window from /api/v2/tabular and renders a metadata
-// header plus a grid. Small files (under the node's preview cap → `editable`)
-// can be edited in place and saved back; larger files are read-only previews.
+// Standalone, reusable tabular / workbook editor. Renders any node+path table
+// from the backend's Arrow-IPC wire (no JSON row materialization), with a
+// metadata header and an editable grid:
+//   - parquet/csv/json/…  -> /tabular (inspect + preview.arrow), save rewrites
+//     the whole bounded file via /tabular/write.
+//   - xlsx/xls            -> /workbook (sheet tabs + read.arrow per sheet),
+//     edits saved surgically via /workbook/edit (formulas/other sheets kept).
 //
-// It's deliberately decoupled from the files page so runs, DAGs, and node
-// artifacts can open the same editor — and so it can grow into the full
-// Excel-like editor (formulas, sorting, column ops) without touching callers.
+// Decoupled from the files page so runs/DAGs/artifacts can open it, and built
+// to grow into the full Excel grid (virtualization, formulas) without touching
+// callers.
 
 import { useCallback, useEffect, useState } from "react";
 import {
   getTabularInspect,
-  getTabularPreview,
+  tabularPreviewArrowUrl,
   writeTabular,
+  isWorkbookName,
+  getWorkbookSheets,
+  workbookReadArrowUrl,
+  editWorkbook,
   fsDownloadUrl,
   type TabularInspect,
   type TabularCell,
+  type WorkbookSheet,
 } from "@/lib/api";
+import { fetchArrowTable } from "@/lib/arrow";
+
+const EDIT_CAP = 2000; // rows we'll load into an editable grid
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+// Excel-like cell coercion for save: blank -> null, =.. -> formula, numeric
+// strings -> numbers, else the raw string.
+function coerce(v: string): TabularCell {
+  if (v === "") return null;
+  if (v.startsWith("=")) return v;
+  if (/^-?\d+$/.test(v)) return Number(v);
+  if (/^-?\d*\.\d+$/.test(v)) return Number(v);
+  return v;
 }
 
 interface Props {
@@ -35,53 +56,81 @@ interface Props {
 }
 
 export default function TabularModal({ node, nodeLabel, path, name, onClose }: Props) {
+  const isWorkbook = isWorkbookName(name);
   const [info, setInfo] = useState<TabularInspect | null>(null);
-  const [columns, setColumns] = useState<string[]>([]);
+  const [sheets, setSheets] = useState<WorkbookSheet[]>([]);
+  const [activeSheet, setActiveSheet] = useState<string>("");
+  const [columns, setColumns] = useState<{ name: string; type: string }[]>([]);
   const [grid, setGrid] = useState<string[][]>([]);
-  const [truncated, setTruncated] = useState(false);
+  const [readOnly, setReadOnly] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [dirty, setDirty] = useState(false);
+  const [edited, setEdited] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  const decodeInto = useCallback(async (url: string) => {
+    const t = await fetchArrowTable(url);
+    setColumns(t.columns);
+    setGrid(t.rows.map((r) => r.map((v) => (v === null || v === undefined ? "" : String(v)))));
+  }, []);
+
+  // ``dims`` is passed explicitly (never read from `sheets` state) so this
+  // callback stays stable — otherwise it would re-create whenever sheets load
+  // and retrigger the load effect in a loop.
+  const loadSheet = useCallback(async (sheet: string, dims: WorkbookSheet[]) => {
+    setLoading(true);
+    setError(null);
+    setEdited(new Set());
+    setSaved(false);
+    try {
+      const dim = dims.find((s) => s.name === sheet);
+      const dataRows = dim ? Math.max(0, dim.rows - 1) : 0;
+      const editable = dataRows <= EDIT_CAP;
+      setReadOnly(!editable);
+      await decodeInto(workbookReadArrowUrl(path, sheet, { n_rows: editable ? undefined : EDIT_CAP, node }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "failed to read sheet");
+    } finally {
+      setLoading(false);
+    }
+  }, [path, node, decodeInto]);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
-    setDirty(false);
+    setEdited(new Set());
     setSaved(false);
     try {
-      const meta = await getTabularInspect(path, node);
-      setInfo(meta);
-      if (meta.schema_error) {
-        setError(meta.schema_error);
-        return;
+      if (isWorkbook) {
+        const res = await getWorkbookSheets(path, node);
+        setSheets(res.sheets);
+        const first = res.sheets[0]?.name ?? "";
+        setActiveSheet(first);
+        if (first) await loadSheet(first, res.sheets);
+        else setLoading(false);
+      } else {
+        const meta = await getTabularInspect(path, node);
+        setInfo(meta);
+        if (meta.schema_error) { setError(meta.schema_error); return; }
+        setReadOnly(!meta.editable);
+        const limit = meta.editable && meta.row_count ? meta.row_count : 200;
+        await decodeInto(tabularPreviewArrowUrl(path, limit, node));
       }
-      // Editable files fit under the cap — pull every row so a save rewrites
-      // the whole file; otherwise just a bounded read-only window.
-      const limit = meta.editable && meta.row_count ? meta.row_count : 200;
-      const prev = await getTabularPreview(path, limit, node);
-      setColumns(prev.columns.map((c) => c.name));
-      setGrid(prev.rows.map((r) => r.map((v) => (v === null || v === undefined ? "" : String(v)))));
-      setTruncated(prev.truncated);
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to read table");
     } finally {
-      setLoading(false);
+      if (!isWorkbook) setLoading(false);
     }
-  }, [path, node]);
+  }, [isWorkbook, path, node, loadSheet, decodeInto]);
 
   useEffect(() => { load(); }, [load]);
 
-  const editable = !!info?.editable && !truncated;
+  const switchSheet = (sheet: string) => { setActiveSheet(sheet); loadSheet(sheet, sheets); };
 
   const setCell = (r: number, c: number, value: string) => {
-    setGrid((g) => {
-      const next = g.map((row) => row.slice());
-      next[r][c] = value;
-      return next;
-    });
-    setDirty(true);
+    setGrid((g) => { const next = g.map((row) => row.slice()); next[r][c] = value; return next; });
+    setEdited((e) => new Set(e).add(`${r},${c}`));
     setSaved(false);
   };
 
@@ -89,10 +138,19 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     setSaving(true);
     setError(null);
     try {
-      // Empty cells become null so numeric columns re-cast cleanly.
-      const rows: TabularCell[][] = grid.map((row) => row.map((v) => (v === "" ? null : v)));
-      await writeTabular(path, columns, rows, node);
-      setDirty(false);
+      if (isWorkbook) {
+        // Surgical: only the cells the user touched (xlsx is 1-based, row 1 is
+        // the header, so grid (r,c) -> sheet (r+2, c+1)).
+        const cells = [...edited].map((k) => {
+          const [r, c] = k.split(",").map(Number);
+          return [r + 2, c + 1, coerce(grid[r][c])] as [number, number, TabularCell];
+        });
+        if (cells.length) await editWorkbook(path, activeSheet, cells, node);
+      } else {
+        const rows: TabularCell[][] = grid.map((row) => row.map(coerce));
+        await writeTabular(path, columns.map((c) => c.name), rows, node);
+      }
+      setEdited(new Set());
       setSaved(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : "save failed");
@@ -100,6 +158,27 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
       setSaving(false);
     }
   };
+
+  const dirty = edited.size > 0;
+  const meta: [string, string][] = isWorkbook
+    ? [
+        ["kind", "workbook"],
+        ["sheets", String(sheets.length)],
+        ["active rows", String(sheets.find((s) => s.name === activeSheet)?.rows ?? "--")],
+        ["columns", String(columns.length)],
+        ["node", nodeLabel ?? node ?? "local"],
+        ["mode", readOnly ? "read-only" : "editable"],
+      ]
+    : info
+      ? [
+          ["format", info.media_type.split(/[/.]/).pop() ?? "--"],
+          ["columns", String(info.column_count)],
+          ["rows", info.row_count != null ? String(info.row_count) : "large"],
+          ["size", formatSize(info.size_bytes)],
+          ["schema", info.schema_hash || "--"],
+          ["node", nodeLabel ?? node ?? "local"],
+        ]
+      : [];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
@@ -113,15 +192,14 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                 <rect x="3" y="3" width="18" height="18" rx="2" /><line x1="3" y1="9" x2="21" y2="9" /><line x1="9" y1="3" x2="9" y2="21" />
               </svg>
               <h3 className="text-sm font-mono font-semibold text-foreground truncate">{name}</h3>
-              {editable
-                ? <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald/15 text-emerald">editable</span>
-                : <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-white/[0.06] text-muted">read-only</span>}
+              <span className={`text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded ${readOnly ? "bg-white/[0.06] text-muted" : "bg-emerald/15 text-emerald"}`}>
+                {readOnly ? "read-only" : "editable"}
+              </span>
+              {isWorkbook && <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-frost/15 text-frost">arrow</span>}
             </div>
-            {info && (
-              <p className="text-[11px] text-muted font-mono truncate mt-1" title={info.source_url}>
-                <span className="text-frost/70">{nodeLabel ?? node ?? "local"}</span>{" : "}{info.source_url}
-              </p>
-            )}
+            <p className="text-[11px] text-muted font-mono truncate mt-1" title={info?.source_url}>
+              <span className="text-frost/70">{nodeLabel ?? node ?? "local"}</span>{" : "}{info?.source_url ?? path}
+            </p>
           </div>
           <button onClick={onClose} className="text-muted hover:text-foreground shrink-0 ml-4">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -130,17 +208,10 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
           </button>
         </div>
 
-        {/* Metadata strip — everything about the source at a glance */}
-        {info && (
+        {/* Metadata strip */}
+        {meta.length > 0 && (
           <div className="grid grid-cols-2 md:grid-cols-6 gap-2 shrink-0 text-[10px] font-mono">
-            {[
-              ["format", info.media_type.split(/[/.]/).pop() ?? "--"],
-              ["columns", String(info.column_count)],
-              ["rows", info.row_count != null ? String(info.row_count) : "large"],
-              ["size", formatSize(info.size_bytes)],
-              ["schema", info.schema_hash || "--"],
-              ["node", nodeLabel ?? node ?? "local"],
-            ].map(([k, v]) => (
+            {meta.map(([k, v]) => (
               <div key={k} className="rounded bg-white/[0.03] border border-white/[0.06] px-2 py-1.5 min-w-0">
                 <div className="text-muted/60 uppercase tracking-wider text-[9px]">{k}</div>
                 <div className="text-foreground/80 truncate">{v}</div>
@@ -149,13 +220,32 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
           </div>
         )}
 
-        {truncated && (
-          <div className="shrink-0 rounded bg-amber/[0.06] border border-amber/15 px-3 py-1.5 text-[10px] font-mono text-amber/90">
-            Read-only — file exceeds the editable row cap. Showing the first {grid.length} rows. Download for the full file.
+        {/* Sheet tabs (workbook) */}
+        {isWorkbook && sheets.length > 0 && (
+          <div className="flex items-center gap-1 shrink-0 overflow-x-auto">
+            {sheets.map((s) => (
+              <button
+                key={s.name}
+                onClick={() => switchSheet(s.name)}
+                className={`px-3 py-1 rounded-t text-[11px] font-mono whitespace-nowrap border-b-2 ${
+                  s.name === activeSheet
+                    ? "text-emerald border-emerald bg-emerald/[0.06]"
+                    : "text-muted border-transparent hover:text-foreground"
+                }`}
+              >
+                {s.name} <span className="text-muted/50">{s.rows}×{s.cols}</span>
+              </button>
+            ))}
           </div>
         )}
 
-        {/* Body */}
+        {readOnly && !loading && !error && (
+          <div className="shrink-0 rounded bg-amber/[0.06] border border-amber/15 px-3 py-1.5 text-[10px] font-mono text-amber/90">
+            Read-only — over the {EDIT_CAP}-row editable cap. Showing the first {grid.length} rows; download for the full file.
+          </div>
+        )}
+
+        {/* Grid */}
         <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30">
           {loading ? (
             <div className="flex items-center justify-center py-16">
@@ -170,10 +260,9 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
               <thead className="sticky top-0 bg-[#0d1117] z-10">
                 <tr>
                   <th className="px-2 py-1.5 text-right text-muted/40 border-b border-white/[0.06] w-10">#</th>
-                  {columns.map((c, ci) => (
+                  {columns.map((col, ci) => (
                     <th key={ci} className="px-2 py-1.5 text-left text-frost/80 border-b border-white/[0.06] whitespace-nowrap">
-                      {c}
-                      <span className="ml-1.5 text-muted/50 font-normal">{info?.columns[ci]?.type}</span>
+                      {col.name}<span className="ml-1.5 text-muted/50 font-normal">{col.type}</span>
                     </th>
                   ))}
                 </tr>
@@ -184,15 +273,15 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                     <td className="px-2 py-1 text-right text-muted/40 border-b border-white/[0.03] select-none">{ri}</td>
                     {row.map((cell, ci) => (
                       <td key={ci} className="border-b border-white/[0.03] p-0">
-                        {editable ? (
+                        {readOnly ? (
+                          <span className="block px-2 py-1 text-foreground/75 truncate max-w-[280px]">{cell}</span>
+                        ) : (
                           <input
                             value={cell}
                             onChange={(e) => setCell(ri, ci, e.target.value)}
                             spellCheck={false}
-                            className="w-full bg-transparent px-2 py-1 text-foreground/85 outline-none focus:bg-frost/10"
+                            className={`w-full bg-transparent px-2 py-1 text-foreground/85 outline-none focus:bg-frost/10 ${edited.has(`${ri},${ci}`) ? "bg-emerald/[0.07]" : ""}`}
                           />
-                        ) : (
-                          <span className="block px-2 py-1 text-foreground/75 truncate max-w-[280px]">{cell}</span>
                         )}
                       </td>
                     ))}
@@ -203,22 +292,19 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
           )}
         </div>
 
-        {/* Footer actions */}
+        {/* Footer */}
         <div className="flex items-center gap-3 pt-1 shrink-0">
-          {editable && (
+          {!readOnly && (
             <button
               onClick={save}
               disabled={!dirty || saving}
               className="px-4 py-2 rounded-lg text-xs font-semibold bg-emerald/15 text-emerald border border-emerald/30 hover:bg-emerald/25 disabled:opacity-40"
             >
-              {saving ? "Saving…" : dirty ? "Save changes" : saved ? "Saved" : "Save"}
+              {saving ? "Saving…" : dirty ? `Save ${edited.size} cell${edited.size === 1 ? "" : "s"}` : saved ? "Saved" : "Save"}
             </button>
           )}
           {dirty && <span className="text-[10px] text-amber/80 font-mono">unsaved edits</span>}
-          <a
-            href={fsDownloadUrl(path, node)}
-            className="px-4 py-2 rounded-lg text-xs font-semibold bg-frost/10 text-frost border border-frost/20 hover:bg-frost/20"
-          >
+          <a href={fsDownloadUrl(path, node)} className="px-4 py-2 rounded-lg text-xs font-semibold bg-frost/10 text-frost border border-frost/20 hover:bg-frost/20">
             Download
           </a>
           <button onClick={onClose} className="px-4 py-2 rounded-lg text-xs font-medium text-muted hover:text-foreground ml-auto">

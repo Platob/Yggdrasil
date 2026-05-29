@@ -146,7 +146,7 @@ async def stream_download(
 ) -> StreamingResponse:
     if node and node != service.settings.node_id:
         return StreamingResponse(
-            network.fs_proxy_download(node, "/stream", {"path": path}),
+            network.proxy_stream(node, "/api/v2/fs/stream", {"path": path}),
             media_type="application/octet-stream",
         )
     info = await service.stat(path)
@@ -171,7 +171,7 @@ async def download_path(
     nodes by proxying the byte stream from the target peer."""
     if node and node != service.settings.node_id:
         return StreamingResponse(
-            network.fs_proxy_download(node, "/download", {"path": path}),
+            network.proxy_stream(node, "/api/v2/fs/download", {"path": path}),
             media_type="application/octet-stream",
         )
     info = await service.stat(path)

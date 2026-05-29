@@ -8,6 +8,7 @@ from .pyfunc import router as pyfunc_router
 from .pyfuncrun import router as pyfuncrun_router
 from .replicate import router as replicate_router
 from .tabular import router as tabular_router
+from .workbook import router as workbook_router
 from .user import router as user_router
 from .messenger import router as messenger_router
 from .excel import router as excel_router
@@ -25,5 +26,6 @@ __all__ = [
     "pyfuncrun_router",
     "replicate_router",
     "tabular_router",
+    "workbook_router",
     "user_router",
 ]

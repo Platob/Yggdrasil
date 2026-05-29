@@ -22,6 +22,7 @@ from .routers import (
     pyfuncrun_router,
     replicate_router,
     tabular_router,
+    workbook_router,
     user_router,
 )
 from .services.audit import AuditLog
@@ -273,6 +274,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(replicate_router, prefix=f"{prefix}/replicate")
     app.include_router(fs_router, prefix=f"{prefix}/fs")
     app.include_router(tabular_router, prefix=f"{prefix}/tabular")
+    app.include_router(workbook_router, prefix=f"{prefix}/workbook")
     app.include_router(user_router, prefix=f"{prefix}/user")
     app.include_router(messenger_router, prefix=f"{prefix}/messenger")
     app.include_router(excel_router, prefix=f"{prefix}/excel")

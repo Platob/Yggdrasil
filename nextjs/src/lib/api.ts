@@ -469,6 +469,41 @@ export async function writeTabular(
   return res;
 }
 
+// Arrow IPC preview URL — fetched + decoded by lib/arrow.fetchArrowTable.
+export function tabularPreviewArrowUrl(path: string, limit = 200, node?: string): string {
+  return `/api/v2/tabular/preview.arrow?path=${encodeURIComponent(path)}&limit=${limit}${nodeParam(node)}`;
+}
+
+export function isWorkbookName(name: string): boolean {
+  const idx = name.lastIndexOf(".");
+  return idx >= 0 && ["xlsx", "xls"].includes(name.slice(idx + 1).toLowerCase());
+}
+
+export interface WorkbookSheet { name: string; rows: number; cols: number; visible: boolean; }
+
+export function getWorkbookSheets(path: string, node?: string): Promise<{ node_id: string; path: string; sheets: WorkbookSheet[] }> {
+  return jsonFetch(`/api/v2/workbook/sheets?path=${encodeURIComponent(path)}${nodeParam(node)}`);
+}
+
+export function workbookReadArrowUrl(
+  path: string, sheet: string, opts: { n_rows?: number; node?: string } = {},
+): string {
+  const n = opts.n_rows ? `&n_rows=${opts.n_rows}` : "";
+  return `/api/v2/workbook/read?path=${encodeURIComponent(path)}&sheet=${encodeURIComponent(sheet)}${n}${nodeParam(opts.node)}`;
+}
+
+// Surgical cell edits (1-based) — preserves formulas/formatting/other sheets.
+export async function editWorkbook(
+  path: string, sheet: string, cells: [number, number, TabularCell][], node?: string,
+): Promise<{ path: string; sheet: string; cells_written: number }> {
+  const res = await jsonFetch<{ path: string; sheet: string; cells_written: number }>(
+    `/api/v2/workbook/edit${node ? `?node=${encodeURIComponent(node)}` : ""}`,
+    { method: "POST", body: JSON.stringify({ path, sheet, cells }) },
+  );
+  invalidate("fs/ls", "workbook", "tabular");
+  return res;
+}
+
 // ── Messenger ──────────────────────────────────────────────────────────────
 
 export function getChannels(fresh = false): Promise<{ node_id: string; channels: ChannelInfo[] }> {

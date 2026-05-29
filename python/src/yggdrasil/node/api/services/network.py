@@ -156,15 +156,16 @@ class NetworkService:
             return {}
         return resp.json()
 
-    async def fs_proxy_download(
-        self, node_id: str, suffix: str, params: dict | None = None,
+    async def proxy_stream(
+        self, node_id: str, api_path: str, params: dict | None = None,
     ) -> AsyncIterator[bytes]:
-        """Stream a /fs download (file passthrough or folder zip) from a peer."""
+        """Stream a peer's byte response (fs download/zip, Arrow IPC, …) through
+        the local node. ``api_path`` is the full path under the peer."""
         base = self.peer_url(node_id)
         if base is None:
             raise APIError(f"Node {node_id!r} is not a linked peer", status_code=404)
         async with self._client.stream(
-            "GET", f"{base}/api/v2/fs{suffix}", params=params,
+            "GET", f"{base}{api_path}", params=params,
             headers={"X-YGG-Source-Node": self.settings.node_id},
         ) as r:
             r.raise_for_status()

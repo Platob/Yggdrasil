@@ -50,6 +50,77 @@ class TabularService:
     async def write(self, req: TabularWriteRequest) -> TabularWriteResponse:
         return await run_in_threadpool(partial(self._write, req))
 
+    # -- Arrow IPC preview --------------------------------------------------
+
+    async def preview_arrow(self, path: str, limit: int) -> bytes:
+        """Bounded preview as an Arrow IPC stream — no JSON/Python row
+        materialization. The frontend decodes columns directly."""
+        return await run_in_threadpool(partial(self._preview_arrow, path, limit))
+
+    def _preview_arrow(self, path: str, limit: int) -> bytes:
+        from ... import transport
+        resolved = self.fs._resolve(path)
+        if not resolved.exists() or resolved.is_dir():
+            raise NotFoundError(f"File not found: {path!r}")
+        limit = max(1, min(limit, self.settings.tabular_preview_max_rows))
+        try:
+            with YggPath.from_(str(resolved)).open("rb") as bio:
+                table = bio.read_arrow_table(options=CastOptions(row_limit=limit))
+        except Exception as exc:
+            raise BadRequestError(f"Cannot read {path!r} as a table: {exc}")
+        return transport.write_arrow_stream_bytes(table)
+
+    # -- Workbook (xlsx) ----------------------------------------------------
+
+    async def workbook_sheets(self, path: str):
+        return await run_in_threadpool(partial(self._workbook_sheets, path))
+
+    async def read_sheet_arrow(
+        self, path: str, sheet: str | None, *,
+        header: bool, skip_rows: int, n_rows: int | None, columns: list[str] | None,
+    ) -> bytes:
+        return await run_in_threadpool(partial(
+            self._read_sheet_arrow, path, sheet, header, skip_rows, n_rows, columns,
+        ))
+
+    async def edit_workbook(self, req) -> int:
+        return await run_in_threadpool(partial(self._edit_workbook, req))
+
+    def _resolve_xlsx(self, path: str):
+        resolved = self.fs._resolve(path)
+        if not resolved.exists() or resolved.is_dir():
+            raise NotFoundError(f"File not found: {path!r}")
+        if resolved.suffix.lstrip(".").lower() not in ("xlsx", "xls"):
+            raise BadRequestError(f"Not an Excel workbook: {path!r}")
+        return resolved
+
+    def _workbook_sheets(self, path: str):
+        resolved = self._resolve_xlsx(path)
+        with YggPath.from_(str(resolved)).open("rb") as wb:
+            return wb.sheet_infos()
+
+    def _read_sheet_arrow(self, path, sheet, header, skip_rows, n_rows, columns) -> bytes:
+        from ... import transport
+        resolved = self._resolve_xlsx(path)
+        with YggPath.from_(str(resolved)).open("rb") as wb:
+            table = wb.read_range(
+                sheet, header=header, skip_rows=skip_rows, n_rows=n_rows, columns=columns,
+            )
+        return transport.write_arrow_stream_bytes(table)
+
+    def _edit_workbook(self, req) -> int:
+        resolved = self._resolve_xlsx(req.path)
+        with YggPath.from_(str(resolved)).open("rb") as wb:
+            if req.values is not None:
+                if req.start_row is None or req.start_col is None:
+                    raise BadRequestError("range edit needs start_row and start_col")
+                return wb.edit_range(
+                    req.sheet, req.start_row, req.start_col, req.values, create=req.create,
+                )
+            if not req.cells:
+                raise BadRequestError("provide either `cells` or `values`+start_row/col")
+            return wb.apply_edits(req.sheet, req.cells, create=req.create)
+
     # -- sync workers -------------------------------------------------------
 
     def _inspect(self, path: str) -> TabularInspect:
