@@ -170,7 +170,8 @@ def _check_permission(
 class Jobs(DatabricksService):
     """Collection-level Databricks job management.
 
-    Listing, finding, creating, and updating jobs live here.
+    Listing, finding, creating, and updating jobs live here, as does
+    :meth:`submit` for one-time runs that aren't backed by a persisted job.
     Individual job lifecycle operations live on the :class:`Job` resource.
 
     Getter methods accept a positional ``obj`` that can be a :class:`Job`,
