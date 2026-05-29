@@ -12,7 +12,7 @@
 // to grow into the full Excel grid (virtualization, formulas) without touching
 // callers.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   getTabularInspect,
   getFsStat,
@@ -42,6 +42,49 @@ import Chart, { type ChartType } from "@/components/Chart";
 
 const AGGS: AggFunc[] = ["sum", "mean", "min", "max", "count", "median", "std", "var"];
 const isNumericType = (t: string) => /int|float|double|decimal/i.test(t);
+
+// Client-side column profile over the loaded grid rows — distinct values +
+// counts and, for numeric columns, basic stats. Cheap (grid is bounded) and
+// keeps the facet/filter pickers off the server.
+function columnProfile(rows: string[][], ci: number) {
+  const counts = new Map<string, number>();
+  const nums: number[] = [];
+  let nulls = 0;
+  for (const r of rows) {
+    const v = r[ci] ?? "";
+    if (v === "") { nulls++; continue; }
+    counts.set(v, (counts.get(v) ?? 0) + 1);
+    const n = Number(v);
+    if (!Number.isNaN(n)) nums.push(n);
+  }
+  const distinct = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const numeric = nums.length === rows.length - nulls && nums.length > 0
+    ? { min: Math.min(...nums), max: Math.max(...nums), mean: nums.reduce((s, x) => s + x, 0) / nums.length }
+    : null;
+  return { distinct, numeric, nulls, total: rows.length };
+}
+
+// Client-side predicate eval — mirrors the backend filter ops so the grid
+// reflects filters instantly without a round-trip.
+function matchRow(row: string[], colIdx: Map<string, number>, filters: FilterSpec[]): boolean {
+  for (const f of filters) {
+    const i = colIdx.get(f.column);
+    if (i === undefined) continue;
+    const cell = row[i] ?? "";
+    const op = f.op;
+    if (op === "is_null") { if (cell !== "") return false; continue; }
+    if (op === "not_null") { if (cell === "") return false; continue; }
+    if (op === "contains") { if (!cell.includes(String(f.value ?? ""))) return false; continue; }
+    if (op === "in") { const vs = (Array.isArray(f.value) ? f.value : [f.value]).map(String); if (!vs.includes(cell)) return false; continue; }
+    const a = Number(cell), b = Number(f.value);
+    const numeric = !Number.isNaN(a) && !Number.isNaN(b);
+    const cmp = numeric
+      ? { "==": a === b, "!=": a !== b, ">": a > b, ">=": a >= b, "<": a < b, "<=": a <= b }
+      : { "==": cell === String(f.value), "!=": cell !== String(f.value), ">": cell > String(f.value), ">=": cell >= String(f.value), "<": cell < String(f.value), "<=": cell <= String(f.value) };
+    if (op in cmp && !cmp[op as keyof typeof cmp]) return false;
+  }
+  return true;
+}
 
 const EDIT_CAP = 2000; // rows we'll load into an editable grid
 const PAGE = 100;      // row page size for read-only viewports
@@ -114,6 +157,8 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const [exporting, setExporting] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const [stat, setStat] = useState<{ modified_at?: string; size?: number } | null>(null);
+  const [facetCol, setFacetCol] = useState<number | null>(null);   // open column profile
+  const [sort, setSort] = useState<{ col: number; dir: "asc" | "desc" } | null>(null);
 
   const decodeInto = useCallback(async (url: string) => {
     const t = await fetchArrowTable(url);
@@ -256,6 +301,24 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
 
   const numericCols = columns.filter((c) => isNumericType(c.type)).map((c) => c.name);
   const allCols = columns.map((c) => c.name);
+  const colIdx = useMemo(() => new Map(columns.map((c, i) => [c.name, i])), [columns]);
+
+  // Filters + sort applied client-side to the loaded rows — instant, no
+  // round-trip. (Backend filters still drive the analyze charts + export.)
+  const viewOrder = useMemo(() => {
+    let idx = grid.map((_, i) => i);
+    if (filters.length) idx = idx.filter((i) => matchRow(grid[i], colIdx, filters));
+    if (sort) {
+      const ci = sort.col, numeric = isNumericType(columns[ci]?.type ?? "");
+      idx = idx.slice().sort((a, b) => {
+        const va = grid[a][ci] ?? "", vb = grid[b][ci] ?? "";
+        const c = numeric ? (Number(va) || 0) - (Number(vb) || 0) : va.localeCompare(vb);
+        return sort.dir === "asc" ? c : -c;
+      });
+    }
+    return idx;
+  }, [grid, filters, sort, colIdx, columns]);
+  const facet = useMemo(() => (facetCol != null ? columnProfile(grid, facetCol) : null), [facetCol, grid]);
 
   const runPivot = async () => {
     if (!measureCol) return;
@@ -543,7 +606,12 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                         {["==", "!=", ">", ">=", "<", "<=", "contains", "in", "is_null", "not_null"].map((o) => <option key={o} value={o}>{o}</option>)}
                       </select>
                       {!["is_null", "not_null"].includes(f.op) && (
-                        <input value={String(f.value ?? "")} onChange={(e) => { const s = e.target.value; const v = s === "" ? null : (s.trim() !== "" && !isNaN(Number(s)) ? Number(s) : s); setFilters((fs) => fs.map((x, j) => j === i ? { ...x, value: v } : x)); }} placeholder="value" className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 w-28 outline-none" />
+                        <>
+                          <input list={`fv-${i}`} value={String(f.value ?? "")} onChange={(e) => { const s = e.target.value; const v = s === "" ? null : (s.trim() !== "" && !isNaN(Number(s)) ? Number(s) : s); setFilters((fs) => fs.map((x, j) => j === i ? { ...x, value: v } : x)); }} placeholder="value" className="bg-white/[0.04] border border-white/10 rounded px-1.5 py-1 w-28 outline-none" />
+                          <datalist id={`fv-${i}`}>
+                            {colIdx.has(f.column) ? columnProfile(grid, colIdx.get(f.column)!).distinct.slice(0, 30).map(([v]) => <option key={v} value={v} />) : null}
+                          </datalist>
+                        </>
                       )}
                       <button onClick={() => setFilters((fs) => fs.filter((_, j) => j !== i))} className="text-rose/70 hover:text-rose px-1">✕</button>
                     </div>
@@ -646,9 +714,24 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
           </div>
         )}
 
+        {/* Active filters (predicate chips) — visible + removable in grid mode */}
+        {mode === "grid" && filters.length > 0 && (
+          <div className="flex items-center gap-1.5 flex-wrap shrink-0 text-[10px] font-mono">
+            <span className="text-muted/60">filters:</span>
+            {filters.map((f, i) => (
+              <span key={i} className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-frost/10 text-frost border border-frost/20">
+                {f.column} {f.op} {!["is_null", "not_null"].includes(f.op) ? String(f.value) : ""}
+                <button onClick={() => setFilters((fs) => fs.filter((_, j) => j !== i))} className="text-frost/60 hover:text-rose">✕</button>
+              </span>
+            ))}
+            <button onClick={() => setFilters([])} className="text-muted hover:text-foreground underline">clear</button>
+            <span className="text-muted/50 ml-1">showing {viewOrder.length} of {grid.length}{readOnly ? " loaded" : ""}</span>
+          </div>
+        )}
+
         {/* Grid */}
         {mode === "grid" && (
-        <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30">
+        <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30" onClick={() => facetCol != null && setFacetCol(null)}>
           {loading ? (
             <div className="flex items-center justify-center py-16">
               <div className="w-6 h-6 border-2 border-frost/30 border-t-frost rounded-full spin-slow" />
@@ -663,32 +746,64 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                 <tr>
                   <th className="px-2 py-1.5 text-right text-muted/40 border-b border-white/[0.06] w-10">#</th>
                   {columns.map((col, ci) => (
-                    <th key={ci} className="px-2 py-1.5 text-left text-frost/80 border-b border-white/[0.06] whitespace-nowrap">
-                      {col.name}<span className="ml-1.5 text-muted/50 font-normal">{col.type}</span>
+                    <th key={ci} className="px-2 py-1.5 text-left border-b border-white/[0.06] whitespace-nowrap relative">
+                      <button onClick={() => setFacetCol((c) => (c === ci ? null : ci))} className="text-frost/80 hover:text-frost inline-flex items-center gap-1" title="Column profile / filter">
+                        {col.name}<span className="text-muted/50 font-normal">{col.type}</span>
+                        {sort?.col === ci && <span className="text-emerald">{sort.dir === "asc" ? "▲" : "▼"}</span>}
+                        <span className="text-muted/40">▾</span>
+                      </button>
+                      {facetCol === ci && facet && (
+                        <div className="absolute left-0 top-full mt-1 z-30 modal-surface p-2.5 w-60 text-[11px] font-mono normal-case font-normal space-y-1.5" onClick={(e) => e.stopPropagation()}>
+                          <div className="flex items-center justify-between">
+                            <span className="text-frost/80">{col.name}</span>
+                            <div className="flex gap-1.5 text-[10px]">
+                              <button onClick={() => setSort({ col: ci, dir: "asc" })} className="text-muted hover:text-emerald">sort ▲</button>
+                              <button onClick={() => setSort({ col: ci, dir: "desc" })} className="text-muted hover:text-emerald">sort ▼</button>
+                              {sort?.col === ci && <button onClick={() => setSort(null)} className="text-muted hover:text-foreground">clear</button>}
+                            </div>
+                          </div>
+                          <div className="text-[10px] text-muted/70">{facet.distinct.length} distinct · {facet.nulls} null{facet.numeric ? ` · min ${facet.numeric.min.toLocaleString(undefined, { maximumFractionDigits: 2 })} · max ${facet.numeric.max.toLocaleString(undefined, { maximumFractionDigits: 2 })} · μ ${facet.numeric.mean.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : ""}</div>
+                          <div className="max-h-44 overflow-auto space-y-0.5">
+                            {facet.distinct.slice(0, 12).map(([val, cnt]) => (
+                              <button key={val}
+                                onClick={() => { setFilters((fs) => [...fs, { column: col.name, op: "==", value: Number.isNaN(Number(val)) || val === "" ? val : Number(val) }]); setFacetCol(null); }}
+                                className="w-full flex items-center justify-between gap-2 px-1.5 py-0.5 rounded hover:bg-emerald/10 group">
+                                <span className="truncate text-foreground/80 group-hover:text-emerald">{val || "∅"}</span>
+                                <span className="text-muted/60 shrink-0">{cnt}</span>
+                              </button>
+                            ))}
+                            {facet.distinct.length > 12 && <div className="text-[10px] text-muted/50 px-1.5">+{facet.distinct.length - 12} more</div>}
+                          </div>
+                          <div className="text-[9px] text-muted/40">click a value to filter == (over loaded rows)</div>
+                        </div>
+                      )}
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {grid.map((row, ri) => (
-                  <tr key={ri} className="hover:bg-white/[0.02]">
-                    <td className="px-2 py-1 text-right text-muted/40 border-b border-white/[0.03] select-none">{readOnly ? page * PAGE + ri : ri}</td>
-                    {row.map((cell, ci) => (
-                      <td key={ci} className="border-b border-white/[0.03] p-0">
-                        {readOnly ? (
-                          <span className="block px-2 py-1 text-foreground/75 truncate max-w-[280px]">{cell}</span>
-                        ) : (
-                          <input
-                            value={cell}
-                            onChange={(e) => setCell(ri, ci, e.target.value)}
-                            spellCheck={false}
-                            className={`w-full bg-transparent px-2 py-1 text-foreground/85 outline-none focus:bg-frost/10 ${edited.has(`${ri},${ci}`) ? "bg-emerald/[0.07]" : ""}`}
-                          />
-                        )}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
+                {viewOrder.map((ri) => {
+                  const row = grid[ri];
+                  return (
+                    <tr key={ri} className="hover:bg-white/[0.02]">
+                      <td className="px-2 py-1 text-right text-muted/40 border-b border-white/[0.03] select-none">{readOnly ? page * PAGE + ri : ri}</td>
+                      {row.map((cell, ci) => (
+                        <td key={ci} className="border-b border-white/[0.03] p-0">
+                          {readOnly ? (
+                            <span className="block px-2 py-1 text-foreground/75 truncate max-w-[280px]">{cell}</span>
+                          ) : (
+                            <input
+                              value={cell}
+                              onChange={(e) => setCell(ri, ci, e.target.value)}
+                              spellCheck={false}
+                              className={`w-full bg-transparent px-2 py-1 text-foreground/85 outline-none focus:bg-frost/10 ${edited.has(`${ri},${ci}`) ? "bg-emerald/[0.07]" : ""}`}
+                            />
+                          )}
+                        </td>
+                      ))}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
