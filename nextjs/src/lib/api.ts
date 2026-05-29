@@ -290,13 +290,37 @@ export function getUsers(fresh = false): Promise<{ node_id: string; users: UserC
 
 // ── Filesystem ─────────────────────────────────────────────────────────────
 
+// A root of the global filesystem tree: the local node + every linked peer.
+export interface FsNodeRoot {
+  node_id: string;
+  host: string;
+  port: number;
+  self: boolean;
+  role: string;
+  cpu_percent?: number;
+  memory_percent?: number;
+  active_runs?: number;
+}
+
+// ``node`` selects which node's filesystem the call targets. Omitting it (or
+// passing the local node id) reads the local fs; a peer id is proxied through
+// the local node — see services/network.fs_proxy_*.
+function nodeParam(node?: string): string {
+  return node ? `&node=${encodeURIComponent(node)}` : "";
+}
+
+export function getFsNodes(fresh = false): Promise<{ node_id: string; nodes: FsNodeRoot[] }> {
+  return cachedGet<{ node_id: string; nodes: FsNodeRoot[] }>(
+    "/api/v2/fs/nodes", TTL.STRUCTURAL, jsonFetch, fresh,
+  );
+}
+
 export function getFsListing(
   path: string,
+  node?: string,
   fresh = false,
 ): Promise<{ node_id: string; path: string; entries: FsEntry[] }> {
-  const url = path
-    ? `/api/v2/fs/ls?path=${encodeURIComponent(path)}`
-    : "/api/v2/fs/ls";
+  const url = `/api/v2/fs/ls?path=${encodeURIComponent(path)}${nodeParam(node)}`;
   return cachedGet<{ node_id: string; path: string; entries: FsEntry[] }>(url, TTL.VITAL, jsonFetch, fresh);
 }
 
@@ -304,39 +328,89 @@ export function getFsListing(
 // memory and sets `truncated` when the file is larger than the returned slice.
 export function getFsRead(
   path: string,
+  node?: string,
 ): Promise<{ path: string; content: string; encoding: string; size: number; truncated: boolean }> {
-  return jsonFetch(`/api/v2/fs/read?path=${encodeURIComponent(path)}`);
+  return jsonFetch(`/api/v2/fs/read?path=${encodeURIComponent(path)}${nodeParam(node)}`);
 }
 
-export function getFsTail(path: string, n = 200): Promise<{ path: string; lines: string[] }> {
+export function getFsTail(path: string, n = 200, node?: string): Promise<{ path: string; lines: string[] }> {
   return jsonFetch<{ path: string; lines: string[] }>(
-    `/api/v2/fs/tail?path=${encodeURIComponent(path)}&n=${n}`,
+    `/api/v2/fs/tail?path=${encodeURIComponent(path)}&n=${n}${nodeParam(node)}`,
   );
 }
 
-export function getFsHead(path: string, n = 100): Promise<{ path: string; lines: string[] }> {
+export function getFsHead(path: string, n = 100, node?: string): Promise<{ path: string; lines: string[] }> {
   return jsonFetch<{ path: string; lines: string[] }>(
-    `/api/v2/fs/head?path=${encodeURIComponent(path)}&n=${n}`,
+    `/api/v2/fs/head?path=${encodeURIComponent(path)}&n=${n}${nodeParam(node)}`,
   );
 }
 
+// Live tail (SSE) is local-node only — the watch stream is not proxied.
 export function createFsWatchStream(path: string): EventSource {
   return new EventSource(`/api/v2/fs/watch?path=${encodeURIComponent(path)}`);
+}
+
+// A direct download URL (file passthrough or folder zip). Used as an <a href>
+// so the browser streams it; peer downloads are proxied through the local node.
+export function fsDownloadUrl(path: string, node?: string): string {
+  return `/api/v2/fs/download?path=${encodeURIComponent(path)}${nodeParam(node)}`;
+}
+
+export async function deleteFsPath(path: string, node?: string): Promise<void> {
+  await jsonFetch<void>(
+    `/api/v2/fs/delete?path=${encodeURIComponent(path)}${nodeParam(node)}`,
+    { method: "DELETE" },
+  );
+  invalidate("fs/ls");
+}
+
+export async function writeFsFile(
+  path: string, content: string, node?: string, encoding = "utf-8",
+): Promise<FsEntry> {
+  const res = await jsonFetch<FsEntry>(
+    `/api/v2/fs/write${node ? `?node=${encodeURIComponent(node)}` : ""}`,
+    { method: "POST", body: JSON.stringify({ path, content, encoding, mkdir: true }) },
+  );
+  invalidate("fs/ls");
+  return res;
+}
+
+export async function mkdirFs(path: string, node?: string): Promise<FsEntry> {
+  const res = await jsonFetch<FsEntry>(
+    `/api/v2/fs/mkdir?path=${encodeURIComponent(path)}${nodeParam(node)}`,
+    { method: "POST" },
+  );
+  invalidate("fs/ls");
+  return res;
+}
+
+// Streams one file's bytes to ``path`` on the target node. Used per-file when a
+// folder is dropped, so a large upload never buffers the whole tree in memory.
+export async function uploadFsFile(path: string, file: File, node?: string): Promise<FsEntry> {
+  const res = await fetch(
+    `/api/v2/fs/upload?path=${encodeURIComponent(path)}${nodeParam(node)}`,
+    { method: "POST", body: file },
+  );
+  if (!res.ok) throw new Error(`Upload failed: HTTP ${res.status}`);
+  invalidate("fs/ls");
+  return (await res.json()) as FsEntry;
 }
 
 export function grepFs(
   path: string,
   pattern: string,
-  opts: { regex?: boolean; case_sensitive?: boolean; max_matches?: number } = {},
+  opts: { regex?: boolean; case_sensitive?: boolean; max_matches?: number; node?: string } = {},
 ): Promise<{
   path: string;
   pattern: string;
   count: number;
+  truncated?: boolean;
   matches: { path: string; line_number: number; line: string; match: string }[];
 }> {
-  return jsonFetch("/api/v2/fs/grep", {
+  const { node, ...body } = opts;
+  return jsonFetch(`/api/v2/fs/grep${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
     method: "POST",
-    body: JSON.stringify({ path, pattern, ...opts }),
+    body: JSON.stringify({ path, pattern, ...body }),
   });
 }
 

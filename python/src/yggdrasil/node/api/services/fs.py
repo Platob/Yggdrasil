@@ -194,6 +194,37 @@ class FsService:
         LOGGER.info("Created directory %r", path)
         return self._entry(resolved)
 
+    def build_dir_zip(self, path: str) -> tuple[Path, str]:
+        """Zip a directory into a temp file (bounded by du_max_entries) and
+        return ``(zip_path, archive_name)``. The caller streams then unlinks the
+        temp file. Writing to disk keeps memory flat regardless of folder size.
+        """
+        import tempfile
+        import zipfile
+
+        resolved = self._resolve(path)
+        if not resolved.exists():
+            raise NotFoundError(f"Path not found: {path!r}")
+        if not resolved.is_dir():
+            raise ForbiddenError(f"Not a directory: {path!r}")
+
+        cap = self.settings.du_max_entries
+        tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tmp.close()
+        count = 0
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in resolved.rglob("*"):
+                if count >= cap:
+                    break
+                if p.is_file():
+                    try:
+                        zf.write(p, p.relative_to(resolved))
+                        count += 1
+                    except OSError:
+                        continue
+        archive_name = f"{resolved.name or 'node'}.zip"
+        return Path(tmp.name), archive_name
+
     async def stream_read(self, path: str) -> AsyncIterator[bytes]:
         resolved = self._resolve(path)
         if not resolved.exists():

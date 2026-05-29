@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 import time
 from threading import Lock
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
+
+from yggdrasil.exceptions.api import APIError
 
 from ...config import Settings
 from ...transport import CONTENT_TYPE_ARROW_STREAM
@@ -113,6 +115,74 @@ class NetworkService:
 
     def set_role(self, role: NodeRole) -> None:
         self._backend.set_role(role)
+
+    # -- Cross-node filesystem proxying ------------------------------------
+    # The local node is the gateway: the browser only ever talks to it, and it
+    # forwards /fs reads/writes to a linked peer over the pooled client. One
+    # origin, one audit trail, and peers that aren't directly reachable from
+    # the browser still show up in the global filesystem tree.
+
+    def peer_url(self, node_id: str) -> str | None:
+        """Base URL for a live peer. None for the local node or an unknown id."""
+        if node_id == self.settings.node_id:
+            return None
+        peer = self._get_peer(node_id)
+        if peer is None:
+            return None
+        return f"http://{peer.host}:{peer.port}"
+
+    async def fs_proxy_json(
+        self, node_id: str, method: str, suffix: str,
+        *, params: dict | None = None, json_body: Any = None,
+    ) -> Any:
+        """Forward a /fs JSON call to ``node_id`` and return its parsed body."""
+        base = self.peer_url(node_id)
+        if base is None:
+            raise APIError(f"Node {node_id!r} is not a linked peer", status_code=404)
+        try:
+            resp = await self._client.request(
+                method, f"{base}/api/v2/fs{suffix}",
+                params=params, json=json_body,
+                headers={"X-YGG-Source-Node": self.settings.node_id},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text or str(exc)
+            raise APIError(f"Peer {node_id} fs error: {detail}", status_code=exc.response.status_code) from exc
+        except httpx.HTTPError as exc:
+            raise APIError(f"Peer {node_id} unreachable: {exc}", status_code=502) from exc
+        if resp.status_code == 204 or not resp.content:
+            return {}
+        return resp.json()
+
+    async def fs_proxy_download(
+        self, node_id: str, suffix: str, params: dict | None = None,
+    ) -> AsyncIterator[bytes]:
+        """Stream a /fs download (file passthrough or folder zip) from a peer."""
+        base = self.peer_url(node_id)
+        if base is None:
+            raise APIError(f"Node {node_id!r} is not a linked peer", status_code=404)
+        async with self._client.stream(
+            "GET", f"{base}/api/v2/fs{suffix}", params=params,
+            headers={"X-YGG-Source-Node": self.settings.node_id},
+        ) as r:
+            r.raise_for_status()
+            async for chunk in r.aiter_bytes(64 * 1024):
+                yield chunk
+
+    async def fs_proxy_upload(
+        self, node_id: str, path: str, body: AsyncIterator[bytes],
+    ) -> Any:
+        """Forward a streamed upload body to a peer's /fs/upload."""
+        base = self.peer_url(node_id)
+        if base is None:
+            raise APIError(f"Node {node_id!r} is not a linked peer", status_code=404)
+        resp = await self._client.post(
+            f"{base}/api/v2/fs/upload", params={"path": path}, content=body,
+            headers={"X-YGG-Source-Node": self.settings.node_id},
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def _select_executor(self) -> NodeMeta | None:
         now = time.monotonic()

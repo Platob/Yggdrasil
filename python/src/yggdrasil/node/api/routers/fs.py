@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from ..deps import get_fs_service
+from ..deps import get_fs_service, get_network_service
 from ..schemas.common import StrictModel
 from ..schemas.fs import (
     FsEntry,
@@ -13,72 +13,142 @@ from ..schemas.fs import (
     FsWriteRequest,
 )
 from ..services.fs import FsService
+from ..services.network import NetworkService
 
 router = APIRouter(tags=["fs"])
+
+
+async def _remote(
+    network: NetworkService, service: FsService, node: str | None,
+    suffix: str, *, method: str = "GET", params: dict | None = None, json_body=None,
+):
+    """If ``node`` names a peer, forward the /fs call and return its JSON;
+    return ``None`` when the target is the local node so the caller runs
+    locally. Raises if ``node`` is set but not a linked peer."""
+    if not node or node == service.settings.node_id:
+        return None
+    return await network.fs_proxy_json(node, method, suffix, params=params, json_body=json_body)
+
+
+@router.get("/nodes")
+async def list_nodes(
+    service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
+) -> dict:
+    """Roots of the global filesystem tree: the local node plus every linked
+    peer. Each is a lazily-expandable root in the UI — reachability is proven
+    when its directory listing is requested, so this stays instant."""
+    peers = await network.get_peers()
+    nodes = [{
+        "node_id": service.settings.node_id,
+        "host": service.settings.host,
+        "port": service.settings.port,
+        "self": True,
+        "role": "self",
+    }]
+    nodes += [{
+        "node_id": p.node_id, "host": p.host, "port": p.port,
+        "self": False, "role": str(p.role),
+        "cpu_percent": p.cpu_percent, "memory_percent": p.memory_percent,
+        "active_runs": p.active_runs,
+    } for p in peers.peers]
+    return {"node_id": service.settings.node_id, "nodes": nodes}
 
 
 @router.get("/ls", response_model=FsListResponse)
 async def list_directory(
     path: str = "",
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> FsListResponse:
-    return await service.ls(path)
+    remote = await _remote(network, service, node, "/ls", params={"path": path})
+    return remote if remote is not None else await service.ls(path)
 
 
 @router.get("/stat", response_model=FsEntry)
 async def stat_path(
     path: str,
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> FsEntry:
-    return await service.stat(path)
+    remote = await _remote(network, service, node, "/stat", params={"path": path})
+    return remote if remote is not None else await service.stat(path)
 
 
 @router.get("/read", response_model=FsReadResponse)
 async def read_file(
     path: str,
     max_bytes: int | None = None,
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> FsReadResponse:
-    return await service.read(path, max_bytes=max_bytes)
+    remote = await _remote(
+        network, service, node, "/read",
+        params={"path": path, **({"max_bytes": max_bytes} if max_bytes else {})},
+    )
+    return remote if remote is not None else await service.read(path, max_bytes=max_bytes)
 
 
 @router.post("/write", response_model=FsEntry)
 async def write_file(
     req: FsWriteRequest,
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> FsEntry:
-    return await service.write(req)
+    remote = await _remote(network, service, node, "/write", method="POST", json_body=req.model_dump())
+    return remote if remote is not None else await service.write(req)
 
 
 @router.delete("/delete", response_model=None, status_code=204)
 async def delete_path(
     path: str,
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> None:
+    if await _remote(network, service, node, "/delete", method="DELETE", params={"path": path}) is not None:
+        return
     await service.delete(path)
 
 
 @router.post("/move", response_model=FsEntry)
 async def move_path(
     req: FsMoveRequest,
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> FsEntry:
-    return await service.move(req)
+    remote = await _remote(network, service, node, "/move", method="POST", json_body=req.model_dump())
+    return remote if remote is not None else await service.move(req)
 
 
 @router.post("/mkdir", response_model=FsEntry)
 async def make_directory(
     path: str,
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> FsEntry:
-    return await service.mkdir(path)
+    remote = await _remote(network, service, node, "/mkdir", method="POST", params={"path": path})
+    return remote if remote is not None else await service.mkdir(path)
 
 
 @router.get("/stream")
 async def stream_download(
     path: str,
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> StreamingResponse:
+    if node and node != service.settings.node_id:
+        return StreamingResponse(
+            network.fs_proxy_download(node, "/stream", {"path": path}),
+            media_type="application/octet-stream",
+        )
     info = await service.stat(path)
     return StreamingResponse(
         service.stream_read(path),
@@ -90,16 +160,65 @@ async def stream_download(
     )
 
 
+@router.get("/download")
+async def download_path(
+    path: str = "",
+    node: str | None = None,
+    service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
+) -> StreamingResponse:
+    """Download a file (passthrough) or a folder (streamed zip). Works across
+    nodes by proxying the byte stream from the target peer."""
+    if node and node != service.settings.node_id:
+        return StreamingResponse(
+            network.fs_proxy_download(node, "/download", {"path": path}),
+            media_type="application/octet-stream",
+        )
+    info = await service.stat(path)
+    if not info.is_dir:
+        return StreamingResponse(
+            service.stream_read(path),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{info.name}"',
+                "Content-Length": str(info.size),
+            },
+        )
+
+    zip_path, archive_name = service.build_dir_zip(path)
+
+    async def _stream_then_cleanup():
+        try:
+            with open(zip_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            zip_path.unlink(missing_ok=True)
+
+    return StreamingResponse(
+        _stream_then_cleanup(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{archive_name}"'},
+    )
+
+
 @router.post("/upload", response_model=FsEntry)
 async def stream_upload(
     path: str,
     request: Request,
+    node: str | None = None,
     service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
 ) -> FsEntry:
     async def _body_chunks():
         async for chunk in request.stream():
             yield chunk
 
+    if node and node != service.settings.node_id:
+        return await network.fs_proxy_upload(node, path, _body_chunks())
     return await service.stream_write(path, _body_chunks())
 
 
@@ -110,8 +229,16 @@ class _SearchRequest(StrictModel):
 
 
 @router.post("/search")
-async def search_files(req: _SearchRequest, service: FsService = Depends(get_fs_service)) -> dict:
+async def search_files(
+    req: _SearchRequest,
+    node: str | None = None,
+    service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
+) -> dict:
     """Search for files matching a pattern (glob or substring)."""
+    remote = await _remote(network, service, node, "/search", method="POST", json_body=req.model_dump())
+    if remote is not None:
+        return remote
     import fnmatch
     from ...exceptions import NotFoundError
     root = service._root / req.path.lstrip("/") if req.path else service._root
@@ -188,8 +315,15 @@ async def copy_path(req: _CopyRequest, service: FsService = Depends(get_fs_servi
 
 
 @router.get("/tree")
-async def tree_listing(path: str = "", depth: int = 3, service: FsService = Depends(get_fs_service)) -> dict:
+async def tree_listing(
+    path: str = "", depth: int = 3, node: str | None = None,
+    service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
+) -> dict:
     """Return a recursive tree of the directory up to N levels deep."""
+    remote = await _remote(network, service, node, "/tree", params={"path": path, "depth": depth})
+    if remote is not None:
+        return remote
     from ...exceptions import NotFoundError
     root = service._root / path.lstrip("/") if path else service._root
     if not root.exists() or not root.is_dir():
@@ -218,14 +352,28 @@ async def tree_listing(path: str = "", depth: int = 3, service: FsService = Depe
 
 
 @router.get("/head")
-async def head_file(path: str, n: int = 100, service: FsService = Depends(get_fs_service)) -> dict:
+async def head_file(
+    path: str, n: int = 100, node: str | None = None,
+    service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
+) -> dict:
     """First N lines of a file. Default 100."""
+    remote = await _remote(network, service, node, "/head", params={"path": path, "n": n})
+    if remote is not None:
+        return remote
     return {"path": path, "lines": service.head_lines(path, n=n)}
 
 
 @router.get("/tail")
-async def tail_file(path: str, n: int = 100, service: FsService = Depends(get_fs_service)) -> dict:
+async def tail_file(
+    path: str, n: int = 100, node: str | None = None,
+    service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
+) -> dict:
     """Last N lines of a file. Default 100. Uses byte-back scan, no full load."""
+    remote = await _remote(network, service, node, "/tail", params={"path": path, "n": n})
+    if remote is not None:
+        return remote
     return {"path": path, "lines": service.tail_lines(path, n=n)}
 
 
@@ -252,8 +400,16 @@ class _GrepRequest(StrictModel):
 
 
 @router.post("/grep")
-async def grep_files(req: _GrepRequest, service: FsService = Depends(get_fs_service)) -> dict:
+async def grep_files(
+    req: _GrepRequest,
+    node: str | None = None,
+    service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
+) -> dict:
     """Recursive grep over text files. Returns matches with line numbers."""
+    remote = await _remote(network, service, node, "/grep", method="POST", json_body=req.model_dump())
+    if remote is not None:
+        return remote
     matches, truncated = service.grep(
         req.path, req.pattern,
         max_matches=req.max_matches,
@@ -267,8 +423,15 @@ async def grep_files(req: _GrepRequest, service: FsService = Depends(get_fs_serv
 
 
 @router.get("/du")
-async def disk_usage(path: str = "", service: FsService = Depends(get_fs_service)) -> dict:
+async def disk_usage(
+    path: str = "", node: str | None = None,
+    service: FsService = Depends(get_fs_service),
+    network: NetworkService = Depends(get_network_service),
+) -> dict:
     """Total disk usage of a directory (recursive)."""
+    remote = await _remote(network, service, node, "/du", params={"path": path})
+    if remote is not None:
+        return remote
     from ...exceptions import NotFoundError
     root = service._root / path.lstrip("/") if path else service._root
     if not root.exists():
