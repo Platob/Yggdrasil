@@ -124,5 +124,38 @@ class TestBoundedDiskUsage(unittest.TestCase):
             self.assertEqual(res["total_size_bytes"], 15)
 
 
+class TestBoundedGrep(unittest.TestCase):
+    def test_grep_finds_and_reports_untruncated(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / "a.txt").write_text("needle here\nother\n", encoding="utf-8")
+            (home / "b.txt").write_text("nothing\n", encoding="utf-8")
+            svc = _service(home)
+            matches, truncated = svc.grep("", "needle")
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["line_number"], 1)
+            self.assertFalse(truncated)
+
+    def test_grep_stops_at_scan_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            # Many files, none matching — without a scan cap this walks them all.
+            for i in range(40):
+                (home / f"f{i}.txt").write_text("plain\n", encoding="utf-8")
+            svc = _service(home, du_max_entries=10)
+            matches, truncated = svc.grep("", "needle")
+            self.assertEqual(matches, [])
+            self.assertTrue(truncated)
+
+    def test_grep_truncates_at_match_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / "big.txt").write_text("hit\n" * 50, encoding="utf-8")
+            svc = _service(home)
+            matches, truncated = svc.grep("", "hit", max_matches=5)
+            self.assertEqual(len(matches), 5)
+            self.assertTrue(truncated)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -92,8 +92,9 @@ class Settings:
     # Bigger files are read up to this cap and flagged ``truncated`` — the
     # node never loads a multi-GB file whole just to preview it.
     max_read_bytes: int = 4 * 1024 * 1024
-    # Upper bound on entries a single /fs/du walk visits before it stops and
-    # reports a partial total — keeps a recursive scan of a huge tree bounded.
+    # Upper bound on tree nodes a single recursive fs walk (du / search / grep)
+    # visits before it stops and reports a partial result — keeps a scan of a
+    # huge tree bounded in both time and memory.
     du_max_entries: int = 200_000
     # Seconds a PyEnv's resolved interpreter version + installed-library
     # listing stays cached before the next ``pip list`` subprocess runs —

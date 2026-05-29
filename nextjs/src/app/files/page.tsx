@@ -144,11 +144,11 @@ export default function FilesPage() {
     }
   };
 
-  const fetchListing = useCallback(async (path: string) => {
+  const fetchListing = useCallback(async (path: string, fresh = false) => {
     setLoading(true);
     setError(false);
     try {
-      const res = await getFsListing(path);
+      const res = await getFsListing(path, fresh);
       // Sort: directories first, then files, both alphabetical
       const sorted = [...res.entries].sort((a, b) => {
         if (a.is_dir && !b.is_dir) return -1;
@@ -277,7 +277,7 @@ export default function FilesPage() {
             {grepOpen ? "Hide search" : "Search"}
           </button>
           <button
-            onClick={() => fetchListing(currentPath)}
+            onClick={() => fetchListing(currentPath, true)}
             className="px-3 py-1.5 rounded-lg text-xs font-medium text-frost/70 hover:text-frost bg-frost/5 hover:bg-frost/10 border border-frost/10 hover:border-frost/20 transition-all"
           >
             <svg className="inline-block mr-1.5 -mt-0.5" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">

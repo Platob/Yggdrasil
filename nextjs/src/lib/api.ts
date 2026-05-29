@@ -25,6 +25,7 @@ import type {
   TopologyResponse,
   UserCard,
 } from "./types";
+import { cachedGet, invalidate, TTL } from "./cache";
 
 // ── Low-level fetch helper ─────────────────────────────────────────────────
 
@@ -53,36 +54,36 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 
 // ── Node identity ──────────────────────────────────────────────────────────
 
-export function getNodeCard(): Promise<NodeCard> {
-  return jsonFetch<NodeCard>("/api/card");
+export function getNodeCard(fresh = false): Promise<NodeCard> {
+  return cachedGet<NodeCard>("/api/card", TTL.STRUCTURAL, jsonFetch, fresh);
 }
 
 // ── Aggregate endpoints ────────────────────────────────────────────────────
 
-export function getStats(): Promise<ClusterStats> {
-  return jsonFetch<ClusterStats>("/api/v2/stats");
+export function getStats(fresh = false): Promise<ClusterStats> {
+  return cachedGet<ClusterStats>("/api/v2/stats", TTL.VITAL, jsonFetch, fresh);
 }
 
-export function getTopology(): Promise<TopologyResponse> {
-  return jsonFetch<TopologyResponse>("/api/v2/topology");
+export function getTopology(fresh = false): Promise<TopologyResponse> {
+  return cachedGet<TopologyResponse>("/api/v2/topology", TTL.STRUCTURAL, jsonFetch, fresh);
 }
 
-export function getHealth(): Promise<HealthResponse> {
-  return jsonFetch<HealthResponse>("/api/v2/health");
+export function getHealth(fresh = false): Promise<HealthResponse> {
+  return cachedGet<HealthResponse>("/api/v2/health", TTL.VITAL, jsonFetch, fresh);
 }
 
-export function getMetrics(): Promise<MetricsResponse> {
-  return jsonFetch<MetricsResponse>("/api/v2/metrics");
+export function getMetrics(fresh = false): Promise<MetricsResponse> {
+  return cachedGet<MetricsResponse>("/api/v2/metrics", TTL.VITAL, jsonFetch, fresh);
 }
 
-export function getAudit(limit = 100): Promise<{ entries: AuditEntry[] }> {
-  return jsonFetch<{ entries: AuditEntry[] }>(`/api/v2/audit?limit=${limit}`);
+export function getAudit(limit = 100, fresh = false): Promise<{ entries: AuditEntry[] }> {
+  return cachedGet<{ entries: AuditEntry[] }>(`/api/v2/audit?limit=${limit}`, TTL.VITAL, jsonFetch, fresh);
 }
 
 // ── Backend ────────────────────────────────────────────────────────────────
 
-export function getBackend(): Promise<{ backend: NodeBackend }> {
-  return jsonFetch<{ backend: NodeBackend }>("/api/v2/backend");
+export function getBackend(fresh = false): Promise<{ backend: NodeBackend }> {
+  return cachedGet<{ backend: NodeBackend }>("/api/v2/backend", TTL.VITAL, jsonFetch, fresh);
 }
 
 // SSE: emits NodeBackend snapshots. ``intervalSec`` sets the cadence
@@ -93,48 +94,54 @@ export function createBackendStream(intervalSec = 1): EventSource {
 
 // ── Network / peers ────────────────────────────────────────────────────────
 
-export function getPeers(): Promise<{ node_id: string; peers: NodeMeta[] }> {
-  return jsonFetch<{ node_id: string; peers: NodeMeta[] }>("/api/v2/network/peers");
+export function getPeers(fresh = false): Promise<{ node_id: string; peers: NodeMeta[] }> {
+  return cachedGet<{ node_id: string; peers: NodeMeta[] }>("/api/v2/network/peers", TTL.STRUCTURAL, jsonFetch, fresh);
 }
 
 // ── PyEnv ──────────────────────────────────────────────────────────────────
 
-export function getEnvs(): Promise<{ node_id: string; envs: PyEnvEntry[] }> {
-  return jsonFetch<{ node_id: string; envs: PyEnvEntry[] }>("/api/v2/pyenv");
+export function getEnvs(fresh = false): Promise<{ node_id: string; envs: PyEnvEntry[] }> {
+  return cachedGet<{ node_id: string; envs: PyEnvEntry[] }>("/api/v2/pyenv", TTL.DEFINITION, jsonFetch, fresh);
 }
 
 export function getExcelInfo(): Promise<ExcelInfo> {
-  return jsonFetch<ExcelInfo>("/api/v2/excel/info");
+  return cachedGet<ExcelInfo>("/api/v2/excel/info", TTL.DEFINITION, jsonFetch);
 }
 
-export function setEnvVars(
+export async function setEnvVars(
   envName: string,
   env_vars: Record<string, string>,
   replace = false,
 ): Promise<PyEnvEnvVars> {
-  return jsonFetch<PyEnvEnvVars>(`/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/env`, {
+  const res = await jsonFetch<PyEnvEnvVars>(`/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/env`, {
     method: "PUT",
     body: JSON.stringify({ env_vars, replace }),
   });
+  invalidate("pyenv");
+  return res;
 }
 
-export function deleteEnvVar(envName: string, key: string): Promise<PyEnvEnvVars> {
-  return jsonFetch<PyEnvEnvVars>(
+export async function deleteEnvVar(envName: string, key: string): Promise<PyEnvEnvVars> {
+  const res = await jsonFetch<PyEnvEnvVars>(
     `/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/env/${encodeURIComponent(key)}`,
     { method: "DELETE" },
   );
+  invalidate("pyenv");
+  return res;
 }
 
 export function getEnvPackages(envName: string): Promise<PyEnvPackages> {
   // Keyed by name (not the int64 id, which JSON.parse can't round-trip
-  // losslessly in JS). Server-side TTL-cached, so polling is cheap.
-  return jsonFetch<PyEnvPackages>(`/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/packages`);
+  // losslessly in JS). Server-side TTL-cached too, so this just coalesces.
+  return cachedGet<PyEnvPackages>(
+    `/api/v2/pyenv/by-name/${encodeURIComponent(envName)}/packages`, TTL.DEFINITION, jsonFetch,
+  );
 }
 
 // ── PyFunc ─────────────────────────────────────────────────────────────────
 
-export function getFuncs(): Promise<{ node_id: string; funcs: PyFuncEntry[] }> {
-  return jsonFetch<{ node_id: string; funcs: PyFuncEntry[] }>("/api/v2/pyfunc");
+export function getFuncs(fresh = false): Promise<{ node_id: string; funcs: PyFuncEntry[] }> {
+  return cachedGet<{ node_id: string; funcs: PyFuncEntry[] }>("/api/v2/pyfunc", TTL.DEFINITION, jsonFetch, fresh);
 }
 
 export interface CreateFuncInput {
@@ -146,20 +153,24 @@ export interface CreateFuncInput {
   env_id?: number | null;
 }
 
-export function createFunc(input: CreateFuncInput): Promise<{ func: PyFuncEntry }> {
-  return jsonFetch<{ func: PyFuncEntry }>("/api/v2/pyfunc", {
+export async function createFunc(input: CreateFuncInput): Promise<{ func: PyFuncEntry }> {
+  const res = await jsonFetch<{ func: PyFuncEntry }>("/api/v2/pyfunc", {
     method: "POST",
     body: JSON.stringify(input),
   });
+  invalidate("pyfunc", "stats", "metrics");
+  return res;
 }
 
-export function bulkDeleteFuncs(
+export async function bulkDeleteFuncs(
   ids: number[],
 ): Promise<{ deleted: number; failed: { id: number; error: string }[] }> {
-  return jsonFetch<{ deleted: number; failed: { id: number; error: string }[] }>(
+  const res = await jsonFetch<{ deleted: number; failed: { id: number; error: string }[] }>(
     "/api/v2/pyfunc/bulk/delete",
     { method: "POST", body: JSON.stringify({ ids }) },
   );
+  invalidate("pyfunc", "stats", "metrics");
+  return res;
 }
 
 // Trigger a function by name, then wait for the result. The chat-style "Quick
@@ -177,6 +188,7 @@ export async function runFuncByName(
   const final = await jsonFetch<{ run: PyFuncRunEntry }>(
     `/api/v2/pyfuncrun/${triggered.run.id}/wait?timeout=60`,
   );
+  invalidate("pyfuncrun", "pyfunc", "stats", "metrics");
   if (final.run.status === "failed" || final.run.error) {
     throw new Error(final.run.error || `Run #${final.run.id} failed`);
   }
@@ -186,22 +198,26 @@ export async function runFuncByName(
 
 // ── PyFuncRun ──────────────────────────────────────────────────────────────
 
-export function getRuns(): Promise<{ node_id: string; runs: PyFuncRunEntry[] }> {
-  return jsonFetch<{ node_id: string; runs: PyFuncRunEntry[] }>("/api/v2/pyfuncrun");
+export function getRuns(fresh = false): Promise<{ node_id: string; runs: PyFuncRunEntry[] }> {
+  return cachedGet<{ node_id: string; runs: PyFuncRunEntry[] }>("/api/v2/pyfuncrun", TTL.VITAL, jsonFetch, fresh);
 }
 
-export function cancelRun(runId: number): Promise<{ run: PyFuncRunEntry }> {
-  return jsonFetch<{ run: PyFuncRunEntry }>(`/api/v2/pyfuncrun/${runId}/cancel`, { method: "POST" });
+export async function cancelRun(runId: number): Promise<{ run: PyFuncRunEntry }> {
+  const res = await jsonFetch<{ run: PyFuncRunEntry }>(`/api/v2/pyfuncrun/${runId}/cancel`, { method: "POST" });
+  invalidate("pyfuncrun", "stats", "metrics");
+  return res;
 }
 
-export function deleteRun(runId: number): Promise<{ run: PyFuncRunEntry }> {
-  return jsonFetch<{ run: PyFuncRunEntry }>(`/api/v2/pyfuncrun/${runId}`, { method: "DELETE" });
+export async function deleteRun(runId: number): Promise<{ run: PyFuncRunEntry }> {
+  const res = await jsonFetch<{ run: PyFuncRunEntry }>(`/api/v2/pyfuncrun/${runId}`, { method: "DELETE" });
+  invalidate("pyfuncrun", "stats", "metrics");
+  return res;
 }
 
 // ── DAG ────────────────────────────────────────────────────────────────────
 
-export function getDags(): Promise<{ node_id: string; dags: DAGEntry[] }> {
-  return jsonFetch<{ node_id: string; dags: DAGEntry[] }>("/api/v2/dag");
+export function getDags(fresh = false): Promise<{ node_id: string; dags: DAGEntry[] }> {
+  return cachedGet<{ node_id: string; dags: DAGEntry[] }>("/api/v2/dag", TTL.DEFINITION, jsonFetch, fresh);
 }
 
 export interface CreateDagInput {
@@ -225,54 +241,63 @@ export interface CreateDagInput {
   }[];
 }
 
-export function createDag(input: CreateDagInput): Promise<{ dag: DAGEntry }> {
-  return jsonFetch<{ dag: DAGEntry }>("/api/v2/dag", {
+export async function createDag(input: CreateDagInput): Promise<{ dag: DAGEntry }> {
+  const res = await jsonFetch<{ dag: DAGEntry }>("/api/v2/dag", {
     method: "POST",
     body: JSON.stringify(input),
   });
+  invalidate("dag", "stats");
+  return res;
 }
 
-export function deleteDag(dagId: number): Promise<{ dag: DAGEntry }> {
-  return jsonFetch<{ dag: DAGEntry }>(`/api/v2/dag/${dagId}`, { method: "DELETE" });
+export async function deleteDag(dagId: number): Promise<{ dag: DAGEntry }> {
+  const res = await jsonFetch<{ dag: DAGEntry }>(`/api/v2/dag/${dagId}`, { method: "DELETE" });
+  invalidate("dag", "stats");
+  return res;
 }
 
-export function runDag(dagId: number): Promise<{ run: DAGRunEntry }> {
-  return jsonFetch<{ run: DAGRunEntry }>(`/api/v2/dag/${dagId}/run`, { method: "POST" });
+export async function runDag(dagId: number): Promise<{ run: DAGRunEntry }> {
+  const res = await jsonFetch<{ run: DAGRunEntry }>(`/api/v2/dag/${dagId}/run`, { method: "POST" });
+  invalidate("dag", "pyfuncrun", "stats", "metrics");
+  return res;
 }
 
 export function getDagRuns(dagId: number): Promise<{ node_id: string; runs: DAGRunEntry[] }> {
-  return jsonFetch<{ node_id: string; runs: DAGRunEntry[] }>(`/api/v2/dag/${dagId}/run`);
+  return cachedGet<{ node_id: string; runs: DAGRunEntry[] }>(`/api/v2/dag/${dagId}/run`, TTL.VITAL, jsonFetch);
 }
 
-export function scheduleDag(
+export async function scheduleDag(
   dagId: number,
   intervalSeconds: number,
   maxRuns?: number,
 ): Promise<{ dag: DAGEntry }> {
-  return jsonFetch<{ dag: DAGEntry }>(`/api/v2/dag/${dagId}/schedule`, {
+  const res = await jsonFetch<{ dag: DAGEntry }>(`/api/v2/dag/${dagId}/schedule`, {
     method: "POST",
     body: JSON.stringify({
       interval_seconds: intervalSeconds,
       max_runs: maxRuns ?? null,
     }),
   });
+  invalidate("dag", "stats");
+  return res;
 }
 
 // ── User ───────────────────────────────────────────────────────────────────
 
-export function getUsers(): Promise<{ node_id: string; users: UserCard[] }> {
-  return jsonFetch<{ node_id: string; users: UserCard[] }>("/api/v2/user");
+export function getUsers(fresh = false): Promise<{ node_id: string; users: UserCard[] }> {
+  return cachedGet<{ node_id: string; users: UserCard[] }>("/api/v2/user", TTL.DEFINITION, jsonFetch, fresh);
 }
 
 // ── Filesystem ─────────────────────────────────────────────────────────────
 
 export function getFsListing(
   path: string,
+  fresh = false,
 ): Promise<{ node_id: string; path: string; entries: FsEntry[] }> {
   const url = path
     ? `/api/v2/fs/ls?path=${encodeURIComponent(path)}`
     : "/api/v2/fs/ls";
-  return jsonFetch<{ node_id: string; path: string; entries: FsEntry[] }>(url);
+  return cachedGet<{ node_id: string; path: string; entries: FsEntry[] }>(url, TTL.VITAL, jsonFetch, fresh);
 }
 
 // Reads a bounded preview of a file. The backend caps how much it pulls into
@@ -317,9 +342,9 @@ export function grepFs(
 
 // ── Messenger ──────────────────────────────────────────────────────────────
 
-export function getChannels(): Promise<{ node_id: string; channels: ChannelInfo[] }> {
-  return jsonFetch<{ node_id: string; channels: ChannelInfo[] }>(
-    "/api/v2/messenger/channels",
+export function getChannels(fresh = false): Promise<{ node_id: string; channels: ChannelInfo[] }> {
+  return cachedGet<{ node_id: string; channels: ChannelInfo[] }>(
+    "/api/v2/messenger/channels", TTL.DEFINITION, jsonFetch, fresh,
   );
 }
 
@@ -327,16 +352,18 @@ export function getMessages(
   channel: string,
   limit = 50,
 ): Promise<{ channel: string; messages: Message[] }> {
-  return jsonFetch<{ channel: string; messages: Message[] }>(
-    `/api/v2/messenger/${encodeURIComponent(channel)}?limit=${limit}`,
+  return cachedGet<{ channel: string; messages: Message[] }>(
+    `/api/v2/messenger/${encodeURIComponent(channel)}?limit=${limit}`, TTL.VITAL, jsonFetch,
   );
 }
 
-export function sendMessage(channel: string, content: string): Promise<Message> {
-  return jsonFetch<Message>(`/api/v2/messenger/${encodeURIComponent(channel)}`, {
+export async function sendMessage(channel: string, content: string): Promise<Message> {
+  const res = await jsonFetch<Message>(`/api/v2/messenger/${encodeURIComponent(channel)}`, {
     method: "POST",
     body: JSON.stringify({ channel, content }),
   });
+  invalidate("messenger");
+  return res;
 }
 
 export function createMessageStream(channel: string): EventSource {

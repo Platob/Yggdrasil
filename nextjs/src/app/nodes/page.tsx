@@ -153,18 +153,18 @@ export default function NodesPage() {
   const eventSourceRef = useRef<EventSource | null>(null);
 
   // ── Initial data fetch ──────────────────────────────────────
-  const fetchAll = useCallback(async () => {
+  const fetchAll = useCallback(async (fresh = false) => {
     try {
       const [backendRes, peersRes, envsRes, funcsRes, dagsRes, runsRes, usersRes, auditRes, statsRes] = await Promise.allSettled([
-        getBackend(),
-        getPeers(),
-        getEnvs(),
-        getFuncs(),
-        getDags(),
-        getRuns(),
-        getUsers(),
-        getAudit(),
-        getStats(),
+        getBackend(fresh),
+        getPeers(fresh),
+        getEnvs(fresh),
+        getFuncs(fresh),
+        getDags(fresh),
+        getRuns(fresh),
+        getUsers(fresh),
+        getAudit(100, fresh),
+        getStats(fresh),
       ]);
       if (statsRes.status === "fulfilled") setStats(statsRes.value);
       if (backendRes.status === "fulfilled") {
@@ -288,7 +288,7 @@ export default function NodesPage() {
             </div>
             {/* Refresh button */}
             <button
-              onClick={fetchAll}
+              onClick={() => fetchAll(true)}
               className="
                 px-3 py-1.5 rounded-lg text-xs font-medium
                 text-frost/70 hover:text-frost

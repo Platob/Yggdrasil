@@ -267,11 +267,15 @@ class FsService:
                     await asyncio.sleep(poll_seconds)
 
     def grep(self, path: str, pattern: str, *, max_matches: int = 200,
-             case_sensitive: bool = False, regex: bool = False) -> list[dict]:
+             case_sensitive: bool = False, regex: bool = False) -> tuple[list[dict], bool]:
         """Recursive substring/regex search over text files inside ``path``.
 
-        Returns a list of {path, line_number, line, match} dicts. Skips files
-        whose first 1 KB is mostly non-text (heuristic null-byte check).
+        Returns ``(matches, truncated)`` where each match is a
+        {path, line_number, line, match} dict. Skips files whose first 1 KB is
+        mostly non-text (heuristic null-byte check). The walk stops once it has
+        either filled ``max_matches`` or visited ``du_max_entries`` tree nodes,
+        so a huge tree never gets materialized or fully scanned — ``truncated``
+        flags when a cap cut the walk short.
         """
         import re
         from ...exceptions import NotFoundError
@@ -281,9 +285,19 @@ class FsService:
         flags = 0 if case_sensitive else re.IGNORECASE
         prog = re.compile(pattern if regex else re.escape(pattern), flags)
         results: list[dict] = []
-        targets = [root] if root.is_file() else list(root.rglob("*"))
+        scan_cap = self.settings.du_max_entries
+        scanned = 0
+        truncated = False
+        # rglob is a generator — iterate it lazily so we never hold the whole
+        # tree in memory; bail the moment a cap is hit.
+        targets = iter([root]) if root.is_file() else root.rglob("*")
         for p in targets:
             if len(results) >= max_matches:
+                truncated = True
+                break
+            scanned += 1
+            if scanned > scan_cap:
+                truncated = True
                 break
             if not p.is_file():
                 continue
@@ -296,6 +310,7 @@ class FsService:
                 with open(p, "r", encoding="utf-8", errors="replace") as fh:
                     for lineno, line in enumerate(fh, start=1):
                         if len(results) >= max_matches:
+                            truncated = True
                             break
                         m = prog.search(line)
                         if m:
@@ -308,4 +323,4 @@ class FsService:
                             })
             except (OSError, UnicodeDecodeError):
                 continue
-        return results
+        return results, truncated

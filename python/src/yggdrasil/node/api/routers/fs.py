@@ -119,8 +119,18 @@ async def search_files(req: _SearchRequest, service: FsService = Depends(get_fs_
         raise NotFoundError(f"Directory {req.path!r} not found")
 
     matches = []
+    scan_cap = service.settings.du_max_entries
+    scanned = 0
+    truncated = False
+    # rglob is lazy — stop at the match cap or the scan cap so a huge tree is
+    # neither materialized nor fully walked.
     for p in root.rglob("*"):
         if len(matches) >= req.max_results:
+            truncated = True
+            break
+        scanned += 1
+        if scanned > scan_cap:
+            truncated = True
             break
         rel = str(p.relative_to(service._root))
         name = p.name
@@ -135,7 +145,10 @@ async def search_files(req: _SearchRequest, service: FsService = Depends(get_fs_
                 })
             except OSError:
                 continue
-    return {"path": req.path, "pattern": req.pattern, "count": len(matches), "matches": matches}
+    return {
+        "path": req.path, "pattern": req.pattern,
+        "count": len(matches), "matches": matches, "truncated": truncated,
+    }
 
 
 class _CopyRequest(StrictModel):
@@ -241,13 +254,16 @@ class _GrepRequest(StrictModel):
 @router.post("/grep")
 async def grep_files(req: _GrepRequest, service: FsService = Depends(get_fs_service)) -> dict:
     """Recursive grep over text files. Returns matches with line numbers."""
-    matches = service.grep(
+    matches, truncated = service.grep(
         req.path, req.pattern,
         max_matches=req.max_matches,
         case_sensitive=req.case_sensitive,
         regex=req.regex,
     )
-    return {"path": req.path, "pattern": req.pattern, "count": len(matches), "matches": matches}
+    return {
+        "path": req.path, "pattern": req.pattern,
+        "count": len(matches), "matches": matches, "truncated": truncated,
+    }
 
 
 @router.get("/du")

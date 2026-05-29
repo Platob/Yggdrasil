@@ -130,11 +130,11 @@ export default function DagsPage() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
 
-  const fetchAll = useCallback(async () => {
+  const fetchAll = useCallback(async (fresh = false) => {
     try {
       const [dagsRes, funcsRes] = await Promise.allSettled([
-        getDags(),
-        getFuncs(),
+        getDags(fresh),
+        getFuncs(fresh),
       ]);
       if (dagsRes.status === "fulfilled") setDags(dagsRes.value.dags);
       if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
@@ -367,7 +367,7 @@ export default function DagsPage() {
             </p>
           </div>
           <button
-            onClick={fetchAll}
+            onClick={() => fetchAll(true)}
             className="
               px-3 py-1.5 rounded-lg text-xs font-medium
               text-frost/70 hover:text-frost
