@@ -115,6 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     excel_cmd.add_argument("--check", action="store_true", default=False, help="Only check; don't write files.")
     excel_cmd.add_argument("--host", default=None, help="Node base URL to check (default: local node).")
+    excel_cmd.add_argument("--install", action="store_true", default=False, help="Sideload the add-in into Excel's trusted folder (where supported).")
     excel_cmd.set_defaults(handler=_node_excel)
 
     # create
@@ -213,8 +214,11 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None, 
 
     npm = shutil.which("npm")
     if npm is None:
+        npm = _ensure_nodejs()
+    if npm is None:
         from yggdrasil.cli.style import dim, out, yellow
-        out(f"  {yellow('skip')}  npm not found — install Node.js to serve the frontend\n")
+        out(f"  {yellow('skip')}  Node.js/npm unavailable and auto-install failed — "
+            f"install Node.js to serve the frontend\n")
         return None
 
     if not (front_home / "node_modules").exists():
@@ -244,6 +248,61 @@ def _start_frontend(settings, *, node_port: int, front_port: int | None = None, 
     from yggdrasil.cli.style import bold, cyan, out
     out(f"  {cyan('front')} {bold(f'http://0.0.0.0:{port}')}\n")
     return proc
+
+
+def _ensure_nodejs() -> "str | None":
+    """Best-effort: make ``npm`` available, auto-installing Node.js via the
+    platform package manager when missing. Returns the npm path or None.
+
+    Tries one manager per platform (Homebrew on macOS; apt/dnf/yum on
+    Linux; winget/choco on Windows). Anything else — no manager, no
+    privileges, network blocked — falls through to None and the caller
+    prints install guidance.
+    """
+    import platform
+    import shutil
+    import subprocess
+    from yggdrasil.cli.style import dim, green, out, yellow
+
+    npm = shutil.which("npm")
+    if npm:
+        return npm
+
+    system = platform.system()
+    # (probe binary, install argv) candidates, first available wins.
+    candidates: list[tuple[str, list[str]]] = []
+    if system == "Darwin":
+        candidates = [("brew", ["brew", "install", "node"])]
+    elif system == "Windows":
+        candidates = [
+            ("winget", ["winget", "install", "-e", "--id", "OpenJS.NodeJS", "--silent"]),
+            ("choco", ["choco", "install", "nodejs", "-y"]),
+        ]
+    else:  # Linux / other POSIX
+        if shutil.which("apt-get"):
+            candidates = [("apt-get", ["sudo", "apt-get", "install", "-y", "nodejs", "npm"])]
+        elif shutil.which("dnf"):
+            candidates = [("dnf", ["sudo", "dnf", "install", "-y", "nodejs"])]
+        elif shutil.which("yum"):
+            candidates = [("yum", ["sudo", "yum", "install", "-y", "nodejs"])]
+
+    mgr = next(((m, cmd) for m, cmd in candidates if shutil.which(m)), None)
+    if mgr is None:
+        out(f"  {yellow('!')} Node.js missing and no known package manager found "
+            f"({dim('install from https://nodejs.org')})\n")
+        return None
+
+    name, cmd = mgr
+    out(f"  {yellow('…')} Node.js missing — attempting install via {name}\n")
+    try:
+        subprocess.run(cmd, check=True, timeout=600)
+    except Exception as exc:  # noqa: BLE001 — best-effort, report and bail
+        out(f"  {yellow('!')} auto-install via {name} failed: {dim(str(exc))}\n")
+        return None
+    npm = shutil.which("npm")
+    if npm:
+        out(f"  {green('✓')} Node.js installed\n")
+    return npm
 
 
 # ── handlers ─────────────────────────────────────────────────────
@@ -416,10 +475,42 @@ def _node_excel(args: argparse.Namespace) -> int:
         out(f"    {green('✓')} {'updated' if existed else 'created'} {dim(str(manifest))}\n")
         out(f"    {dim('taskpane')}  {blue(taskpane)}\n")
 
-    # 3. Power Query + page pointers
+    # 3. deploy prerequisites — Node.js (frontend hosts the task-pane)
+    import platform
+    import shutil
+    node = shutil.which("node")
+    npm = shutil.which("npm")
+    out(f"\n  {cyan('node.js')}\n")
+    if node and npm:
+        out(f"    {green('✓')} node {dim(node)}\n")
+    else:
+        out(f"    {yellow('!')} not found — run {bold('ygg node serve')} to auto-install, "
+            f"or get it from {dim('https://nodejs.org')}\n")
+
+    # 4. direct add-in install into Excel's trusted sideload folder
+    system = platform.system()
+    if system == "Darwin":
+        wef = Path.home() / "Library" / "Containers" / "com.microsoft.Excel" / "Data" / "Documents" / "wef"
+        out(f"\n  {cyan('sideload')}    {dim('macOS trusted folder available')}\n")
+        if args.install and not args.check:
+            wef.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(manifest, wef / "yggdrasil.manifest.xml")
+            out(f"    {green('✓')} installed → {dim(str(wef / 'yggdrasil.manifest.xml'))}\n")
+            out(f"    {dim('Restart Excel; find it under Insert → Add-ins → Developer Add-ins.')}\n")
+        else:
+            out(f"    {dim('run with --install to copy the manifest there')}\n")
+    elif system == "Windows":
+        out(f"\n  {cyan('sideload')}    {dim('Windows needs a shared-folder trusted catalog')}\n")
+        out(f"    {dim('Share the manifest folder, then File → Options → Trust Center → Trusted Add-in Catalogs.')}\n")
+        if args.install:
+            out(f"    {yellow('!')} direct install unsupported on Windows (catalog is registry-based)\n")
+    else:
+        out(f"\n  {cyan('sideload')}    {dim('Excel desktop not present on this OS; use Upload My Add-in on Win/Mac')}\n")
+
+    # 5. Power Query + page pointers
     out(f"\n  {cyan('power query')}  {dim('powerquery/YggdrasilExcel.pq (paste) · Yggdrasil.pq (.mez)')}\n")
     out(f"  {cyan('manage')}       {blue(f'http://localhost:{front_port}/excel')}\n")
-    out(f"\n  Sideload: Excel → Insert → Add-ins → Upload My Add-in → manifest.xml\n")
+    out(f"\n  Manual sideload: Excel → Insert → Add-ins → Upload My Add-in → manifest.xml\n")
     return 0
 
 
