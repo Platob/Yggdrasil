@@ -1288,11 +1288,22 @@ class HTTPResponse(IO):  # IO inherits Tabular
                 return col[i].as_py()
             except (OverflowError, ValueError):
                 # A corrupt/legacy cache cell can hold a timestamp int64
-                # outside Python's datetime range (year 1–9999); .as_py()
-                # then raises "date value out of range". Don't let one bad
-                # cell kill the whole batch read — treat it as missing. For
-                # received_at this defaults to epoch, so the stale entry is
-                # simply refetched rather than served.
+                # whose unit makes .as_py() overflow Python's datetime range
+                # (year 1–9999) — e.g. a microsecond magnitude stored in a
+                # second-unit column. Fall back to the raw underlying int64
+                # so the downstream any_to_datetime can re-detect the unit,
+                # rather than dropping the cell (which defaults received_at
+                # to epoch and forces a needless refetch). Only keep the int
+                # if it actually re-converts; an irrecoverably out-of-range
+                # value still drops to None so one bad cell can't kill the
+                # batch read.
+                try:
+                    raw = col[i].value
+                    if isinstance(raw, int):
+                        any_to_datetime(raw)
+                        return raw
+                except (AttributeError, OverflowError, ValueError):
+                    pass
                 LOGGER.warning(
                     "Dropping unreadable Arrow cell %r (row %d): out-of-range value",
                     name, i,
