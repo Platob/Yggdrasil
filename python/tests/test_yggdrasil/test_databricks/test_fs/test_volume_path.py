@@ -397,6 +397,108 @@ class TestRangeReads:
         assert p._stat_cached.size == len(self.PAYLOAD)
 
 
+class TestFormats:
+    """How VolumePath behaves under the real format readers/writers
+    (Parquet, pickle) over the HTTP transport. A store-backed fake
+    round-trips bytes through ``workspace.files`` so write→read goes the
+    whole way through ``_upload`` / ``_read_mv``."""
+
+    @staticmethod
+    def _store_backed(workspace):
+        """Wire ``workspace.files`` to a single in-memory blob store."""
+        store: dict[str, bytes] = {}
+
+        def _upload(*, file_path, contents, overwrite):
+            store["blob"] = contents.read()
+
+        def _download(path):
+            if "blob" not in store:
+                raise NotFound(path)
+            return SimpleNamespace(
+                contents=SimpleNamespace(read=lambda: store["blob"]),
+                content_type=None,
+                last_modified=None,
+            )
+
+        def _get_metadata(path):
+            if "blob" not in store:
+                raise NotFound(path)
+            return SimpleNamespace(
+                content_length=len(store["blob"]),
+                content_type=None,
+                last_modified=None,
+            )
+
+        workspace.files.upload.side_effect = _upload
+        workspace.files.download.side_effect = _download
+        workspace.files.get_metadata.side_effect = _get_metadata
+        workspace.files.get_directory_metadata.side_effect = NotFound()
+        return store
+
+    def test_parquet_write_read_roundtrip(self, workspace, client, service):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        self._store_backed(workspace)
+        table = pa.table({"id": pa.array(range(1000), type=pa.int64()),
+                          "name": pa.array([f"r{i}" for i in range(1000)])})
+        sink = io.BytesIO()
+        pq.write_table(table, sink)
+        p = VolumePath("/Volumes/c/s/v/data.parquet", service=service)
+        p.write_bytes(sink.getvalue(), overwrite=True)
+
+        got = pq.read_table(io.BytesIO(bytes(p.read_bytes())))
+        assert got.equals(table)
+
+    def test_parquetfile_reader_over_volume(self, workspace, client, service):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        store = self._store_backed(workspace)
+        table = pa.table({"x": pa.array(range(500), type=pa.int64())})
+        sink = io.BytesIO()
+        pq.write_table(table, sink)
+        store["blob"] = sink.getvalue()
+
+        p = VolumePath("/Volumes/c/s/v/data.parquet", service=service)
+        got = ParquetFile(holder=p, owns_holder=False).read_arrow_table()
+        assert got.equals(table)
+
+    def test_format_read_snapshots_whole_object(self, workspace, client, service):
+        # The format readers go through ``arrow_input_stream``, which
+        # snapshots a remote holder (one whole-object GET) before handing
+        # pyarrow a BufferReader — so a Parquet read transfers the entire
+        # file, NOT a ranged projection. This anchors that behaviour: the
+        # Range optimization lands on raw partial reads, and making
+        # column projection range-backed would flip this assertion.
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        store = self._store_backed(workspace)
+        table = pa.table({f"c{i}": pa.array(range(2000), type=pa.int64())
+                          for i in range(8)})
+        sink = io.BytesIO()
+        pq.write_table(table, sink, row_group_size=200)
+        store["blob"] = sink.getvalue()
+
+        p = VolumePath("/Volumes/c/s/v/wide.parquet", service=service)
+        ParquetFile(holder=p, owns_holder=False).read_arrow_table()
+        # Whole object pulled (snapshot), not a sub-range.
+        assert client.files_session.return_value.bytes_served >= len(store["blob"])
+
+    def test_pickle_roundtrip(self, workspace, client, service):
+        import pickle
+
+        self._store_backed(workspace)
+        obj = {"ids": list(range(2000)), "label": "x" * 500, "nested": {"a": [1, 2]}}
+        p = VolumePath("/Volumes/c/s/v/obj.pkl", service=service)
+        p.write_bytes(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),
+                      overwrite=True)
+        assert pickle.loads(bytes(p.read_bytes())) == obj
+
+
 class TestWrite:
 
     def test_overwrite(self, workspace, client, service) -> None:
