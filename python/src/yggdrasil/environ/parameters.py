@@ -40,9 +40,10 @@ import datetime as dt
 import logging
 import os
 import sys
+import types
 from collections.abc import Mapping as MappingABC
 from enum import Enum
-from typing import Any, ClassVar, Iterator, Mapping, get_args, get_origin, get_type_hints
+from typing import Any, ClassVar, Iterator, Mapping, Union, get_args, get_origin, get_type_hints
 
 from yggdrasil.data.cast import convert
 
@@ -316,18 +317,29 @@ class SystemParameters(MappingABC):
 
     @staticmethod
     def _is_iterable_type(type_: Any) -> bool:
-        """Return ``True`` when *type_* is a list/set-shaped annotation.
+        """Return ``True`` when *type_* is a list/set/tuple/frozenset annotation.
 
-        Handles bare ``list`` / ``set``, parameterised ``list[int]`` /
-        ``set[str]``, and nested ``Optional[list[...]]`` via origin lookup.
-        ``str`` / ``bytes`` are *not* iterable for this purpose — we don't
-        want a declared ``str`` field to be split on commas.
+        Handles bare ``list`` / ``set`` / ``tuple`` / ``frozenset``,
+        parameterised ``list[int]`` / ``set[str]`` / ``tuple[int, ...]``, and
+        ``Optional[list[...]]`` / ``list[...] | None`` by unwrapping the union
+        and checking the non-``None`` members. ``str`` / ``bytes`` are *not*
+        iterable for this purpose — we don't want a declared ``str`` field to
+        be split on commas.
         """
         if type_ in (list, set, tuple, frozenset):
             return True
         origin = get_origin(type_)
         if origin is None:
             return False
+        # See through ``Optional[list[int]]`` (origin ``typing.Union``) and
+        # ``list[int] | None`` (origin ``types.UnionType``) so an optional
+        # iterable field still gets the CSV pre-split.
+        if origin is Union or origin is getattr(types, "UnionType", None):
+            return any(
+                arg is not type(None)
+                and SystemParameters._is_iterable_type(arg)
+                for arg in get_args(type_)
+            )
         return origin in (list, set, tuple, frozenset)
 
     def _lookup_raw(self, key: str) -> Any:

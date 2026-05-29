@@ -6,7 +6,7 @@ import os
 import sys
 from collections.abc import Mapping
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 from unittest import mock
 
 import pytest
@@ -549,6 +549,32 @@ class TestIterableCasting:
         cfg = Config(argv=None, dbutils=None)
         assert cfg.content_ids == ()
         assert cfg.tags == {"a"}
+
+    def test_frozenset_field(self) -> None:
+        class Config(SystemParameters):
+            ids: frozenset[int] = frozenset()
+
+        cfg = Config({"ids": "1,2,1"}, argv=None, dbutils=None)
+        assert cfg.ids == frozenset({1, 2})
+        assert isinstance(cfg.ids, frozenset)
+        # Empty source collapses to the empty frozenset, not {0}.
+        assert Config({"ids": ""}, argv=None, dbutils=None).ids == frozenset()
+
+    def test_optional_list_splits_csv(self) -> None:
+        class Config(SystemParameters):
+            content_ids: Optional[list[int]] = None
+
+        # An optional iterable still gets the CSV pre-split + cast.
+        assert Config({"content_ids": "1,2,3"}, argv=None, dbutils=None).content_ids == [1, 2, 3]
+        # Truly unset keeps the declared default.
+        assert Config(argv=None, dbutils=None).content_ids is None
+
+    def test_pep604_optional_list_splits_csv(self) -> None:
+        class Config(SystemParameters):
+            ports: "list[int] | None" = None
+
+        cfg = Config(argv=["--ports=80,443"], dbutils=None)
+        assert cfg.ports == [80, 443]
 
 
 # ============================================================================
