@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from ..deps import get_fs_service, get_network_service
+from ..deps import get_fs_service, get_network_service, get_saga_service
 from ..schemas.common import StrictModel
 from ..schemas.fs import (
     FsEntry,
@@ -14,6 +14,7 @@ from ..schemas.fs import (
 )
 from ..services.fs import FsService
 from ..services.network import NetworkService
+from ..services.saga import SagaService
 
 router = APIRouter(tags=["fs"])
 
@@ -34,10 +35,13 @@ async def _remote(
 async def list_nodes(
     service: FsService = Depends(get_fs_service),
     network: NetworkService = Depends(get_network_service),
+    saga: SagaService = Depends(get_saga_service),
 ) -> dict:
-    """Roots of the global filesystem tree: the local node plus every linked
-    peer. Each is a lazily-expandable root in the UI — reachability is proven
-    when its directory listing is requested, so this stays instant."""
+    """Roots of the global filesystem tree: the local node, every linked peer,
+    and every registered Saga mount. Each is a lazily-expandable root in the UI
+    — reachability is proven when its listing is requested, so this stays
+    instant. A mount expands via ``/api/v2/saga/mount/{alias}/ls`` and its
+    tabular children are queryable in the SQL editor as ``alias/sub.parquet``."""
     peers = await network.get_peers()
     nodes = [{
         "node_id": service.settings.node_id,
@@ -52,7 +56,11 @@ async def list_nodes(
         "cpu_percent": p.cpu_percent, "memory_percent": p.memory_percent,
         "active_runs": p.active_runs,
     } for p in peers.peers]
-    return {"node_id": service.settings.node_id, "nodes": nodes}
+    mounts = [{
+        "alias": m.name, "target": m.target, "kind": m.kind,
+        "read_only": m.read_only, "comment": m.comment,
+    } for m in (await saga.list_mounts()).mounts]
+    return {"node_id": service.settings.node_id, "nodes": nodes, "mounts": mounts}
 
 
 @router.get("/ls", response_model=FsListResponse)

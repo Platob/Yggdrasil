@@ -228,6 +228,73 @@ class DiscoverRequest(StrictModel):
     model_config = {"populate_by_name": True}
 
 
+# -- path mounts ------------------------------------------------------------
+# A Mount is a named alias for a base path or URL — the same idea as the
+# @function feature, but for path objects. ``mount://<alias>/<sub>`` (or just
+# ``<alias>/<sub>``) expands to ``<target>/<sub>`` everywhere a source is
+# resolved: the SQL engine (``SELECT * FROM 'prod_vol/2024/jan.parquet'``), a
+# registered table's ``source_url``, and the file browser. The target is any
+# URL the yggdrasil ``Path``/``Tabular`` layer can open — a Databricks volume
+# (``/Volumes/cat/sch/vol``), an S3 prefix (``s3://bucket/key``), a remote node
+# (``npfs://node-2:8100/data``) or a node-home-relative folder.
+
+class MountCreate(StrictModel):
+    name: str                          # the alias (e.g. "prod_vol")
+    target: str                        # base path/URL the alias expands to
+    comment: str = ""
+    read_only: bool = True             # navigation/SQL never mutates unless False
+    properties: dict[str, str] = Field(default_factory=dict)
+
+
+class MountUpdate(StrictModel):
+    target: str | None = None
+    comment: str | None = None
+    read_only: bool | None = None
+    properties: dict[str, str] | None = None
+
+
+class MountEntry(StrictModel):
+    id: int
+    name: str
+    target: str
+    comment: str = ""
+    read_only: bool = True
+    # The path family of the target, sniffed from its scheme/prefix — purely
+    # informational for the UI (databricks_volume | s3 | node | local | ...).
+    kind: str = "local"
+    node_id: str = ""
+    properties: dict[str, str] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+
+
+class MountResponse(StrictModel):
+    mount: MountEntry
+
+
+class MountListResponse(StrictModel):
+    node_id: str
+    mounts: list[MountEntry]
+
+
+# -- mount navigation (lazy browse through the Path layer) ------------------
+
+class MountNode(StrictModel):
+    name: str
+    path: str                          # the mount-relative subpath of this child
+    is_dir: bool = False
+    size: int = 0
+    is_tabular: bool = False           # a tabular file → queryable / previewable
+
+
+class MountListing(StrictModel):
+    mount: str
+    subpath: str = ""
+    target: str                        # the resolved absolute target it expanded to
+    entries: list[MountNode]
+    truncated: bool = False
+
+
 # -- forecast workflow ------------------------------------------------------
 
 class ForecastSpec(StrictModel):
