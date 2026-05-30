@@ -366,3 +366,25 @@ class TestFolderPredicate:
         assert out.num_rows == 3
         assert sorted(out.column("pk").to_pylist()) == ["a", "b", "c"]
         assert sorted(out.column("val").to_pylist()) == [10, 20, 30]
+
+    def test_plan_leaves_lists_and_prunes_before_read(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        # The planning pass resolves the concrete surviving leaf-file set from
+        # directory listings + path-level prune, opening no data file.
+        fp = Folder(path=str(tmp_path / "part"))
+        fp.write_arrow_batches([
+            _partitioned_batch(["a", "a", "b", "c", "c"], [10, 20, 30, 40, 50])
+        ])
+
+        # Partition KV lives on each leaf's containing folder (tabular_parent).
+        full = list(fp._plan_leaves(FolderOptions(), fp._free_cols_for(None)))
+        assert {lf.tabular_parent.static_values.get("pk") for lf in full} == {"a", "b", "c"}
+        # Every planned entry is a concrete data-file leaf, not a sub-folder.
+        assert all(not isinstance(lf, Folder) for lf in full)
+
+        pred = col("pk") == "a"
+        pruned = list(
+            fp._plan_leaves(FolderOptions(predicate=pred), fp._free_cols_for(pred))
+        )
+        assert {lf.tabular_parent.static_values.get("pk") for lf in pruned} == {"a"}
