@@ -59,6 +59,42 @@ __all__ = [
 ]
 
 
+def _field_has_variant(field: "Field") -> bool:
+    """``True`` when *field*'s type tree contains an ``ObjectType`` (variant)
+    anywhere — at the field itself or nested inside a struct / map / list."""
+    if field.type_id == DataTypeId.OBJECT:
+        return True
+    return any(_field_has_variant(c) for c in field.dtype.children)
+
+
+def _rebind_variant_fields(
+    target_children: "list[Field]",
+    casted: "list[pa.Array]",
+    arrow_fields: "list[pa.Field]",
+) -> "list[pa.Field]":
+    """Rebind every target field whose type tree carries a variant
+    (``ObjectType``) to its column's actual arrow type before struct assembly.
+
+    An ``ObjectType`` target is a "keep whatever's here" passthrough — its cast
+    returns the source array untouched and its declared arrow type
+    (``large_binary``) is a physical stand-in, not a cast request. When a
+    variant sits anywhere in the tree the casted array — not the declared
+    schema — is authoritative for that column, so binding its real type into
+    the assembled fields lets a bare ``columns=`` projection over struct / map /
+    list children preserve source dtypes instead of failing to coerce e.g.
+    ``int64`` -> large_binary. Returns *arrow_fields* unchanged when no field
+    carries a variant.
+    """
+    if not any(_field_has_variant(c) for c in target_children):
+        return arrow_fields
+    return [
+        pa.field(f.name, arr.type, f.nullable)
+        if _field_has_variant(c)
+        else f
+        for c, arr, f in zip(target_children, casted, arrow_fields)
+    ]
+
+
 def cast_arrow_struct_array(
     array: pa.StructArray,
     options: "CastOptions",
@@ -127,6 +163,10 @@ def cast_arrow_struct_array(
                 options=options.copy(source=source_child, target=target_child),
             )
         )
+    target_fields = _rebind_variant_fields(
+        target_type.children, children, target_fields,
+    )
+
     # ``pa.StructArray.from_arrays`` raises a bare ArrowInvalid when a
     # child's type doesn't equal the declared field type. Wrap the
     # assembler so the failing leaf surfaces with its source / target
@@ -192,7 +232,10 @@ def cast_arrow_map_array(
 
     return pa.StructArray.from_arrays(
         children,
-        fields=[f.to_arrow_field() for f in target_type.fields],
+        fields=_rebind_variant_fields(
+            target_type.children, children,
+            [f.to_arrow_field() for f in target_type.fields],
+        ),
         mask=array.is_null(),
         memory_pool=options.arrow_memory_pool,
     )
@@ -235,7 +278,10 @@ def cast_arrow_list_array(
 
     return pa.StructArray.from_arrays(
         casted_children,
-        fields=[f.to_arrow_field() for f in target_type.fields],
+        fields=_rebind_variant_fields(
+            target_children, casted_children,
+            [f.to_arrow_field() for f in target_type.fields],
+        ),
         mask=array.is_null() if isinstance(array, pa.Array) else None,
         memory_pool=memory_pool,
     )
@@ -426,23 +472,16 @@ def cast_arrow_tabular(
         target_arrays.append(casted)
         target_sources.append(source_field)
 
-    # A variant (``ObjectType``) target field is a "keep whatever's here"
-    # passthrough — its per-column cast returns the source array untouched and
-    # its declared arrow type (``large_binary``) is a physical stand-in, not a
-    # cast request. Rebind those fields to the projected column's real type so
-    # a bare ``columns=`` projection (struct-of-objects target) preserves the
-    # source dtypes instead of failing to coerce e.g. ``int64`` -> large_binary.
-    if any(c.type_id == DataTypeId.OBJECT for c in target_schema.children):
+    # Rebind variant (``ObjectType``) target fields to the projected column's
+    # real type so a bare ``columns=`` projection (struct-of-objects target)
+    # preserves source dtypes instead of failing to coerce to large_binary.
+    arrow_fields = list(target_arrow_schema)
+    rebound = _rebind_variant_fields(
+        target_schema.children, target_arrays, arrow_fields,
+    )
+    if rebound is not arrow_fields:
         target_arrow_schema = pa.schema(
-            [
-                pa.field(f.name, arr.type, f.nullable)
-                if child.type_id == DataTypeId.OBJECT
-                else f
-                for child, arr, f in zip(
-                    target_schema.children, target_arrays, target_arrow_schema
-                )
-            ],
-            metadata=target_arrow_schema.metadata,
+            rebound, metadata=target_arrow_schema.metadata,
         )
 
     # ``pa.Table.from_arrays(schema=...)`` silently coerces a column

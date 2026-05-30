@@ -249,3 +249,37 @@ class TestFieldSelectDrop:
         s = schema(fields=[field("a", pa.int64()), field("b", pa.string())])
         out = s.drop()
         assert out.names == ["a", "b"]
+
+
+class TestVariantTargetPassthrough:
+    """An ``ObjectType`` (variant) target field is a "keep whatever's here"
+    passthrough — it projects a column without forcing a coerce to its
+    physical ``large_binary`` stand-in, including when nested inside a
+    struct / map / list target."""
+
+    def test_top_level_object_keeps_source_type(self):
+        from yggdrasil.data.types.primitive.object import ObjectType
+        from yggdrasil.data.options import CastOptions
+
+        src = pa.table({"id": pa.array([1, 2, 3], pa.int64()),
+                        "x": pa.array([1.5, 2.5, 3.5], pa.float64())})
+        tgt = schema(fields=[field("id", ObjectType())])
+        out = CastOptions.check(target=tgt).cast_arrow(src)
+        assert out.column_names == ["id"]
+        assert out.schema.field("id").type == pa.int64()
+        assert out.column("id").to_pylist() == [1, 2, 3]
+
+    def test_struct_child_object_keeps_source_type(self):
+        from yggdrasil.data.types.primitive.object import ObjectType
+        from yggdrasil.data.types.nested.struct import StructType
+        from yggdrasil.data.data_field import Field
+        from yggdrasil.data.options import CastOptions
+
+        src = pa.table({"s": pa.array([{"a": 1, "b": 2}, {"a": 3, "b": 4}])})
+        tgt = schema(fields=[
+            field("s", StructType(fields=(Field(name="a", dtype=ObjectType()),)))
+        ])
+        out = CastOptions.check(target=tgt).cast_arrow(src)
+        # 'a' keeps its int64 type (not large_binary), 'b' is projected away.
+        assert out.schema.field("s").type == pa.struct([pa.field("a", pa.int64())])
+        assert out.column("s").to_pylist() == [{"a": 1}, {"a": 3}]
