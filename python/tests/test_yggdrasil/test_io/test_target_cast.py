@@ -285,41 +285,27 @@ class TestVariantTargetPassthrough:
         assert out.column("s").to_pylist() == [{"a": 1}, {"a": 3}]
 
 
-class TestCheckInvariant:
-    """``CastOptions.check_invariant`` completes autotyping: variant
-    (``ObjectType``) target slots adopt the matching source field's dtype while
-    the target's projection and concrete types are preserved."""
+class TestAutoMergeFillsVariants:
+    """``Mode.AUTO`` merge completes autotyping: variant (``ObjectType`` /
+    ``NullType``) target slots adopt the matching source field's dtype by name,
+    while source-only columns are never pulled in (the field set stays the
+    target's). This is what turns a bare ``columns=`` projection into a
+    fully-typed target once the source schema is known."""
 
-    def test_fills_object_targets_from_source(self):
-        from yggdrasil.data.options import CastOptions
+    def test_auto_fills_object_and_null_without_adding_columns(self):
+        from yggdrasil.data.types.primitive.object import ObjectType
+        from yggdrasil.data.types.primitive.null import NullType
+        from yggdrasil.enums import Mode
 
-        src = schema(fields=[
+        src = field("", schema(fields=[
             field("id", pa.int64()), field("price", pa.float64()),
             field("name", pa.string()),
-        ])
-        # bare columns= -> struct of ObjectType placeholders
-        opt = CastOptions.check(columns=["id", "price"]).check_source(src)
-        filled = opt.check_invariant()
-        assert filled.target.dtype == schema(fields=[
-            field("id", pa.int64()), field("price", pa.float64()),
-        ]).dtype
-
-    def test_preserves_concrete_target_and_ignores_extra_source(self):
-        from yggdrasil.data.types.primitive.object import ObjectType
-        from yggdrasil.data.options import CastOptions
-
-        src = schema(fields=[
-            field("id", pa.int64()), field("qty", pa.int64()), field("x", pa.float64()),
-        ])
-        tgt = schema(fields=[field("id", pa.int32()), field("qty", ObjectType())])
-        filled = CastOptions(source=src, target=tgt).check_invariant()
-        # id keeps the explicit int32, qty is filled to int64, x is not added.
-        assert filled.target.names == ["id", "qty"]
-        assert filled.target.field(name="id").dtype.to_arrow() == pa.int32()
-        assert filled.target.field(name="qty").dtype.to_arrow() == pa.int64()
-
-    def test_noop_without_source(self):
-        from yggdrasil.data.options import CastOptions
-
-        opt = CastOptions.check(columns=["id"])
-        assert opt.check_invariant() is opt
+        ]).dtype)
+        tgt = field("", schema(fields=[
+            field("id", ObjectType()), field("price", NullType()),
+        ]).dtype)
+        merged = tgt.merge_with(src, mode=Mode.AUTO)
+        # object -> int64, null -> float64; 'name' is NOT added.
+        assert merged.names == ["id", "price"]
+        assert merged.field(name="id").dtype.to_arrow() == pa.int64()
+        assert merged.field(name="price").dtype.to_arrow() == pa.float64()
