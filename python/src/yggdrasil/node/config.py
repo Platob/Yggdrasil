@@ -110,6 +110,12 @@ class Settings:
     # Rows an analysis (aggregate / describe / finance) pulls before computing.
     # Bounds memory/time; results over this cap are flagged truncated.
     analysis_max_rows: int = 200_000
+    # Byte budget for the rows a query materialises in memory. Reductions stream
+    # the whole file regardless; this caps the *materialised* paths (finance,
+    # forecast, the non-scannable fallback) by measuring the Arrow size of a
+    # sample and deriving a row cap — preferred over a fixed row count because a
+    # wide row costs far more memory than a narrow one. Defaults to 256 MiB.
+    analysis_max_bytes: int = 256 * 1024 * 1024
     # Seconds a PyEnv's resolved interpreter version + installed-library
     # listing stays cached before the next ``pip list`` subprocess runs —
     # keeps the UI's per-env package view from flooding the node.
@@ -239,6 +245,7 @@ def get_settings() -> Settings:
         du_max_entries=int(os.getenv("YGG_NODE_DU_MAX_ENTRIES", "200000")),
         tabular_preview_max_rows=int(os.getenv("YGG_NODE_TABULAR_PREVIEW_ROWS", "2000")),
         analysis_max_rows=int(os.getenv("YGG_NODE_ANALYSIS_MAX_ROWS", "200000")),
+        analysis_max_bytes=int(os.getenv("YGG_NODE_ANALYSIS_MAX_BYTES", str(256 * 1024 * 1024))),
         pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
         seed_defaults=_as_bool(os.getenv("YGG_NODE_SEED_DEFAULTS"), True),
         tmp_ttl=int(os.getenv("YGG_NODE_TMP_TTL", str(86_400))),

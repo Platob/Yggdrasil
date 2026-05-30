@@ -108,8 +108,13 @@ class AnalysisService:
         has_g = bool(req.group and req.group in cols)
         keep = list(dict.fromkeys(
             [req.column] + ([req.x] if has_x else []) + ([req.group] if has_g else [])))
-        df = lf.select(keep).collect(engine="streaming")
-        source_rows = df.height
+        plan = lf.select(keep)
+        # Bound the materialised series by the byte budget — keeps forecasting a
+        # huge file from pulling it all into memory; we forecast the tail.
+        cap = self._row_cap_for_bytes(plan)
+        full_rows = plan.select(pl.len()).collect(engine="streaming").item()
+        df = plan.tail(cap).collect(engine="streaming") if full_rows > cap else plan.collect(engine="streaming")
+        source_rows = full_rows
 
         agg = req.agg if req.agg in ("mean", "sum", "last", "max", "min") else "mean"
 
@@ -248,6 +253,21 @@ class AnalysisService:
             lf = lf.head(t.limit)
         return lf
 
+    def _row_cap_for_bytes(self, plan: pl.LazyFrame, max_bytes: int | None = None) -> int:
+        """How many rows of ``plan`` fit the byte budget — measured, not guessed.
+
+        Streams a small sample, measures its in-memory Arrow size, and divides
+        the budget by the per-row cost. A wide row (many/large columns) yields a
+        small cap; a narrow row a large one. Bounded by ``analysis_max_rows`` so
+        a degenerate estimate can't blow up. Returns the row cap."""
+        budget = max_bytes or self.settings.analysis_max_bytes
+        sample = plan.head(2048).collect(engine="streaming")
+        if sample.height == 0:
+            return self.settings.analysis_max_rows
+        per_row = max(1, sample.estimated_size() // sample.height)
+        cap = int(budget // per_row)
+        return max(256, min(cap, self.settings.analysis_max_rows))
+
     # -- export -------------------------------------------------------------
 
     def _export(self, req: ExportRequest):
@@ -344,7 +364,9 @@ class AnalysisService:
         plan = lf.select(keep)
         if req.order_by and req.order_by in cols:
             plan = plan.sort(req.order_by)
-        cap = req.limit
+        # Cap by the byte budget (Arrow size of a sample), not just req.limit —
+        # a wide series exhausts memory at far fewer rows than a narrow one.
+        cap = min(req.limit, self._row_cap_for_bytes(plan))
         df = plan.head(cap + 1).collect(engine="streaming")
         truncated = df.height > cap
         if truncated:
