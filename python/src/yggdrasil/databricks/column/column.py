@@ -51,12 +51,6 @@ class Column:
         else:
             f.metadata.update(metadata)
 
-        logger.debug(
-            "Parsed column %s.%s.%s.%s (dtype=%s, nullable=%s)",
-            table.catalog_name, table.schema_name, table.table_name, f.name,
-            f.dtype, f.nullable,
-        )
-
         return cls(
             table=table,
             name=f.name,
