@@ -85,12 +85,31 @@ def _build_url_struct(url: URL) -> dict[str, Any]:
     return url.to_struct_dict()
 
 
+_DEFAULT_SENDER: "UserInfo | None | EllipsisType" = ...
+
+
 def _default_sender() -> UserInfo | None:
-    """Resolve :class:`UserInfo` for the current process — never raises."""
+    """Resolve :class:`UserInfo` for the current process — never raises.
+
+    Memoised: the local identity is process-stable and
+    :meth:`UserInfo.current` already returns a singleton, so the only
+    thing the repeated call bought on the hot path (every request and
+    every response resolves a default sender / receiver) was a
+    ``socket.gethostname()`` syscall plus a singleton-cache lookup. The
+    cached value is the identical object :meth:`UserInfo.current` would
+    return, so callers see no behaviour change. A failed resolution is
+    not cached — the next call retries.
+    """
+    global _DEFAULT_SENDER
+    cached = _DEFAULT_SENDER
+    if cached is not ...:
+        return cached
     try:
-        return UserInfo.current()
+        resolved = UserInfo.current()
     except Exception:
         return None
+    _DEFAULT_SENDER = resolved
+    return resolved
 
 
 def _coerce_request_buffer(obj: Any) -> Optional[Holder]:

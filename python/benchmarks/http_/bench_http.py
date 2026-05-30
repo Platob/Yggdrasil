@@ -35,9 +35,8 @@ import time
 from typing import Callable
 
 from yggdrasil.url import URL
-from yggdrasil.io.headers import Headers
 from yggdrasil.http_.session import HTTPSession
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.http_.send_config import SendConfig

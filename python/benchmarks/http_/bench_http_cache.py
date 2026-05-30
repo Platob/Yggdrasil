@@ -47,7 +47,7 @@ from typing import Callable
 
 from yggdrasil.http_.session import HTTPSession
 from yggdrasil.url import URL
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response

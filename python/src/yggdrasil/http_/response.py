@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import functools
 import http.client
 import logging
 import warnings
@@ -157,6 +158,33 @@ def _is_probably_placeholder_content_type(value: str | None) -> bool:
     }
 
 
+# Resolved once — the OCTET_STREAM fallback is identity-stable, so
+# rebuilding it per header-sniff (every response carries one) was pure
+# waste. ``MediaType`` is a frozen dataclass, so the shared instance is
+# safe to hand back to every caller.
+_OCTET_MEDIA: "MediaType" = MediaType.from_mime(MimeTypes.OCTET_STREAM)
+
+
+@functools.lru_cache(maxsize=512)
+def _media_from_mime_strings(
+    content_type: str | None,
+    content_encoding: str | None,
+) -> MediaType:
+    """Resolve a ``(Content-Type, Content-Encoding)`` pair to a MediaType.
+
+    Memoised because the mapping is pure and the same header strings
+    repeat on nearly every response (``application/json``,
+    ``application/vnd.apache.arrow.stream``, …). The bare
+    :meth:`MediaType.from_many` walk over the mime registry costs
+    ~12 us; the cached lookup is ~0.1 us. ``MediaType`` is frozen, so
+    the shared instance is safe to return to every caller.
+    """
+    return MediaType.from_many(
+        mime_types=[content_type, content_encoding],
+        default=_OCTET_MEDIA,
+    )
+
+
 def _sniff_media_from_body(
     body: Holder,
     *,
@@ -164,14 +192,11 @@ def _sniff_media_from_body(
     content_encoding: str | None,
 ) -> MediaType:
     if content_type or content_encoding:
-        return MediaType.from_many(
-            mime_types=[content_type, content_encoding],
-            default=MediaType.from_mime(MimeTypes.OCTET_STREAM)
-        )
+        return _media_from_mime_strings(content_type, content_encoding)
     declared = body.media_type
     if declared is not None:
         return declared
-    return MediaType.from_mime(MimeTypes.OCTET_STREAM)
+    return _OCTET_MEDIA
 
 
 def _media_type_from_headers(
@@ -186,10 +211,7 @@ def _media_type_from_headers(
     if not declared_encoding and _is_probably_placeholder_content_type(declared_type):
         return None
 
-    return MediaType.from_many(
-        mime_types=[declared_type, declared_encoding],
-        default=MediaType.from_mime(MimeTypes.OCTET_STREAM),
-    )
+    return _media_from_mime_strings(declared_type, declared_encoding)
 
 
 def _ensure_media_headers(

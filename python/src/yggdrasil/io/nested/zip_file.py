@@ -475,7 +475,10 @@ class ZipFile(IO):
         ``size`` / Tabular hook on a child triggers its own
         single-entry decompression.
         """
-        if self.size == 0:
+        # Guard on ``size_known`` too: a streaming holder reports
+        # ``size == 0`` until the body is pulled, so a bare ``size == 0``
+        # check would short-circuit a not-yet-read stream to "empty".
+        if self.size_known and self.size == 0:
             return
         with self.view(pos=0) as v:
             with zipfile.ZipFile(v, "r") as zf:
@@ -492,7 +495,8 @@ class ZipFile(IO):
 
     def list_entries(self) -> "list[str]":
         """Return entry names in stored order. One directory walk; no decompression."""
-        if self.size == 0:
+        # ``size_known`` guard — a streaming holder is size 0 until pulled.
+        if self.size_known and self.size == 0:
             return []
         with self.view(pos=0) as v:
             with zipfile.ZipFile(v, "r") as zf:
@@ -620,7 +624,8 @@ class ZipFile(IO):
         format, …) behind an empty read. Empty archives still
         return zero batches without raising.
         """
-        if self.size == 0:
+        # ``size_known`` guard — a streaming holder is size 0 until pulled.
+        if self.size_known and self.size == 0:
             return
 
         # Side-effect import: ensures the primitive leaves registered

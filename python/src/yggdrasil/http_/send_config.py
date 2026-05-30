@@ -46,7 +46,7 @@ class SendConfig:
 
     __slots__ = (
         "raise_error", "wait", "remote_cache", "local_cache",
-        "cache_only", "spark_session",
+        "cache_only", "spark_session", "stream",
     )
 
     def __init__(
@@ -57,12 +57,24 @@ class SendConfig:
         local_cache: "CacheConfig | None" = None,
         cache_only: bool = False,
         spark_session: "bool | None" = None,
+        stream: bool = False,
     ):
         self.raise_error = raise_error
         self.wait = WaitingConfig.from_(wait) if wait is not None else None
         self.remote_cache = CacheConfig.from_(remote_cache) if remote_cache is not None else None
         self.local_cache = CacheConfig.from_(local_cache) if local_cache is not None else None
         self.cache_only = cache_only
+        # When ``stream`` is set the wire send leaves the body un-preloaded
+        # (``preload_content=False``): ``from_wire`` keeps the live socket
+        # as the buffer's source instead of draining it eagerly, so a
+        # consumer reading via ``.stream()`` / ``.iter_content`` pulls the
+        # body incrementally and a multi-GB download never fully resides in
+        # memory. The consumer owns draining + connection release (every
+        # body accessor — ``.content`` / ``.data`` / ``.text`` / ``.json``
+        # / ``.stream`` — does this). Incompatible with caching, which must
+        # read the whole body to persist it; ``_can_fast_path`` already
+        # routes cached requests away from the streaming wire path.
+        self.stream = stream
         if spark_session is not None and spark_session is not False:
             self.spark_session = True
         else:
@@ -238,6 +250,8 @@ class SendConfig:
             parts.append("cache_only=True")
         if self.spark_session:
             parts.append("spark_session=True")
+        if self.stream:
+            parts.append("stream=True")
         return f"SendConfig({', '.join(parts)})"
 
     def __eq__(self, other):
@@ -249,13 +263,14 @@ class SendConfig:
             and self.remote_cache == other.remote_cache
             and self.local_cache == other.local_cache
             and self.cache_only == other.cache_only
+            and self.stream == other.stream
         )
 
     def __hash__(self):
         return hash((
             self.raise_error, self.wait,
             self.remote_cache, self.local_cache,
-            self.cache_only,
+            self.cache_only, self.stream,
         ))
 
     def __getstate__(self):
@@ -266,6 +281,7 @@ class SendConfig:
             "local_cache": self.local_cache,
             "cache_only": self.cache_only,
             "spark_session": self.spark_session,
+            "stream": self.stream,
         }
 
     def __setstate__(self, state):
@@ -275,6 +291,7 @@ class SendConfig:
         self.local_cache = state.get("local_cache")
         self.cache_only = state.get("cache_only", False)
         self.spark_session = bool(state.get("spark_session", False))
+        self.stream = bool(state.get("stream", False))
 
     def copy(self, **overrides):
         clean = {k: v for k, v in overrides.items() if v is not ...}
