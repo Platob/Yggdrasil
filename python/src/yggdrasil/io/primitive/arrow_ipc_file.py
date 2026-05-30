@@ -140,11 +140,11 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         faulted in. Columns the target wants but the file lacks are absent here;
         the cast fills them with nulls.
         """
-        target = options.target
-        if target is None or not available_names:
+        wanted = options.read_columns()
+        if wanted is None or not available_names:
             return None
         avail = frozenset(available_names)
-        selected = [n for n in target.names if n in avail]
+        selected = [n for n in wanted if n in avail]
         if not selected or len(selected) == len(available_names):
             return None
         return selected

@@ -374,3 +374,57 @@ class TestAutoMergeFillsVariants:
         out = opt.cast_arrow(src)
         assert out.column_names == ["id"]
         assert out.schema.field("id").type == pa.int64()
+
+
+class TestProjectionWithPredicate:
+    """columns= projection + a predicate that filters on a *dropped* column
+    must keep that column through the read (for the filter) and still return
+    only the projected columns — and an empty result keeps concrete types."""
+
+    def _folder(self, tmp_path):
+        from yggdrasil.path.folder import Folder
+        sch = pa.schema([
+            pa.field("partition_key", pa.int64(), metadata={b"t:partition_by": b"True"}),
+            pa.field("request_public_hash", pa.int64()),
+        ])
+        t = pa.table({"partition_key": pa.array([1, 1, 2], pa.int64()),
+                      "request_public_hash": pa.array([111, 222, 333], pa.int64())},
+                     schema=sch)
+        Folder(path=str(tmp_path / "c")).write_arrow_table(t)
+        return Folder(path=str(tmp_path / "c"))
+
+    def test_predicate_on_projected_out_partition_column(self, tmp_path):
+        from yggdrasil.execution.expr import col
+        out = self._folder(tmp_path).read_arrow_table(
+            predicate=col("partition_key").is_in([1]),
+            columns=["request_public_hash"],
+        )
+        assert out.column_names == ["request_public_hash"]
+        assert sorted(out.column("request_public_hash").to_pylist()) == [111, 222]
+        assert out.schema.field("request_public_hash").type == pa.int64()
+
+    def test_empty_result_keeps_concrete_type_not_objecttype(self, tmp_path):
+        from yggdrasil.execution.expr import col
+        fp = self._folder(tmp_path)
+        fp._schema_cache = ...   # cold cache → fallback resolves via merged
+        out = fp.read_arrow_table(
+            predicate=col("partition_key").is_in([99]),   # matches nothing
+            columns=["request_public_hash"],
+        )
+        assert out.num_rows == 0
+        assert out.column_names == ["request_public_hash"]
+        assert out.schema.field("request_public_hash").type == pa.int64()
+
+    def test_direct_parquet_columns_plus_predicate_on_dropped_column(self, tmp_path):
+        import pyarrow.parquet as pq
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.path.local_path import LocalPath
+        from yggdrasil.execution.expr import col
+
+        path = str(tmp_path / "f.parquet")
+        pq.write_table(pa.table({"x": [1, 2, 3], "y": [10, 20, 30]}), path)
+        out = ParquetFile(holder=LocalPath.from_(path)).read_arrow_table(
+            predicate=col("x") == 2, columns=["y"],
+        )
+        assert out.column_names == ["y"]
+        assert out.column("y").to_pylist() == [20]

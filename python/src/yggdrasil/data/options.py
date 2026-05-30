@@ -479,6 +479,27 @@ class CastOptions:
 
         return merged.names
 
+    def read_columns(self) -> list[str] | None:
+        """Columns a source reader must keep — the projection plus the
+        predicate's columns.
+
+        :attr:`column_names` is what the read should *end up* with, but the
+        predicate row-filter runs before the cast projects down to it, so any
+        column the predicate touches has to survive the read even when the
+        caller didn't ask for it (``columns=["a"]`` + ``predicate`` on ``b``).
+        ``None`` means no projection — read everything.
+        """
+        names = self.column_names
+        if names is None:
+            return None
+        cols = list(names)
+        if self.predicate is not None:
+            from yggdrasil.execution.expr import free_columns
+            for c in (free_columns(self.predicate) or ()):
+                if c not in cols:
+                    cols.append(c)
+        return cols
+
     @property
     def match_by_keys(self) -> list[str] | None:
         """Resolved key column names to dedup on.
@@ -1085,7 +1106,16 @@ class CastOptions:
 
     def _apply_predicate_and_cast(self, data: Any) -> Any:
         if self.predicate is not None:
-            data = self.predicate.filter_arrow_batch(data)
+            # Only filter when the data still carries the predicate's columns.
+            # A projected read keeps them for the leaf filter then casts them
+            # away, so a re-applied filter further up the pipe (or a partition
+            # column already enforced by the path prune) would otherwise blow
+            # up on the missing column — it's a no-op here, the filter already
+            # ran where the columns existed.
+            from yggdrasil.execution.expr import free_columns
+            free = free_columns(self.predicate)
+            if free is None or set(free).issubset(data.schema.names):
+                data = self.predicate.filter_arrow_batch(data)
         if self.target is None or self.checked_cast:
             return data
         return self.merged.cast_arrow_tabular(data, options=self)

@@ -160,11 +160,11 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         Columns the target asks for but the file doesn't carry are
         silently dropped here; the cast will fill them with nulls.
         """
-        target = options.target
-        if target is None or available_names is None:
+        wanted = options.read_columns()
+        if wanted is None or available_names is None:
             return None
         avail = available_names if isinstance(available_names, frozenset) else frozenset(available_names)
-        selected = [n for n in target.names if n in avail]
+        selected = [n for n in wanted if n in avail]
         if not selected or len(selected) == len(avail):
             return None
         return selected

@@ -1089,9 +1089,23 @@ class Folder(Path):
                 yielded = True
                 yield batch
         if not yielded:
-            schema = self._schema_cache
-            if schema is ... or not schema:
-                schema = options.target
+            schema = self._schema_cache if self._schema_cache is not ... else None
+            target = options.target
+            if target is not None:
+                # A projected read (``columns=[...]``) carries ObjectType
+                # placeholders on the target; resolve them against the folder's
+                # own schema via the AUTO merge so an empty result still reports
+                # concrete column types (int64, …) instead of the ObjectType
+                # ``large_binary`` stand-in.
+                if not schema:
+                    # ``_collect_schema`` (not the public wrapper, which would
+                    # short-circuit to ``options.merged`` == the ObjectType
+                    # target) reads the real sidecar / first-batch schema.
+                    try:
+                        schema = self._collect_schema(options)
+                    except Exception:
+                        schema = None
+                schema = options.with_source(schema).merged if schema else target
             if schema and hasattr(schema, "to_arrow_schema"):
                 arrow_schema = schema.to_arrow_schema()
                 yield pa.RecordBatch.from_pydict(
