@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchArrowRichPost, type ColKind } from "@/lib/arrow";
-import type { PlanGraph } from "@/lib/api";
+import { materializeSql, type PlanGraph } from "@/lib/api";
+import TabularAnalyze from "@/components/TabularAnalyze";
 
 export interface TabularColumnDef { name: string; dtype?: string; kind?: ColKind }
 export type Cell = unknown;
@@ -81,6 +82,10 @@ export default function TabularDisplay({
   const [visible, setVisible] = useState(pageSize);
   const [copied, setCopied] = useState(false);
   const reqId = useRef(0);
+  const [pane, setPane] = useState<"grid" | "analyze">("grid");
+  const [aPath, setAPath] = useState<string | null>(query?.source ?? null);
+  const [aBusy, setABusy] = useState(false);
+  const [aErr, setAErr] = useState("");
 
   useEffect(() => {
     if (!query) return;
@@ -137,6 +142,26 @@ export default function TabularDisplay({
     return n;
   });
 
+  // Analytics + download run against a tabular *path*. A file source is already
+  // a path; a SQL source is materialised once to a tmp parquet on demand — so
+  // Saga and Files analyse the exact same way.
+  const canAnalyze = !!(query && (query.source || query.sql));
+  const analyzeCols = useMemo(() => src.columns.map((c) => ({ name: c.name, type: c.dtype })), [src.columns]);
+  const openAnalyze = async () => {
+    setPane("analyze");
+    if (aPath) return;
+    if (query?.source) { setAPath(query.source); return; }
+    if (query?.sql) {
+      setABusy(true); setAErr("");
+      try {
+        const r = await materializeSql({ sql: query.sql, catalog: query.catalog, schema: query.schema, node: query.node });
+        setAPath(r.path);
+      } catch (e) { setAErr(String(e)); }
+      finally { setABusy(false); }
+    }
+  };
+  useEffect(() => { setAPath(query?.source ?? null); setPane("grid"); }, [query?.sql, query?.source]);
+
   const cap = caption ?? (tookMs != null ? `${src.rows.length} rows · ${tookMs} ms` : undefined);
 
   return (
@@ -153,18 +178,34 @@ export default function TabularDisplay({
           ))}
         </div>
       )}
-      {(cap || onExpand) && (
+      {(cap || onExpand || canAnalyze) && (
         <div className="flex items-center gap-2 px-1 pb-1.5 text-[11px] text-muted">
+          {canAnalyze && (
+            <span className="flex items-center gap-1 font-mono">
+              <button onClick={() => setPane("grid")} className={pane === "grid" ? "text-frost font-semibold" : "text-muted hover:text-foreground-dim"}>Grid</button>
+              <span className="text-muted/40">|</span>
+              <button onClick={openAnalyze} className={pane === "analyze" ? "text-frost font-semibold" : "text-muted hover:text-foreground-dim"}>Analyze</button>
+              <span className="w-px h-3 bg-white/10 mx-1" />
+            </span>
+          )}
           {cap && <span className="font-mono">{cap}</span>}
           {view.length !== src.rows.length && <span className="text-amber/80">· {view.length} shown</span>}
           {copied && <span className="text-emerald/80">· copied</span>}
-          {loading && <span className="text-frost/80">· loading…</span>}
+          {(loading || aBusy) && <span className="text-frost/80">· {aBusy ? "materialising…" : "loading…"}</span>}
           <div className="flex-1" />
           {onExpand && <button onClick={onExpand} className="text-frost/70 hover:text-frost" title="expand">⤢</button>}
         </div>
       )}
       {err && <div className="text-[12px] text-rose/90 font-mono p-2 bg-rose/5 border border-rose/20 rounded-lg mb-1 break-words">{err}</div>}
+      {aErr && <div className="text-[12px] text-rose/90 font-mono p-2 bg-rose/5 border border-rose/20 rounded-lg mb-1 break-words">{aErr}</div>}
 
+      {pane === "analyze" && canAnalyze ? (
+        aPath ? (
+          <TabularAnalyze path={aPath} node={query?.node} columns={analyzeCols} />
+        ) : (
+          <div className="flex-1 p-4 text-[12px] text-muted">{aBusy ? "materialising result…" : "preparing analytics…"}</div>
+        )
+      ) : (
       <div className="flex-1 overflow-auto border border-white/[0.06] rounded-lg min-h-0" style={{ maxHeight }}>
         <table className="w-full text-[12px] font-mono border-collapse">
           <thead className="sticky top-0 z-10 bg-[#0a0a1a]">
@@ -232,6 +273,7 @@ export default function TabularDisplay({
           </button>
         )}
       </div>
+      )}
     </div>
   );
 }

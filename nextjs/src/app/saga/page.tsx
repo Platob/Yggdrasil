@@ -32,7 +32,6 @@ import {
   type PlanEdit,
   type OpLogEntry,
 } from "@/lib/api";
-import TabularModal from "@/components/TabularModal";
 import TabularDisplay, { type QuerySpec } from "@/components/TabularDisplay";
 import PlanGraphView from "@/components/PlanGraph";
 
@@ -658,13 +657,18 @@ export default function SagaPage() {
       </div>
 
       {preview && (
-        <TabularModal
-          node={node}
-          nodeLabel={node ?? "local"}
-          path={preview.path}
-          name={preview.name}
-          onClose={() => setPreview(null)}
-        />
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
+          style={{ background: "var(--modal-scrim, rgba(0,0,0,0.72))" }} onClick={() => setPreview(null)}>
+          <div className="modal-surface rounded-xl w-full max-w-6xl h-[85vh] flex flex-col p-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-semibold text-frost truncate">{preview.name}</span>
+              <button onClick={() => setPreview(null)} className="text-muted hover:text-foreground text-sm">close ✕</button>
+            </div>
+            <div className="flex-1 min-h-0">
+              <TabularDisplay query={{ source: preview.path, node }} maxHeight="100%" />
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Full asset edit modal */}

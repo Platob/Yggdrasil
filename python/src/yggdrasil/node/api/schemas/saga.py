@@ -282,6 +282,15 @@ class StagedResult(StrictModel):
     elapsed_ms: float
 
 
+class MaterializeResult(StrictModel):
+    node_id: str
+    # Node-home-relative path to the result parquet (drives /tabular + /analysis).
+    path: str
+    columns: list[SqlColumn]
+    row_count: int
+    elapsed_ms: float
+
+
 class SqlExportRequest(StrictModel):
     sql: str
     dialect: str | None = None

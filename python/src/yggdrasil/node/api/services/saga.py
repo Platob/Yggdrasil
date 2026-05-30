@@ -63,6 +63,7 @@ from ..schemas.saga import (
     PlanEditResult,
     PlanGraph,
     PlanOp,
+    MaterializeResult,
     RegisterRequest,
     ReplicateRequest,
     ReplicateResult,
@@ -1232,7 +1233,40 @@ class SagaService:
         target.write_bytes(data)
         return str(target)
 
-    # -- export (download the full result in any media type) ----------------
+    # -- materialize (run once → a path the path-based APIs can analyse) -----
+
+    async def materialize_sql(self, req: SqlRequest):
+        return await run_in_threadpool(self._materialize_sql, req)
+
+    def _materialize_sql(self, req: SqlRequest):
+        """Run the query and write the result to a tmp parquet, returning a
+        node-home-relative path. Lets the existing path-based /tabular and
+        /analysis surfaces drive analytics over a SQL result — so Saga and the
+        Files browser share the exact same tabular display + analyze + export."""
+        from pathlib import Path as _P
+
+        import pyarrow.parquet as pq
+
+        node, _, refs = self.plan_for(req)
+        tables = self._build_tables(refs, req.catalog, req.schema_)
+        t0 = time.perf_counter()
+        try:
+            table = execute_plan(node, tables).read_arrow_table()
+        except (BadRequestError, NotFoundError):
+            raise
+        except Exception as exc:
+            raise BadRequestError(f"query failed: {exc}")
+        spill = scratch.new_path(self.settings.tmp_root, "tmp",
+                                 ttl_seconds=self.settings.tmp_ttl, suffix="materialize.parquet")
+        pq.write_table(table, str(spill))
+        rel = str(_P(spill).relative_to(self.settings.node_home))
+        return MaterializeResult(
+            node_id=self.settings.node_id, path=rel,
+            columns=_sql_columns(table.schema), row_count=table.num_rows,
+            elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+        )
+
+    # -- export (download the full media type) -----------------------------
 
     async def export_sql(self, req):
         return await run_in_threadpool(self._export_sql, req)

@@ -780,6 +780,13 @@ export function editPlan(body: { sql: string; dialect?: string; catalog?: string
   return jsonFetch("/api/v2/saga/plan/edit", { method: "POST", body: JSON.stringify(body) });
 }
 
+export interface MaterializeResult { node_id: string; path: string; columns: SqlColumn[]; row_count: number; elapsed_ms: number }
+// Run a query once and write it to a tmp parquet, returning a node path so the
+// path-based /tabular + /analysis surfaces can analyse a SQL result.
+export function materializeSql(body: { sql: string; dialect?: string; catalog?: string; schema?: string; node?: string }): Promise<MaterializeResult> {
+  return jsonFetch<MaterializeResult>("/api/v2/saga/sql.materialize", { method: "POST", body: JSON.stringify(body) });
+}
+
 export const SQL_EXPORT_FORMATS = ["csv", "parquet", "json", "ndjson", "arrow", "xlsx"] as const;
 
 // Run the query on the node where the data lives and download the full result

@@ -17,6 +17,7 @@ from ..schemas.saga import (
     CatalogUpdate,
     DiscoverRequest,
     ExplainResult,
+    MaterializeResult,
     OpLogResponse,
     PlanEditRequest,
     PlanEditResult,
@@ -292,6 +293,20 @@ async def stage_sql(req: SqlRequest, saga: SagaService = Depends(get_saga_servic
         body["node"] = None
         return await network.proxy_json(target, "POST", "/api/v2/saga/sql.stage", json_body=body)
     return await saga.stage_result(req)
+
+
+@router.post("/sql.materialize", response_model=MaterializeResult)
+async def materialize_sql(req: SqlRequest,
+                         saga: SagaService = Depends(get_saga_service),
+                         network: NetworkService = Depends(get_network_service)):
+    """Run the query once and write it to a tmp parquet, returning a node path.
+    Drives the shared /tabular + /analysis surfaces over a SQL result."""
+    target = saga.compute_node(req)
+    if target:
+        body = req.model_dump(by_alias=True)
+        body["node"] = None
+        return await network.proxy_json(target, "POST", "/api/v2/saga/sql.materialize", json_body=body)
+    return await saga.materialize_sql(req)
 
 
 @router.post("/explain", response_model=ExplainResult)
