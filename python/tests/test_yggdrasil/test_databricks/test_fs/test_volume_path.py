@@ -1995,3 +1995,78 @@ class TestUCNavigation:
         p = VolumePath("/Volumes", service=service)
         with pytest.raises(ValueError, match="/Volumes/<cat>/<sch>/<vol>"):
             _ = p.schema
+
+
+class TestStreamingUpload:
+    """Arrow/Parquet writes to a VolumePath spill the encode to a temp file
+    and stream it to the Files API in bounded memory (``_upload_stream``),
+    never materialising the whole payload through ``_upload``."""
+
+    def _roundtrip_store(self, workspace) -> dict:
+        store: dict = {}
+
+        def upload(*, file_path, contents, overwrite):
+            store["buf"] = contents.read() if hasattr(contents, "read") else bytes(contents)
+
+        def download(path):
+            buf = store.get("buf")
+            if buf is None:
+                raise NotFound(path)
+            return SimpleNamespace(
+                contents=SimpleNamespace(read=lambda: buf),
+                content_type=None,
+                last_modified=None,
+            )
+
+        def get_metadata(path):
+            buf = store.get("buf")
+            if buf is None:
+                raise NotFound(path)
+            return SimpleNamespace(content_length=len(buf), content_type=None, last_modified=None)
+
+        workspace.files.upload.side_effect = upload
+        workspace.files.download.side_effect = download
+        workspace.files.get_metadata.side_effect = get_metadata
+        return store
+
+    def test_parquet_write_streams_from_a_spill_file_and_roundtrips(
+        self, workspace, client, service, monkeypatch
+    ):
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.path.local_path import LocalPath
+
+        self._roundtrip_store(workspace)
+        p = VolumePath("/Volumes/c/s/v/t.parquet", service=service)
+
+        seen = {"stream": 0, "materialize": 0, "source_type": None, "source_size": 0}
+        real_stream = VolumePath._upload_stream
+        real_upload = VolumePath._upload
+
+        def spy_stream(self, source):
+            seen["stream"] += 1
+            # Capture during the call — the spill file is unlinked afterwards.
+            seen["source_type"] = type(source)
+            seen["source_size"] = int(source.size)
+            return real_stream(self, source)
+
+        def spy_upload(self, content):
+            seen["materialize"] += 1
+            return real_upload(self, content)
+
+        monkeypatch.setattr(VolumePath, "_upload_stream", spy_stream)
+        monkeypatch.setattr(VolumePath, "_upload", spy_upload)
+
+        table = pa.table({"id": pa.array(list(range(1000)), type=pa.int64())})
+        ParquetFile(holder=p).write_arrow_table(table)
+
+        # Streamed, not materialised; and the source was a real on-disk spill
+        # file (a LocalPath), proving the encode never lived whole in memory.
+        assert seen["stream"] == 1
+        assert seen["materialize"] == 0
+        assert seen["source_type"] is LocalPath
+        assert seen["source_size"] > 0
+
+        # And it round-trips byte-correct through the Files API.
+        got = ParquetFile(holder=p).read_arrow_table()
+        assert got.column("id").to_pylist() == list(range(1000))

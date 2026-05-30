@@ -3308,6 +3308,27 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
 
         return _ArrowOutputStreamContext(self, append=append)
 
+    def _commit_format_source(
+        self,
+        source: "Holder",
+        *,
+        append: bool = False,
+    ) -> int:
+        """Commit a format payload that was spilled to *source* (a Holder over
+        a temp file) instead of buffered in memory.
+
+        When the backing holder streams its upload (``SUPPORTS_STREAMING_UPLOAD``)
+        and this isn't an append, push *source* straight to the backend in
+        bounded chunks via :meth:`_upload_stream` — the payload never
+        materialises whole. Otherwise (in-memory holder, append, or a backend
+        that doesn't stream) read the spill and route it through the normal
+        :meth:`_commit_format_payload`, which is byte-for-byte the prior path.
+        """
+        holder = self._parent if self._parent is not None else self
+        if not append and getattr(holder, "SUPPORTS_STREAMING_UPLOAD", False):
+            return holder._upload_stream(source)
+        return self._commit_format_payload(source.read_bytes(), append=append)
+
     def _commit_format_payload(
         self,
         payload: "Any",
