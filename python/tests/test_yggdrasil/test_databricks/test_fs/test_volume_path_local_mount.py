@@ -421,7 +421,10 @@ class TestOSErrorFallback:
         real_open = builtins.open
 
         def bad_open(path, *a, **kw):
-            if "/Volumes/cat/sch/vol/explode" in str(path):
+            # Normalise separators — on Windows ``str(path)`` is
+            # backslash-joined, so a forward-slash substring never matched
+            # and the real ``open`` ran (raising FileNotFoundError).
+            if str(path).replace("\\", "/").endswith("/Volumes/cat/sch/vol/explode"):
                 raise PermissionError("simulated")
             return real_open(path, *a, **kw)
 

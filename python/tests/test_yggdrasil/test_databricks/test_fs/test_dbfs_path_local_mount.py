@@ -344,7 +344,10 @@ class TestOSErrorFallback:
         real_stat = os.stat
 
         def bad_stat(path, *a, **kw):
-            if "/dbfs/tmp/explode" in str(path):
+            # Match the leaf name, not a "/"-joined fragment — on Windows
+            # ``str(path)`` uses backslashes, so a "/dbfs/tmp/explode"
+            # substring never matched and the real ``os.stat`` ran instead.
+            if str(path).replace("\\", "/").endswith("/dbfs/tmp/explode"):
                 raise PermissionError("simulated")
             return real_stat(path, *a, **kw)
 
