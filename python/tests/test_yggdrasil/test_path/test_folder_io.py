@@ -366,3 +366,27 @@ class TestFolderPredicate:
         assert out.num_rows == 3
         assert sorted(out.column("pk").to_pylist()) == ["a", "b", "c"]
         assert sorted(out.column("val").to_pylist()) == [10, 20, 30]
+
+    def test_iter_leaves_skips_private_and_empty_and_prunes(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        fp = Folder(path=str(tmp_path / "part"))
+        fp.write_arrow_batches([_partitioned_batch(["a", "a", "b", "c"], [1, 2, 3, 4])])
+
+        # Drop a dot-file and a 0-byte file alongside a real part.
+        root = pathlib.Path(str(tmp_path / "part"))
+        (root / "pk=a" / ".hidden").write_text("x")
+        (root / "pk=b" / "empty.arrow").write_bytes(b"")
+
+        leaves = list(Folder(path=str(tmp_path / "part")).iter_leaves())
+        names = [lf.holder.name for lf in leaves]
+        assert all(not n.startswith(".") for n in names)     # no private
+        assert "empty.arrow" not in names                    # no 0-byte file
+        assert all(not isinstance(lf, Folder) for lf in leaves)
+
+        # Path-level prune keeps only the matching partition's leaves.
+        pruned = list(
+            Folder(path=str(tmp_path / "part")).iter_leaves(
+                FolderOptions(predicate=col("pk") == "a"))
+        )
+        assert {lf.tabular_parent.static_values.get("pk") for lf in pruned} == {"a"}

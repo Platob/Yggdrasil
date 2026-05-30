@@ -1145,40 +1145,50 @@ class Folder(Path):
             else:
                 out.append(child)
 
+    def iter_leaves(
+        self, options: "FolderOptions | None" = None,
+    ) -> "Iterator[Tabular]":
+        """Recursively yield the surviving leaf data files under this folder.
+
+        Walks the tree itself — a non-recursive :meth:`Path.ls` at each level —
+        skipping private entries (dot-prefixed) and empty (0-byte) files, and
+        recursing into sub-directories the predicate doesn't prune on their
+        path-level Hive :attr:`static_values`. Opens **no** data file: a pure
+        listing + path-prune, reusable as a file-enumeration pass. The residual
+        row-level filter stays in :meth:`_read_arrow_batches`.
+        """
+        free_cols = self._free_cols_for(getattr(options, "predicate", None))
+        if self._should_prune_by_predicate(options, free_cols=free_cols):
+            return
+        for entry in self.path.ls():
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                yield from type(self)(
+                    path=entry, tabular_parent=self,
+                ).iter_leaves(options)
+            elif entry.size != 0:
+                leaf = self._leaf_for(entry)
+                if leaf is not None:
+                    leaf.tabular_parent = self
+                    yield leaf
+
     def _read_arrow_batches(
         self, options: FolderOptions,
     ) -> Iterator[pa.RecordBatch]:
-        """Chain :meth:`iter_children` into one Arrow batch stream.
+        """Read every surviving leaf from :meth:`iter_leaves` into one stream.
 
-        Sub-folders recurse through their own
-        :meth:`_read_arrow_batches`; leaf children read in turn.
-
-        Self + per-child predicate pruning runs through
-        :meth:`Tabular._should_prune_by_predicate`: when
-        ``options.predicate`` is provably false against the bound
-        :attr:`static_values` (own seed + inherited from
-        :attr:`tabular_parent`), the whole read is skipped without
-        opening the directory; per-child the same check skips
-        sub-folders / leaf files whose static surface decides the
-        predicate negatively. Children without a static surface fall
-        through unchanged (undecidable → read), so a vanilla folder
-        without partition KV behaves exactly as before.
-
-        When the folder's resolved schema declares any partition
-        columns (via :class:`Field` ``partition_by`` tags), the
-        listing is Hive-aware (see :meth:`iter_children`). Each
-        yielded child carries the consumed partition KV on its
-        :attr:`static_values`; the recursive read just forwards
-        ``predicate`` / ``prune_values``, and the child's
-        :meth:`partition_columns` filters the consumed column out
-        of its own schema-driven lookup so the next level naturally
-        drops to the remaining partitions (or to a flat write when
-        the schema's partition set is exhausted).
+        Partition pruning happened on the path in :meth:`iter_leaves`; each
+        leaf's own read applies the predicate row-filter + target cast (every
+        format funnels batches through ``options.cast_arrow_batch``), so the
+        folder just chains them. An all-pruned / empty read still emits one
+        empty batch carrying the resolved schema so the result keeps its columns.
         """
         yielded = False
-        for batch in self._read_arrow_batches_inner(options):
-            yielded = True
-            yield batch
+        for leaf in self.iter_leaves(options):
+            for batch in leaf._read_arrow_batches(options):
+                yielded = True
+                yield batch
         if not yielded:
             schema = self._schema_cache
             if schema is ... or not schema:
@@ -1189,46 +1199,6 @@ class Folder(Path):
                     {f.name: pa.array([], type=f.type) for f in arrow_schema},
                     schema=arrow_schema,
                 )
-
-    def _read_arrow_batches_inner(
-        self, options: FolderOptions,
-    ) -> Iterator[pa.RecordBatch]:
-        predicate = options.predicate
-        free_cols = self._free_cols_for(predicate)
-        if self._should_prune_by_predicate(options, free_cols=free_cols):
-            LOGGER.debug("Pruned read from %r — predicate eliminates partition", self)
-            return
-
-        for child in self.iter_children(options=options):
-            if child._should_prune_by_predicate(options, free_cols=free_cols):
-                continue
-            child_options = self._child_read_options(child, options)
-            stream = child._read_arrow_batches(child_options)
-            # Each child owns its own read: sub-folders recurse through their
-            # own ``_read_arrow_batches`` (applying the predicate at their leaf
-            # level); flat-format leaves (parquet / arrow IPC / csv) don't
-            # filter rows themselves, so route each leaf batch through
-            # :meth:`Predicate.filter_arrow_batch` — the predicate picks the
-            # best engine internally (hashset shortcut for the typical
-            # ``InList`` / ``AND-of-InList`` lookup shape, pyarrow's C++
-            # ``filter`` otherwise). The static-value prune above already
-            # eliminated whole sub-trees the predicate rejects on a partition
-            # column; this is the residual non-partition filter.
-            if isinstance(child, Folder):
-                yield from stream
-                continue
-            needs_row_filter = predicate is not None and (
-                free_cols is None or not set(free_cols).issubset(self.static_values.keys())
-            )
-            for batch in stream:
-                if batch.num_rows == 0:
-                    continue
-                if not needs_row_filter:
-                    yield batch
-                    continue
-                kept = predicate.filter_arrow_batch(batch)
-                if kept.num_rows > 0:
-                    yield kept
 
     def _free_cols_for(self, predicate: "Predicate") -> "tuple[str, ...] | None":
         """Memoised :func:`free_columns` lookup keyed by ``id(predicate)``.
