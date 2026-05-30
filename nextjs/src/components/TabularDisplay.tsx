@@ -99,7 +99,9 @@ export default function TabularDisplay({
     })
       .then((t) => {
         if (id !== reqId.current) return;
-        setFetched({ columns: t.columns, rows: t.rows });
+        // Rich decode columns carry `type` + `kind`; the grid/analytics read
+        // `dtype`, so normalise here (this is what feeds numeric detection).
+        setFetched({ columns: t.columns.map((c) => ({ name: c.name, dtype: c.type, kind: c.kind })), rows: t.rows });
         setTookMs(Math.round(performance.now() - t0));
       })
       .catch((e) => { if (id === reqId.current) setErr(String(e)); })
