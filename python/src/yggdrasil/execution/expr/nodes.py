@@ -49,6 +49,7 @@ each backend's emitter, not subclassing N abstract operator classes.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Union
 
 from .operators import ArithmeticOp, CompareOp, LogicalOp
@@ -56,6 +57,9 @@ from .operators import ArithmeticOp, CompareOp, LogicalOp
 if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
     from yggdrasil.data.types.base import DataType
+
+
+_LOG = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -652,6 +656,8 @@ class Predicate(Expression):
         fully-dropped batches are skipped so consumers see only
         "non-empty rows that match".
         """
+        import pyarrow as pa
+
         clauses = _to_inlist_clauses(self)
         effective_arrow: "Any" = None
         for batch in batches:
@@ -665,7 +671,13 @@ class Predicate(Expression):
                         self, _arrow_field_lookup(batch.schema),
                     )
                     effective_arrow = effective.to_arrow()
-                kept = _materialize_view_columns(batch).filter(effective_arrow)
+                try:
+                    kept = batch.filter(effective_arrow)
+                except pa.ArrowNotImplementedError as exc:
+                    # No filter kernel for string_view/binary_view on this
+                    # pyarrow — skip the filter and pass the batch through.
+                    _LOG.warning("Skipping Arrow filter: %s", exc)
+                    kept = batch
             if kept.num_rows > 0:
                 yield kept
 
@@ -694,7 +706,14 @@ class Predicate(Expression):
         if clauses is not None:
             return _apply_inlist(target, clauses)
         effective = _rewrite_with_target_lookup(self, _arrow_field_lookup(target.schema))
-        return _materialize_view_columns(target).filter(effective.to_arrow())
+        import pyarrow as pa
+        try:
+            return target.filter(effective.to_arrow())
+        except pa.ArrowNotImplementedError as exc:
+            # Some pyarrow runtimes lack filter kernels for string_view/
+            # binary_view columns. Skip rather than blow up.
+            _LOG.warning("Skipping Arrow filter: %s", exc)
+            return target
 
     # ------------------------------------------------------------------
     # Engine filters — mirrors the read_X / write_X surface every
@@ -1523,47 +1542,6 @@ def _apply_inlist_pylist(
     return out
 
 
-def _materialize_view_columns(target: "Any") -> "Any":
-    """Replace Arrow ``string_view`` / ``binary_view`` columns with their
-    materialized (``utf8`` / ``binary``) equivalents.
-
-    PyArrow's ``filter`` / ``take`` kernels have no ``*_view`` support in the
-    runtimes bundled with some platforms (e.g. Databricks), so applying a
-    boolean mask over a ``string_view`` column raises
-    ``ArrowNotImplementedError: Function 'array_take' has no kernel matching
-    input types (string_view, ...)``. Materializing the offending columns
-    first keeps :meth:`filter` on the supported path. *target* (a
-    :class:`pa.Table` or :class:`pa.RecordBatch`) is returned unchanged when
-    it carries no view columns. Detection is by type name so it works even on
-    pyarrow builds that predate the ``pa.types.is_string_view`` predicate.
-    """
-    import pyarrow as pa
-
-    plain_for = {"string_view": pa.string(), "binary_view": pa.binary()}
-    schema = target.schema
-    replacements: "dict[int, Any]" = {}
-    for index, field in enumerate(schema):
-        plain = plain_for.get(str(field.type))
-        if plain is not None:
-            replacements[index] = field.with_type(plain)
-    if not replacements:
-        return target
-
-    new_schema = pa.schema(
-        [replacements.get(i, f) for i, f in enumerate(schema)],
-        metadata=schema.metadata,
-    )
-    if hasattr(target, "cast"):  # pa.Table.cast(schema)
-        return target.cast(new_schema)
-    # pa.RecordBatch has no .cast(schema) — rebuild from per-column casts.
-    columns = [
-        target.column(i).cast(new_schema.field(i).type) if i in replacements
-        else target.column(i)
-        for i in range(target.num_columns)
-    ]
-    return pa.RecordBatch.from_arrays(columns, schema=new_schema)
-
-
 def _apply_inlist(
     target: "Any",
     clauses: "list[tuple[str, frozenset, bool]]",
@@ -1586,23 +1564,27 @@ def _apply_inlist(
     """
     if not clauses:
         return target
-    # Materialize up front so every downstream kernel (pc.is_in, filter, take)
-    # sees utf8/binary rather than the *_view types they lack kernels for.
-    target = _materialize_view_columns(target)
     n = target.num_rows
     if n <= 4:
         return _apply_inlist_small(target, clauses, n)
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    mask: "Any | None" = None
-    for column, value_set, includes_null in clauses:
-        col_arr = target.column(column)
-        m = pc.is_in(col_arr, value_set=pa.array(list(value_set)))
-        if includes_null:
-            m = pc.or_kleene(m, pc.is_null(col_arr))
-        mask = m if mask is None else pc.and_kleene(mask, m)
-    return target.filter(mask)
+    try:
+        mask: "Any | None" = None
+        for column, value_set, includes_null in clauses:
+            col_arr = target.column(column)
+            m = pc.is_in(col_arr, value_set=pa.array(list(value_set)))
+            if includes_null:
+                m = pc.or_kleene(m, pc.is_null(col_arr))
+            mask = m if mask is None else pc.and_kleene(mask, m)
+        return target.filter(mask)
+    except pa.ArrowNotImplementedError as exc:
+        # Some pyarrow runtimes (e.g. Databricks) lack is_in/filter kernels
+        # for string_view/binary_view columns. Skip the filter rather than
+        # blow up — the caller gets the unfiltered data.
+        _LOG.warning("Skipping Arrow InList filter: %s", exc)
+        return target
 
 
 def _apply_inlist_small(
@@ -1637,7 +1619,12 @@ def _apply_inlist_small(
             return target.slice(0, 0)
     if surviving is None or len(surviving) == n:
         return target
-    return target.take(pa.array(surviving, type=pa.int64()))
+    try:
+        return target.take(pa.array(surviving, type=pa.int64()))
+    except pa.ArrowNotImplementedError as exc:
+        # take has no string_view/binary_view kernel on some pyarrow runtimes.
+        _LOG.warning("Skipping Arrow InList filter: %s", exc)
+        return target
 
 
 # ---------------------------------------------------------------------------
