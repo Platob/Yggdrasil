@@ -125,6 +125,11 @@ class S3Path(RemotePath):
     # :meth:`RemotePath.arrow_random_access_file`).
     SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True
 
+    # Arrow/Parquet writes spill the encode to a temp file and stream it to S3
+    # via boto's managed transfer (see :meth:`_upload_stream`), so a multi-GB
+    # write never materialises the encoded payload whole in memory.
+    SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = True
+
     # At / above ``MULTIPART_THRESHOLD`` an upload runs through boto3's
     # managed transfer (``upload_fileobj`` + :class:`TransferConfig`),
     # which splits the object into ``MULTIPART_CHUNKSIZE`` parts uploaded
@@ -723,6 +728,45 @@ class S3Path(RemotePath):
             )
         )
         self._cache_after_upload(bytes(content), size)
+        return size
+
+    def _upload_stream(self, source: "Any") -> int:
+        """Stream *source* (a local spill file) to S3 without materialising it.
+
+        The Arrow/Parquet write path spills the encode to a temp file and hands
+        it here; ``upload_fileobj`` reads that file in bounded chunks (managed
+        multipart past ``MULTIPART_THRESHOLD``), so peak memory is one
+        chunk × concurrency rather than the whole object. Falls back to the
+        materialising :meth:`_upload` if the source isn't a local file. Skips
+        the read-after-write page cache (it would re-materialise the body);
+        later reads re-fetch via ranged GET.
+        """
+        os_path = getattr(source, "os_path", None) if getattr(source, "is_local_path", False) else None
+        if os_path is None:
+            return self._upload(source.read_bytes())
+
+        from boto3.s3.transfer import TransferConfig
+
+        size = int(source.size)
+        config = TransferConfig(
+            multipart_threshold=self.MULTIPART_THRESHOLD,
+            multipart_chunksize=self.MULTIPART_CHUNKSIZE,
+            max_concurrency=self.MULTIPART_CONCURRENCY,
+            use_threads=True,
+        )
+        LOGGER.debug("Streaming S3 object %r from %s (bytes=%d)", self, os_path, size)
+        with open(os_path, "rb") as fh:
+            self._call(self.client.upload_fileobj, fh, self.bucket, self.key, Config=config)
+        LOGGER.info("Streamed S3 object %r (bytes=%d)", self, size)
+        self._persist_stat_cache(
+            IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            )
+        )
+        self._note_streamed_upload(size)
         return size
 
     def reserve(self, n: int) -> None:

@@ -328,13 +328,14 @@ class TestOverwrite:
         assert p.size == 5
         client.head_object.assert_not_called()
 
-    def test_parquetfile_write_arrow_table_uses_write_all(
+    def test_parquetfile_write_arrow_table_streams_one_upload(
         self,
         client,
         service,
     ) -> None:
-        """ParquetFile(holder=S3Path).write_arrow_table() routes through
-        write_all: 1 put_object, 0 get_object for the write itself."""
+        """ParquetFile(holder=S3Path).write_arrow_table() spills the encode and
+        streams it: 1 upload_fileobj, 0 put_object, 0 get_object for the write
+        itself (no read-modify-write)."""
         import pyarrow as pa
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
@@ -353,20 +354,20 @@ class TestOverwrite:
         pf = ParquetFile(holder=p, owns_holder=False)
         pf.write_arrow_table(table)
 
-        assert client.put_object.call_count == 1
+        assert client.upload_fileobj.call_count == 1
+        assert client.put_object.call_count == 0
         assert client.get_object.call_count == 0
 
-    def test_parquetfile_write_single_put_object(
+    def test_parquetfile_write_single_streamed_upload(
         self,
         client,
         service,
     ) -> None:
-        """write_arrow_table issues exactly 1 put_object.
+        """write_arrow_table issues exactly 1 streamed upload, no read-modify-write.
 
-        Before: _commit_format_payload did seek(0) + truncate(0) +
-        write_bytes — on S3Path that's head_object (size) + get_object
-        (truncate) + put_object (truncate) + put_object (write).
-        After: 1 put_object, 0 get_object.
+        The encode spills to a temp file and streams via upload_fileobj — so
+        no head_object/get_object/put_object round-trips for the write: just
+        one upload_fileobj.
         """
         import pyarrow as pa
         from yggdrasil.io.primitive.parquet_file import ParquetFile
@@ -381,7 +382,8 @@ class TestOverwrite:
         pf = ParquetFile(holder=p, owns_holder=False)
         pf.write_arrow_table(table)
 
-        assert client.put_object.call_count == 1
+        assert client.upload_fileobj.call_count == 1
+        assert client.put_object.call_count == 0
         assert client.get_object.call_count == 0
 
 
@@ -777,3 +779,43 @@ class TestIterMvRangeStreaming:
         once = b"".join(bytes(c) for c in p.iter_mv(32 * 1024))
         twice = b"".join(bytes(c) for c in p.iter_mv(32 * 1024))
         assert once == twice == blob
+
+
+class TestS3StreamingUpload:
+    """``_upload_stream`` hands boto's managed transfer the spill file directly
+    (``upload_fileobj``), so an Arrow/Parquet write never materialises the
+    encoded payload — peak memory is one chunk × concurrency, not the object."""
+
+    def test_streams_spill_file_via_upload_fileobj(self, client, service, tmp_path):
+        from yggdrasil.path.local_path import LocalPath
+
+        data = bytes((i * 9) % 256 for i in range(300_000))
+        spill = tmp_path / "spill.bin"
+        spill.write_bytes(data)
+
+        sent: dict = {}
+
+        def _upload_fileobj(fileobj, bucket, key, Config=None):
+            sent["bucket"] = bucket
+            sent["key"] = key
+            sent["data"] = fileobj.read()  # boto streams the file handle
+
+        client.upload_fileobj.side_effect = _upload_fileobj
+
+        p = S3Path("s3://b/k.parquet", service=service)
+        n = p._upload_stream(LocalPath.from_(str(spill)))
+
+        assert n == len(data)
+        assert (sent["bucket"], sent["key"]) == ("b", "k.parquet")
+        assert sent["data"] == data            # the file content reached S3
+        client.put_object.assert_not_called()  # streamed, never buffered as a PUT body
+
+    def test_non_local_source_falls_back_to_materialised_put(self, client, service):
+        from yggdrasil.path.memory import Memory
+
+        client.head_object.side_effect = _client_error()
+        p = S3Path("s3://b/m.bin", service=service)
+        p._upload_stream(Memory(binary=b"in-memory-bytes"))
+        # No local file → materialise via _upload (small → put_object).
+        client.put_object.assert_called_once()
+        assert client.put_object.call_args.kwargs["Body"] == b"in-memory-bytes"
