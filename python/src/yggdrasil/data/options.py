@@ -832,6 +832,32 @@ class CastOptions:
             )
         return self
 
+    def check_invariant(self: T, *, copy: bool = True) -> T:
+        """Complete autotyping: resolve variant (``ObjectType`` / ``NullType``)
+        target fields against the bound source.
+
+        When both source and target are bound, merge the source into the target
+        in :attr:`Mode.UPSERT`: every still-unresolved variant target slot
+        adopts the matching source field's dtype by name (the
+        ``is_any_or_null`` merge rule fills the placeholder), while the target's
+        concrete types, field set, and projection are left untouched — source-
+        only fields are *not* pulled in. This is what turns a bare ``columns=``
+        projection (a struct of ``ObjectType`` placeholders) into a fully-typed
+        target once the source schema is known, so ``merged`` /
+        ``select_source_column_names`` and the cast see real dtypes.
+
+        :attr:`Mode.IGNORE` (the default ``schema_mode`` behind :attr:`merged`)
+        can't do this — it short-circuits to the target unchanged — so the fill
+        runs through ``UPSERT``, which keys on name and ignores extra source
+        fields. No-op when either side is unbound or the merge changes nothing.
+        """
+        if self.source is None or self.target is None:
+            return self
+        filled = self.target.merge_with(self.source, mode=Mode.UPSERT)
+        if filled == self.target:
+            return self
+        return self.with_target(filled, copy=copy)
+
     def with_source(self: T, source: "Field", copy: bool = False) -> T:
         """Return a copy with *source* as the new source field.
 
