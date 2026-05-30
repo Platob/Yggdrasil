@@ -51,6 +51,9 @@ from ..schemas.saga import (
     ColumnStat,
     DiscoverRequest,
     ExplainResult,
+    ForecastAssetResult,
+    ForecastRegisterRequest,
+    ForecastSpec,
     SchemaCreate,
     SchemaEntry,
     SchemaListResponse,
@@ -451,6 +454,91 @@ class SagaService:
             table_type=req.table_type, infer=True,
         ))
 
+    # -- forecast workflows -------------------------------------------------
+
+    async def register_forecast(self, req: ForecastRegisterRequest) -> ForecastAssetResult:
+        """Upsert a FORECAST asset and (optionally) materialise it.
+
+        The spec rides the asset's ``definition`` so it persists in store.json
+        and replicates like any other asset. Materialising runs the forecast
+        once and writes a managed parquet snapshot under the Saga data root; the
+        asset then resolves from the snapshot until refreshed (a `live=false`
+        optimisation), otherwise it recomputes on every query."""
+        # Ensure catalog + schema exist (the easy path, like register()).
+        with self._lock:
+            need_cat = self._catalog_by_name(req.catalog) is None
+            need_sch = self._schema_by_name(req.catalog, req.schema_) is None
+        if need_cat:
+            await self.create_catalog(CatalogCreate(name=req.catalog))
+        if need_sch:
+            await self.create_schema(req.catalog, SchemaCreate(name=req.schema_))
+        return await run_in_threadpool(partial(self._register_forecast, req))
+
+    def _register_forecast(self, req: ForecastRegisterRequest) -> ForecastAssetResult:
+        from .forecast import forecast_frame
+        spec = req.spec.model_copy(update={"materialized": req.materialize or req.spec.materialized})
+        now = _now()
+        full = f"{req.catalog}.{req.schema_}.{req.name}"
+
+        df = self._forecast_source_frame(spec, req.catalog, req.schema_, set())
+        out, used, rmse = forecast_frame(
+            df, value=spec.column, x=spec.x, keys=list(spec.keys),
+            horizon=spec.horizon, model=spec.model, period=spec.period, agg=spec.agg)
+
+        materialized_url: str | None = None
+        if spec.materialized:
+            self.settings.saga_data_root.mkdir(parents=True, exist_ok=True)
+            snap = self.settings.saga_data_root / f"forecast_{make_id(full)}.parquet"
+            out.write_parquet(str(snap))
+            materialized_url = str(snap)
+
+        cols = [ColumnSpec(name=f.name, dtype=str(f.type), nullable=True)
+                for f in out.to_arrow().schema]
+        props = {"materialized_url": materialized_url} if materialized_url else {}
+        props.update({"model_used": used, "horizon": str(spec.horizon),
+                      "materialized_at": now if materialized_url else ""})
+        with self._lock:
+            self._require_schema(req.catalog, req.schema_)
+            existing = self._table_by_name(req.catalog, req.schema_, req.name)
+            base = existing or TableEntry(
+                id=make_id(full), catalog=req.catalog, schema=req.schema_, name=req.name,
+                full_name=full, created_at=now, updated_at=now)
+            entry = base.model_copy(update={
+                "object_type": "FORECAST",
+                "definition": spec.model_dump_json(),
+                "node": req.node,
+                "source_url": materialized_url or "",
+                "comment": req.comment or base.comment,
+                "columns": cols,
+                "statistics": TableStatistics(row_count=out.height, computed_at=now),
+                "properties": {**base.properties, **props},
+                "updated_at": now,
+            })
+            self._tables[entry.id] = entry
+            self._save()
+        self._record(full, "update" if existing else "register",
+                     detail=f"FORECAST {spec.column}~{spec.x or 'idx'} h{spec.horizon} ({used})")
+        return ForecastAssetResult(
+            node_id=self.settings.node_id, table=entry, model_used=used,
+            rmse=round(rmse, 4) if rmse is not None else None, rows=out.height,
+            materialized_url=materialized_url,
+            sampled=bool(spec.keys) and out.height > 0,
+        )
+
+    async def refresh_forecast(self, catalog: str, schema: str, name: str) -> ForecastAssetResult:
+        """Recompute a materialised forecast snapshot (or refresh a live one's
+        column/stat metadata)."""
+        with self._lock:
+            t = self._table_by_name(catalog, schema, name)
+            if t is None:
+                raise NotFoundError(f"Forecast {catalog}.{schema}.{name!r} not found")
+            if t.object_type != "FORECAST":
+                raise BadRequestError(f"{t.full_name!r} is not a FORECAST asset")
+            spec = ForecastSpec.model_validate_json(t.definition)
+        return await self.register_forecast(ForecastRegisterRequest(
+            catalog=catalog, schema=schema, name=name, spec=spec, node=t.node,
+            comment=t.comment, materialize=bool(spec.materialized)))
+
     async def search(self, q: str, *, limit: int = 50) -> "SearchResponse":
         """Substring search across catalogs/schemas/tables (assets)."""
         ql = (q or "").strip().lower()
@@ -809,6 +897,68 @@ class SagaService:
         from yggdrasil.arrow.tabular import ArrowTabular
         return ArrowTabular(execute_plan(node, tables).read_arrow_table())
 
+    def _forecast_source_frame(self, spec: ForecastSpec, catalog: str | None,
+                               schema: str | None, seen: set[str]):
+        """Load the forecast source as a polars DataFrame, projected to just the
+        value/x/key columns. The source is a registered table (resolved through
+        the same VIEW/TABLE machinery) or a node-rooted file path."""
+        import polars as pl
+        keep = list(dict.fromkeys(
+            [spec.column] + ([spec.x] if spec.x else []) + list(spec.keys)))
+        reg = self._table_by_full(self._qualify(TableRef(name=spec.source), catalog, schema)) \
+            or self._table_by_full(spec.source)
+        if reg is not None:
+            tab = self._build_tables([TableRef(name=spec.source)], catalog, schema, seen)[
+                self._qualify(TableRef(name=spec.source), catalog, schema)]
+            df = pl.from_arrow(tab.read_arrow_table())
+        else:
+            src = self._resolve_path(spec.source)
+            ext = src.rsplit(".", 1)[-1].lower() if "." in src else ""
+            if ext in ("parquet", "pq"):
+                lf = pl.scan_parquet(src)
+            elif ext in ("csv", "tsv"):
+                lf = pl.scan_csv(src, separator="\t" if ext == "tsv" else ",")
+            elif ext == "ndjson":
+                lf = pl.scan_ndjson(src)
+            else:
+                tab = Tabular.from_(src, default=None)
+                if tab is None:
+                    raise BadRequestError(f"cannot open forecast source {spec.source!r}")
+                lf = pl.from_arrow(tab.read_arrow_table()).lazy()
+            present = [c for c in keep if c in lf.collect_schema().names()]
+            df = lf.select(present).collect(engine="streaming")
+        missing = [c for c in keep if c not in df.columns]
+        if missing:
+            raise BadRequestError(f"forecast source missing columns {missing}")
+        return df
+
+    def _resolve_forecast(self, asset: TableEntry, seen: set[str]) -> "Tabular":
+        """Resolve a FORECAST asset to its history+forecast table.
+
+        Fast path: if a fresh materialised snapshot exists, scan it. Otherwise
+        recompute live from the source (the workflow is a live view by default).
+        """
+        from yggdrasil.arrow.tabular import ArrowTabular
+        if asset.full_name in seen:
+            raise BadRequestError(f"forecast {asset.full_name!r} is recursive")
+        if not asset.definition.strip():
+            raise BadRequestError(f"forecast {asset.full_name!r} has no spec")
+        spec = ForecastSpec.model_validate_json(asset.definition)
+        snap = asset.properties.get("materialized_url")
+        if snap:
+            src = self._resolve_path(snap)
+            if os.path.exists(src):
+                tab = Tabular.from_(src, default=None)
+                if tab is not None:
+                    return tab
+        from .forecast import forecast_frame
+        df = self._forecast_source_frame(spec, asset.catalog, asset.schema_name,
+                                         seen | {asset.full_name})
+        out, _, _ = forecast_frame(
+            df, value=spec.column, x=spec.x, keys=list(spec.keys),
+            horizon=spec.horizon, model=spec.model, period=spec.period, agg=spec.agg)
+        return ArrowTabular(out.to_arrow())
+
     def _build_tables(self, refs: list[TableRef], catalog: str | None,
                       schema: str | None, seen: set[str] | None = None) -> dict[str, Tabular]:
         """Resolve referenced table names to concrete Tabular sources."""
@@ -828,6 +978,9 @@ class SagaService:
                     # A view resolves to the materialised result of its SQL — its
                     # own table refs resolve recursively against the catalog.
                     tab = self._resolve_view(reg, seen)
+                elif reg.object_type == "FORECAST":
+                    # A forecast workflow resolves to its history+forecast view.
+                    tab = self._resolve_forecast(reg, seen)
                 elif reg.object_type != "TABLE":
                     raise BadRequestError(
                         f"{reg.object_type.lower()} {full!r} is not queryable")

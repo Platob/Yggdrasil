@@ -14,8 +14,11 @@ from .common import StrictModel
 # created (and may delete) under its catalog's storage location.
 TableType = str  # "EXTERNAL" | "MANAGED"
 # Asset object kinds — a schema's children are no longer just tables.
-ObjectType = str  # "TABLE" | "VIEW" | "FUNCTION" | "MODEL" | "OTHER"
-OBJECT_TYPES = ("TABLE", "VIEW", "FUNCTION", "MODEL", "OTHER")
+# FORECAST is a registered forecasting workflow: a JSON spec in `definition`
+# that resolves (live, or from a materialised snapshot) to a history+forecast
+# table the plan engine can query like a view.
+ObjectType = str  # "TABLE" | "VIEW" | "FUNCTION" | "MODEL" | "FORECAST" | "OTHER"
+OBJECT_TYPES = ("TABLE", "VIEW", "FUNCTION", "MODEL", "FORECAST", "OTHER")
 
 
 # -- column + statistics metadata ------------------------------------------
@@ -223,6 +226,47 @@ class DiscoverRequest(StrictModel):
     infer: bool = True
 
     model_config = {"populate_by_name": True}
+
+
+# -- forecast workflow ------------------------------------------------------
+
+class ForecastSpec(StrictModel):
+    """The persisted definition of a FORECAST asset — everything needed to
+    rebuild the history+forecast view anywhere. Serialised to JSON in the
+    asset's ``definition`` field, so it rides the same store + replication."""
+    source: str                       # registered table name/full_name or a file path
+    column: str                       # value column to forecast
+    x: str | None = None              # time / order column (else row index)
+    keys: list[str] = Field(default_factory=list)  # aggregation keys (per-key series)
+    horizon: int = 24                 # steps ahead
+    model: str = "auto"               # auto | xgboost | gbr | ridge
+    period: int | None = None         # seasonal period (Fourier features)
+    agg: str = "mean"                 # collapse duplicate x: mean|sum|last|max|min
+    materialized: bool = False        # snapshot to a managed parquet (vs live recompute)
+
+
+class ForecastRegisterRequest(StrictModel):
+    """Register (upsert) a forecast workflow as a catalog asset."""
+    catalog: str = "main"
+    schema_: str = Field(default="default", alias="schema")
+    name: str
+    spec: ForecastSpec
+    node: str | None = None
+    comment: str = ""
+    # Materialise immediately (run once, write the snapshot) on register.
+    materialize: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
+class ForecastAssetResult(StrictModel):
+    node_id: str
+    table: "TableEntry"
+    model_used: str
+    rmse: float | None = None
+    rows: int                         # rows in the materialised view (history + forecast)
+    materialized_url: str | None = None
+    sampled: bool = False
 
 
 # -- SQL editor -------------------------------------------------------------

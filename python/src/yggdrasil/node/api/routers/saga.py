@@ -17,6 +17,8 @@ from ..schemas.saga import (
     CatalogUpdate,
     DiscoverRequest,
     ExplainResult,
+    ForecastAssetResult,
+    ForecastRegisterRequest,
     MaterializeResult,
     OpLogResponse,
     SessionResult,
@@ -211,6 +213,33 @@ async def table_activity(catalog: str, schema: str, name: str, node: str | None 
 @router.post("/discover", response_model=TableListResponse)
 async def discover(req: DiscoverRequest, saga: SagaService = Depends(get_saga_service)):
     return await saga.discover(req)
+
+
+# -- forecast workflows -----------------------------------------------------
+
+@router.post("/forecast", response_model=ForecastAssetResult)
+async def register_forecast(req: ForecastRegisterRequest, node: str | None = None,
+                            saga: SagaService = Depends(get_saga_service),
+                            network: NetworkService = Depends(get_network_service)):
+    """Register (upsert) a forecasting workflow as a FORECAST catalog asset — a
+    persisted spec that resolves to a history+forecast view the SQL engine can
+    query like a table. `materialize` snapshots it to a managed parquet."""
+    if node and node != saga.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/saga/forecast",
+                                        json_body=req.model_dump(by_alias=True))
+    return await saga.register_forecast(req)
+
+
+@router.post("/catalog/{catalog}/schema/{schema}/table/{name}/forecast/refresh",
+             response_model=ForecastAssetResult)
+async def refresh_forecast(catalog: str, schema: str, name: str, node: str | None = None,
+                           saga: SagaService = Depends(get_saga_service),
+                           network: NetworkService = Depends(get_network_service)):
+    """Recompute a forecast workflow (rewrites its materialised snapshot)."""
+    remote = await _remote(network, saga, node,
+                           f"/catalog/{catalog}/schema/{schema}/table/{name}/forecast/refresh",
+                           method="POST")
+    return remote if remote is not None else await saga.refresh_forecast(catalog, schema, name)
 
 
 # -- replication ------------------------------------------------------------

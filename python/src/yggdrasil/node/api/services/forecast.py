@@ -105,3 +105,64 @@ def forecast_series(y: list[float], horizon: int, period: int | None, model: str
         lower.append(p - band)
         upper.append(p + band)
     return preds, lower, upper, rmse, used
+
+
+def forecast_frame(df, *, value: str, x: str | None, keys: list[str],
+                   horizon: int, model: str, period: int | None, agg: str):
+    """Materialise a forecast workflow's *live view* from a source frame.
+
+    Aggregates ``value`` per ``x`` (and per ``keys`` group), forecasts
+    ``horizon`` steps, and returns a long-form polars DataFrame with the key
+    columns, the x column, ``value``, ``lower``/``upper`` bands and a ``kind``
+    tag ("history" | "forecast"). The future x is extrapolated by the median
+    step of the (numeric) x axis, else a running index. Returns
+    ``(DataFrame, model_used, rmse)``."""
+    import polars as pl
+
+    agg = agg if agg in ("mean", "sum", "last", "max", "min") else "mean"
+    horizon = max(1, int(horizon))
+    keys = [k for k in (keys or []) if k in df.columns]
+    has_x = bool(x and x in df.columns)
+    used = "ridge"
+    rmses: list[float] = []
+    blocks: list[pl.DataFrame] = []
+
+    groups = (df.select(keys).unique().iter_rows() if keys else [()])
+    for combo in groups:
+        sub = df
+        for k, v in zip(keys, combo):
+            sub = sub.filter(pl.col(k) == v)
+        if has_x:
+            gb = (sub.group_by(x)
+                  .agg(getattr(pl.col(value).cast(pl.Float64, strict=False), agg)())
+                  .sort(x))
+            xs = gb[x].to_list()
+            ys = gb[value].to_list()
+        else:
+            xs = list(range(sub.height))
+            ys = sub[value].cast(pl.Float64, strict=False).to_list()
+        preds, lo, hi, rmse, mu = forecast_series(ys, horizon, period, model)
+        used = mu if mu != "naive" else used
+        if rmse is not None:
+            rmses.append(rmse)
+        try:
+            xnum = [float(v) for v in xs]
+            step = float(np.median(np.diff(xnum))) if len(xnum) > 1 else 1.0
+            fx = [xnum[-1] + step * (k + 1) for k in range(len(preds))] if xnum else list(range(len(preds)))
+        except (TypeError, ValueError):
+            base = len(xs)
+            fx = [base + k for k in range(len(preds))]
+
+        hist_block = {x if has_x else "x": xs, value: ys,
+                      "lower": ys, "upper": ys, "kind": ["history"] * len(xs)}
+        fc_block = {x if has_x else "x": fx, value: preds,
+                    "lower": lo, "upper": hi, "kind": ["forecast"] * len(preds)}
+        for k, v in zip(keys, combo):
+            hist_block[k] = [v] * len(xs)
+            fc_block[k] = [v] * len(preds)
+        blocks.append(pl.DataFrame(hist_block))
+        blocks.append(pl.DataFrame(fc_block))
+
+    out = pl.concat(blocks, how="diagonal_relaxed") if blocks else pl.DataFrame()
+    rmse_avg = float(np.mean(rmses)) if rmses else None
+    return out, used, rmse_avg
