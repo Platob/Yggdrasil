@@ -1237,14 +1237,16 @@ class Folder(Path):
             # residual condition on a non-partition column (the path-level
             # prune in the plan already eliminated whole partitions). The
             # partition KVs live on the leaf's containing folder
-            # (``tabular_parent``), not the data file itself — when they cover
-            # every free column the partition prune was exact and no row filter
-            # is needed.
-            holder = leaf.tabular_parent
-            static_keys = holder.static_values.keys() if holder is not None else ()
-            needs_row_filter = predicate is not None and (
-                free_cols is None or not set(free_cols).issubset(static_keys)
-            )
+            # (``tabular_parent``), not the data file — and only matter when
+            # there's a predicate to row-filter, so resolve them lazily. By the
+            # time a leaf survives the plan, that folder's ``static_values`` is
+            # already memoised from the prune check that let us descend into it,
+            # so this is a cache hit, not a re-parse.
+            needs_row_filter = predicate is not None
+            if needs_row_filter and free_cols is not None:
+                holder = leaf.tabular_parent
+                static_keys = holder.static_values.keys() if holder is not None else ()
+                needs_row_filter = not set(free_cols).issubset(static_keys)
             for batch in leaf._read_arrow_batches(leaf_options):
                 if batch.num_rows == 0:
                     continue
