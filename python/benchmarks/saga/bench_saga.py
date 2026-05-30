@@ -107,6 +107,25 @@ def main() -> None:
         print("\n=== Op-log append overhead (ms/op) ===")
         print(f"  log.append: {_timeit(lambda: svc._record('main.market.trades', 'query', statement='SELECT 1', rows=1), 100):.3f}")
 
+        print("\n=== Forecast workflow (FORECAST asset) ===")
+        from yggdrasil.node.api.schemas.saga import ForecastRegisterRequest, ForecastSpec
+        spec = ForecastSpec(source="data/trades.parquet", column="px", x="ts",
+                            keys=["sym"], horizon=24, model="auto")
+        t0 = time.perf_counter()
+        fc = run(svc.register_forecast(ForecastRegisterRequest(
+            catalog="main", schema="market", name="px_fc", spec=spec, materialize=True)))
+        print(f"  register + materialise ({fc.model_used}, {fc.rows:,} rows): {(time.perf_counter()-t0)*1000:.1f} ms")
+        # query the materialised snapshot (fast path) vs a live recompute
+        mat_ms = _timeit(lambda: run(svc.execute_sql(SqlRequest(
+            sql="SELECT kind, count(*) AS n FROM main.market.px_fc GROUP BY kind"))), 5)
+        run(svc.register_forecast(ForecastRegisterRequest(
+            catalog="main", schema="market", name="px_live", spec=spec.model_copy(update={"materialized": False}))))
+        live_ms = _timeit(lambda: run(svc.execute_sql(SqlRequest(
+            sql="SELECT kind, count(*) AS n FROM main.market.px_live GROUP BY kind"))), 3)
+        print(f"  query materialised snapshot : {mat_ms:8.1f} ms")
+        print(f"  query live (recompute)      : {live_ms:8.1f} ms")
+        print(f"  ==> {live_ms/mat_ms:5.1f}x  (snapshot avoids re-fitting on every query)")
+
         print(f"\nsource file: {size_mb:.1f} MB parquet")
 
 

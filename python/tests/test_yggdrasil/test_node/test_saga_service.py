@@ -295,6 +295,74 @@ class TestObjectTypes(unittest.TestCase):
                 asyncio.run(svc.execute_sql(SqlRequest(sql="SELECT * FROM main.market.loop")))
 
 
+def _ts_series(s: Settings, name: str = "series.parquet") -> str:
+    import math
+    d = s.node_home / "data"
+    d.mkdir(parents=True, exist_ok=True)
+    n = 60
+    ts = list(range(n))
+    grp = ["a" if t % 2 == 0 else "b" for t in ts]
+    val = [100.0 + 0.5 * t + 6.0 * math.sin(2 * math.pi * t / 12) for t in ts]
+    pq.write_table(pa.table({"ts": ts, "grp": grp, "value": val}), str(d / name))
+    return f"data/{name}"
+
+
+class TestForecastWorkflow(unittest.TestCase):
+    def _register(self, svc, **kw):
+        from yggdrasil.node.api.schemas.saga import ForecastRegisterRequest, ForecastSpec
+        run = asyncio.run
+        run(svc.create_catalog(CatalogCreate(name="main")))
+        run(svc.create_schema("main", SchemaCreate(name="market")))
+        spec = ForecastSpec(source=_ts_series(svc.settings), column="value", x="ts",
+                            keys=kw.pop("keys", []), horizon=kw.pop("horizon", 8),
+                            model="ridge", period=kw.pop("period", None))
+        return run(svc.register_forecast(ForecastRegisterRequest(
+            catalog="main", schema="market", name=kw.pop("name", "fc"), spec=spec, **kw)))
+
+    def test_live_forecast_queryable(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d))
+            res = self._register(svc, keys=["grp"], horizon=6, materialize=False)
+            self.assertEqual(res.table.object_type, "FORECAST")
+            self.assertIsNone(res.materialized_url)
+            # the asset resolves through the plan engine like a view
+            r = asyncio.run(svc.execute_sql(SqlRequest(
+                sql="SELECT kind, count(*) AS n FROM main.market.fc GROUP BY kind ORDER BY kind")))
+            by = {row[0]: row[1] for row in r.rows}
+            self.assertEqual(by["forecast"], 6 * 2)        # horizon × groups
+            self.assertEqual(by["history"], 60)
+
+    def test_materialized_snapshot_written(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d))
+            res = self._register(svc, name="mfc", materialize=True)
+            self.assertTrue(res.materialized_url)
+            self.assertTrue(os.path.exists(res.materialized_url))
+            # query the materialised view back
+            r = asyncio.run(svc.execute_sql(SqlRequest(
+                sql="SELECT count(*) AS n FROM main.market.mfc")))
+            self.assertEqual(r.rows[0][0], res.rows)
+
+    def test_spec_persists_in_store(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            res = self._register(_svc(home), name="pfc", materialize=False)
+            # a fresh service over the same store reloads the FORECAST asset + spec
+            reloaded = _svc(home)
+            t = asyncio.run(reloaded.get_table("main", "market", "pfc")).table
+            self.assertEqual(t.object_type, "FORECAST")
+            self.assertIn('"column":"value"', t.definition)
+            self.assertEqual(res.model_used, "ridge")
+
+    def test_refresh_recomputes(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d))
+            self._register(svc, name="rfc", materialize=True)
+            again = asyncio.run(svc.refresh_forecast("main", "market", "rfc"))
+            self.assertTrue(again.materialized_url)
+            self.assertEqual(again.table.object_type, "FORECAST")
+
+
 class TestSession(unittest.TestCase):
     def test_stage_window_transforms_and_close(self):
         import pyarrow.ipc as _ipc

@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 from yggdrasil.exceptions.api import BadRequestError
 from yggdrasil.node.api.schemas.analysis import (
     AggMeasure, AggregateRequest, CastSpec, ExportRequest, FilterSpec,
-    FinanceRequest, OhlcRequest, SeriesRequest, Transform,
+    FinanceRequest, ForecastRequest, OhlcRequest, SeriesRequest, Transform,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
@@ -203,6 +203,66 @@ class TestFiltersAndExport(unittest.TestCase):
                 self.assertEqual(pq.read_table(str(tmp)).num_rows, 5)
             finally:
                 tmp.unlink(missing_ok=True)
+
+
+def _series(home: Path, name="s.parquet", n=80) -> None:
+    import math
+    ts = list(range(n))
+    val = [100.0 + 0.7 * t + 8.0 * math.sin(2 * math.pi * t / 12) for t in ts]
+    grp = ["a" if t % 2 == 0 else "b" for t in ts]
+    pq.write_table(pa.table({"ts": ts, "value": val, "grp": grp}), str(home / name))
+
+
+class TestForecast(unittest.TestCase):
+    def test_single_series_history_and_band(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _series(home)
+            res = asyncio.run(_svc(home).forecast(ForecastRequest(
+                path="s.parquet", column="value", x="ts", horizon=10, model="ridge")))
+            self.assertEqual(len(res.series), 1)
+            s = res.series[0]
+            self.assertEqual(len(s.forecast_x), 10)
+            self.assertEqual(len(s.forecast_y), 10)
+            # band brackets the point forecast and widens with the horizon
+            self.assertTrue(all(lo <= p <= up for lo, p, up in zip(s.lower, s.forecast_y, s.upper)))
+            self.assertGreaterEqual(s.upper[-1] - s.lower[-1], s.upper[0] - s.lower[0])
+            # future x extrapolates beyond the last observed step
+            self.assertGreater(s.forecast_x[0], 79)
+            self.assertEqual(res.model_used, "ridge")
+
+    def test_per_group_forecast(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _series(home)
+            res = asyncio.run(_svc(home).forecast(ForecastRequest(
+                path="s.parquet", column="value", x="ts", group="grp",
+                horizon=5, model="ridge", max_groups=4)))
+            keys = {s.key for s in res.series}
+            self.assertEqual(keys, {"a", "b"})
+            self.assertTrue(all(len(s.forecast_y) == 5 for s in res.series))
+
+    def test_short_series_naive_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pq.write_table(pa.table({"v": [1.0, 2.0, 3.0]}), str(home / "tiny.parquet"))
+            res = asyncio.run(_svc(home).forecast(ForecastRequest(
+                path="tiny.parquet", column="v", horizon=4)))
+            self.assertEqual(res.model_used, "naive")
+            self.assertEqual(res.series[0].forecast_y, [3.0, 3.0, 3.0, 3.0])
+
+    def test_value_equals_x_column_no_crash(self):
+        # forecasting a column that shares the x/group name must not trip
+        # polars' duplicate-column error (aliased aggregation).
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _series(home)
+            res = asyncio.run(_svc(home).forecast(ForecastRequest(
+                path="s.parquet", column="ts", x="ts", horizon=3, model="ridge")))
+            self.assertEqual(len(res.series[0].forecast_y), 3)
+
+    def test_bad_column_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _series(home)
+            with self.assertRaises(BadRequestError):
+                asyncio.run(_svc(home).forecast(ForecastRequest(path="s.parquet", column="nope")))
 
 
 if __name__ == "__main__":
