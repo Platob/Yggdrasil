@@ -74,6 +74,7 @@ from yggdrasil.data.cast import any_to_datetime, parse_http_date
 from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.enums.media_type import MediaType
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
+from yggdrasil.http_.exceptions import HTTPError
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
@@ -1310,6 +1311,27 @@ class VolumePath(DatabricksPath):
             return super()._write_stream(src, offset=offset, size=size, **kwargs)
         return self._upload(src)
 
+    def _upload_call_ensuring_volume(self, do_upload) -> None:
+        """Run *do_upload* with parent **and volume** recovery.
+
+        :meth:`_call_ensuring_parents` already recovers a clean ``NotFound`` by
+        creating the missing directory / volume. But the Files edge often
+        closes the TLS connection mid-upload (``SSLEOFError`` → ``MaxRetryError``)
+        instead of returning a clean 404 when the target volume doesn't exist —
+        and that transport error never trips the NotFound recovery. So on an
+        ``HTTPError`` / ``OSError`` from the upload, ensure the volume exists
+        (idempotent :meth:`Volume.create`) and retry exactly once.
+        """
+        try:
+            self._call_ensuring_parents(do_upload)
+        except (HTTPError, OSError) as exc:
+            logger.warning(
+                "Upload of %r failed at the transport layer (%s) — ensuring the "
+                "volume exists and retrying once.", self, exc,
+            )
+            self._ensure_volume()
+            self._call_ensuring_parents(do_upload)
+
     def _upload(self, content: Any) -> int:
         """Upload *content* via ``PUT /api/2.0/fs/files`` (overwrite).
 
@@ -1404,7 +1426,7 @@ class VolumePath(DatabricksPath):
                 )
                 self._raise_for_files_status(resp, api_path)
 
-            self._call_ensuring_parents(_do_upload)
+            self._upload_call_ensuring_volume(_do_upload)
             logger.info("Uploaded volume file %r (size=%d)", self, size)
         self._persist_stat_cache(
             IOStats(
@@ -1459,7 +1481,7 @@ class VolumePath(DatabricksPath):
                 )
                 self._raise_for_files_status(resp, api_path)
 
-            self._call_ensuring_parents(_do_upload)
+            self._upload_call_ensuring_volume(_do_upload)
             logger.info("Streamed volume file %r (size=%d)", self, size)
         self._persist_stat_cache(
             IOStats(

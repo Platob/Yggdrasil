@@ -2166,3 +2166,49 @@ class TestStreamingUploadWire:
         assert _Handler.received is not None
         got = pq.read_table(_io.BytesIO(_Handler.received))
         assert got.equals(table)                    # full, valid Parquet delivered
+
+
+class TestUploadVolumeRecovery:
+    """A transport-level upload failure (SSLEOFError → MaxRetryError) — what the
+    Files edge returns when the target volume doesn't exist — must trigger an
+    idempotent ``Volume.create`` and one retry, since the NotFound-based parent
+    recovery never sees a TLS-close error."""
+
+    def test_transport_error_ensures_volume_then_retries(self, service, monkeypatch):
+        from yggdrasil.http_.exceptions import MaxRetryError
+
+        state = {"attempts": 0, "ensure": 0}
+
+        def do_upload():
+            state["attempts"] += 1
+            if state["ensure"] == 0:  # edge keeps closing until the volume exists
+                raise MaxRetryError(
+                    None, "https://h/api/2.0/fs/files/x.bin",
+                    Exception("EOF occurred in violation of protocol"),
+                )
+
+        monkeypatch.setattr(
+            VolumePath, "_ensure_volume",
+            lambda self: state.__setitem__("ensure", state["ensure"] + 1) or True,
+        )
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
+        p._upload_call_ensuring_volume(do_upload)
+
+        assert state["ensure"] == 1          # volume ensured on the transport error
+        assert state["attempts"] >= 2        # failed pre-ensure, succeeded after
+
+    def test_non_transport_error_does_not_create_volume(self, service, monkeypatch):
+        # A logic / permission error is not a missing volume — don't create it.
+        state = {"ensure": 0}
+        monkeypatch.setattr(
+            VolumePath, "_ensure_volume",
+            lambda self: state.__setitem__("ensure", state["ensure"] + 1),
+        )
+
+        def do_upload():
+            raise ValueError("deterministic failure, not a transport drop")
+
+        p = VolumePath("/Volumes/c/s/v/y.bin", service=service)
+        with pytest.raises(ValueError):
+            p._upload_call_ensuring_volume(do_upload)
+        assert state["ensure"] == 0
