@@ -13,7 +13,7 @@ the HTTP machinery lives on this class:
 
 Wire calls go straight to :mod:`http.client` — no intermediate transport
 class wraps the send. The supporting types (:class:`Retry`,
-:class:`Timeout`, :class:`HTTPResponse`, :class:`HTTPHeaderDict`,
+:class:`Timeout`, :class:`HTTPResponse`, :class:`HTTPHeaders`,
 :mod:`exceptions`) live in the small side modules (:mod:`yggdrasil.http_.retry`,
 :mod:`yggdrasil.http_.timeout`, :mod:`yggdrasil.http_.exceptions`,
 :mod:`yggdrasil.http_.headers`); feature code
@@ -1244,7 +1244,7 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
-                LOGGER.debug(
+                LOGGER.warning(
                     "Read timeout on %s %s — retrying on a fresh socket (%s left): %s",
                     current_request.method, url_str, retries.total, exc,
                 )
@@ -1261,7 +1261,7 @@ class HTTPSession(Session):
                         method=current_request.method, url=url_str,
                         error=wrapped, _pool=self,
                     )
-                    LOGGER.debug(
+                    LOGGER.warning(
                         "TLS EOF/reset on %s %s — retrying on a fresh socket (%s left): %s",
                         current_request.method, url_str, retries.total, msg,
                     )
@@ -1290,7 +1290,7 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
-                LOGGER.debug(
+                LOGGER.warning(
                     "Connection error on %s %s — retrying on a fresh socket (%s left): %s",
                     current_request.method, url_str, retries.total, exc,
                 )
@@ -1339,10 +1339,14 @@ class HTTPSession(Session):
                         response=response, _pool=self,
                     )
                 except MaxRetryError:
+                    LOGGER.error(
+                        "Exhausted retries for %s %s (last status %d)",
+                        current_request.method, current_request.url, response.status,
+                    )
                     if retries.raise_on_status:
                         raise
                     return response
-                LOGGER.debug(
+                LOGGER.warning(
                     "Retryable %d on %s %s — retrying (%s left)",
                     response.status, current_request.method,
                     current_request.url, next_retries.total,
