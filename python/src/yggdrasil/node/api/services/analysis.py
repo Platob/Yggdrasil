@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from functools import partial
 
+import numpy as np
 import polars as pl
 from fastapi.concurrency import run_in_threadpool
 
@@ -31,6 +32,9 @@ from ..schemas.analysis import (
     FilterSpec,
     FinanceRequest,
     FinanceResult,
+    ForecastRequest,
+    ForecastResult,
+    ForecastSeries,
     OhlcRequest,
     OhlcResult,
     SeriesRequest,
@@ -82,6 +86,85 @@ class AnalysisService:
         """Apply the transform and write the result in `fmt`. Returns
         (temp_path, download_name) — the caller streams then unlinks it."""
         return await run_in_threadpool(partial(self._export, req))
+
+    async def forecast(self, req: "ForecastRequest") -> "ForecastResult":
+        return await run_in_threadpool(partial(self._forecast, req))
+
+    def _forecast(self, req: "ForecastRequest") -> "ForecastResult":
+        """Forecast a value column over time (optionally per group key).
+
+        Aggregates the series per time bucket, fits the chosen model (xgboost →
+        gbr → ridge fallback) over engineered trend/lag/seasonal features, and
+        forecasts ``horizon`` steps with a widening confidence band. Streaming
+        polars scan keeps the read bounded."""
+        from .forecast import forecast_series
+        from ..schemas.analysis import ForecastResult, ForecastSeries
+
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        if req.column not in cols:
+            raise BadRequestError(f"column {req.column!r} not found")
+        has_x = bool(req.x and req.x in cols)
+        has_g = bool(req.group and req.group in cols)
+        keep = list(dict.fromkeys(
+            [req.column] + ([req.x] if has_x else []) + ([req.group] if has_g else [])))
+        df = lf.select(keep).collect(engine="streaming")
+        source_rows = df.height
+
+        agg = req.agg if req.agg in ("mean", "sum", "last", "max", "min") else "mean"
+
+        def _series_for(sub: pl.DataFrame) -> ForecastSeries:
+            # collapse duplicate x with the chosen aggregation, ordered by x
+            if has_x:
+                gb = sub.group_by(req.x).agg(getattr(pl.col(req.column).cast(pl.Float64, strict=False), agg)())
+                gb = gb.sort(req.x)
+                xs = gb[req.x].to_list()
+                y = gb[req.column].to_list()
+            else:
+                xs = list(range(sub.height))
+                y = sub[req.column].cast(pl.Float64, strict=False).to_list()
+            preds, lo, hi, rmse, used[0] = forecast_series(y, req.horizon, req.period, req.model)
+            # future x: extrapolate by the median step for numeric x, else index
+            fx: list = []
+            try:
+                xnum = [float(v) for v in xs]
+                step = float(np.median(np.diff(xnum))) if len(xnum) > 1 else 1.0
+                last = xnum[-1] if xnum else 0.0
+                fx = [last + step * (k + 1) for k in range(len(preds))]
+            except (TypeError, ValueError):
+                base = len(xs)
+                fx = [base + k for k in range(len(preds))]
+            # downsample history for display
+            hx, hy = xs, y
+            if len(hx) > req.points:
+                idx = np.linspace(0, len(hx) - 1, req.points).astype(int)
+                hx = [hx[i] for i in idx]
+                hy = [hy[i] for i in idx]
+            return ForecastSeries(
+                key="", history_x=[_safe(v) for v in hx], history_y=[_safe(v) for v in hy],
+                forecast_x=[_safe(v) for v in fx], forecast_y=[_safe(v) for v in preds],
+                lower=[_safe(v) for v in lo], upper=[_safe(v) for v in hi],
+                rmse=round(rmse, 4) if rmse is not None else None,
+            )
+
+        used = ["ridge"]
+        out: list[ForecastSeries] = []
+        if has_g:
+            top = (df.group_by(req.group).len().sort("len", descending=True)
+                   .head(req.max_groups)[req.group].to_list())
+            for key in top:
+                s = _series_for(df.filter(pl.col(req.group) == key))
+                s.key = str(key)
+                out.append(s)
+        else:
+            out.append(_series_for(df))
+
+        return ForecastResult(
+            node_id=self.settings.node_id, path=req.path, column=req.column,
+            model_used=used[0], horizon=req.horizon, period=req.period,
+            series=out, source_rows=source_rows,
+            sampled=any(len(s.history_x) < source_rows for s in out),
+        )
 
     # -- lazy scan ----------------------------------------------------------
 
