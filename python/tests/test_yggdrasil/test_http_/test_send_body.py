@@ -13,6 +13,8 @@ from __future__ import annotations
 import gc
 import hashlib
 import http.server
+import socket
+import struct
 import threading
 import tracemalloc
 from socketserver import ThreadingMixIn
@@ -84,17 +86,43 @@ def test_iter_mv_over_a_real_file(tmp_path):
 
 class _EchoHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    fail_first = 0
+    fail_first = 0       # drop the first N connections before reading the body
+    interrupt_first = 0  # read a little of the body on the first N, then RST mid-send
     conns = 0
 
     def setup(self):
         super().setup()
         type(self).conns += 1
         self._kill = type(self).conns <= type(self).fail_first
+        self._interrupt = (
+            not self._kill
+            and type(self).conns <= type(self).fail_first + type(self).interrupt_first
+        )
+
+    def _abort(self):
+        # Abortive close (RST) — makefile refs dropped so the fd really closes.
+        self.close_connection = True
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        for f in (self.rfile, self.wfile):
+            try:
+                f.close()
+            except Exception:
+                pass
+        self.connection.close()
 
     def do_POST(self):
         if self._kill:
             self.close_connection = True   # drop → client retries on a fresh socket
+            return
+        if self._interrupt:
+            # Consume a little of the body, then yank the socket so the client's
+            # sendall fails *mid-body* — the case where a naive consumed body
+            # would re-send truncated/empty.
+            try:
+                self.rfile.read(4096)
+            except Exception:
+                pass
+            self._abort()
             return
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
@@ -113,6 +141,9 @@ class _EchoHandler(http.server.BaseHTTPRequestHandler):
 class _Server(ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
+    def handle_error(self, request, client_address):
+        pass  # abortive close leaves the handler flushing a closed socket — expected
+
 
 @pytest.fixture
 def server():
@@ -120,6 +151,7 @@ def server():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
     _EchoHandler.fail_first = 0
+    _EchoHandler.interrupt_first = 0
     _EchoHandler.conns = 0
     HTTPSession._INSTANCES.clear()
     try:
@@ -158,6 +190,22 @@ def test_wire_retry_replays_full_body_on_fresh_socket(server, tmp_path):
     assert r.status_code == 200
     assert r.content.decode() == hashlib.sha256(data).hexdigest()
     assert _EchoHandler.conns == 2  # dropped once, succeeded on the retry
+
+
+def test_wire_resends_full_body_when_interrupted_mid_send(server):
+    # The connection is RST *while the body is being sent* (server reads a few
+    # KB, then aborts). iter_mv reads positionally and is rebuilt per attempt,
+    # so the body resets to the start — the retry must deliver the whole body,
+    # not a truncated remainder. Body is multi-MiB so the send spans many
+    # writes and the interrupt genuinely lands mid-stream.
+    _EchoHandler.interrupt_first = 1
+    session = HTTPSession(base_url=server)
+    data = bytes((i * 11) % 256 for i in range(8 * _MIB))
+    r = session.post("/echo", body=Memory(binary=data))
+    assert r.status_code == 200
+    assert r.headers.get("X-Body-Len") == str(len(data))  # full body, not partial
+    assert r.content.decode() == hashlib.sha256(data).hexdigest()
+    assert _EchoHandler.conns == 2
 
 
 # -- benchmark: bounded memory ----------------------------------------------
