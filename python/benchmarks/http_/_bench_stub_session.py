@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from yggdrasil.io.memory import Memory
+from yggdrasil.path.memory import Memory
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
 from yggdrasil.http_.send_config import SendConfig
