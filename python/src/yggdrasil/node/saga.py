@@ -123,12 +123,12 @@ class SqlResult:
         self.referenced_tables: list[str] = payload.get("referenced_tables", [])
         self.node_id: str = payload.get("node_id", "")
 
-    def dicts(self) -> list[dict]:
-        return [dict(zip(self.columns, r)) for r in self.rows]
-
     def __iter__(self) -> Iterator[dict]:
         for r in self.rows:
             yield dict(zip(self.columns, r))
+
+    def dicts(self) -> list[dict]:
+        return list(self)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -347,9 +347,8 @@ def finance(path: str, column: str, *, order_by: str | None = None, window: int 
     payload = {"path": path, "column": column, "order_by": order_by,
                "window": window, "limit": limit,
                "periods_per_year": periods_per_year, "risk_free": risk_free}
-    if node and node != "":
-        # The analysis endpoints take ?node= as a query param, not in the body.
-        url = f"{_base_url(node_url)}/api/v2/analysis/finance?node={_q(node)}"
-    else:
-        url = f"{_base_url(node_url)}/api/v2/analysis/finance"
+    # The analysis endpoints take ?node= as a query param, not in the body.
+    url = f"{_base_url(node_url)}/api/v2/analysis/finance"
+    if node:
+        url += f"?node={_q(node)}"
     return _request("POST", url, payload)
