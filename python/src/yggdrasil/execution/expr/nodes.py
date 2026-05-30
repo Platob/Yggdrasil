@@ -1586,6 +1586,9 @@ def _apply_inlist(
     """
     if not clauses:
         return target
+    # Materialize up front so every downstream kernel (pc.is_in, filter, take)
+    # sees utf8/binary rather than the *_view types they lack kernels for.
+    target = _materialize_view_columns(target)
     n = target.num_rows
     if n <= 4:
         return _apply_inlist_small(target, clauses, n)
@@ -1599,7 +1602,7 @@ def _apply_inlist(
         if includes_null:
             m = pc.or_kleene(m, pc.is_null(col_arr))
         mask = m if mask is None else pc.and_kleene(mask, m)
-    return _materialize_view_columns(target).filter(mask)
+    return target.filter(mask)
 
 
 def _apply_inlist_small(
