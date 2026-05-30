@@ -13,11 +13,11 @@ import {
   uploadFsFile,
   mkdirFs,
   isTabularName,
-  registerFile,
   type FsNodeRoot,
 } from "@/lib/api";
 import type { FsEntry } from "@/lib/types";
 import TabularModal from "@/components/TabularModal";
+import RegisterSagaModal from "@/components/RegisterSagaModal";
 
 // ── Helpers ───────────────────────────────────────────────────
 function formatSize(bytes: number): string {
@@ -136,6 +136,7 @@ export default function FilesPage() {
 
   // Tabular files open the dedicated (reusable) tabular editor instead.
   const [tabular, setTabular] = useState<{ node: string; entry: FsEntry } | null>(null);
+  const [sagaReg, setSagaReg] = useState<{ source: string; node?: string } | null>(null);
 
   // Selected file + text preview modal
   const [selected, setSelected] = useState<{ node: string; entry: FsEntry } | null>(null);
@@ -262,22 +263,10 @@ export default function FilesPage() {
     } catch { /* tree shows last good state */ }
   }, [ensureLoaded]);
 
-  // Register a tabular file as a Saga external table in one call — the backend
-  // ensures the catalog/schema, infers the name from the filename, and profiles
-  // it. source_url is the node-home-relative path Saga uses, so the new table
-  // opens in the SQL editor immediately.
-  const registerSaga = useCallback(async (node: string, entry: FsEntry) => {
-    const stem = entry.name.replace(/\.[^.]+$/, "");
-    const fq = prompt("Register as catalog.schema.table", `main.default.${stem}`);
-    if (!fq) return;
-    const [catalog, schema, table] = fq.split(".").map((s) => s.trim());
-    try {
-      const r = await registerFile({
-        source_url: entry.path, catalog, schema, table,
-        node: node === selfNodeId ? undefined : node,
-      });
-      alert(`Registered ${r.table.full_name} → Saga (${r.table.statistics.row_count ?? "?"} rows)`);
-    } catch (e) { alert(String(e)); }
+  // Open the reusable Saga register modal, prefilled from the file (and from any
+  // existing registration). source_url is the node-home-relative path Saga uses.
+  const registerSaga = useCallback((node: string, entry: FsEntry) => {
+    setSagaReg({ source: entry.path, node: node === selfNodeId ? undefined : node });
   }, [selfNodeId]);
 
   const newFolder = useCallback(async (node: string, basePath: string) => {
@@ -624,6 +613,10 @@ export default function FilesPage() {
           name={tabular.entry.name}
           onClose={() => setTabular(null)}
         />
+      )}
+
+      {sagaReg && (
+        <RegisterSagaModal source={sagaReg.source} node={sagaReg.node} onClose={() => setSagaReg(null)} />
       )}
 
       {/* File preview / edit modal */}
