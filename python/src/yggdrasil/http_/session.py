@@ -1704,7 +1704,7 @@ class HTTPSession(Session):
         config = request.send_config_or_default
         wait_cfg = config.wait if config.wait is not None else self.waiting
 
-        result = self._wire_send(request, wait_cfg)
+        result = self._wire_send(request, wait_cfg, stream=config.stream)
 
         if result.status_code in (401, 403):
             LOGGER.warning(
@@ -1740,18 +1740,31 @@ class HTTPSession(Session):
         self,
         request: HTTPRequest,
         wait_cfg: WaitingConfig,
+        *,
+        stream: bool = False,
     ) -> HTTPResponse:
         """Single wire-level send.
 
         :class:`HTTPSession` IS the pool now: :meth:`_send_http`
-        returns the drained :class:`HTTPResponse` directly, so callers
-        read ``X-Current-Page`` / ``X-Last-Page`` straight off
+        returns the :class:`HTTPResponse` directly, so callers read
+        ``X-Current-Page`` / ``X-Last-Page`` straight off
         ``response.headers`` without a parallel raw-response object.
+
+        ``stream=True`` leaves the body un-preloaded
+        (``preload_content=False``): the response buffer keeps the live
+        socket as its source, so a consumer reading via ``.stream()`` /
+        ``.iter_content`` pulls the body incrementally and the socket is
+        returned to the pool only once the body is drained. The headers
+        (status, ``Content-Length``, pagination markers) are already
+        available off ``getresponse()`` without touching the body, so the
+        :meth:`_local_send` pagination / ``raise_for_status`` checks work
+        unchanged; the difference is purely *when* the body bytes cross
+        the wire.
         """
         result = self._send_http(
             request,
             timeout=wait_cfg.timeout_pool,
-            preload_content=True,
+            preload_content=not stream,
             decode_content=False,
             redirect=True,
         )
