@@ -206,5 +206,106 @@ class TestFiltersAndExport(unittest.TestCase):
                 tmp.unlink(missing_ok=True)
 
 
+class TestIndicators(unittest.TestCase):
+    def _prices(self, home: Path, n=60) -> None:
+        import math
+        pq.write_table(pa.table({
+            "price": [100 + 10 * math.sin(i / 8) for i in range(n)],
+            "ts": list(range(n)),
+        }), str(home / "p.parquet"))
+
+    def test_rsi_bounded_and_aligned(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); self._prices(home)
+            res = asyncio.run(_svc(home).indicators(
+                IndicatorRequest(path="p.parquet", column="price", x="ts",
+                                 indicators=[IndicatorSpec(type="rsi", params={"period": 14})])))
+            self.assertEqual(res.source_rows, 60)
+            self.assertEqual(len(res.x), 60)
+            ind = res.indicators[0]
+            self.assertEqual(ind.type, "rsi")
+            self.assertEqual(ind.name, "RSI(14)")
+            self.assertEqual(len(ind.values["rsi"]), 60)
+            vals = [v for v in ind.values["rsi"] if v is not None]
+            self.assertTrue(all(0.0 <= v <= 100.0 for v in vals))
+
+    def test_macd_emits_three_series(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); self._prices(home)
+            res = asyncio.run(_svc(home).indicators(
+                IndicatorRequest(path="p.parquet", column="price", x="ts",
+                                 indicators=[IndicatorSpec(type="macd")])))
+            ind = res.indicators[0]
+            self.assertEqual(set(ind.values), {"macd", "signal", "histogram"})
+            # histogram == macd - signal at every defined point
+            for m, s, h in zip(ind.values["macd"], ind.values["signal"], ind.values["histogram"]):
+                if m is not None and s is not None and h is not None:
+                    self.assertAlmostEqual(h, m - s, places=6)
+
+    def test_bollinger_band_ordering(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); self._prices(home)
+            res = asyncio.run(_svc(home).indicators(
+                IndicatorRequest(path="p.parquet", column="price", x="ts",
+                                 indicators=[IndicatorSpec(type="bb", params={"period": 10})])))
+            ind = res.indicators[0]
+            self.assertEqual(set(ind.values), {"middle", "upper", "lower"})
+            for lo, mid, hi in zip(ind.values["lower"], ind.values["middle"], ind.values["upper"]):
+                if lo is not None and mid is not None and hi is not None:
+                    self.assertLessEqual(lo, mid)
+                    self.assertLessEqual(mid, hi)
+
+    def test_multiple_indicators_in_one_call(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); self._prices(home)
+            res = asyncio.run(_svc(home).indicators(
+                IndicatorRequest(path="p.parquet", column="price", x="ts",
+                                 indicators=[IndicatorSpec(type="rsi"), IndicatorSpec(type="ema"),
+                                             IndicatorSpec(type="macd"), IndicatorSpec(type="bb")])))
+            self.assertEqual([i.type for i in res.indicators], ["rsi", "ema", "macd", "bb"])
+
+    def test_caps_at_5000_points(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pq.write_table(pa.table({"price": [float(i) for i in range(6000)],
+                                     "ts": list(range(6000))}), str(home / "big.parquet"))
+            res = asyncio.run(_svc(home).indicators(
+                IndicatorRequest(path="big.parquet", column="price", x="ts",
+                                 indicators=[IndicatorSpec(type="ema")])))
+            self.assertEqual(len(res.x), 5000)            # capped
+            self.assertEqual(res.source_rows, 6000)       # but reports true total
+
+    def test_no_x_uses_row_index(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); self._prices(home)
+            res = asyncio.run(_svc(home).indicators(
+                IndicatorRequest(path="p.parquet", column="price",
+                                 indicators=[IndicatorSpec(type="ema")])))
+            self.assertEqual(res.x, list(range(60)))
+
+    def test_missing_column(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); self._prices(home)
+            with self.assertRaises(BadRequestError):
+                asyncio.run(_svc(home).indicators(
+                    IndicatorRequest(path="p.parquet", column="ghost",
+                                     indicators=[IndicatorSpec(type="rsi")])))
+
+    def test_unknown_indicator_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); self._prices(home)
+            with self.assertRaises(BadRequestError):
+                asyncio.run(_svc(home).indicators(
+                    IndicatorRequest(path="p.parquet", column="price",
+                                     indicators=[IndicatorSpec(type="ichimoku")])))
+
+    def test_empty_indicators_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); self._prices(home)
+            with self.assertRaises(BadRequestError):
+                asyncio.run(_svc(home).indicators(
+                    IndicatorRequest(path="p.parquet", column="price", indicators=[])))
+
+
 if __name__ == "__main__":
     unittest.main()
