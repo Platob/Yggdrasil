@@ -294,10 +294,10 @@ def run(repeat: int) -> None:
     print(f"{_fmt(r)}\n{'':52s}  -> {mbps:,.0f} MiB/s")
 
     # --- concurrency under latency ----------------------------------------
-    # The send_many fast path is sequential on the theory that http.client
-    # I/O is GIL-bound. But blocking socket recv/send RELEASE the GIL, so
-    # against a server with real per-request latency a thread fan-out
-    # should win. This case quantifies the gap.
+    # send_many fans the uncached fast path out across the job pool, and
+    # blocking socket recv/send release the GIL, so against a server with
+    # real per-request latency it overlaps the waits. This case quantifies
+    # the win over a naive sequential loop.
     n = 40
     slow_reqs = [HTTPRequest.prepare("GET", f"{base_url}/slow?i={i}") for i in range(n)]
 
@@ -305,7 +305,7 @@ def run(repeat: int) -> None:
         for i in range(n):
             session.get("/slow")
 
-    def _send_many_seq():
+    def _send_many_concurrent():
         list(session.send_many(iter(list(slow_reqs)), raise_error=False))
 
     def _thread_fanout():
@@ -315,7 +315,7 @@ def run(repeat: int) -> None:
     print(f"\n# Concurrency under {_LATENCY_S*1e3:.0f} ms upstream latency ({n} requests)")
     for label, fn in (
         ("sequential get loop", _seq_loop),
-        ("send_many (sequential fast path)", _send_many_seq),
+        ("send_many (job-pool fan-out)", _send_many_concurrent),
         ("ThreadPoolExecutor(8) fan-out", _thread_fanout),
     ):
         rr = _time(label, fn, repeat=repeat, inner=3)
