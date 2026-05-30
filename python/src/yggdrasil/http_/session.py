@@ -93,7 +93,7 @@ from yggdrasil.http_.cache_config import CacheConfig
 from yggdrasil.http_.send_config import DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.url import URL
 
-from .user_agents import random_user_agent
+from .user_agents import random_browser_profile
 from .exceptions import (
     InsecureRequestWarning,
     LocationParseError,
@@ -1317,12 +1317,14 @@ class HTTPSession(Session):
                 retries = next_retries
                 if response.status == 429:
                     # Rate limited: retry on a fresh connection (new source
-                    # port / TLS session) with a rotated User-Agent, so a
-                    # per-connection or UA-keyed limiter sees a clean client
-                    # rather than the just-throttled pooled socket.
+                    # port / TLS session) with a rotated browser identity, so a
+                    # per-connection or fingerprint-keyed limiter sees a clean,
+                    # internally-consistent client rather than the just-throttled
+                    # pooled socket. Only the who-am-I headers rotate —
+                    # content negotiation (Accept/Accept-Encoding) is preserved.
                     self._evict_host(current_request.url)
                     rotated_headers = HTTPHeaders(current_request.headers)
-                    rotated_headers["User-Agent"] = random_user_agent()
+                    rotated_headers.update(random_browser_profile().identity)
                     current_request = current_request.copy(headers=rotated_headers)
                 continue
 
