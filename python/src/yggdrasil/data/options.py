@@ -203,8 +203,9 @@ def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
     """Build a :class:`Schema` from *columns* with :class:`ObjectType` fields.
 
     Used by :meth:`CastOptions.check` when the caller passed a bare
-    ``columns=`` list and no target schema bound. The children default
-    to :class:`ObjectType` so casts pass through untouched.
+    ``columns=`` list and no target schema bound — the names become a
+    target projection. The children default to :class:`ObjectType` so the
+    projection narrows columns without casting their types.
     """
     from yggdrasil.data.data_field import Field as _Field
     from yggdrasil.data.schema import Schema as _Schema
@@ -511,15 +512,14 @@ class CastOptions:
         bound" semantic should chain :meth:`check_source` /
         :meth:`check_target` after the call.
 
-        ``columns=`` shortcut: a sequence of column names. When the
-        caller didn't bind a source by any other means (no ``source=``
-        override, the wrapped options didn't carry one either), the
-        names are promoted to a struct-shaped source field whose
-        children default to :class:`ObjectType` — a "I have these
-        columns, no idea what's in them yet" placeholder that
-        downstream casts treat as passthroughs. Ignored when the source
-        is already bound, so callers can pass it defensively without
-        clobbering richer schemas.
+        ``columns=`` shortcut: a sequence of column names describing the
+        desired output projection. When a ``target`` is already bound the
+        names narrow it (``target.select(columns)``); otherwise they are
+        promoted to a struct-shaped *target* field whose children default
+        to :class:`ObjectType` — a "I want these columns, leave their
+        types alone" placeholder that drives projection without casting.
+        It lands on ``target`` (not ``source``) so it never shadows the
+        real source schema inferred at read time.
 
         :raises TypeError: if *options* is a type the dispatch table
             doesn't cover.
@@ -619,8 +619,8 @@ class CastOptions:
         if columns:
             if instance.target is not None:
                 instance = instance.copy(target=instance.target.select(columns))
-            elif instance.source is None:
-                instance = instance.copy(source=_struct_of_objects(columns))
+            else:
+                instance = instance.copy(target=_struct_of_objects(columns))
         return instance
 
     @classmethod

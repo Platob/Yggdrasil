@@ -945,17 +945,22 @@ class HTTPSession(Session):
                 except (ProxyError, OSError) as exc:
                     exc_msg = str(exc)
                     if "CERTIFICATE_VERIFY_FAILED" in exc_msg:
+                        # The CONNECT tunnel succeeded — the proxy is fine; it's
+                        # the *target's* TLS cert that failed. Keep the proxy
+                        # (don't mark it dead) and surface the error instead of
+                        # falling back to a direct connection, which would hit
+                        # the same cert failure.
                         LOGGER.error(
                             "SSL certificate verification failed for %s:%s "
                             "(tunneled via proxy %s:%s). "
                             "Use HTTPSession(verify=False) or session.insecure(): %s",
                             host, port, proxy.host, proxy.port, exc_msg,
                         )
-                    else:
-                        LOGGER.warning(
-                            "Proxy %s:%s failed for %s:%s (%s)",
-                            proxy.host, proxy.port, host, port, exc,
-                        )
+                        raise
+                    LOGGER.warning(
+                        "Proxy %s:%s failed for %s:%s (%s)",
+                        proxy.host, proxy.port, host, port, exc,
+                    )
                     self._mark_proxy_dead(proxy)
 
             return http.client.HTTPSConnection(

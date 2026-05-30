@@ -426,6 +426,25 @@ def cast_arrow_tabular(
         target_arrays.append(casted)
         target_sources.append(source_field)
 
+    # A variant (``ObjectType``) target field is a "keep whatever's here"
+    # passthrough — its per-column cast returns the source array untouched and
+    # its declared arrow type (``large_binary``) is a physical stand-in, not a
+    # cast request. Rebind those fields to the projected column's real type so
+    # a bare ``columns=`` projection (struct-of-objects target) preserves the
+    # source dtypes instead of failing to coerce e.g. ``int64`` -> large_binary.
+    if any(c.type_id == DataTypeId.OBJECT for c in target_schema.children):
+        target_arrow_schema = pa.schema(
+            [
+                pa.field(f.name, arr.type, f.nullable)
+                if child.type_id == DataTypeId.OBJECT
+                else f
+                for child, arr, f in zip(
+                    target_schema.children, target_arrays, target_arrow_schema
+                )
+            ],
+            metadata=target_arrow_schema.metadata,
+        )
+
     # ``pa.Table.from_arrays(schema=...)`` silently coerces a column
     # whose type doesn't exactly equal the declared schema field — handy
     # for benign mismatches like ``string`` vs ``large_string``, but
