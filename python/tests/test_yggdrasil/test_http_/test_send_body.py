@@ -1,14 +1,12 @@
-"""SendIO — the seekable, zero-copy, bounded request-body adapter.
+"""Zero-copy, bounded request-body streaming via ``Holder.iter_mv``.
 
-Unit cases pin the file-like contract (chunked read, len, seek/tell, window,
-zero-copy memoryview). Wire cases prove a body round-trips byte-exact through a
-real ``HTTPSession`` POST — both an in-memory :class:`Memory` holder and a real
-on-disk file IO — replays intact across a connection-retry, and (the headline)
-uploads a large file in bounded memory instead of materialising it whole.
-
-SendIO is generic over any yggdrasil :class:`~yggdrasil.io.holder.Holder`, so
-the tests drive it with the two real IOs you'd actually send: ``Memory`` and a
-``LocalPath`` file opened ``"rb"`` — no synthetic buffer plumbing.
+The wire send no longer materialises the body with ``read_mv(-1, 0)``; it hands
+``http.client`` the holder's ``iter_mv`` — a generator of zero-copy
+``memoryview`` chunks. These tests pin the IO enrichment itself (chunking,
+reassembly, zero-copy, window, replayable iteration) and the wire behaviour it
+enables: a body round-trips byte-exact through a real ``HTTPSession`` POST —
+both an in-memory :class:`Memory` and a real on-disk file — replays intact
+across a connection retry, and uploads a large file in bounded memory.
 """
 from __future__ import annotations
 
@@ -21,7 +19,6 @@ from socketserver import ThreadingMixIn
 
 import pytest
 
-from yggdrasil.http_.send_io import SEND_CHUNK, SendIO
 from yggdrasil.http_.session import HTTPSession
 from yggdrasil.path.local_path import LocalPath
 from yggdrasil.path.memory import Memory
@@ -35,78 +32,52 @@ def _file_io(path, data):
     return LocalPath.from_(str(path)).open(mode="rb")
 
 
-# -- unit: file-like contract ----------------------------------------------
+# -- unit: Holder.iter_mv ---------------------------------------------------
 
-def test_len_and_chunked_read_reassembles():
+def test_iter_mv_chunks_reassemble():
     data = bytes(range(256)) * 400  # 102_400 bytes
-    sio = SendIO(Memory(binary=data), chunk_size=4096)
-    assert len(sio) == len(data)
-    out = bytearray()
-    while True:
-        chunk = sio.read(64 * 1024)   # ask big; SendIO caps at chunk_size
-        if not chunk:
-            break
-        assert len(chunk) <= 4096
-        out += chunk
-    assert bytes(out) == data
-    assert sio.tell() == len(data)
+    chunks = list(Memory(binary=data).iter_mv(4096))
+    assert all(isinstance(c, memoryview) for c in chunks)
+    assert all(len(c) <= 4096 for c in chunks)
+    assert b"".join(bytes(c) for c in chunks) == data
 
 
-def test_read_returns_zero_copy_memoryview_into_holder():
+def test_iter_mv_yields_zero_copy_views():
     data = b"abcdefgh" * 1000
     holder = Memory(binary=data)
-    sio = SendIO(holder, chunk_size=4096)
-    mv = sio.read(100)
-    assert isinstance(mv, memoryview)   # not a bytes copy — handed to sendall as-is
-    assert bytes(mv) == data[:100]
-    assert bytes(holder.read_mv(100, 0)) == data[:100]
+    first = next(holder.iter_mv(100))
+    assert isinstance(first, memoryview)        # not a bytes copy
+    assert bytes(first) == data[:100]
 
 
-def test_seek_rewind_replays_from_start():
-    data = b"0123456789" * 5000
-    sio = SendIO(Memory(binary=data), chunk_size=8192)
-    first = b"".join(iter(lambda: bytes(sio.read(8192)), b""))
-    assert first == data
-    assert sio.read(1) == b""           # exhausted
-    assert sio.seek(0) == 0             # rewind
-    again = b"".join(iter(lambda: bytes(sio.read(8192)), b""))
-    assert again == data                # full replay
-    # whence variants
-    sio.seek(10)
-    assert sio.tell() == 10
-    sio.seek(5, 1)
-    assert sio.tell() == 15
-    sio.seek(-3, 2)
-    assert sio.tell() == len(data) - 3
-    sio.seek(-100, 0)                   # clamps, never negative
-    assert sio.tell() == 0
+def test_iter_mv_is_replayable():
+    # Positional reads don't move a cursor, so the same holder streams again —
+    # exactly what a connection retry relies on.
+    holder = Memory(binary=b"0123456789" * 5000)
+    once = b"".join(bytes(c) for c in holder.iter_mv(8192))
+    twice = b"".join(bytes(c) for c in holder.iter_mv(8192))
+    assert once == twice == holder.read_bytes()
 
 
-def test_base_and_length_define_a_window():
+def test_iter_mv_window_with_start_and_length():
     data = bytes(range(256))
-    sio = SendIO(Memory(binary=data), base=100, length=50, chunk_size=16)
-    assert len(sio) == 50
-    assert b"".join(iter(lambda: bytes(sio.read(16)), b"")) == data[100:150]
+    chunks = list(Memory(binary=data).iter_mv(16, start=100, length=50))
+    assert b"".join(bytes(c) for c in chunks) == data[100:150]
 
 
-def test_empty_body_reads_nothing():
-    sio = SendIO(Memory(binary=b""))
-    assert len(sio) == 0
-    assert sio.read(10) == b""
+def test_iter_mv_empty_holder_yields_nothing():
+    assert list(Memory(binary=b"").iter_mv()) == []
 
 
-def test_invalid_args_raise():
+def test_iter_mv_rejects_bad_chunk_size():
     with pytest.raises(ValueError):
-        SendIO(Memory(binary=b"x"), chunk_size=0)
-    with pytest.raises(ValueError):
-        SendIO(Memory(binary=b"x"), base=99)
+        list(Memory(binary=b"x").iter_mv(0))
 
 
-def test_works_over_a_real_file_io(tmp_path):
+def test_iter_mv_over_a_real_file(tmp_path):
     data = bytes((i * 5) % 256 for i in range(200_000))
-    sio = SendIO(_file_io(tmp_path / "b.bin", data), chunk_size=8192)
-    assert len(sio) == len(data)
-    assert b"".join(iter(lambda: bytes(sio.read(8192)), b"")) == data
+    io_ = _file_io(tmp_path / "b.bin", data)
+    assert b"".join(bytes(c) for c in io_.iter_mv(8192)) == data
 
 
 # -- wire: round-trip through a real session --------------------------------
@@ -179,7 +150,7 @@ def test_wire_post_file_body_roundtrips(server, tmp_path):
 
 def test_wire_retry_replays_full_body_on_fresh_socket(server, tmp_path):
     # First connection is dropped before responding → the send retries on a
-    # fresh socket with a fresh SendIO that must re-send the whole file.
+    # fresh socket with a fresh iter_mv that must re-send the whole file.
     _EchoHandler.fail_first = 1
     session = HTTPSession(base_url=server)
     data = bytes((i * 7) % 256 for i in range(4 * _MIB))
@@ -191,9 +162,9 @@ def test_wire_retry_replays_full_body_on_fresh_socket(server, tmp_path):
 
 # -- benchmark: bounded memory ----------------------------------------------
 
-def test_sendio_streams_a_file_in_bounded_memory(tmp_path):
+def test_iter_mv_streams_a_file_in_bounded_memory(tmp_path):
     # Produce the whole body two ways and compare peak heap:
-    #   (a) SendIO chunked reads (what the wire send now does), vs
+    #   (a) iter_mv chunked views (what the wire send now does), vs
     #   (b) read_mv(-1, 0) — the old path that materialises the file whole.
     size = 32 * _MIB
     data = bytes((i * 13) % 256 for i in range(size))
@@ -210,27 +181,23 @@ def test_sendio_streams_a_file_in_bounded_memory(tmp_path):
         gc.collect()
         return pk
 
-    def via_sendio():
-        sio = SendIO(LocalPath.from_(str(path)).open(mode="rb"))
+    def via_iter_mv():
         total = 0
-        while True:
-            chunk = sio.read(SEND_CHUNK)  # not retained → bounded resident set
-            if not chunk:
-                break
-            total += len(chunk)
+        for chunk in LocalPath.from_(str(path)).open(mode="rb").iter_mv():
+            total += len(chunk)  # not retained → bounded resident set
         assert total == size
 
     def via_full_read():
         mv = LocalPath.from_(str(path)).open(mode="rb").read_mv(-1, 0)
         assert len(mv) == size
 
-    via_sendio()      # warm
+    via_iter_mv()      # warm
     via_full_read()
 
-    peak_sendio = peak(via_sendio)
+    peak_iter = peak(via_iter_mv)
     peak_full = peak(via_full_read)
 
     assert peak_full > size * 0.5, f"control didn't materialise the file: {peak_full}"
-    assert peak_sendio < peak_full * 0.25, (
-        f"SendIO peak {peak_sendio} not well below full-read {peak_full}"
+    assert peak_iter < peak_full * 0.25, (
+        f"iter_mv peak {peak_iter} not well below full-read {peak_full}"
     )

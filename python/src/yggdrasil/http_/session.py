@@ -106,7 +106,6 @@ from .exceptions import (
 )
 from .response import HTTPResponse
 from .retry import Retry
-from .send_io import SendIO
 from .timeout import _resolve_timeout
 
 if TYPE_CHECKING:
@@ -1402,21 +1401,18 @@ class HTTPSession(Session):
                 proxy = self._resolve_proxy_for(scheme, host)
                 if proxy:
                     send_headers.update(self._proxy_auth_headers(proxy))
-            # Stream the body off our seekable, spill-backed buffer in bounded
-            # zero-copy chunks (:class:`SendIO`) rather than materialising it
-            # whole with ``read_mv(-1, 0)``: a large or spilled PUT uploads in
-            # ~one-chunk memory, ``sock.sendall`` writes each memoryview without
-            # a copy, and a fresh SendIO per attempt re-sends from byte 0 so a
-            # stale-socket retry replays the full body.
+            # Stream the body off the buffer in bounded zero-copy chunks
+            # (``iter_mv``) rather than materialising it whole with
+            # ``read_mv(-1, 0)``: a large or spilled/file-backed PUT uploads in
+            # ~one-chunk memory, and ``sock.sendall`` writes each memoryview
+            # without a copy. ``iter_mv`` reads positionally, so a fresh
+            # iterator per attempt re-sends the full body on a stale-socket
+            # retry. ``Content-Length`` frames it (no chunked encoding).
             body = None
             if request.buffer is not None:
                 if "Content-Length" not in send_headers:
                     send_headers["Content-Length"] = str(request.buffer.size)
-                body = SendIO(request.buffer)
-                # http.client reads a file-like body in ``conn.blocksize`` gulps
-                # (default 8 KiB) — match it to SendIO's chunk so each sendall
-                # carries a full window.
-                conn.blocksize = max(getattr(conn, "blocksize", 8192), body.chunk_size)
+                body = request.buffer.iter_mv()
             conn.request(request.method, request_path, body=body, headers=send_headers)
             raw = conn.getresponse()
         except socket.timeout as exc:
