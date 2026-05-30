@@ -157,6 +157,14 @@ class RemotePath(Path):
     # False so projection keeps the single-GET snapshot.
     SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = False
 
+    # When True, an Arrow/Parquet write to this backend spills the encode to a
+    # temp file and the upload streams it from disk in bounded chunks (see
+    # :meth:`_upload_stream`) — so a multi-GB write never materialises whole in
+    # memory. Backends whose upload rides a third-party transport that already
+    # streams (S3 via boto3, Workspace via the Databricks SDK) leave it False
+    # and keep the in-memory commit. Defaults False; :class:`VolumePath` opts in.
+    SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = False
+
     # Activate the :class:`Singleton` cache: 5-minute default TTL,
     # bounded at 10 000 entries as defence-in-depth against
     # accidental cardinality explosions.
@@ -642,6 +650,31 @@ class RemotePath(Path):
         raise NotImplementedError(
             f"{type(self).__name__} must implement _upload(content)."
         )
+
+    def _note_streamed_upload(self, size: int) -> None:
+        """Post-streaming-upload bookkeeping — :meth:`_cache_after_upload`
+        minus the byte copy.
+
+        Makes the committed *size* authoritative (so a follow-up read on the
+        same instance doesn't see the pre-write ``_buffered_size`` and conclude
+        the object is empty) and drops any stale pages so a later read falls
+        through to a ranged backend fetch.
+        """
+        self._buffered_size = size
+        self._dirty_pages.clear()
+        if self._pages is not None:
+            self._pages.clear()
+
+    def _upload_stream(self, source: "Holder") -> int:
+        """Upload *source* (a seekable, sized Holder) as the whole object.
+
+        Default: materialise *source* and defer to :meth:`_upload` — keeps
+        backends that don't stream (S3, Workspace, DBFS) on their existing
+        path. Only reached when ``SUPPORTS_STREAMING_UPLOAD`` is set, so the
+        default is a safety net; :class:`VolumePath` overrides it to push
+        *source* to the Files API in bounded chunks. Returns the byte count.
+        """
+        return self._upload(source.read_bytes())
 
     def _write_mv(self, data: memoryview, pos: int) -> int:
         """Splice *data* at *pos* via the backend upload primitive.

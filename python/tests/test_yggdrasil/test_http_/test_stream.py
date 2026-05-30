@@ -23,11 +23,13 @@ class _FakeRaw:
 
 
 class _FakeConn:
+    sock = None  # _open_range_connection dials only when the socket is down
+
     def __init__(self):
         self.requested = None
 
     def connect(self):
-        pass
+        self.sock = object()
 
     def request(self, method, path, body=None, headers=None):
         self.requested = (method, path, dict(headers or {}))

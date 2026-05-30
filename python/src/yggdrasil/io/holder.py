@@ -2224,6 +2224,37 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         """View over the holder's visible bytes."""
         return self.read_mv(-1, 0)
 
+    def iter_mv(
+        self,
+        chunk_size: int = 256 * 1024,
+        *,
+        start: int = 0,
+        length: Optional[int] = None,
+    ) -> Iterator[memoryview]:
+        """Yield ``[start, start+length)`` in bounded, zero-copy ``memoryview``
+        chunks (default: the whole holder from ``start``).
+
+        Each chunk is a :meth:`read_mv` slice — a view straight into the live
+        in-memory window, or a bounded read for spilled / file-backed storage —
+        so a consumer like ``http.client`` can ``sock.sendall`` it without a
+        copy, and never more than ``chunk_size`` is resident at once. Reads are
+        positional (the cursor is untouched), so the holder can be iterated
+        again — e.g. a connection retry re-sending the same body — by calling
+        this afresh.
+        """
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {chunk_size!r}")
+        total = self.size
+        start = _resolve_pos(start, total)
+        end = total if length is None else min(total, start + max(0, length))
+        pos = start
+        while pos < end:
+            mv = self.read_mv(min(chunk_size, end - pos), pos)
+            if not mv:
+                break
+            yield mv
+            pos += len(mv)
+
     # ------------------------------------------------------------------
     # Bytes / text convenience surface
     # ------------------------------------------------------------------
@@ -3276,6 +3307,27 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         from yggdrasil.io.base import _ArrowOutputStreamContext
 
         return _ArrowOutputStreamContext(self, append=append)
+
+    def _commit_format_source(
+        self,
+        source: "Holder",
+        *,
+        append: bool = False,
+    ) -> int:
+        """Commit a format payload that was spilled to *source* (a Holder over
+        a temp file) instead of buffered in memory.
+
+        When the backing holder streams its upload (``SUPPORTS_STREAMING_UPLOAD``)
+        and this isn't an append, push *source* straight to the backend in
+        bounded chunks via :meth:`_upload_stream` — the payload never
+        materialises whole. Otherwise (in-memory holder, append, or a backend
+        that doesn't stream) read the spill and route it through the normal
+        :meth:`_commit_format_payload`, which is byte-for-byte the prior path.
+        """
+        holder = self._parent if self._parent is not None else self
+        if not append and getattr(holder, "SUPPORTS_STREAMING_UPLOAD", False):
+            return holder._upload_stream(source)
+        return self._commit_format_payload(source.read_bytes(), append=append)
 
     def _commit_format_payload(
         self,

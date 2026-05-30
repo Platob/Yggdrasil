@@ -178,9 +178,17 @@ class FakeFilesSession:
                 self.bytes_served += len(data)
                 return FakeResp(200, headers=headers, body=data)
             if method == "PUT" and kind == "files":
+                # A streaming body arrives as a yggdrasil Holder (the real
+                # session would iter_mv it onto the wire); read it here.
+                if hasattr(body, "read_bytes"):
+                    data = body.read_bytes()
+                elif hasattr(body, "read"):
+                    data = body.read()
+                else:
+                    data = bytes(body or b"")
                 files.upload(
                     file_path=api_path,
-                    contents=io.BytesIO(body or b""),
+                    contents=io.BytesIO(data),
                     overwrite=True,
                 )
                 return FakeResp(204)

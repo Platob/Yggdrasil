@@ -23,7 +23,7 @@ from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io.base import IO
 from yggdrasil.path.memory_stream import MemoryStream
 from yggdrasil.enums import Codec, MediaType, MimeTypes
-from yggdrasil.http_.headers import HTTPHeaders, HTTPHeaderDict
+from yggdrasil.http_.headers import HTTPHeaders
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.io.tabular.base import Tabular

@@ -1,92 +1,23 @@
-"""Case-insensitive, multi-value HTTP header dict — :class:`HTTPHeaderDict`.
+"""HTTP header container — :class:`HTTPHeaders`.
 
-The transport surface (raw socket writes, retry-after parsing, the
-urllib3-shim error path in :mod:`yggdrasil.exceptions.http`) speaks the
-urllib3-shaped :class:`HTTPHeaderDict`: same name, same multi-value
-semantics, lowercase-keyed storage with first-seen original casing
-preserved on iteration. The high-level
-:class:`yggdrasil.io.headers.HTTPHeaders` is a different abstraction
-(normalised, anonymisation-aware, hash-stable) and isn't a drop-in
-replacement at the transport layer.
+A case-insensitive (RFC 7230 §3.2) string→string mapping that preserves each
+field's original casing for faithful serialization, bumps a version counter on
+mutation for cache fingerprinting, and carries the canonical-name normalization
++ anonymization vocabulary. This is the single header type the request /
+response / session pipeline speaks.
 """
 from __future__ import annotations
 
-import collections.abc
 import platform
 import re
 import socket
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Iterator, Mapping, MutableMapping, Optional, Tuple, Union, Literal
+from typing import Any, ClassVar, Iterator, Mapping, MutableMapping, Optional, Union, Literal
 
 from yggdrasil.enums import MediaType, MimeTypes, Codec
 from yggdrasil.io.holder import IO
 from yggdrasil.version import __version_info__, __version__
 
-__all__ = ["HTTPHeaderDict"]
-
-
-class HTTPHeaderDict(collections.abc.MutableMapping):
-    """Case-insensitive, multi-value header dict mirroring ``urllib3``'s.
-
-    Stores values per lowercase key but preserves the first-seen original
-    casing when iterating. Multi-value headers (Set-Cookie, …) are joined
-    with ``, `` on read, matching urllib3's collapsing behavior.
-    """
-
-    def __init__(self, headers: Any = None, **kwargs: str) -> None:
-        # _store maps lowercase key -> (original_case, [values])
-        self._store: dict[str, Tuple[str, list[str]]] = {}
-        if headers is not None:
-            self.extend(headers)
-        if kwargs:
-            self.extend(kwargs)
-
-    # MutableMapping protocol -------------------------------------------------
-    def __setitem__(self, key: str, value: str) -> None:
-        self._store[key.lower()] = (key, [value])
-
-    def __getitem__(self, key: str) -> str:
-        _, values = self._store[key.lower()]
-        return ", ".join(values)
-
-    def __delitem__(self, key: str) -> None:
-        del self._store[key.lower()]
-
-    def __iter__(self) -> Iterator[str]:
-        return (original for original, _ in self._store.values())
-
-    def __len__(self) -> int:
-        return len(self._store)
-
-    def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and key.lower() in self._store
-
-    # Multi-value helpers -----------------------------------------------------
-    def add(self, key: str, value: str) -> None:
-        slot = self._store.get(key.lower())
-        if slot is None:
-            self._store[key.lower()] = (key, [value])
-        else:
-            slot[1].append(value)
-
-    def extend(self, other: Any) -> None:
-        if isinstance(other, HTTPHeaderDict):
-            for original, values in other._store.values():
-                for v in values:
-                    self.add(original, v)
-            return
-        if hasattr(other, "items"):
-            other = other.items()
-        for k, v in other:
-            self.add(k, v)
-
-    def getlist(self, key: str) -> list[str]:
-        slot = self._store.get(key.lower())
-        return list(slot[1]) if slot is not None else []
-
-    def __repr__(self) -> str:
-        return f"HTTPHeaderDict({dict(self.items())!r})"
-# yggdrasil.io.headers
 __all__ = [
     "HTTPHeaders",
     "HeaderValue",
@@ -417,11 +348,13 @@ class HTTPHeaders(MutableMapping[str, str]):
       (``headers["Accept"] = "*/*"`` when it already is) short-circuit
       without bumping the version, so re-applying defaults is free.
 
-    Keys and values are coerced to ``str`` on the way in. Lookups stay
-    case-sensitive — the canonical-name normalization sits in
-    :func:`normalize_headers`, separate from this container, so
-    callers that already speak in canonical names don't pay for a
-    second pass.
+    Keys and values are coerced to ``str`` on the way in. The store keeps each
+    name's original case (for faithful serialization), but **lookups are
+    case-insensitive** per RFC 7230 §3.2 — ``headers.get("Location")`` finds a
+    wire ``location`` (HTTP/2 lowercases every field name) and a redirect /
+    ``Retry-After`` read works regardless of how the origin cased it. Canonical
+    Title-Case rewriting still lives in :func:`normalize_headers`, separate from
+    this container.
     """
 
     __slots__ = (
@@ -492,20 +425,52 @@ class HTTPHeaders(MutableMapping[str, str]):
     # Mapping / MutableMapping protocol
     # ------------------------------------------------------------------
 
+    def _existing_key(self, sk: str) -> "str | None":
+        """The stored key equal to *sk* ignoring case, or None.
+
+        HTTP field names are case-insensitive (RFC 7230 §3.2), so a write to
+        ``Content-Length`` must land on an existing ``content-length`` slot
+        (HTTP/2 lowercases every name) rather than create a sibling. Exact hit
+        is the fast path; the scan only runs on a case mismatch.
+        """
+        if sk in self._data:
+            return sk
+        kl = sk.lower()
+        for k in self._data:
+            if k.lower() == kl:
+                return k
+        return None
+
     def __getitem__(self, key: str) -> str:
-        return self._data[key]
+        try:
+            return self._data[key]
+        except KeyError:
+            kl = key.lower()
+            for k, v in self._data.items():
+                if k.lower() == kl:
+                    return v
+            raise
 
     def __setitem__(self, key: Any, value: Any) -> None:
         sk = str(key)
         sv = str(value)
-        existing = self._data.get(sk, _MISSING)
-        if existing is not _MISSING and existing == sv:
+        # Update an existing same-name slot (any case) in place rather than
+        # adding a case-variant duplicate; keep the stored name's casing.
+        target = self._existing_key(sk)
+        if target is not None:
+            if self._data[target] == sv:
+                return
+            self._data[target] = sv
+            self._version += 1
             return
         self._data[sk] = sv
         self._version += 1
 
     def __delitem__(self, key: str) -> None:
-        del self._data[key]
+        target = self._existing_key(key)
+        if target is None:
+            raise KeyError(key)
+        del self._data[target]
         self._version += 1
 
     def __iter__(self) -> Iterator[str]:
@@ -515,7 +480,12 @@ class HTTPHeaders(MutableMapping[str, str]):
         return len(self._data)
 
     def __contains__(self, key: object) -> bool:
-        return key in self._data
+        if key in self._data:
+            return True
+        if not isinstance(key, str):
+            return False
+        kl = key.lower()
+        return any(k.lower() == kl for k in self._data)
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, HTTPHeaders):
@@ -570,11 +540,15 @@ class HTTPHeaders(MutableMapping[str, str]):
         for k, v in kwargs.items():
             merged[str(k)] = str(v)
         for k, v in merged.items():
-            existing = self._data.get(k, _MISSING)
-            if existing is not _MISSING and existing == v:
-                continue
-            self._data[k] = v
-            self._version += 1
+            target = self._existing_key(k)
+            if target is not None:
+                if self._data[target] == v:
+                    continue
+                self._data[target] = v  # update same-name slot, keep its case
+                self._version += 1
+            else:
+                self._data[k] = v
+                self._version += 1
 
     def clear(self) -> None:
         if not self._data:

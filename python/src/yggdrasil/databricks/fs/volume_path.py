@@ -74,6 +74,7 @@ from yggdrasil.data.cast import any_to_datetime, parse_http_date
 from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.enums.media_type import MediaType
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
+from yggdrasil.http_.exceptions import HTTPError
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
@@ -191,6 +192,11 @@ class VolumePath(DatabricksPath):
     # can pull the footer + projected chunks only (see
     # :meth:`RemotePath.arrow_random_access_file`).
     SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True
+
+    # Arrow/Parquet writes spill the encode to a temp file and stream it to the
+    # Files API in bounded chunks (see :meth:`_upload_stream`), so a multi-GB
+    # write never materialises whole in memory.
+    SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = True
 
     # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
@@ -1305,6 +1311,27 @@ class VolumePath(DatabricksPath):
             return super()._write_stream(src, offset=offset, size=size, **kwargs)
         return self._upload(src)
 
+    def _upload_call_ensuring_volume(self, do_upload) -> None:
+        """Run *do_upload* with parent **and volume** recovery.
+
+        :meth:`_call_ensuring_parents` already recovers a clean ``NotFound`` by
+        creating the missing directory / volume. But the Files edge often
+        closes the TLS connection mid-upload (``SSLEOFError`` → ``MaxRetryError``)
+        instead of returning a clean 404 when the target volume doesn't exist —
+        and that transport error never trips the NotFound recovery. So on an
+        ``HTTPError`` / ``OSError`` from the upload, ensure the volume exists
+        (idempotent :meth:`Volume.create`) and retry exactly once.
+        """
+        try:
+            self._call_ensuring_parents(do_upload)
+        except (HTTPError, OSError) as exc:
+            logger.warning(
+                "Upload of %r failed at the transport layer (%s) — ensuring the "
+                "volume exists and retrying once.", self, exc,
+            )
+            self._ensure_volume()
+            self._call_ensuring_parents(do_upload)
+
     def _upload(self, content: Any) -> int:
         """Upload *content* via ``PUT /api/2.0/fs/files`` (overwrite).
 
@@ -1399,7 +1426,7 @@ class VolumePath(DatabricksPath):
                 )
                 self._raise_for_files_status(resp, api_path)
 
-            self._call_ensuring_parents(_do_upload)
+            self._upload_call_ensuring_volume(_do_upload)
             logger.info("Uploaded volume file %r (size=%d)", self, size)
         self._persist_stat_cache(
             IOStats(
@@ -1410,6 +1437,61 @@ class VolumePath(DatabricksPath):
             )
         )
         self._cache_after_upload(payload, size)
+        return size
+
+    def _upload_stream(self, source: "Any") -> int:
+        """Stream *source* (a seekable, sized Holder) to the Files API as the
+        whole object, in bounded chunks — the memory-bounded counterpart to
+        :meth:`_upload` driven by the Arrow/Parquet write path.
+
+        The single PUT hands the session the Holder itself: its ``iter_mv``
+        streams the body off disk window-by-window, and re-reads from byte 0
+        on a transient retry (positional reads, no consumed cursor). Skips the
+        read-after-write page cache that :meth:`_upload` populates — caching
+        would re-materialise the whole body, defeating the bound; later reads
+        re-fetch via Range instead.
+        """
+        size = int(source.size)
+        api_path = self.api_path
+        logger.debug("Streaming volume file %r (%d bytes)", self, size)
+        # Cluster fast path — copy straight to the kernel mount, bounded.
+        if _local_mount_available():
+            parent = os.path.dirname(api_path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            with open(api_path, "wb") as fh:
+                for chunk in source.iter_mv():
+                    fh.write(chunk)
+            self._persist_stat_cache(
+                IOStats(kind=IOKind.FILE, size=size, mtime=time.time())
+            )
+            self._note_streamed_upload(size)
+            return size
+        # Past the single-PUT ceiling, presigned multipart needs the bytes;
+        # materialise only in that (already very large) case.
+        if size >= self.MULTIPART_MIN_SIZE and self._try_multipart_upload(
+            api_path, source.read_bytes()
+        ):
+            pass
+        else:
+            def _do_upload() -> None:
+                resp = self._fs_request(
+                    "PUT", "files", api_path,
+                    params={"overwrite": "true"}, body=source,
+                )
+                self._raise_for_files_status(resp, api_path)
+
+            self._upload_call_ensuring_volume(_do_upload)
+            logger.info("Streamed volume file %r (size=%d)", self, size)
+        self._persist_stat_cache(
+            IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            )
+        )
+        self._note_streamed_upload(size)
         return size
 
     def _clear(self) -> None:

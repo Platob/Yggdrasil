@@ -125,6 +125,11 @@ class S3Path(RemotePath):
     # :meth:`RemotePath.arrow_random_access_file`).
     SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True
 
+    # Arrow/Parquet writes spill the encode to a temp file and stream it to S3
+    # via boto's managed transfer (see :meth:`_upload_stream`), so a multi-GB
+    # write never materialises the encoded payload whole in memory.
+    SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = True
+
     # At / above ``MULTIPART_THRESHOLD`` an upload runs through boto3's
     # managed transfer (``upload_fileobj`` + :class:`TransferConfig`),
     # which splits the object into ``MULTIPART_CHUNKSIZE`` parts uploaded
@@ -134,6 +139,15 @@ class S3Path(RemotePath):
     MULTIPART_THRESHOLD: ClassVar[int] = 100 * 1024 * 1024
     MULTIPART_CHUNKSIZE: ClassVar[int] = 16 * 1024 * 1024
     MULTIPART_CONCURRENCY: ClassVar[int] = 8
+
+    # Directory-listing cache: a repeated ``iterdir`` / ``ls`` of the same
+    # prefix within ``LS_CACHE_TTL`` seconds replays the cached child keys
+    # instead of re-paginating S3. Only listings that fully fit within
+    # ``LS_CACHE_MAX_ENTRIES`` are cached (cheap key strings); a larger prefix
+    # streams uncached so a huge directory never balloons memory. Invalidated
+    # on any mutation under the prefix and on ``invalidate_singleton``.
+    LS_CACHE_TTL: ClassVar[float] = _STAT_CACHE_TTL
+    LS_CACHE_MAX_ENTRIES: ClassVar[int] = 10_000
 
     # ==================================================================
     # Singleton key
@@ -403,7 +417,36 @@ class S3Path(RemotePath):
         *,
         singleton_ttl: Any = False,
     ) -> Iterator["S3Path"]:
-        """List direct (or recursive) children under this prefix."""
+        """List direct (or recursive) children under this prefix.
+
+        Replays a fresh cached listing when one exists; otherwise paginates S3
+        lazily (one page in flight) and caches the child keys — but only while
+        the listing fits ``LS_CACHE_MAX_ENTRIES``, so a huge prefix streams
+        through in bounded memory and is never cached.
+        """
+        cached = self._ls_cache_get(recursive)
+        if cached is not None:
+            for key in cached:
+                yield self._make_child(key, singleton_ttl=singleton_ttl)
+            return
+
+        collected: "list[str] | None" = []   # accumulate for the cache
+        for key in self._iter_listing_keys(recursive):
+            if collected is not None:
+                if len(collected) < self.LS_CACHE_MAX_ENTRIES:
+                    collected.append(key)
+                else:
+                    collected = None   # over the cap → stop caching, keep streaming
+            yield self._make_child(key, singleton_ttl=singleton_ttl)
+        # Only a fully-drained listing within the cap is cached. A consumer that
+        # stops early (e.g. a bounded ``ls(limit=...)``) suspends the generator
+        # here, so a partial listing is never cached as if complete.
+        if collected is not None:
+            self._ls_cache_set(recursive, collected)
+
+    def _iter_listing_keys(self, recursive: bool) -> Iterator[str]:
+        """Yield child key / common-prefix strings under this prefix, one S3
+        ``list_objects_v2`` page at a time (incremental — no full buffer)."""
         prefix = self.key
         if prefix and not prefix.endswith("/"):
             prefix = prefix + "/"
@@ -427,18 +470,47 @@ class S3Path(RemotePath):
             for cp in page.get("CommonPrefixes") or ():
                 sub_prefix = cp.get("Prefix")
                 if sub_prefix:
-                    yield self._make_child(sub_prefix, singleton_ttl=singleton_ttl)
+                    yield sub_prefix
             for obj in page.get("Contents") or ():
                 key = obj.get("Key")
                 if not key:
                     continue
                 if not recursive and key.endswith("/") and obj.get("Size", 0) == 0:
-                    # Listing leaks placeholder objects (zero-byte
-                    # keys ending in '/') under non-recursive mode;
-                    # treat them as directories that will surface as
-                    # CommonPrefixes on a directory walk.
+                    # Listing leaks placeholder objects (zero-byte keys ending
+                    # in '/') under non-recursive mode; treat them as
+                    # directories that surface as CommonPrefixes on a walk.
                     continue
-                yield self._make_child(key, singleton_ttl=singleton_ttl)
+                yield key
+
+    # -- listing cache ------------------------------------------------------
+
+    def _ls_cache_get(self, recursive: bool) -> "list[str] | None":
+        cache = getattr(self, "_ls_cache", None)
+        return cache.get(recursive) if cache is not None else None
+
+    def _ls_cache_set(self, recursive: bool, keys: "list[str]") -> None:
+        cache = getattr(self, "_ls_cache", None)
+        if cache is None:
+            cache = ExpiringDict(default_ttl=self.LS_CACHE_TTL)
+            self._ls_cache = cache
+        cache[recursive] = keys
+
+    def _invalidate_ls_cache(self) -> None:
+        cache = getattr(self, "_ls_cache", None)
+        if cache is not None:
+            cache.clear()
+
+    def _invalidate_parent_ls(self) -> None:
+        """A write/delete under this key stales the parent prefix's listing."""
+        parent = self.parent
+        if parent is not None and parent is not self:
+            invalidate = getattr(parent, "_invalidate_ls_cache", None)
+            if callable(invalidate):
+                invalidate()
+
+    def invalidate_singleton(self, remove_global: bool = True) -> None:
+        self._invalidate_ls_cache()
+        super().invalidate_singleton(remove_global=remove_global)
 
     def _make_child(self, key: str, *, singleton_ttl: Any = False) -> "S3Path":
         # Skip the ``URL.from_(f"s3://...")`` parse — the bucket/host /
@@ -482,6 +554,7 @@ class S3Path(RemotePath):
             return
         LOGGER.info("Deleted S3 object %r", self)
         self.invalidate_singleton()
+        self._invalidate_parent_ls()
 
     def _remove_dir(
         self,
@@ -517,6 +590,7 @@ class S3Path(RemotePath):
                 raise
             LOGGER.info("Deleted S3 prefix placeholder %r", self)
             self.invalidate_singleton()
+            self._invalidate_parent_ls()
             return
 
         prefix = self.key
@@ -551,6 +625,7 @@ class S3Path(RemotePath):
             raise
         LOGGER.info("Deleted S3 prefix %r (objects=%d)", self, deleted)
         self.invalidate_singleton()
+        self._invalidate_parent_ls()
 
     def _delete_batch(self, batch: list[dict]) -> None:
         if not batch:
@@ -723,6 +798,47 @@ class S3Path(RemotePath):
             )
         )
         self._cache_after_upload(bytes(content), size)
+        self._invalidate_parent_ls()
+        return size
+
+    def _upload_stream(self, source: "Any") -> int:
+        """Stream *source* (a local spill file) to S3 without materialising it.
+
+        The Arrow/Parquet write path spills the encode to a temp file and hands
+        it here; ``upload_fileobj`` reads that file in bounded chunks (managed
+        multipart past ``MULTIPART_THRESHOLD``), so peak memory is one
+        chunk × concurrency rather than the whole object. Falls back to the
+        materialising :meth:`_upload` if the source isn't a local file. Skips
+        the read-after-write page cache (it would re-materialise the body);
+        later reads re-fetch via ranged GET.
+        """
+        os_path = getattr(source, "os_path", None) if getattr(source, "is_local_path", False) else None
+        if os_path is None:
+            return self._upload(source.read_bytes())
+
+        from boto3.s3.transfer import TransferConfig
+
+        size = int(source.size)
+        config = TransferConfig(
+            multipart_threshold=self.MULTIPART_THRESHOLD,
+            multipart_chunksize=self.MULTIPART_CHUNKSIZE,
+            max_concurrency=self.MULTIPART_CONCURRENCY,
+            use_threads=True,
+        )
+        LOGGER.debug("Streaming S3 object %r from %s (bytes=%d)", self, os_path, size)
+        with open(os_path, "rb") as fh:
+            self._call(self.client.upload_fileobj, fh, self.bucket, self.key, Config=config)
+        LOGGER.info("Streamed S3 object %r (bytes=%d)", self, size)
+        self._persist_stat_cache(
+            IOStats(
+                size=size,
+                kind=IOKind.FILE,
+                mtime=time.time(),
+                media_type=self.media_type,
+            )
+        )
+        self._note_streamed_upload(size)
+        self._invalidate_parent_ls()
         return size
 
     def reserve(self, n: int) -> None:

@@ -326,6 +326,11 @@ class _ArrowOutputStreamContext:
         # nothing left to commit on exit; ``False`` when the sink is
         # an in-memory buffer that still needs a commit.
         self._direct: bool = False
+        # Set to a temp path when the sink spills the encode to disk for a
+        # holder that streams its upload (e.g. a Databricks VolumePath): the
+        # encoded payload never lives whole in memory — it's written to this
+        # file and then streamed to the backend on exit.
+        self._stream_spill: "pathlib.Path | None" = None
 
     def __enter__(self) -> "pa.NativeFile":
         parent = self._parent
@@ -360,6 +365,22 @@ class _ArrowOutputStreamContext:
                         # mismatch) shouldn't break the write.
                         self._sink = None
                         self._direct = False
+            # Remote holder that streams its upload (VolumePath): spill the
+            # encode to a temp file so the payload never materialises whole in
+            # memory, then stream it to the backend on exit. Gated on an
+            # explicit opt-in so every other remote backend (S3 via boto,
+            # Workspace via the SDK) keeps the unchanged in-memory commit.
+            if holder is not None and getattr(holder, "SUPPORTS_STREAMING_UPLOAD", False):
+                try:
+                    spill = _mint_spill_path("arrowup", 3600)
+                    self._sink = pa.OSFile(str(spill), "wb")
+                    self._stream_spill = spill
+                    self._direct = False
+                    return self._sink
+                except Exception:
+                    self._sink = None
+                    self._stream_spill = None
+                    self._direct = False
         self._sink = pa.BufferOutputStream()
         self._direct = False
         return self._sink
@@ -369,6 +390,8 @@ class _ArrowOutputStreamContext:
         self._sink = None
         direct = self._direct
         self._direct = False
+        spill = self._stream_spill
+        self._stream_spill = None
         if sink is None:
             return
         if exc_type is not None:
@@ -376,6 +399,25 @@ class _ArrowOutputStreamContext:
                 sink.close()
             except Exception:
                 pass
+            if spill is not None:
+                spill.unlink(missing_ok=True)
+            return
+        if spill is not None:
+            # Encode landed on disk — stream the spill file to the backend
+            # (the holder's streaming upload reads it in bounded chunks), then
+            # drop the temp file. Memory peaks at one chunk, not the payload.
+            try:
+                sink.close()
+            except Exception:
+                pass
+            try:
+                from yggdrasil.path.local_path import LocalPath
+
+                self._parent._commit_format_source(
+                    LocalPath.from_(str(spill)), append=self._append,
+                )
+            finally:
+                spill.unlink(missing_ok=True)
             return
         if direct:
             # Bytes already on disk — just close the file handle and

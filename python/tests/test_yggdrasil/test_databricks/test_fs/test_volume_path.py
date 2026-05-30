@@ -1995,3 +1995,220 @@ class TestUCNavigation:
         p = VolumePath("/Volumes", service=service)
         with pytest.raises(ValueError, match="/Volumes/<cat>/<sch>/<vol>"):
             _ = p.schema
+
+
+class TestStreamingUpload:
+    """Arrow/Parquet writes to a VolumePath spill the encode to a temp file
+    and stream it to the Files API in bounded memory (``_upload_stream``),
+    never materialising the whole payload through ``_upload``."""
+
+    def _roundtrip_store(self, workspace) -> dict:
+        store: dict = {}
+
+        def upload(*, file_path, contents, overwrite):
+            store["buf"] = contents.read() if hasattr(contents, "read") else bytes(contents)
+
+        def download(path):
+            buf = store.get("buf")
+            if buf is None:
+                raise NotFound(path)
+            return SimpleNamespace(
+                contents=SimpleNamespace(read=lambda: buf),
+                content_type=None,
+                last_modified=None,
+            )
+
+        def get_metadata(path):
+            buf = store.get("buf")
+            if buf is None:
+                raise NotFound(path)
+            return SimpleNamespace(content_length=len(buf), content_type=None, last_modified=None)
+
+        workspace.files.upload.side_effect = upload
+        workspace.files.download.side_effect = download
+        workspace.files.get_metadata.side_effect = get_metadata
+        return store
+
+    def test_parquet_write_streams_from_a_spill_file_and_roundtrips(
+        self, workspace, client, service, monkeypatch
+    ):
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.path.local_path import LocalPath
+
+        self._roundtrip_store(workspace)
+        p = VolumePath("/Volumes/c/s/v/t.parquet", service=service)
+
+        seen = {"stream": 0, "materialize": 0, "source_type": None, "source_size": 0}
+        real_stream = VolumePath._upload_stream
+        real_upload = VolumePath._upload
+
+        def spy_stream(self, source):
+            seen["stream"] += 1
+            # Capture during the call — the spill file is unlinked afterwards.
+            seen["source_type"] = type(source)
+            seen["source_size"] = int(source.size)
+            return real_stream(self, source)
+
+        def spy_upload(self, content):
+            seen["materialize"] += 1
+            return real_upload(self, content)
+
+        monkeypatch.setattr(VolumePath, "_upload_stream", spy_stream)
+        monkeypatch.setattr(VolumePath, "_upload", spy_upload)
+
+        table = pa.table({"id": pa.array(list(range(1000)), type=pa.int64())})
+        ParquetFile(holder=p).write_arrow_table(table)
+
+        # Streamed, not materialised; and the source was a real on-disk spill
+        # file (a LocalPath), proving the encode never lived whole in memory.
+        assert seen["stream"] == 1
+        assert seen["materialize"] == 0
+        assert seen["source_type"] is LocalPath
+        assert seen["source_size"] > 0
+
+        # And it round-trips byte-correct through the Files API.
+        got = ParquetFile(holder=p).read_arrow_table()
+        assert got.column("id").to_pylist() == list(range(1000))
+
+
+class TestStreamingUploadWire:
+    """End-to-end: a Parquet write to a VolumePath spills the encode to disk
+    and streams it to the Files API over a *real* HTTPSession. When the PUT is
+    cut mid-body, the session retries on a fresh connection and re-streams the
+    spill file from byte 0 — so the workspace receives the complete object.
+    """
+
+    def test_parquet_put_interrupted_midsend_retries_and_delivers_full(
+        self, monkeypatch
+    ):
+        import http.server
+        import io as _io
+        import socket
+        import struct
+        import threading
+        from socketserver import ThreadingMixIn
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from yggdrasil.databricks.volume.volumes import Volumes
+        from yggdrasil.http_ import HTTPSession
+        from yggdrasil.http_ import retry as _retry
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        monkeypatch.setattr(_retry.time, "sleep", lambda *a, **k: None)
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            conns = 0
+            interrupt_first = 1
+            received = None
+
+            def setup(self):
+                super().setup()
+                type(self).conns += 1
+                self._interrupt = type(self).conns <= type(self).interrupt_first
+
+            def do_PUT(self):
+                length = int(self.headers.get("Content-Length", 0))
+                if self._interrupt:
+                    try:
+                        self.rfile.read(min(4096, length))  # consume a little, then RST
+                    except Exception:
+                        pass
+                    self.close_connection = True
+                    self.connection.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    for f in (self.rfile, self.wfile):
+                        try:
+                            f.close()
+                        except Exception:
+                            pass
+                    self.connection.close()
+                    return
+                type(self).received = self.rfile.read(length)
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        class _Server(ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+            def handle_error(self, request, client_address):
+                pass  # the abortive close is expected
+
+        srv = _Server(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        HTTPSession._INSTANCES.clear()
+        client = MagicMock()
+        client.base_url = URL.from_(base)
+        client.files_authorization.return_value = "Bearer t"
+        client.files_session.return_value = HTTPSession(base_url=base)
+        svc = MagicMock(spec=Volumes)
+        svc.client = client
+
+        # A few MiB so the PUT body spans many writes and the cut lands mid-send.
+        table = pa.table({"id": pa.array(list(range(120_000)), type=pa.int64())})
+        try:
+            p = VolumePath("/Volumes/c/s/v/big.parquet", service=svc)
+            ParquetFile(holder=p).write_arrow_table(table)
+        finally:
+            srv.shutdown()
+            HTTPSession._INSTANCES.clear()
+
+        assert _Handler.conns == 2                  # interrupted once, retried on a fresh socket
+        assert _Handler.received is not None
+        got = pq.read_table(_io.BytesIO(_Handler.received))
+        assert got.equals(table)                    # full, valid Parquet delivered
+
+
+class TestUploadVolumeRecovery:
+    """A transport-level upload failure (SSLEOFError → MaxRetryError) — what the
+    Files edge returns when the target volume doesn't exist — must trigger an
+    idempotent ``Volume.create`` and one retry, since the NotFound-based parent
+    recovery never sees a TLS-close error."""
+
+    def test_transport_error_ensures_volume_then_retries(self, service, monkeypatch):
+        from yggdrasil.http_.exceptions import MaxRetryError
+
+        state = {"attempts": 0, "ensure": 0}
+
+        def do_upload():
+            state["attempts"] += 1
+            if state["ensure"] == 0:  # edge keeps closing until the volume exists
+                raise MaxRetryError(
+                    None, "https://h/api/2.0/fs/files/x.bin",
+                    Exception("EOF occurred in violation of protocol"),
+                )
+
+        monkeypatch.setattr(
+            VolumePath, "_ensure_volume",
+            lambda self: state.__setitem__("ensure", state["ensure"] + 1) or True,
+        )
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
+        p._upload_call_ensuring_volume(do_upload)
+
+        assert state["ensure"] == 1          # volume ensured on the transport error
+        assert state["attempts"] >= 2        # failed pre-ensure, succeeded after
+
+    def test_non_transport_error_does_not_create_volume(self, service, monkeypatch):
+        # A logic / permission error is not a missing volume — don't create it.
+        state = {"ensure": 0}
+        monkeypatch.setattr(
+            VolumePath, "_ensure_volume",
+            lambda self: state.__setitem__("ensure", state["ensure"] + 1),
+        )
+
+        def do_upload():
+            raise ValueError("deterministic failure, not a transport drop")
+
+        p = VolumePath("/Volumes/c/s/v/y.bin", service=service)
+        with pytest.raises(ValueError):
+            p._upload_call_ensuring_volume(do_upload)
+        assert state["ensure"] == 0

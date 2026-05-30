@@ -13,7 +13,7 @@ the HTTP machinery lives on this class:
 
 Wire calls go straight to :mod:`http.client` — no intermediate transport
 class wraps the send. The supporting types (:class:`Retry`,
-:class:`Timeout`, :class:`HTTPResponse`, :class:`HTTPHeaderDict`,
+:class:`Timeout`, :class:`HTTPResponse`, :class:`HTTPHeaders`,
 :mod:`exceptions`) live in the small side modules (:mod:`yggdrasil.http_.retry`,
 :mod:`yggdrasil.http_.timeout`, :mod:`yggdrasil.http_.exceptions`,
 :mod:`yggdrasil.http_.headers`); feature code
@@ -93,7 +93,7 @@ from yggdrasil.http_.cache_config import CacheConfig
 from yggdrasil.http_.send_config import DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.url import URL
 
-from .user_agents import random_user_agent
+from .user_agents import random_browser_profile
 from .exceptions import (
     InsecureRequestWarning,
     LocationParseError,
@@ -663,9 +663,9 @@ def _format_cookie_header(cookies: Any) -> str:
 # time to clear; both schedules are tight (we'd rather surface an error
 # fast than mask a real outage with a minute-long retry storm).
 # Server-supplied Retry-After always wins over these when present.
-_RETRY_TOTAL = 4
-_RETRY_CONNECT = 3
-_RETRY_READ = 3
+_RETRY_TOTAL = 8
+_RETRY_CONNECT = 5
+_RETRY_READ = 5
 
 # 5xx schedule: 0.5, 1, 2 (capped at backoff_max). Worst-case ~3.5s.
 _BACKOFF_5XX_FACTOR = 0.5
@@ -874,7 +874,11 @@ class HTTPSession(Session):
             connect=_RETRY_CONNECT,
             read=_RETRY_READ,
             status=_RETRY_TOTAL,
-            other=4,
+            # SSL EOF / connection-reset on send is classed as an "other" error
+            # by Retry.increment — keep its budget at the full total so a flaky
+            # peer (e.g. Databricks Files dropping the TLS socket mid-upload)
+            # gets every retry, each on a fresh connection, before we give up.
+            other=_RETRY_TOTAL,
             status_forcelist=_RETRY_STATUSES,
             allowed_methods=None,  # retry every method, incl. POST/PATCH
             respect_retry_after_header=True,
@@ -955,6 +959,7 @@ class HTTPSession(Session):
                     )
                     self._mark_proxy_dead(proxy)
 
+            LOGGER.debug("Opening direct HTTPS connection to %s:%s", host, port)
             return http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
             )
@@ -969,6 +974,10 @@ class HTTPSession(Session):
                 )
                 conn.connect()
                 conn._ygg_proxy = True  # type: ignore[attr-defined]
+                LOGGER.debug(
+                    "Routing HTTP %s:%s through proxy %s:%s",
+                    host, port, proxy_host, proxy_port,
+                )
                 return conn
             except OSError as exc:
                 LOGGER.warning(
@@ -977,6 +986,7 @@ class HTTPSession(Session):
                 )
                 self._mark_proxy_dead(proxy)
 
+        LOGGER.debug("Opening direct HTTP connection to %s:%s", host, port)
         return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
 
     def _build_connect_tunnel(
@@ -1042,6 +1052,10 @@ class HTTPSession(Session):
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
             )
             conn.sock = tls_sock
+            LOGGER.debug(
+                "CONNECT tunnel established to %s:%s via proxy %s:%s",
+                host, port, proxy_host, proxy_port,
+            )
             return conn
         except Exception:
             try:
@@ -1109,6 +1123,29 @@ class HTTPSession(Session):
         else:
             try:
                 conn.close()
+            except Exception:
+                pass
+
+    def _evict_host(self, url: "URL") -> None:
+        """Close and drop every idle socket cached for ``url``'s host.
+
+        Called before a connection-level retry: once a peer has dropped a
+        socket mid-send (stale keep-alive, TLS EOF, reset), its sibling pooled
+        sockets are just as suspect, so the next :meth:`_get_connection` must
+        dial fresh rather than hand back another about-to-fail socket.
+        """
+        scheme = url.scheme
+        port = url.port or (443 if scheme == "https" else 80)
+        queue = self._connections.pop((scheme, url.host, port), None)
+        if not queue:
+            return
+        LOGGER.debug(
+            "Evicting %d idle connection(s) for %s://%s:%s before retry",
+            len(queue), scheme, url.host, port,
+        )
+        while queue:
+            try:
+                queue.popleft().close()
             except Exception:
                 pass
 
@@ -1207,6 +1244,11 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
+                LOGGER.warning(
+                    "Read timeout on %s %s — retrying on a fresh socket (%s left): %s",
+                    current_request.method, url_str, retries.total, exc,
+                )
+                self._evict_host(current_request.url)  # retry on a fresh socket
                 retries.sleep()
                 continue
             except ssl.SSLError as exc:
@@ -1219,6 +1261,11 @@ class HTTPSession(Session):
                         method=current_request.method, url=url_str,
                         error=wrapped, _pool=self,
                     )
+                    LOGGER.warning(
+                        "TLS EOF/reset on %s %s — retrying on a fresh socket (%s left): %s",
+                        current_request.method, url_str, retries.total, msg,
+                    )
+                    self._evict_host(current_request.url)  # retry on a fresh socket
                     retries.sleep()
                     continue
                 if "CERTIFICATE_VERIFY_FAILED" in msg and self.verify is not False:
@@ -1243,6 +1290,11 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
+                LOGGER.warning(
+                    "Connection error on %s %s — retrying on a fresh socket (%s left): %s",
+                    current_request.method, url_str, retries.total, exc,
+                )
+                self._evict_host(current_request.url)  # retry on a fresh socket
                 retries.sleep()
                 continue
 
@@ -1251,6 +1303,11 @@ class HTTPSession(Session):
             if redirect and response.status in self._REDIRECT_STATUSES:
                 location = response.headers.get("Location")
                 if location and visited_redirects < self._MAX_REDIRECTS:
+                    LOGGER.debug(
+                        "Following %d redirect: %s %s -> %s",
+                        response.status, current_request.method,
+                        current_request.url, location,
+                    )
                     response.drain_conn()
                     response.release_conn()
                     visited_redirects += 1
@@ -1282,16 +1339,32 @@ class HTTPSession(Session):
                         response=response, _pool=self,
                     )
                 except MaxRetryError:
+                    LOGGER.error(
+                        "Exhausted retries for %s %s (last status %d)",
+                        current_request.method, current_request.url, response.status,
+                    )
                     if retries.raise_on_status:
                         raise
                     return response
+                LOGGER.warning(
+                    "Retryable %d on %s %s — retrying (%s left)",
+                    response.status, current_request.method,
+                    current_request.url, next_retries.total,
+                )
                 response.drain_conn()
                 response.release_conn()
                 next_retries.sleep(response=response)
                 retries = next_retries
                 if response.status == 429:
+                    # Rate limited: retry on a fresh connection (new source
+                    # port / TLS session) with a rotated browser identity, so a
+                    # per-connection or fingerprint-keyed limiter sees a clean,
+                    # internally-consistent client rather than the just-throttled
+                    # pooled socket. Only the who-am-I headers rotate —
+                    # content negotiation (Accept/Accept-Encoding) is preserved.
+                    self._evict_host(current_request.url)
                     rotated_headers = HTTPHeaders(current_request.headers)
-                    rotated_headers["User-Agent"] = random_user_agent()
+                    rotated_headers.update(random_browser_profile().identity)
                     current_request = current_request.copy(headers=rotated_headers)
                 continue
 
@@ -1370,15 +1443,18 @@ class HTTPSession(Session):
                 proxy = self._resolve_proxy_for(scheme, host)
                 if proxy:
                     send_headers.update(self._proxy_auth_headers(proxy))
-            # Zero-copy body: hand http.client a memoryview into the
-            # buffer rather than ``to_bytes()`` (which copies the whole
-            # body). ``sock.sendall`` accepts a memoryview, so a large
-            # PUT — or each multipart part — no longer doubles in memory
-            # on the way to the wire. Re-read per attempt so retries on a
-            # fresh socket still send the full body.
-            body = request.buffer.read_mv(-1, 0) if request.buffer is not None else None
-            if body is not None and "Content-Length" not in send_headers:
-                send_headers["Content-Length"] = str(len(body))
+            # Stream the body off the buffer in bounded zero-copy chunks
+            # (``iter_mv``) rather than materialising it whole with
+            # ``read_mv(-1, 0)``: a large or spilled/file-backed PUT uploads in
+            # ~one-chunk memory, and ``sock.sendall`` writes each memoryview
+            # without a copy. ``iter_mv`` reads positionally, so a fresh
+            # iterator per attempt re-sends the full body on a stale-socket
+            # retry. ``Content-Length`` frames it (no chunked encoding).
+            body = None
+            if request.buffer is not None:
+                if "Content-Length" not in send_headers:
+                    send_headers["Content-Length"] = str(request.buffer.size)
+                body = request.buffer.iter_mv()
             conn.request(request.method, request_path, body=body, headers=send_headers)
             raw = conn.getresponse()
         except socket.timeout as exc:

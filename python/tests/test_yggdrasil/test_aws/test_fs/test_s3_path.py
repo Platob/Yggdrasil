@@ -328,13 +328,14 @@ class TestOverwrite:
         assert p.size == 5
         client.head_object.assert_not_called()
 
-    def test_parquetfile_write_arrow_table_uses_write_all(
+    def test_parquetfile_write_arrow_table_streams_one_upload(
         self,
         client,
         service,
     ) -> None:
-        """ParquetFile(holder=S3Path).write_arrow_table() routes through
-        write_all: 1 put_object, 0 get_object for the write itself."""
+        """ParquetFile(holder=S3Path).write_arrow_table() spills the encode and
+        streams it: 1 upload_fileobj, 0 put_object, 0 get_object for the write
+        itself (no read-modify-write)."""
         import pyarrow as pa
         from yggdrasil.io.primitive.parquet_file import ParquetFile
 
@@ -353,20 +354,20 @@ class TestOverwrite:
         pf = ParquetFile(holder=p, owns_holder=False)
         pf.write_arrow_table(table)
 
-        assert client.put_object.call_count == 1
+        assert client.upload_fileobj.call_count == 1
+        assert client.put_object.call_count == 0
         assert client.get_object.call_count == 0
 
-    def test_parquetfile_write_single_put_object(
+    def test_parquetfile_write_single_streamed_upload(
         self,
         client,
         service,
     ) -> None:
-        """write_arrow_table issues exactly 1 put_object.
+        """write_arrow_table issues exactly 1 streamed upload, no read-modify-write.
 
-        Before: _commit_format_payload did seek(0) + truncate(0) +
-        write_bytes — on S3Path that's head_object (size) + get_object
-        (truncate) + put_object (truncate) + put_object (write).
-        After: 1 put_object, 0 get_object.
+        The encode spills to a temp file and streams via upload_fileobj — so
+        no head_object/get_object/put_object round-trips for the write: just
+        one upload_fileobj.
         """
         import pyarrow as pa
         from yggdrasil.io.primitive.parquet_file import ParquetFile
@@ -381,7 +382,8 @@ class TestOverwrite:
         pf = ParquetFile(holder=p, owns_holder=False)
         pf.write_arrow_table(table)
 
-        assert client.put_object.call_count == 1
+        assert client.upload_fileobj.call_count == 1
+        assert client.put_object.call_count == 0
         assert client.get_object.call_count == 0
 
 
@@ -726,3 +728,242 @@ class TestArrowFilesystem:
         p = real_service.path("s3://b/k")
         fs = p.arrow_filesystem()
         assert isinstance(fs, pafs.S3FileSystem)
+
+
+# ---------------------------------------------------------------------------
+# iter_mv — body streaming over a RemotePath (S3) reads via bounded Range GETs
+# ---------------------------------------------------------------------------
+
+
+class TestIterMvRangeStreaming:
+    """``Holder.iter_mv`` (used by the HTTP send path to stream a request body)
+    over an S3Path must read the object in bounded, sequential ``Range``
+    ``GetObject`` calls — never one whole-object fetch — and reassemble exactly.
+    This is the access pattern a remote file used as a request body produces on
+    the wire; it's also replayable, since reads are positional.
+    """
+
+    def _backed_client(self, client, blob: bytes):
+        client.head_object.return_value = {"ContentLength": len(blob), "LastModified": None}
+        ranges: list[str | None] = []
+
+        def _get(**kw):
+            rng = kw.get("Range")
+            ranges.append(rng)
+            if rng is None:
+                return {"Body": _Body(blob)}
+            spec = rng[len("bytes="):]
+            lo, _, hi = spec.partition("-")
+            a = int(lo)
+            b = int(hi) + 1 if hi else len(blob)
+            return {"Body": _Body(blob[a:b])}
+
+        client.get_object.side_effect = _get
+        return ranges
+
+    def test_iter_mv_reassembles_via_bounded_range_gets(self, client, service):
+        blob = bytes((i * 7) % 256 for i in range(300_000))
+        ranges = self._backed_client(client, blob)
+        # Small pages force several Range GETs across the object.
+        p = S3Path("s3://b/k", service=service, page_size=64 * 1024)
+        out = b"".join(bytes(c) for c in p.iter_mv(64 * 1024))
+        assert out == blob                          # exact reassembly
+        assert len(ranges) >= 2                      # multiple bounded reads
+        assert all(r and r.startswith("bytes=") for r in ranges)  # never a whole-object GET
+
+    def test_iter_mv_is_replayable_over_s3(self, client, service):
+        # Positional reads → a retry can stream the same body again.
+        blob = bytes((i * 11) % 256 for i in range(120_000))
+        self._backed_client(client, blob)
+        p = S3Path("s3://b/k", service=service, page_size=32 * 1024)
+        once = b"".join(bytes(c) for c in p.iter_mv(32 * 1024))
+        twice = b"".join(bytes(c) for c in p.iter_mv(32 * 1024))
+        assert once == twice == blob
+
+
+class TestS3StreamingUpload:
+    """``_upload_stream`` hands boto's managed transfer the spill file directly
+    (``upload_fileobj``), so an Arrow/Parquet write never materialises the
+    encoded payload — peak memory is one chunk × concurrency, not the object."""
+
+    def test_streams_spill_file_via_upload_fileobj(self, client, service, tmp_path):
+        from yggdrasil.path.local_path import LocalPath
+
+        data = bytes((i * 9) % 256 for i in range(300_000))
+        spill = tmp_path / "spill.bin"
+        spill.write_bytes(data)
+
+        sent: dict = {}
+
+        def _upload_fileobj(fileobj, bucket, key, Config=None):
+            sent["bucket"] = bucket
+            sent["key"] = key
+            sent["data"] = fileobj.read()  # boto streams the file handle
+
+        client.upload_fileobj.side_effect = _upload_fileobj
+
+        p = S3Path("s3://b/k.parquet", service=service)
+        n = p._upload_stream(LocalPath.from_(str(spill)))
+
+        assert n == len(data)
+        assert (sent["bucket"], sent["key"]) == ("b", "k.parquet")
+        assert sent["data"] == data            # the file content reached S3
+        client.put_object.assert_not_called()  # streamed, never buffered as a PUT body
+
+    def test_non_local_source_falls_back_to_materialised_put(self, client, service):
+        from yggdrasil.path.memory import Memory
+
+        client.head_object.side_effect = _client_error()
+        p = S3Path("s3://b/m.bin", service=service)
+        p._upload_stream(Memory(binary=b"in-memory-bytes"))
+        # No local file → materialise via _upload (small → put_object).
+        client.put_object.assert_called_once()
+        assert client.put_object.call_args.kwargs["Body"] == b"in-memory-bytes"
+
+
+class TestS3StreamingRoundTrip:
+    """End-to-end: a Parquet write to S3 streams via upload_fileobj and reads
+    back byte-correct through a store-backed mock boto client (data integrity,
+    not just call shape). Plus read-after-write size on the same instance."""
+
+    def _store_backed(self, client):
+        store: dict = {}
+
+        def _upload_fileobj(fileobj, bucket, key, Config=None):
+            store[(bucket, key)] = fileobj.read()
+
+        def _head(Bucket, Key):
+            blob = store.get((Bucket, Key))
+            if blob is None:
+                raise _client_error()
+            return {"ContentLength": len(blob), "LastModified": None}
+
+        def _get(**kw):
+            blob = store.get((kw["Bucket"], kw["Key"]))
+            if blob is None:
+                raise _client_error()
+            rng = kw.get("Range")
+            if rng and rng.startswith("bytes="):
+                lo, _, hi = rng[len("bytes="):].partition("-")
+                a = int(lo) if lo.strip() else 0
+                b = int(hi) + 1 if hi.strip() else len(blob)
+                return {"Body": _Body(blob[a:b])}
+            return {"Body": _Body(blob)}
+
+        client.upload_fileobj.side_effect = _upload_fileobj
+        client.head_object.side_effect = _head
+        client.get_object.side_effect = _get
+        client.list_objects_v2.return_value = {"KeyCount": 0}
+        return store
+
+    def test_parquet_streams_then_reads_back(self, client, service):
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        store = self._store_backed(client)
+        rows = 2000
+        table = pa.table({
+            "id": pa.array(range(rows), type=pa.int64()),
+            "v": pa.array(range(0, rows * 2, 2), type=pa.int64()),
+        })
+        p = S3Path("s3://b/data.parquet", service=service)
+        ParquetFile(holder=p, owns_holder=False).write_arrow_table(table)
+
+        assert ("b", "data.parquet") in store     # streamed via upload_fileobj
+        client.put_object.assert_not_called()       # never buffered as a PUT body
+
+        # Cold read on a fresh instance → reassembles the table exactly.
+        p.invalidate_singleton()
+        back = ParquetFile(
+            holder=S3Path("s3://b/data.parquet", service=service)
+        ).read_arrow_table()
+        assert back.num_rows == rows
+        assert back.column("v").to_pylist()[:3] == [0, 2, 4]
+
+    def test_read_after_write_sees_committed_size(self, client, service):
+        # _upload_stream must make the committed size authoritative
+        # (_note_streamed_upload) — otherwise a follow-up size/read on the same
+        # instance sees buffered_size 0 and thinks the object is empty.
+        from yggdrasil.path.local_path import LocalPath
+        import tempfile, os as _os
+
+        store = self._store_backed(client)
+        data = bytes((i * 3) % 256 for i in range(123456))
+        tmp = _os.path.join(tempfile.mkdtemp(), "spill.bin")
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+
+        p = S3Path("s3://b/obj.bin", service=service)
+        p._upload_stream(LocalPath.from_(tmp))
+        assert ("b", "obj.bin") in store
+        assert p.size == len(data)                 # not 0 on the same instance
+
+
+class TestS3ListCaching:
+    """``iterdir`` / ``ls`` cache the child keys (TTL'd) so a repeat doesn't
+    re-paginate, stay incremental + bounded (``limit``), and never cache a
+    listing larger than ``LS_CACHE_MAX_ENTRIES`` (no OOM on huge prefixes)."""
+
+    def _wire_pages(self, client, pages):
+        paginator = MagicMock()
+        paginator.paginate.side_effect = lambda **kw: iter(pages)  # fresh iter per call
+        client.get_paginator.return_value = paginator
+        return paginator
+
+    def test_repeated_ls_replays_cache(self, client, service):
+        pages = [{
+            "CommonPrefixes": [{"Prefix": "d/sub/"}],
+            "Contents": [{"Key": "d/a.bin", "Size": 5}, {"Key": "d/b.bin", "Size": 5}],
+        }]
+        pag = self._wire_pages(client, pages)
+        p = S3Path("s3://b/d", service=service)
+
+        first = [c.key for c in p.iterdir()]
+        second = [c.key for c in p.iterdir()]
+        assert set(first) == {"d/sub/", "d/a.bin", "d/b.bin"}
+        assert second == first
+        assert pag.paginate.call_count == 1   # second served from cache
+
+    def test_invalidate_singleton_clears_listing_cache(self, client, service):
+        pag = self._wire_pages(client, [{"Contents": [{"Key": "d/a.bin", "Size": 1}]}])
+        p = S3Path("s3://b/d", service=service)
+        list(p.iterdir())
+        list(p.iterdir())
+        assert pag.paginate.call_count == 1   # cached
+        p.invalidate_singleton()
+        list(p.iterdir())
+        assert pag.paginate.call_count == 2   # re-paginated after invalidation
+
+    def test_limit_is_bounded_and_not_cached(self, client, service):
+        pages = [{"Contents": [{"Key": f"d/{i}.bin", "Size": 1} for i in range(50)]}]
+        pag = self._wire_pages(client, pages)
+        p = S3Path("s3://b/d", service=service)
+
+        got = list(p.iterdir(limit=5))
+        assert len(got) == 5
+        # A bounded listing isn't cached as complete → next full ls re-paginates.
+        full = list(p.iterdir())
+        assert len(full) == 50
+        assert pag.paginate.call_count == 2
+
+    def test_listing_over_cap_is_streamed_not_cached(self, client, service, monkeypatch):
+        monkeypatch.setattr(S3Path, "LS_CACHE_MAX_ENTRIES", 10)
+        pages = [{"Contents": [{"Key": f"d/{i}.bin", "Size": 1} for i in range(50)]}]
+        pag = self._wire_pages(client, pages)
+        p = S3Path("s3://b/d", service=service)
+
+        assert len(list(p.iterdir())) == 50   # all yielded (streamed past the cap)
+        assert len(list(p.iterdir())) == 50   # over cap → never cached → re-paginate
+        assert pag.paginate.call_count == 2
+
+    def test_write_under_prefix_invalidates_parent_listing(self, client, service):
+        pag = self._wire_pages(client, [{"Contents": [{"Key": "d/a.bin", "Size": 1}]}])
+        parent = S3Path("s3://b/d", service=service)
+        list(parent.iterdir())
+        assert pag.paginate.call_count == 1
+
+        child = parent / "new.bin"
+        assert child.parent is parent          # shared singleton → shared cache
+        child._upload(b"x")                    # put_object + parent-listing invalidation
+        list(parent.iterdir())
+        assert pag.paginate.call_count == 2    # parent listing refreshed

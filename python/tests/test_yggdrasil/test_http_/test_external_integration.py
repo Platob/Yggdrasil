@@ -281,3 +281,63 @@ class TestRedirects:
         resp = session.get("/")
         assert resp.status_code == 200
         assert "example" in resp.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Browser-profile smoke test — a real server sees a coherent browser
+# ---------------------------------------------------------------------------
+
+
+class TestBrowserProfileLive:
+    """Send a generated browser profile to live endpoints and confirm the
+    server receives a coherent, browser-shaped request (matching UA + client
+    hints), and that a real CDN accepts it. Header-only compatibility — no TLS
+    fingerprint spoofing."""
+
+    @staticmethod
+    def _echoed(resp):
+        # httpbin echoes request headers; normalise names for comparison.
+        return {k.lower(): v for k, v in resp.json()["headers"].items()}
+
+    def test_profile_headers_reach_the_server(self):
+        from yggdrasil.http_.user_agents import random_browser_profile
+
+        prof = random_browser_profile(seed=1234)
+        session = HTTPSession()
+        try:
+            resp = session.get("https://httpbin.org/headers", headers=prof.headers)
+        except Exception as exc:  # noqa: BLE001 — flaky public service
+            pytest.skip(f"httpbin.org unreachable: {exc}")
+        if resp.status_code != 200:
+            pytest.skip(f"httpbin.org returned {resp.status_code}")
+
+        echoed = self._echoed(resp)
+        # The identity headers reach the server verbatim — it sees a consistent
+        # browser (matching UA + client hints + Sec-Fetch + language). ``Accept``
+        # is library-owned content negotiation (HTTPHeaders.normalized collapses
+        # it to a single media type), so it's intentionally outside the rotating
+        # identity and not asserted here.
+        for key, value in prof.identity.items():
+            assert echoed.get(key.lower()) == value, key
+
+    def test_user_agent_endpoint_sees_the_profile_ua(self):
+        from yggdrasil.http_.user_agents import random_browser_profile
+
+        prof = random_browser_profile(seed=99)
+        session = HTTPSession()
+        try:
+            resp = session.get("https://httpbin.org/user-agent", headers=prof.headers)
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"httpbin.org unreachable: {exc}")
+        if resp.status_code != 200:
+            pytest.skip(f"httpbin.org returned {resp.status_code}")
+        assert resp.json()["user-agent"] == prof.user_agent
+
+    def test_real_cdn_accepts_browser_profile(self):
+        from yggdrasil.http_.user_agents import random_browser_profile
+
+        prof = random_browser_profile(seed=7)
+        session = HTTPSession(base_url="https://example.com")
+        resp = session.get("/", headers=prof.headers)
+        assert resp.status_code == 200
+        assert "example domain" in resp.text.lower()

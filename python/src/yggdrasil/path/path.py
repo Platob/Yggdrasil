@@ -342,16 +342,31 @@ class Path(IO, os.PathLike, ABC):
         self._stat_cached_at = 0.0
         super().invalidate_singleton(remove_global=remove_global)
 
-    def iterdir(self, *, singleton_ttl: Any = False) -> Iterator["Path"]:
-        yield from self._ls(recursive=False, singleton_ttl=singleton_ttl)
+    def iterdir(
+        self, *, limit: "int | None" = None, singleton_ttl: Any = False,
+    ) -> Iterator["Path"]:
+        yield from self.ls(recursive=False, limit=limit, singleton_ttl=singleton_ttl)
 
     def ls(
         self,
         *,
         recursive: bool = False,
+        limit: "int | None" = None,
         singleton_ttl: Any = False,
     ) -> Iterator["Path"]:
-        yield from self._ls(recursive=recursive, singleton_ttl=singleton_ttl)
+        """Yield children lazily. ``limit`` caps how many are produced — the
+        underlying listing stays incremental, so a bounded ``ls`` over a huge
+        prefix never materialises (or fetches) more than it needs."""
+        children = self._ls(recursive=recursive, singleton_ttl=singleton_ttl)
+        if limit is None:
+            yield from children
+            return
+        if limit <= 0:
+            return
+        for i, child in enumerate(children):
+            yield child
+            if i + 1 >= limit:
+                return
 
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> "Path":
         self._mkdir(parents=parents, exist_ok=exist_ok)
