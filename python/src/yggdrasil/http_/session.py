@@ -1305,8 +1305,17 @@ class HTTPSession(Session):
         preload_content: bool,
         decode_content: bool,
         tags: Optional[Mapping[str, str]] = None,
+        _retry_stale: bool = True,
     ) -> HTTPResponse:
-        """Single wire send — one connection, one ``conn.getresponse``."""
+        """Single wire send — one connection, one ``conn.getresponse``.
+
+        ``_retry_stale`` is the one-shot reconnect guard: a request that came
+        off a pooled (kept-alive) socket and then errored or timed out is
+        almost always hitting a connection the peer silently dropped, so we
+        rebuild once on a fresh socket. The retry passes ``_retry_stale=False``
+        so a genuinely broken / slow endpoint (or a CONNECT tunnel, whose fresh
+        socket also reports ``from_pool``) can't loop.
+        """
         url = request.url
         scheme = url.scheme
         if scheme not in ("http", "https"):
@@ -1377,6 +1386,21 @@ class HTTPSession(Session):
                 conn.close()
             except Exception:
                 pass
+            # A timeout on a pooled keep-alive socket is almost always a stale
+            # connection the server/proxy silently dropped — the write or read
+            # then blocks until the deadline (the Databricks Files upload
+            # "write operation timed out" on a reused ``files_session`` socket
+            # is the canonical case). Rebuild once on a fresh socket before
+            # surfacing it as a real read timeout.
+            if from_pool and _retry_stale:
+                return self._send_once(
+                    request=request,
+                    timeout=timeout,
+                    preload_content=preload_content,
+                    decode_content=decode_content,
+                    tags=tags,
+                    _retry_stale=False,
+                )
             raise ReadTimeoutError(self, url.to_string(), str(exc)) from exc
         except (OSError, http.client.HTTPException) as exc:
             try:
@@ -1386,13 +1410,14 @@ class HTTPSession(Session):
             # Stale pooled connection — the server closed the keep-alive
             # socket between requests. Retry once on a fresh connection
             # without charging the caller's retry budget.
-            if from_pool:
+            if from_pool and _retry_stale:
                 return self._send_once(
                     request=request,
                     timeout=timeout,
                     preload_content=preload_content,
                     decode_content=decode_content,
                     tags=tags,
+                    _retry_stale=False,
                 )
             raise
         except Exception:

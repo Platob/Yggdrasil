@@ -187,10 +187,9 @@ class Cluster(Singleton, DatabricksResource, URLBased):
         cls,
         service: "Clusters | None" = None,
         cluster_id: str | None = None,
-        cluster_name: str | None = None,
         **_kwargs: Any,
     ) -> Any:
-        return (cls, service, cluster_id, cluster_name)
+        return (cls, service, cluster_id)
 
     def __new__(
         cls,
