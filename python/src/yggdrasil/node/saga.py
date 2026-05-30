@@ -203,7 +203,9 @@ def mount(name: str, target: str, *, comment: str = "", read_only: bool = True,
           node_url: str | None = None) -> Mount:
     """Register (upsert by alias) a mount: a named base path/URL the SQL engine
     and file browser expand on demand — a Databricks volume, an S3 prefix, an
-    ``npfs://`` node path, or a node-home folder."""
+    ``npfs://`` node path, a node-home folder, or a live-database connection URI
+    (``postgres://`` / ``mysql://`` / ``sqlite://`` / ``mssql://`` …, queried via
+    connectorx as ``SELECT ... FROM 'alias/schema.table'``)."""
     payload = {"name": name, "target": target, "comment": comment,
                "read_only": read_only}
     resp = _request("POST", f"{_base_url(node_url)}/api/v2/saga/mount", payload)

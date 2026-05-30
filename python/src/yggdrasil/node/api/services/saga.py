@@ -654,10 +654,18 @@ class SagaService:
 
     # -- mounts (named aliases over path objects) ---------------------------
 
-    @staticmethod
-    def _mount_kind(target: str) -> str:
-        """Sniff the path family of a mount target for the UI (informational)."""
+    # Connection-URI schemes that make a mount a live database source (read via
+    # connectorx) rather than a path. ``SELECT ... FROM 'alias/schema.table'``
+    # then reads that table from the database.
+    _DB_SCHEMES = ("postgres://", "postgresql://", "mysql://", "mariadb://",
+                   "sqlite://", "mssql://", "redshift://", "clickhouse://")
+
+    @classmethod
+    def _mount_kind(cls, target: str) -> str:
+        """Sniff the family of a mount target for the UI + resolution routing."""
         low = target.lower()
+        if low.startswith(cls._DB_SCHEMES):
+            return "database"
         if low.startswith(("/volumes/", "dbfs+volume:", "/workspace/", "dbfs+workspace:",
                             "/dbfs/", "dbfs:", "dbfs+dbfs:")):
             return "databricks"
@@ -752,6 +760,10 @@ class SagaService:
             mount = self._mounts.get(mid) if mid is not None else None
         if mount is None:
             raise NotFoundError(f"Mount {name!r} not found")
+        if mount.kind == "database":
+            # A DB mount has no directory tree to walk; list its tables from the
+            # information schema so the UI can browse + click-to-query them.
+            return self._list_db_mount(name, mount.target)
         target = self._resolve_path(f"mount://{name}/{subpath}" if subpath else f"mount://{name}")
         from yggdrasil.path import Path as YggPath
         try:
@@ -787,6 +799,83 @@ class SagaService:
             mount=name, subpath=subpath, target=target,
             entries=entries, truncated=truncated,
         )
+
+    def _list_db_mount(self, name: str, uri: str) -> MountListing:
+        """List the tables of a database mount as queryable leaves.
+
+        sqlite exposes them in ``sqlite_master``; every other supported engine
+        in the standard ``information_schema.tables``. Each entry's path is the
+        ``alias/[schema.]table`` ref the SQL editor queries directly."""
+        import polars as pl
+
+        low = uri.lower()
+        if low.startswith("sqlite://"):
+            query = ("SELECT '' AS table_schema, name AS table_name "
+                     "FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")
+        else:
+            query = ("SELECT table_schema, table_name FROM information_schema.tables "
+                     "WHERE table_schema NOT IN "
+                     "('information_schema','pg_catalog','sys','mysql','performance_schema') "
+                     "ORDER BY table_schema, table_name")
+        try:
+            df = pl.read_database_uri(query, uri)
+        except Exception as exc:
+            raise BadRequestError(f"cannot list tables of database mount {name!r}: {exc}")
+        cap = self.settings.du_max_entries
+        entries: list[MountNode] = []
+        for row in df.iter_rows(named=True):
+            if len(entries) >= cap:
+                break
+            sch = (row.get("table_schema") or "").strip()
+            tbl = row.get("table_name")
+            qualified = f"{sch}.{tbl}" if sch else str(tbl)
+            entries.append(MountNode(name=qualified, path=qualified, is_dir=False,
+                                     size=0, is_tabular=True))
+        return MountListing(mount=name, subpath="", target=uri,
+                            entries=entries, truncated=len(entries) >= cap)
+
+    def _db_source(self, ref: str) -> tuple[str, str] | None:
+        """If ``ref`` (``alias/schema.table`` or ``mount://alias/...``) names a
+        *database* mount, return ``(connection_uri, table_name)``; else None.
+
+        The leading segment must be a registered mount whose target is a DB
+        connection URI; the remainder is the (optionally schema-qualified)
+        table to read. A plain file path is never matched.
+        """
+        raw = ref[len("mount://"):] if ref.startswith("mount://") else ref
+        head, _, sub = raw.partition("/")
+        if not head or not sub:
+            return None
+        mid = self._mnt_idx.get(head)
+        mount = self._mounts.get(mid) if mid is not None else None
+        if mount is None or mount.kind != "database":
+            return None
+        return mount.target, sub
+
+    def _read_db_tabular(self, uri: str, table: str) -> Tabular:
+        """Read a database table into a bounded in-memory Tabular via connectorx.
+
+        connectorx has no lazy pushdown, so the whole table would load — cap it
+        with ``saga_db_row_limit`` (LIMIT pushed into the source query). The
+        outer SQL's projection/predicate still apply after the load. A
+        bare table name is read as ``SELECT * FROM <table> LIMIT n``; SQL
+        identifiers aren't quoted here so a fully-qualified ``schema.table``
+        passes through unchanged.
+        """
+        import polars as pl
+        from yggdrasil.arrow.tabular import ArrowTabular
+
+        limit = self.settings.saga_db_row_limit
+        query = f"SELECT * FROM {table} LIMIT {int(limit)}"
+        try:
+            df = pl.read_database_uri(query, uri)
+        except ModuleNotFoundError as exc:
+            raise BadRequestError(
+                "database mounts need connectorx — install with "
+                f"`pip install 'ygg[database]'` ({exc})")
+        except Exception as exc:
+            raise BadRequestError(f"cannot read {table!r} from database mount: {exc}")
+        return ArrowTabular(df.to_arrow())
 
     async def read_log(self, catalog: str, schema: str, name: str, *, limit: int = 200) -> OpLogResponse:
         full = f"{catalog}.{schema}.{name}"
@@ -873,9 +962,13 @@ class SagaService:
             if t is None:
                 raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
             is_view = t.object_type == "VIEW"
-            source = None if is_view else self._resolve_path(t.source_url)
+            db = None if is_view else self._db_source(t.source_url)
+            source = None if (is_view or db) else self._resolve_path(t.source_url)
         if is_view:
             cols, stats = await run_in_threadpool(self._infer_view, t)
+        elif db is not None:
+            # A live-DB source: profile the (bounded) read directly.
+            cols, stats = await run_in_threadpool(self._infer_db, *db)
         else:
             cols, stats = await run_in_threadpool(self._infer, source)
         with self._lock:
@@ -888,6 +981,15 @@ class SagaService:
             self._tables[entry.id] = entry
             self._save()
             return entry
+
+    def _infer_db(self, uri: str, table: str) -> tuple[list[ColumnSpec], TableStatistics]:
+        """Profile a database-mount source from its bounded read."""
+        tab = self._read_db_tabular(uri, table)
+        schema = tab.collect_schema()
+        cols = [ColumnSpec(name=f.name, dtype=str(f.dtype), nullable=f.nullable)
+                for f in schema.fields]
+        rows = tab.read_arrow_table().num_rows
+        return cols, TableStatistics(row_count=rows, computed_at=_now())
 
     def _infer_view(self, view: TableEntry) -> tuple[list[ColumnSpec], TableStatistics]:
         """Profile a view by running its definition and reading the result schema."""
@@ -1189,10 +1291,14 @@ class SagaService:
                     raise BadRequestError(
                         f"{reg.object_type.lower()} {full!r} is not queryable")
                 else:
-                    src = self._resolve_path(reg.source_url)
-                    tab = Tabular.from_(src, default=None)
-                    if tab is None:
-                        raise BadRequestError(f"cannot open source for table {full!r}")
+                    db = self._db_source(reg.source_url)
+                    if db is not None:
+                        tab = self._read_db_tabular(*db)
+                    else:
+                        src = self._resolve_path(reg.source_url)
+                        tab = Tabular.from_(src, default=None)
+                        if tab is None:
+                            raise BadRequestError(f"cannot open source for table {full!r}")
                 # Register under every name shape the executor might look up.
                 tables[full] = tab
                 tables[reg.name] = tab
@@ -1205,6 +1311,10 @@ class SagaService:
             # the node files dir — so `SELECT * FROM 'data/x.parquet'` reads from
             # the node and `FROM 'prod_vol/2024/jan.parquet'` follows the mount.
             cand = ref.name
+            db = self._db_source(cand)
+            if db is not None:
+                tables[cand] = self._read_db_tabular(*db)
+                continue
             resolved = self._expand_mount(cand)
             if resolved is not None:
                 if is_tabular_source(resolved):

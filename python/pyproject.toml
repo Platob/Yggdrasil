@@ -69,6 +69,12 @@ delta = [
   "deltalake>=1.0",
 ]
 
+# Live-database sources for the Saga SQL engine (mounts with a postgres://,
+# mysql://, sqlite://, mssql://, … target). Read via polars.read_database_uri.
+database = [
+  "connectorx>=0.3",
+]
+
 databricks = [
   "databricks-sdk>=0.107",
 ]
