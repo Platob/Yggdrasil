@@ -959,6 +959,7 @@ class HTTPSession(Session):
                     )
                     self._mark_proxy_dead(proxy)
 
+            LOGGER.debug("Opening direct HTTPS connection to %s:%s", host, port)
             return http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
             )
@@ -973,6 +974,10 @@ class HTTPSession(Session):
                 )
                 conn.connect()
                 conn._ygg_proxy = True  # type: ignore[attr-defined]
+                LOGGER.debug(
+                    "Routing HTTP %s:%s through proxy %s:%s",
+                    host, port, proxy_host, proxy_port,
+                )
                 return conn
             except OSError as exc:
                 LOGGER.warning(
@@ -981,6 +986,7 @@ class HTTPSession(Session):
                 )
                 self._mark_proxy_dead(proxy)
 
+        LOGGER.debug("Opening direct HTTP connection to %s:%s", host, port)
         return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
 
     def _build_connect_tunnel(
@@ -1046,6 +1052,10 @@ class HTTPSession(Session):
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
             )
             conn.sock = tls_sock
+            LOGGER.debug(
+                "CONNECT tunnel established to %s:%s via proxy %s:%s",
+                host, port, proxy_host, proxy_port,
+            )
             return conn
         except Exception:
             try:
@@ -1129,6 +1139,10 @@ class HTTPSession(Session):
         queue = self._connections.pop((scheme, url.host, port), None)
         if not queue:
             return
+        LOGGER.debug(
+            "Evicting %d idle connection(s) for %s://%s:%s before retry",
+            len(queue), scheme, url.host, port,
+        )
         while queue:
             try:
                 queue.popleft().close()
@@ -1230,6 +1244,10 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
+                LOGGER.debug(
+                    "Read timeout on %s %s — retrying on a fresh socket (%s left): %s",
+                    current_request.method, url_str, retries.total, exc,
+                )
                 self._evict_host(current_request.url)  # retry on a fresh socket
                 retries.sleep()
                 continue
@@ -1242,6 +1260,10 @@ class HTTPSession(Session):
                     retries = retries.increment(
                         method=current_request.method, url=url_str,
                         error=wrapped, _pool=self,
+                    )
+                    LOGGER.debug(
+                        "TLS EOF/reset on %s %s — retrying on a fresh socket (%s left): %s",
+                        current_request.method, url_str, retries.total, msg,
                     )
                     self._evict_host(current_request.url)  # retry on a fresh socket
                     retries.sleep()
@@ -1268,6 +1290,10 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
+                LOGGER.debug(
+                    "Connection error on %s %s — retrying on a fresh socket (%s left): %s",
+                    current_request.method, url_str, retries.total, exc,
+                )
                 self._evict_host(current_request.url)  # retry on a fresh socket
                 retries.sleep()
                 continue
@@ -1277,6 +1303,11 @@ class HTTPSession(Session):
             if redirect and response.status in self._REDIRECT_STATUSES:
                 location = response.headers.get("Location")
                 if location and visited_redirects < self._MAX_REDIRECTS:
+                    LOGGER.debug(
+                        "Following %d redirect: %s %s -> %s",
+                        response.status, current_request.method,
+                        current_request.url, location,
+                    )
                     response.drain_conn()
                     response.release_conn()
                     visited_redirects += 1
@@ -1311,6 +1342,11 @@ class HTTPSession(Session):
                     if retries.raise_on_status:
                         raise
                     return response
+                LOGGER.debug(
+                    "Retryable %d on %s %s — retrying (%s left)",
+                    response.status, current_request.method,
+                    current_request.url, next_retries.total,
+                )
                 response.drain_conn()
                 response.release_conn()
                 next_retries.sleep(response=response)
