@@ -214,25 +214,6 @@ class Folder(Path):
         default_ttl=_FOLDER_PATH_SINGLETON_TTL, max_size=10_000,
     )
 
-    # Per-leaf-partition data cache. Keyed by the full URL string of
-    # the partition directory (e.g. ``file:///cache/partition_key=ab/``);
-    # value is the tuple of unfiltered :class:`pa.RecordBatch` that
-    # :meth:`_read_arrow_batches` last drained from the directory's
-    # leaf files. Hits skip every file open / IPC parse / per-leaf
-    # batch yield in :meth:`iter_children` — the row-level predicate
-    # filter still runs in pyarrow's C++ kernels on the cached
-    # batches, so different predicates against the same partition
-    # all share one cache entry.
-    #
-    # TTL is short (60 s default) so the cache eventually converges
-    # with any out-of-process writer; in-process writes invalidate
-    # explicitly via :meth:`_invalidate_partition_cache` so a
-    # ``send_many`` write/read cycle on the same partition never
-    # serves stale rows.
-    _PARTITION_DATA_CACHE: "ClassVar[ExpiringDict[str, tuple]]" = ExpiringDict(
-        default_ttl=60.0, max_size=4_096,
-    )
-
     @classmethod
     def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
         """Key by ``(cls, url_str, yggmeta_enabled)``.
@@ -1218,17 +1199,6 @@ class Folder(Path):
             LOGGER.debug("Pruned read from %r — predicate eliminates partition", self)
             return
 
-        cache_key = self._partition_cache_key()
-        if cache_key is not None:
-            cached = self._PARTITION_DATA_CACHE.get(cache_key)
-            if cached is not None:
-                yield from self._yield_filtered(cached, predicate)
-                return
-
-        accumulated: "list[pa.RecordBatch] | None" = (
-            [] if cache_key is not None else None
-        )
-
         for child in self.iter_children(options=options):
             if child._should_prune_by_predicate(options, free_cols=free_cols):
                 continue
@@ -1240,16 +1210,12 @@ class Folder(Path):
             # leaf batch through :meth:`Predicate.filter_arrow_batch`
             # — the predicate picks the best engine internally
             # (hashset shortcut for the typical ``InList`` /
-            # ``AND-of-InList`` cache lookup shape, pyarrow's C++
+            # ``AND-of-InList`` lookup shape, pyarrow's C++
             # ``filter`` for everything else). The static-value prune
             # above already eliminated whole sub-trees the predicate
             # rejects on a partition column; this is the residual
             # non-partition filter.
             if isinstance(child, Folder):
-                # Recursive sub-folder branch: any inner partition
-                # leaf populates its own cache entry via the same
-                # mechanism; we don't double-cache the recursive
-                # output here.
                 yield from stream
                 continue
             needs_row_filter = predicate is not None and (
@@ -1258,99 +1224,12 @@ class Folder(Path):
             for batch in stream:
                 if batch.num_rows == 0:
                     continue
-                if accumulated is not None:
-                    accumulated.append(batch)
                 if not needs_row_filter:
                     yield batch
                     continue
                 kept = predicate.filter_arrow_batch(batch)
                 if kept.num_rows > 0:
                     yield kept
-
-        if accumulated is not None and cache_key is not None:
-            if accumulated:
-                total = sum(b.num_rows for b in accumulated)
-                LOGGER.debug(
-                    "Caching %d batch(es) / %d row(s) for partition %r",
-                    len(accumulated), total, cache_key,
-                )
-                try:
-                    cached_table = pa.Table.from_batches(accumulated)
-                except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
-                    # Part files inside this partition drifted in schema
-                    # (binary vs large_binary, int64 vs timestamp, …) —
-                    # conform each to the first batch's schema so the
-                    # cached table assembles cleanly.
-                    from yggdrasil.arrow.cast import conform_arrow_batch
-                    target = accumulated[0].schema
-                    cached_table = pa.Table.from_batches(
-                        [conform_arrow_batch(b, target) for b in accumulated]
-                    )
-                self._PARTITION_DATA_CACHE.set(
-                    cache_key, cached_table.combine_chunks().to_batches(),
-                )
-            else:
-                self._PARTITION_DATA_CACHE.set(cache_key, ())
-
-    def _partition_cache_key(self) -> "str | None":
-        """Return the in-memory partition-cache key, or ``None`` to skip caching.
-
-        Only :class:`Folder` instances bound to a real Hive
-        ``<col>=<val>/`` partition (non-empty :attr:`static_values`)
-        cache their batches — the root cache folder doesn't, since
-        its read flows into per-partition child reads that each
-        cache independently. The leaf's URL string is stable across
-        the singleton's lifetime so it's safe to use as the key.
-        """
-        if not self.static_values:
-            return None
-        full = getattr(self.path, "full_path", None)
-        return full() if callable(full) else None
-
-    def _invalidate_partition_cache(self) -> None:
-        """Drop this folder's :attr:`_PARTITION_DATA_CACHE` entry.
-
-        Called at the start of :meth:`_write_arrow_batches` so any
-        concurrent in-process reader sees the invalidation before a
-        write begins. Non-partition folders (root cache directory,
-        flat folders without Hive layout) have no key and skip the
-        cache entirely, so this is a no-op for them.
-        """
-        key = self._partition_cache_key()
-        if key is not None:
-            self._PARTITION_DATA_CACHE.pop(key, None)
-
-    @staticmethod
-    def _yield_filtered(
-        batches: "Iterable[pa.RecordBatch]",
-        predicate: "Any | None",
-    ) -> "Iterator[pa.RecordBatch]":
-        """Apply *predicate* to ``batches`` (pass-through when ``None``).
-
-        Used by the cache-hit branch of :meth:`_read_arrow_batches`;
-        :meth:`Predicate.filter_arrow_batch` picks the hashset
-        shortcut for ``InList`` / ``AND-of-InList`` shapes and
-        :meth:`pa.RecordBatch.filter` for everything else. Empty /
-        fully-dropped batches are skipped so consumers can treat
-        the output as "non-empty rows that match" without an extra
-        guard.
-        """
-        if predicate is None:
-            for batch in batches:
-                if batch.num_rows:
-                    yield batch
-            return
-        for batch in batches:
-            if batch.num_rows == 0:
-                continue
-            kept = predicate.filter_arrow_batch(batch)
-            if kept.num_rows > 0:
-                yield kept
-            elif batch.num_rows > 0:
-                LOGGER.debug(
-                    "Predicate filtered %d cached row(s) to 0",
-                    batch.num_rows,
-                )
 
     def _free_cols_for(self, predicate: "Predicate") -> "tuple[str, ...] | None":
         """Memoised :func:`free_columns` lookup keyed by ``id(predicate)``.
@@ -1476,14 +1355,6 @@ class Folder(Path):
         :meth:`collect_schema` without re-opening a data leaf.
         """
         import pyarrow.compute as pc
-
-        # Invalidate this folder's leaf-partition data cache up front
-        # so a concurrent reader on this process can't serve a hit from
-        # the about-to-be-stale entry. Recursive writes on partition
-        # children invalidate their own keys when they re-enter; the
-        # root partitioned folder has no cache key (empty static_values)
-        # so the call collapses to a no-op there.
-        self._invalidate_partition_cache()
 
         materialised = [b for b in batches if b.num_rows > 0]
         if not materialised:

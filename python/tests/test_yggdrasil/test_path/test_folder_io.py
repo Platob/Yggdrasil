@@ -46,10 +46,8 @@ def _partitioned_batch(
 @pytest.fixture(autouse=True)
 def _clear_singletons():
     Folder._INSTANCES.clear()
-    Folder._PARTITION_DATA_CACHE.clear()
     yield
     Folder._INSTANCES.clear()
-    Folder._PARTITION_DATA_CACHE.clear()
 
 
 # ===================================================================

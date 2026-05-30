@@ -52,10 +52,8 @@ def _clear_singletons():
     back a cached instance with warm caches, poisoning assertions.
     """
     Folder._INSTANCES.clear()
-    Folder._PARTITION_DATA_CACHE.clear()
     yield
     Folder._INSTANCES.clear()
-    Folder._PARTITION_DATA_CACHE.clear()
 
 
 # ===================================================================
