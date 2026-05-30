@@ -417,11 +417,13 @@ class HTTPHeaders(MutableMapping[str, str]):
       (``headers["Accept"] = "*/*"`` when it already is) short-circuit
       without bumping the version, so re-applying defaults is free.
 
-    Keys and values are coerced to ``str`` on the way in. Lookups stay
-    case-sensitive — the canonical-name normalization sits in
-    :func:`normalize_headers`, separate from this container, so
-    callers that already speak in canonical names don't pay for a
-    second pass.
+    Keys and values are coerced to ``str`` on the way in. The store keeps each
+    name's original case (for faithful serialization), but **lookups are
+    case-insensitive** per RFC 7230 §3.2 — ``headers.get("Location")`` finds a
+    wire ``location`` (HTTP/2 lowercases every field name) and a redirect /
+    ``Retry-After`` read works regardless of how the origin cased it. Canonical
+    Title-Case rewriting still lives in :func:`normalize_headers`, separate from
+    this container.
     """
 
     __slots__ = (
@@ -493,7 +495,19 @@ class HTTPHeaders(MutableMapping[str, str]):
     # ------------------------------------------------------------------
 
     def __getitem__(self, key: str) -> str:
-        return self._data[key]
+        try:
+            return self._data[key]
+        except KeyError:
+            # HTTP field names are case-insensitive (RFC 7230 §3.2). The store
+            # keeps the original case for serialization, but a lookup must still
+            # find e.g. ``location`` (HTTP/2 lowercases every name) under a
+            # ``"Location"`` query. Fast path is the exact hit; the scan only
+            # runs on a case mismatch.
+            kl = key.lower()
+            for k, v in self._data.items():
+                if k.lower() == kl:
+                    return v
+            raise
 
     def __setitem__(self, key: Any, value: Any) -> None:
         sk = str(key)
@@ -505,6 +519,12 @@ class HTTPHeaders(MutableMapping[str, str]):
         self._version += 1
 
     def __delitem__(self, key: str) -> None:
+        if key not in self._data:
+            kl = key.lower()
+            for k in self._data:
+                if k.lower() == kl:
+                    key = k
+                    break
         del self._data[key]
         self._version += 1
 
@@ -515,7 +535,12 @@ class HTTPHeaders(MutableMapping[str, str]):
         return len(self._data)
 
     def __contains__(self, key: object) -> bool:
-        return key in self._data
+        if key in self._data:
+            return True
+        if not isinstance(key, str):
+            return False
+        kl = key.lower()
+        return any(k.lower() == kl for k in self._data)
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, HTTPHeaders):

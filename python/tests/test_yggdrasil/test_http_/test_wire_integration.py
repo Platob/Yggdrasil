@@ -52,6 +52,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "/json")
             self.end_headers()
 
+        elif path == "/redirect-lower":
+            # 303 with a *lowercase* ``location`` — what HTTP/2 origins (e.g.
+            # Databricks) emit. The redirect follow must be case-insensitive.
+            self.send_response(303)
+            self.send_header("location", "/json")
+            self.end_headers()
+
         elif path == "/status/204":
             self.send_response(204)
             self.end_headers()
@@ -302,6 +309,14 @@ class TestRedirectChains:
         session = HTTPSession(base_url=server)
         r = session.get("/redirect-chain")
         assert r.request is not None
+
+    def test_follows_lowercase_location(self, server):
+        # Regression: an HTTP/2-style lowercase ``location`` header on a 303
+        # must still be followed (header lookups are case-insensitive).
+        session = HTTPSession(base_url=server)
+        r = session.get("/redirect-lower")
+        assert r.status_code == 200
+        assert r.json()["n"] > 0
 
 
 # ---------------------------------------------------------------------------
