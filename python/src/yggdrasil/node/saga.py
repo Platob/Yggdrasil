@@ -49,7 +49,7 @@ import urllib.request
 from typing import Any, Iterator
 
 __all__ = [
-    "sql", "mount", "register", "table", "catalog", "forecast",
+    "sql", "mount", "register", "table", "catalog", "forecast", "finance",
     "mounts", "SqlResult", "Mount", "Catalog",
 ]
 
@@ -324,3 +324,30 @@ def forecast(name: str, *, source: str, column: str, x: str | None = None,
                  "period": period, "agg": agg, "materialized": materialize},
     }
     return _request("POST", f"{_base_url(node_url)}/api/v2/saga/forecast", payload)
+
+
+# ---------------------------------------------------------------------------
+# Finance — risk/return analytics over a price series
+# ---------------------------------------------------------------------------
+
+
+def finance(path: str, column: str, *, order_by: str | None = None, window: int = 20,
+            limit: int = 2000, periods_per_year: int = 252, risk_free: float = 0.0,
+            node: str | None = None, node_url: str | None = None) -> dict:
+    """Risk/return analytics over a price series in a node-rooted (or mount)
+    file. Returns per-row series (value, pct_change, cum_return, rolling
+    mean/vol, EMA, drawdown) plus a ``metrics`` summary (total return, CAGR,
+    annualized return/vol, Sharpe, Sortino, max drawdown, Calmar).
+
+    ``periods_per_year`` annualizes the scalar metrics (252 daily / 52 weekly /
+    12 monthly); ``risk_free`` is the per-year rate for Sharpe/Sortino.
+    """
+    payload = {"path": path, "column": column, "order_by": order_by,
+               "window": window, "limit": limit,
+               "periods_per_year": periods_per_year, "risk_free": risk_free}
+    if node and node != "":
+        # The analysis endpoints take ?node= as a query param, not in the body.
+        url = f"{_base_url(node_url)}/api/v2/analysis/finance?node={_q(node)}"
+    else:
+        url = f"{_base_url(node_url)}/api/v2/analysis/finance"
+    return _request("POST", url, payload)

@@ -3,7 +3,9 @@ from .client import NodeClient
 from .fn import DagHandle, FunctionHandle, FunctionRun, dag, function, get_input, set_output
 from .path import NodePath
 from .remote import remote
-from .saga import Catalog, Mount, SqlResult, catalog, forecast, mount, mounts, register, sql, table
+from .saga import (
+    Catalog, Mount, SqlResult, catalog, finance, forecast, mount, mounts, register, sql, table,
+)
 
 __all__ = [
     "app",
@@ -26,6 +28,7 @@ __all__ = [
     "table",
     "catalog",
     "forecast",
+    "finance",
     "SqlResult",
     "Mount",
     "Catalog",
