@@ -13,6 +13,9 @@ from .common import StrictModel
 # Table kinds: EXTERNAL points at a pre-existing file; MANAGED is one Saga
 # created (and may delete) under its catalog's storage location.
 TableType = str  # "EXTERNAL" | "MANAGED"
+# Asset object kinds — a schema's children are no longer just tables.
+ObjectType = str  # "TABLE" | "VIEW" | "FUNCTION" | "MODEL" | "OTHER"
+OBJECT_TYPES = ("TABLE", "VIEW", "FUNCTION", "MODEL", "OTHER")
 
 
 # -- column + statistics metadata ------------------------------------------
@@ -124,8 +127,11 @@ class SchemaListResponse(StrictModel):
 
 class TableCreate(StrictModel):
     name: str
-    # A filesystem path or npfs:// URL to the backing data file.
-    source_url: str
+    # A filesystem path or npfs:// URL to the backing data file (TABLE), or "".
+    source_url: str = ""
+    object_type: ObjectType = "TABLE"
+    # VIEW: the SQL definition. FUNCTION/MODEL: the code/spec.
+    definition: str = ""
     # Node id that physically holds the bytes (None = local / network fs).
     node: str | None = None
     table_type: TableType = "EXTERNAL"
@@ -139,6 +145,8 @@ class TableCreate(StrictModel):
 
 class TableUpdate(StrictModel):
     source_url: str | None = None
+    object_type: ObjectType | None = None
+    definition: str | None = None
     node: str | None = None
     table_type: TableType | None = None
     format: str | None = None
@@ -153,6 +161,8 @@ class TableEntry(StrictModel):
     schema_name: str = Field(alias="schema")
     name: str
     full_name: str
+    object_type: ObjectType = "TABLE"
+    definition: str = ""
     table_type: TableType = "EXTERNAL"
     format: str = ""
     source_url: str = ""
@@ -185,12 +195,14 @@ class TableListResponse(StrictModel):
 # -- one-shot register (ensure catalog + schema, infer name/format) ---------
 
 class RegisterRequest(StrictModel):
-    # A filesystem path or npfs:// URL to the backing data file.
-    source_url: str
+    # A filesystem path or npfs:// URL to the backing data file (TABLE).
+    source_url: str = ""
     catalog: str = "main"
     schema_: str = Field(default="default", alias="schema")
     # Table name; defaults to the source file's stem.
     table: str | None = None
+    object_type: ObjectType = "TABLE"
+    definition: str = ""
     node: str | None = None
     table_type: TableType = "EXTERNAL"
     # Dialect for the catalog if it has to be created.
@@ -223,8 +235,10 @@ class SqlRequest(StrictModel):
     schema_: str | None = Field(default=None, alias="schema")
     # Node to run the query on (None = this node). A peer id proxies the run.
     node: str | None = None
-    # Row cap for the JSON grid response.
+    # Row cap for the JSON grid response (maps to CastOptions.row_limit).
     limit: int | None = None
+    # Arrow IPC chunk size in rows (CastOptions.row_size) for the stream path.
+    batch_rows: int | None = None
     # When set (an npfs:// NodePath URL), the executing node writes the Arrow
     # result there instead of streaming it back — lets a remote node stage the
     # output near whoever asked for it.
@@ -379,3 +393,38 @@ class OpLogResponse(StrictModel):
     node_id: str
     asset: str
     entries: list[OpLogEntry]
+
+
+# -- search -----------------------------------------------------------------
+
+class SearchHit(StrictModel):
+    kind: str  # "catalog" | "schema" | "table"
+    name: str
+    full_name: str
+    object_type: ObjectType = "TABLE"
+    catalog: str = ""
+    schema_: str = Field(default="", alias="schema")
+    comment: str = ""
+
+    model_config = {"populate_by_name": True}
+
+
+class SearchResponse(StrictModel):
+    node_id: str
+    query: str
+    hits: list[SearchHit]
+    total: int
+    truncated: bool
+
+
+# -- activity (asset monitoring dashboard) ----------------------------------
+
+class ActivityResponse(StrictModel):
+    node_id: str
+    asset: str
+    op_counts: dict[str, int]
+    total_ops: int
+    last_op_at: str | None = None
+    # Per-day op counts (most recent last) for a sparkline.
+    daily: list[int] = Field(default_factory=list)
+    recent: list[OpLogEntry] = Field(default_factory=list)

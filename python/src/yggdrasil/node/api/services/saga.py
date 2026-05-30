@@ -24,6 +24,7 @@ from typing import Any
 import pyarrow as pa
 from fastapi.concurrency import run_in_threadpool
 
+from yggdrasil.data.options import CastOptions
 from yggdrasil.enums.dialect import Dialect
 from yggdrasil.io.tabular.base import Tabular, is_tabular_source
 from yggdrasil.plan.execute import execute_plan
@@ -55,6 +56,7 @@ from ..schemas.saga import (
     SchemaListResponse,
     SchemaResponse,
     SchemaUpdate,
+    ActivityResponse,
     OpLogEntry,
     OpLogResponse,
     PlanEditRequest,
@@ -64,6 +66,8 @@ from ..schemas.saga import (
     RegisterRequest,
     ReplicateRequest,
     ReplicateResult,
+    SearchHit,
+    SearchResponse,
     StagedResult,
     SqlColumn,
     SqlRequest,
@@ -399,6 +403,8 @@ class SagaService:
             )
             entry = base.model_copy(update={
                 "source_url": req.source_url,
+                "object_type": req.object_type,
+                "definition": req.definition or base.definition,
                 "node": req.node,
                 "table_type": req.table_type,
                 "format": fmt,
@@ -410,9 +416,10 @@ class SagaService:
             self._tables[entry.id] = entry
             self._save()
         self._record(full, "update" if existing else "register",
-                     detail=f"{entry.table_type} {entry.source_url}")
-        # Infer outside the lock — the scan can touch the filesystem.
-        if req.infer and not req.node:
+                     detail=f"{entry.object_type} {entry.source_url or entry.definition[:40]}")
+        # Infer outside the lock — only file-backed TABLEs scan; a VIEW's schema
+        # comes from running its definition, others carry declared columns.
+        if req.infer and not req.node and entry.object_type in ("TABLE", "VIEW") and (req.source_url or req.definition):
             try:
                 entry = await self.refresh_table(catalog, schema, req.name)
                 return TableResponse(table=entry)
@@ -437,8 +444,55 @@ class SagaService:
             await self.create_schema(req.catalog, SchemaCreate(name=req.schema_))
         return await self.create_table(req.catalog, req.schema_, TableCreate(
             name=name, source_url=req.source_url, node=req.node,
+            object_type=req.object_type, definition=req.definition,
             table_type=req.table_type, infer=True,
         ))
+
+    async def search(self, q: str, *, limit: int = 50) -> "SearchResponse":
+        """Substring search across catalogs/schemas/tables (assets)."""
+        ql = (q or "").strip().lower()
+        hits: list[SearchHit] = []
+        with self._lock:
+            cats = list(self._catalogs.values())
+            schs = list(self._schemas.values())
+            tbls = list(self._tables.values())
+        for c in cats:
+            if not ql or ql in c.name.lower() or ql in c.comment.lower():
+                hits.append(SearchHit(kind="catalog", name=c.name, full_name=c.name, comment=c.comment))
+        for s in schs:
+            if not ql or ql in s.full_name.lower() or ql in s.comment.lower():
+                hits.append(SearchHit(kind="schema", name=s.name, full_name=s.full_name,
+                                      catalog=s.catalog, comment=s.comment))
+        for t in tbls:
+            if not ql or ql in t.full_name.lower() or ql in t.comment.lower():
+                hits.append(SearchHit(kind="table", name=t.name, full_name=t.full_name,
+                                      object_type=t.object_type, catalog=t.catalog,
+                                      schema=t.schema_name, comment=t.comment))
+        hits.sort(key=lambda h: (h.kind != "table", h.full_name))
+        total = len(hits)
+        return SearchResponse(node_id=self.settings.node_id, query=q,
+                              hits=hits[:limit], total=total, truncated=total > limit)
+
+    async def activity(self, catalog: str, schema: str, name: str) -> "ActivityResponse":
+        """Op-log rollup for an asset — the monitoring dashboard feed."""
+        full = f"{catalog}.{schema}.{name}"
+        table = await run_in_threadpool(partial(self._log.read, full, limit=2000))
+        rows = table.to_pylist()
+        counts: dict[str, int] = {}
+        per_day: dict[str, int] = {}
+        for r in rows:
+            counts[r["op"]] = counts.get(r["op"], 0) + 1
+            day = (r["ts"] or "")[:10]
+            if day:
+                per_day[day] = per_day.get(day, 0) + 1
+        days = sorted(per_day)[-14:]
+        recent = [OpLogEntry(**{k: _json_safe(v) for k, v in rows[i].items()})
+                  for i in range(min(20, len(rows)))]
+        return ActivityResponse(
+            node_id=self.settings.node_id, asset=full, op_counts=counts,
+            total_ops=len(rows), last_op_at=(rows[0]["ts"] if rows else None),
+            daily=[per_day[d] for d in days], recent=recent,
+        )
 
     async def list_tables(self, catalog: str, schema: str) -> TableListResponse:
         with self._lock:
@@ -463,7 +517,7 @@ class SagaService:
             if t is None:
                 raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
             upd: dict[str, Any] = {"updated_at": _now()}
-            for f in ("source_url", "node", "table_type", "comment"):
+            for f in ("source_url", "object_type", "definition", "node", "table_type", "comment"):
                 v = getattr(req, f)
                 if v is not None:
                     upd[f] = v
@@ -523,8 +577,12 @@ class SagaService:
             t = self._table_by_name(catalog, schema, name)
             if t is None:
                 raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
-            source = self._resolve_path(t.source_url)
-        cols, stats = await run_in_threadpool(self._infer, source)
+            is_view = t.object_type == "VIEW"
+            source = None if is_view else self._resolve_path(t.source_url)
+        if is_view:
+            cols, stats = await run_in_threadpool(self._infer_view, t)
+        else:
+            cols, stats = await run_in_threadpool(self._infer, source)
         with self._lock:
             cur = self._tables.get(t.id, t)
             entry = cur.model_copy(update={
@@ -535,6 +593,15 @@ class SagaService:
             self._tables[entry.id] = entry
             self._save()
             return entry
+
+    def _infer_view(self, view: TableEntry) -> tuple[list[ColumnSpec], TableStatistics]:
+        """Profile a view by running its definition and reading the result schema."""
+        tab = self._resolve_view(view, set())
+        schema = tab.collect_schema()
+        cols = [ColumnSpec(name=f.name, dtype=str(f.dtype), nullable=f.nullable)
+                for f in schema.fields]
+        rows = tab.read_arrow_table().num_rows
+        return cols, TableStatistics(row_count=rows, computed_at=_now())
 
     def _infer(self, source: str) -> tuple[list[ColumnSpec], TableStatistics]:
         """Read schema + bounded statistics from a tabular source.
@@ -707,9 +774,26 @@ class SagaService:
             )
         return None
 
+    def _resolve_view(self, view: TableEntry, seen: set[str]) -> Tabular:
+        if view.full_name in seen:
+            raise BadRequestError(f"view {view.full_name!r} is recursive")
+        if not view.definition.strip():
+            raise BadRequestError(f"view {view.full_name!r} has no definition")
+        try:
+            node = parse_sql(view.definition, dialect=self._resolve_dialect(None))
+        except (ValueError, NotImplementedError) as exc:
+            raise BadRequestError(f"view {view.full_name!r} SQL error: {exc}")
+        refs: list[TableRef] = []
+        self._collect_refs(node, refs)
+        tables = self._build_tables(refs, view.catalog, view.schema_name,
+                                    seen | {view.full_name})
+        from yggdrasil.arrow.tabular import ArrowTabular
+        return ArrowTabular(execute_plan(node, tables).read_arrow_table())
+
     def _build_tables(self, refs: list[TableRef], catalog: str | None,
-                      schema: str | None) -> dict[str, Tabular]:
+                      schema: str | None, seen: set[str] | None = None) -> dict[str, Tabular]:
         """Resolve referenced table names to concrete Tabular sources."""
+        seen = seen or set()
         tables: dict[str, Tabular] = {}
         for ref in refs:
             full = self._qualify(ref, catalog, schema)
@@ -721,10 +805,18 @@ class SagaService:
                         f"table {full!r} lives on node {reg.node!r}; run the query "
                         "with node= set to that node"
                     )
-                src = self._resolve_path(reg.source_url)
-                tab = Tabular.from_(src, default=None)
-                if tab is None:
-                    raise BadRequestError(f"cannot open source for table {full!r}")
+                if reg.object_type == "VIEW":
+                    # A view resolves to the materialised result of its SQL — its
+                    # own table refs resolve recursively against the catalog.
+                    tab = self._resolve_view(reg, seen)
+                elif reg.object_type != "TABLE":
+                    raise BadRequestError(
+                        f"{reg.object_type.lower()} {full!r} is not queryable")
+                else:
+                    src = self._resolve_path(reg.source_url)
+                    tab = Tabular.from_(src, default=None)
+                    if tab is None:
+                        raise BadRequestError(f"cannot open source for table {full!r}")
                 # Register under every name shape the executor might look up.
                 tables[full] = tab
                 tables[reg.name] = tab
@@ -758,7 +850,9 @@ class SagaService:
         t0 = time.perf_counter()
         try:
             result = execute_plan(node, tables)
-            table = result.read_arrow_table()
+            # Bound the materialised read with CastOptions.row_limit (+1 to
+            # detect "there's more") instead of reading everything then slicing.
+            table = result.read_arrow_table(options=CastOptions(row_limit=limit + 1))
         except (BadRequestError, NotFoundError):
             raise
         except Exception as exc:
@@ -1018,8 +1112,10 @@ class SagaService:
         except Exception as exc:
             raise BadRequestError(f"query failed: {exc}")
 
+        # CastOptions.row_size → Arrow IPC chunk size.
+        chunk = req.batch_rows if (req.batch_rows and req.batch_rows > 0) else 65536
         if table.num_rows <= self.settings.saga_result_spill_rows:
-            batches = table.to_batches(max_chunksize=65536)
+            batches = table.to_batches(max_chunksize=chunk)
             return transport.iter_arrow_ipc_stream(iter(batches), table.schema), None
 
         # Spill: write batch-by-batch to a self-describing tmp IPC file, then
@@ -1028,7 +1124,7 @@ class SagaService:
         spill = str(scratch.new_path(
             self.settings.tmp_root, "tmp", ttl_seconds=self.settings.tmp_ttl,
             suffix="saga-spill.arrows"))
-        transport.write_arrow_ipc_file(spill, iter(table.to_batches(max_chunksize=65536)), table.schema)
+        transport.write_arrow_ipc_file(spill, iter(table.to_batches(max_chunksize=chunk)), table.schema)
 
         def _cleanup() -> None:
             try:

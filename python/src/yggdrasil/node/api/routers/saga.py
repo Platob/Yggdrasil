@@ -22,8 +22,10 @@ from ..schemas.saga import (
     PlanEditResult,
     PlanGraph,
     RegisterRequest,
+    ActivityResponse,
     ReplicateRequest,
     ReplicateResult,
+    SearchResponse,
     SchemaCreate,
     SchemaListResponse,
     SchemaResponse,
@@ -184,6 +186,23 @@ async def read_table_log(catalog: str, schema: str, name: str, limit: int = 200,
 async def register(req: RegisterRequest, saga: SagaService = Depends(get_saga_service)):
     """One-shot: ensure catalog + schema, infer the name, register + profile."""
     return await saga.register(req)
+
+
+@router.get("/search", response_model=SearchResponse)
+async def search(q: str = "", limit: int = 50, node: str | None = None,
+                 saga: SagaService = Depends(get_saga_service),
+                 network: NetworkService = Depends(get_network_service)):
+    remote = await _remote(network, saga, node, "/search", params={"q": q, "limit": limit})
+    return remote if remote is not None else await saga.search(q, limit=limit)
+
+
+@router.get("/catalog/{catalog}/schema/{schema}/table/{name}/activity", response_model=ActivityResponse)
+async def table_activity(catalog: str, schema: str, name: str, node: str | None = None,
+                         saga: SagaService = Depends(get_saga_service),
+                         network: NetworkService = Depends(get_network_service)):
+    remote = await _remote(network, saga, node,
+                           f"/catalog/{catalog}/schema/{schema}/table/{name}/activity")
+    return remote if remote is not None else await saga.activity(catalog, schema, name)
 
 
 @router.post("/discover", response_model=TableListResponse)

@@ -264,6 +264,59 @@ class TestPlanGraph(unittest.TestCase):
             self.assertNotIn("ORDER BY", r.sql.upper())
 
 
+class TestObjectTypes(unittest.TestCase):
+    def test_view_resolves_and_queries(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d)); _seed(svc, _trades(svc.settings))
+            v = asyncio.run(svc.create_table("main", "market", TableCreate(
+                name="big", object_type="VIEW",
+                definition="SELECT sym, qty FROM main.market.trades WHERE qty >= 3")))
+            self.assertEqual(v.table.object_type, "VIEW")
+            self.assertEqual(v.table.statistics.row_count, 3)
+            r = asyncio.run(svc.execute_sql(SqlRequest(
+                sql="SELECT count(*) AS n FROM main.market.big")))
+            self.assertEqual(r.rows, [[3]])
+
+    def test_function_not_queryable(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d)); _seed(svc, _trades(svc.settings))
+            asyncio.run(svc.create_table("main", "market", TableCreate(
+                name="fn", object_type="FUNCTION", definition="x=1", infer=False)))
+            with self.assertRaises(BadRequestError):
+                asyncio.run(svc.execute_sql(SqlRequest(sql="SELECT * FROM main.market.fn")))
+
+    def test_recursive_view_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d)); _seed(svc, _trades(svc.settings))
+            asyncio.run(svc.create_table("main", "market", TableCreate(
+                name="loop", object_type="VIEW",
+                definition="SELECT * FROM main.market.loop", infer=False)))
+            with self.assertRaises(BadRequestError):
+                asyncio.run(svc.execute_sql(SqlRequest(sql="SELECT * FROM main.market.loop")))
+
+
+class TestSearchActivity(unittest.TestCase):
+    def test_search_and_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d)); _seed(svc, _trades(svc.settings))
+            r = asyncio.run(svc.search("trad", limit=10))
+            names = {h.full_name for h in r.hits}
+            self.assertIn("main.market.trades", names)
+            r2 = asyncio.run(svc.search("", limit=1))
+            self.assertTrue(r2.truncated)
+            self.assertEqual(len(r2.hits), 1)
+
+    def test_activity_rollup(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d)); _seed(svc, _trades(svc.settings))
+            asyncio.run(svc.execute_sql(SqlRequest(sql="SELECT * FROM main.market.trades")))
+            a = asyncio.run(svc.activity("main", "market", "trades"))
+            self.assertIn("register", a.op_counts)
+            self.assertIn("query", a.op_counts)
+            self.assertGreaterEqual(a.total_ops, 2)
+            self.assertTrue(a.daily)
+
+
 class TestExport(unittest.TestCase):
     def test_export_all_media_types(self):
         from yggdrasil.node.api.schemas.saga import SqlExportRequest
