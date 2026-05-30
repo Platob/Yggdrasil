@@ -55,13 +55,26 @@ class _Server(ThreadingMixIn, http.server.HTTPServer):
 
 
 @pytest.fixture
-def server():
+def session():
+    """Fresh server + isolated session per test.
+
+    The singleton cache is cleared on entry *and* exit and the session's
+    pooled keep-alive sockets are dropped on teardown, so a streamed
+    (``preload_content=False``) response that leaves a live socket in one
+    test can never be reused by the next — full-suite ordering stays
+    hermetic.
+    """
     srv = _Server(("127.0.0.1", 0), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
     HTTPSession._INSTANCES.clear()
-    yield base
-    srv.shutdown()
+    sess = HTTPSession(base_url=base)
+    try:
+        yield sess
+    finally:
+        sess.clear_connections()
+        HTTPSession._INSTANCES.clear()
+        srv.shutdown()
 
 
 # --- SendConfig field contract --------------------------------------------
@@ -89,28 +102,24 @@ def test_send_config_stream_from_options():
 # --- wire behaviour --------------------------------------------------------
 
 
-def test_stream_get_body_matches_full(server):
-    session = HTTPSession(base_url=server)
+def test_stream_get_body_matches_full(session):
     r = session.get("/big", stream=True)
     chunks = list(r.stream(64 * 1024))
     assert b"".join(chunks) == _BIG
 
 
-def test_stream_content_accessor_still_works(server):
-    session = HTTPSession(base_url=server)
+def test_stream_content_accessor_still_works(session):
     r = session.get("/big", stream=True)
     assert r.content == _BIG  # .content drains the un-preloaded body
 
 
-def test_non_stream_path_unchanged(server):
-    session = HTTPSession(base_url=server)
+def test_non_stream_path_unchanged(session):
     r = session.get("/big")
     assert r.content == _BIG
     assert len(r.content) == len(_BIG)
 
 
-def test_stream_releases_connection(server):
-    session = HTTPSession(base_url=server)
+def test_stream_releases_connection(session):
     r = session.get("/big", stream=True)
     for _ in r.stream(64 * 1024):
         pass
@@ -122,8 +131,7 @@ def test_stream_releases_connection(server):
     assert b"".join(r2.stream(64 * 1024)) == _BIG
 
 
-def test_stream_peak_below_preload(server):
-    session = HTTPSession(base_url=server)
+def test_stream_peak_below_preload(session):
 
     def stream_consume():
         r = session.get("/big", stream=True)
