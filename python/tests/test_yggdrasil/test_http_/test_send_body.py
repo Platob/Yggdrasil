@@ -82,6 +82,39 @@ def test_iter_mv_over_a_real_file(tmp_path):
     assert b"".join(bytes(c) for c in io_.iter_mv(8192)) == data
 
 
+def test_iter_mv_over_unopened_localpath(tmp_path):
+    # A LocalPath is itself a Holder/IO — no .open() needed; iter_mv reads it
+    # positionally straight off disk.
+    data = bytes((i * 3) % 256 for i in range(150_000))
+    p = tmp_path / "u.bin"
+    p.write_bytes(data)
+    lp = LocalPath.from_(str(p))
+    assert b"".join(bytes(c) for c in lp.iter_mv(8192)) == data
+
+
+def test_iter_mv_issues_sequential_bounded_positional_reads():
+    # A RemotePath (e.g. VolumePath) turns each read_mv into an HTTP Range GET,
+    # so iter_mv must drive *sequential, bounded, positional* reads — never a
+    # full-object fetch. This spy records the exact access pattern a remote
+    # body would see on the wire.
+    data = bytes(range(256)) * 1000  # 256_000
+    calls: list[tuple[int, int]] = []
+
+    class _Spy(Memory):
+        def read_mv(self, size=-1, offset=0, *, cursor=False):
+            calls.append((offset, size))
+            return super().read_mv(size, offset, cursor=cursor)
+
+    chunks = list(_Spy(binary=data).iter_mv(64 * 1024))
+    assert b"".join(bytes(c) for c in chunks) == data
+    nxt = 0
+    for off, sz in calls:
+        assert off == nxt                 # contiguous, in order
+        assert 0 < sz <= 64 * 1024        # bounded — one Range window, not the whole object
+        nxt += sz
+    assert nxt == len(data)
+
+
 # -- wire: round-trip through a real session --------------------------------
 
 class _EchoHandler(http.server.BaseHTTPRequestHandler):
@@ -178,6 +211,32 @@ def test_wire_post_file_body_roundtrips(server, tmp_path):
     session = HTTPSession(base_url=server)
     data = bytes((i * 17) % 256 for i in range(4 * _MIB))
     _post_and_check(session, _file_io(tmp_path / "body.bin", data), data)
+
+
+def test_wire_post_localpath_unopened_and_opened(server, tmp_path):
+    # Both forms of a file path stream the same way through iter_mv: the
+    # LocalPath itself (a Holder), and its opened "rb" IO cursor.
+    session = HTTPSession(base_url=server)
+    data = bytes((i * 23) % 256 for i in range(3 * _MIB))
+    p = tmp_path / "body.bin"
+    p.write_bytes(data)
+    _post_and_check(session, LocalPath.from_(str(p)), data)            # non-opened
+    _post_and_check(session, LocalPath.from_(str(p)).open(mode="rb"), data)  # opened
+
+
+def test_wire_localpath_unopened_replays_when_interrupted_mid_send(server, tmp_path):
+    # A non-opened LocalPath body must also reset to the start when the send is
+    # cut mid-stream — iter_mv re-reads it positionally off disk on the retry.
+    _EchoHandler.interrupt_first = 1
+    session = HTTPSession(base_url=server)
+    data = bytes((i * 19) % 256 for i in range(8 * _MIB))
+    p = tmp_path / "big.bin"
+    p.write_bytes(data)
+    r = session.post("/echo", body=LocalPath.from_(str(p)))
+    assert r.status_code == 200
+    assert r.headers.get("X-Body-Len") == str(len(data))
+    assert r.content.decode() == hashlib.sha256(data).hexdigest()
+    assert _EchoHandler.conns == 2
 
 
 def test_wire_retry_replays_full_body_on_fresh_socket(server, tmp_path):
