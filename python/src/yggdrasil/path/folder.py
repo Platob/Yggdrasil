@@ -1190,28 +1190,6 @@ class Folder(Path):
                     schema=arrow_schema,
                 )
 
-    def _plan_leaves(
-        self, options: FolderOptions, free_cols: "tuple[str, ...] | None",
-    ) -> "Iterator[Tabular]":
-        """Listing-only planning pass: walk the partition tree and yield every
-        surviving leaf (data-file) child.
-
-        Whole partitions the predicate rejects on their path-level
-        :attr:`Tabular.static_values` are skipped without descending. Opens
-        **no** data file — only the directory listings — so the complete set
-        of files the read will scan is resolved up front. Sub-folders recurse
-        (forwarding the predicate so deeper partition levels prune too).
-        """
-        for child in self.iter_children(options=options):
-            if child._should_prune_by_predicate(options, free_cols=free_cols):
-                continue
-            if isinstance(child, Folder):
-                yield from child._plan_leaves(
-                    self._child_read_options(child, options), free_cols,
-                )
-            else:
-                yield child
-
     def _read_arrow_batches_inner(
         self, options: FolderOptions,
     ) -> Iterator[pa.RecordBatch]:
@@ -1221,33 +1199,28 @@ class Folder(Path):
             LOGGER.debug("Pruned read from %r — predicate eliminates partition", self)
             return
 
-        # Plan first: enumerate + prune every partition leaf path (directory
-        # listings only) so the concrete survivor set is known before a single
-        # file is opened, then read the plan.
-        leaves = list(self._plan_leaves(options, free_cols))
-        if LOGGER.isEnabledFor(logging.DEBUG):
-            LOGGER.debug(
-                "Read plan for %r: %d leaf file(s) survive the partition prune",
-                self, len(leaves),
+        for child in self.iter_children(options=options):
+            if child._should_prune_by_predicate(options, free_cols=free_cols):
+                continue
+            child_options = self._child_read_options(child, options)
+            stream = child._read_arrow_batches(child_options)
+            # Each child owns its own read: sub-folders recurse through their
+            # own ``_read_arrow_batches`` (applying the predicate at their leaf
+            # level); flat-format leaves (parquet / arrow IPC / csv) don't
+            # filter rows themselves, so route each leaf batch through
+            # :meth:`Predicate.filter_arrow_batch` — the predicate picks the
+            # best engine internally (hashset shortcut for the typical
+            # ``InList`` / ``AND-of-InList`` lookup shape, pyarrow's C++
+            # ``filter`` otherwise). The static-value prune above already
+            # eliminated whole sub-trees the predicate rejects on a partition
+            # column; this is the residual non-partition filter.
+            if isinstance(child, Folder):
+                yield from stream
+                continue
+            needs_row_filter = predicate is not None and (
+                free_cols is None or not set(free_cols).issubset(self.static_values.keys())
             )
-        for leaf in leaves:
-            leaf_options = self._child_read_options(leaf, options)
-            # Flat-format leaves (parquet / arrow IPC / csv) don't filter rows
-            # themselves; route each batch through the predicate when it has a
-            # residual condition on a non-partition column (the path-level
-            # prune in the plan already eliminated whole partitions). The
-            # partition KVs live on the leaf's containing folder
-            # (``tabular_parent``), not the data file — and only matter when
-            # there's a predicate to row-filter, so resolve them lazily. By the
-            # time a leaf survives the plan, that folder's ``static_values`` is
-            # already memoised from the prune check that let us descend into it,
-            # so this is a cache hit, not a re-parse.
-            needs_row_filter = predicate is not None
-            if needs_row_filter and free_cols is not None:
-                holder = leaf.tabular_parent
-                static_keys = holder.static_values.keys() if holder is not None else ()
-                needs_row_filter = not set(free_cols).issubset(static_keys)
-            for batch in leaf._read_arrow_batches(leaf_options):
+            for batch in stream:
                 if batch.num_rows == 0:
                     continue
                 if not needs_row_filter:
