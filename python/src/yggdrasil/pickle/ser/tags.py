@@ -168,6 +168,23 @@ class Tags:
         if cid in cls._IMPORTED_CATEGORIES or cid < 0:
             return
 
+        try:
+            cls._import_category(cid)
+        except ImportError:
+            # Categories 7 (pyspark) and 8 (databricks) cover optional
+            # third-party SDKs. When the SDK isn't installed the category
+            # module raises ``ImportError`` at import time — that must not
+            # break serialization of *any* object (a plain Arrow table
+            # iterates every category looking for its tag). Mark the
+            # category resolved-as-empty: its types simply aren't
+            # registered, so an object of one of those types falls through
+            # to the generic pickle path, while every core type keeps
+            # working. A later call won't retry the failed import.
+            pass
+        cls._IMPORTED_CATEGORIES.add(cid)
+
+    @classmethod
+    def _import_category(cls, cid: int) -> None:
         if cid == 0:
             from yggdrasil.pickle.ser.primitives import PrimitiveSerialized  # noqa: F401
             from yggdrasil.pickle.ser.logicals import LogicalSerialized  # noqa: F401
@@ -195,8 +212,6 @@ class Tags:
             from yggdrasil.pickle.ser.databricks import DatabricksSerialized  # noqa: F401
         else:
             return
-
-        cls._IMPORTED_CATEGORIES.add(cid)
 
     @classmethod
     def get_class(cls, tag: int) -> type["Serialized[object]"] | None:
