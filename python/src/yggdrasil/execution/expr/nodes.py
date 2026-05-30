@@ -1576,7 +1576,10 @@ def _apply_inlist_small(
 
     surviving: "list[int] | None" = None
     for col_name, value_set, includes_null in clauses:
-        col_arr = target.column(col_name)
+        try:
+            col_arr = target.column(col_name)
+        except KeyError:
+            return target
         keep: "list[int]" = []
         for i in (range(n) if surviving is None else surviving):
             v = col_arr[i].as_py()
