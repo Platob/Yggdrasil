@@ -403,3 +403,86 @@ class TestArrowMetadata:
         r1 = session.get("/json")
         r2 = session.get("/json")
         assert r1.arrow_values["request_hash"] == r2.arrow_values["request_hash"]
+
+
+# ---------------------------------------------------------------------------
+# Stale pooled socket — timeout reconnects once on a fresh socket
+# ---------------------------------------------------------------------------
+
+
+class _FakeRaw:
+    status = 200
+    version = 11
+    will_close = False
+
+    def __init__(self):
+        self._body = b"ok"
+
+    def getheaders(self):
+        return [("Content-Length", "2")]
+
+    def read(self, *a, **k):
+        body, self._body = self._body, b""
+        return body
+
+
+class _FakeSock:
+    def settimeout(self, *a):
+        pass
+
+
+class _FakeConn:
+    """Minimal http.client-shaped connection. ``pooled`` sets ``sock`` so
+    ``_send_once`` treats it as reused; ``fail`` raises a write timeout."""
+
+    def __init__(self, *, pooled: bool, fail: bool):
+        self.sock = _FakeSock() if pooled else None
+        self._fail = fail
+        self.closed = False
+
+    def connect(self):
+        self.sock = _FakeSock()
+
+    def request(self, *a, **k):
+        if self._fail:
+            raise __import__("socket").timeout("The write operation timed out")
+
+    def getresponse(self):
+        return _FakeRaw()
+
+    def close(self):
+        self.closed = True
+
+
+class TestStalePooledTimeoutReconnect:
+
+    def _drive(self, conns):
+        session = HTTPSession(base_url="http://stale.example")
+        handed: list = []
+
+        def fake_get(scheme, host, port, connect_timeout):
+            c = conns[len(handed)]
+            handed.append(c)
+            return c
+
+        session._get_connection = fake_get  # type: ignore[assignment]
+        req = HTTPRequest.prepare(method="GET", url="http://stale.example/x")
+        resp = session._send_once(
+            request=req, timeout=5, preload_content=True, decode_content=False,
+        )
+        return resp, handed
+
+    def test_pooled_write_timeout_reconnects_once(self):
+        # First (pooled) socket times out on write → rebuild on a fresh one.
+        conns = [_FakeConn(pooled=True, fail=True), _FakeConn(pooled=True, fail=False)]
+        resp, handed = self._drive(conns)
+        assert resp.status_code == 200
+        assert len(handed) == 2            # reconnected exactly once
+        assert conns[0].closed             # stale socket was closed
+
+    def test_fresh_write_timeout_does_not_loop(self):
+        from yggdrasil.http_.exceptions import ReadTimeoutError
+        # A non-pooled (fresh) socket timeout surfaces as ReadTimeout — no retry.
+        conns = [_FakeConn(pooled=False, fail=True)]
+        with pytest.raises(ReadTimeoutError):
+            self._drive(conns)
