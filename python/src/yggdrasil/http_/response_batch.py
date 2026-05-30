@@ -188,17 +188,6 @@ class HTTPResponseBatch(Tabular):
             ]
             self._misses = misses
 
-        if self._remote_hashes and cfg.local_cache is not None:
-            if remote_tab is not None:
-                try:
-                    remote_table = remote_tab.read_arrow_table()
-                    if remote_table.num_rows > 0:
-                        cfg.local_cache.write_responses_tabular(
-                            remote_table, mode=Mode.OVERWRITE, session=self._session,
-                        )
-                except Exception:
-                    LOGGER.debug("Remote→local backfill failed", exc_info=True)
-
         LOGGER.debug(
             "Cache split: %d local hit(s), %d remote hit(s), %d miss(es)",
             len(self._local_hashes), len(self._remote_hashes), len(misses),
