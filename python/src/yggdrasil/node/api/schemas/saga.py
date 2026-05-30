@@ -268,6 +268,20 @@ class StagedResult(StrictModel):
     elapsed_ms: float
 
 
+class SqlExportRequest(StrictModel):
+    sql: str
+    dialect: str | None = None
+    catalog: str | None = None
+    schema_: str | None = Field(default=None, alias="schema")
+    node: str | None = None
+    # csv | parquet | json | ndjson | arrow | xlsx | tsv | feather
+    fmt: str = "csv"
+    # Cap the exported rows (None = the whole result).
+    max_rows: int | None = None
+
+    model_config = {"populate_by_name": True}
+
+
 # -- execution plan graph (DAG + analyze timings) ---------------------------
 
 class PlanOp(StrictModel):

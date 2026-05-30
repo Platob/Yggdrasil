@@ -80,6 +80,8 @@ from .saga_log import OpLog
 from ...ids import make_id
 
 _TABULAR_EXTS = {"parquet", "pq", "csv", "tsv", "ndjson", "json", "arrow", "feather", "ipc", "xlsx"}
+# Formats the result-export writer can emit (every one has a tabular encoder).
+_EXPORT_FMTS = {"csv", "parquet", "json", "ndjson", "arrow", "xlsx"}
 _DIALECTS = {d.value for d in Dialect}
 
 
@@ -1128,6 +1130,56 @@ class SagaService:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         return str(target)
+
+    # -- export (download the full result in any media type) ----------------
+
+    async def export_sql(self, req):
+        return await run_in_threadpool(self._export_sql, req)
+
+    def _export_sql(self, req):
+        """Run the query (full result, optionally row-capped) and write it to a
+        tmp file in the requested media type. Returns (path, download_name).
+
+        Leverages the project's MediaType registry + Path writer, so every
+        tabular format it handles — csv/parquet/json/ndjson/arrow/xlsx/tsv —
+        comes for free. The caller streams the file then unlinks it.
+        """
+        from yggdrasil.enums.media_type import MediaType
+        from yggdrasil.path import Path as YggPath
+
+        node, _, refs = self.plan_for(SqlRequest(
+            sql=req.sql, dialect=req.dialect, catalog=req.catalog, schema=req.schema_))
+        if isinstance(node, SelectNode) and node.limit is None and req.max_rows:
+            node.limit = req.max_rows
+        tables = self._build_tables(refs, req.catalog, req.schema_)
+        try:
+            table = execute_plan(node, tables).read_arrow_table()
+        except (BadRequestError, NotFoundError):
+            raise
+        except Exception as exc:
+            raise BadRequestError(f"query failed: {exc}")
+        if req.max_rows and table.num_rows > req.max_rows:
+            table = table.slice(0, req.max_rows)
+
+        fmt = (req.fmt or "csv").lower()
+        if fmt not in _EXPORT_FMTS:
+            raise BadRequestError(f"unsupported export format {fmt!r}; one of {sorted(_EXPORT_FMTS)}")
+        ext = {"ipc": "arrow"}.get(fmt, fmt)
+        media = MediaType.from_(fmt, default=None) or MediaType.from_("csv")
+        spill = str(scratch.new_path(
+            self.settings.tmp_root, "tmp", ttl_seconds=self.settings.tmp_ttl,
+            suffix=f"saga-export.{ext}"))
+        with YggPath.from_(spill).open("wb", media_type=media) as bio:
+            bio.write_arrow_table(table)
+        ref = sorted({self._qualify(r, req.catalog, req.schema_) for r in refs})
+        with self._lock:
+            known = {t.full_name for t in self._tables.values()}
+        for a in ref:
+            if a in known:
+                self._record(a, "export", statement=req.sql, rows=table.num_rows, detail=fmt)
+        base = (ref[0].split(".")[-1] if ref else "result")
+        from pathlib import Path as _P
+        return _P(spill), f"{base}.{ext}"
 
     # -- replication --------------------------------------------------------
 

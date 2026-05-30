@@ -28,6 +28,7 @@ from ..schemas.saga import (
     SchemaListResponse,
     SchemaResponse,
     SchemaUpdate,
+    SqlExportRequest,
     StagedResult,
     SqlRequest,
     SqlResult,
@@ -221,6 +222,45 @@ async def run_sql(req: SqlRequest,
             # clear "table lives on node X" error.
             req = req.model_copy(update={"node": None})
     return await saga.execute_sql(req)
+
+
+_EXPORT_MEDIA = {
+    "csv": "text/csv", "parquet": "application/vnd.apache.parquet",
+    "json": "application/json", "ndjson": "application/x-ndjson",
+    "arrow": "application/vnd.apache.arrow.stream",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+@router.post("/sql.export")
+async def export_sql(req: SqlExportRequest,
+                     saga: SagaService = Depends(get_saga_service),
+                     network: NetworkService = Depends(get_network_service)):
+    """Run the query and download the full result in any handled media type
+    (csv/parquet/json/ndjson/arrow/xlsx/tsv). Runs where the data lives."""
+    media = _EXPORT_MEDIA.get((req.fmt or "csv").lower(), "application/octet-stream")
+    sql_req = SqlRequest(sql=req.sql, dialect=req.dialect, catalog=req.catalog,
+                         schema=req.schema_, node=req.node)
+    target = saga.compute_node(sql_req)
+    if target:
+        body = req.model_dump(by_alias=True)
+        body["node"] = None
+        return StreamingResponse(
+            network.proxy_post_stream(target, "/api/v2/saga/sql.export", body),
+            media_type=media)
+
+    tmp_path, name = await saga.export_sql(req)
+
+    def _gen():
+        try:
+            yield from transport.iter_file_chunks(str(tmp_path))
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    return StreamingResponse(
+        _gen(), media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{name}"',
+                 "X-Accel-Buffering": "no"})
 
 
 @router.post("/sql.stage", response_model=StagedResult)

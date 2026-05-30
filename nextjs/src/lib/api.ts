@@ -779,6 +779,25 @@ export function editPlan(body: { sql: string; dialect?: string; catalog?: string
   return jsonFetch("/api/v2/saga/plan/edit", { method: "POST", body: JSON.stringify(body) });
 }
 
+export const SQL_EXPORT_FORMATS = ["csv", "parquet", "json", "ndjson", "arrow", "xlsx"] as const;
+
+// Run the query on the node where the data lives and download the full result
+// in any handled media type. max_rows null = the whole result.
+export async function downloadSqlExport(body: { sql: string; fmt: string; dialect?: string; catalog?: string; schema?: string; node?: string; max_rows?: number | null }): Promise<void> {
+  const res = await fetch("/api/v2/saga/sql.export", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    let detail = ""; try { detail = (await res.json()).detail; } catch { /* ignore */ }
+    throw new Error(`export failed: HTTP ${res.status}${detail ? ` — ${detail}` : ""}`);
+  }
+  const blob = await res.blob();
+  const name = res.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1] ?? `result.${body.fmt}`;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 export interface OpLogEntry {
   ts: string; op: string; user: string; node: string;
   statement: string; rows: number | null; detail: string;

@@ -264,6 +264,31 @@ class TestPlanGraph(unittest.TestCase):
             self.assertNotIn("ORDER BY", r.sql.upper())
 
 
+class TestExport(unittest.TestCase):
+    def test_export_all_media_types(self):
+        from yggdrasil.node.api.schemas.saga import SqlExportRequest
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d)); _seed(svc, _trades(svc.settings))
+            for fmt in ["csv", "parquet", "json", "ndjson", "arrow", "xlsx"]:
+                p, name = asyncio.run(svc.export_sql(SqlExportRequest(
+                    sql="SELECT sym, sum(qty) AS q FROM main.market.trades GROUP BY sym", fmt=fmt)))
+                self.assertTrue(p.exists() and p.stat().st_size > 0, fmt)
+                self.assertTrue(name.endswith(f".{fmt}"))
+                p.unlink(missing_ok=True)
+
+    def test_export_max_rows_and_bad_fmt(self):
+        from yggdrasil.node.api.schemas.saga import SqlExportRequest
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d)); _seed(svc, _trades(svc.settings))
+            p, _ = asyncio.run(svc.export_sql(SqlExportRequest(
+                sql="SELECT * FROM main.market.trades", fmt="csv", max_rows=2)))
+            self.assertEqual(len(p.read_text().strip().splitlines()), 3)  # header + 2
+            p.unlink(missing_ok=True)
+            with self.assertRaises(BadRequestError):
+                asyncio.run(svc.export_sql(SqlExportRequest(
+                    sql="SELECT * FROM main.market.trades", fmt="tsv")))
+
+
 class TestOpLog(unittest.TestCase):
     def test_register_query_and_drop_logging(self):
         with tempfile.TemporaryDirectory() as d:

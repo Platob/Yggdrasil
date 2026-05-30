@@ -16,6 +16,8 @@ import {
   runSql,
   getPlan,
   editPlan,
+  downloadSqlExport,
+  SQL_EXPORT_FORMATS,
   getTableLog,
   replicateTable,
   type CatalogEntry,
@@ -66,6 +68,9 @@ export default function SagaPage() {
   const [tab, setTab] = useState<"results" | "plan">("results");
   const [running, setRunning] = useState(false);
   const [sqlErr, setSqlErr] = useState("");
+  const [limit, setLimit] = useState(1000);   // rows shown in the grid
+  const [dlOpen, setDlOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   const loadCatalogs = useCallback(async () => {
     setTreeErr("");
@@ -220,12 +225,20 @@ export default function SagaPage() {
   const onRun = async () => {
     setRunning(true); setSqlErr("");
     try {
-      const r = await runSql({ ...planBody(), node });
+      const r = await runSql({ ...planBody(), node, limit });
       setResult(r); setTab("results");
       // Keep the (logical) plan in sync with whatever just ran.
       getPlan(planBody()).then(setPlan).catch(() => {});
     } catch (e) { setSqlErr(String(e)); setResult(null); }
     finally { setRunning(false); }
+  };
+
+  const onExport = async (fmt: string) => {
+    setDlOpen(false); setExporting(true); setSqlErr("");
+    try {
+      await downloadSqlExport({ ...planBody(), node, fmt });  // full result, all rows
+    } catch (e) { setSqlErr(String(e)); }
+    finally { setExporting(false); }
   };
 
   const onExplain = async () => {
@@ -250,7 +263,7 @@ export default function SagaPage() {
     try {
       const r = await editPlan({ ...planBody(), edits });
       setSql(r.sql);
-      const res = await runSql({ sql: r.sql, dialect, catalog: ctx.catalog, schema: ctx.schema, node });
+      const res = await runSql({ sql: r.sql, dialect, catalog: ctx.catalog, schema: ctx.schema, node, limit });
       setResult(res);
       setPlan(await getPlan({ sql: r.sql, dialect, catalog: ctx.catalog, schema: ctx.schema }));
     } catch (e) { setSqlErr(String(e)); }
@@ -439,6 +452,29 @@ export default function SagaPage() {
               onChange={(e) => setCtx((c) => ({ ...c, schema: e.target.value || undefined }))}
               className="w-28 bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1.5 text-xs font-mono outline-none focus:border-frost/30" />
             <div className="flex-1" />
+            <label className="flex items-center gap-1 text-[11px] text-muted" title="rows shown in the grid">
+              limit
+              <input type="number" min={1} value={limit}
+                onChange={(e) => setLimit(Math.max(1, Number(e.target.value) || 1))}
+                className="w-20 bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1.5 text-xs font-mono outline-none focus:border-frost/30" />
+            </label>
+            <div className="relative">
+              <button onClick={() => setDlOpen((v) => !v)} disabled={exporting}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/[0.04] text-foreground-dim border border-white/[0.08] hover:bg-white/[0.08] disabled:opacity-40">
+                {exporting ? "Exporting…" : "Download ▾"}
+              </button>
+              {dlOpen && (
+                <div className="absolute right-0 mt-1 z-20 rounded-lg border border-white/[0.1] bg-[#0a0a1a] shadow-xl py-1 min-w-[120px]">
+                  <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-muted">full result as</div>
+                  {SQL_EXPORT_FORMATS.map((f) => (
+                    <button key={f} onClick={() => onExport(f)}
+                      className="block w-full text-left px-3 py-1.5 text-xs font-mono text-foreground-dim hover:bg-white/[0.06] hover:text-frost">
+                      {f}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <button onClick={onExplain} disabled={running}
               className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white/[0.04] text-foreground-dim border border-white/[0.08] hover:bg-white/[0.08] disabled:opacity-40">
               Explain
