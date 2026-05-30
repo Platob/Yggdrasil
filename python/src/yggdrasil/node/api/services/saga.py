@@ -21,6 +21,7 @@ from functools import partial
 from threading import Lock
 from typing import Any
 
+import pyarrow as pa
 from fastapi.concurrency import run_in_threadpool
 
 from yggdrasil.enums.dialect import Dialect
@@ -106,6 +107,9 @@ class SagaService:
         self._catalogs: dict[int, CatalogEntry] = {}
         self._schemas: dict[int, SchemaEntry] = {}
         self._tables: dict[int, TableEntry] = {}
+        self._cat_idx: dict[str, int] = {}
+        self._sch_idx: dict[str, int] = {}
+        self._tbl_idx: dict[str, int] = {}
         self._log = OpLog(settings.saga_log_root)
         self._network = None  # bound after construction; enables replication
         try:
@@ -154,9 +158,19 @@ class SagaService:
                 self._tables[e.id] = e
             except Exception:
                 continue
+        self._reindex()
+
+    def _reindex(self) -> None:
+        """Rebuild the name → id indexes. Cheap, and called from the one place
+        that mutates state (``_save``), so every lookup stays O(1) without
+        scattering index bookkeeping across each create/delete."""
+        self._cat_idx = {c.name: c.id for c in self._catalogs.values()}
+        self._sch_idx = {f"{s.catalog}.{s.name}": s.id for s in self._schemas.values()}
+        self._tbl_idx = {t.full_name: t.id for t in self._tables.values()}
 
     def _save(self) -> None:
-        """Atomic write: dump to a temp file in the same dir, then rename."""
+        """Reindex, then atomic-write: dump to a temp file, then rename."""
+        self._reindex()
         doc = {
             "catalogs": [c.model_dump() for c in self._catalogs.values()],
             "schemas": [s.model_dump() for s in self._schemas.values()],
@@ -177,23 +191,19 @@ class SagaService:
     # -- internal lookups (assume lock held) --------------------------------
 
     def _catalog_by_name(self, name: str) -> CatalogEntry | None:
-        for c in self._catalogs.values():
-            if c.name == name:
-                return c
-        return None
+        cid = self._cat_idx.get(name)
+        return self._catalogs.get(cid) if cid is not None else None
 
     def _schema_by_name(self, catalog: str, name: str) -> SchemaEntry | None:
-        for s in self._schemas.values():
-            if s.catalog == catalog and s.name == name:
-                return s
-        return None
+        sid = self._sch_idx.get(f"{catalog}.{name}")
+        return self._schemas.get(sid) if sid is not None else None
 
     def _table_by_name(self, catalog: str, schema: str, name: str) -> TableEntry | None:
-        full = f"{catalog}.{schema}.{name}"
-        for t in self._tables.values():
-            if t.full_name == full:
-                return t
-        return None
+        return self._table_by_full(f"{catalog}.{schema}.{name}")
+
+    def _table_by_full(self, full_name: str) -> TableEntry | None:
+        tid = self._tbl_idx.get(full_name)
+        return self._tables.get(tid) if tid is not None else None
 
     def _require_catalog(self, name: str) -> CatalogEntry:
         c = self._catalog_by_name(name)
@@ -647,10 +657,7 @@ class SagaService:
         nodes: set[str] = set()
         with self._lock:
             for ref in refs:
-                full = self._qualify(ref, req.catalog, req.schema_)
-                t = self._tables.get(make_id(full))
-                t = t if (t and t.full_name == full) else next(
-                    (x for x in self._tables.values() if x.full_name == full), None)
+                t = self._table_by_full(self._qualify(ref, req.catalog, req.schema_))
                 if t and t.node and t.node != self.settings.node_id:
                     nodes.add(t.node)
                 elif t:
@@ -669,13 +676,10 @@ class SagaService:
                       schema: str | None) -> dict[str, Tabular]:
         """Resolve referenced table names to concrete Tabular sources."""
         tables: dict[str, Tabular] = {}
-        with self._lock:
-            registry = {t.full_name: t for t in self._tables.values()}
         for ref in refs:
             full = self._qualify(ref, catalog, schema)
-            reg = registry.get(full)
-            if reg is None and ref.name in registry:  # bare name already qualified
-                reg = registry[ref.name]
+            with self._lock:
+                reg = self._table_by_full(full) or self._table_by_full(ref.name)
             if reg is not None:
                 if reg.node and reg.node != self.settings.node_id:
                     raise BadRequestError(
@@ -729,7 +733,7 @@ class SagaService:
         truncated = table.num_rows > limit
         if truncated:
             table = table.slice(0, limit)
-        cols = [SqlColumn(name=f.name, dtype=str(f.type)) for f in table.schema]
+        cols = _sql_columns(table.schema)
         pydict = table.to_pydict()
         col_data = [pydict[c.name] for c in cols]
         rows = [[_json_safe(col_data[ci][ri]) for ci in range(len(cols))]
@@ -865,7 +869,7 @@ class SagaService:
         written = self._stage_write(req.staging_path, data)
         return StagedResult(
             node_id=self.settings.node_id, staging_path=written,
-            columns=[SqlColumn(name=f.name, dtype=str(f.type)) for f in table.schema],
+            columns=_sql_columns(table.schema),
             row_count=table.num_rows, bytes=len(data),
             elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
         )
@@ -988,3 +992,18 @@ def _as_int(v: Any) -> int | None:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _dtype_label(arrow_type: "pa.DataType") -> str:
+    """One-line canonical dtype name via yggdrasil.data's type system.
+
+    Routes pyarrow types through ``DataType.from_arrow_type`` so the SQL grid
+    labels match the catalog's inferred column dtypes exactly, collapsing the
+    pretty-printer's whitespace for nested types onto a single line.
+    """
+    from yggdrasil.data.types.base import DataType
+    return " ".join(str(DataType.from_arrow_type(arrow_type)).split())
+
+
+def _sql_columns(schema: "pa.Schema") -> list[SqlColumn]:
+    return [SqlColumn(name=f.name, dtype=_dtype_label(f.type)) for f in schema]
