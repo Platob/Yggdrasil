@@ -1,17 +1,20 @@
-"""SendIO — the seekable, zero-copy, spill-backed request-body adapter.
+"""SendIO — the seekable, zero-copy, bounded request-body adapter.
 
 Unit cases pin the file-like contract (chunked read, len, seek/tell, window,
-zero-copy memoryview). Wire cases prove a body — in-memory *and* spilled to
-disk — round-trips byte-exact through a real ``HTTPSession`` POST, replays
-intact across a connection-retry, and (the headline) uploads a large spilled
-body in bounded memory instead of materialising it whole.
+zero-copy memoryview). Wire cases prove a body round-trips byte-exact through a
+real ``HTTPSession`` POST — both an in-memory :class:`Memory` holder and a real
+on-disk file IO — replays intact across a connection-retry, and (the headline)
+uploads a large file in bounded memory instead of materialising it whole.
+
+SendIO is generic over any yggdrasil :class:`~yggdrasil.io.holder.Holder`, so
+the tests drive it with the two real IOs you'd actually send: ``Memory`` and a
+``LocalPath`` file opened ``"rb"`` — no synthetic buffer plumbing.
 """
 from __future__ import annotations
 
 import gc
 import hashlib
 import http.server
-import io
 import threading
 import tracemalloc
 from socketserver import ThreadingMixIn
@@ -20,20 +23,16 @@ import pytest
 
 from yggdrasil.http_.send_io import SEND_CHUNK, SendIO
 from yggdrasil.http_.session import HTTPSession
+from yggdrasil.path.local_path import LocalPath
 from yggdrasil.path.memory import Memory
-from yggdrasil.path.memory_stream import MemoryStream
 
 _MIB = 1024 * 1024
 
 
-def _spilled_stream(data: bytes, *, spill_threshold: int = _MIB) -> MemoryStream:
-    """A MemoryStream holding ``data`` mostly on disk: a small in-memory window
-    (``spill_threshold``) with the default multi-GiB retention budget, so the
-    head stays readable from byte 0 (nothing evicted) while the bulk is spilled.
-    """
-    ms = MemoryStream(source=io.BytesIO(data), spill_threshold=spill_threshold)
-    ms._pull_to_eof()
-    return ms
+def _file_io(path, data):
+    """A real on-disk file opened as a readable IO (``.size`` + ``read_mv``)."""
+    path.write_bytes(data)
+    return LocalPath.from_(str(path)).open(mode="rb")
 
 
 # -- unit: file-like contract ----------------------------------------------
@@ -58,9 +57,7 @@ def test_read_returns_zero_copy_memoryview_into_holder():
     holder = Memory(binary=data)
     sio = SendIO(holder, chunk_size=4096)
     mv = sio.read(100)
-    assert isinstance(mv, memoryview)
-    # Same bytes as the holder slice, and an actual view (not a fresh copy):
-    # mutating the holder buffer shows through the still-live view.
+    assert isinstance(mv, memoryview)   # not a bytes copy — handed to sendall as-is
     assert bytes(mv) == data[:100]
     assert bytes(holder.read_mv(100, 0)) == data[:100]
 
@@ -103,6 +100,13 @@ def test_invalid_args_raise():
         SendIO(Memory(binary=b"x"), chunk_size=0)
     with pytest.raises(ValueError):
         SendIO(Memory(binary=b"x"), base=99)
+
+
+def test_works_over_a_real_file_io(tmp_path):
+    data = bytes((i * 5) % 256 for i in range(200_000))
+    sio = SendIO(_file_io(tmp_path / "b.bin", data), chunk_size=8192)
+    assert len(sio) == len(data)
+    assert b"".join(iter(lambda: bytes(sio.read(8192)), b"")) == data
 
 
 # -- wire: round-trip through a real session --------------------------------
@@ -154,7 +158,7 @@ def server():
         srv.shutdown()
 
 
-def _post_and_check(session, base, holder, data):
+def _post_and_check(session, holder, data):
     r = session.post("/echo", body=holder)
     assert r.status_code == 200
     assert r.headers.get("X-Body-Len") == str(len(data))
@@ -164,28 +168,22 @@ def _post_and_check(session, base, holder, data):
 def test_wire_post_in_memory_body_roundtrips(server):
     session = HTTPSession(base_url=server)
     data = bytes((i * 31) % 256 for i in range(3 * _MIB))
-    _post_and_check(session, server, Memory(binary=data), data)
+    _post_and_check(session, Memory(binary=data), data)
 
 
-def test_wire_post_spilled_stream_body_roundtrips(server):
+def test_wire_post_file_body_roundtrips(server, tmp_path):
     session = HTTPSession(base_url=server)
     data = bytes((i * 17) % 256 for i in range(4 * _MIB))
-    ms = _spilled_stream(data, spill_threshold=_MIB)
-    # Precondition: the body really is spilled (bulk on disk) yet retained
-    # from byte 0, which is exactly what SendIO must stream + replay.
-    assert ms._window_start > 0
-    assert ms._spill_start == 0
-    _post_and_check(session, server, ms, data)
+    _post_and_check(session, _file_io(tmp_path / "body.bin", data), data)
 
 
-def test_wire_retry_replays_full_spilled_body_on_fresh_socket(server):
+def test_wire_retry_replays_full_body_on_fresh_socket(server, tmp_path):
     # First connection is dropped before responding → the send retries on a
-    # fresh socket with a fresh SendIO that must re-send the whole spilled body.
+    # fresh socket with a fresh SendIO that must re-send the whole file.
     _EchoHandler.fail_first = 1
     session = HTTPSession(base_url=server)
     data = bytes((i * 7) % 256 for i in range(4 * _MIB))
-    ms = _spilled_stream(data, spill_threshold=_MIB)
-    r = session.post("/echo", body=ms)
+    r = session.post("/echo", body=_file_io(tmp_path / "body.bin", data))
     assert r.status_code == 200
     assert r.content.decode() == hashlib.sha256(data).hexdigest()
     assert _EchoHandler.conns == 2  # dropped once, succeeded on the retry
@@ -193,13 +191,14 @@ def test_wire_retry_replays_full_spilled_body_on_fresh_socket(server):
 
 # -- benchmark: bounded memory ----------------------------------------------
 
-def test_sendio_streams_a_spilled_body_in_bounded_memory():
-    # Compare peak heap of producing the whole body two ways:
+def test_sendio_streams_a_file_in_bounded_memory(tmp_path):
+    # Produce the whole body two ways and compare peak heap:
     #   (a) SendIO chunked reads (what the wire send now does), vs
-    #   (b) read_mv(-1, 0) — the old path that materialises the body whole.
-    # SendIO must peak far below the full-materialisation path.
+    #   (b) read_mv(-1, 0) — the old path that materialises the file whole.
     size = 32 * _MIB
     data = bytes((i * 13) % 256 for i in range(size))
+    path = tmp_path / "big.bin"
+    path.write_bytes(data)
 
     def peak(fn):
         gc.collect()
@@ -212,8 +211,7 @@ def test_sendio_streams_a_spilled_body_in_bounded_memory():
         return pk
 
     def via_sendio():
-        ms = _spilled_stream(data, spill_threshold=_MIB)
-        sio = SendIO(ms)
+        sio = SendIO(LocalPath.from_(str(path)).open(mode="rb"))
         total = 0
         while True:
             chunk = sio.read(SEND_CHUNK)  # not retained → bounded resident set
@@ -223,19 +221,16 @@ def test_sendio_streams_a_spilled_body_in_bounded_memory():
         assert total == size
 
     def via_full_read():
-        ms = _spilled_stream(data, spill_threshold=_MIB)
-        mv = ms.read_mv(-1, 0)            # one contiguous view over the whole body
+        mv = LocalPath.from_(str(path)).open(mode="rb").read_mv(-1, 0)
         assert len(mv) == size
 
-    # warm (build spill files, fill caches) so the measured run is steady-state
-    via_sendio()
+    via_sendio()      # warm
     via_full_read()
 
     peak_sendio = peak(via_sendio)
     peak_full = peak(via_full_read)
 
-    # Full materialisation pays ~the whole body; SendIO pays ~one window+chunk.
-    assert peak_full > size * 0.5, f"control didn't materialise the body: {peak_full}"
+    assert peak_full > size * 0.5, f"control didn't materialise the file: {peak_full}"
     assert peak_sendio < peak_full * 0.25, (
         f"SendIO peak {peak_sendio} not well below full-read {peak_full}"
     )
