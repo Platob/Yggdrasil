@@ -60,9 +60,10 @@ __all__ = [
 
 
 def _field_has_variant(field: "Field") -> bool:
-    """``True`` when *field*'s type tree contains an ``ObjectType`` (variant)
-    anywhere — at the field itself or nested inside a struct / map / list."""
-    if field.type_id == DataTypeId.OBJECT:
+    """``True`` when *field*'s type tree carries an opaque/variant type
+    (``ObjectType`` or ``NullType`` — :attr:`DataTypeId.is_any_or_null`)
+    anywhere: at the field itself or nested inside a struct / map / list."""
+    if field.dtype.type_id.is_any_or_null:
         return True
     return any(_field_has_variant(c) for c in field.dtype.children)
 
@@ -72,18 +73,18 @@ def _rebind_variant_fields(
     casted: "list[pa.Array]",
     arrow_fields: "list[pa.Field]",
 ) -> "list[pa.Field]":
-    """Rebind every target field whose type tree carries a variant
-    (``ObjectType``) to its column's actual arrow type before struct assembly.
+    """Rebind every target field whose type tree carries an opaque/variant type
+    to its column's actual arrow type before struct assembly.
 
-    An ``ObjectType`` target is a "keep whatever's here" passthrough — its cast
-    returns the source array untouched and its declared arrow type
-    (``large_binary``) is a physical stand-in, not a cast request. When a
-    variant sits anywhere in the tree the casted array — not the declared
-    schema — is authoritative for that column, so binding its real type into
-    the assembled fields lets a bare ``columns=`` projection over struct / map /
-    list children preserve source dtypes instead of failing to coerce e.g.
-    ``int64`` -> large_binary. Returns *arrow_fields* unchanged when no field
-    carries a variant.
+    ``ObjectType`` / ``NullType`` targets are "keep whatever's here"
+    passthroughs (identity under merge, no-op on cast) — their declared arrow
+    type (``large_binary`` / ``null``) is a physical stand-in, not a cast
+    request. When such a type sits anywhere in the tree the casted array — not
+    the declared schema — is authoritative for that column, so binding its real
+    type into the assembled fields lets a bare ``columns=`` projection over
+    struct / map / list children preserve source dtypes instead of failing to
+    coerce e.g. ``int64`` -> large_binary. Returns *arrow_fields* unchanged when
+    no field carries one.
     """
     if not any(_field_has_variant(c) for c in target_children):
         return arrow_fields
