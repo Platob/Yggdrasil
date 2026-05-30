@@ -665,7 +665,7 @@ class Predicate(Expression):
                         self, _arrow_field_lookup(batch.schema),
                     )
                     effective_arrow = effective.to_arrow()
-                kept = batch.filter(effective_arrow)
+                kept = _materialize_view_columns(batch).filter(effective_arrow)
             if kept.num_rows > 0:
                 yield kept
 
@@ -694,7 +694,7 @@ class Predicate(Expression):
         if clauses is not None:
             return _apply_inlist(target, clauses)
         effective = _rewrite_with_target_lookup(self, _arrow_field_lookup(target.schema))
-        return target.filter(effective.to_arrow())
+        return _materialize_view_columns(target).filter(effective.to_arrow())
 
     # ------------------------------------------------------------------
     # Engine filters — mirrors the read_X / write_X surface every
@@ -1523,6 +1523,47 @@ def _apply_inlist_pylist(
     return out
 
 
+def _materialize_view_columns(target: "Any") -> "Any":
+    """Replace Arrow ``string_view`` / ``binary_view`` columns with their
+    materialized (``utf8`` / ``binary``) equivalents.
+
+    PyArrow's ``filter`` / ``take`` kernels have no ``*_view`` support in the
+    runtimes bundled with some platforms (e.g. Databricks), so applying a
+    boolean mask over a ``string_view`` column raises
+    ``ArrowNotImplementedError: Function 'array_take' has no kernel matching
+    input types (string_view, ...)``. Materializing the offending columns
+    first keeps :meth:`filter` on the supported path. *target* (a
+    :class:`pa.Table` or :class:`pa.RecordBatch`) is returned unchanged when
+    it carries no view columns. Detection is by type name so it works even on
+    pyarrow builds that predate the ``pa.types.is_string_view`` predicate.
+    """
+    import pyarrow as pa
+
+    plain_for = {"string_view": pa.string(), "binary_view": pa.binary()}
+    schema = target.schema
+    replacements: "dict[int, Any]" = {}
+    for index, field in enumerate(schema):
+        plain = plain_for.get(str(field.type))
+        if plain is not None:
+            replacements[index] = field.with_type(plain)
+    if not replacements:
+        return target
+
+    new_schema = pa.schema(
+        [replacements.get(i, f) for i, f in enumerate(schema)],
+        metadata=schema.metadata,
+    )
+    if hasattr(target, "cast"):  # pa.Table.cast(schema)
+        return target.cast(new_schema)
+    # pa.RecordBatch has no .cast(schema) — rebuild from per-column casts.
+    columns = [
+        target.column(i).cast(new_schema.field(i).type) if i in replacements
+        else target.column(i)
+        for i in range(target.num_columns)
+    ]
+    return pa.RecordBatch.from_arrays(columns, schema=new_schema)
+
+
 def _apply_inlist(
     target: "Any",
     clauses: "list[tuple[str, frozenset, bool]]",
@@ -1558,7 +1599,7 @@ def _apply_inlist(
         if includes_null:
             m = pc.or_kleene(m, pc.is_null(col_arr))
         mask = m if mask is None else pc.and_kleene(mask, m)
-    return target.filter(mask)
+    return _materialize_view_columns(target).filter(mask)
 
 
 def _apply_inlist_small(
