@@ -186,9 +186,6 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         rather than paying for an extra ``HeadObject`` /
         ``get_metadata`` round trip up front.
         """
-        if options.target:
-            return options.target
-
         if self.size_known and self.size == 0:
             return Schema.empty()
         try:

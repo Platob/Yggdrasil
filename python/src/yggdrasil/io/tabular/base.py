@@ -958,9 +958,10 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             return self._schema_cache
 
         options = self.check_options(options, overrides=locals())
+        m = options.merged
 
-        if options.target:
-            return options.target
+        if m:
+            return m
 
         schema = self._collect_schema(options)
         if schema is not None:

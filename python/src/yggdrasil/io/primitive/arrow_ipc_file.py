@@ -188,9 +188,6 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         through :meth:`arrow_input_stream` so a codec'd holder is
         transparently decompressed before the footer probe.
         """
-        if options.target:
-            return options.target
-
         if self.size_known and self.size == 0:
             return Schema.empty()
         try:

@@ -137,8 +137,6 @@ class PickleFile(IO[Any, PickleOptions]):
     # ==================================================================
 
     def _collect_schema(self, options: PickleOptions) -> Schema:
-        if options.target:
-            return options.target
         if self.size_known and self.size == 0:
             return Schema.empty()
         try:
