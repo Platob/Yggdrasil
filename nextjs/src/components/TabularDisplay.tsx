@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchArrowRichPost, type ColKind } from "@/lib/arrow";
 import { materializeSql, type PlanGraph } from "@/lib/api";
 import TabularAnalyze from "@/components/TabularAnalyze";
+import RegisterSagaModal from "@/components/RegisterSagaModal";
 
 export interface TabularColumnDef { name: string; dtype?: string; kind?: ColKind }
 export type Cell = unknown;
@@ -61,6 +62,35 @@ function fmt(v: unknown): string {
   return String(v);
 }
 
+interface XForm { op: "explode" | "unnest"; col: string }
+type Grid = { columns: TabularColumnDef[]; rows: Cell[][] };
+
+// Client-side nested transforms — lazy, no backend round-trip.
+function applyXforms(columns: TabularColumnDef[], rows: Cell[][], xs: XForm[]): Grid {
+  let c = columns, r = rows;
+  for (const x of xs) {
+    const i = c.findIndex((col) => col.name === x.col);
+    if (i < 0) continue;
+    if (x.op === "explode") {
+      const nr: Cell[][] = [];
+      for (const row of r) {
+        const v = row[i];
+        if (Array.isArray(v)) { for (const el of v) { const nrow = [...row]; nrow[i] = el; nr.push(nrow); } }
+        else nr.push(row);
+      }
+      r = nr;
+      c = c.map((col, j) => (j === i ? { ...col, dtype: "item", kind: "other" } : col));
+    } else { // unnest a struct into one column per field
+      const fields: string[] = [];
+      for (const row of r) { const v = row[i]; if (v && typeof v === "object" && !Array.isArray(v)) for (const k of Object.keys(v)) if (!fields.includes(k)) fields.push(k); }
+      const cols: TabularColumnDef[] = fields.map((f) => ({ name: `${x.col}.${f}`, dtype: "", kind: "other" }));
+      c = [...c.slice(0, i), ...cols, ...c.slice(i + 1)];
+      r = r.map((row) => { const v = row[i] as Record<string, unknown> | null; const vals = fields.map((f) => (v && typeof v === "object" ? (v[f] ?? null) : null)); return [...row.slice(0, i), ...vals, ...row.slice(i + 1)]; });
+    }
+  }
+  return { columns: c, rows: r };
+}
+
 /**
  * Embeddable typed tabular grid. Two modes: in-memory `data`, or `query` which
  * streams Arrow IPC from `/sql.arrow` (a straight source becomes
@@ -86,6 +116,8 @@ export default function TabularDisplay({
   const [aPath, setAPath] = useState<string | null>(query?.source ?? null);
   const [aBusy, setABusy] = useState(false);
   const [aErr, setAErr] = useState("");
+  const [xforms, setXforms] = useState<XForm[]>([]);
+  const [regOpen, setRegOpen] = useState(false);
 
   useEffect(() => {
     if (!query) return;
@@ -109,7 +141,10 @@ export default function TabularDisplay({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query?.sql, query?.source, query?.catalog, query?.schema, query?.node, query?.limit, pageSize]);
 
-  const src = data ?? fetched ?? { columns: [], rows: [] };
+  const base = useMemo(() => data ?? fetched ?? { columns: [], rows: [] }, [data, fetched]);
+  // Apply client-side nested transforms (explode/unnest) to derive the grid.
+  const src = useMemo(() => (xforms.length ? applyXforms(base.columns, base.rows, xforms) : base),
+    [base, xforms]);
   const kinds = useMemo(
     () => src.columns.map((c) => c.kind ?? kindFromDtype(c.dtype)),
     [src.columns],
@@ -148,7 +183,8 @@ export default function TabularDisplay({
   // a path; a SQL source is materialised once to a tmp parquet on demand — so
   // Saga and Files analyse the exact same way.
   const canAnalyze = !!(query && (query.source || query.sql));
-  const analyzeCols = useMemo(() => src.columns.map((c) => ({ name: c.name, type: c.dtype })), [src.columns]);
+  // Analytics run on the materialised *original* result, so use base columns.
+  const analyzeCols = useMemo(() => base.columns.map((c) => ({ name: c.name, type: c.dtype })), [base.columns]);
   const openAnalyze = async () => {
     setPane("analyze");
     if (aPath) return;
@@ -191,10 +227,19 @@ export default function TabularDisplay({
             </span>
           )}
           {cap && <span className="font-mono">{cap}</span>}
+          {xforms.map((x, i) => (
+            <span key={i} className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber/10 text-amber border border-amber/20 font-mono">
+              {x.op} {x.col}
+              <button onClick={() => setXforms((xs) => xs.filter((_, j) => j !== i))} className="text-amber/60 hover:text-rose">✕</button>
+            </span>
+          ))}
           {view.length !== src.rows.length && <span className="text-amber/80">· {view.length} shown</span>}
           {copied && <span className="text-emerald/80">· copied</span>}
           {(loading || aBusy) && <span className="text-frost/80">· {aBusy ? "materialising…" : "loading…"}</span>}
           <div className="flex-1" />
+          {query?.sql && (
+            <button onClick={() => setRegOpen(true)} className="text-emerald/70 hover:text-emerald" title="register this query as a Saga view">⊕ view</button>
+          )}
           {onExpand && <button onClick={onExpand} className="text-frost/70 hover:text-frost" title="expand">⤢</button>}
         </div>
       )}
@@ -214,11 +259,23 @@ export default function TabularDisplay({
             <tr>
               <th className="w-10 text-right px-2 py-1.5 border-b border-white/[0.08] text-muted font-normal select-none">#</th>
               {src.columns.map((c, ci) => (
-                <th key={ci} onClick={() => toggleSort(ci)}
-                  className="text-left px-2 py-1.5 border-b border-white/[0.08] text-frost/80 whitespace-nowrap cursor-pointer hover:text-frost select-none">
-                  {c.name}
-                  <span className="text-muted ml-1 font-normal">{NESTED.includes(kinds[ci]) ? kinds[ci] : (c.dtype ?? "")}</span>
-                  {sort?.col === ci && <span className="ml-1 text-frost">{sort.dir === 1 ? "▲" : "▼"}</span>}
+                <th key={ci}
+                  className="text-left px-2 py-1.5 border-b border-white/[0.08] text-frost/80 whitespace-nowrap select-none group">
+                  <span onClick={() => toggleSort(ci)} className="cursor-pointer hover:text-frost">
+                    {c.name}
+                    <span className="text-muted ml-1 font-normal">{NESTED.includes(kinds[ci]) ? kinds[ci] : (c.dtype ?? "")}</span>
+                    {sort?.col === ci && <span className="ml-1 text-frost">{sort.dir === 1 ? "▲" : "▼"}</span>}
+                  </span>
+                  {kinds[ci] === "list" && (
+                    <button onClick={() => setXforms((x) => [...x, { op: "explode", col: c.name }])}
+                      title="explode list → one row per element"
+                      className="ml-1.5 opacity-0 group-hover:opacity-100 text-amber/70 hover:text-amber">⊞</button>
+                  )}
+                  {kinds[ci] === "struct" && (
+                    <button onClick={() => setXforms((x) => [...x, { op: "unnest", col: c.name }])}
+                      title="unnest struct → one column per field"
+                      className="ml-1.5 opacity-0 group-hover:opacity-100 text-frost/70 hover:text-frost">⊟</button>
+                  )}
                 </th>
               ))}
             </tr>
@@ -275,6 +332,14 @@ export default function TabularDisplay({
           </button>
         )}
       </div>
+      )}
+
+      {regOpen && query?.sql && (
+        <RegisterSagaModal
+          node={query.node}
+          defaults={{ objectType: "VIEW", definition: query.sql }}
+          onClose={() => setRegOpen(false)}
+        />
       )}
     </div>
   );

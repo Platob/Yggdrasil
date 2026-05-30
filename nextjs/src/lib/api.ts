@@ -742,7 +742,12 @@ export async function deleteCatalogEntity(path: string): Promise<void> {
 
 // One-shot: ensure catalog + schema, infer the table name from the file, and
 // register + profile it. Used by the Files page's "register in Saga" action.
-export async function registerFile(body: { source_url: string; catalog?: string; schema?: string; table?: string; node?: string | null }): Promise<{ table: TableEntry }> {
+// The current user on this node — used to default-name a registered view.
+export function getMe(): Promise<UserCard> {
+  return jsonFetch<UserCard>("/api/v2/user/me");
+}
+
+export async function registerFile(body: { source_url: string; catalog?: string; schema?: string; table?: string; object_type?: string; definition?: string; node?: string | null }): Promise<{ table: TableEntry }> {
   const r = await jsonFetch<{ table: TableEntry }>("/api/v2/saga/register", { method: "POST", body: JSON.stringify(body) });
   invalidate("saga/catalog");
   return r;
