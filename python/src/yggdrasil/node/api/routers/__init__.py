@@ -13,6 +13,8 @@ from .workbook import router as workbook_router
 from .user import router as user_router
 from .messenger import router as messenger_router
 from .excel import router as excel_router
+from .market import router as market_router
+from .ai_insight import router as ai_insight_router
 
 __all__ = [
     "backend_router",
@@ -30,4 +32,6 @@ __all__ = [
     "analysis_router",
     "workbook_router",
     "user_router",
+    "market_router",
+    "ai_insight_router",
 ]

@@ -131,3 +131,33 @@ class OhlcResult(StrictModel):
     volume: list[float | None] | None = None
     bars: int
     source_rows: int
+
+
+class IndicatorSpec(StrictModel):
+    type: str                 # rsi | macd | ema | bb (bollinger bands)
+    params: dict[str, Any] = {}
+
+
+class IndicatorRequest(StrictModel):
+    path: str
+    column: str               # price column
+    x: str | None = None      # time/order column (else row index)
+    indicators: list[IndicatorSpec]
+    filters: list[FilterSpec] = []
+
+
+class IndicatorSeries(StrictModel):
+    type: str
+    name: str
+    # Different indicators emit different output keys: rsi -> {"rsi": [...]},
+    # macd -> {"macd", "signal", "histogram"}, bb -> {"middle", "upper", "lower"}.
+    values: dict[str, list[float | None]]
+
+
+class IndicatorResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    x: list[Any]
+    source_rows: int
+    indicators: list[IndicatorSeries]

@@ -683,3 +683,120 @@ export async function sendMessage(channel: string, content: string): Promise<Mes
 export function createMessageStream(channel: string): EventSource {
   return new EventSource(`/api/v2/messenger/${encodeURIComponent(channel)}/stream`);
 }
+
+// ── Market ─────────────────────────────────────────────────────────────────
+
+export interface MarketQuote {
+  ticker: string;
+  price: number | null;
+  previous_close: number | null;
+  change: number | null;
+  change_pct: number | null;
+  volume: number | null;
+  timestamp: string | null;
+  available: boolean;
+  error?: string;
+}
+
+export interface MarketHistory {
+  ticker: string;
+  period: string;
+  interval: string;
+  x: string[];
+  open: (number | null)[];
+  high: (number | null)[];
+  low: (number | null)[];
+  close: (number | null)[];
+  volume: (number | null)[];
+  available: boolean;
+  error?: string;
+}
+
+export function getWatchlist(): Promise<{ node_id: string; tickers: string[] }> {
+  return jsonFetch("/api/v2/market/watchlist");
+}
+
+export async function addToWatchlist(ticker: string): Promise<{ node_id: string; tickers: string[] }> {
+  return jsonFetch("/api/v2/market/watchlist", {
+    method: "POST",
+    body: JSON.stringify({ ticker }),
+  });
+}
+
+export async function removeFromWatchlist(ticker: string): Promise<{ node_id: string; tickers: string[] }> {
+  return jsonFetch(`/api/v2/market/watchlist/${encodeURIComponent(ticker)}`, { method: "DELETE" });
+}
+
+export function getMarketQuote(ticker: string): Promise<MarketQuote> {
+  return jsonFetch(`/api/v2/market/quote?ticker=${encodeURIComponent(ticker)}`);
+}
+
+export function getMarketHistory(
+  ticker: string,
+  period = "1mo",
+  interval = "1d",
+): Promise<MarketHistory> {
+  return jsonFetch(
+    `/api/v2/market/history?ticker=${encodeURIComponent(ticker)}&period=${period}&interval=${interval}`,
+  );
+}
+
+// ── Technical Indicators ───────────────────────────────────────────────────
+
+export interface IndicatorSpec {
+  type: "rsi" | "macd" | "ema" | "bb";
+  params?: Record<string, number>;
+}
+
+export interface IndicatorSeries {
+  type: string;
+  name: string;
+  values: Record<string, (number | null)[]>;
+}
+
+export interface IndicatorResult {
+  node_id: string;
+  path: string;
+  column: string;
+  x: (string | number)[];
+  source_rows: number;
+  indicators: IndicatorSeries[];
+}
+
+export function getIndicators(
+  path: string,
+  column: string,
+  indicators: IndicatorSpec[],
+  opts: { x?: string; filters?: FilterSpec[] } = {},
+): Promise<IndicatorResult> {
+  return jsonFetch("/api/v2/analysis/indicators", {
+    method: "POST",
+    body: JSON.stringify({ path, column, indicators, ...opts }),
+  });
+}
+
+// ── AI Insights ────────────────────────────────────────────────────────────
+
+export interface AIAnalysisResult {
+  analysis: string;
+  model: string;
+}
+
+export interface AIInsightResult {
+  insight: string;
+  model: string;
+}
+
+export function aiAnalyzeFile(path: string, query: string): Promise<AIAnalysisResult> {
+  return jsonFetch("/api/v2/ai/analyze", {
+    method: "POST",
+    body: JSON.stringify({ path, query }),
+  });
+}
+
+export function aiGenerateInsight(context: string): Promise<AIInsightResult> {
+  return jsonFetch("/api/v2/ai/insight", {
+    method: "POST",
+    body: JSON.stringify({ context }),
+  });
+}

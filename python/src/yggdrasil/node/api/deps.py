@@ -15,6 +15,8 @@ from .services.replicate import ReplicateService
 from .services.user import UserService
 from .services.messenger import MessengerService as V2MessengerService
 from .services.excel import ExcelService
+from .services.market import MarketService
+from .services.ai_insight import AIInsightService
 
 
 def get_fs_service(request: Request) -> FsService:
@@ -67,3 +69,11 @@ def get_messenger_service(request: Request) -> V2MessengerService:
 
 def get_excel_service(request: Request) -> ExcelService:
     return request.app.state.excel_service
+
+
+def get_market_service(request: Request) -> MarketService:
+    return request.app.state.market_service
+
+
+def get_ai_insight_service(request: Request) -> AIInsightService:
+    return request.app.state.ai_insight_service

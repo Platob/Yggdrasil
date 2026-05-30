@@ -101,6 +101,12 @@ const Icons = {
       <path d="M11 4c-2 0-3 1.2-3 4v8c0 2.8-1 4-3 4" />
     </svg>
   ),
+  trading: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 12v4M5 6v2M19 16v2M19 8v4M12 8v8" />
+      <path d="M3 14h4M3 8h4M17 18h4M17 12h4M10 10h4" />
+    </svg>
+  ),
 };
 
 const NAV_ITEMS = [
@@ -111,6 +117,7 @@ const NAV_ITEMS = [
   { href: "/topology", label: "Topology", icon: Icons.topology },
   { href: "/functions", label: "Functions", icon: Icons.functions },
   { href: "/dags", label: "DAGs", icon: Icons.dags },
+  { href: "/trading", label: "Trading", icon: Icons.trading },
   { href: "/chat", label: "Chat", icon: Icons.chat },
   { href: "/files", label: "Files", icon: Icons.files },
   { href: "/excel", label: "Excel", icon: Icons.excel },

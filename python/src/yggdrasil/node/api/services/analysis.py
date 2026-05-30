@@ -31,6 +31,9 @@ from ..schemas.analysis import (
     FilterSpec,
     FinanceRequest,
     FinanceResult,
+    IndicatorRequest,
+    IndicatorResult,
+    IndicatorSeries,
     OhlcRequest,
     OhlcResult,
     SeriesRequest,
@@ -77,6 +80,9 @@ class AnalysisService:
 
     async def ohlc(self, req: OhlcRequest) -> OhlcResult:
         return await run_in_threadpool(partial(self._ohlc, req))
+
+    async def indicators(self, req: IndicatorRequest) -> IndicatorResult:
+        return await run_in_threadpool(partial(self._indicators, req))
 
     async def export(self, req: ExportRequest):
         """Apply the transform and write the result in `fmt`. Returns
@@ -378,4 +384,91 @@ class AnalysisService:
             low=_safe_list(out["low"]), close=_safe_list(out["close"]),
             volume=_safe_list(out["volume"]) if has_vol else None,
             bars=out.height, source_rows=source_rows,
+        )
+
+    # -- technical indicators -----------------------------------------------
+
+    def _indicators(self, req: IndicatorRequest) -> IndicatorResult:
+        """RSI / MACD / EMA / Bollinger Bands as polars expressions over the
+        ordered price series. Capped at 5000 points so the returned vectors stay
+        bounded; the indicators themselves are causal (use past values only)."""
+        if not req.indicators:
+            raise BadRequestError("indicators needs at least one indicator spec")
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        if req.column not in cols:
+            raise BadRequestError(f"column {req.column!r} not found")
+        has_x = bool(req.x and req.x in cols)
+        keep = [req.column] + ([req.x] if has_x else [])
+        plan = lf.select(keep)
+        if has_x:
+            plan = plan.sort(req.x)
+        cap = 5000
+        df = plan.head(cap).collect(engine="streaming")
+        source_rows = lf.select(pl.len()).collect(engine="streaming").item()
+
+        price = df[req.column].cast(pl.Float64, strict=False)
+        series: list[IndicatorSeries] = []
+        for spec in req.indicators:
+            kind = spec.type.lower()
+            p = spec.params
+            if kind == "rsi":
+                period = int(p.get("period", 14))
+                delta = price.diff()
+                gain = delta.clip(lower_bound=0)
+                loss = (-delta).clip(lower_bound=0)
+                avg_gain = gain.ewm_mean(alpha=1 / period, adjust=False)
+                avg_loss = loss.ewm_mean(alpha=1 / period, adjust=False)
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+                series.append(IndicatorSeries(
+                    type="rsi", name=f"RSI({period})",
+                    values={"rsi": _safe_list(rsi)},
+                ))
+            elif kind == "ema":
+                period = int(p.get("period", 20))
+                ema = price.ewm_mean(span=period)
+                series.append(IndicatorSeries(
+                    type="ema", name=f"EMA({period})",
+                    values={"ema": _safe_list(ema)},
+                ))
+            elif kind == "macd":
+                fast = int(p.get("fast", 12))
+                slow = int(p.get("slow", 26))
+                signal_period = int(p.get("signal", 9))
+                macd = price.ewm_mean(span=fast) - price.ewm_mean(span=slow)
+                signal = macd.ewm_mean(span=signal_period)
+                histogram = macd - signal
+                series.append(IndicatorSeries(
+                    type="macd", name=f"MACD({fast},{slow},{signal_period})",
+                    values={
+                        "macd": _safe_list(macd),
+                        "signal": _safe_list(signal),
+                        "histogram": _safe_list(histogram),
+                    },
+                ))
+            elif kind == "bb":
+                period = int(p.get("period", 20))
+                num_std = float(p.get("num_std", 2))
+                middle = price.rolling_mean(window_size=period)
+                std = price.rolling_std(window_size=period)
+                upper = middle + num_std * std
+                lower = middle - num_std * std
+                series.append(IndicatorSeries(
+                    type="bb", name=f"BB({period},{num_std:g})",
+                    values={
+                        "middle": _safe_list(middle),
+                        "upper": _safe_list(upper),
+                        "lower": _safe_list(lower),
+                    },
+                ))
+            else:
+                raise BadRequestError(
+                    f"unknown indicator {spec.type!r}; one of rsi, macd, ema, bb"
+                )
+
+        x = df[req.x].to_list() if has_x else list(range(df.height))
+        return IndicatorResult(
+            node_id=self.settings.node_id, path=req.path, column=req.column,
+            x=[_safe(v) for v in x], source_rows=source_rows, indicators=series,
         )

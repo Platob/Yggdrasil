@@ -11,6 +11,8 @@ from ..schemas.analysis import (
     ExportRequest,
     FinanceRequest,
     FinanceResult,
+    IndicatorRequest,
+    IndicatorResult,
     OhlcRequest,
     OhlcResult,
     SeriesRequest,
@@ -94,6 +96,20 @@ async def ohlc(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/ohlc", json_body=req.model_dump())
     return await service.ohlc(req)
+
+
+@router.post("/indicators", response_model=IndicatorResult)
+async def indicators(
+    req: IndicatorRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> IndicatorResult:
+    """Technical indicators (RSI / MACD / EMA / Bollinger Bands) over the
+    ordered price series, capped at 5000 points."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/indicators", json_body=req.model_dump())
+    return await service.indicators(req)
 
 
 @router.post("/export")
