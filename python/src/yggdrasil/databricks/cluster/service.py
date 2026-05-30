@@ -465,7 +465,7 @@ class Clusters(DatabricksService):
                 "Ensure that you have the rights to do it."
             ) from e
 
-        instance = Cluster(service=self, cluster_id=details.cluster_id, cluster_name=details.cluster_name).set_details(details=details)
+        instance = Cluster(service=self, cluster_id=details.cluster_id).set_details(details=details)
 
         LOGGER.info("Created cluster %r", instance)
 
@@ -566,11 +566,11 @@ class Clusters(DatabricksService):
         for details in client.list(filter_by=filter_by):
             if name:
                 if name == details.cluster_name:
-                    cluster = Cluster(service=self, cluster_id=details.cluster_id, cluster_name=details.cluster_name).set_details(details=details)
+                    cluster = Cluster(service=self, cluster_id=details.cluster_id).set_details(details=details)
                     yield cluster
                     cnt += 1
             else:
-                cluster = Cluster(service=self, cluster_id=details.cluster_id, cluster_name=details.cluster_name).set_details(details=details)
+                cluster = Cluster(service=self, cluster_id=details.cluster_id).set_details(details=details)
 
                 yield cluster
                 cnt += 1
