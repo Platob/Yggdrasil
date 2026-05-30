@@ -995,7 +995,14 @@ class SagaService:
                 "table": payload.table.model_copy(update={
                     "source_url": target_source_url, "node": None}),
             })
-        elif req.mode != "metadata":
+        elif req.mode == "metadata":
+            # The target keeps a pointer to where the data lives, so queries on
+            # the target route compute back to this node (compute follows data).
+            payload = payload.model_copy(update={
+                "table": payload.table.model_copy(update={
+                    "node": payload.table.node or self.settings.node_id}),
+            })
+        else:
             raise BadRequestError(f"unknown replicate mode {req.mode!r}")
 
         await self._network.proxy_json(req.target, "POST", "/api/v2/saga/import",
