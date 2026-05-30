@@ -210,18 +210,17 @@ class NodePath:
     def read_text(self, encoding: str = "utf-8") -> str:
         if self.is_local:
             return self._local_path().read_text(encoding=encoding)
-        resp = _get(f"{self._node_url}/api/v2/fs/read?path={_quote(str(self._path))}")
-        content = resp.get("content", "")
-        if resp.get("encoding") == "base64":
-            return base64.b64decode(content).decode(encoding)
-        return content
+        # Stream the whole file so the JSON /read window (4 MB) never truncates it.
+        return b"".join(self.stream_read()).decode(encoding)
 
     def read_bytes(self, offset: int = 0, length: int | None = None) -> bytes:
         """Read the whole file, or a byte range ``[offset, offset+length)``.
 
         A ranged read seeks locally and uses the node's ``/fs/read?offset=&
         max_bytes=`` window remotely — so paging through a large remote file
-        never pulls the whole thing across the network.
+        never pulls the whole thing across the network. A full remote read
+        (no range) streams via ``/fs/stream`` so it is never capped by the
+        JSON ``/read`` window (4 MB) — large files come back intact.
         """
         if self.is_local:
             if offset == 0 and length is None:
@@ -230,6 +229,8 @@ class NodePath:
                 if offset:
                     f.seek(offset)
                 return f.read(length if length is not None else -1)
+        if offset == 0 and length is None:
+            return b"".join(self.stream_read())
         url = f"{self._node_url}/api/v2/fs/read?path={_quote(str(self._path))}&offset={offset}"
         if length is not None:
             url += f"&max_bytes={length}"
@@ -352,7 +353,13 @@ class NodePath:
                 yield chunk
 
     def stream_write(self, data: Iterator[bytes]) -> None:
-        """Send streaming data to the remote upload endpoint."""
+        """Send streaming data to the remote upload endpoint.
+
+        The iterator is handed straight to the request body — urllib emits it
+        with ``Transfer-Encoding: chunked`` and the node's ``/fs/upload``
+        endpoint writes each chunk as it arrives, so neither side ever holds
+        the whole file in memory.
+        """
         if self.is_local:
             p = self._local_path()
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -360,11 +367,9 @@ class NodePath:
                 for chunk in data:
                     f.write(chunk)
             return
-        # For remote, collect and POST as upload body
-        collected = b"".join(data)
         req = urllib.request.Request(
             f"{self._node_url}/api/v2/fs/upload?path={_quote(str(self._path))}",
-            data=collected,
+            data=iter(data),
             headers={"Content-Type": "application/octet-stream"},
             method="POST",
         )
@@ -384,8 +389,10 @@ class NodePath:
         if self.is_local and target.is_local:
             shutil.copy2(str(self._local_path()), str(target._local_path()))
         else:
-            data = self.read_bytes()
-            target.write_bytes(data)
+            # Pipe the source byte stream straight into the destination's
+            # streaming writer — even a remote→remote copy of a huge file
+            # flows chunk-by-chunk and never lands wholly in memory.
+            target.stream_write(self.stream_read())
         return target
 
 
