@@ -69,20 +69,34 @@ class TestArrowIPCTargetCast:
         out = self._write_and_read(target=target, columns=["id", "price"])
         assert out.column_names == ["id", "price"]
 
-    def test_projection_pushdown_computes_included_fields(self):
-        # The projection is pushed into the IPC reader as field indices, in
-        # file order, for exactly the columns the target wants.
+    def test_projection_columns_resolves_target_subset(self):
+        # The projection is the target's columns (target order) intersected
+        # with the file, applied as a zero-copy select.
         from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
         from yggdrasil.data.options import CastOptions
 
         names = ["id", "price", "name"]
         opt = CastOptions(target=schema(fields=[field("name", pa.string()),
                                                 field("id", pa.int64())]))
-        assert ArrowIPCFile._included_fields(opt, names) == [0, 2]   # id, name
+        assert ArrowIPCFile._projection_columns(opt, names) == ["name", "id"]
         # No target / full coverage / no file → read everything.
-        assert ArrowIPCFile._included_fields(CastOptions(), names) is None
+        assert ArrowIPCFile._projection_columns(CastOptions(), names) is None
         full = schema(fields=[field(n, pa.int64()) for n in names])
-        assert ArrowIPCFile._included_fields(CastOptions(target=full), names) is None
+        assert ArrowIPCFile._projection_columns(CastOptions(target=full), names) is None
+
+    def test_projected_read_stays_a_zero_copy_view(self):
+        # A projected read keeps the kept column viewing the source buffer
+        # (no decode copy), not just the full read.
+        import pyarrow as _pa
+        holder = Memory()
+        ArrowIPCFile(holder=holder, mode="wb").write_arrow_table(_source_table())
+        mv = holder.read_mv(-1, 0)
+        base = _pa.py_buffer(mv).address
+        end = base + len(mv)
+        out = ArrowIPCFile(holder=holder, mode="rb").read_arrow_table(
+            target=schema(fields=[field("price", pa.float64())]))
+        buf = out.column("price").chunk(0).buffers()[1]
+        assert base <= buf.address < end   # still a view into the source
 
     def test_projection_with_column_absent_from_file_fills_null(self):
         # A target column the file doesn't carry must survive the pushdown —

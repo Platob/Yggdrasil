@@ -121,28 +121,33 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
     # ==================================================================
 
     @staticmethod
-    def _included_fields(
+    def _projection_columns(
         options: ArrowIPCOptions, available_names: "list[str]",
-    ) -> "list[int] | None":
-        """File-field *indices* to push into ``IpcReadOptions.included_fields``.
+    ) -> "list[str] | None":
+        """Target column subset to project off each batch, in target order.
 
         The IPC analog of the Parquet ``columns=`` projection: when a target is
         bound and asks for fewer columns than the file carries, return the
-        indices (in file order) of the columns the target wants, so the reader
-        only reconstructs those fields instead of every column in each batch.
-        ``None`` means read everything — no target bound, or the target already
-        covers every column on disk (no point paying the reopen). Columns the
-        target wants but the file lacks are simply absent here; the downstream
-        cast fills them with nulls.
+        names it wants (intersected with the file, target order). ``None`` means
+        read everything — no target, or the target already covers every column.
+
+        Applied via :meth:`pa.RecordBatch.select` / :meth:`pa.Table.select`,
+        which is zero-copy: the kept columns keep referencing the underlying
+        memory-mapped / buffer payload (Arrow IPC is no-decode), the unwanted
+        ones are just dropped — so the projected read stays a view, unlike
+        ``IpcReadOptions(included_fields=…)`` which copies the selected fields
+        out. On a memory-mapped file the dropped columns' pages are never
+        faulted in. Columns the target wants but the file lacks are absent here;
+        the cast fills them with nulls.
         """
         target = options.target
         if target is None or not available_names:
             return None
-        wanted = frozenset(target.names)
-        included = [i for i, n in enumerate(available_names) if n in wanted]
-        if not included or len(included) == len(available_names):
+        avail = frozenset(available_names)
+        selected = [n for n in target.names if n in avail]
+        if not selected or len(selected) == len(available_names):
             return None
-        return included
+        return selected
 
     def _read_arrow_batches(
         self,
@@ -155,10 +160,9 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         read it back" flow is common enough to deserve the
         short-circuit.
 
-        A bound target narrows the read: the footer schema is read once to
-        resolve the projection, and when it shrinks the column set the reader
-        is reopened with ``IpcReadOptions(included_fields=…)`` so only the
-        wanted fields are decoded out of each batch.
+        A bound target narrows each batch with a zero-copy
+        :meth:`pa.RecordBatch.select` — the kept columns still view the
+        underlying mmap / buffer, the rest are dropped.
         """
         if self.size_known and self.size == 0:
             return
@@ -173,18 +177,12 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                 reader = ipc.RecordBatchFileReader(stream)
             except pa.ArrowInvalid:
                 return
-            included = self._included_fields(options, reader.schema.names)
-            if included is not None:
-                # Reopen with projection pushdown — the footer read above was
-                # metadata-only, so the only batch decode happens here.
-                stream_ctx.__exit__(None, None, None)
-                stream_ctx = self.arrow_input_stream()
-                stream = stream_ctx.__enter__()
-                reader = ipc.RecordBatchFileReader(
-                    stream, options=ipc.IpcReadOptions(included_fields=included),
-                )
+            columns = self._projection_columns(options, reader.schema.names)
             for i in range(reader.num_record_batches):
-                yield options.cast_arrow_batch(reader.get_batch(i))
+                batch = reader.get_batch(i)
+                if columns is not None:
+                    batch = batch.select(columns)
+                yield options.cast_arrow_batch(batch)
         finally:
             stream_ctx.__exit__(None, None, None)
 
@@ -210,18 +208,13 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                     reader = ipc.RecordBatchFileReader(stream)
                 except pa.ArrowInvalid:
                     return super()._read_arrow_table(options)
-                included = self._included_fields(options, reader.schema.names)
-                if included is None:
-                    table = reader.read_all()
-                else:
-                    # Projection pushdown: reopen so ``read_all`` only
-                    # reconstructs the wanted fields (the first open was the
-                    # metadata-only footer read).
-                    with self.arrow_input_stream() as projected:
-                        table = ipc.RecordBatchFileReader(
-                            projected,
-                            options=ipc.IpcReadOptions(included_fields=included),
-                        ).read_all()
+                table = reader.read_all()
+                columns = self._projection_columns(options, reader.schema.names)
+                if columns is not None:
+                    # Zero-copy projection: the kept columns keep viewing the
+                    # mmap / buffer payload; the rest are dropped (and on an
+                    # mmap their pages are never faulted in).
+                    table = table.select(columns)
         except FileNotFoundError:
             return super()._read_arrow_table(options)
         table = options.cast_arrow_table(table)
