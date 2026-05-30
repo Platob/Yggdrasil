@@ -1316,6 +1316,11 @@ class HTTPSession(Session):
                 next_retries.sleep(response=response)
                 retries = next_retries
                 if response.status == 429:
+                    # Rate limited: retry on a fresh connection (new source
+                    # port / TLS session) with a rotated User-Agent, so a
+                    # per-connection or UA-keyed limiter sees a clean client
+                    # rather than the just-throttled pooled socket.
+                    self._evict_host(current_request.url)
                     rotated_headers = HTTPHeaders(current_request.headers)
                     rotated_headers["User-Agent"] = random_user_agent()
                     current_request = current_request.copy(headers=rotated_headers)

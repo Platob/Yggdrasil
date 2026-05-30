@@ -62,8 +62,10 @@ def test_connection_errors_exhaust_only_after_eight():
 
 class _FlakyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    fail_first = 0   # drop the first N connections before responding
-    conns = 0        # connections the server accepted
+    fail_first = 0     # drop the first N connections before responding
+    throttle_first = 0  # answer the first N requests with 429 before 200
+    conns = 0          # connections the server accepted
+    requests = 0       # requests the server answered (any status)
 
     def setup(self):
         super().setup()
@@ -76,6 +78,15 @@ class _FlakyHandler(http.server.BaseHTTPRequestHandler):
             # raises RemoteDisconnected (a ConnectionResetError), the same shape
             # as a peer dropping a pooled socket.
             self.close_connection = True
+            return
+        type(self).requests += 1
+        if type(self).requests <= type(self).throttle_first:
+            body = b"slow down"
+            self.send_response(429)
+            self.send_header("Retry-After", "0")  # no real wait in the test
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         body = b"ok"
         self.send_response(200)
@@ -101,7 +112,9 @@ def server():
 @pytest.fixture(autouse=True)
 def _reset_handler():
     _FlakyHandler.fail_first = 0
+    _FlakyHandler.throttle_first = 0
     _FlakyHandler.conns = 0
+    _FlakyHandler.requests = 0
     yield
 
 
@@ -125,3 +138,16 @@ def test_exhausts_budget_and_raises_after_eight(server):
     with pytest.raises(MaxRetryError):
         session.get("/x")
     assert _FlakyHandler.conns == 9  # initial attempt + 8 retries, all fresh
+
+
+def test_429_retries_on_a_fresh_connection(server):
+    # First three requests are throttled (429), the fourth is 200. Each 429
+    # retry must dial a fresh socket rather than reuse the throttled pooled
+    # one — so connection count tracks request count.
+    _FlakyHandler.throttle_first = 3
+    session = HTTPSession(base_url=server)
+    r = session.get("/x")
+    assert r.status_code == 200
+    assert r.content == b"ok"
+    assert _FlakyHandler.requests == 4   # 3 × 429 + 1 × 200
+    assert _FlakyHandler.conns == 4      # a fresh connection per attempt
