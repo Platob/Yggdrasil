@@ -11,6 +11,8 @@ from ..schemas.analysis import (
     ExportRequest,
     FinanceRequest,
     FinanceResult,
+    ForecastRequest,
+    ForecastResult,
     OhlcRequest,
     OhlcResult,
     SeriesRequest,
@@ -80,6 +82,21 @@ async def series(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/series", json_body=req.model_dump())
     return await service.series(req)
+
+
+@router.post("/forecast", response_model=ForecastResult)
+async def forecast(
+    req: ForecastRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> ForecastResult:
+    """Forecast a value column over time (optionally per group key): fits
+    xgboost → gbr → ridge over trend/lag/seasonal features and projects
+    ``horizon`` steps with a confidence band. Runs where the data lives."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/forecast", json_body=req.model_dump())
+    return await service.forecast(req)
 
 
 @router.post("/ohlc", response_model=OhlcResult)

@@ -25,6 +25,7 @@ from .routers import (
     analysis_router,
     workbook_router,
     user_router,
+    saga_router,
 )
 from .services.audit import AuditLog
 from .services.backend import BackendService
@@ -40,6 +41,7 @@ from .services.tabular import TabularService
 from .services.analysis import AnalysisService
 from .services.user import UserService
 from .services.excel import ExcelService
+from .services.saga import SagaService
 
 
 def create_api(settings: Settings | None = None) -> FastAPI:
@@ -63,6 +65,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.state.fs_service = fs
     app.state.tabular_service = TabularService(settings, fs=fs)
     app.state.analysis_service = AnalysisService(settings, fs=fs)
+    app.state.saga_service = SagaService(settings)
 
     pyenv = PyEnvService(settings, audit=audit)
     pyfunc = PyFuncService(settings, audit=audit)
@@ -73,6 +76,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         lambda: pyfuncrun.total_count,
     )
     network = NetworkService(settings, backend)
+    app.state.saga_service.bind_network(network)
     dag = DAGService(settings, pyfuncrun, network_service=network, backend_service=backend)
     replicate = ReplicateService(settings, pyenv, pyfunc, dag)
     user_svc = UserService(settings)
@@ -282,6 +286,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(user_router, prefix=f"{prefix}/user")
     app.include_router(messenger_router, prefix=f"{prefix}/messenger")
     app.include_router(excel_router, prefix=f"{prefix}/excel")
+    app.include_router(saga_router, prefix=f"{prefix}/saga")
 
     @app.get(f"{prefix}/audit")
     async def get_audit(limit: int = 100):

@@ -23,6 +23,33 @@ class PyFuncUpdate(StrictModel):
     env_id: int | None = None
 
 
+# -- inference (scan code → name, signature, typed params, deps) -------------
+
+class PyFuncInferRequest(StrictModel):
+    code: str
+    name: str | None = None            # which def to read (else the first)
+    pin_versions: bool = True          # pin inferred deps to installed versions
+
+
+class PyFuncParam(StrictModel):
+    name: str
+    annotation: str = ""               # the source annotation, verbatim
+    dtype: str = ""                    # mapped to a yggdrasil.data dtype
+    default: str | None = None
+    has_default: bool = False
+
+
+class PyFuncInferResult(StrictModel):
+    name: str
+    signature: str                     # e.g. "process(data: list, k: float = 0.5) -> dict"
+    params: list[PyFuncParam] = Field(default_factory=list)
+    return_annotation: str = ""
+    return_dtype: str = ""
+    dependencies: list[str] = Field(default_factory=list)
+    python_version: str
+    docstring: str = ""
+
+
 class PyFuncEntry(StrictModel):
     id: int
     name: str

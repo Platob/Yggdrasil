@@ -654,6 +654,302 @@ export function analysisOhlc(
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
+// ── Forecasting ─────────────────────────────────────────────────────────
+export interface ForecastSeriesData {
+  key: string;
+  history_x: (string | number)[];
+  history_y: (number | null)[];
+  forecast_x: (string | number)[];
+  forecast_y: (number | null)[];
+  lower: (number | null)[];
+  upper: (number | null)[];
+  rmse: number | null;
+}
+
+export interface ForecastResult {
+  node_id: string;
+  path: string;
+  column: string;
+  model_used: string;
+  horizon: number;
+  period: number | null;
+  series: ForecastSeriesData[];
+  source_rows: number;
+  sampled: boolean;
+}
+
+// POST /analysis/forecast — fit xgboost→gbr→ridge over trend/lag/seasonal
+// features and project `horizon` steps with a confidence band. Cached client
+// side so re-opening the panel doesn't re-fit.
+export function analysisForecast(
+  path: string, column: string,
+  opts: {
+    x?: string; group?: string; horizon?: number; model?: string;
+    period?: number; agg?: string; filters?: FilterSpec[]; node?: string;
+  } = {},
+): Promise<ForecastResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/forecast${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
+export interface ForecastSpec {
+  source: string; column: string; x?: string | null; keys?: string[];
+  horizon?: number; model?: string; period?: number | null; agg?: string;
+  materialized?: boolean;
+}
+
+export interface ForecastAssetResult {
+  node_id: string;
+  table: TableEntry;
+  model_used: string;
+  rmse: number | null;
+  rows: number;
+  materialized_url: string | null;
+  sampled: boolean;
+}
+
+// POST /saga/forecast — register a forecasting workflow as a queryable
+// FORECAST catalog asset (live view, or materialised snapshot).
+export function registerForecastWorkflow(
+  input: { catalog?: string; schema?: string; name: string; spec: ForecastSpec; materialize?: boolean; comment?: string },
+  node?: string,
+): Promise<ForecastAssetResult> {
+  const url = `/api/v2/saga/forecast${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  return jsonFetch(url, { method: "POST", body: JSON.stringify(input) });
+}
+
+// ── Saga catalog ─────────────────────────────────────────────────────────
+
+export interface ColumnSpec { name: string; dtype: string; nullable: boolean; comment: string; }
+export interface ColumnStat {
+  column: string; null_count: number | null; distinct_count: number | null;
+  min: unknown; max: unknown;
+}
+export interface TableStatistics {
+  row_count: number | null; size_bytes: number | null;
+  columns: ColumnStat[]; computed_at: string | null;
+}
+export interface CatalogEntry {
+  id: number; name: string; comment: string; owner: string; dialect: string;
+  storage_location: string; node_id: string; schema_count: number;
+  properties: Record<string, string>; created_at: string; updated_at: string;
+}
+export interface SchemaEntry {
+  id: number; catalog: string; name: string; full_name: string; comment: string;
+  table_count: number; properties: Record<string, string>; created_at: string; updated_at: string;
+}
+export interface TableEntry {
+  id: number; catalog: string; schema: string; name: string; full_name: string;
+  object_type: string; definition: string;
+  table_type: string; format: string; source_url: string; node: string | null;
+  comment: string; columns: ColumnSpec[]; statistics: TableStatistics;
+  replicas: string[];
+  properties: Record<string, string>; created_at: string; updated_at: string;
+}
+export interface SqlColumn { name: string; dtype: string; }
+export interface SqlResult {
+  node_id: string; columns: SqlColumn[]; rows: (string | number | boolean | null)[][];
+  row_count: number; truncated: boolean; elapsed_ms: number;
+  plan_sql: string; referenced_tables: string[];
+}
+export interface ExplainResult {
+  node_id: string; dialect: string; plan: string; plan_sql: string;
+  referenced_tables: string[]; statement: string;
+}
+
+const sagaNode = (node?: string) => (node ? `?node=${encodeURIComponent(node)}` : "");
+
+export function getCatalogs(node?: string, fresh = false): Promise<{ node_id: string; catalogs: CatalogEntry[] }> {
+  return cachedGet<{ node_id: string; catalogs: CatalogEntry[] }>(`/api/v2/saga/catalog${sagaNode(node)}`, TTL.DEFINITION, jsonFetch, fresh);
+}
+
+export function getSchemas(catalog: string, node?: string, fresh = false): Promise<{ node_id: string; catalog: string; schemas: SchemaEntry[] }> {
+  return cachedGet<{ node_id: string; catalog: string; schemas: SchemaEntry[] }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema${sagaNode(node)}`, TTL.DEFINITION, jsonFetch, fresh);
+}
+
+export function getTables(catalog: string, schema: string, node?: string, fresh = false): Promise<{ node_id: string; catalog: string; schema: string; tables: TableEntry[] }> {
+  return cachedGet<{ node_id: string; catalog: string; schema: string; tables: TableEntry[] }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table${sagaNode(node)}`, TTL.DEFINITION, jsonFetch, fresh);
+}
+
+export function getTable(catalog: string, schema: string, name: string, node?: string): Promise<{ table: TableEntry }> {
+  return jsonFetch(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}${sagaNode(node)}`);
+}
+
+export async function createCatalog(body: { name: string; comment?: string; dialect?: string }): Promise<{ catalog: CatalogEntry }> {
+  const r = await jsonFetch<{ catalog: CatalogEntry }>("/api/v2/saga/catalog", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function createSchema(catalog: string, body: { name: string; comment?: string }): Promise<{ schema: SchemaEntry }> {
+  const r = await jsonFetch<{ schema: SchemaEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema`, { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function createTable(catalog: string, schema: string, body: { name: string; source_url: string; node?: string | null; table_type?: string; comment?: string; infer?: boolean }): Promise<{ table: TableEntry }> {
+  const r = await jsonFetch<{ table: TableEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table`, { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function refreshTable(catalog: string, schema: string, name: string): Promise<{ table: TableEntry }> {
+  const r = await jsonFetch<{ table: TableEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}/refresh`, { method: "POST", body: "{}" });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function deleteCatalogEntity(path: string): Promise<void> {
+  await jsonFetch(`/api/v2/saga/${path}`, { method: "DELETE" });
+  invalidate("saga/catalog");
+}
+
+// One-shot: ensure catalog + schema, infer the table name from the file, and
+// register + profile it. Used by the Files page's "register in Saga" action.
+// The current user on this node — used to default-name a registered view.
+export function getMe(): Promise<UserCard> {
+  return jsonFetch<UserCard>("/api/v2/user/me");
+}
+
+export async function registerFile(body: { source_url: string; catalog?: string; schema?: string; table?: string; object_type?: string; definition?: string; node?: string | null }): Promise<{ table: TableEntry }> {
+  const r = await jsonFetch<{ table: TableEntry }>("/api/v2/saga/register", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export async function discoverTables(body: { catalog: string; schema: string; path?: string; node?: string | null; recursive?: boolean }): Promise<{ tables: TableEntry[] }> {
+  const r = await jsonFetch<{ tables: TableEntry[] }>("/api/v2/saga/discover", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export function runSql(body: { sql: string; dialect?: string; catalog?: string; schema?: string; node?: string; limit?: number }): Promise<SqlResult> {
+  return jsonFetch<SqlResult>("/api/v2/saga/sql", { method: "POST", body: JSON.stringify(body) });
+}
+
+export function explainSql(body: { sql: string; dialect?: string; catalog?: string; schema?: string }): Promise<ExplainResult> {
+  return jsonFetch<ExplainResult>("/api/v2/saga/explain", { method: "POST", body: JSON.stringify(body) });
+}
+
+export interface PlanOp {
+  id: string; op: string; title: string; detail: string; inputs: string[];
+  rows: number | null; elapsed_ms: number | null;
+}
+export interface PlanGraph {
+  node_id: string; dialect: string; statement: string; plan_sql: string;
+  ops: PlanOp[]; analyzed: boolean; total_ms: number | null; sampled: boolean;
+}
+export type PlanEdit = { op: string; value?: number };
+
+export function getPlan(body: { sql: string; dialect?: string; catalog?: string; schema?: string }, analyze = false): Promise<PlanGraph> {
+  return jsonFetch<PlanGraph>(`/api/v2/saga/plan${analyze ? "?analyze=true" : ""}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function editPlan(body: { sql: string; dialect?: string; catalog?: string; schema?: string; edits: PlanEdit[] }): Promise<{ node_id: string; sql: string; plan_sql: string }> {
+  return jsonFetch("/api/v2/saga/plan/edit", { method: "POST", body: JSON.stringify(body) });
+}
+
+export interface SessionResult { node_id: string; path: string; columns: SqlColumn[]; row_count: number; elapsed_ms: number }
+export interface SagaFilter { column: string; op: string; value?: unknown }
+export interface WindowTransform { op: "explode" | "unnest"; column: string }
+// Stage a heavy result to an Arrow IPC file for lazy windowed scrolling.
+export function createSession(body: { sql: string; dialect?: string; catalog?: string; schema?: string; node?: string }): Promise<SessionResult> {
+  return jsonFetch<SessionResult>("/api/v2/saga/sql.session", { method: "POST", body: JSON.stringify(body) });
+}
+// Clear a staged session (best-effort; also fired via sendBeacon on unload).
+export function closeSession(path: string, node?: string): void {
+  const url = `/api/v2/saga/session/close?path=${encodeURIComponent(path)}${node ? `&node=${encodeURIComponent(node)}` : ""}`;
+  try { if (navigator.sendBeacon) { navigator.sendBeacon(url); return; } } catch { /* fall through */ }
+  fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+}
+
+export interface MaterializeResult { node_id: string; path: string; columns: SqlColumn[]; row_count: number; elapsed_ms: number }
+// Run a query once and write it to a tmp parquet, returning a node path so the
+// path-based /tabular + /analysis surfaces can analyse a SQL result.
+export function materializeSql(body: { sql: string; dialect?: string; catalog?: string; schema?: string; node?: string }): Promise<MaterializeResult> {
+  return jsonFetch<MaterializeResult>("/api/v2/saga/sql.materialize", { method: "POST", body: JSON.stringify(body) });
+}
+
+export const SQL_EXPORT_FORMATS = ["csv", "parquet", "json", "ndjson", "arrow", "xlsx"] as const;
+
+// Run the query on the node where the data lives and download the full result
+// in any handled media type. max_rows null = the whole result.
+export async function downloadSqlExport(body: { sql: string; fmt: string; dialect?: string; catalog?: string; schema?: string; node?: string; max_rows?: number | null }): Promise<void> {
+  const res = await fetch("/api/v2/saga/sql.export", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    let detail = ""; try { detail = (await res.json()).detail; } catch { /* ignore */ }
+    throw new Error(`export failed: HTTP ${res.status}${detail ? ` — ${detail}` : ""}`);
+  }
+  const blob = await res.blob();
+  const name = res.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1] ?? `result.${body.fmt}`;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+export interface OpLogEntry {
+  ts: string; op: string; user: string; node: string;
+  statement: string; rows: number | null; detail: string;
+}
+
+export function getTableLog(catalog: string, schema: string, name: string, node?: string, limit = 100): Promise<{ node_id: string; asset: string; entries: OpLogEntry[] }> {
+  const q = `limit=${limit}${node ? `&node=${encodeURIComponent(node)}` : ""}`;
+  return jsonFetch(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}/log?${q}`);
+}
+
+export interface ReplicateResult {
+  source_node: string; target_node: string; full_name: string;
+  mode: string; bytes_copied: number; target_source_url: string;
+}
+
+export async function replicateTable(body: { catalog: string; schema: string; table: string; target: string; mode: "metadata" | "data" }): Promise<ReplicateResult> {
+  const r = await jsonFetch<ReplicateResult>("/api/v2/saga/replicate", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export interface PyFuncParam { name: string; annotation: string; dtype: string; default: string | null; has_default: boolean }
+export interface PyFuncInferResult {
+  name: string; signature: string; params: PyFuncParam[];
+  return_annotation: string; return_dtype: string;
+  dependencies: string[]; python_version: string; docstring: string;
+}
+// Scan code → typed signature + version-pinned deps. Powers live infer in the
+// function editor.
+export function inferFunc(code: string, name?: string, pin_versions = true): Promise<PyFuncInferResult> {
+  return jsonFetch<PyFuncInferResult>("/api/v2/pyfunc/infer", { method: "POST", body: JSON.stringify({ code, name, pin_versions }) });
+}
+
+export const OBJECT_TYPES = ["TABLE", "VIEW", "FUNCTION", "MODEL", "OTHER"] as const;
+
+export interface SearchHit {
+  kind: string; name: string; full_name: string; object_type: string;
+  catalog: string; schema: string; comment: string;
+}
+export function searchSaga(q: string, limit = 50, node?: string): Promise<{ node_id: string; query: string; hits: SearchHit[]; total: number; truncated: boolean }> {
+  const u = `q=${encodeURIComponent(q)}&limit=${limit}${node ? `&node=${encodeURIComponent(node)}` : ""}`;
+  return jsonFetch(`/api/v2/saga/search?${u}`);
+}
+
+export interface ActivityResponse {
+  node_id: string; asset: string; op_counts: Record<string, number>;
+  total_ops: number; last_op_at: string | null; daily: number[]; recent: OpLogEntry[];
+}
+export function getActivity(catalog: string, schema: string, name: string, node?: string): Promise<ActivityResponse> {
+  const q = node ? `?node=${encodeURIComponent(node)}` : "";
+  return jsonFetch(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}/activity${q}`);
+}
+
+export async function updateTable(catalog: string, schema: string, name: string, body: Partial<{ source_url: string; object_type: string; definition: string; comment: string; table_type: string; node: string | null; properties: Record<string, string> }>): Promise<{ table: TableEntry }> {
+  const r = await jsonFetch<{ table: TableEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
 // ── Messenger ──────────────────────────────────────────────────────────────
 
 export function getChannels(fresh = false): Promise<{ node_id: string; channels: ChannelInfo[] }> {

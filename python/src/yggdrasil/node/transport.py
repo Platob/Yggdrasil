@@ -104,6 +104,75 @@ def read_arrow_stream(data: bytes) -> pa.Table:
     return reader.read_all()
 
 
+def iter_arrow_ipc_stream(
+    batches: "Iterator[pa.RecordBatch]",
+    schema: pa.Schema,
+) -> Iterator[bytes]:
+    """Encode a record-batch iterator into a streaming IPC byte iterator.
+
+    Unlike :func:`write_arrow_stream` (which buffers the whole table and yields
+    one blob), this drains the writer after each batch so a multi-GB result
+    leaves the server in bounded chunks. Framing is preserved — concatenating
+    every yielded chunk yields exactly one valid Arrow IPC stream.
+    """
+    import io
+
+    buf = io.BytesIO()
+    sink = pa.output_stream(buf)
+    writer = ipc.RecordBatchStreamWriter(sink, schema)
+
+    def _drain() -> bytes:
+        sink.flush()
+        data = buf.getvalue()
+        if data:
+            buf.seek(0)
+            buf.truncate(0)
+        return data
+
+    head = _drain()  # schema message
+    if head:
+        yield head
+    for batch in batches:
+        writer.write_batch(batch)
+        chunk = _drain()
+        if chunk:
+            yield chunk
+    writer.close()
+    tail = _drain()  # EOS marker
+    if tail:
+        yield tail
+
+
+def iter_file_chunks(path: str, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+    """Stream a file from disk in ``chunk_size`` byte chunks.
+
+    Used to hand back a spilled Arrow IPC result without re-reading it into
+    memory — the node spills heavy query results to ``spill_root`` and streams
+    the file straight off disk.
+    """
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+
+def write_arrow_ipc_file(path: str, batches: "Iterator[pa.RecordBatch]", schema: pa.Schema) -> int:
+    """Write a record-batch iterator to an Arrow IPC stream file on disk.
+
+    Returns the row count written. Memory stays bounded by one batch — the
+    spill path for results too large to hold whole.
+    """
+    rows = 0
+    with pa.OSFile(path, "wb") as sink:
+        with ipc.RecordBatchStreamWriter(sink, schema) as writer:
+            for batch in batches:
+                writer.write_batch(batch)
+                rows += batch.num_rows
+    return rows
+
+
 # -- Parquet transport (Power Query reads this natively) -------------------
 
 CONTENT_TYPE_PARQUET = MimeTypes.PARQUET.value

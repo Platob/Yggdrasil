@@ -27,6 +27,89 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 
+# Python builtin annotation → yggdrasil.data dtype name.
+_PY_DTYPE = {
+    "int": "int64", "float": "float64", "str": "string", "bool": "bool",
+    "bytes": "binary", "complex": "float64", "list": "list", "tuple": "list",
+    "set": "list", "dict": "struct", "datetime": "timestamp[us]",
+    "date": "date32", "Any": "string", "None": "null", "NoneType": "null",
+}
+
+
+def _ann_to_dtype(ann: str) -> str:
+    """Map a source annotation to a yggdrasil.data dtype (best effort)."""
+    if not ann:
+        return ""
+    base = ann.split("[")[0].strip()  # list[int] -> list, dict[str,int] -> dict
+    return _PY_DTYPE.get(base.rsplit(".", 1)[-1], "")
+
+
+def infer_function(code: str, name: str | None, *, pin_versions: bool, default_py: str):
+    """AST-scan code for the function's name, typed signature and imports.
+
+    Reuses the @function decorator's dependency inference; maps annotations to
+    yggdrasil.data dtypes; pins inferred deps to the installed version when
+    available. Returns a ``PyFuncInferResult``.
+    """
+    import ast
+
+    from yggdrasil.exceptions.api import BadRequestError
+
+    from ...fn import _infer_dependencies
+    from ..schemas.pyfunc import PyFuncInferResult, PyFuncParam
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        raise BadRequestError(f"cannot parse code: {exc}")
+
+    fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (name is None or node.name == name):
+            fn = node
+            break
+    if fn is None:
+        raise BadRequestError("no function definition found in code")
+
+    def _src(n) -> str:
+        try:
+            return ast.unparse(n) if n is not None else ""
+        except Exception:
+            return ""
+
+    args = fn.args
+    pos = args.posonlyargs + args.args
+    pad = [None] * (len(pos) - len(args.defaults)) + list(args.defaults)
+    params: list[PyFuncParam] = []
+    sig_parts: list[str] = []
+    for a, dflt in zip(pos, pad):
+        ann = _src(a.annotation)
+        dval = _src(dflt) if dflt is not None else None
+        params.append(PyFuncParam(name=a.arg, annotation=ann, dtype=_ann_to_dtype(ann),
+                                  default=dval, has_default=dflt is not None))
+        sig_parts.append(f"{a.arg}{f': {ann}' if ann else ''}{f' = {dval}' if dval is not None else ''}")
+    ret_ann = _src(fn.returns)
+    sig = f"{fn.name}({', '.join(sig_parts)}){f' -> {ret_ann}' if ret_ann else ''}"
+
+    deps = _infer_dependencies(code)
+    if pin_versions:
+        from importlib.metadata import version
+        pinned = []
+        for d in deps:
+            try:
+                pinned.append(f"{d}>={version(d)}")
+            except Exception:
+                pinned.append(d)
+        deps = pinned
+
+    return PyFuncInferResult(
+        name=fn.name, signature=sig, params=params,
+        return_annotation=ret_ann, return_dtype=_ann_to_dtype(ret_ann),
+        dependencies=deps, python_version=default_py,
+        docstring=(ast.get_docstring(fn) or ""),
+    )
+
+
 class PyFuncService:
     def __init__(self, settings: Settings, *, audit: AuditLog | None = None) -> None:
         self.settings = settings

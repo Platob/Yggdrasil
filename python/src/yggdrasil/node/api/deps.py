@@ -15,6 +15,7 @@ from .services.replicate import ReplicateService
 from .services.user import UserService
 from .services.messenger import MessengerService as V2MessengerService
 from .services.excel import ExcelService
+from .services.saga import SagaService
 
 
 def get_fs_service(request: Request) -> FsService:
@@ -67,3 +68,7 @@ def get_messenger_service(request: Request) -> V2MessengerService:
 
 def get_excel_service(request: Request) -> ExcelService:
     return request.app.state.excel_service
+
+
+def get_saga_service(request: Request) -> SagaService:
+    return request.app.state.saga_service

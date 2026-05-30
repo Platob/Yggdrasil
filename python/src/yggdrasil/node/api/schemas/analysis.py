@@ -131,3 +131,42 @@ class OhlcResult(StrictModel):
     volume: list[float | None] | None = None
     bars: int
     source_rows: int
+
+
+# -- forecasting ------------------------------------------------------------
+
+class ForecastRequest(StrictModel):
+    path: str
+    column: str                       # value column to forecast
+    x: str | None = None              # time / order column (else row index)
+    group: str | None = None          # forecast per group key (capped)
+    horizon: int = 24                 # steps ahead
+    model: str = "auto"               # auto | xgboost | gbr | ridge
+    period: int | None = None         # seasonal period (Fourier features)
+    agg: str = "mean"                 # collapse duplicate x: mean|sum|last|max|min
+    filters: list[FilterSpec] = []
+    points: int = 600                 # history downsample for display
+    max_groups: int = 6
+
+
+class ForecastSeries(StrictModel):
+    key: str = ""                     # group value ("" when no group)
+    history_x: list[Any]
+    history_y: list[float | None]
+    forecast_x: list[Any]
+    forecast_y: list[float | None]
+    lower: list[float | None]
+    upper: list[float | None]
+    rmse: float | None = None         # in-sample residual RMSE
+
+
+class ForecastResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    model_used: str
+    horizon: int
+    period: int | None = None
+    series: list[ForecastSeries]
+    source_rows: int
+    sampled: bool = False

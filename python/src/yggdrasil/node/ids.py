@@ -31,3 +31,24 @@ def make_id(semantic_key: str) -> int:
 def make_id_pair(key1: str, key2: str) -> int:
     """Generate an int64 from two semantic keys: xxh32(key1) << 32 | xxh32(key2)."""
     return (_xxh32(key1) << 32) | _xxh32(key2)
+
+
+# Largest exactly-representable JS integer (2**53 - 1). Static ids stay under it
+# so the frontend gets the id back without precision loss.
+_JS_SAFE = (1 << 53) - 1
+
+
+def make_static_id(semantic_key: str) -> int:
+    """Deterministic, time-independent int64 from a semantic key.
+
+    The same key yields the same id on every node and across restarts (no
+    timestamp) — the technical handle a distributed catalog needs so an asset
+    has one stable id everywhere. Masked into the JS-safe integer range so it
+    round-trips through JSON without precision loss.
+    """
+    try:
+        import xxhash
+        h = xxhash.xxh64_intdigest(semantic_key.encode())
+    except ImportError:
+        h = abs(hash(semantic_key))
+    return h & _JS_SAFE

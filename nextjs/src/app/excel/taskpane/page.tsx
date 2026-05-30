@@ -11,11 +11,15 @@ import {
   readFile,
   runPython,
   writeFileCsv,
+  sagaCatalogs,
+  sagaTables,
+  sagaSql,
   type FsNode,
   type NodeInfo,
+  type SagaTableRef,
 } from "@/lib/excel";
 
-type Tab = "run" | "files" | "write";
+type Tab = "run" | "files" | "saga" | "write";
 
 export default function TaskPane() {
   const [officeReady, setOfficeReady] = useState(false);
@@ -35,6 +39,12 @@ export default function TaskPane() {
   // files state
   const [cwd, setCwd] = useState("");
   const [entries, setEntries] = useState<FsNode[]>([]);
+
+  // saga state
+  const [sagaCats, setSagaCats] = useState<string[]>([]);
+  const [sagaCat, setSagaCat] = useState("");
+  const [sagaTbls, setSagaTbls] = useState<SagaTableRef[]>([]);
+  const [sql, setSql] = useState("SELECT * FROM catalog.schema.table LIMIT 1000");
 
   // write state
   const [writePath, setWritePath] = useState("excel/export.csv");
@@ -116,6 +126,33 @@ export default function TaskPane() {
     }
   }, [base, writePath]);
 
+  const loadCatalogs = useCallback(async () => {
+    setStatus({ kind: "busy", msg: "Loading catalogs…" });
+    try {
+      const cats = await sagaCatalogs(base);
+      setSagaCats(cats);
+      setStatus(null);
+    } catch (e) { setStatus({ kind: "err", msg: String((e as Error).message) }); }
+  }, [base]);
+
+  const pickCatalog = useCallback(async (c: string) => {
+    setSagaCat(c);
+    setStatus({ kind: "busy", msg: `Loading ${c}…` });
+    try {
+      setSagaTbls(await sagaTables(base, c));
+      setStatus(null);
+    } catch (e) { setStatus({ kind: "err", msg: String((e as Error).message) }); }
+  }, [base]);
+
+  const runSqlToSheet = useCallback(async (statement: string, name: string) => {
+    setStatus({ kind: "busy", msg: "Querying…" });
+    try {
+      const grid = await sagaSql(base, statement);
+      await gridToNewSheet(grid, name);
+      setStatus({ kind: "ok", msg: `Loaded ${grid.rows.length} rows × ${grid.headers.length} cols` });
+    } catch (e) { setStatus({ kind: "err", msg: String((e as Error).message) }); }
+  }, [base]);
+
   const parent = cwd.includes("/") ? cwd.slice(0, cwd.lastIndexOf("/")) : "";
 
   return (
@@ -139,9 +176,9 @@ export default function TaskPane() {
       {info && <div style={S.meta}>v{info.version} · {info.capabilities.join(", ")}</div>}
 
       <div style={S.tabs}>
-        {(["run", "files", "write"] as Tab[]).map((t) => (
+        {(["run", "files", "saga", "write"] as Tab[]).map((t) => (
           <button key={t} style={{ ...S.tab, ...(tab === t ? S.tabActive : {}) }} onClick={() => setTab(t)}>
-            {t === "run" ? "Run Python" : t === "files" ? "Files" : "Save"}
+            {t === "run" ? "Run Python" : t === "files" ? "Files" : t === "saga" ? "Saga" : "Save"}
           </button>
         ))}
       </div>
@@ -173,6 +210,29 @@ export default function TaskPane() {
                 ) : (
                   <button style={S.linkBtn} onClick={() => loadFile(e.path)}>→ sheet</button>
                 )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {tab === "saga" && (
+        <div style={S.panel}>
+          <p style={S.note}>Query the network catalog from this node — it federates across the mesh. Results land in a new sheet.</p>
+          <textarea style={S.code} value={sql} onChange={(e) => setSql(e.target.value)} rows={4} />
+          <button style={S.btnWide} onClick={() => runSqlToSheet(sql, "Saga Query")}>Run SQL → new sheet</button>
+          <div style={{ ...S.row, marginTop: 8 }}>
+            <button style={S.btn} onClick={loadCatalogs}>Catalogs</button>
+            {sagaCats.map((c) => (
+              <button key={c} style={{ ...S.btn, ...(c === sagaCat ? S.tabActive : {}) }} onClick={() => pickCatalog(c)}>{c}</button>
+            ))}
+          </div>
+          <div style={S.list}>
+            {sagaTbls.length === 0 && <div style={S.empty}>Pick a catalog to list its tables.</div>}
+            {sagaTbls.map((t) => (
+              <div key={t.full_name} style={S.fileRow}>
+                <span>🗄 {t.schema}.{t.name}</span>
+                <button style={S.linkBtn} onClick={() => runSqlToSheet(`SELECT * FROM ${t.full_name} LIMIT 100000`, t.name)}>→ sheet</button>
               </div>
             ))}
           </div>

@@ -72,6 +72,38 @@ class NetworkService:
             gpu_count=len(snap.gpus),
         )
 
+    def _load_score(self, *, cpu: float, mem: float, runs: int) -> float:
+        """Normalised 0..n load score — lower is freer."""
+        return cpu / 100.0 + mem / 100.0 + runs * 0.05
+
+    def least_loaded(self, candidates: set[str], *, offload_threshold: float = 0.85) -> str | None:
+        """Pick the freest node among *candidates* (which all hold the data).
+
+        The local node is preferred whenever its own load is under
+        ``offload_threshold`` — only a genuinely busy node hands the work to a
+        less-loaded peer, so light queries never pay a network hop. Returns a
+        node id (possibly self), or ``None`` if no candidate is reachable.
+        """
+        if not candidates:
+            return None
+        me = self.settings.node_id
+        loads: dict[str, float] = {}
+        if me in candidates:
+            snap = self._backend.snapshot()
+            mem = (snap.memory_used_mb / snap.memory_total_mb * 100) if snap.memory_total_mb else 0.0
+            loads[me] = self._load_score(cpu=snap.cpu_percent, mem=mem, runs=snap.active_runs)
+        now = time.monotonic()
+        with self._lock:
+            for m, ts in self._peers.values():
+                if m.node_id in candidates and now - ts < _PEER_TTL:
+                    loads[m.node_id] = self._load_score(cpu=m.cpu_percent, mem=m.memory_percent, runs=m.active_runs)
+        if not loads:
+            return next(iter(candidates))
+        # Stay local unless we're busy and a peer is meaningfully freer.
+        if me in loads and loads[me] < offload_threshold:
+            return me
+        return min(loads, key=lambda k: (loads[k], k != me))
+
     async def dispatch(self, req: DispatchRequest) -> DispatchResponse:
         target = self._select_executor()
         if target is None:

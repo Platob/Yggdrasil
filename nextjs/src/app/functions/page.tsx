@@ -13,6 +13,8 @@ import {
   getEnvs,
   createEnv,
   deleteEnv,
+  inferFunc,
+  type PyFuncInferResult,
 } from "@/lib/api";
 import type { PyFuncEntry, PyEnvEntry } from "@/lib/types";
 
@@ -26,7 +28,17 @@ export default function FunctionsPage() {
 
   // Function editor modal
   const [editing, setEditing] = useState<typeof BLANK | null>(null);
+  const [inferred, setInferred] = useState<PyFuncInferResult | null>(null);
   const [isNew, setIsNew] = useState(false);
+
+  // Live infer: scan the code as it's edited (debounced) for the signature,
+  // typed params and version-pinned dependencies.
+  const code = editing?.code;
+  useEffect(() => {
+    if (!code) { setInferred(null); return; }
+    const t = setTimeout(() => { inferFunc(code).then(setInferred).catch(() => setInferred(null)); }, 500);
+    return () => clearTimeout(t);
+  }, [code]);
   const [saving, setSaving] = useState(false);
   const [editErr, setEditErr] = useState<string | null>(null);
 
@@ -198,6 +210,22 @@ export default function FunctionsPage() {
             </div>
             <input value={editing.description} onChange={(e) => setEditing({ ...editing, description: e.target.value })} placeholder="description" className="bg-white/[0.04] border border-white/10 rounded px-2 py-1.5 text-xs outline-none" />
             <input value={editing.deps} onChange={(e) => setEditing({ ...editing, deps: e.target.value })} placeholder="dependencies (comma) — inferred from imports if blank" className="bg-white/[0.04] border border-white/10 rounded px-2 py-1.5 text-xs font-mono outline-none" />
+            {inferred && (
+              <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap rounded border border-frost/15 bg-frost/[0.04] px-2 py-1.5">
+                <span className="text-frost/90 truncate" title={inferred.signature}>ƒ {inferred.signature}</span>
+                {inferred.params.map((p) => p.dtype && (
+                  <span key={p.name} className="px-1.5 py-0.5 rounded bg-white/[0.05] text-foreground-dim" title={`${p.name}: ${p.annotation}`}>{p.name}:{p.dtype}</span>
+                ))}
+                {inferred.dependencies.length > 0 && <span className="text-emerald/70" title={inferred.dependencies.join(", ")}>⬡ {inferred.dependencies.length} dep(s)</span>}
+                <button onClick={() => setEditing((ed) => ed && ({
+                  ...ed,
+                  name: isNew && !ed.name.trim() ? inferred.name : ed.name,
+                  python_version: ed.python_version.trim() || inferred.python_version,
+                  deps: ed.deps.trim() || inferred.dependencies.join(", "),
+                  description: ed.description.trim() || inferred.docstring,
+                }))} className="ml-auto text-frost/80 hover:text-frost">use ↵</button>
+              </div>
+            )}
             <textarea value={editing.code} onChange={(e) => setEditing({ ...editing, code: e.target.value })} spellCheck={false} className="flex-1 min-h-[40vh] bg-black/40 border border-white/10 rounded p-3 text-xs font-mono text-foreground/90 outline-none focus:border-frost/30 resize-none" />
             {editErr && <div className="text-[11px] text-rose/90 font-mono">{editErr}</div>}
             <div className="flex items-center gap-2">

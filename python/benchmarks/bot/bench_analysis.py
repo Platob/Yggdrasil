@@ -20,7 +20,9 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from yggdrasil.node.api.schemas.analysis import AggMeasure, AggregateRequest, OhlcRequest, SeriesRequest
+from yggdrasil.node.api.schemas.analysis import (
+    AggMeasure, AggregateRequest, ForecastRequest, OhlcRequest, SeriesRequest,
+)
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
 from yggdrasil.node.config import Settings
@@ -67,6 +69,33 @@ def main() -> None:
         ohlc_ms = (time.perf_counter() - t0) * 1000
         print(f"  downsample {n:,} -> {len(s.x)} pts:  {ds_ms:8.1f} ms")
         print(f"  ohlc {n:,} -> {o.bars} bars:      {ohlc_ms:8.1f} ms\n")
+
+    # -- forecasting (xgboost→gbr→ridge over engineered features) -----------
+    import math
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        m = 50_000
+        ts = list(range(m))
+        grp = [["a", "b", "c", "d"][i % 4] for i in range(m)]
+        val = [100.0 + 0.01 * i + 12.0 * math.sin(2 * math.pi * i / 24) for i in range(m)]
+        pq.write_table(pa.table({"ts": ts, "grp": grp, "value": val}), str(home / "ts.parquet"))
+        settings = Settings(node_id="bench", node_home=home, front_home=home)
+        svc = AnalysisService(settings, fs=FsService(settings))
+        print(f"  ts.parquet: {m:,} rows, 4 groups — forecast value~ts\n")
+        for model in ("ridge", "gbr", "xgboost"):
+            t0 = time.perf_counter()
+            try:
+                r = asyncio.run(svc.forecast(ForecastRequest(
+                    path="ts.parquet", column="value", x="ts", group="grp",
+                    horizon=48, model=model, period=24)))
+            except Exception as exc:                       # backend not installed
+                print(f"  forecast {model:8s}: skipped ({type(exc).__name__})")
+                continue
+            ms = (time.perf_counter() - t0) * 1000
+            rmse = r.series[0].rmse
+            print(f"  forecast {model:8s} ({r.model_used:8s}): {ms:8.1f} ms  "
+                  f"{len(r.series)} series x 48h  rmse≈{rmse}")
+        print()
 
 
 if __name__ == "__main__":

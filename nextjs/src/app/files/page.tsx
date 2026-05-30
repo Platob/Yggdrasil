@@ -16,7 +16,8 @@ import {
   type FsNodeRoot,
 } from "@/lib/api";
 import type { FsEntry } from "@/lib/types";
-import TabularModal from "@/components/TabularModal";
+import TabularDisplay from "@/components/TabularDisplay";
+import RegisterSagaModal from "@/components/RegisterSagaModal";
 
 // ── Helpers ───────────────────────────────────────────────────
 function formatSize(bytes: number): string {
@@ -135,6 +136,7 @@ export default function FilesPage() {
 
   // Tabular files open the dedicated (reusable) tabular editor instead.
   const [tabular, setTabular] = useState<{ node: string; entry: FsEntry } | null>(null);
+  const [sagaReg, setSagaReg] = useState<{ source: string; node?: string } | null>(null);
 
   // Selected file + text preview modal
   const [selected, setSelected] = useState<{ node: string; entry: FsEntry } | null>(null);
@@ -260,6 +262,12 @@ export default function FilesPage() {
       await ensureLoaded(node, parentPath, true);
     } catch { /* tree shows last good state */ }
   }, [ensureLoaded]);
+
+  // Open the reusable Saga register modal, prefilled from the file (and from any
+  // existing registration). source_url is the node-home-relative path Saga uses.
+  const registerSaga = useCallback((node: string, entry: FsEntry) => {
+    setSagaReg({ source: entry.path, node: node === selfNodeId ? undefined : node });
+  }, [selfNodeId]);
 
   const newFolder = useCallback(async (node: string, basePath: string) => {
     const name = prompt("New folder name");
@@ -433,6 +441,18 @@ export default function FilesPage() {
                     </svg>
                   </button>
                 )}
+                {!entry.is_dir && isTabularName(entry.name) && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); registerSaga(node, entry); }}
+                    className="opacity-0 group-hover:opacity-100 text-emerald/60 hover:text-emerald"
+                    title="Register in Saga catalog"
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <ellipse cx="12" cy="5" rx="8" ry="3" />
+                      <path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6" />
+                    </svg>
+                  </button>
+                )}
                 <a
                   href={fsDownloadUrl(entry.path, node)}
                   onClick={(e) => e.stopPropagation()}
@@ -584,15 +604,30 @@ export default function FilesPage() {
         </div>
       )}
 
-      {/* Tabular editor (reusable component) */}
+      {/* Tabular viewer — the same component Saga uses: grid + analyze + download */}
       {tabular && (
-        <TabularModal
-          node={tabular.node}
-          nodeLabel={tabular.node === selfNodeId ? "local" : tabular.node}
-          path={tabular.entry.path}
-          name={tabular.entry.name}
-          onClose={() => setTabular(null)}
-        />
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
+          style={{ background: "var(--modal-scrim, rgba(0,0,0,0.72))" }} onClick={() => setTabular(null)}>
+          <div className="modal-surface rounded-xl w-full max-w-6xl h-[85vh] flex flex-col p-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-semibold text-frost truncate">
+                {tabular.entry.name}
+                <span className="text-muted font-normal ml-2">@{tabular.node === selfNodeId ? "local" : tabular.node}</span>
+              </span>
+              <button onClick={() => setTabular(null)} className="text-muted hover:text-foreground text-sm">close ✕</button>
+            </div>
+            <div className="flex-1 min-h-0">
+              <TabularDisplay
+                query={{ source: tabular.entry.path, node: tabular.node === selfNodeId ? undefined : tabular.node }}
+                maxHeight="100%"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {sagaReg && (
+        <RegisterSagaModal source={sagaReg.source} node={sagaReg.node} onClose={() => setSagaReg(null)} />
       )}
 
       {/* File preview / edit modal */}

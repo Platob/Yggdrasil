@@ -43,6 +43,12 @@ def _node_home() -> Path:
     return Path.home() / ".node" / _stable_node_id()
 
 
+def _saga_home() -> Path:
+    # Managed Saga metadata + data lives outside ~/.node so it is NOT exposed
+    # through the node filesystem API (which is rooted at node_home).
+    return Path.home() / ".saga" / _stable_node_id()
+
+
 def _find_open_port(start: int = 8100, end: int = 8200) -> int:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -75,6 +81,7 @@ class Settings:
     api_prefix: str = "/api"
     node_id: str = field(default_factory=_stable_node_id)
     node_home: Path = field(default_factory=_node_home)
+    saga_home: Path = field(default_factory=_saga_home)
     front_home: Path = field(default_factory=_default_front_home)
     max_cmd_timeout: float = 300.0
     max_python_timeout: float = 600.0
@@ -103,6 +110,12 @@ class Settings:
     # Rows an analysis (aggregate / describe / finance) pulls before computing.
     # Bounds memory/time; results over this cap are flagged truncated.
     analysis_max_rows: int = 200_000
+    # Byte budget for the rows a query materialises in memory. Reductions stream
+    # the whole file regardless; this caps the *materialised* paths (finance,
+    # forecast, the non-scannable fallback) by measuring the Arrow size of a
+    # sample and deriving a row cap — preferred over a fixed row count because a
+    # wide row costs far more memory than a narrow one. Defaults to 256 MiB.
+    analysis_max_bytes: int = 256 * 1024 * 1024
     # Seconds a PyEnv's resolved interpreter version + installed-library
     # listing stays cached before the next ``pip list`` subprocess runs —
     # keeps the UI's per-env package view from flooding the node.
@@ -111,6 +124,28 @@ class Settings:
     # is immediately useful. The env builds in the background; functions are
     # registered instantly and run on the node interpreter until it's ready.
     seed_defaults: bool = True
+    # Default lifetime baked into a ``tmp/`` scratch entry's self-describing
+    # name. SQL spill and download staging are transient; a day outlives any
+    # single run. Foreign (un-named) tmp files fall back to this as an mtime TTL.
+    tmp_ttl: int = 86_400
+    # Default lifetime for ``stg/`` staging entries — results a remote node
+    # parked here for in-flight work. Far longer than tmp; swept rarely.
+    stg_ttl: int = 7 * 86_400
+    # Cadence (seconds) of the scratch janitor loop. Independent of the TTLs so
+    # a short TTL still can't busy-loop the sweep.
+    tmp_cleanup_interval: float = 3600.0
+    # Default SQL dialect the Saga editor parses with when a request / catalog
+    # doesn't pin one. Postgres is the most familiar lingua franca.
+    saga_default_dialect: str = "postgres"
+    # Rows a Saga SQL run returns to the JSON editor grid before flagging the
+    # result truncated — keeps the interactive editor snappy.
+    saga_sql_preview_rows: int = 10_000
+    # Result rows above which a Saga Arrow-IPC response spills to a temp file
+    # under spill_root and streams from disk instead of buffering in memory.
+    saga_result_spill_rows: int = 250_000
+    # Local load score (cpu% + mem% + 0.05·runs, all /100) above which a query
+    # over replicated data is offloaded to a freer peer that also holds it.
+    saga_offload_load: float = 0.85
 
     @property
     def local_clients(self) -> set[str]:
@@ -144,6 +179,27 @@ class Settings:
     def spill_root(self) -> Path:
         return self.node_home / "spill"
 
+    @property
+    def tmp_root(self) -> Path:
+        return self.node_home / "tmp"
+
+    @property
+    def stg_root(self) -> Path:
+        return self.node_home / "stg"
+
+    @property
+    def saga_root(self) -> Path:
+        """Managed Saga metadata directory (under ~/.saga, off the network fs)."""
+        return self.saga_home
+
+    @property
+    def saga_data_root(self) -> Path:
+        return self.saga_home / "data"
+
+    @property
+    def saga_log_root(self) -> Path:
+        return self.saga_home / "logs"
+
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
@@ -167,6 +223,9 @@ def get_settings() -> Settings:
         node_home=Path(
             os.getenv("YGG_NODE_HOME", str(_node_home()))
         ).expanduser().resolve(),
+        saga_home=Path(
+            os.getenv("YGG_NODE_SAGA_HOME", str(_saga_home()))
+        ).expanduser().resolve(),
         front_home=Path(
             os.getenv("YGG_NODE_FRONT_HOME", str(_default_front_home()))
         ).expanduser().resolve(),
@@ -186,6 +245,14 @@ def get_settings() -> Settings:
         du_max_entries=int(os.getenv("YGG_NODE_DU_MAX_ENTRIES", "200000")),
         tabular_preview_max_rows=int(os.getenv("YGG_NODE_TABULAR_PREVIEW_ROWS", "2000")),
         analysis_max_rows=int(os.getenv("YGG_NODE_ANALYSIS_MAX_ROWS", "200000")),
+        analysis_max_bytes=int(os.getenv("YGG_NODE_ANALYSIS_MAX_BYTES", str(256 * 1024 * 1024))),
         pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
         seed_defaults=_as_bool(os.getenv("YGG_NODE_SEED_DEFAULTS"), True),
+        tmp_ttl=int(os.getenv("YGG_NODE_TMP_TTL", str(86_400))),
+        stg_ttl=int(os.getenv("YGG_NODE_STG_TTL", str(7 * 86_400))),
+        tmp_cleanup_interval=float(os.getenv("YGG_NODE_TMP_CLEANUP_INTERVAL", "3600")),
+        saga_default_dialect=os.getenv("YGG_NODE_SAGA_DIALECT", "postgres"),
+        saga_sql_preview_rows=int(os.getenv("YGG_NODE_SAGA_PREVIEW_ROWS", "10000")),
+        saga_result_spill_rows=int(os.getenv("YGG_NODE_SAGA_SPILL_ROWS", "250000")),
+        saga_offload_load=float(os.getenv("YGG_NODE_SAGA_OFFLOAD_LOAD", "0.85")),
     )
