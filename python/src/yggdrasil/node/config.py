@@ -137,6 +137,9 @@ class Settings:
     # Result rows above which a Saga Arrow-IPC response spills to a temp file
     # under spill_root and streams from disk instead of buffering in memory.
     saga_result_spill_rows: int = 250_000
+    # Local load score (cpu% + mem% + 0.05·runs, all /100) above which a query
+    # over replicated data is offloaded to a freer peer that also holds it.
+    saga_offload_load: float = 0.85
 
     @property
     def local_clients(self) -> set[str]:
@@ -244,4 +247,5 @@ def get_settings() -> Settings:
         saga_default_dialect=os.getenv("YGG_NODE_SAGA_DIALECT", "postgres"),
         saga_sql_preview_rows=int(os.getenv("YGG_NODE_SAGA_PREVIEW_ROWS", "10000")),
         saga_result_spill_rows=int(os.getenv("YGG_NODE_SAGA_SPILL_ROWS", "250000")),
+        saga_offload_load=float(os.getenv("YGG_NODE_SAGA_OFFLOAD_LOAD", "0.85")),
     )

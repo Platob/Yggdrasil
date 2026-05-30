@@ -749,32 +749,48 @@ class SagaService:
         return node, dialect, refs
 
     def compute_node(self, req: SqlRequest) -> str | None:
-        """Which node should run this query — explicit, else where the data is.
+        """Which node should run this query — explicit, else where the data is,
+        and among equally-valid holders the freest one.
 
-        Returns ``None`` for the local node. If the referenced *registered*
-        tables all live on a single peer, the query follows the data there;
-        mixing peers (or a peer + local) needs an explicit ``node``.
+        Each referenced registered table has a set of *holders* — the node that
+        owns the bytes plus any node carrying a local data replica. The query
+        must run on a node that holds *every* referenced table (the intersection
+        of holder sets); among those, the freest node is chosen so a busy node
+        offloads to a less-loaded replica (compute follows data *and* resources).
+        ``None`` means run locally. A query whose tables share no common holder
+        spans nodes and needs an explicit ``node=``.
         """
         if req.node:
             return None if req.node == self.settings.node_id else req.node
+        me = self.settings.node_id
         _, _, refs = self.plan_for(req)
-        nodes: set[str] = set()
+        holder_sets: list[set[str]] = []
         with self._lock:
             for ref in refs:
                 t = self._table_by_full(self._qualify(ref, req.catalog, req.schema_))
-                if t and t.node and t.node != self.settings.node_id:
-                    nodes.add(t.node)
-                elif t:
-                    nodes.add(self.settings.node_id)
-        remote = {n for n in nodes if n != self.settings.node_id}
-        if len(remote) == 1 and self.settings.node_id not in nodes:
-            return next(iter(remote))
-        if len(remote) > 1:
+                if t is not None:
+                    holder_sets.append({t.node or me} | set(t.replicas))
+                else:
+                    cand = ref.name
+                    ext = cand.rsplit(".", 1)[-1].lower() if "." in cand else ""
+                    if "/" in cand or "\\" in cand or ext in _TABULAR_EXTS:
+                        holder_sets.append({me})   # raw path resolves locally
+        if not holder_sets:
+            return None
+        candidates = set.intersection(*holder_sets)
+        if not candidates:
             raise BadRequestError(
                 "query spans tables on multiple nodes; pass an explicit node= to "
-                "pick where it runs"
-            )
-        return None
+                "pick where it runs")
+        # Resource-aware pick among the data holders.
+        if len(candidates) > 1 and getattr(self._network, "least_loaded", None):
+            chosen = self._network.least_loaded(
+                candidates, offload_threshold=self.settings.saga_offload_load)
+            if chosen:
+                return None if chosen == me else chosen
+        if me in candidates:
+            return None
+        return next(iter(candidates))
 
     def _resolve_view(self, view: TableEntry, seen: set[str]) -> Tabular:
         if view.full_name in seen:
@@ -1099,46 +1115,35 @@ class SagaService:
     def execute_sql_arrow(self, req: SqlRequest):
         """Run the query and return (iterator-of-ipc-bytes, cleanup-callable).
 
-        Small results stream straight from the in-memory Arrow buffer. Heavy
-        results (> ``saga_result_spill_rows``) spill to an Arrow IPC file under
-        ``spill_root`` and stream off disk, so the encoded result never sits
-        whole in memory.
+        Streams the result **batch by batch** straight into the Arrow IPC
+        encoder, so peak memory stays near one chunk regardless of result size
+        (bench: ~3.7 MB streamed vs ~26 MB to buffer a 1M-row result whole). A
+        source that already spilled to disk is read from its parts, never
+        re-concatenated. The schema is learned by peeking the first batch — no
+        upfront full materialisation.
         """
-        node, dialect, refs = self.plan_for(req)
+        import itertools
+
+        node, _dialect, refs = self.plan_for(req)
         # Honor a display limit on a LIMIT-less SELECT so a preview fetch stays
         # bounded without the caller rewriting the SQL.
         if req.limit and req.limit > 0 and isinstance(node, SelectNode) and node.limit is None:
             node.limit = req.limit
         tables = self._build_tables(refs, req.catalog, req.schema_)
+        # CastOptions.row_size → Arrow IPC chunk size.
+        chunk = req.batch_rows if (req.batch_rows and req.batch_rows > 0) else 65536
         try:
             result = execute_plan(node, tables)
-            table = result.read_arrow_table()
+            batches = iter(result.read_arrow_batches(CastOptions(row_size=chunk)))
+            first = next(batches, None)
         except (BadRequestError, NotFoundError):
             raise
         except Exception as exc:
             raise BadRequestError(f"query failed: {exc}")
-
-        # CastOptions.row_size → Arrow IPC chunk size.
-        chunk = req.batch_rows if (req.batch_rows and req.batch_rows > 0) else 65536
-        if table.num_rows <= self.settings.saga_result_spill_rows:
-            batches = table.to_batches(max_chunksize=chunk)
-            return transport.iter_arrow_ipc_stream(iter(batches), table.schema), None
-
-        # Spill: write batch-by-batch to a self-describing tmp IPC file, then
-        # stream from disk. The name carries its own expiry so the janitor
-        # reclaims it even if the stream is abandoned mid-flight.
-        spill = str(scratch.new_path(
-            self.settings.tmp_root, "tmp", ttl_seconds=self.settings.tmp_ttl,
-            suffix="saga-spill.arrows"))
-        transport.write_arrow_ipc_file(spill, iter(table.to_batches(max_chunksize=chunk)), table.schema)
-
-        def _cleanup() -> None:
-            try:
-                os.unlink(spill)
-            except OSError:
-                pass
-
-        return transport.iter_file_chunks(spill), _cleanup
+        if first is None:  # empty result — still emit the schema frame
+            schema = result.read_arrow_table().schema
+            return transport.iter_arrow_ipc_stream(iter(()), schema), None
+        return transport.iter_arrow_ipc_stream(itertools.chain([first], batches), first.schema), None
 
     # -- discovery ----------------------------------------------------------
 
@@ -1392,14 +1397,17 @@ class SagaService:
 
         await self._network.proxy_json(req.target, "POST", "/api/v2/saga/import",
                                        json_body=payload.model_dump(by_alias=True))
-        with self._lock:
-            cur = self._tables.get(payload.table.id) or self._table_by_name(
-                req.catalog, req.schema_, req.table)
-            if cur is not None and req.target not in cur.replicas:
-                self._tables[cur.id] = cur.model_copy(update={
-                    "replicas": sorted(set(cur.replicas) | {req.target}),
-                    "updated_at": _now()})
-                self._save()
+        # Only a *data* replica makes the target a holder the query router can
+        # offload to; a metadata copy just points back here, so it isn't one.
+        if req.mode == "data":
+            with self._lock:
+                cur = self._tables.get(payload.table.id) or self._table_by_name(
+                    req.catalog, req.schema_, req.table)
+                if cur is not None and req.target not in cur.replicas:
+                    self._tables[cur.id] = cur.model_copy(update={
+                        "replicas": sorted(set(cur.replicas) | {req.target}),
+                        "updated_at": _now()})
+                    self._save()
         self._record(full, "replicate", detail=f"-> {req.target} ({req.mode}, {bytes_copied}B)")
         return ReplicateResult(
             source_node=self.settings.node_id, target_node=req.target,

@@ -390,12 +390,14 @@ class TestReplication(unittest.TestCase):
             res = asyncio.run(a.replicate(ReplicateRequest(
                 catalog="main", schema="market", table="trades", target="peerB", mode="metadata")))
             self.assertEqual(res.target_node, "peerB")
-            # Peer now has the catalog/schema/table.
+            # Peer now has the catalog/schema/table, pointing back at the source.
             tb = asyncio.run(b.get_table("main", "market", "trades"))
             self.assertEqual(tb.table.full_name, "main.market.trades")
-            # Source records the replica.
+            self.assertEqual(tb.table.node, a.settings.node_id)
+            # Metadata replication does NOT make the peer a data holder, so it
+            # is not listed as a replica (only data replicas are routable).
             ta = asyncio.run(a.get_table("main", "market", "trades"))
-            self.assertIn("peerB", ta.table.replicas)
+            self.assertNotIn("peerB", ta.table.replicas)
 
     def test_export_import_roundtrip(self):
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
@@ -405,6 +407,62 @@ class TestReplication(unittest.TestCase):
             payload = a.export_payload("main", "market", "trades")
             asyncio.run(b.import_payload(payload))
             self.assertEqual(asyncio.run(b.list_catalogs()).catalogs[0].name, "main")
+
+
+class _LoadNetwork:
+    """Network stub exposing least_loaded over a fixed load map."""
+    def __init__(self, self_id, loads):
+        self.settings = type("S", (), {"node_id": self_id})()
+        self._loads = loads
+
+    def least_loaded(self, candidates, *, offload_threshold=0.85):
+        me = self.settings.node_id
+        loads = {n: self._loads[n] for n in candidates if n in self._loads}
+        if not loads:
+            return next(iter(candidates))
+        if me in loads and loads[me] < offload_threshold:
+            return me
+        return min(loads, key=lambda k: (loads[k], k != me))
+
+
+class TestResourceRouting(unittest.TestCase):
+    def _seeded(self, home, replicas):
+        svc = _svc(home)
+        src = _trades(svc.settings)
+        asyncio.run(svc.create_catalog(CatalogCreate(name="main")))
+        asyncio.run(svc.create_schema("main", SchemaCreate(name="market")))
+        asyncio.run(svc.create_table("main", "market", TableCreate(name="trades", source_url=src)))
+        # mark replicas directly (as a data replication would)
+        with svc._lock:
+            tid = svc._tbl_idx["main.market.trades"]
+            svc._tables[tid] = svc._tables[tid].model_copy(update={"replicas": replicas})
+            svc._save()
+        return svc
+
+    def test_local_when_not_busy(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = self._seeded(Path(d), ["peerB"])
+            svc.bind_network(_LoadNetwork("t", {"t": 0.1, "peerB": 0.9}))
+            self.assertIsNone(svc.compute_node(SqlRequest(sql="SELECT * FROM main.market.trades")))
+
+    def test_offload_to_freer_replica_when_busy(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = self._seeded(Path(d), ["peerB"])
+            svc.bind_network(_LoadNetwork("t", {"t": 0.95, "peerB": 0.2}))
+            self.assertEqual(svc.compute_node(SqlRequest(sql="SELECT * FROM main.market.trades")), "peerB")
+
+    def test_no_common_holder_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d)); src = _trades(svc.settings)
+            asyncio.run(svc.create_catalog(CatalogCreate(name="main")))
+            asyncio.run(svc.create_schema("main", SchemaCreate(name="m")))
+            asyncio.run(svc.create_table("main", "m", TableCreate(name="local", source_url=src)))
+            # a table that only lives on a peer (no local data, no replicas)
+            asyncio.run(svc.create_table("main", "m", TableCreate(
+                name="remote", source_url="x", node="peerB", infer=False)))
+            with self.assertRaises(BadRequestError):
+                svc.compute_node(SqlRequest(
+                    sql="SELECT * FROM main.m.local JOIN main.m.remote ON 1=1"))
 
 
 class TestStaging(unittest.TestCase):
@@ -446,7 +504,6 @@ class TestTmpJanitor(unittest.TestCase):
             self.assertFalse(foreign.exists())
 
     def test_stg_is_name_only(self):
-        from yggdrasil.node import scratch
         with tempfile.TemporaryDirectory() as d:
             s = _settings(Path(d))
             s.stg_root.mkdir(parents=True, exist_ok=True)
