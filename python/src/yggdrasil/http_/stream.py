@@ -49,6 +49,7 @@ class HTTPStream(MemoryStream):
 
     __slots__ = (
         "_request", "_session_ref", "_max_retries", "_retry_count",
+        "_live_conn", "_live_pool_key",
     )
 
     def __init__(
@@ -66,6 +67,8 @@ class HTTPStream(MemoryStream):
         self._session_ref = session
         self._max_retries = max_retries
         self._retry_count = 0
+        self._live_conn: Any = None
+        self._live_pool_key: Any = None
 
     def __getstate__(self) -> dict:
         self._pull_to_eof()
@@ -176,7 +179,21 @@ class HTTPStream(MemoryStream):
         ``base + offset`` and preserve the original upper bound — not
         from ``offset`` alone, which would be an absolute address into
         the wrong part of the object and silently corrupt the read.
+
+        Stores the new connection in ``_live_conn`` / ``_live_pool_key``
+        so :meth:`HTTPResponse.release_conn` can return it to the pool
+        instead of the original (now-broken) connection.
         """
+        # Close any previous reconnect connection — it's being replaced.
+        old = self._live_conn
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+            self._live_conn = None
+            self._live_pool_key = None
+
         session = self._session_ref
         request = self._request
         headers = {**dict(request.headers)}
@@ -202,10 +219,12 @@ class HTTPStream(MemoryStream):
 
         conn = session._get_connection(scheme, host, port, None)
         try:
-            conn.connect()
+            if conn.sock is None:
+                conn.connect()
             headers.setdefault(
                 "Host", f"{host}:{port}" if port not in (80, 443) else host,
             )
+            headers.setdefault("Connection", "keep-alive")
             conn.request(request.method, path, body=None, headers=headers)
             raw = conn.getresponse()
         except Exception:
@@ -225,6 +244,9 @@ class HTTPStream(MemoryStream):
                 f"for {request.method} {request.url}"
             )
 
+        pool_key = (scheme, host, port)
+        self._live_conn = conn
+        self._live_pool_key = None if getattr(raw, "will_close", False) else pool_key
         self._eof = False
         self._read_chunk = raw.read
 

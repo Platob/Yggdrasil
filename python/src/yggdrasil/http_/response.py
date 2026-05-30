@@ -1546,12 +1546,37 @@ class HTTPResponse(IO):  # IO inherits Tabular
         fixtures (``_connection`` is ``None``). On a wire-fetched
         response, defers to ``session._release_connection`` so the
         socket lands back in the per-host idle cache.
+
+        When the body stream reconnected mid-flight (``HTTPStream``
+        issued a Range request on a transient error), the original
+        connection is broken — we close it instead of pooling it — and
+        the live replacement connection stored on the stream is returned
+        to the pool instead.
         """
         if self._released:
             return
         self._released = True
         session = self._session
-        if (
+
+        buffer = self.buffer
+        live_conn = getattr(buffer, "_live_conn", None)
+        live_key = getattr(buffer, "_live_pool_key", None)
+
+        if live_conn is not None:
+            # Stream reconnected — original socket is broken; close it.
+            if self._connection is not None:
+                try:
+                    self._connection.close()
+                except Exception:
+                    pass
+            if session is not None and live_key is not None and hasattr(session, "_release_connection"):
+                session._release_connection(live_key, live_conn)
+            else:
+                try:
+                    live_conn.close()
+                except Exception:
+                    pass
+        elif (
             session is not None
             and self._connection is not None
             and self._pool_key is not None
