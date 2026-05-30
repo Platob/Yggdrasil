@@ -22,7 +22,6 @@ import pytest
 
 from yggdrasil.http_.session import (
     HTTPSession,
-    _DEAD_PROXIES,
     _ProxyEnv,
     _resolve_proxy_url,
     _should_bypass_proxy,
@@ -209,11 +208,9 @@ def origin_server():
 @pytest.fixture(autouse=True)
 def _fresh_state():
     HTTPSession._INSTANCES.clear()
-    _DEAD_PROXIES.clear()
     _ProxyEnv.reset()
     yield
     HTTPSession._INSTANCES.clear()
-    _DEAD_PROXIES.clear()
     _ProxyEnv.reset()
 
 
@@ -304,24 +301,29 @@ class TestDeadProxyFallback:
 
     def test_unreachable_proxy_marked_dead(self, origin_server):
         session = HTTPSession(proxy="http://127.0.0.1:19999")
-        assert len(_DEAD_PROXIES) == 0
+        assert len(session._dead_proxies) == 0
         resp = session.get(f"{origin_server}/direct")
         data = resp.json()
         assert data.get("origin") is True
-        assert len(_DEAD_PROXIES) == 1
+        assert len(session._dead_proxies) == 1
 
     def test_second_request_skips_dead_proxy(self, origin_server):
         session = HTTPSession(proxy="http://127.0.0.1:19998")
         session.get(f"{origin_server}/first")
-        assert len(_DEAD_PROXIES) == 1
+        assert len(session._dead_proxies) == 1
         resp = session.get(f"{origin_server}/second")
         assert resp.json().get("origin") is True
 
-    def test_dead_proxy_shared_across_sessions(self, origin_server):
+    def test_dead_proxy_not_shared_across_sessions(self, origin_server):
+        # A proxy that one session gives up on must NOT be blacklisted for
+        # other sessions — the dead-proxy state is scoped to the session.
         s1 = HTTPSession(proxy="http://127.0.0.1:19996")
         s1.get(f"{origin_server}/trigger")
-        assert len(_DEAD_PROXIES) == 1
+        assert len(s1._dead_proxies) == 1
         s2 = HTTPSession(base_url=f"{origin_server}", proxy="http://127.0.0.1:19996")
+        assert s2._dead_proxies == set()
+        # s2 still reaches the origin (it falls back on its own failed connect),
+        # but it independently decided to — s1 didn't poison it.
         resp = s2.get("/check")
         assert resp.json().get("origin") is True
 
@@ -336,34 +338,40 @@ class TestDeadProxyFallback:
     def test_dead_proxy_persists_across_clear_connections(self, origin_server):
         session = HTTPSession(proxy="http://127.0.0.1:19995")
         session.get(f"{origin_server}/first")
-        assert len(_DEAD_PROXIES) == 1
+        assert len(session._dead_proxies) == 1
         session.clear_connections()
         resp = session.get(f"{origin_server}/after-clear")
         assert resp.json().get("origin") is True
-        assert len(_DEAD_PROXIES) == 1
+        assert len(session._dead_proxies) == 1
 
-    def test_dead_proxy_prevents_all_routing(self, origin_server):
-        from yggdrasil.http_.session import mark_proxy_dead, is_proxy_dead
-        proxy_url = URL.from_("http://127.0.0.1:19994")
-        mark_proxy_dead(proxy_url)
-        assert is_proxy_dead(proxy_url)
+    def test_dead_proxy_prevents_routing_for_session(self, origin_server):
         session = HTTPSession(proxy="http://127.0.0.1:19994")
+        proxy_url = URL.from_("http://127.0.0.1:19994")
+        session._mark_proxy_dead(proxy_url)
+        assert session._is_proxy_dead(proxy_url)
         resolved = session._resolve_proxy_for("http", URL.from_(origin_server).host)
         assert resolved is None
 
-    def test_multiple_dead_proxies_tracked(self, origin_server):
+    def test_multiple_dead_proxies_tracked_per_session(self, origin_server):
         s1 = HTTPSession(proxy="http://127.0.0.1:19993")
         s1.get(f"{origin_server}/a")
         s2 = HTTPSession(proxy="http://127.0.0.1:19992")
         s2.get(f"{origin_server}/b")
-        assert len(_DEAD_PROXIES) >= 2
-        assert "127.0.0.1:19993" in _DEAD_PROXIES
-        assert "127.0.0.1:19992" in _DEAD_PROXIES
+        assert s1._dead_proxies == {"127.0.0.1:19993"}
+        assert s2._dead_proxies == {"127.0.0.1:19992"}
 
     def test_dead_proxy_does_not_retry(self, origin_server):
         session = HTTPSession(proxy="http://127.0.0.1:19991")
         session.get(f"{origin_server}/trigger")
-        dead_before = len(_DEAD_PROXIES)
+        dead_before = len(session._dead_proxies)
         for _ in range(5):
             session.get(f"{origin_server}/repeat")
-        assert len(_DEAD_PROXIES) == dead_before
+        assert len(session._dead_proxies) == dead_before
+
+    def test_dead_proxy_is_permanent_within_session(self):
+        session = HTTPSession(proxy="http://127.0.0.1:19990")
+        proxy_url = URL.from_("http://127.0.0.1:19990")
+        session._mark_proxy_dead(proxy_url)
+        # No expiry — the proxy stays dead for the life of this session.
+        assert session._is_proxy_dead(proxy_url)
+        assert session._is_proxy_dead(proxy_url)

@@ -203,8 +203,9 @@ def _struct_of_objects(columns: "Iterable[str]") -> "Schema":
     """Build a :class:`Schema` from *columns* with :class:`ObjectType` fields.
 
     Used by :meth:`CastOptions.check` when the caller passed a bare
-    ``columns=`` list and no target schema bound. The children default
-    to :class:`ObjectType` so casts pass through untouched.
+    ``columns=`` list and no target schema bound — the names become a
+    target projection. The children default to :class:`ObjectType` so the
+    projection narrows columns without casting their types.
     """
     from yggdrasil.data.data_field import Field as _Field
     from yggdrasil.data.schema import Schema as _Schema
@@ -313,7 +314,7 @@ class CastOptions:
     #: the source.
     checked_cast: bool = False
     mode: Mode = Mode.AUTO
-    schema_mode: Mode = Mode.IGNORE
+    schema_mode: Mode = Mode.AUTO
     row_size: int | None = None
     byte_size: int | None = None
     row_limit: int | None = None
@@ -419,7 +420,7 @@ class CastOptions:
             setattr_(self, "mode", Mode.from_(mode, default=Mode.AUTO))
         schema_mode = self.schema_mode
         if not isinstance(schema_mode, Mode):
-            setattr_(self, "schema_mode", Mode.from_(schema_mode, default=Mode.IGNORE))
+            setattr_(self, "schema_mode", Mode.from_(schema_mode, default=Mode.AUTO))
 
     # ==================================================================
     # Derived properties
@@ -427,6 +428,16 @@ class CastOptions:
 
     @property
     def merged(self) -> Field | None:
+        """Target reconciled with source under :attr:`schema_mode`.
+
+        With the default :attr:`Mode.AUTO`, a target field that matches a
+        source field by name is merged — so variant (``ObjectType`` /
+        ``NullType``) target slots adopt the source dtype — while the target's
+        field set is preserved (source-only columns are not pulled in). This is
+        the schema casts coerce to: see the ``cast_*`` dispatchers, which run
+        against ``merged`` rather than the raw ``target`` so a bare ``columns=``
+        projection autotypes against the bound source.
+        """
         cached = self._merged_cache
         if cached is not ...:
             return cached
@@ -467,6 +478,27 @@ class CastOptions:
             return None
 
         return merged.names
+
+    def read_columns(self) -> list[str] | None:
+        """Columns a source reader must keep — the projection plus the
+        predicate's columns.
+
+        :attr:`column_names` is what the read should *end up* with, but the
+        predicate row-filter runs before the cast projects down to it, so any
+        column the predicate touches has to survive the read even when the
+        caller didn't ask for it (``columns=["a"]`` + ``predicate`` on ``b``).
+        ``None`` means no projection — read everything.
+        """
+        names = self.column_names
+        if names is None:
+            return None
+        cols = list(names)
+        if self.predicate is not None:
+            from yggdrasil.execution.expr import free_columns
+            for c in (free_columns(self.predicate) or ()):
+                if c not in cols:
+                    cols.append(c)
+        return cols
 
     @property
     def match_by_keys(self) -> list[str] | None:
@@ -511,15 +543,14 @@ class CastOptions:
         bound" semantic should chain :meth:`check_source` /
         :meth:`check_target` after the call.
 
-        ``columns=`` shortcut: a sequence of column names. When the
-        caller didn't bind a source by any other means (no ``source=``
-        override, the wrapped options didn't carry one either), the
-        names are promoted to a struct-shaped source field whose
-        children default to :class:`ObjectType` — a "I have these
-        columns, no idea what's in them yet" placeholder that
-        downstream casts treat as passthroughs. Ignored when the source
-        is already bound, so callers can pass it defensively without
-        clobbering richer schemas.
+        ``columns=`` shortcut: a sequence of column names describing the
+        desired output projection. When a ``target`` is already bound the
+        names narrow it (``target.select(columns)``); otherwise they are
+        promoted to a struct-shaped *target* field whose children default
+        to :class:`ObjectType` — a "I want these columns, leave their
+        types alone" placeholder that drives projection without casting.
+        It lands on ``target`` (not ``source``) so it never shadows the
+        real source schema inferred at read time.
 
         :raises TypeError: if *options* is a type the dispatch table
             doesn't cover.
@@ -619,8 +650,8 @@ class CastOptions:
         if columns:
             if instance.target is not None:
                 instance = instance.copy(target=instance.target.select(columns))
-            elif instance.source is None:
-                instance = instance.copy(source=_struct_of_objects(columns))
+            else:
+                instance = instance.copy(target=_struct_of_objects(columns))
         return instance
 
     @classmethod
@@ -966,7 +997,7 @@ class CastOptions:
         """Finalize any object — delegates to :meth:`Field.finalize`."""
         if self.target is None:
             return obj
-        return self.target.finalize(obj, default_scalar=default_scalar)
+        return self.merged.finalize(obj, default_scalar=default_scalar)
 
     def finalize_spark_cast(
         self,
@@ -1057,7 +1088,7 @@ class CastOptions:
             return self.cast_tabular(obj)
         if self.target is None:
             return obj
-        return self.target.cast(obj, options=self)
+        return self.merged.cast(obj, options=self)
 
     # ---- pyarrow -----------------------------------------------------
 
@@ -1065,20 +1096,29 @@ class CastOptions:
         """Cast any pyarrow object — delegates to :meth:`Field.cast_arrow`."""
         if self.target is None:
             return obj
-        return self.target.cast_arrow(obj, options=self)
+        return self.merged.cast_arrow(obj, options=self)
 
     def cast_arrow_array(self, array: Any) -> Any:
         """Cast a :class:`pa.Array` or :class:`pa.ChunkedArray`."""
         if self.target is None:
             return array
-        return self.target.cast_arrow_array(array, options=self)
+        return self.merged.cast_arrow_array(array, options=self)
 
     def _apply_predicate_and_cast(self, data: Any) -> Any:
         if self.predicate is not None:
-            data = self.predicate.filter_arrow_batch(data)
+            # Only filter when the data still carries the predicate's columns.
+            # A projected read keeps them for the leaf filter then casts them
+            # away, so a re-applied filter further up the pipe (or a partition
+            # column already enforced by the path prune) would otherwise blow
+            # up on the missing column — it's a no-op here, the filter already
+            # ran where the columns existed.
+            from yggdrasil.execution.expr import free_columns
+            free = free_columns(self.predicate)
+            if free is None or set(free).issubset(data.schema.names):
+                data = self.predicate.filter_arrow_batch(data)
         if self.target is None or self.checked_cast:
             return data
-        return self.target.cast_arrow_tabular(data, options=self)
+        return self.merged.cast_arrow_tabular(data, options=self)
 
     def cast_arrow_batch(self, batch: "pa.RecordBatch") -> "pa.RecordBatch":
         """Filter + cast a :class:`pa.RecordBatch`."""
@@ -1349,19 +1389,19 @@ class CastOptions:
                 row_size=self.row_size,
                 memory_pool=self.arrow_memory_pool,
             )
-        return self.target.cast_arrow_batch_iterator(batches, options=self)
+        return self.merged.cast_arrow_batch_iterator(batches, options=self)
 
     def fill_arrow_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level null fill — delegates to :meth:`Field.fill_arrow`."""
         if self.target is None:
             return obj
-        return self.target.fill_arrow(obj, default_scalar=default_scalar)
+        return self.merged.fill_arrow(obj, default_scalar=default_scalar)
 
     def fill_arrow_array_nulls(self, array: Any, *, default_scalar: Any = None) -> Any:
         """Narrow null fill for a :class:`pa.Array` / :class:`pa.ChunkedArray`."""
         if self.target is None:
             return array
-        return self.target.fill_arrow_array_nulls(
+        return self.merged.fill_arrow_array_nulls(
             array, default_scalar=default_scalar
         )
 
@@ -1371,13 +1411,13 @@ class CastOptions:
         """Cast any polars object — delegates to :meth:`Field.cast_polars`."""
         if self.target is None:
             return obj
-        return self.target.cast_polars(obj, options=self)
+        return self.merged.cast_polars(obj, options=self)
 
     def cast_polars_series(self, series: Any, *, default_scalar: Any = None) -> Any:
         """Cast a :class:`pl.Series`."""
         if self.target is None:
             return series
-        return self.target.cast_polars_series(
+        return self.merged.cast_polars_series(
             series, options=self, default_scalar=default_scalar
         )
 
@@ -1389,7 +1429,7 @@ class CastOptions:
         """
         if self.target is None:
             return expr
-        return self.target.cast_polars_expr(
+        return self.merged.cast_polars_expr(
             expr, options=self, default_scalar=default_scalar
         )
 
@@ -1397,13 +1437,13 @@ class CastOptions:
         """Cast a :class:`pl.DataFrame` or :class:`pl.LazyFrame`."""
         if self.target is None:
             return data
-        return self.target.cast_polars_tabular(data, options=self)
+        return self.merged.cast_polars_tabular(data, options=self)
 
     def fill_polars_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level polars null fill — delegates to :meth:`Field.fill_polars`."""
         if self.target is None:
             return obj
-        return self.target.fill_polars(obj, default_scalar=default_scalar)
+        return self.merged.fill_polars(obj, default_scalar=default_scalar)
 
     def polars_alias(self, obj: Any) -> Any:
         """Rename a polars Series/Expr to the target name — no-op if matching.
@@ -1413,7 +1453,7 @@ class CastOptions:
         """
         if self.target is None:
             return obj
-        return self.target.polars_alias(obj)
+        return self.merged.polars_alias(obj)
 
     # ---- pandas ------------------------------------------------------
 
@@ -1421,13 +1461,13 @@ class CastOptions:
         """Cast any pandas object — delegates to :meth:`Field.cast_pandas`."""
         if self.target is None:
             return obj
-        return self.target.cast_pandas(obj, options=self)
+        return self.merged.cast_pandas(obj, options=self)
 
     def fill_pandas_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level pandas null fill — delegates to :meth:`Field.fill_pandas`."""
         if self.target is None:
             return obj
-        return self.target.fill_pandas(obj, default_scalar=default_scalar)
+        return self.merged.fill_pandas(obj, default_scalar=default_scalar)
 
     # ---- spark -------------------------------------------------------
 
@@ -1441,7 +1481,7 @@ class CastOptions:
             df = self.predicate.filter_spark_frame(df)
         if self.target is None:
             return df
-        return self.target.cast_spark_tabular(df, options=self)
+        return self.merged.cast_spark_tabular(df, options=self)
 
     def cast_spark_tabular(self, data: Any) -> Any:
         """Filter + cast a :class:`Dataset` (Spark Tabular wrapper)."""
@@ -1459,7 +1499,7 @@ class CastOptions:
         """Cast a Spark Column."""
         if self.target is None:
             return obj
-        return self.target.cast_spark_column(obj, options=self)
+        return self.merged.cast_spark_column(obj, options=self)
 
     def cast_spark(self, obj: Any) -> Any:
         """Dispatch spark types to the specific cast method."""
@@ -1470,19 +1510,19 @@ class CastOptions:
             return self.cast_spark_frame(obj)
         if self.target is None:
             return obj
-        return self.target.cast_spark(obj, options=self)
+        return self.merged.cast_spark(obj, options=self)
 
     def fill_spark_nulls(self, obj: Any, *, default_scalar: Any = None) -> Any:
         """Engine-level spark null fill — delegates to :meth:`Field.fill_spark`."""
         if self.target is None:
             return obj
-        return self.target.fill_spark(obj, default_scalar=default_scalar)
+        return self.merged.fill_spark(obj, default_scalar=default_scalar)
 
     def spark_alias(self, obj: Any) -> Any:
         """Rename a Spark Column to the target name — delegates to :meth:`Field.spark_alias`."""
         if self.target is None:
             return obj
-        return self.target.spark_alias(obj)
+        return self.merged.spark_alias(obj)
 
     def get_spark_session(self, create: bool = False, **kwargs):
         return PyEnv.spark_session(

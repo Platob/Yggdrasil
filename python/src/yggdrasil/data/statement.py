@@ -624,9 +624,6 @@ class StatementBatch(StatementResult[PS], Generic[PS, SR]):
         return "; ".join(r.text for r in self.results.values())
 
     def _collect_schema(self, options: O) -> Schema:
-        if options.target:
-            return options.target
-
         if not self.results:
             return Schema.empty()  # or whatever your empty sentinel is
 

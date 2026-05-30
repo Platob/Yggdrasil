@@ -1368,10 +1368,11 @@ class Table(DatabricksPath):
         return client_url.with_path("/" + "/".join(path_parts) if path_parts else "/")
 
     def _options_to_sql(self, options: CastOptions):
+        merged = self.collect_schema(options)
         safe_char = "`"
         names = ",".join(
             safe_char + name + safe_char
-            for name in options.column_names or [c.name for c in self.columns]
+            for name in options.column_names
         )
         query = f"SELECT {names} FROM {self.full_name(safe=True)}"
 

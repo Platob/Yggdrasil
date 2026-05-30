@@ -309,9 +309,6 @@ class ArrowTabular(Tabular[CastOptions]):
     # ------------------------------------------------------------------
 
     def _collect_schema(self, options: O) -> Schema:
-        if options.target:
-            return options.target
-
         if self._schema_cache is ...:
             for batch in self.batches:
                 self._schema_cache = StructField.from_arrow_schema(batch.schema)

@@ -12,7 +12,7 @@ state within a run.
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from databricks.sdk.service.jobs import (
     Run as SDKRun,
@@ -21,15 +21,14 @@ from databricks.sdk.service.jobs import (
     RunState,
     RunTask as SDKRunTask,
 )
-
 from yggdrasil.dataclasses.awaitable import Awaitable
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.enums.state import State
 from yggdrasil.url import URL
 
+from .service import JobRuns, _is_numeric
 from ..resource import DatabricksResource
-from .service import JobRuns, _is_numeric, _resolve_run_obj
 
 __all__ = ["JobRun", "JobTask"]
 

@@ -59,6 +59,43 @@ __all__ = [
 ]
 
 
+def _field_has_variant(field: "Field") -> bool:
+    """``True`` when *field*'s type tree carries an opaque/variant type
+    (``ObjectType`` or ``NullType`` — :attr:`DataTypeId.is_any_or_null`)
+    anywhere: at the field itself or nested inside a struct / map / list."""
+    if field.dtype.type_id.is_any_or_null:
+        return True
+    return any(_field_has_variant(c) for c in field.dtype.children)
+
+
+def _rebind_variant_fields(
+    target_children: "list[Field]",
+    casted: "list[pa.Array]",
+    arrow_fields: "list[pa.Field]",
+) -> "list[pa.Field]":
+    """Rebind every target field whose type tree carries an opaque/variant type
+    to its column's actual arrow type before struct assembly.
+
+    ``ObjectType`` / ``NullType`` targets are "keep whatever's here"
+    passthroughs (identity under merge, no-op on cast) — their declared arrow
+    type (``large_binary`` / ``null``) is a physical stand-in, not a cast
+    request. When such a type sits anywhere in the tree the casted array — not
+    the declared schema — is authoritative for that column, so binding its real
+    type into the assembled fields lets a bare ``columns=`` projection over
+    struct / map / list children preserve source dtypes instead of failing to
+    coerce e.g. ``int64`` -> large_binary. Returns *arrow_fields* unchanged when
+    no field carries one.
+    """
+    if not any(_field_has_variant(c) for c in target_children):
+        return arrow_fields
+    return [
+        pa.field(f.name, arr.type, f.nullable)
+        if _field_has_variant(c)
+        else f
+        for c, arr, f in zip(target_children, casted, arrow_fields)
+    ]
+
+
 def cast_arrow_struct_array(
     array: pa.StructArray,
     options: "CastOptions",
@@ -127,6 +164,10 @@ def cast_arrow_struct_array(
                 options=options.copy(source=source_child, target=target_child),
             )
         )
+    target_fields = _rebind_variant_fields(
+        target_type.children, children, target_fields,
+    )
+
     # ``pa.StructArray.from_arrays`` raises a bare ArrowInvalid when a
     # child's type doesn't equal the declared field type. Wrap the
     # assembler so the failing leaf surfaces with its source / target
@@ -192,7 +233,10 @@ def cast_arrow_map_array(
 
     return pa.StructArray.from_arrays(
         children,
-        fields=[f.to_arrow_field() for f in target_type.fields],
+        fields=_rebind_variant_fields(
+            target_type.children, children,
+            [f.to_arrow_field() for f in target_type.fields],
+        ),
         mask=array.is_null(),
         memory_pool=options.arrow_memory_pool,
     )
@@ -235,7 +279,10 @@ def cast_arrow_list_array(
 
     return pa.StructArray.from_arrays(
         casted_children,
-        fields=[f.to_arrow_field() for f in target_type.fields],
+        fields=_rebind_variant_fields(
+            target_children, casted_children,
+            [f.to_arrow_field() for f in target_type.fields],
+        ),
         mask=array.is_null() if isinstance(array, pa.Array) else None,
         memory_pool=memory_pool,
     )
@@ -425,6 +472,18 @@ def cast_arrow_tabular(
 
         target_arrays.append(casted)
         target_sources.append(source_field)
+
+    # Rebind variant (``ObjectType``) target fields to the projected column's
+    # real type so a bare ``columns=`` projection (struct-of-objects target)
+    # preserves source dtypes instead of failing to coerce to large_binary.
+    arrow_fields = list(target_arrow_schema)
+    rebound = _rebind_variant_fields(
+        target_schema.children, target_arrays, arrow_fields,
+    )
+    if rebound is not arrow_fields:
+        target_arrow_schema = pa.schema(
+            rebound, metadata=target_arrow_schema.metadata,
+        )
 
     # ``pa.Table.from_arrays(schema=...)`` silently coerces a column
     # whose type doesn't exactly equal the declared schema field — handy

@@ -88,6 +88,10 @@ class NumericType(PrimitiveType, ABC):
         mode = Mode.from_(mode, Mode.UPSERT)
         if mode is Mode.IGNORE:
             return self
+        if mode is Mode.AUTO:
+            # AUTO prefers the target outright — no width / signedness widen.
+            # (A numeric type is never a variant, so there's nothing to fill.)
+            return self
 
         same_kind = (
             self.type_id == other.type_id

@@ -46,10 +46,8 @@ def _partitioned_batch(
 @pytest.fixture(autouse=True)
 def _clear_singletons():
     Folder._INSTANCES.clear()
-    Folder._PARTITION_DATA_CACHE.clear()
     yield
     Folder._INSTANCES.clear()
-    Folder._PARTITION_DATA_CACHE.clear()
 
 
 # ===================================================================
@@ -368,3 +366,49 @@ class TestFolderPredicate:
         assert out.num_rows == 3
         assert sorted(out.column("pk").to_pylist()) == ["a", "b", "c"]
         assert sorted(out.column("val").to_pylist()) == [10, 20, 30]
+
+    def test_iter_leaves_skips_private_and_empty_and_prunes(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        fp = Folder(path=str(tmp_path / "part"))
+        fp.write_arrow_batches([_partitioned_batch(["a", "a", "b", "c"], [1, 2, 3, 4])])
+
+        # Drop a dot-file and a 0-byte file alongside a real part.
+        root = pathlib.Path(str(tmp_path / "part"))
+        (root / "pk=a" / ".hidden").write_text("x")
+        (root / "pk=b" / "empty.arrow").write_bytes(b"")
+
+        leaves = list(Folder(path=str(tmp_path / "part")).iter_leaves())
+        names = [lf.holder.name for lf in leaves]
+        assert all(not n.startswith(".") for n in names)     # no private
+        assert "empty.arrow" not in names                    # no 0-byte file
+        assert all(not isinstance(lf, Folder) for lf in leaves)
+
+        # Path-level prune keeps only the matching partition's leaves.
+        pruned = list(
+            Folder(path=str(tmp_path / "part")).iter_leaves(
+                FolderOptions(predicate=col("pk") == "a"))
+        )
+        assert {lf.tabular_parent.static_values.get("pk") for lf in pruned} == {"a"}
+
+    def test_eq_and_in_predicate_probe_partition_paths_without_listing_root(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        from yggdrasil.path.local_path import LocalPath
+
+        fp = Folder(path=str(tmp_path / "part"))
+        fp.write_arrow_batches([_partitioned_batch(["a", "b", "c", "d"], [1, 2, 3, 4])])
+        root = str(tmp_path / "part")
+
+        listed: list[str] = []
+        orig = LocalPath._ls
+        monkeypatch.setattr(
+            LocalPath, "_ls",
+            lambda self, *a, **k: (listed.append(self.os_path), orig(self, *a, **k))[1],
+        )
+
+        out = Folder(path=root).read_arrow_table(options=FolderOptions(predicate=col("pk") == "a"))
+        assert sorted(out.column("val").to_pylist()) == [1]
+        # The root partition dir was never listed — pk=a was probed directly.
+        assert root not in listed
+        assert any(p.endswith("pk=a") for p in listed)

@@ -123,24 +123,8 @@ LOGGER = logging.getLogger(__name__)
 # Proxy helpers — resolved once per process, shared across all sessions
 # ---------------------------------------------------------------------------
 
-# Dead proxies — process-wide set so one failure skips the proxy for
-# every session in the process, not just the one that hit the error.
-_DEAD_PROXIES: set[str] = set()
-
-
 def _proxy_key(proxy: "URL") -> str:
     return f"{proxy.host}:{proxy.port or 8080}"
-
-
-def mark_proxy_dead(proxy: "URL") -> None:
-    """Mark *proxy* as unreachable for the rest of the process."""
-    key = _proxy_key(proxy)
-    _DEAD_PROXIES.add(key)
-    LOGGER.warning("Proxy %s marked dead — falling back to direct connections", key)
-
-
-def is_proxy_dead(proxy: "URL") -> bool:
-    return _proxy_key(proxy) in _DEAD_PROXIES
 
 
 def _read_env_proxy(name: str) -> "URL | None":
@@ -837,6 +821,11 @@ class HTTPSession(Session):
         # existing TCP / TLS handshake instead of paying for a new one;
         # capped at ``pool_maxsize`` entries per host.
         self._connections: dict[tuple[str, str, int], "collections.deque[http.client.HTTPConnection]"] = {}
+        # Proxies this session has given up on. A proxy that fails to connect is
+        # skipped for the rest of *this* session's life (fall back to direct) —
+        # scoped to the session, not blacklisted process-wide, so one session's
+        # bad proxy never disables it for every other session in the process.
+        self._dead_proxies: set[str] = set()
         # Retry policy is built once at init — same policy applies to
         # every wire send and the singleton key already pins
         # ``pool_maxsize`` / ``waiting`` / ``verify`` so two sessions
@@ -867,6 +856,7 @@ class HTTPSession(Session):
             return
         super().__setstate__(state)
         self._connections = {}
+        self._dead_proxies = set()
         self._retry = self._build_retry()
 
     # ------------------------------------------------------------------
@@ -898,12 +888,21 @@ class HTTPSession(Session):
             backoff_max=_BACKOFF_429_MAX,
         )
 
+    def _mark_proxy_dead(self, proxy: "URL") -> None:
+        """Skip *proxy* for the rest of this session — fall back to direct."""
+        key = _proxy_key(proxy)
+        self._dead_proxies.add(key)
+        LOGGER.warning("Proxy %s marked dead for this session — falling back to direct connections", key)
+
+    def _is_proxy_dead(self, proxy: "URL") -> bool:
+        return _proxy_key(proxy) in self._dead_proxies
+
     def _resolve_proxy_for(self, scheme: str, host: str) -> "URL | None":
         """Return the proxy URL for this request, or ``None`` to go direct."""
         if _should_bypass_proxy(host, self.no_proxy):
             return None
         proxy = _resolve_proxy_url(self.proxy, target_scheme=scheme)
-        if proxy is not None and is_proxy_dead(proxy):
+        if proxy is not None and self._is_proxy_dead(proxy):
             return None
         return proxy
 
@@ -944,20 +943,17 @@ class HTTPSession(Session):
                         proxy, host, port, connect_timeout, ssl_ctx,
                     )
                 except (ProxyError, OSError) as exc:
-                    exc_msg = str(exc)
-                    if "CERTIFICATE_VERIFY_FAILED" in exc_msg:
-                        LOGGER.error(
-                            "SSL certificate verification failed for %s:%s "
-                            "(tunneled via proxy %s:%s). "
-                            "Use HTTPSession(verify=False) or session.insecure(): %s",
-                            host, port, proxy.host, proxy.port, exc_msg,
-                        )
-                    else:
-                        LOGGER.warning(
-                            "Proxy %s:%s failed for %s:%s (%s)",
-                            proxy.host, proxy.port, host, port, exc,
-                        )
-                    mark_proxy_dead(proxy)
+                    if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                        # The CONNECT tunnel succeeded — the proxy is fine; it's
+                        # the *target's* TLS cert that failed. Keep the proxy
+                        # (don't mark it dead) and re-raise so the request loop
+                        # logs the single warning and retries with verify=False.
+                        raise
+                    LOGGER.warning(
+                        "Proxy %s:%s failed for %s:%s (%s)",
+                        proxy.host, proxy.port, host, port, exc,
+                    )
+                    self._mark_proxy_dead(proxy)
 
             return http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
@@ -979,7 +975,7 @@ class HTTPSession(Session):
                     "Proxy %s:%s unreachable (%s) — falling back to direct",
                     proxy_host, proxy_port, exc,
                 )
-                mark_proxy_dead(proxy)
+                self._mark_proxy_dead(proxy)
 
         return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
 
@@ -1226,18 +1222,17 @@ class HTTPSession(Session):
                     retries.sleep()
                     continue
                 if "CERTIFICATE_VERIFY_FAILED" in msg and self.verify is not False:
+                    # Invalid/untrusted cert: warn once, disable verification
+                    # for this session, and retry. The proxy is left untouched
+                    # — a CONNECT tunnel cert failure is the *target*'s cert,
+                    # not the proxy's. ``self.verify is not False`` gates this
+                    # to a single flip, so a second cert failure just raises.
                     LOGGER.warning(
-                        "SSL certificate verification failed for %s — "
-                        "dropping proxy + retrying with verify=False: %s",
+                        "SSL certificate verification failed for %s — disabling "
+                        "verification for this session and retrying once: %s",
                         current_request.url, msg,
                     )
                     self.verify = False
-                    self.proxy = None
-                    self.no_proxy = None
-                    for var in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-                                "https_proxy", "http_proxy", "all_proxy"):
-                        os.environ.pop(var, None)
-                    _ProxyEnv.reset()
                     self.clear_connections()
                     continue
                 raise SSLError(msg) from exc
@@ -1354,7 +1349,15 @@ class HTTPSession(Session):
             send_headers.setdefault(
                 "Host", f"{host}:{port}" if port not in (80, 443) else host,
             )
+            # Ask the server (and, on a CONNECT tunnel, end-to-end through it)
+            # to hold the socket open so :meth:`_release_connection` can pool it
+            # for the next request instead of paying a fresh TCP+TLS (or
+            # TCP+CONNECT+TLS) handshake. HTTP/1.1 keeps alive by default, but
+            # being explicit also nudges older / picky proxies into reusing the
+            # client<->proxy hop.
+            send_headers.setdefault("Connection", "keep-alive")
             if is_http_proxy:
+                send_headers.setdefault("Proxy-Connection", "keep-alive")
                 proxy = self._resolve_proxy_for(scheme, host)
                 if proxy:
                     send_headers.update(self._proxy_auth_headers(proxy))
@@ -1399,12 +1402,20 @@ class HTTPSession(Session):
                 pass
             raise
 
+        # Only hand the socket back to the pool when the server intends to
+        # keep it open. ``http.client`` sets ``will_close`` during ``begin()``
+        # (run inside ``getresponse``) from the response's ``Connection`` /
+        # HTTP-version semantics. A ``Connection: close`` socket is dead after
+        # this response, so pooling it would just get popped next call,
+        # fail mid-request, and rebuild — pass ``pool_key=None`` and let
+        # ``release_conn`` close it cleanly instead.
+        pool_key = None if getattr(raw, "will_close", False) else key
         return HTTPResponse.from_wire(
             request=request,
             raw=raw,
             session=self,
             connection=conn,
-            pool_key=key,
+            pool_key=pool_key,
             decode_content=decode_content,
             preload_content=preload_content,
             tags=tags,

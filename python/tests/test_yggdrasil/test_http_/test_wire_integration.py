@@ -169,6 +169,50 @@ class TestConnectionPooling:
         r = session.get("/json")
         assert r.status_code == 200
 
+    def test_keep_alive_header_is_sent(self, server):
+        session = HTTPSession(base_url=server)
+        echoed = {k.lower(): v for k, v in session.get("/echo-headers").json().items()}
+        assert echoed.get("connection") == "keep-alive"
+
+
+class _KeepAliveHandler(_Handler):
+    # HTTP/1.1 so the server honours keep-alive and the client can actually
+    # pool + reuse the socket (the base _Handler is HTTP/1.0 → every response
+    # is will_close, which never pools).
+    protocol_version = "HTTP/1.1"
+
+
+@pytest.fixture(scope="module")
+def ka_server():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _KeepAliveHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{port}"
+    srv.shutdown()
+
+
+class TestKeepAlivePooling:
+
+    @staticmethod
+    def _idle(session):
+        return sum(len(q) for q in session._connections.values())
+
+    def test_keep_alive_response_is_pooled_and_reused(self, ka_server):
+        session = HTTPSession(base_url=ka_server)
+        session.get("/json").json()
+        assert self._idle(session) == 1   # socket held open for reuse
+        session.get("/json").json()
+        assert self._idle(session) == 1   # same socket reused, not a 2nd one
+
+    def test_close_header_socket_is_not_pooled(self, ka_server):
+        session = HTTPSession(base_url=ka_server)
+        session.get("/close-connection").json()
+        # Server said Connection: close — don't pool a dead socket.
+        assert self._idle(session) == 0
+        # …and the next request still works on a fresh socket.
+        assert session.get("/json").status_code == 200
+
 
 # ---------------------------------------------------------------------------
 # Concurrent dispatch

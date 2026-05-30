@@ -924,9 +924,6 @@ class WarehouseStatementResult(StatementResult):
         return self.statement.disposition
 
     def _collect_schema(self, options) -> Schema:
-        if options.target:
-            return options.target
-
         self.wait()
         manifest = self.manifest
         metadata = {

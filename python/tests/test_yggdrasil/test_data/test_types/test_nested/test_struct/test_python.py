@@ -300,11 +300,13 @@ class TestMerge:
         # Metadata picked up from right.
         assert result.fields[1].metadata == {b"comment": b"rhs"}
 
-    def test_drops_left_only_fields_when_right_is_authoritative(
+    def test_auto_prefers_left_keeps_left_only_and_drops_right_only(
         self,
         int64_type: IntegerType,
         string_type,
     ) -> None:
+        # AUTO prefers the target (left): left-only fields are kept, right-only
+        # fields are not pulled in. The shared field merges (left wins on type).
         left = StructType(
             fields=[
                 Field(name="left_only", dtype=int64_type, nullable=True),
@@ -312,12 +314,15 @@ class TestMerge:
             ]
         )
         right = StructType(
-            fields=[Field(name="shared", dtype=string_type, nullable=True)]
+            fields=[
+                Field(name="shared", dtype=string_type, nullable=True),
+                Field(name="right_only", dtype=int64_type, nullable=True),
+            ]
         )
 
         result = left._merge_with_same_id(right)
 
-        assert [f.name for f in result.fields] == ["shared"]
+        assert [f.name for f in result.fields] == ["left_only", "shared"]
 
     def test_overwrite_mode_drops_right_only_fields(
         self,

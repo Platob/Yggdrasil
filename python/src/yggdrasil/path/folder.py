@@ -214,25 +214,6 @@ class Folder(Path):
         default_ttl=_FOLDER_PATH_SINGLETON_TTL, max_size=10_000,
     )
 
-    # Per-leaf-partition data cache. Keyed by the full URL string of
-    # the partition directory (e.g. ``file:///cache/partition_key=ab/``);
-    # value is the tuple of unfiltered :class:`pa.RecordBatch` that
-    # :meth:`_read_arrow_batches` last drained from the directory's
-    # leaf files. Hits skip every file open / IPC parse / per-leaf
-    # batch yield in :meth:`iter_children` — the row-level predicate
-    # filter still runs in pyarrow's C++ kernels on the cached
-    # batches, so different predicates against the same partition
-    # all share one cache entry.
-    #
-    # TTL is short (60 s default) so the cache eventually converges
-    # with any out-of-process writer; in-process writes invalidate
-    # explicitly via :meth:`_invalidate_partition_cache` so a
-    # ``send_many`` write/read cycle on the same partition never
-    # serves stale rows.
-    _PARTITION_DATA_CACHE: "ClassVar[ExpiringDict[str, tuple]]" = ExpiringDict(
-        default_ttl=60.0, max_size=4_096,
-    )
-
     @classmethod
     def _singleton_key(cls, *args: Any, **kwargs: Any) -> Any:
         """Key by ``(cls, url_str, yggmeta_enabled)``.
@@ -714,75 +695,26 @@ class Folder(Path):
     def iter_children(
         self, options: "FolderOptions | None" = None,
     ) -> "Iterator[Tabular]":
-        """Yield every non-private direct entry of :attr:`path`.
+        """Yield every non-private **direct** entry of :attr:`path` (one level).
 
-        Sub-directories come back as a fresh :class:`Folder`. File
-        entries route through :class:`MediaType.from_` (extension
-        first, magic-byte fallback) to a registered :class:`Tabular`
-        leaf — :class:`ParquetFile` for ``.parquet``,
-        :class:`ArrowIPCFile` for ``.arrow``, etc. Files that don't
-        resolve fall back to a plain :class:`IO`, which is
-        useful for the children-surface walk but raises on the
-        Tabular hooks (so they're transparently skipped by
-        :meth:`_read_arrow_batches`).
+        Sub-directories come back as a fresh :class:`Folder`; file entries
+        resolve through :meth:`_leaf_for` to a registered :class:`Tabular`
+        leaf (non-tabular files are skipped). A missing folder yields nothing.
 
-        A missing folder yields nothing — no error. A stat failure
-        mid-listing (race with a delete) silently skips the entry
-        rather than aborting the whole walk.
-
-        When *options* has ``partition_columns`` set, the listing is
-        Hive-aware:
-
-        - the leading column is consumed at this level; sub-folders
-          matching ``<col>=<val>/`` are minted with the parsed value
-          seeded into their :attr:`Tabular.static_values` (and the
-          ``partition_columns`` tuple shrunk by one so the recursion
-          consumes the next level next time);
-        - when ``options.predicate`` constrains that column to a
-          finite value set (via :func:`extract_partition_filters`),
-          candidate sub-paths are built directly from the accepted
-          values and probed — :meth:`Path.iterdir` is **not** called,
-          so a wide partition tree stays cheap;
-        - otherwise we ``iterdir()``-walk and discard any
-          ``<col>=<val>/`` whose value is rejected by the predicate
-          via the static-values prune.
-
-        Non-partitioned folders and unset ``options`` keep the
-        legacy flat-listing behaviour.
+        Plain flat listing — the partition-aware, recursive walk lives in
+        :meth:`iter_leaves` (which the read path uses). ``options`` is accepted
+        for signature symmetry but isn't consulted here.
         """
-        # Cheap early exit on a folder that hasn't been created yet
-        # — without this :meth:`partition_columns` would call
-        # :meth:`collect_schema`, which falls back to
-        # ``super()._collect_schema`` → ``_read_arrow_batches`` →
-        # back here, cycling forever on the very first write to a
-        # fresh partition child whose sidecar doesn't exist yet.
-        # ``Path.exists`` is one stat probe and we'd pay the same on
-        # the unguarded ``iterdir`` anyway.
-        if not self.path.exists():
-            return
-        partition_columns = self.partition_columns(options)
-        if partition_columns:
-            yield from self._iter_partition_children(options, partition_columns)
-            return
-
-        for entry in self.path.iterdir():
+        for entry in self.path.ls():
             if entry.name.startswith("."):
                 continue
-
-            try:
-                is_dir = entry.is_dir()
-            except Exception:
-                continue
-
-            if is_dir:
+            if entry.is_dir():
                 yield type(self)(path=entry, tabular_parent=self)
-                continue
-
-            child = self._leaf_for(entry)
-            if child is None:
-                continue
-            child.tabular_parent = self
-            yield child
+            else:
+                child = self._leaf_for(entry)
+                if child is not None:
+                    child.tabular_parent = self
+                    yield child
 
     def partition_columns(
         self,
@@ -836,60 +768,6 @@ class Folder(Path):
         )
         self._partition_columns_cache = (cache_key, result)
         return result
-
-    def _iter_partition_children(
-        self,
-        options: "FolderOptions",
-        partition_columns: "tuple[str, ...]",
-    ) -> "Iterator[Tabular]":
-        """Hive-aware listing variant — see :meth:`iter_children`.
-
-        ``partition_columns[0]`` is the column this level resolves;
-        descendants re-resolve the layout from their own
-        :attr:`static_values` (the consumed head gets filtered out
-        of the schema-driven lookup, so the next level naturally
-        picks up the remaining partition columns). Leaf files at
-        this level (plain ``part-*.<ext>``, no ``<col>=<val>``
-        prefix) still pass through so a partially-populated tree
-        (e.g. a freshly minted folder where the writer happened to
-        land a non-partitioned leaf alongside the partition dirs)
-        reads cleanly.
-        """
-        head = partition_columns[0]
-        accepted = self._accepted_partition_values(options, head)
-
-        if accepted is not None:
-            yield from self._iter_partition_candidates(head, accepted)
-            return
-
-        for entry in self.path.iterdir():
-            if entry.name.startswith("."):
-                continue
-            try:
-                is_dir = entry.is_dir()
-            except Exception:
-                continue
-            if is_dir:
-                parsed = hive_split(entry.name)
-                if parsed is not None and parsed[0] == head:
-                    value = hive_cast_value(
-                        parsed[1], self._partition_dtype(head),
-                    )
-                    yield self._mint_partition_child(entry, head, value)
-                else:
-                    # Non-Hive sub-folder mixed in (older layout,
-                    # operator scratch dir, …): yield it as a plain
-                    # child so the walker still descends, but don't
-                    # seed any partition KV — the predicate prune
-                    # falls back to the row-level filter for it.
-                    yield type(self)(path=entry, tabular_parent=self)
-                continue
-
-            child = self._leaf_for(entry)
-            if child is None:
-                continue
-            child.tabular_parent = self
-            yield child
 
     def _iter_partition_candidates(
         self,
@@ -1111,8 +989,7 @@ class Folder(Path):
         schema = self._collect_schema(options)
         spark_schema = schema.to_spark_schema()
 
-        leaves: list = []
-        self._collect_leaves(leaves, options)
+        leaves: list = list(self.iter_leaves(options))
 
         if not leaves:
             return spark.createDataFrame([], schema=spark_schema)
@@ -1151,205 +1028,89 @@ class Folder(Path):
 
         return leaf_df.mapInArrow(_read_holders, schema=spark_schema)
 
-    def _collect_leaves(
-        self, out: list, options: "FolderOptions",
-    ) -> None:
-        """Recursively collect leaf Tabular children, applying predicate pruning."""
-        free_cols = self._free_cols_for(options.predicate) if options.predicate else None
+    def iter_leaves(
+        self, options: "FolderOptions | None" = None,
+    ) -> "Iterator[Tabular]":
+        """Recursively yield the surviving leaf data files under this folder.
+
+        Walks the tree itself — a non-recursive :meth:`Path.ls` at each level —
+        skipping private entries (dot-prefixed) and empty (0-byte) files, and
+        recursing into sub-directories the predicate doesn't prune on their
+        path-level Hive :attr:`static_values`. Opens **no** data file: a pure
+        listing + path-prune, reusable as a file-enumeration pass. The residual
+        row-level filter stays in :meth:`_read_arrow_batches`.
+
+        Fast get: when the predicate pins this level's partition column to a
+        finite value set (``col == v`` / ``col in [...]``), the matching
+        ``<col>=<val>/`` sub-paths are probed directly — a handful of ``stat``s
+        instead of listing (and pruning) every sibling partition.
+        """
+        predicate = getattr(options, "predicate", None)
+        free_cols = self._free_cols_for(predicate)
         if self._should_prune_by_predicate(options, free_cols=free_cols):
             return
-        for child in self.iter_children(options=options):
-            if isinstance(child, type(self)):
-                child._collect_leaves(out, self._child_read_options(child, options))
-            else:
-                out.append(child)
+
+        if predicate is not None:
+            cols = self.partition_columns(options)
+            if cols:
+                accepted = self._accepted_partition_values(options, cols[0])
+                if accepted is not None:
+                    for child in self._iter_partition_candidates(cols[0], accepted):
+                        yield from child.iter_leaves(options)
+                    return
+
+        for entry in self.path.ls():
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                yield from type(self)(
+                    path=entry, tabular_parent=self,
+                ).iter_leaves(options)
+            elif entry.size != 0:
+                leaf = self._leaf_for(entry)
+                if leaf is not None:
+                    leaf.tabular_parent = self
+                    yield leaf
 
     def _read_arrow_batches(
         self, options: FolderOptions,
     ) -> Iterator[pa.RecordBatch]:
-        """Chain :meth:`iter_children` into one Arrow batch stream.
+        """Read every surviving leaf from :meth:`iter_leaves` into one stream.
 
-        Sub-folders recurse through their own
-        :meth:`_read_arrow_batches`; leaf children read in turn.
-
-        Self + per-child predicate pruning runs through
-        :meth:`Tabular._should_prune_by_predicate`: when
-        ``options.predicate`` is provably false against the bound
-        :attr:`static_values` (own seed + inherited from
-        :attr:`tabular_parent`), the whole read is skipped without
-        opening the directory; per-child the same check skips
-        sub-folders / leaf files whose static surface decides the
-        predicate negatively. Children without a static surface fall
-        through unchanged (undecidable → read), so a vanilla folder
-        without partition KV behaves exactly as before.
-
-        When the folder's resolved schema declares any partition
-        columns (via :class:`Field` ``partition_by`` tags), the
-        listing is Hive-aware (see :meth:`iter_children`). Each
-        yielded child carries the consumed partition KV on its
-        :attr:`static_values`; the recursive read just forwards
-        ``predicate`` / ``prune_values``, and the child's
-        :meth:`partition_columns` filters the consumed column out
-        of its own schema-driven lookup so the next level naturally
-        drops to the remaining partitions (or to a flat write when
-        the schema's partition set is exhausted).
+        Partition pruning happened on the path in :meth:`iter_leaves`; each
+        leaf's own read applies the predicate row-filter + target cast (every
+        format funnels batches through ``options.cast_arrow_batch``), so the
+        folder just chains them. An all-pruned / empty read still emits one
+        empty batch carrying the resolved schema so the result keeps its columns.
         """
         yielded = False
-        for batch in self._read_arrow_batches_inner(options):
-            yielded = True
-            yield batch
+        for leaf in self.iter_leaves(options):
+            for batch in leaf._read_arrow_batches(options):
+                yielded = True
+                yield batch
         if not yielded:
-            schema = self._schema_cache
-            if schema is ... or not schema:
-                schema = options.target
+            schema = self._schema_cache if self._schema_cache is not ... else None
+            target = options.target
+            if target is not None:
+                # A projected read (``columns=[...]``) carries ObjectType
+                # placeholders on the target; resolve them against the folder's
+                # own schema via the AUTO merge so an empty result still reports
+                # concrete column types (int64, …) instead of the ObjectType
+                # ``large_binary`` stand-in.
+                if not schema:
+                    # ``_collect_schema`` (not the public wrapper, which would
+                    # short-circuit to ``options.merged`` == the ObjectType
+                    # target) reads the real sidecar / first-batch schema.
+                    try:
+                        schema = self._collect_schema(options)
+                    except Exception:
+                        schema = None
+                schema = options.with_source(schema).merged if schema else target
             if schema and hasattr(schema, "to_arrow_schema"):
                 arrow_schema = schema.to_arrow_schema()
                 yield pa.RecordBatch.from_pydict(
                     {f.name: pa.array([], type=f.type) for f in arrow_schema},
                     schema=arrow_schema,
-                )
-
-    def _read_arrow_batches_inner(
-        self, options: FolderOptions,
-    ) -> Iterator[pa.RecordBatch]:
-        predicate = options.predicate
-        free_cols = self._free_cols_for(predicate)
-        if self._should_prune_by_predicate(options, free_cols=free_cols):
-            LOGGER.debug("Pruned read from %r — predicate eliminates partition", self)
-            return
-
-        cache_key = self._partition_cache_key()
-        if cache_key is not None:
-            cached = self._PARTITION_DATA_CACHE.get(cache_key)
-            if cached is not None:
-                yield from self._yield_filtered(cached, predicate)
-                return
-
-        accumulated: "list[pa.RecordBatch] | None" = (
-            [] if cache_key is not None else None
-        )
-
-        for child in self.iter_children(options=options):
-            if child._should_prune_by_predicate(options, free_cols=free_cols):
-                continue
-            child_options = self._child_read_options(child, options)
-            stream = child._read_arrow_batches(child_options)
-            # Sub-folders recurse and apply the predicate at their
-            # own leaf level; flat-format leaves (parquet / arrow IPC
-            # / csv) don't filter rows themselves, so we route each
-            # leaf batch through :meth:`Predicate.filter_arrow_batch`
-            # — the predicate picks the best engine internally
-            # (hashset shortcut for the typical ``InList`` /
-            # ``AND-of-InList`` cache lookup shape, pyarrow's C++
-            # ``filter`` for everything else). The static-value prune
-            # above already eliminated whole sub-trees the predicate
-            # rejects on a partition column; this is the residual
-            # non-partition filter.
-            if isinstance(child, Folder):
-                # Recursive sub-folder branch: any inner partition
-                # leaf populates its own cache entry via the same
-                # mechanism; we don't double-cache the recursive
-                # output here.
-                yield from stream
-                continue
-            needs_row_filter = predicate is not None and (
-                free_cols is None or not set(free_cols).issubset(self.static_values.keys())
-            )
-            for batch in stream:
-                if batch.num_rows == 0:
-                    continue
-                if accumulated is not None:
-                    accumulated.append(batch)
-                if not needs_row_filter:
-                    yield batch
-                    continue
-                kept = predicate.filter_arrow_batch(batch)
-                if kept.num_rows > 0:
-                    yield kept
-
-        if accumulated is not None and cache_key is not None:
-            if accumulated:
-                total = sum(b.num_rows for b in accumulated)
-                LOGGER.debug(
-                    "Caching %d batch(es) / %d row(s) for partition %r",
-                    len(accumulated), total, cache_key,
-                )
-                try:
-                    cached_table = pa.Table.from_batches(accumulated)
-                except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
-                    # Part files inside this partition drifted in schema
-                    # (binary vs large_binary, int64 vs timestamp, …) —
-                    # conform each to the first batch's schema so the
-                    # cached table assembles cleanly.
-                    from yggdrasil.arrow.cast import conform_arrow_batch
-                    target = accumulated[0].schema
-                    cached_table = pa.Table.from_batches(
-                        [conform_arrow_batch(b, target) for b in accumulated]
-                    )
-                self._PARTITION_DATA_CACHE.set(
-                    cache_key, cached_table.combine_chunks().to_batches(),
-                )
-            else:
-                self._PARTITION_DATA_CACHE.set(cache_key, ())
-
-    def _partition_cache_key(self) -> "str | None":
-        """Return the in-memory partition-cache key, or ``None`` to skip caching.
-
-        Only :class:`Folder` instances bound to a real Hive
-        ``<col>=<val>/`` partition (non-empty :attr:`static_values`)
-        cache their batches — the root cache folder doesn't, since
-        its read flows into per-partition child reads that each
-        cache independently. The leaf's URL string is stable across
-        the singleton's lifetime so it's safe to use as the key.
-        """
-        if not self.static_values:
-            return None
-        full = getattr(self.path, "full_path", None)
-        return full() if callable(full) else None
-
-    def _invalidate_partition_cache(self) -> None:
-        """Drop this folder's :attr:`_PARTITION_DATA_CACHE` entry.
-
-        Called at the start of :meth:`_write_arrow_batches` so any
-        concurrent in-process reader sees the invalidation before a
-        write begins. Non-partition folders (root cache directory,
-        flat folders without Hive layout) have no key and skip the
-        cache entirely, so this is a no-op for them.
-        """
-        key = self._partition_cache_key()
-        if key is not None:
-            self._PARTITION_DATA_CACHE.pop(key, None)
-
-    @staticmethod
-    def _yield_filtered(
-        batches: "Iterable[pa.RecordBatch]",
-        predicate: "Any | None",
-    ) -> "Iterator[pa.RecordBatch]":
-        """Apply *predicate* to ``batches`` (pass-through when ``None``).
-
-        Used by the cache-hit branch of :meth:`_read_arrow_batches`;
-        :meth:`Predicate.filter_arrow_batch` picks the hashset
-        shortcut for ``InList`` / ``AND-of-InList`` shapes and
-        :meth:`pa.RecordBatch.filter` for everything else. Empty /
-        fully-dropped batches are skipped so consumers can treat
-        the output as "non-empty rows that match" without an extra
-        guard.
-        """
-        if predicate is None:
-            for batch in batches:
-                if batch.num_rows:
-                    yield batch
-            return
-        for batch in batches:
-            if batch.num_rows == 0:
-                continue
-            kept = predicate.filter_arrow_batch(batch)
-            if kept.num_rows > 0:
-                yield kept
-            elif batch.num_rows > 0:
-                LOGGER.debug(
-                    "Predicate filtered %d cached row(s) to 0",
-                    batch.num_rows,
                 )
 
     def _free_cols_for(self, predicate: "Predicate") -> "tuple[str, ...] | None":
@@ -1476,14 +1237,6 @@ class Folder(Path):
         :meth:`collect_schema` without re-opening a data leaf.
         """
         import pyarrow.compute as pc
-
-        # Invalidate this folder's leaf-partition data cache up front
-        # so a concurrent reader on this process can't serve a hit from
-        # the about-to-be-stale entry. Recursive writes on partition
-        # children invalidate their own keys when they re-enter; the
-        # root partitioned folder has no cache key (empty static_values)
-        # so the call collapses to a no-op there.
-        self._invalidate_partition_cache()
 
         materialised = [b for b in batches if b.num_rows > 0]
         if not materialised:

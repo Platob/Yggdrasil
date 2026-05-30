@@ -56,17 +56,17 @@ from __future__ import annotations
 
 import logging
 import os
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 from yggdrasil.data.data_field import Field as _Field
+from yggdrasil.data.options import CastOptions
+from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.enums import MediaType, MimeType, Mode, ModeLike
-from yggdrasil.data.options import CastOptions
-from yggdrasil.data.schema import Schema
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.url.based import URLBased
 
@@ -958,9 +958,10 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             return self._schema_cache
 
         options = self.check_options(options, overrides=locals())
+        m = options.merged
 
-        if options.target:
-            return options.target
+        if m:
+            return m
 
         schema = self._collect_schema(options)
         if schema is not None:

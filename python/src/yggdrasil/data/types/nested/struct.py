@@ -142,7 +142,10 @@ class StructType(NestedType):
             if found is None:
                 if mode is Mode.APPEND and not f.dtype.type_id.is_any_or_null:
                     missing_fields.append(f)
-                elif mode is Mode.UPSERT:
+                elif mode in (Mode.UPSERT, Mode.AUTO):
+                    # AUTO prefers the target: a target field with no source
+                    # match is kept as-is (only its variant slots would have
+                    # been filled, and there's nothing to fill from).
                     merged_fields.append(f)
             else:
                 seen.add(found.name)

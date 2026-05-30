@@ -244,3 +244,111 @@ class TestVerifyProperty:
         session = HTTPSession(base_url="https://example.com", verify=ca_dir)
         assert isinstance(session.verify, str)
         assert session.verify == str(ca_dir)
+
+
+# ---------------------------------------------------------------------------
+# Invalid-cert auto-disable — warn once, flip verify=False, retry
+# ---------------------------------------------------------------------------
+
+
+def _self_signed_cert(tmp_path):
+    """Write a throwaway self-signed cert + key; return (cert_path, key_path).
+
+    Uses the ``openssl`` CLI — the ``cryptography`` wheel in this env has no
+    working ``_cffi_backend``. Skips the test if ``openssl`` isn't available.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl CLI not available")
+    cert_path = tmp_path / "cert.pem"
+    key_path = tmp_path / "key.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key_path), "-out", str(cert_path),
+            "-days", "1", "-subj", "/CN=127.0.0.1",
+            "-addext", "subjectAltName=IP:127.0.0.1",
+        ],
+        check=True, capture_output=True,
+    )
+    return str(cert_path), str(key_path)
+
+
+@pytest.fixture
+def tls_server(tmp_path):
+    import http.server
+    import threading
+
+    cert_path, key_path = _self_signed_cert(tmp_path)
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    # Swallow the client-aborted handshake (verify=True attempt) so it
+    # doesn't spew tracebacks from the server thread.
+    srv.handle_error = lambda *a, **k: None
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"https://127.0.0.1:{port}"
+    srv.shutdown()
+
+
+class TestInvalidCertAutoDisable:
+
+    def test_cert_failure_disables_verify_and_succeeds(self, tls_server):
+        session = HTTPSession(base_url=tls_server, verify=True)
+        resp = session.get("/json")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        # Verification was flipped off for the session (the "disable once").
+        assert session.verify is False
+
+    def test_cert_failure_keeps_proxy(self, tls_server):
+        # The proxy must survive a target-cert failure (it's the target's
+        # cert, not the proxy's). No real proxy reachable here, so point at a
+        # dead one and confirm it's still set after the verify flip — the
+        # request itself goes direct (no_proxy covers the loopback host).
+        session = HTTPSession(
+            base_url=tls_server, verify=True,
+            proxy="http://127.0.0.1:9", no_proxy="127.0.0.1",
+        )
+        resp = session.get("/json")
+        assert resp.status_code == 200
+        assert session.verify is False
+        assert session.proxy is not None          # not dropped
+        assert session.proxy.host == "127.0.0.1"
+
+    def test_cert_failure_warns_once(self, tls_server):
+        import logging
+        logger = logging.getLogger("yggdrasil.http_.session")
+        records: list[logging.LogRecord] = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Cap(level=logging.WARNING)
+        logger.addHandler(handler)
+        try:
+            HTTPSession(base_url=tls_server, verify=True).get("/json")
+        finally:
+            logger.removeHandler(handler)
+        hits = [r for r in records
+                if "certificate verification failed" in r.getMessage().lower()]
+        assert len(hits) == 1
