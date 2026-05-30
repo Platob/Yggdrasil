@@ -663,9 +663,9 @@ def _format_cookie_header(cookies: Any) -> str:
 # time to clear; both schedules are tight (we'd rather surface an error
 # fast than mask a real outage with a minute-long retry storm).
 # Server-supplied Retry-After always wins over these when present.
-_RETRY_TOTAL = 4
-_RETRY_CONNECT = 3
-_RETRY_READ = 3
+_RETRY_TOTAL = 8
+_RETRY_CONNECT = 5
+_RETRY_READ = 5
 
 # 5xx schedule: 0.5, 1, 2 (capped at backoff_max). Worst-case ~3.5s.
 _BACKOFF_5XX_FACTOR = 0.5
@@ -874,7 +874,11 @@ class HTTPSession(Session):
             connect=_RETRY_CONNECT,
             read=_RETRY_READ,
             status=_RETRY_TOTAL,
-            other=4,
+            # SSL EOF / connection-reset on send is classed as an "other" error
+            # by Retry.increment — keep its budget at the full total so a flaky
+            # peer (e.g. Databricks Files dropping the TLS socket mid-upload)
+            # gets every retry, each on a fresh connection, before we give up.
+            other=_RETRY_TOTAL,
             status_forcelist=_RETRY_STATUSES,
             allowed_methods=None,  # retry every method, incl. POST/PATCH
             respect_retry_after_header=True,
@@ -1112,6 +1116,25 @@ class HTTPSession(Session):
             except Exception:
                 pass
 
+    def _evict_host(self, url: "URL") -> None:
+        """Close and drop every idle socket cached for ``url``'s host.
+
+        Called before a connection-level retry: once a peer has dropped a
+        socket mid-send (stale keep-alive, TLS EOF, reset), its sibling pooled
+        sockets are just as suspect, so the next :meth:`_get_connection` must
+        dial fresh rather than hand back another about-to-fail socket.
+        """
+        scheme = url.scheme
+        port = url.port or (443 if scheme == "https" else 80)
+        queue = self._connections.pop((scheme, url.host, port), None)
+        if not queue:
+            return
+        while queue:
+            try:
+                queue.popleft().close()
+            except Exception:
+                pass
+
     def clear_connections(self) -> None:
         """Close every cached idle connection.
 
@@ -1207,6 +1230,7 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
+                self._evict_host(current_request.url)  # retry on a fresh socket
                 retries.sleep()
                 continue
             except ssl.SSLError as exc:
@@ -1219,6 +1243,7 @@ class HTTPSession(Session):
                         method=current_request.method, url=url_str,
                         error=wrapped, _pool=self,
                     )
+                    self._evict_host(current_request.url)  # retry on a fresh socket
                     retries.sleep()
                     continue
                 if "CERTIFICATE_VERIFY_FAILED" in msg and self.verify is not False:
@@ -1243,6 +1268,7 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
+                self._evict_host(current_request.url)  # retry on a fresh socket
                 retries.sleep()
                 continue
 
