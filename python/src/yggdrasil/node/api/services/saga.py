@@ -82,7 +82,7 @@ from ..schemas.saga import (
     TableUpdate,
 )
 from .saga_log import OpLog
-from ...ids import make_id
+from ...ids import make_static_id as make_id
 
 _TABULAR_EXTS = {"parquet", "pq", "csv", "tsv", "ndjson", "json", "arrow", "feather",
                  "ipc", "xlsx", "zip", "gz", "orc", "delta"}

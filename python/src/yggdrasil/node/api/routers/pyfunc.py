@@ -7,19 +7,21 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import Field
 
-_SSE_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
-
 from ..deps import get_pyfunc_service, get_pyfuncrun_service
 from ..schemas.common import StrictModel
 from ..schemas.pyfunc import (
     PyFuncCreate,
+    PyFuncInferRequest,
+    PyFuncInferResult,
     PyFuncListResponse,
     PyFuncResponse,
     PyFuncUpdate,
 )
 from ..schemas.pyfuncrun import PyFuncRunCreate, PyFuncRunListResponse, PyFuncRunResponse
-from ..services.pyfunc import PyFuncService
+from ..services.pyfunc import PyFuncService, infer_function
 from ..services.pyfuncrun import PyFuncRunService
+
+_SSE_HEADERS = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
 
 router = APIRouter(tags=["pyfunc"])
 
@@ -37,6 +39,20 @@ async def create_func(
     service: PyFuncService = Depends(get_pyfunc_service),
 ) -> PyFuncResponse:
     return await service.create(req)
+
+
+@router.post("/infer", response_model=PyFuncInferResult)
+async def infer_func(
+    req: PyFuncInferRequest,
+    service: PyFuncService = Depends(get_pyfunc_service),
+) -> PyFuncInferResult:
+    """Scan code → name, typed signature (yggdrasil.data dtypes), version-pinned
+    dependencies and the target python version. Drives the editor's live infer."""
+    from fastapi.concurrency import run_in_threadpool
+    return await run_in_threadpool(
+        infer_function, req.code, req.name,
+        pin_versions=req.pin_versions, default_py="3.11",
+    )
 
 
 @router.get("/by-name/{name}", response_model=PyFuncResponse)
