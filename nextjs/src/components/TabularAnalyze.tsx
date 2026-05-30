@@ -5,11 +5,14 @@ import {
   aggregate,
   analysisSeries,
   analysisOhlc,
+  analysisForecast,
+  registerForecastWorkflow,
   downloadExport,
   type AggFunc,
   type AggregateResult,
   type SeriesResult,
   type OhlcResult,
+  type ForecastResult,
   type FilterSpec,
   type CastSpec,
 } from "@/lib/api";
@@ -39,7 +42,7 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
   const allCols = useMemo(() => columns.map((c) => c.name), [columns]);
   const numericCols = useMemo(() => columns.filter((c) => NUMERIC.test(c.type ?? "")).map((c) => c.name), [columns]);
 
-  const [kind, setKind] = useState<"pivot" | "series" | "candles">("pivot");
+  const [kind, setKind] = useState<"pivot" | "series" | "candles" | "forecast">("pivot");
   const [groupBy, setGroupBy] = useState("");
   const [measureCol, setMeasureCol] = useState(numericCols[0] ?? allCols[0] ?? "");
   const [aggFn, setAggFn] = useState<AggFunc>("sum");
@@ -55,6 +58,21 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
   const [maWindow, setMaWindow] = useState(20);
   const [analyzing, setAnalyzing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  // forecast panel
+  const [fcGroup, setFcGroup] = useState("");
+  const [fcHorizon, setFcHorizon] = useState(24);
+  const [fcModel, setFcModel] = useState("auto");
+  const [fcPeriod, setFcPeriod] = useState("");
+  const [fcAgg, setFcAgg] = useState("mean");
+  const [fcData, setFcData] = useState<ForecastResult | null>(null);
+  const [regOpen, setRegOpen] = useState(false);
+  const [regName, setRegName] = useState("");
+  const [regCatalog, setRegCatalog] = useState("main");
+  const [regSchema, setRegSchema] = useState("default");
+  const [regMaterialize, setRegMaterialize] = useState(true);
+  const [registering, setRegistering] = useState(false);
+  const [regMsg, setRegMsg] = useState<string | null>(null);
 
   const [transformOpen, setTransformOpen] = useState(false);
   const [filters, setFilters] = useState<FilterSpec[]>([]);
@@ -82,6 +100,35 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
     try { setCandles(await analysisOhlc(path, seriesCol, { x: xCol || undefined, volume: volCol || undefined, buckets: 120, filters, node })); }
     catch (e) { setErr(e instanceof Error ? e.message : "ohlc failed"); }
     finally { setAnalyzing(false); }
+  };
+  const runForecast = async () => {
+    if (!seriesCol) return;
+    setAnalyzing(true); setErr(null);
+    try {
+      setFcData(await analysisForecast(path, seriesCol, {
+        x: xCol || undefined, group: fcGroup || undefined, horizon: fcHorizon,
+        model: fcModel, period: fcPeriod ? Number(fcPeriod) : undefined, agg: fcAgg,
+        filters, node,
+      }));
+    } catch (e) { setErr(e instanceof Error ? e.message : "forecast failed"); }
+    finally { setAnalyzing(false); }
+  };
+  const registerWorkflow = async () => {
+    if (!regName || !seriesCol) return;
+    setRegistering(true); setRegMsg(null); setErr(null);
+    try {
+      const r = await registerForecastWorkflow({
+        catalog: regCatalog, schema: regSchema, name: regName, materialize: regMaterialize,
+        spec: {
+          source: path, column: seriesCol, x: xCol || null,
+          keys: fcGroup ? [fcGroup] : [], horizon: fcHorizon, model: fcModel,
+          period: fcPeriod ? Number(fcPeriod) : null, agg: fcAgg, materialized: regMaterialize,
+        },
+      }, node);
+      setRegMsg(`registered ${r.table.full_name} · ${r.model_used} · ${r.rows} rows${r.materialized_url ? " · materialized" : " · live"}`);
+      setRegOpen(false);
+    } catch (e) { setErr(e instanceof Error ? e.message : "register failed"); }
+    finally { setRegistering(false); }
   };
   const exportAs = async (fmt: string) => {
     setDlOpen(false); setExporting(true); setErr(null);
@@ -111,7 +158,7 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
   return (
     <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30 p-3 space-y-3">
       <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap">
-        {(["pivot", "series", "candles"] as const).map((k) => (
+        {(["pivot", "series", "candles", "forecast"] as const).map((k) => (
           <button key={k} onClick={() => setKind(k)}
             className={`px-2.5 py-1 rounded ${kind === k ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{k}</button>
         ))}
@@ -168,6 +215,35 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
             )}
           </>
         )}
+        {kind === "forecast" && (
+          <>
+            <label className="text-muted">value</label>
+            <select value={seriesCol} onChange={(e) => setSeriesCol(e.target.value)} className={sel}>
+              {(numericCols.length ? numericCols : allCols).map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <label className="text-muted">time</label>
+            <select value={xCol} onChange={(e) => setXCol(e.target.value)} className={sel}>
+              <option value="">(index)</option>
+              {allCols.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <label className="text-muted">by</label>
+            <select value={fcGroup} onChange={(e) => setFcGroup(e.target.value)} className={sel}>
+              <option value="">(none)</option>
+              {allCols.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <label className="text-muted">h</label>
+            <input type="number" min={1} max={2000} value={fcHorizon} onChange={(e) => setFcHorizon(Math.max(1, Number(e.target.value) || 1))} className={`${sel} w-14`} title="horizon (steps ahead)" />
+            <select value={fcModel} onChange={(e) => setFcModel(e.target.value)} className={sel} title="model">
+              {["auto", "xgboost", "gbr", "ridge"].map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+            <input type="number" min={0} value={fcPeriod} onChange={(e) => setFcPeriod(e.target.value)} placeholder="period" className={`${sel} w-16`} title="seasonal period (Fourier features)" />
+            <select value={fcAgg} onChange={(e) => setFcAgg(e.target.value)} className={sel} title="collapse duplicate time">
+              {["mean", "sum", "last", "max", "min"].map((a) => <option key={a} value={a}>{a}</option>)}
+            </select>
+            <button onClick={runForecast} disabled={analyzing || !seriesCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
+            <button onClick={() => { setRegName(`${seriesCol}_forecast`); setRegOpen((v) => !v); }} className="px-2.5 py-1 rounded bg-frost/10 text-frost border border-frost/25">register ▾</button>
+          </>
+        )}
         {/* Download-as (applies filters + casts) */}
         <div className="relative ml-1">
           <button onClick={() => setDlOpen((v) => !v)} disabled={exporting}
@@ -183,6 +259,24 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
           )}
         </div>
       </div>
+
+      {kind === "forecast" && regOpen && (
+        <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap rounded border border-frost/20 bg-frost/[0.04] p-2">
+          <span className="text-frost/80">register workflow</span>
+          <input value={regCatalog} onChange={(e) => setRegCatalog(e.target.value)} placeholder="catalog" className={`${sel} w-24`} />
+          <span className="text-muted">.</span>
+          <input value={regSchema} onChange={(e) => setRegSchema(e.target.value)} placeholder="schema" className={`${sel} w-24`} />
+          <span className="text-muted">.</span>
+          <input value={regName} onChange={(e) => setRegName(e.target.value)} placeholder="name" className={`${sel} w-36`} />
+          <label className="flex items-center gap-1 text-muted" title="snapshot to a managed parquet (vs recompute live on query)">
+            <input type="checkbox" checked={regMaterialize} onChange={(e) => setRegMaterialize(e.target.checked)} />
+            materialize
+          </label>
+          <button onClick={registerWorkflow} disabled={registering || !regName} className="px-2.5 py-1 rounded bg-frost/15 text-frost border border-frost/30 disabled:opacity-40">{registering ? "…" : "save"}</button>
+          <span className="text-muted/70">queryable as <code className="text-foreground/70">{regCatalog}.{regSchema}.{regName || "…"}</code></span>
+        </div>
+      )}
+      {regMsg && <div className="text-[11px] text-emerald/90 font-mono">{regMsg}</div>}
 
       {/* Transform: filters (rows) + casts (download) */}
       <div className="text-[11px] font-mono">
@@ -284,9 +378,40 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
         </div>
       )}
 
-      {((kind === "pivot" && !pivot) || (kind === "series" && !seriesData) || (kind === "candles" && !candles)) && !analyzing && !err && (
+      {kind === "forecast" && fcData && !analyzing && (
+        <div className="space-y-3">
+          <div className="text-[10px] text-muted font-mono">
+            model <span className="text-emerald/90">{fcData.model_used}</span> · horizon {fcData.horizon}
+            {fcData.period ? ` · period ${fcData.period}` : ""} · {fcData.series.length} series · {fcData.source_rows.toLocaleString()} rows
+          </div>
+          {fcData.series.map((s) => {
+            // One continuous line: history then forecast. The band collapses to
+            // the line over history (min=max=y) and opens over the forecast.
+            const labels = [...s.history_x, ...s.forecast_x];
+            const values = [...s.history_y, ...s.forecast_y];
+            const bandMin = [...s.history_y, ...s.lower];
+            const bandMax = [...s.history_y, ...s.upper];
+            return (
+              <div key={s.key || "all"} className="space-y-1">
+                <div className="flex items-center gap-2 text-[10px] font-mono text-muted">
+                  <span className="text-frost/80">{s.key || seriesCol}</span>
+                  {s.rmse != null && <span>rmse {s.rmse.toLocaleString(undefined, { maximumFractionDigits: 4 })}</span>}
+                  <span className="text-muted/60">{s.history_x.length} history → {s.forecast_x.length} forecast</span>
+                </div>
+                <Chart type="line" labels={labels} values={values}
+                  band={{ min: bandMin, max: bandMax }}
+                  color="var(--emerald)" yLabel={seriesCol} height={260} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {((kind === "pivot" && !pivot) || (kind === "series" && !seriesData) || (kind === "candles" && !candles) || (kind === "forecast" && !fcData)) && !analyzing && !err && (
         <div className="text-[11px] text-muted font-mono py-8 text-center">
-          Pick a {kind === "pivot" ? "group + measure" : kind === "candles" ? "price (+ x / volume)" : "series (+ x)"} and hit run.
+          {kind === "forecast"
+            ? "Pick a value (+ time / by) and hit run to forecast — then register it as a live Saga workflow."
+            : `Pick a ${kind === "pivot" ? "group + measure" : kind === "candles" ? "price (+ x / volume)" : "series (+ x)"} and hit run.`}
         </div>
       )}
     </div>

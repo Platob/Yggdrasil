@@ -654,6 +654,72 @@ export function analysisOhlc(
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
+// ── Forecasting ─────────────────────────────────────────────────────────
+export interface ForecastSeriesData {
+  key: string;
+  history_x: (string | number)[];
+  history_y: (number | null)[];
+  forecast_x: (string | number)[];
+  forecast_y: (number | null)[];
+  lower: (number | null)[];
+  upper: (number | null)[];
+  rmse: number | null;
+}
+
+export interface ForecastResult {
+  node_id: string;
+  path: string;
+  column: string;
+  model_used: string;
+  horizon: number;
+  period: number | null;
+  series: ForecastSeriesData[];
+  source_rows: number;
+  sampled: boolean;
+}
+
+// POST /analysis/forecast — fit xgboost→gbr→ridge over trend/lag/seasonal
+// features and project `horizon` steps with a confidence band. Cached client
+// side so re-opening the panel doesn't re-fit.
+export function analysisForecast(
+  path: string, column: string,
+  opts: {
+    x?: string; group?: string; horizon?: number; model?: string;
+    period?: number; agg?: string; filters?: FilterSpec[]; node?: string;
+  } = {},
+): Promise<ForecastResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/forecast${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
+export interface ForecastSpec {
+  source: string; column: string; x?: string | null; keys?: string[];
+  horizon?: number; model?: string; period?: number | null; agg?: string;
+  materialized?: boolean;
+}
+
+export interface ForecastAssetResult {
+  node_id: string;
+  table: TableEntry;
+  model_used: string;
+  rmse: number | null;
+  rows: number;
+  materialized_url: string | null;
+  sampled: boolean;
+}
+
+// POST /saga/forecast — register a forecasting workflow as a queryable
+// FORECAST catalog asset (live view, or materialised snapshot).
+export function registerForecastWorkflow(
+  input: { catalog?: string; schema?: string; name: string; spec: ForecastSpec; materialize?: boolean; comment?: string },
+  node?: string,
+): Promise<ForecastAssetResult> {
+  const url = `/api/v2/saga/forecast${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  return jsonFetch(url, { method: "POST", body: JSON.stringify(input) });
+}
+
 // ── Saga catalog ─────────────────────────────────────────────────────────
 
 export interface ColumnSpec { name: string; dtype: string; nullable: boolean; comment: string; }

@@ -134,10 +134,10 @@ def forecast_frame(df, *, value: str, x: str | None, keys: list[str],
             sub = sub.filter(pl.col(k) == v)
         if has_x:
             gb = (sub.group_by(x)
-                  .agg(getattr(pl.col(value).cast(pl.Float64, strict=False), agg)())
+                  .agg(getattr(pl.col(value).cast(pl.Float64, strict=False), agg)().alias("__y"))
                   .sort(x))
             xs = gb[x].to_list()
-            ys = gb[value].to_list()
+            ys = gb["__y"].to_list()
         else:
             xs = list(range(sub.height))
             ys = sub[value].cast(pl.Float64, strict=False).to_list()

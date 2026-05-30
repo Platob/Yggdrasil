@@ -121,10 +121,13 @@ class AnalysisService:
         def _series_for(sub: pl.DataFrame) -> ForecastSeries:
             # collapse duplicate x with the chosen aggregation, ordered by x
             if has_x:
-                gb = sub.group_by(req.x).agg(getattr(pl.col(req.column).cast(pl.Float64, strict=False), agg)())
+                # Alias the measure so it can't collide with the group key (the
+                # x column itself, when someone forecasts a column named like x).
+                gb = sub.group_by(req.x).agg(
+                    getattr(pl.col(req.column).cast(pl.Float64, strict=False), agg)().alias("__y"))
                 gb = gb.sort(req.x)
                 xs = gb[req.x].to_list()
-                y = gb[req.column].to_list()
+                y = gb["__y"].to_list()
             else:
                 xs = list(range(sub.height))
                 y = sub[req.column].cast(pl.Float64, strict=False).to_list()
