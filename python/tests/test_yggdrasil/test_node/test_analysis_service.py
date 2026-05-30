@@ -134,6 +134,13 @@ class TestSeriesDownsample(unittest.TestCase):
             self.assertFalse(res.sampled)
             self.assertEqual(res.y, [1.0, 2.0, 3.0])
 
+    def test_column_equals_x_no_duplicate_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pq.write_table(pa.table({"t": list(range(10))}), str(home / "s.parquet"))
+            res = asyncio.run(_svc(home).series(SeriesRequest(path="s.parquet", column="t", x="t", points=100)))
+            self.assertEqual(res.source_rows, 10)
+
 
 class TestOhlc(unittest.TestCase):
     def test_resamples_to_bars(self):
@@ -148,6 +155,13 @@ class TestOhlc(unittest.TestCase):
             self.assertEqual(res.close[0], 9.0)                  # last price of bucket 0
             self.assertGreaterEqual(res.high[0], res.low[0])
             self.assertEqual(res.volume[0], 10.0)                # 10 rows * vol 1
+
+    def test_column_equals_x_no_duplicate_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pq.write_table(pa.table({"t": [float(i) for i in range(20)]}), str(home / "p.parquet"))
+            res = asyncio.run(_svc(home).ohlc(OhlcRequest(path="p.parquet", column="t", x="t", buckets=4)))
+            self.assertEqual(res.bars, 4)
 
 
 class TestFiltersAndExport(unittest.TestCase):

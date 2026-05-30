@@ -363,7 +363,7 @@ class AnalysisService:
         cols = set(lf.collect_schema().names())
         if req.column not in cols:
             raise BadRequestError(f"column {req.column!r} not found")
-        keep = [req.column] + ([req.order_by] if req.order_by and req.order_by in cols else [])
+        keep = list(dict.fromkeys([req.column] + ([req.order_by] if req.order_by and req.order_by in cols else [])))
         plan = lf.select(keep)
         if req.order_by and req.order_by in cols:
             plan = plan.sort(req.order_by)
@@ -401,7 +401,7 @@ class AnalysisService:
         if req.column not in cols:
             raise BadRequestError(f"column {req.column!r} not found")
         has_x = bool(req.x and req.x in cols)
-        keep = [req.column] + ([req.x] if has_x else [])
+        keep = list(dict.fromkeys([req.column] + ([req.x] if has_x else [])))
         plan = lf.select(keep)
         # Zoom window — predicate pushed into the scan, so a zoomed-in view reads
         # only the rows in range.
@@ -458,7 +458,7 @@ class AnalysisService:
             raise BadRequestError(f"column {req.column!r} not found")
         has_x = bool(req.x and req.x in cols)
         has_vol = bool(req.volume and req.volume in cols)
-        keep = [req.column] + ([req.x] if has_x else []) + ([req.volume] if has_vol else [])
+        keep = list(dict.fromkeys([req.column] + ([req.x] if has_x else []) + ([req.volume] if has_vol else [])))
         plan = lf.select(keep)
         if has_x:
             plan = plan.sort(req.x)
