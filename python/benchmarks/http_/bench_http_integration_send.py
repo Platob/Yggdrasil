@@ -1,7 +1,7 @@
 """Integration-send benchmarks — performance **and** memory.
 
 Exercises the full :meth:`HTTPSession.send` / :meth:`send_many` pipeline
-two ways:
+several ways:
 
 * **Wire-stubbed** — ``_send_once`` is overridden to build an
   :class:`HTTPResponse` without touching a socket, so the numbers
@@ -15,6 +15,17 @@ two ways:
   measured without the delayed-ACK / Nagle stall that makes a naive
   ``BaseHTTPRequestHandler`` report ~40 ms/req. This is the realistic
   end-to-end latency.
+
+Coverage cases (beyond the headline send):
+
+* concurrency under latency — sequential vs ``send_many`` (sequential
+  fast path) vs a thread-pool fan-out against a server that sleeps per
+  request, to show whether threading beats the sequential path when
+  the wire (not the CPU) dominates;
+* large-body throughput (MB/s) on a 2 MiB download;
+* gzip response decode cost;
+* cold (fresh socket each call) vs warm (pooled) connection cost;
+* POST upload of a 64 KiB body.
 
 Memory is measured with :mod:`tracemalloc`: peak allocation across a
 run, and the *retained* growth after the run (a streaming pipeline
@@ -30,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import gc
 import http.server
 import json
@@ -39,6 +51,7 @@ import sys
 import threading
 import time
 import tracemalloc
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Callable
@@ -60,6 +73,9 @@ from yggdrasil.path.memory import Memory
 
 _SMALL = json.dumps({"ok": True, "n": 1}).encode()
 _MEDIUM = json.dumps({"data": "x" * 1_000}).encode()
+_LARGE = b"x" * (2 * 1024 * 1024)          # 2 MiB
+_GZIP_BODY = gzip.compress(json.dumps({"data": "y" * 10_000}).encode())
+_LATENCY_S = 0.003                          # 3 ms simulated upstream latency
 _RECEIVED_AT = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
 
 
@@ -102,16 +118,28 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # client-side cost we want to measure.
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def _reply(self, body: bytes):
+    def _reply(self, body: bytes, *, extra: str = ""):
         head = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
+            f"{extra}"
             f"Content-Length: {len(body)}\r\n\r\n"
         ).encode()
         self.wfile.write(head + body)  # one write — no second-packet stall
 
     def do_GET(self):
-        self._reply(_MEDIUM if self.path.startswith("/medium") else _SMALL)
+        path = self.path.split("?", 1)[0]
+        if path == "/medium":
+            self._reply(_MEDIUM)
+        elif path == "/large":
+            self._reply(_LARGE)
+        elif path == "/gzip":
+            self._reply(_GZIP_BODY, extra="Content-Encoding: gzip\r\n")
+        elif path == "/slow":
+            time.sleep(_LATENCY_S)
+            self._reply(_SMALL)
+        else:
+            self._reply(_SMALL)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -223,6 +251,7 @@ def run(repeat: int) -> None:
     session = HTTPSession(base_url=base_url)
     reqs_live = [HTTPRequest.prepare("GET", f"{base_url}/x?i={i}") for i in range(50)]
     body = b'{"k":"v"}'
+    body_64k = b"x" * (64 * 1024)
 
     print("\n# Live localhost — keep-alive, TCP_NODELAY (realistic end-to-end)")
     print(f"# {'label':<52s}  {'best':>14s}  {'median':>16s}")
@@ -231,8 +260,12 @@ def run(repeat: int) -> None:
               repeat=repeat, inner=2_000),
         _time("GET /medium (~1 KiB)", lambda: session.get("/medium"),
               repeat=repeat, inner=2_000),
+        _time("GET /gzip (decode)", lambda: session.get("/gzip"),
+              repeat=repeat, inner=2_000),
         _time("POST /small (small body)", lambda: session.post("/small", data=body),
               repeat=repeat, inner=2_000),
+        _time("POST /echo (64 KiB body)", lambda: session.post("/x", data=body_64k),
+              repeat=repeat, inner=1_000),
         _time("send_many(50) sequential",
               lambda: list(session.send_many(iter(list(reqs_live)), raise_error=False)),
               repeat=repeat, inner=40),
@@ -240,11 +273,62 @@ def run(repeat: int) -> None:
     for r in live:
         print(_fmt(r))
 
+    # --- cold vs warm connection ------------------------------------------
+    def _cold():
+        session.clear_connections()
+        session.get("/small")
+    print("\n# Connection reuse")
+    for r in (
+        _time("GET /small warm (pooled socket)", lambda: session.get("/small"),
+              repeat=repeat, inner=2_000),
+        _time("GET /small cold (fresh socket each call)", _cold,
+              repeat=repeat, inner=500),
+    ):
+        print(_fmt(r))
+
+    # --- large-body throughput --------------------------------------------
+    print("\n# Large-body throughput (2 MiB download)")
+    r = _time("GET /large (2 MiB)", lambda: session.get("/large").content,
+              repeat=repeat, inner=50)
+    mbps = (len(_LARGE) / (1024 * 1024)) / r["best"]
+    print(f"{_fmt(r)}\n{'':52s}  -> {mbps:,.0f} MiB/s")
+
+    # --- concurrency under latency ----------------------------------------
+    # The send_many fast path is sequential on the theory that http.client
+    # I/O is GIL-bound. But blocking socket recv/send RELEASE the GIL, so
+    # against a server with real per-request latency a thread fan-out
+    # should win. This case quantifies the gap.
+    n = 40
+    slow_reqs = [HTTPRequest.prepare("GET", f"{base_url}/slow?i={i}") for i in range(n)]
+
+    def _seq_loop():
+        for i in range(n):
+            session.get("/slow")
+
+    def _send_many_seq():
+        list(session.send_many(iter(list(slow_reqs)), raise_error=False))
+
+    def _thread_fanout():
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _: session.get("/slow"), range(n)))
+
+    print(f"\n# Concurrency under {_LATENCY_S*1e3:.0f} ms upstream latency ({n} requests)")
+    for label, fn in (
+        ("sequential get loop", _seq_loop),
+        ("send_many (sequential fast path)", _send_many_seq),
+        ("ThreadPoolExecutor(8) fan-out", _thread_fanout),
+    ):
+        rr = _time(label, fn, repeat=repeat, inner=3)
+        per_req = rr["best"] / n * 1e6
+        print(f"{label:<52s}  best={rr['best']*1e3:8.2f} ms  "
+              f"per_req={per_req:8.1f} us  ({n/rr['best']:,.0f} req/s)")
+
     # --- memory -----------------------------------------------------------
     print("\n# Memory — tracemalloc (peak per op + retained after run)")
     mem = [
         _mem("send (stubbed wire)", lambda: stub.get("/x"), ops=5_000),
         _mem("send (live, body discarded)", lambda: session.get("/small"), ops=2_000),
+        _mem("GET /large (2 MiB) .content", lambda: session.get("/large").content, ops=50),
     ]
 
     # send_many must stream: draining the iterator without keeping
