@@ -309,3 +309,30 @@ class TestAutoMergeFillsVariants:
         assert merged.names == ["id", "price"]
         assert merged.field(name="id").dtype.to_arrow() == pa.int64()
         assert merged.field(name="price").dtype.to_arrow() == pa.float64()
+
+    def test_auto_prefers_target_no_width_shrink_or_widen(self):
+        from yggdrasil.enums import Mode
+
+        # concrete target wins outright — no int32->int64 widen from source.
+        src = field("", schema(fields=[field("id", pa.int64())]).dtype)
+        tgt = field("", schema(fields=[field("id", pa.int32())]).dtype)
+        merged = tgt.merge_with(src, mode=Mode.AUTO)
+        assert merged.field(name="id").dtype.to_arrow() == pa.int32()
+
+    def test_default_schema_mode_is_auto_and_cast_fills_via_merged(self):
+        from yggdrasil.data.types.primitive.object import ObjectType
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.enums import Mode
+
+        assert CastOptions().schema_mode is Mode.AUTO
+        src = pa.table({"id": pa.array([1, 2, 3], pa.int64()),
+                        "x": pa.array([1.5, 2.5, 3.5], pa.float64())})
+        # An object-typed target + bound source: the cast runs against
+        # ``merged`` so the projection autotypes to the source dtype.
+        opt = CastOptions(
+            source=schema(fields=[field("id", pa.int64()), field("x", pa.float64())]),
+            target=schema(fields=[field("id", ObjectType())]),
+        )
+        out = opt.cast_arrow(src)
+        assert out.column_names == ["id"]
+        assert out.schema.field("id").type == pa.int64()

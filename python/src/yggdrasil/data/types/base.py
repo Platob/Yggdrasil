@@ -566,6 +566,21 @@ class DataType(BaseChildrenFields, ABC):
         if mode is Mode.IGNORE:
             return self
 
+        if mode is Mode.AUTO:
+            # AUTO prefers the target (``self``) outright: the only thing the
+            # other side contributes is filling variant (``object`` / ``null``)
+            # slots, recursively through nested types. No width / precision
+            # shrink-or-widen, no nested-vs-primitive promotion — a concrete
+            # target type always wins. Nested types recurse so a variant buried
+            # inside a struct / list / map child still gets filled.
+            if self.type_id.is_any_or_null:
+                return other
+            if self.type_id == other.type_id and self.type_id.is_nested:
+                return self._merge_with_same_id(
+                    other=other, mode=mode, downcast=downcast, upcast=upcast,
+                )
+            return self
+
         if self.type_id == other.type_id:
             return self._merge_with_same_id(
                 other=other,

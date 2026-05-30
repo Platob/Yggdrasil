@@ -1932,8 +1932,11 @@ class Field(BaseChildrenFields):
         mode = Mode.from_(mode, default=Mode.AUTO)
 
         if mode is Mode.AUTO:
+            # AUTO prefers the target (``self``): keep the target's name,
+            # nullability and metadata; the other side only fills variant
+            # (object/null) dtype slots (handled in ``dtype.merge_with``).
             name = self.name or other.name
-            nullable = not (not self.nullable or not other.nullable)
+            nullable = self.nullable
             metadata = {
                 **(other.metadata or {}),
                 **(self.metadata or {}),
