@@ -18,8 +18,14 @@ import {
   editPlan,
   downloadSqlExport,
   SQL_EXPORT_FORMATS,
+  searchSaga,
   getTableLog,
+  getActivity,
+  updateTable,
   replicateTable,
+  OBJECT_TYPES,
+  type SearchHit,
+  type ActivityResponse,
   type CatalogEntry,
   type SchemaEntry,
   type TableEntry,
@@ -29,6 +35,7 @@ import {
   type OpLogEntry,
 } from "@/lib/api";
 import TabularModal from "@/components/TabularModal";
+import TabularDisplay from "@/components/TabularDisplay";
 import PlanGraphView from "@/components/PlanGraph";
 
 const DIALECTS = ["postgres", "sqlite", "mysql", "databricks"];
@@ -43,6 +50,16 @@ function fmtBytes(b: number | null | undefined): string {
 
 const chip = "px-2 py-0.5 rounded text-[10px] font-mono border border-white/[0.08] bg-white/[0.03] text-foreground-dim";
 
+// Per object-type glyph + colour so a schema's leaves read at a glance.
+const OBJ: Record<string, { glyph: string; color: string }> = {
+  TABLE: { glyph: "▦", color: "text-emerald/70" },
+  VIEW: { glyph: "◫", color: "text-frost/70" },
+  FUNCTION: { glyph: "ƒ", color: "text-amber/80" },
+  MODEL: { glyph: "◈", color: "text-violet-400" },
+  OTHER: { glyph: "○", color: "text-muted" },
+};
+const objOf = (t: string) => OBJ[t] ?? OBJ.OTHER;
+
 export default function SagaPage() {
   const [nodes, setNodes] = useState<{ node_id: string; self: boolean }[]>([]);
   const [node, setNode] = useState<string | undefined>(undefined);
@@ -54,9 +71,13 @@ export default function SagaPage() {
   const [tables, setTables] = useState<Record<string, TableEntry[]>>({});
   const [detail, setDetail] = useState<TableEntry | null>(null);
   const [log, setLog] = useState<OpLogEntry[] | null>(null);
+  const [activity, setActivity] = useState<ActivityResponse | null>(null);
+  const [edit, setEdit] = useState<TableEntry | null>(null);
   const [preview, setPreview] = useState<{ path: string; name: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [treeErr, setTreeErr] = useState("");
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<{ hits: SearchHit[]; total: number; truncated: boolean } | null>(null);
 
   // -- SQL editor state
   const [sql, setSql] = useState("SELECT * FROM ");
@@ -71,6 +92,7 @@ export default function SagaPage() {
   const [limit, setLimit] = useState(1000);   // rows shown in the grid
   const [dlOpen, setDlOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [expanded, setExpanded] = useState(false);   // fullscreen result viewer
 
   const loadCatalogs = useCallback(async () => {
     setTreeErr("");
@@ -89,6 +111,35 @@ export default function SagaPage() {
   }, []);
 
   useEffect(() => { loadCatalogs(); }, [loadCatalogs]);
+
+  // Debounced asset search across the catalog (bounded, truncation-flagged).
+  const onSearch = (q: string) => {
+    setQuery(q);
+    if (!q.trim()) { setHits(null); return; }
+    searchSaga(q.trim(), 40, node).then((r) => setHits(r)).catch(() => setHits({ hits: [], total: 0, truncated: false }));
+  };
+
+  const onHit = async (h: SearchHit) => {
+    if (h.kind === "table") {
+      setQuery(""); setHits(null);
+      const next = new Set(openCat); next.add(h.catalog); setOpenCat(next);
+      if (!schemas[h.catalog]) {
+        const r = await getSchemas(h.catalog, node, true);
+        setSchemas((s) => ({ ...s, [h.catalog]: r.schemas }));
+      }
+      const key = `${h.catalog}.${h.schema}`;
+      setOpenSch((o) => new Set(o).add(key));
+      if (!tables[key]) {
+        const r = await getTables(h.catalog, h.schema, node, true);
+        setTables((t) => ({ ...t, [key]: r.tables }));
+      }
+      await openTable(h.catalog, h.schema, h.name);
+    } else if (h.kind === "schema") {
+      onSearch("");
+      const c = catalogs.find((x) => x.name === h.catalog);
+      if (c) await toggleCat(c);
+    }
+  };
 
   const toggleCat = async (c: CatalogEntry) => {
     const next = new Set(openCat);
@@ -189,8 +240,27 @@ export default function SagaPage() {
   const loadLog = async (t: TableEntry) => {
     try {
       const r = await getTableLog(t.catalog, t.schema, t.name, node);
-      setLog(r.entries);
+      setLog(r.entries); setActivity(null);
     } catch (e) { setTreeErr(String(e)); }
+  };
+
+  const loadActivity = async (t: TableEntry) => {
+    try {
+      const r = await getActivity(t.catalog, t.schema, t.name, node);
+      setActivity(r); setLog(null);
+    } catch (e) { setTreeErr(String(e)); }
+  };
+
+  const saveEdit = async (e: TableEntry) => {
+    setBusy(true);
+    try {
+      const r = await updateTable(e.catalog, e.schema, e.name, {
+        object_type: e.object_type, definition: e.definition, comment: e.comment,
+        source_url: e.source_url, table_type: e.table_type,
+      });
+      setDetail(r.table); setEdit(null);
+      await refreshSchema(e.catalog, e.schema);
+    } catch (err) { setTreeErr(String(err)); } finally { setBusy(false); }
   };
 
   const onReplicate = async (t: TableEntry) => {
@@ -311,7 +381,35 @@ export default function SagaPage() {
             <span className="text-[11px] uppercase tracking-wide text-muted">Catalogs</span>
             <button onClick={loadCatalogs} className="text-[11px] text-frost/80 hover:text-frost">refresh</button>
           </div>
+          <input value={query} onChange={(e) => onSearch(e.target.value)}
+            placeholder="🔍 search assets…"
+            className="w-full mb-2 bg-white/[0.04] border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-frost/30" />
           {treeErr && <div className="text-[11px] text-rose/80 font-mono mb-2 break-words">{treeErr}</div>}
+
+          {/* Search results replace the lazy tree while a query is active. */}
+          {query.trim() ? (
+            <div className="space-y-0.5">
+              {hits && (
+                <div className="text-[10px] text-muted mb-1">
+                  {hits.total} match{hits.total === 1 ? "" : "es"}{hits.truncated ? ` · showing ${hits.hits.length}` : ""}
+                </div>
+              )}
+              {hits?.hits.map((h) => (
+                <div key={`${h.kind}:${h.full_name}`}
+                  className="group flex items-center gap-1.5 py-1 px-1 rounded hover:bg-white/[0.03] cursor-pointer"
+                  onClick={() => onHit(h)}
+                  title={h.kind === "table" ? "open" : "expand"}>
+                  <span className={h.kind === "table" ? objOf(h.object_type).color : "text-frost/70"}>
+                    {h.kind === "catalog" ? "🗄" : h.kind === "schema" ? "▤" : objOf(h.object_type).glyph}
+                  </span>
+                  <span className="text-xs flex-1 truncate">{h.full_name}</span>
+                  <span className={chip}>{h.kind === "table" ? h.object_type.toLowerCase() : h.kind}</span>
+                </div>
+              ))}
+              {hits && hits.hits.length === 0 && <div className="text-[11px] text-muted py-2">no matches</div>}
+            </div>
+          ) : (
+          <>
           {catalogs.length === 0 && <div className="text-[11px] text-muted py-2">No catalogs yet. Create one to begin.</div>}
           <div className="space-y-0.5">
             {catalogs.map((c) => {
@@ -356,9 +454,9 @@ export default function SagaPage() {
                                     onDoubleClick={() => insertRef(t.full_name)}
                                     title="click: details · double-click: insert into editor">
                                     <span className="w-3" />
-                                    <span className="text-emerald/70">▦</span>
+                                    <span className={objOf(t.object_type).color}>{objOf(t.object_type).glyph}</span>
                                     <span className="text-xs flex-1 truncate">{t.name}</span>
-                                    <span className={chip}>{t.format || "?"}</span>
+                                    <span className={chip}>{t.object_type === "TABLE" ? (t.format || "?") : t.object_type.toLowerCase()}</span>
                                   </div>
                                 ))}
                                 {(tables[key] ?? []).length === 0 && (
@@ -378,6 +476,8 @@ export default function SagaPage() {
               );
             })}
           </div>
+          </>
+          )}
 
           {/* Table detail */}
           {detail && (
@@ -393,15 +493,21 @@ export default function SagaPage() {
                 <button onClick={() => insertRef(detail.full_name)} className="text-amber/80 hover:text-amber">insert</button>
                 <button onClick={() => onRefreshTable(detail)} disabled={busy} className="text-frost/80 hover:text-frost">refresh stats</button>
                 <button onClick={() => onReplicate(detail)} disabled={busy} className="text-emerald/80 hover:text-emerald">replicate</button>
+                <button onClick={() => setEdit(detail)} className="text-amber/80 hover:text-amber">edit</button>
+                <button onClick={() => loadActivity(detail)} className="text-violet-300 hover:text-violet-200">activity</button>
                 <button onClick={() => loadLog(detail)} className="text-foreground-dim hover:text-foreground">history</button>
               </div>
               <div className="flex flex-wrap gap-3 text-[11px] text-foreground-dim mb-1.5 font-mono">
+                <span className={`${objOf(detail.object_type).color}`}>{objOf(detail.object_type).glyph} {detail.object_type.toLowerCase()}</span>
                 <span>{detail.statistics.row_count ?? "?"} rows</span>
                 <span>{fmtBytes(detail.statistics.size_bytes)}</span>
                 <span className={chip}>{detail.table_type}</span>
                 {detail.replicas.length > 0 && <span className="text-emerald/80">⧉ {detail.replicas.length} replica(s)</span>}
-                <span className="truncate max-w-full">{detail.source_url}</span>
+                <span className="truncate max-w-full">{detail.source_url || "—"}</span>
               </div>
+              {detail.definition && (
+                <pre className="text-[11px] font-mono text-frost/80 bg-[#06060f] border border-white/[0.06] rounded p-2 mb-1.5 whitespace-pre-wrap break-words max-h-24 overflow-auto">{detail.definition}</pre>
+              )}
               <div className="space-y-0.5 max-h-48 overflow-auto">
                 {detail.columns.map((col) => {
                   const st = detail.statistics.columns.find((c) => c.column === col.name);
@@ -418,6 +524,35 @@ export default function SagaPage() {
                   );
                 })}
               </div>
+              {activity && (
+                <div className="mt-2 pt-2 border-t border-white/[0.06]">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[11px] uppercase tracking-wide text-muted">Activity</span>
+                    <span className="text-[10px] text-muted font-mono">{activity.total_ops} ops</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 mb-1.5">
+                    {Object.entries(activity.op_counts).map(([op, n]) => (
+                      <span key={op} className={chip}>{op} · {n}</span>
+                    ))}
+                  </div>
+                  {activity.daily.length > 0 && (
+                    <div className="flex items-end gap-0.5 h-10 mb-1.5" title="ops per day (last 14d)">
+                      {(() => { const mx = Math.max(1, ...activity.daily); return activity.daily.map((v, i) => (
+                        <div key={i} className="flex-1 bg-frost/40 rounded-t" style={{ height: `${Math.max(6, (v / mx) * 100)}%` }} title={`${v}`} />
+                      )); })()}
+                    </div>
+                  )}
+                  <div className="space-y-0.5 max-h-28 overflow-auto">
+                    {activity.recent.map((e, i) => (
+                      <div key={i} className="text-[11px] font-mono flex gap-2" title={e.statement}>
+                        <span className="text-muted w-[88px] shrink-0 truncate">{e.ts.slice(5, 19).replace("T", " ")}</span>
+                        <span className="text-frost/80 w-16 shrink-0">{e.op}</span>
+                        <span className="text-foreground-dim truncate flex-1">{e.statement || e.detail}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {log && (
                 <div className="mt-2 pt-2 border-t border-white/[0.06]">
                   <div className="text-[11px] uppercase tracking-wide text-muted mb-1">History</div>
@@ -508,31 +643,10 @@ export default function SagaPage() {
 
           <div className="flex-1 overflow-auto border border-white/[0.06] rounded-lg min-h-0">
             {tab === "results" && result && (
-              <table className="w-full text-[12px] font-mono border-collapse">
-                <thead className="sticky top-0 bg-[#0a0a1a] z-10">
-                  <tr>
-                    {result.columns.map((c) => (
-                      <th key={c.name} className="text-left px-2 py-1.5 border-b border-white/[0.08] text-frost/80 whitespace-nowrap">
-                        {c.name}<span className="text-muted ml-1 font-normal">{c.dtype}</span>
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {result.rows.map((row, ri) => (
-                    <tr key={ri} className="hover:bg-white/[0.02]">
-                      {row.map((cell, ci) => (
-                        <td key={ci} className="px-2 py-1 border-b border-white/[0.04] text-foreground-dim whitespace-nowrap max-w-[280px] truncate">
-                          {cell === null ? <span className="text-muted italic">null</span> : String(cell)}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                  {result.rows.length === 0 && (
-                    <tr><td className="px-2 py-3 text-muted text-center" colSpan={Math.max(1, result.columns.length)}>0 rows</td></tr>
-                  )}
-                </tbody>
-              </table>
+              <div className="h-full p-1">
+                <TabularDisplay columns={result.columns} rows={result.rows}
+                  maxHeight="100%" onExpand={() => setExpanded(true)} />
+              </div>
             )}
             {tab === "results" && !result && (
               <div className="p-4 text-[12px] text-muted">Run a query to see results.</div>
@@ -556,6 +670,62 @@ export default function SagaPage() {
           name={preview.name}
           onClose={() => setPreview(null)}
         />
+      )}
+
+      {/* Full asset edit modal */}
+      {edit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
+          style={{ background: "var(--modal-scrim, rgba(0,0,0,0.72))" }} onClick={() => setEdit(null)}>
+          <div className="modal-surface rounded-xl w-full max-w-lg p-5 space-y-3" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-semibold text-emerald">{edit.full_name}</span>
+              <button onClick={() => setEdit(null)} className="text-muted hover:text-foreground text-sm">✕</button>
+            </div>
+            <label className="block text-[11px] text-muted">type
+              <select value={edit.object_type} onChange={(e) => setEdit({ ...edit, object_type: e.target.value })}
+                className="w-full mt-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1.5 text-xs font-mono outline-none focus:border-frost/30">
+                {OBJECT_TYPES.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </label>
+            {edit.object_type === "TABLE" ? (
+              <label className="block text-[11px] text-muted">source_url
+                <input value={edit.source_url} onChange={(e) => setEdit({ ...edit, source_url: e.target.value })}
+                  className="w-full mt-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1.5 text-xs font-mono outline-none focus:border-frost/30" />
+              </label>
+            ) : (
+              <label className="block text-[11px] text-muted">definition
+                <textarea value={edit.definition} onChange={(e) => setEdit({ ...edit, definition: e.target.value })} rows={4}
+                  className="w-full mt-1 bg-[#06060f] border border-white/[0.08] rounded-lg px-2 py-1.5 text-xs font-mono outline-none focus:border-frost/30" />
+              </label>
+            )}
+            <label className="block text-[11px] text-muted">comment
+              <input value={edit.comment} onChange={(e) => setEdit({ ...edit, comment: e.target.value })}
+                className="w-full mt-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-2 py-1.5 text-xs outline-none focus:border-frost/30" />
+            </label>
+            <div className="flex justify-end gap-2 pt-1">
+              <button onClick={() => setEdit(null)} className="px-3 py-1.5 rounded-lg text-xs bg-white/[0.04] border border-white/[0.08] hover:bg-white/[0.08]">cancel</button>
+              <button onClick={() => saveEdit(edit)} disabled={busy}
+                className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-emerald/15 text-emerald border border-emerald/30 hover:bg-emerald/25 disabled:opacity-40">save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* The same TabularDisplay, full-screen — proving it works in a modal too. */}
+      {expanded && result && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
+          style={{ background: "var(--modal-scrim, rgba(0,0,0,0.72))" }} onClick={() => setExpanded(false)}>
+          <div className="modal-surface rounded-xl w-full max-w-6xl h-[85vh] flex flex-col p-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-semibold text-frost">Query result</span>
+              <button onClick={() => setExpanded(false)} className="text-muted hover:text-foreground text-sm">close ✕</button>
+            </div>
+            <div className="flex-1 min-h-0">
+              <TabularDisplay columns={result.columns} rows={result.rows} maxHeight="100%"
+                caption={`${result.row_count} rows · ${result.elapsed_ms} ms${result.truncated ? " · truncated" : ""}`} />
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

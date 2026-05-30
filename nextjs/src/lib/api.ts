@@ -676,6 +676,7 @@ export interface SchemaEntry {
 }
 export interface TableEntry {
   id: number; catalog: string; schema: string; name: string; full_name: string;
+  object_type: string; definition: string;
   table_type: string; format: string; source_url: string; node: string | null;
   comment: string; columns: ColumnSpec[]; statistics: TableStatistics;
   replicas: string[];
@@ -815,6 +816,32 @@ export interface ReplicateResult {
 
 export async function replicateTable(body: { catalog: string; schema: string; table: string; target: string; mode: "metadata" | "data" }): Promise<ReplicateResult> {
   const r = await jsonFetch<ReplicateResult>("/api/v2/saga/replicate", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
+export const OBJECT_TYPES = ["TABLE", "VIEW", "FUNCTION", "MODEL", "OTHER"] as const;
+
+export interface SearchHit {
+  kind: string; name: string; full_name: string; object_type: string;
+  catalog: string; schema: string; comment: string;
+}
+export function searchSaga(q: string, limit = 50, node?: string): Promise<{ node_id: string; query: string; hits: SearchHit[]; total: number; truncated: boolean }> {
+  const u = `q=${encodeURIComponent(q)}&limit=${limit}${node ? `&node=${encodeURIComponent(node)}` : ""}`;
+  return jsonFetch(`/api/v2/saga/search?${u}`);
+}
+
+export interface ActivityResponse {
+  node_id: string; asset: string; op_counts: Record<string, number>;
+  total_ops: number; last_op_at: string | null; daily: number[]; recent: OpLogEntry[];
+}
+export function getActivity(catalog: string, schema: string, name: string, node?: string): Promise<ActivityResponse> {
+  const q = node ? `?node=${encodeURIComponent(node)}` : "";
+  return jsonFetch(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}/activity${q}`);
+}
+
+export async function updateTable(catalog: string, schema: string, name: string, body: Partial<{ source_url: string; object_type: string; definition: string; comment: string; table_type: string; node: string | null; properties: Record<string, string> }>): Promise<{ table: TableEntry }> {
+  const r = await jsonFetch<{ table: TableEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(body) });
   invalidate("saga/catalog");
   return r;
 }
