@@ -225,6 +225,45 @@ class TestRegister(unittest.TestCase):
             self.assertEqual(dialect.value, "databricks")
 
 
+class TestPlanGraph(unittest.TestCase):
+    def _svc_seeded(self, home):
+        svc = _svc(home); _seed(svc, _trades(svc.settings)); return svc
+
+    def test_logical_plan_dag(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = self._svc_seeded(Path(d))
+            g = svc.build_plan(SqlRequest(
+                sql="SELECT sym, sum(qty) AS q FROM main.market.trades WHERE px > 11 GROUP BY sym ORDER BY q DESC LIMIT 5"))
+            ops = [(o.op, o.inputs) for o in g.ops]
+            kinds = [o for o, _ in ops]
+            self.assertEqual(kinds, ["scan", "filter", "aggregate", "sort", "limit"])
+            # edges chain forward
+            self.assertEqual(g.ops[1].inputs, [g.ops[0].id])
+            self.assertEqual(g.ops[-1].inputs, [g.ops[-2].id])
+
+    def test_analyze_fills_rows_and_times(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = self._svc_seeded(Path(d))
+            g = asyncio.run(svc.analyze_plan(SqlRequest(
+                sql="SELECT sym, sum(qty) AS q FROM main.market.trades WHERE px > 11 GROUP BY sym")))
+            self.assertTrue(g.analyzed)
+            scan = next(o for o in g.ops if o.op == "scan")
+            self.assertEqual(scan.rows, 5)               # full table
+            filt = next(o for o in g.ops if o.op == "filter")
+            self.assertEqual(filt.rows, 3)               # px>11 keeps 3
+            self.assertIsNotNone(g.total_ms)
+
+    def test_edit_plan_set_limit_and_drop_order(self):
+        from yggdrasil.node.api.schemas.saga import PlanEdit, PlanEditRequest
+        with tempfile.TemporaryDirectory() as d:
+            svc = self._svc_seeded(Path(d))
+            r = svc.edit_plan(PlanEditRequest(
+                sql="SELECT * FROM main.market.trades ORDER BY px LIMIT 100",
+                edits=[PlanEdit(op="set_limit", value=7), PlanEdit(op="drop_order")]))
+            self.assertIn("LIMIT 7", r.sql.upper())
+            self.assertNotIn("ORDER BY", r.sql.upper())
+
+
 class TestOpLog(unittest.TestCase):
     def test_register_query_and_drop_logging(self):
         with tempfile.TemporaryDirectory() as d:

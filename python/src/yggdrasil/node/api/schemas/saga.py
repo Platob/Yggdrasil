@@ -268,6 +268,53 @@ class StagedResult(StrictModel):
     elapsed_ms: float
 
 
+# -- execution plan graph (DAG + analyze timings) ---------------------------
+
+class PlanOp(StrictModel):
+    id: str
+    # scan | join | union | filter | aggregate | having | distinct | project | sort | limit
+    op: str
+    title: str
+    detail: str = ""
+    inputs: list[str] = Field(default_factory=list)
+    # Filled by analyze: rows out of this op + its measured time.
+    rows: int | None = None
+    elapsed_ms: float | None = None
+
+
+class PlanGraph(StrictModel):
+    node_id: str
+    dialect: str
+    statement: str
+    plan_sql: str
+    ops: list[PlanOp]
+    analyzed: bool = False
+    total_ms: float | None = None
+    sampled: bool = False
+
+
+class PlanEdit(StrictModel):
+    # set_limit | set_offset | drop_filter | drop_group | drop_order | drop_limit | drop_distinct
+    op: str
+    value: int | None = None
+
+
+class PlanEditRequest(StrictModel):
+    sql: str
+    dialect: str | None = None
+    catalog: str | None = None
+    schema_: str | None = Field(default=None, alias="schema")
+    edits: list[PlanEdit] = Field(default_factory=list)
+
+    model_config = {"populate_by_name": True}
+
+
+class PlanEditResult(StrictModel):
+    node_id: str
+    sql: str
+    plan_sql: str
+
+
 # -- replication ------------------------------------------------------------
 
 class ReplicateRequest(StrictModel):

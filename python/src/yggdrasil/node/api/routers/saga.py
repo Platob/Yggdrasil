@@ -18,6 +18,9 @@ from ..schemas.saga import (
     DiscoverRequest,
     ExplainResult,
     OpLogResponse,
+    PlanEditRequest,
+    PlanEditResult,
+    PlanGraph,
     RegisterRequest,
     ReplicateRequest,
     ReplicateResult,
@@ -235,6 +238,20 @@ async def stage_sql(req: SqlRequest, saga: SagaService = Depends(get_saga_servic
 @router.post("/explain", response_model=ExplainResult)
 async def explain_sql(req: SqlRequest, saga: SagaService = Depends(get_saga_service)):
     return saga.explain(req)
+
+
+@router.post("/plan", response_model=PlanGraph)
+async def plan(req: SqlRequest, analyze: bool = False,
+               saga: SagaService = Depends(get_saga_service)):
+    """Structured execution-plan DAG. With ``?analyze=true`` it runs the query
+    in staged prefixes and fills per-operation rows + elapsed times."""
+    return await saga.analyze_plan(req) if analyze else saga.build_plan(req)
+
+
+@router.post("/plan/edit", response_model=PlanEditResult)
+async def plan_edit(req: PlanEditRequest, saga: SagaService = Depends(get_saga_service)):
+    """Apply structural edits (set limit, drop filter/order/…) and re-emit SQL."""
+    return saga.edit_plan(req)
 
 
 @router.post("/sql.arrow")

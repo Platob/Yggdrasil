@@ -57,6 +57,10 @@ from ..schemas.saga import (
     SchemaUpdate,
     OpLogEntry,
     OpLogResponse,
+    PlanEditRequest,
+    PlanEditResult,
+    PlanGraph,
+    PlanOp,
     RegisterRequest,
     ReplicateRequest,
     ReplicateResult,
@@ -799,6 +803,200 @@ class SagaService:
             referenced_tables=sorted({self._qualify(r, req.catalog, req.schema_) for r in refs}),
             statement=req.sql,
         )
+
+    # -- execution plan graph ----------------------------------------------
+
+    _AGG = {"COUNT", "SUM", "AVG", "MEAN", "MIN", "MAX", "STDDEV", "VARIANCE",
+            "MEDIAN", "APPROX_COUNT_DISTINCT", "COLLECT_LIST", "COLLECT_SET"}
+
+    def _is_aggregate(self, node: SelectNode) -> bool:
+        from yggdrasil.execution.expr.nodes import Alias, FunctionCall
+        if node.group_by:
+            return True
+        for p in (node.projections or []):
+            e = p.expr if isinstance(p, Alias) else p
+            if isinstance(e, FunctionCall) and e.name.upper() in self._AGG:
+                return True
+        return False
+
+    def _plan_ops(self, node: PlanNode, refs: list[TableRef],
+                  catalog: str | None, schema: str | None, dialect: Dialect) -> list:
+        """Logical operations of a query as a DAG (scans feed a linear pipeline;
+        joins/unions branch)."""
+        from yggdrasil.execution.expr.nodes import Alias, Column, FunctionCall, SortOrder, Star
+
+        ops: list[PlanOp] = []
+        scan_ids: list[str] = []
+        for i, ref in enumerate(refs or []):
+            sid = f"scan{i}"
+            ops.append(PlanOp(id=sid, op="scan", title="Scan",
+                              detail=self._qualify(ref, catalog, schema)))
+            scan_ids.append(sid)
+        if not scan_ids:
+            ops.append(PlanOp(id="scan0", op="scan", title="Scan", detail="—"))
+            scan_ids = ["scan0"]
+
+        if len(scan_ids) > 1:
+            ops.append(PlanOp(id="join", op="join", title="Join",
+                              detail=f"{len(scan_ids)} inputs", inputs=list(scan_ids)))
+            cur = "join"
+        else:
+            cur = scan_ids[0]
+
+        if not isinstance(node, SelectNode):
+            return ops
+
+        def chain(op_id: str, op: str, title: str, detail: str) -> None:
+            nonlocal cur
+            ops.append(PlanOp(id=op_id, op=op, title=title, detail=detail, inputs=[cur]))
+            cur = op_id
+
+        def esql(expr) -> str:
+            try:
+                return expr.to_sql(dialect=dialect)
+            except Exception:
+                return str(expr)[:80]
+
+        if node.where is not None:
+            chain("filter", "filter", "Filter", esql(node.where))
+        if self._is_aggregate(node):
+            keys = ", ".join(c.name for c in (node.group_by or []) if isinstance(c, Column))
+            measures = ", ".join(
+                (p.expr if isinstance(p, Alias) else p).name + "()"
+                for p in (node.projections or [])
+                if isinstance((p.expr if isinstance(p, Alias) else p), FunctionCall))
+            detail = (f"by {keys} · {measures}" if keys else measures) or "aggregate"
+            chain("aggregate", "aggregate", "Aggregate", detail)
+        if node.having is not None:
+            chain("having", "having", "Having", esql(node.having))
+        if getattr(node, "distinct", False):
+            chain("distinct", "distinct", "Distinct", "")
+        names = [
+            (p.name if isinstance(p, Alias)
+             else p.name if isinstance(p, Column) else None)
+            for p in (node.projections or [])
+            if not isinstance((p.expr if isinstance(p, Alias) else p), Star)
+        ]
+        names = [n for n in names if n]
+        if names and not self._is_aggregate(node):
+            chain("project", "project", "Project", ", ".join(names[:8]))
+        if node.order_by:
+            keys = ", ".join(
+                f"{o.expr.name}{'' if getattr(o,'ascending',True) else ' desc'}"
+                for o in node.order_by
+                if isinstance(o, SortOrder) and isinstance(o.expr, Column))
+            chain("sort", "sort", "Sort", keys)
+        if node.limit is not None or node.offset:
+            d = []
+            if node.limit is not None:
+                d.append(f"LIMIT {node.limit}")
+            if node.offset:
+                d.append(f"OFFSET {node.offset}")
+            chain("limit", "limit", "Limit", " ".join(d))
+        return ops
+
+    def build_plan(self, req: SqlRequest) -> PlanGraph:
+        node, dialect, refs = self.plan_for(req)
+        ops = self._plan_ops(node, refs, req.catalog, req.schema_, dialect)
+        try:
+            plan_sql = node.to_sql(dialect=dialect)
+        except Exception:
+            plan_sql = ""
+        return PlanGraph(node_id=self.settings.node_id, dialect=dialect.value,
+                         statement=req.sql, plan_sql=plan_sql, ops=ops)
+
+    async def analyze_plan(self, req: SqlRequest) -> PlanGraph:
+        return await run_in_threadpool(self._analyze_plan, req)
+
+    def _analyze_plan(self, req: SqlRequest) -> PlanGraph:
+        """Run the query in staged prefixes through the real engine, timing each
+        and recording rows out — an EXPLAIN ANALYZE the editor can visualise."""
+        import dataclasses
+
+        from yggdrasil.execution.expr.nodes import Star
+
+        node, dialect, refs = self.plan_for(req)
+        graph = self.build_plan(req)
+        if not isinstance(node, SelectNode):
+            return graph
+        tables = self._build_tables(refs, req.catalog, req.schema_)
+
+        def run(n) -> tuple[int, float]:
+            t0 = time.perf_counter()
+            tbl = execute_plan(n, dict(tables)).read_arrow_table()
+            return tbl.num_rows, (time.perf_counter() - t0) * 1000.0
+
+        cap = self.settings.analysis_max_rows
+        # Measured stages → which op id they land on.
+        scan = dataclasses.replace(
+            node, where=None, group_by=None, having=None, qualify=None,
+            order_by=None, limit=cap, offset=None, distinct=False,
+            projections=[Star()], set_ops=None)
+        stages: list[tuple[str, Any]] = [(graph.ops[0].id if graph.ops else "scan0", scan)]
+        if node.where is not None:
+            stages.append(("filter", dataclasses.replace(scan, where=node.where)))
+        if self._is_aggregate(node):
+            stages.append(("aggregate", dataclasses.replace(
+                node, order_by=None, limit=None, offset=None, distinct=False)))
+        last_id = graph.ops[-1].id if graph.ops else "scan0"
+        stages.append((last_id, node))
+
+        by_id = {o.id: o for o in graph.ops}
+        sampled = False
+        total = 0.0
+        # Each stage is timed independently through the real engine (so a stage's
+        # number is its own wall time, not a fragile delta); rows-out is exact.
+        for op_id, n in stages:
+            try:
+                rows, ms = run(n)
+            except Exception:
+                continue
+            total = ms  # the final (full-query) stage is the headline total
+            if rows >= cap:
+                sampled = True
+            op = by_id.get(op_id)
+            if op is not None:
+                op.rows = rows
+                op.elapsed_ms = round(ms, 2)
+        graph.analyzed = True
+        graph.total_ms = round(total, 2)
+        graph.sampled = sampled
+        return graph
+
+    def edit_plan(self, req: PlanEditRequest) -> PlanEditResult:
+        """Apply structural edits to a parsed query and re-emit SQL — the plan
+        player's 'modify live' path."""
+        import dataclasses
+
+        dialect = self._resolve_dialect(req.dialect)
+        try:
+            node = parse_sql(req.sql, dialect=dialect)
+        except (ValueError, NotImplementedError) as exc:
+            raise BadRequestError(f"SQL parse error: {exc}")
+        if not isinstance(node, SelectNode):
+            raise BadRequestError("only SELECT statements can be edited")
+        for e in req.edits:
+            if e.op == "set_limit":
+                node = dataclasses.replace(node, limit=e.value)
+            elif e.op == "set_offset":
+                node = dataclasses.replace(node, offset=e.value)
+            elif e.op == "drop_limit":
+                node = dataclasses.replace(node, limit=None, offset=None)
+            elif e.op == "drop_filter":
+                node = dataclasses.replace(node, where=None)
+            elif e.op == "drop_group":
+                node = dataclasses.replace(node, group_by=None, having=None)
+            elif e.op == "drop_order":
+                node = dataclasses.replace(node, order_by=None)
+            elif e.op == "drop_distinct":
+                node = dataclasses.replace(node, distinct=False)
+            else:
+                raise BadRequestError(f"unknown plan edit {e.op!r}")
+        try:
+            sql = node.to_sql(dialect=dialect)
+        except Exception as exc:
+            raise BadRequestError(f"cannot re-emit edited plan: {exc}")
+        return PlanEditResult(node_id=self.settings.node_id, sql=sql, plan_sql=sql)
 
     def execute_sql_arrow(self, req: SqlRequest):
         """Run the query and return (iterator-of-ipc-bytes, cleanup-callable).
