@@ -1704,7 +1704,15 @@ class HTTPSession(Session):
         config = request.send_config_or_default
         wait_cfg = config.wait if config.wait is not None else self.waiting
 
-        result = self._wire_send(request, wait_cfg, stream=config.stream)
+        # Only thread ``stream`` through when a caller actually opted in.
+        # Subclasses (test stubs, the SQL :class:`StatementExecutor`)
+        # override ``_wire_send`` with the original ``(request, wait_cfg)``
+        # signature and never stream, so the default path must call it
+        # exactly as before — passing an unknown kwarg would break them.
+        if config.stream:
+            result = self._wire_send(request, wait_cfg, stream=True)
+        else:
+            result = self._wire_send(request, wait_cfg)
 
         if result.status_code in (401, 403):
             LOGGER.warning(
