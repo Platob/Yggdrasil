@@ -761,6 +761,24 @@ export function explainSql(body: { sql: string; dialect?: string; catalog?: stri
   return jsonFetch<ExplainResult>("/api/v2/saga/explain", { method: "POST", body: JSON.stringify(body) });
 }
 
+export interface PlanOp {
+  id: string; op: string; title: string; detail: string; inputs: string[];
+  rows: number | null; elapsed_ms: number | null;
+}
+export interface PlanGraph {
+  node_id: string; dialect: string; statement: string; plan_sql: string;
+  ops: PlanOp[]; analyzed: boolean; total_ms: number | null; sampled: boolean;
+}
+export type PlanEdit = { op: string; value?: number };
+
+export function getPlan(body: { sql: string; dialect?: string; catalog?: string; schema?: string }, analyze = false): Promise<PlanGraph> {
+  return jsonFetch<PlanGraph>(`/api/v2/saga/plan${analyze ? "?analyze=true" : ""}`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function editPlan(body: { sql: string; dialect?: string; catalog?: string; schema?: string; edits: PlanEdit[] }): Promise<{ node_id: string; sql: string; plan_sql: string }> {
+  return jsonFetch("/api/v2/saga/plan/edit", { method: "POST", body: JSON.stringify(body) });
+}
+
 export interface OpLogEntry {
   ts: string; op: string; user: string; node: string;
   statement: string; rows: number | null; detail: string;

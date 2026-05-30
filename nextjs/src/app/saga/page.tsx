@@ -14,17 +14,20 @@ import {
   deleteCatalogEntity,
   discoverTables,
   runSql,
-  explainSql,
+  getPlan,
+  editPlan,
   getTableLog,
   replicateTable,
   type CatalogEntry,
   type SchemaEntry,
   type TableEntry,
   type SqlResult,
-  type ExplainResult,
+  type PlanGraph,
+  type PlanEdit,
   type OpLogEntry,
 } from "@/lib/api";
 import TabularModal from "@/components/TabularModal";
+import PlanGraphView from "@/components/PlanGraph";
 
 const DIALECTS = ["postgres", "sqlite", "mysql", "databricks"];
 
@@ -58,7 +61,8 @@ export default function SagaPage() {
   const [dialect, setDialect] = useState("postgres");
   const [ctx, setCtx] = useState<{ catalog?: string; schema?: string }>({});
   const [result, setResult] = useState<SqlResult | null>(null);
-  const [explain, setExplain] = useState<ExplainResult | null>(null);
+  const [plan, setPlan] = useState<PlanGraph | null>(null);
+  const [planBusy, setPlanBusy] = useState(false);
   const [tab, setTab] = useState<"results" | "plan">("results");
   const [running, setRunning] = useState(false);
   const [sqlErr, setSqlErr] = useState("");
@@ -210,12 +214,16 @@ export default function SagaPage() {
     setSql((s) => (s.trimEnd().endsWith("FROM") ? `${s} ${full}` : `${s}${full}`));
   };
 
+  const planBody = () => ({ sql, dialect, catalog: ctx.catalog, schema: ctx.schema });
+
   // -- SQL run
   const onRun = async () => {
-    setRunning(true); setSqlErr(""); setExplain(null);
+    setRunning(true); setSqlErr("");
     try {
-      const r = await runSql({ sql, dialect, catalog: ctx.catalog, schema: ctx.schema, node });
+      const r = await runSql({ ...planBody(), node });
       setResult(r); setTab("results");
+      // Keep the (logical) plan in sync with whatever just ran.
+      getPlan(planBody()).then(setPlan).catch(() => {});
     } catch (e) { setSqlErr(String(e)); setResult(null); }
     finally { setRunning(false); }
   };
@@ -223,10 +231,29 @@ export default function SagaPage() {
   const onExplain = async () => {
     setRunning(true); setSqlErr("");
     try {
-      const r = await explainSql({ sql, dialect, catalog: ctx.catalog, schema: ctx.schema });
-      setExplain(r); setTab("plan");
+      setPlan(await getPlan(planBody()));
+      setTab("plan");
     } catch (e) { setSqlErr(String(e)); }
     finally { setRunning(false); }
+  };
+
+  const onAnalyze = async () => {
+    setPlanBusy(true); setSqlErr("");
+    try {
+      setPlan(await getPlan(planBody(), true));
+    } catch (e) { setSqlErr(String(e)); }
+    finally { setPlanBusy(false); }
+  };
+
+  // Apply a structural plan edit live: re-emit SQL, drop it into the editor, run.
+  const onPlanEdit = async (edits: PlanEdit[]) => {
+    try {
+      const r = await editPlan({ ...planBody(), edits });
+      setSql(r.sql);
+      const res = await runSql({ sql: r.sql, dialect, catalog: ctx.catalog, schema: ctx.schema, node });
+      setResult(res);
+      setPlan(await getPlan({ sql: r.sql, dialect, catalog: ctx.catalog, schema: ctx.schema }));
+    } catch (e) { setSqlErr(String(e)); }
   };
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -475,32 +502,11 @@ export default function SagaPage() {
               <div className="p-4 text-[12px] text-muted">Run a query to see results.</div>
             )}
             {tab === "plan" && (
-              <div className="p-3 text-[12px] font-mono space-y-3">
-                {(explain ?? result) ? (
-                  <>
-                    <div>
-                      <div className="text-[11px] uppercase tracking-wide text-muted mb-1">Emitted SQL</div>
-                      <pre className="text-frost/90 whitespace-pre-wrap break-words bg-[#06060f] border border-white/[0.06] rounded p-2">{(explain?.plan_sql ?? result?.plan_sql) || "—"}</pre>
-                    </div>
-                    <div>
-                      <div className="text-[11px] uppercase tracking-wide text-muted mb-1">Referenced tables</div>
-                      <div className="flex flex-wrap gap-1.5">
-                        {((explain?.referenced_tables ?? result?.referenced_tables) ?? []).map((t) => (
-                          <span key={t} className={chip}>{t}</span>
-                        ))}
-                      </div>
-                    </div>
-                    {explain?.plan && (
-                      <div>
-                        <div className="text-[11px] uppercase tracking-wide text-muted mb-1">Plan tree</div>
-                        <pre className="text-foreground-dim whitespace-pre-wrap break-words bg-[#06060f] border border-white/[0.06] rounded p-2 max-h-64 overflow-auto">{explain.plan}</pre>
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <div className="text-muted">Run or Explain a query to see the execution plan.</div>
-                )}
-              </div>
+              plan ? (
+                <PlanGraphView graph={plan} busy={planBusy} onAnalyze={onAnalyze} onApply={onPlanEdit} />
+              ) : (
+                <div className="p-4 text-[12px] text-muted">Run or Explain a query to see the execution plan.</div>
+              )
             )}
           </div>
         </div>
