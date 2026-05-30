@@ -182,6 +182,23 @@ class TableListResponse(StrictModel):
     model_config = {"populate_by_name": True}
 
 
+# -- one-shot register (ensure catalog + schema, infer name/format) ---------
+
+class RegisterRequest(StrictModel):
+    # A filesystem path or npfs:// URL to the backing data file.
+    source_url: str
+    catalog: str = "main"
+    schema_: str = Field(default="default", alias="schema")
+    # Table name; defaults to the source file's stem.
+    table: str | None = None
+    node: str | None = None
+    table_type: TableType = "EXTERNAL"
+    # Dialect for the catalog if it has to be created.
+    dialect: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
 # -- discovery (auto-register a folder of files) ----------------------------
 
 class DiscoverRequest(StrictModel):

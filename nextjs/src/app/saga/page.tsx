@@ -167,7 +167,14 @@ export default function SagaPage() {
       const r = await getTable(cat, schema, name, node);
       setDetail(r.table);
       setLog(null);
+      // Prefill the editor context from the selected table so Run "just works".
+      setCtx({ catalog: cat, schema });
     } catch (e) { setTreeErr(String(e)); }
+  };
+
+  const queryTable = (t: TableEntry) => {
+    setSql(`SELECT *\nFROM ${t.full_name}\nLIMIT 100`);
+    setCtx({ catalog: t.catalog, schema: t.schema });
   };
 
   const loadLog = async (t: TableEntry) => {
@@ -340,6 +347,7 @@ export default function SagaPage() {
                 <button onClick={() => { setDetail(null); setLog(null); }} className="text-[11px] text-muted hover:text-foreground">close</button>
               </div>
               <div className="flex flex-wrap gap-2 mb-1.5 text-[11px]">
+                <button onClick={() => queryTable(detail)} className="text-frost/90 hover:text-frost font-semibold">query →</button>
                 <button onClick={() => setPreview({ path: detail.source_url, name: detail.name })}
                   className="text-frost/80 hover:text-frost">preview data</button>
                 <button onClick={() => insertRef(detail.full_name)} className="text-amber/80 hover:text-amber">insert</button>

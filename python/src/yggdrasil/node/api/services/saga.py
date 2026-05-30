@@ -57,6 +57,7 @@ from ..schemas.saga import (
     SchemaUpdate,
     OpLogEntry,
     OpLogResponse,
+    RegisterRequest,
     ReplicateRequest,
     ReplicateResult,
     StagedResult,
@@ -413,6 +414,26 @@ class SagaService:
                 pass
         return TableResponse(table=entry)
 
+    async def register(self, req: RegisterRequest) -> TableResponse:
+        """One call to land a file in the catalog: ensure the catalog + schema
+        exist, infer the table name from the filename, register and profile it.
+
+        This is the easy path the Files page and Excel use — no need to create
+        the catalog/schema first."""
+        from pathlib import PurePosixPath
+        name = req.table or PurePosixPath(req.source_url.split("://")[-1]).stem or "table"
+        with self._lock:
+            need_cat = self._catalog_by_name(req.catalog) is None
+            need_sch = self._schema_by_name(req.catalog, req.schema_) is None
+        if need_cat:
+            await self.create_catalog(CatalogCreate(name=req.catalog, dialect=req.dialect))
+        if need_sch:
+            await self.create_schema(req.catalog, SchemaCreate(name=req.schema_))
+        return await self.create_table(req.catalog, req.schema_, TableCreate(
+            name=name, source_url=req.source_url, node=req.node,
+            table_type=req.table_type, infer=True,
+        ))
+
     async def list_tables(self, catalog: str, schema: str) -> TableListResponse:
         with self._lock:
             self._require_schema(catalog, schema)
@@ -635,7 +656,15 @@ class SagaService:
     def plan_for(self, req: SqlRequest) -> tuple[PlanNode, Dialect, list[TableRef]]:
         if not req.sql or not req.sql.strip():
             raise BadRequestError("empty SQL statement")
-        dialect = self._resolve_dialect(req.dialect)
+        # Infer the dialect from the default catalog when the request doesn't
+        # pin one — a catalog created as databricks parses its own queries.
+        chosen = req.dialect
+        if chosen is None and req.catalog:
+            with self._lock:
+                cat = self._catalog_by_name(req.catalog)
+            if cat is not None:
+                chosen = cat.dialect
+        dialect = self._resolve_dialect(chosen)
         try:
             node = parse_sql(req.sql, dialect=dialect)
         except (ValueError, NotImplementedError) as exc:

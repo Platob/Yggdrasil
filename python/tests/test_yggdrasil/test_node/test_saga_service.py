@@ -203,6 +203,28 @@ class TestPersistence(unittest.TestCase):
             self.assertEqual(tables.tables[0].name, "trades")
 
 
+class TestRegister(unittest.TestCase):
+    def test_one_shot_register_creates_catalog_schema_and_infers_name(self):
+        from yggdrasil.node.api.schemas.saga import RegisterRequest
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); svc = _svc(home); src = _trades(svc.settings)
+            resp = asyncio.run(svc.register(RegisterRequest(source_url=src)))
+            t = resp.table
+            self.assertEqual(t.full_name, "main.default.trades")  # name from filename
+            self.assertEqual(t.statistics.row_count, 5)
+            self.assertEqual(asyncio.run(svc.list_catalogs()).catalogs[0].name, "main")
+
+    def test_dialect_inferred_from_catalog(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); svc = _svc(home); src = _trades(svc.settings)
+            asyncio.run(svc.create_catalog(CatalogCreate(name="dbx", dialect="databricks")))
+            asyncio.run(svc.create_schema("dbx", SchemaCreate(name="s")))
+            asyncio.run(svc.create_table("dbx", "s", TableCreate(name="trades", source_url=src)))
+            # No dialect in the request — should pick up the catalog's.
+            _, dialect, _ = svc.plan_for(SqlRequest(sql="SELECT * FROM dbx.s.trades", catalog="dbx"))
+            self.assertEqual(dialect.value, "databricks")
+
+
 class TestOpLog(unittest.TestCase):
     def test_register_query_and_drop_logging(self):
         with tempfile.TemporaryDirectory() as d:

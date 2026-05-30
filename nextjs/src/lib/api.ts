@@ -739,6 +739,14 @@ export async function deleteCatalogEntity(path: string): Promise<void> {
   invalidate("saga/catalog");
 }
 
+// One-shot: ensure catalog + schema, infer the table name from the file, and
+// register + profile it. Used by the Files page's "register in Saga" action.
+export async function registerFile(body: { source_url: string; catalog?: string; schema?: string; table?: string; node?: string | null }): Promise<{ table: TableEntry }> {
+  const r = await jsonFetch<{ table: TableEntry }>("/api/v2/saga/register", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/catalog");
+  return r;
+}
+
 export async function discoverTables(body: { catalog: string; schema: string; path?: string; node?: string | null; recursive?: boolean }): Promise<{ tables: TableEntry[] }> {
   const r = await jsonFetch<{ tables: TableEntry[] }>("/api/v2/saga/discover", { method: "POST", body: JSON.stringify(body) });
   invalidate("saga/catalog");

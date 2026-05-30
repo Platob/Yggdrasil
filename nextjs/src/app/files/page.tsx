@@ -13,9 +13,7 @@ import {
   uploadFsFile,
   mkdirFs,
   isTabularName,
-  createCatalog,
-  createSchema,
-  createTable,
+  registerFile,
   type FsNodeRoot,
 } from "@/lib/api";
 import type { FsEntry } from "@/lib/types";
@@ -264,23 +262,21 @@ export default function FilesPage() {
     } catch { /* tree shows last good state */ }
   }, [ensureLoaded]);
 
-  // Register a tabular file as a Saga external table — creates the catalog /
-  // schema on demand. source_url is the node-home-relative path, exactly the
-  // rooting Saga uses, so the new table opens in the SQL editor immediately.
+  // Register a tabular file as a Saga external table in one call — the backend
+  // ensures the catalog/schema, infers the name from the filename, and profiles
+  // it. source_url is the node-home-relative path Saga uses, so the new table
+  // opens in the SQL editor immediately.
   const registerSaga = useCallback(async (node: string, entry: FsEntry) => {
-    const fq = prompt("Register as catalog.schema.table", `main.default.${entry.name.split(".")[0]}`);
+    const stem = entry.name.replace(/\.[^.]+$/, "");
+    const fq = prompt("Register as catalog.schema.table", `main.default.${stem}`);
     if (!fq) return;
-    const parts = fq.split(".");
-    if (parts.length !== 3) { alert("Use the form catalog.schema.table"); return; }
-    const [catalog, schema, table] = parts.map((s) => s.trim());
+    const [catalog, schema, table] = fq.split(".").map((s) => s.trim());
     try {
-      await createCatalog({ name: catalog });
-      await createSchema(catalog, { name: schema });
-      await createTable(catalog, schema, {
-        name: table, source_url: entry.path,
+      const r = await registerFile({
+        source_url: entry.path, catalog, schema, table,
         node: node === selfNodeId ? undefined : node,
       });
-      alert(`Registered ${catalog}.${schema}.${table} → Saga`);
+      alert(`Registered ${r.table.full_name} → Saga (${r.table.statistics.row_count ?? "?"} rows)`);
     } catch (e) { alert(String(e)); }
   }, [selfNodeId]);
 

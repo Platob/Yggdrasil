@@ -18,6 +18,7 @@ from ..schemas.saga import (
     DiscoverRequest,
     ExplainResult,
     OpLogResponse,
+    RegisterRequest,
     ReplicateRequest,
     ReplicateResult,
     SchemaCreate,
@@ -173,6 +174,12 @@ async def read_table_log(catalog: str, schema: str, name: str, limit: int = 200,
                            f"/catalog/{catalog}/schema/{schema}/table/{name}/log",
                            params={"limit": limit})
     return remote if remote is not None else await saga.read_log(catalog, schema, name, limit=limit)
+
+
+@router.post("/register", response_model=TableResponse)
+async def register(req: RegisterRequest, saga: SagaService = Depends(get_saga_service)):
+    """One-shot: ensure catalog + schema, infer the name, register + profile."""
+    return await saga.register(req)
 
 
 @router.post("/discover", response_model=TableListResponse)
